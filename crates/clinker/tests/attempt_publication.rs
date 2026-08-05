@@ -1818,8 +1818,7 @@ fn readiness_reopen_rejects_artifact_leaf_substitution() {
         .mark_ready(&artifact_id)
         .expect_err("handle-relative no-follow reopen must reject substitution");
     assert!(
-        error.to_string().contains("security_policy")
-            || error.to_string().contains("containment"),
+        error.to_string().contains("security_policy") || error.to_string().contains("containment"),
         "{error}"
     );
     assert_eq!(std::fs::read(&outside_canary).unwrap(), b"outside");
@@ -1975,6 +1974,125 @@ fn bounded_attempt_listing_advances_across_more_attempts_than_one_page() {
     }
 
     assert_eq!(observed, execution_ids);
+}
+
+#[test]
+fn live_lock_only_crash_state_is_discoverable_and_removable() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let attempt = begin(root.path());
+    let attempt_root = attempt.attempt_root().to_path_buf();
+    let manifest_path = attempt.manifest_path().to_path_buf();
+    drop(attempt);
+    std::fs::remove_file(manifest_path).expect("simulate crash after manifest unlink");
+
+    let policy = bounded_policy(root.path(), 0, 1_000, 8_000_000_000, 2_000);
+    let query = query(root.path(), &policy, "terminal_owner_metadata");
+    let root_id = query.owned_root_ids()[0].to_owned();
+    let inspection = query
+        .inspect(&root_id, EXECUTION_ID, 400_000)
+        .expect("terminal metadata remains inspectable");
+    assert!(inspection.is_owner_metadata_cleanup());
+    assert!(inspection.is_eligible());
+
+    let request = query
+        .purge_execution(&root_id, EXECUTION_ID)
+        .expect("typed purge request");
+    let report = query
+        .execute(&request, 400_000, None, &ShutdownToken::detached())
+        .expect("fresh process removes terminal metadata");
+    assert_eq!(report.disposition(), PurgeDisposition::Removed);
+    assert!(!attempt_root.exists());
+}
+
+#[test]
+fn purge_byte_budget_charges_manifest_evidence_not_artifact_payloads() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let registry = OutputStagingRegistry::default();
+    let mut attempt = begin(root.path());
+    let artifact_id = stage_ready(&mut attempt, &registry, root.path(), &[b'x'; 8_192]);
+    let attempt_root = attempt.attempt_root().to_path_buf();
+    drop(attempt);
+    let manifest_bytes = std::fs::metadata(attempt_root.join("manifest.json"))
+        .expect("manifest metadata")
+        .len();
+    assert!(manifest_bytes < 2_048);
+
+    let policy = bounded_policy(root.path(), 0, 1_000, 2_048, 2_000);
+    let query = query(root.path(), &policy, "payload_independent_budget");
+    let root_id = query.owned_root_ids()[0].to_owned();
+    let request = query
+        .purge_execution(&root_id, EXECUTION_ID)
+        .expect("typed purge request");
+    let report = query
+        .execute(&request, 400_000, None, &ShutdownToken::detached())
+        .expect("payload size does not consume metadata budget");
+
+    assert_eq!(report.disposition(), PurgeDisposition::Removed);
+    assert_eq!(report.removed_artifact_count(), 1);
+    assert!(report.bounds().considered_bytes() < 2_048);
+    assert!(!attempt_root.join(artifact_id).exists());
+}
+
+#[test]
+fn maximum_manifest_cardinality_purges_across_smaller_cleanup_pages() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let attempt = begin(root.path());
+    let attempt_root = attempt.attempt_root().to_path_buf();
+    let manifest_path = attempt.manifest_path().to_path_buf();
+    drop(attempt);
+
+    let mut artifacts = Vec::with_capacity(MANIFEST_MAX_ARTIFACTS);
+    for index in 0..MANIFEST_MAX_ARTIFACTS {
+        let artifact_id = format!("artifact-{index:08x}");
+        std::fs::write(attempt_root.join(&artifact_id), b"").expect("artifact fixture");
+        artifacts.push(artifact(
+            &artifact_id,
+            "bounded-cleanup",
+            &format!("artifact-{index:08x}.bin"),
+            0,
+        ));
+    }
+    let manifest =
+        AttemptManifest::new(EXECUTION_ID, 1_000, 301_000, AttemptState::Ready, artifacts)
+            .expect("maximum-cardinality manifest");
+    std::fs::write(
+        &manifest_path,
+        manifest.to_bytes().expect("canonical manifest"),
+    )
+    .expect("install maximum-cardinality manifest");
+
+    let policy = bounded_policy(root.path(), 0, 2_048, 8_000_000_000, 2_000);
+    let query = query(root.path(), &policy, "maximum_cardinality_cleanup");
+    let root_id = query.owned_root_ids()[0].to_owned();
+    let request = query
+        .purge_execution(&root_id, EXECUTION_ID)
+        .expect("typed purge request");
+    let mut continuation = None;
+    let mut removed = 0_usize;
+    let mut pages = 0_usize;
+
+    loop {
+        let report = query
+            .execute(
+                &request,
+                400_000,
+                continuation.as_ref(),
+                &ShutdownToken::detached(),
+            )
+            .expect("bounded cleanup page");
+        pages += 1;
+        removed += report.removed_artifact_count();
+        continuation = report.continuation().cloned();
+        if continuation.is_none() {
+            assert_eq!(report.disposition(), PurgeDisposition::Removed);
+            break;
+        }
+        assert_eq!(report.disposition(), PurgeDisposition::Partial);
+    }
+
+    assert!(pages > 1);
+    assert_eq!(removed, MANIFEST_MAX_ARTIFACTS);
+    assert!(!attempt_root.exists());
 }
 
 #[test]

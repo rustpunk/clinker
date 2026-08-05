@@ -794,6 +794,7 @@ pub struct AttemptInspection {
     bounds: AttemptQueryBounds,
     physical_path: Option<PathBuf>,
     eligible: bool,
+    owner_metadata_only: bool,
 }
 
 impl std::fmt::Debug for AttemptInspection {
@@ -856,6 +857,12 @@ impl AttemptInspection {
     /// Whether durable state and the configured policy make this attempt eligible.
     pub fn is_eligible(&self) -> bool {
         self.eligible
+    }
+
+    /// Whether metadata-last cleanup reached the exact terminal live-lock-only
+    /// form and can be resumed without a continuation token.
+    pub fn is_owner_metadata_cleanup(&self) -> bool {
+        self.owner_metadata_only
     }
 
     /// Physical attempt path behind explicit sanitized-output opt-in.
@@ -1251,7 +1258,7 @@ impl AttemptQuery {
                 list.continuation =
                     Some(self.continuation(root_identifier, "list", Some(name.clone())));
             }
-            if inspection.state.is_some() {
+            if inspection.state.is_some() || inspection.owner_metadata_only {
                 list.entries.push(AttemptListEntry { inspection });
             } else {
                 for debt in inspection.cleanup_debt {
@@ -1714,15 +1721,29 @@ impl AttemptQuery {
                     report.bounds = budget.bounds();
                     return Ok(report);
                 }
-                let _ = FileExt::unlock(&lock);
-                drop(lock);
                 if attempt_root.directory.remove_file("live.lock").is_err()
-                    || attempt_root.remove_empty().is_err()
+                    || attempt_root.directory.sync().is_err()
                 {
                     report.disposition = PurgeDisposition::Partial;
                     report.cleanup_debt.push(CleanupDebt::new(
                         CleanupDebtKind::Operational,
                         "owner metadata or empty attempt root could not be removed last",
+                    ));
+                    report.continuation = Some(self.continuation(
+                        &request.root_identifier,
+                        &selector_name,
+                        Some(OWNER_METADATA_CURSOR.to_owned()),
+                    ));
+                    report.bounds = budget.bounds();
+                    return Ok(report);
+                }
+                let _ = FileExt::unlock(&lock);
+                drop(lock);
+                if attempt_root.remove_empty().is_err() {
+                    report.disposition = PurgeDisposition::Partial;
+                    report.cleanup_debt.push(CleanupDebt::new(
+                        CleanupDebtKind::Operational,
+                        "empty attempt root could not be removed after owner metadata",
                     ));
                     report.continuation = Some(self.continuation(
                         &request.root_identifier,
@@ -1813,6 +1834,46 @@ impl AttemptQuery {
             report.continuation =
                 Some(self.continuation(&request.root_identifier, &selector_name, cursor));
             let _ = FileExt::unlock(&lock);
+            report.bounds = budget.bounds();
+            return Ok(report);
+        }
+        if observed.len() == 1 && observed.get("live.lock") == Some(&ContainedEntryKind::File) {
+            if attempt_root.directory.remove_file("live.lock").is_err()
+                || attempt_root.directory.sync().is_err()
+            {
+                report.disposition = PurgeDisposition::Partial;
+                report.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::Operational,
+                    "terminal owner metadata could not be removed while locked",
+                ));
+                report.continuation = Some(self.continuation(
+                    &request.root_identifier,
+                    &selector_name,
+                    Some(OWNER_METADATA_CURSOR.to_owned()),
+                ));
+                let _ = FileExt::unlock(&lock);
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+            let _ = FileExt::unlock(&lock);
+            drop(lock);
+            if attempt_root.remove_empty().is_err() {
+                report.disposition = PurgeDisposition::Partial;
+                report.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::Operational,
+                    "empty attempt root could not be removed after terminal owner metadata",
+                ));
+                report.continuation = Some(self.continuation(
+                    &request.root_identifier,
+                    &selector_name,
+                    Some(OWNER_METADATA_CURSOR.to_owned()),
+                ));
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+            report.disposition = PurgeDisposition::Removed;
+            report.removed_execution_ids.push(execution_id.to_owned());
+            report.kept_execution_ids.clear();
             report.bounds = budget.bounds();
             return Ok(report);
         }
@@ -2068,15 +2129,29 @@ impl AttemptQuery {
             report.bounds = budget.bounds();
             return Ok(report);
         }
-        let _ = FileExt::unlock(&lock);
-        drop(lock);
         if attempt_root.directory.remove_file("live.lock").is_err()
-            || attempt_root.remove_empty().is_err()
+            || attempt_root.directory.sync().is_err()
         {
             report.disposition = PurgeDisposition::Partial;
             report.cleanup_debt.push(CleanupDebt::new(
                 CleanupDebtKind::Operational,
                 "owner metadata or empty attempt root could not be removed last",
+            ));
+            report.continuation = Some(self.continuation(
+                &request.root_identifier,
+                &selector_name,
+                Some(OWNER_METADATA_CURSOR.to_owned()),
+            ));
+            report.bounds = budget.bounds();
+            return Ok(report);
+        }
+        let _ = FileExt::unlock(&lock);
+        drop(lock);
+        if attempt_root.remove_empty().is_err() {
+            report.disposition = PurgeDisposition::Partial;
+            report.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::Operational,
+                "empty attempt root could not be removed after owner metadata",
             ));
             report.continuation = Some(self.continuation(
                 &request.root_identifier,
@@ -2327,6 +2402,7 @@ fn inspect_owned_attempt(
         bounds: budget.bounds(),
         physical_path: None,
         eligible: false,
+        owner_metadata_only: false,
     };
     let attempt_root = match AttemptRoot::open(&root.destination, execution_id) {
         Ok(Some(attempt_root)) => attempt_root,
@@ -2383,6 +2459,25 @@ fn inspect_owned_attempt(
             CleanupDebtKind::EntryBudget,
             "attempt exceeds the bounded manifest ownership inventory",
         ));
+        inspection.bounds = budget.bounds();
+        return inspection;
+    }
+    if observed.len() == 1 && observed.get("live.lock") == Some(&ContainedEntryKind::File) {
+        match attempt_root.directory.open_file("live.lock") {
+            Ok(lock) if FileExt::try_lock(&lock).is_ok() => {
+                let _ = FileExt::unlock(&lock);
+                inspection.owner_metadata_only = true;
+                inspection.eligible = true;
+            }
+            Ok(_) => inspection.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::LiveAttempt,
+                "terminal owner metadata is still locked by a live writer",
+            )),
+            Err(_) => inspection.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::Operational,
+                "terminal owner metadata could not be reopened through its retained handle",
+            )),
+        }
         inspection.bounds = budget.bounds();
         return inspection;
     }
@@ -2676,6 +2771,7 @@ fn legacy_inspection(execution_id: &str, disposition: CleanupDisposition) -> Att
         bounds: AttemptQueryBounds::default(),
         physical_path: None,
         eligible: disposition == CleanupDisposition::Removed,
+        owner_metadata_only: false,
     }
 }
 
@@ -4056,11 +4152,12 @@ impl AttemptPublication {
         for (_, mut additional) in additional_roots {
             additional.root.directory.remove_file("manifest.json")?;
             additional.root.directory.sync()?;
+            additional.root.directory.remove_file("live.lock")?;
+            additional.root.directory.sync()?;
             if let Some(lock) = additional.lock_file.take() {
                 let _ = FileExt::unlock(&lock);
                 drop(lock);
             }
-            additional.root.directory.remove_file("live.lock")?;
             additional.root.remove_empty()?;
         }
         let attempt_root = self
@@ -4069,11 +4166,12 @@ impl AttemptPublication {
             .ok_or(AttemptError::InvalidTransition("attempt root was removed"))?;
         attempt_root.directory.remove_file("manifest.json")?;
         attempt_root.directory.sync()?;
+        attempt_root.directory.remove_file("live.lock")?;
+        attempt_root.directory.sync()?;
         if let Some(lock) = self.lock_file.take() {
             let _ = FileExt::unlock(&lock);
             drop(lock);
         }
-        attempt_root.directory.remove_file("live.lock")?;
         let attempt_root = self
             .attempt_root
             .take()
