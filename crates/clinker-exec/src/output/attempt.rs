@@ -9,7 +9,7 @@ use std::io::{BufReader, Read, Seek, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clinker_plan::config::{
     DestinationProfile, PUBLICATION_MANIFEST_MAX_BYTES, PUBLICATION_MAX_RETAINED_ATTEMPTS,
@@ -3731,6 +3731,42 @@ struct RootReceiptInput {
     historical_sources: Vec<HistoricalSourceIdentity>,
 }
 
+#[derive(Clone, Copy)]
+enum AdmissionObservation {
+    Provided,
+    SystemClock,
+}
+
+impl AdmissionObservation {
+    fn after_lock(self, created_unix_ms: u64) -> Result<u64, AttemptError> {
+        match self {
+            Self::Provided => Ok(created_unix_ms),
+            Self::SystemClock => {
+                let observed = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| {
+                        AttemptError::AggregateAdmissionUnproven(
+                            "system clock precedes the durable attempt epoch",
+                        )
+                    })?
+                    .as_millis()
+                    .try_into()
+                    .map_err(|_| {
+                        AttemptError::AggregateAdmissionUnproven(
+                            "system clock exceeds the durable attempt range",
+                        )
+                    })?;
+                if observed < created_unix_ms {
+                    return Err(AttemptError::AggregateAdmissionUnproven(
+                        "system clock moved backwards during retained-attempt admission",
+                    ));
+                }
+                Ok(observed)
+            }
+        }
+    }
+}
+
 impl RunAttemptPublication {
     /// Create one empty run-owned attempt over a finite set of compiled
     /// destination-parent roots.
@@ -3748,6 +3784,7 @@ impl RunAttemptPublication {
             eligible_after_unix_ms,
             destination_roots,
             None,
+            AdmissionObservation::Provided,
         )
         .map(|attempt| Self {
             inner: Arc::new(Mutex::new(attempt)),
@@ -3784,6 +3821,7 @@ impl RunAttemptPublication {
                 plan_hash: *plan.pipeline_hash(),
                 historical_sources,
             }),
+            AdmissionObservation::SystemClock,
         )
         .map(|attempt| Self {
             inner: Arc::new(Mutex::new(attempt)),
@@ -4007,6 +4045,7 @@ impl AttemptPublication {
             eligible_after_unix_ms,
             destination_roots.into_values().collect(),
             None,
+            AdmissionObservation::Provided,
         )?;
 
         let mut writers = Vec::with_capacity(registrations.len());
@@ -4023,6 +4062,7 @@ impl AttemptPublication {
         eligible_after_unix_ms: u64,
         destination_roots: Vec<ValidatedPath>,
         receipt_input: Option<RootReceiptInput>,
+        admission_observation: AdmissionObservation,
     ) -> Result<Self, AttemptError> {
         validate_execution_id(execution_id)?;
         if destination_roots.is_empty() || destination_roots.len() > MANIFEST_MAX_ARTIFACTS {
@@ -4104,7 +4144,12 @@ impl AttemptPublication {
             })
             .transpose()?;
         let admission_locks = lock_admission_roots(&admission_roots)?;
-        enforce_retained_attempt_admission(&policy, admission_roots.clone(), created_unix_ms)?;
+        let admission_observed_unix_ms = admission_observation.after_lock(created_unix_ms)?;
+        enforce_retained_attempt_admission(
+            &policy,
+            admission_roots.clone(),
+            admission_observed_unix_ms,
+        )?;
         let owner_profile = match policy.mode() {
             PublicationMode::Direct => policy.destination_profile(),
             PublicationMode::LocalThenPublish => DestinationProfile::Local,

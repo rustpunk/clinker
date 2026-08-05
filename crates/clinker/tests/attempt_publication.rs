@@ -703,6 +703,44 @@ fn concurrent_aggregate_admission_reserves_estimated_bytes_until_sizes_are_exact
     );
 }
 
+#[test]
+fn receipt_backed_admission_refreshes_a_stale_creation_observation() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let receipt_root = tempfile::tempdir().expect("receipt root");
+    let registry = OutputStagingRegistry::default();
+    let policy = retained_policy(root.path(), 8, 8_000_000_000, 1);
+    let newer_execution_id = "018f47a2-9a41-7a27-b4d6-4f7137e3c267";
+    let (newer_attempt, newer_writers) = AttemptPublication::create_run(
+        policy.clone(),
+        &registry,
+        newer_execution_id,
+        2_000,
+        u64::MAX,
+        vec![registration(
+            ArtifactKind::Primary,
+            root.path(),
+            "newer.bin",
+            "newer-output",
+        )],
+    )
+    .expect("create the attempt observed after the next run started");
+    drop(newer_writers);
+    drop(newer_attempt);
+
+    let admitted = RunAttemptPublication::create_with_root_receipt(
+        policy,
+        &compiled_plan("stale_creation_observation"),
+        validated(receipt_root.path(), "."),
+        Vec::new(),
+        "018f47a2-9a41-7a27-b4d6-4f7137e3c268",
+        1_000,
+        u64::MAX,
+        vec![validated(root.path(), ".")],
+    )
+    .expect("admission observes retained state after acquiring its locks");
+    admitted.abandon().expect("retain admitted attempt");
+}
+
 #[cfg(unix)]
 #[test]
 fn authored_legacy_lock_leaf_cannot_replace_the_internal_admission_mutex() {
