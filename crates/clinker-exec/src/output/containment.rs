@@ -111,6 +111,16 @@ pub enum ContainmentError {
     },
 }
 
+fn containment_kind(error: &ContainmentError) -> Option<std::io::ErrorKind> {
+    match error {
+        ContainmentError::Io { source, .. }
+        | ContainmentError::VisibleButUnsynced { source, .. } => Some(source.kind()),
+        ContainmentError::SecurityPolicy { .. }
+        | ContainmentError::PolicyRequired { .. }
+        | ContainmentError::PublishedCleanup { .. } => None,
+    }
+}
+
 impl ContainmentError {
     fn security(code: &'static str, path: &Path, detail: &'static str) -> Self {
         Self::SecurityPolicy {
@@ -533,7 +543,17 @@ impl OutputContainment {
                             ),
                         ));
                     }
-                    self.parent.remove_leaf(&leaf)?;
+                    // The previous owner removes the name before releasing its
+                    // handle. If that happens between our open and unlink, we
+                    // hold the old inode but the directory entry is already
+                    // gone. Treat that as successful stale-name recovery and
+                    // retry the create-new acquisition below.
+                    match self.parent.remove_leaf(&leaf) {
+                        Ok(()) => {}
+                        Err(error)
+                            if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => {}
+                        Err(error) => return Err(error),
+                    }
                     let _ = FileExt::unlock(&existing);
                 }
                 Err(error) => return Err(error),
@@ -2501,7 +2521,7 @@ mod platform {
             let handle = open_file_at(
                 &self.handle,
                 leaf,
-                DELETE | SYNCHRONIZE,
+                FILE_GENERIC_READ | DELETE | SYNCHRONIZE,
                 FILE_OPEN,
                 FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
             )

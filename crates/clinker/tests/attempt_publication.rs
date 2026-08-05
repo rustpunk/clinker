@@ -1961,6 +1961,32 @@ fn remove_matrix_namespace(root: &Path) {
 }
 
 #[cfg(target_os = "linux")]
+fn wait_for_retained_execution(root: &Path, expected: &str) {
+    let namespace = root.join(".clinker-attempts");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let expected = vec![std::ffi::OsString::from(expected)];
+    loop {
+        let retained = std::fs::read_dir(&namespace).map(|entries| {
+            let mut retained = entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_dir())
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>();
+            retained.sort();
+            retained
+        });
+        if retained.as_ref().is_ok_and(|actual| actual == &expected) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mounted roots did not converge on the admitted execution: {retained:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn matrix_admission_contention(destination: &Path, profile: &str, scenario: &str, index: u64) {
     let first_root = destination.join(format!("{scenario}-first"));
     let second_root = destination.join(format!("{scenario}-second"));
@@ -2021,17 +2047,7 @@ fn matrix_admission_contention(destination: &Path, profile: &str, scenario: &str
     };
     for root in [&first_root, &second_root] {
         let namespace = root.join(".clinker-attempts");
-        let retained = std::fs::read_dir(&namespace)
-            .expect("mounted admission namespace readback")
-            .filter_map(Result::ok)
-            .filter(|entry| entry.path().is_dir())
-            .map(|entry| entry.file_name())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            retained,
-            vec![std::ffi::OsString::from(admitted_execution)],
-            "each mounted root must retain exactly the same one execution"
-        );
+        wait_for_retained_execution(root, admitted_execution);
         let attempt_root = namespace.join(admitted_execution);
         assert!(
             attempt_root.is_dir(),

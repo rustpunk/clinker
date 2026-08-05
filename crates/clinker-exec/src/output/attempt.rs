@@ -4,12 +4,16 @@ use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, Write};
+#[cfg(target_os = "linux")]
+use std::io::BufReader;
+use std::io::{Read, Seek, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use clinker_plan::config::{
     DestinationProfile, PUBLICATION_MANIFEST_MAX_BYTES, PUBLICATION_MAX_RETAINED_ATTEMPTS,
