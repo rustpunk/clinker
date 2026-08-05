@@ -1390,14 +1390,17 @@ fn matrix_operator_proof(
     execution_id: &str,
     plan_name: &str,
 ) -> AttemptState {
-    let (expected_state, expected_artifact_state) = matrix_retained_states(plan_name);
+    let expected_state = matrix_retained_attempt_state(plan_name);
     let policy = matrix_resolved_policy(destination, mode, spool, 256 * 1024 * 1024);
     let mut roots = vec![validated(destination, ".")];
     if let Some(spool) = spool {
         roots.push(validated(spool, "."));
     }
-    let query = AttemptQuery::new(&compiled_plan(plan_name), &policy, roots)
-        .expect("construct mounted operator query");
+    let plan = compiled_plan(plan_name);
+    let destination_query = AttemptQuery::new(&plan, &policy, vec![validated(destination, ".")])
+        .expect("construct mounted destination identity");
+    let destination_root_id = destination_query.owned_root_ids()[0].to_owned();
+    let query = AttemptQuery::new(&plan, &policy, roots).expect("construct mounted operator query");
     let mut observed_state = None;
     for root_id in query
         .owned_root_ids()
@@ -1417,7 +1420,10 @@ fn matrix_operator_proof(
         assert_eq!(state, expected_state);
         assert_eq!(
             inspected.artifact_states(),
-            &[("artifact-00000001".to_owned(), expected_artifact_state)]
+            &[(
+                ("artifact-00000001").to_owned(),
+                matrix_retained_artifact_state(plan_name, root_id == destination_root_id)
+            )]
         );
         assert_eq!(observed_state.get_or_insert(state), &state);
         assert!(inspected.cleanup_debt().is_empty());
@@ -1434,26 +1440,73 @@ fn matrix_operator_proof(
 }
 
 #[cfg(target_os = "linux")]
-fn matrix_retained_states(plan_name: &str) -> (AttemptState, ArtifactState) {
+fn matrix_retained_attempt_state(plan_name: &str) -> AttemptState {
     if plan_name == "capacity-enospc"
         || plan_name.ends_with("-copy")
         || plan_name.ends_with("-file_synchronization")
     {
-        return (AttemptState::Staging, ArtifactState::Staging);
+        return AttemptState::Staging;
     }
     if plan_name.starts_with("ordinary-failure-") {
-        return (AttemptState::Incomplete, ArtifactState::Ready);
+        return AttemptState::Incomplete;
     }
-    if plan_name.ends_with("-rename") {
-        return (AttemptState::Publishing, ArtifactState::Unpublished);
-    }
-    if plan_name.ends_with("-parent_directory_synchronization") {
-        return (
-            AttemptState::Publishing,
-            ArtifactState::VisibleUnsynchronized,
-        );
+    if plan_name.ends_with("-rename") || plan_name.ends_with("-parent_directory_synchronization") {
+        return AttemptState::Publishing;
     }
     panic!("scenario has no retained-state contract: {plan_name}");
+}
+
+#[cfg(target_os = "linux")]
+fn matrix_retained_artifact_state(plan_name: &str, destination_root: bool) -> ArtifactState {
+    if plan_name == "capacity-enospc"
+        || plan_name.ends_with("-copy")
+        || plan_name.ends_with("-file_synchronization")
+    {
+        return ArtifactState::Staging;
+    }
+    if plan_name.starts_with("ordinary-failure-") {
+        return ArtifactState::Ready;
+    }
+    if !destination_root
+        && (plan_name.ends_with("-rename")
+            || plan_name.ends_with("-parent_directory_synchronization"))
+    {
+        return ArtifactState::Promoting;
+    }
+    if plan_name.ends_with("-rename") {
+        return ArtifactState::Unpublished;
+    }
+    if plan_name.ends_with("-parent_directory_synchronization") {
+        return ArtifactState::VisibleUnsynchronized;
+    }
+    panic!("scenario has no retained-artifact contract: {plan_name}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mounted_recovery_distinguishes_destination_state_from_spool_intent() {
+    assert_eq!(
+        matrix_retained_artifact_state("interruption-local_then_publish-rename", true),
+        ArtifactState::Unpublished
+    );
+    assert_eq!(
+        matrix_retained_artifact_state("interruption-local_then_publish-rename", false),
+        ArtifactState::Promoting
+    );
+    assert_eq!(
+        matrix_retained_artifact_state(
+            "interruption-local_then_publish-parent_directory_synchronization",
+            true,
+        ),
+        ArtifactState::VisibleUnsynchronized
+    );
+    assert_eq!(
+        matrix_retained_artifact_state(
+            "interruption-local_then_publish-parent_directory_synchronization",
+            false,
+        ),
+        ArtifactState::Promoting
+    );
 }
 
 #[cfg(target_os = "linux")]
