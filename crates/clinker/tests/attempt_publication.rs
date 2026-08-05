@@ -44,7 +44,17 @@ fn resolved_policy(
     spool: Option<&Path>,
     estimated_attempt_bytes: u64,
 ) -> ResolvedPublicationPolicy {
-    let config = match (mode, spool) {
+    resolved_policy_for_profile(destination_root, mode, spool, estimated_attempt_bytes, None)
+}
+
+fn resolved_policy_for_profile(
+    destination_root: &Path,
+    mode: PublicationMode,
+    spool: Option<&Path>,
+    estimated_attempt_bytes: u64,
+    destination_profile: Option<&str>,
+) -> ResolvedPublicationPolicy {
+    let mut config = match (mode, spool) {
         (PublicationMode::Direct, _) => String::new(),
         (PublicationMode::LocalThenPublish, Some(spool)) => format!(
             "[storage.publication]\nmode = \"local_then_publish\"\nlocal_spool_dir = \"{}\"\n",
@@ -54,6 +64,14 @@ fn resolved_policy(
             panic!("local_then_publish fixture requires a spool")
         }
     };
+    if let Some(destination_profile) = destination_profile {
+        if config.is_empty() {
+            config.push_str("[storage.publication]\n");
+        }
+        config.push_str(&format!(
+            "destination_profile = \"{destination_profile}\"\n"
+        ));
+    }
     ClinkerToml::parse(&config)
         .expect("parse publication fixture")
         .storage
@@ -1343,6 +1361,29 @@ fn matrix_execution_id(index: u64) -> String {
 }
 
 #[cfg(target_os = "linux")]
+fn matrix_resolved_policy(
+    destination: &Path,
+    mode: PublicationMode,
+    spool: Option<&Path>,
+    estimated_attempt_bytes: u64,
+) -> ResolvedPublicationPolicy {
+    let profile = std::env::var("CLINKER_FILESYSTEM_PROFILE")
+        .expect("mounted qualification profile must be provided");
+    let destination_profile = match profile.as_str() {
+        "linux-nfsv4.1-loopback-ci" => "nfs_v4_1",
+        "linux-smb3.1.1-loopback-ci" => "smb_3_1_1",
+        _ => panic!("unsupported qualification profile"),
+    };
+    resolved_policy_for_profile(
+        destination,
+        mode,
+        spool,
+        estimated_attempt_bytes,
+        Some(destination_profile),
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn matrix_operator_proof(
     destination: &Path,
     mode: PublicationMode,
@@ -1351,7 +1392,7 @@ fn matrix_operator_proof(
     plan_name: &str,
 ) -> AttemptState {
     let (expected_state, expected_artifact_state) = matrix_retained_states(plan_name);
-    let policy = resolved_policy(destination, mode, spool, 256 * 1024 * 1024);
+    let policy = matrix_resolved_policy(destination, mode, spool, 256 * 1024 * 1024);
     let mut roots = vec![validated(destination, ".")];
     if let Some(spool) = spool {
         roots.push(validated(spool, "."));
@@ -1424,7 +1465,7 @@ fn matrix_execute_purge(
     execution_id: &str,
     plan_name: &str,
 ) {
-    let policy = resolved_policy(destination, mode, spool, 256 * 1024 * 1024);
+    let policy = matrix_resolved_policy(destination, mode, spool, 256 * 1024 * 1024);
     let mut roots = vec![validated(destination, ".")];
     if let Some(spool) = spool {
         roots.push(validated(spool, "."));
@@ -1471,7 +1512,7 @@ fn matrix_attempt(
     OutputStagingRegistry,
 ) {
     let registry = OutputStagingRegistry::default();
-    let policy = resolved_policy(destination, mode, spool, 256 * 1024 * 1024);
+    let policy = matrix_resolved_policy(destination, mode, spool, 256 * 1024 * 1024);
     let (attempt, writers) = AttemptPublication::create_run_for_testing(
         policy,
         &registry,
