@@ -159,11 +159,7 @@ fn seed_incomplete_attempt(output_root: &Path, execution_id: &str) {
     seed_incomplete_attempt_with_fault(output_root, execution_id, AttemptFault::BeforeRename);
 }
 
-fn seed_incomplete_attempt_with_fault(
-    output_root: &Path,
-    execution_id: &str,
-    fault: AttemptFault,
-) {
+fn seed_incomplete_attempt_with_fault(output_root: &Path, execution_id: &str, fault: AttemptFault) {
     let registry = OutputStagingRegistry::default();
     let mut attempt =
         AttemptPublication::create(validated(output_root, "."), execution_id, 1_000, 2_000)
@@ -274,8 +270,7 @@ fn inspect_reuses_base_absolute_and_run_scoped_template_identity() {
     let workspace = tempfile::tempdir().expect("temporary workspace");
     let output_root = workspace.path().join("absolute-output").join(EXECUTION_ID);
     std::fs::create_dir_all(&output_root).expect("resolved output root");
-    std::fs::write(workspace.path().join("input.csv"), "value\nexample\n")
-        .expect("input fixture");
+    std::fs::write(workspace.path().join("input.csv"), "value\nexample\n").expect("input fixture");
     std::fs::write(
         workspace.path().join("clinker.toml"),
         "[storage.publication]\nfailed_retention_seconds = 0\ncreation_grace_seconds = 1\nmin_free_bytes = \"1B\"\n",

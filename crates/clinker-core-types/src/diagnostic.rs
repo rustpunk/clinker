@@ -528,7 +528,7 @@ fn quote_command_argument(value: &str) -> String {
     quote_windows_argument(value)
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[allow(dead_code)]
 fn quote_windows_argument(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('"');
