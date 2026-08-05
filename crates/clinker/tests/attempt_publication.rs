@@ -2059,19 +2059,20 @@ fn matrix_admission_contention(destination: &Path, profile: &str, scenario: &str
         assert_eq!(manifest.admitted_bytes(), 100);
     }
 
-    // The retained root receipt makes cleanup span every owned root. Inspect
-    // both copies before invoking that one logical cleanup operation.
-    let cleanup =
-        AttemptPublication::cleanup(validated(&first_root, "."), admitted_execution, 100_000_000)
-            .expect("cleanup admitted contention fixture");
-    assert_eq!(cleanup.disposition(), CleanupDisposition::Removed);
+    // Inspect every copy before exercising the root-scoped cleanup boundary.
+    // The CLI reconstructs the receipt's owned-root set and invokes this
+    // operation for each root.
     for root in [&first_root, &second_root] {
+        let cleanup =
+            AttemptPublication::cleanup(validated(root, "."), admitted_execution, 100_000_000)
+                .expect("cleanup admitted contention fixture");
+        assert_eq!(cleanup.disposition(), CleanupDisposition::Removed);
         assert!(
             !root
                 .join(".clinker-attempts")
                 .join(admitted_execution)
                 .exists(),
-            "logical cleanup must remove the admitted attempt from every owned root"
+            "root-scoped cleanup must remove the admitted attempt"
         );
     }
 
