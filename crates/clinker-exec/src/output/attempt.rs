@@ -31,6 +31,7 @@ use crate::pipeline::shutdown::ShutdownToken;
 const MANIFEST_SCHEMA: &str = "clinker.attempt-manifest/v1";
 const CONTINUATION_SCHEMA: &str = "clinker.attempt-continuation/v1";
 const OWNER_METADATA_CURSOR: &str = "owner-metadata-last";
+const ADMISSION_LOCK_LEAF: &str = ".clinker-attempt-admission.lock";
 const PRODUCER_MAX_CHARS: usize = 96;
 const PRODUCER_MAX_ENCODED_BYTES: usize = 192;
 const LOGICAL_MAX_CHARS: usize = 384;
@@ -2536,18 +2537,12 @@ fn enforce_retained_attempt_admission(
     )?;
     let mut retained = BTreeMap::new();
     for entry in inventory {
-        match retained.entry(entry.execution_id) {
-            std::collections::btree_map::Entry::Vacant(slot) => {
-                slot.insert(entry.retained_bytes);
-            }
-            std::collections::btree_map::Entry::Occupied(slot)
-                if *slot.get() == entry.retained_bytes => {}
-            std::collections::btree_map::Entry::Occupied(_) => {
-                return Err(AttemptError::AggregateAdmissionUnproven(
-                    "replicated retained manifests disagree on byte ownership",
-                ));
-            }
-        }
+        let bytes = retained.entry(entry.execution_id).or_insert(0_u64);
+        *bytes = bytes.checked_add(entry.retained_bytes).ok_or(
+            AttemptError::AggregateAdmissionUnproven(
+                "retained byte accounting overflowed across owned roots",
+            ),
+        )?;
     }
     let retained_count = u64::try_from(retained.len()).map_err(|_| {
         AttemptError::AggregateAdmissionUnproven("retained attempt count overflowed")
@@ -2579,6 +2574,38 @@ fn enforce_retained_attempt_admission(
     Ok(())
 }
 
+#[derive(Debug)]
+struct AdmissionLocks {
+    _files: Vec<File>,
+}
+
+fn lock_admission_roots(roots: &[ValidatedPath]) -> Result<AdmissionLocks, AttemptError> {
+    let mut canonical_roots = BTreeMap::new();
+    for root in roots {
+        canonical_roots
+            .entry(destination_root_key(root.as_path()))
+            .or_insert_with(|| root.clone());
+    }
+    let mut files = Vec::with_capacity(canonical_roots.len());
+    for root in canonical_roots.into_values() {
+        let directory = AnchoredDirectory::open(&root)?;
+        let file = match directory.create_file(ADMISSION_LOCK_LEAF) {
+            Ok(file) => file,
+            Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::AlreadyExists) => {
+                directory.open_file(ADMISSION_LOCK_LEAF)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        FileExt::lock(&file).map_err(|source| AttemptError::Io {
+            operation: "lock retained-attempt admission root",
+            path: root.as_path().join(ADMISSION_LOCK_LEAF),
+            source,
+        })?;
+        files.push(file);
+    }
+    Ok(AdmissionLocks { _files: files })
+}
+
 fn collect_retained_inventory(
     query: &AttemptQuery,
     observed_unix_ms: u64,
@@ -2605,15 +2632,21 @@ fn collect_retained_inventory(
                     "retained inventory contains ambiguous cleanup debt",
                 ));
             }
-            inventory.extend(page.entries().iter().map(|entry| {
+            for entry in page.entries() {
                 let inspection = entry.inspection();
-                RetainedInventoryEntry {
+                let retained_bytes =
+                    inspection
+                        .retained_bytes()
+                        .ok_or(AttemptError::AggregateAdmissionUnproven(
+                            "retained physical byte ownership could not be established",
+                        ))?;
+                inventory.push(RetainedInventoryEntry {
                     root_identifier: root_identifier.clone(),
                     execution_id: inspection.execution_id().to_owned(),
-                    retained_bytes: inspection.retained_bytes().unwrap_or(0),
+                    retained_bytes,
                     eligible: inspection.is_eligible(),
-                }
-            }));
+                });
+            }
             let Some(next) = page.continuation().cloned() else {
                 break;
             };
@@ -2693,7 +2726,10 @@ fn inspect_owned_attempt(
             ));
             continue;
         };
-        if observed.insert(name, entry.kind).is_some() {
+        if observed
+            .insert(name, (entry.kind, entry.size_bytes))
+            .is_some()
+        {
             inspection.cleanup_debt.push(CleanupDebt::new(
                 CleanupDebtKind::InvalidOwnership,
                 "attempt contains duplicate child identities",
@@ -2708,12 +2744,17 @@ fn inspect_owned_attempt(
         inspection.bounds = budget.bounds();
         return inspection;
     }
-    if observed.len() == 1 && observed.get("live.lock") == Some(&ContainedEntryKind::File) {
+    if observed.len() == 1
+        && observed
+            .get("live.lock")
+            .is_some_and(|(kind, _)| *kind == ContainedEntryKind::File)
+    {
         match attempt_root.directory.open_file("live.lock") {
             Ok(lock) if FileExt::try_lock(&lock).is_ok() => {
                 let _ = FileExt::unlock(&lock);
                 inspection.owner_metadata_only = true;
                 inspection.eligible = true;
+                inspection.retained_bytes = Some(0);
             }
             Ok(_) => inspection.cleanup_debt.push(CleanupDebt::new(
                 CleanupDebtKind::LiveAttempt,
@@ -2727,8 +2768,12 @@ fn inspect_owned_attempt(
         inspection.bounds = budget.bounds();
         return inspection;
     }
-    if observed.get("live.lock") != Some(&ContainedEntryKind::File)
-        || observed.get("manifest.json") != Some(&ContainedEntryKind::File)
+    if !observed
+        .get("live.lock")
+        .is_some_and(|(kind, _)| *kind == ContainedEntryKind::File)
+        || !observed
+            .get("manifest.json")
+            .is_some_and(|(kind, _)| *kind == ContainedEntryKind::File)
     {
         inspection.cleanup_debt.push(CleanupDebt::new(
             CleanupDebtKind::InvalidOwnership,
@@ -2737,7 +2782,7 @@ fn inspect_owned_attempt(
         inspection.bounds = budget.bounds();
         return inspection;
     }
-    if observed.values().any(|kind| {
+    if observed.values().any(|(kind, _)| {
         matches!(
             kind,
             ContainedEntryKind::LinkOrReparse
@@ -2781,7 +2826,7 @@ fn inspect_owned_attempt(
     inspection.state = Some(manifest.state);
     inspection.created_unix_ms = Some(manifest.created_unix_ms);
     inspection.eligible_after_unix_ms = Some(manifest.eligible_after_unix_ms);
-    inspection.retained_bytes = Some(manifest.total_bytes);
+    let mut retained_bytes = Some(0_u64);
     let expected = manifest
         .artifacts
         .iter()
@@ -2817,13 +2862,52 @@ fn inspect_owned_attempt(
                 artifact.artifact_id.as_str()
             };
         match observed.get(quarantine_leaf) {
-            Some(ContainedEntryKind::File) => {
+            Some((ContainedEntryKind::File, size_bytes)) => {
                 inspection.artifact_ids.push(artifact.artifact_id.clone());
-                if attempt_root.directory.open_file(quarantine_leaf).is_err() {
-                    inspection.cleanup_debt.push(CleanupDebt::new(
-                        CleanupDebtKind::Operational,
-                        "owned artifact could not be opened through its retained handle",
-                    ));
+                match attempt_root.directory.open_file(quarantine_leaf) {
+                    Ok(_) => match size_bytes {
+                        Some(size_bytes) => {
+                            if let Some(total) = retained_bytes {
+                                retained_bytes = total.checked_add(*size_bytes);
+                                if retained_bytes.is_none() {
+                                    inspection.cleanup_debt.push(CleanupDebt::new(
+                                        CleanupDebtKind::Operational,
+                                        "owned artifact byte accounting overflowed",
+                                    ));
+                                }
+                            }
+                            if artifact.state != ArtifactState::Promoting {
+                                match usize::try_from(*size_bytes) {
+                                    Ok(size) => {
+                                        if let Err(debt) = budget.consume_bytes(size) {
+                                            inspection.cleanup_debt.push(debt);
+                                        }
+                                    }
+                                    Err(_) => {
+                                        inspection.cleanup_debt.push(CleanupDebt::new(
+                                            CleanupDebtKind::ByteBudget,
+                                            "owned artifact exceeds the addressable byte budget",
+                                        ));
+                                        retained_bytes = None;
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            retained_bytes = None;
+                            inspection.cleanup_debt.push(CleanupDebt::new(
+                                CleanupDebtKind::Operational,
+                                "owned artifact size could not be established handle-relatively",
+                            ));
+                        }
+                    },
+                    Err(_) => {
+                        retained_bytes = None;
+                        inspection.cleanup_debt.push(CleanupDebt::new(
+                            CleanupDebtKind::Operational,
+                            "owned artifact could not be opened through its retained handle",
+                        ));
+                    }
                 }
             }
             None => {}
@@ -2843,6 +2927,7 @@ fn inspect_owned_attempt(
             .artifact_states
             .push((artifact.artifact_id.clone(), reconciled));
     }
+    inspection.retained_bytes = retained_bytes;
 
     match attempt_root.directory.open_file("live.lock") {
         Ok(lock) => {
@@ -3608,7 +3693,8 @@ impl AttemptPublication {
         }) {
             admission_roots.push(owner_root.clone());
         }
-        enforce_retained_attempt_admission(&policy, admission_roots, created_unix_ms)?;
+        let admission_locks = lock_admission_roots(&admission_roots)?;
+        enforce_retained_attempt_admission(&policy, admission_roots.clone(), created_unix_ms)?;
         let owner_profile = match policy.mode() {
             PublicationMode::Direct => policy.destination_profile(),
             PublicationMode::LocalThenPublish => DestinationProfile::Local,
@@ -3627,6 +3713,7 @@ impl AttemptPublication {
             attempt.destination_root_keys.push(key);
         }
         attempt.destination_root_keys.sort();
+        drop(admission_locks);
         Ok(attempt)
     }
 

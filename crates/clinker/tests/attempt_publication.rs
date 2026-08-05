@@ -547,6 +547,116 @@ fn aggregate_admission_purges_eligible_attempts_before_counting() {
 }
 
 #[test]
+fn concurrent_aggregate_admission_allows_exactly_one_attempt_at_the_count_limit() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let root_path = root.path().to_path_buf();
+    let policy = retained_policy(root.path(), 1, 8_000_000_000, 1);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let execution_ids = [
+        "018f47a2-9a41-7a27-b4d6-4f7137e3c262",
+        "018f47a2-9a41-7a27-b4d6-4f7137e3c263",
+    ];
+    let threads = execution_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, execution_id)| {
+            let root_path = root_path.clone();
+            let policy = policy.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let registry = OutputStagingRegistry::default();
+                barrier.wait();
+                AttemptPublication::create_run(
+                    policy,
+                    &registry,
+                    execution_id,
+                    1_000,
+                    301_000,
+                    vec![registration(
+                        ArtifactKind::Primary,
+                        &root_path,
+                        &format!("concurrent-{index}.bin"),
+                        &format!("concurrent-{index}"),
+                    )],
+                )
+                .is_ok()
+            })
+        })
+        .collect::<Vec<_>>();
+    let admitted = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("admission thread"))
+        .filter(|admitted| *admitted)
+        .count();
+
+    assert_eq!(admitted, 1);
+    let namespace = root.path().join(".clinker-attempts");
+    assert_eq!(std::fs::read_dir(namespace).unwrap().count(), 1);
+}
+
+#[test]
+fn aggregate_bytes_include_staging_copies_across_every_owned_root() {
+    let destination = tempfile::tempdir().expect("destination");
+    let spool = tempfile::tempdir().expect("local spool");
+    let config = format!(
+        "[storage.publication]\nmode = \"local_then_publish\"\nlocal_spool_dir = \"{}\"\nfailed_retention_seconds = 0\nmax_attempt_bytes = \"100B\"\nretained_byte_limit = \"850B\"\nretained_attempt_limit = 8\nmin_free_bytes = \"1B\"\n",
+        spool.path().display().to_string().replace('\\', "\\\\")
+    );
+    let policy = ClinkerToml::parse(&config)
+        .expect("parse multi-root retained policy")
+        .storage
+        .publication
+        .resolve(destination.path(), 100, 8_000_000_000)
+        .expect("resolve multi-root retained policy");
+    let registry = OutputStagingRegistry::default();
+    let (mut retained, mut writers) = AttemptPublication::create_run(
+        policy.clone(),
+        &registry,
+        EXECUTION_ID,
+        1_000,
+        301_000,
+        vec![registration(
+            ArtifactKind::Primary,
+            destination.path(),
+            "retained.bin",
+            "retained-output",
+        )],
+    )
+    .expect("create retained staging attempt");
+    writers[0]
+        .file_mut()
+        .write_all(&[b'x'; 400])
+        .expect("write local staging bytes");
+    let artifact_id = writers[0].artifact_id().to_owned();
+    drop(writers);
+    retained.set_fault_for_testing(AttemptFault::DestinationFileSync);
+    retained
+        .mark_ready(&artifact_id)
+        .expect_err("retain both the local source and destination copy");
+    drop(retained);
+
+    let error = AttemptPublication::create_run(
+        policy,
+        &registry,
+        "018f47a2-9a41-7a27-b4d6-4f7137e3c264",
+        1_000,
+        301_000,
+        vec![registration(
+            ArtifactKind::Primary,
+            destination.path(),
+            "new.bin",
+            "new-output",
+        )],
+    )
+    .expect_err("800 retained physical bytes plus 100 admitted bytes exceed 850");
+
+    assert!(
+        error.to_string().contains("retained attempt bytes 800"),
+        "{error}"
+    );
+}
+
+#[test]
 fn local_then_publish_copies_in_bounded_chunks_and_verifies_destination() {
     let destination = tempfile::tempdir().expect("destination");
     let spool = tempfile::tempdir().expect("local spool");

@@ -115,6 +115,13 @@ results carry logical execution/artifact IDs, logical leaves, and exact
 published, visible-unsynchronized, or unpublished states. Physical paths are
 available only through an explicit opt-in intended for sanitized diagnostics.
 
+Aggregate retained-attempt admission acquires handle-relative root lock files
+in canonical root order and holds them through inventory, eligible cleanup,
+limit checks, and creation of every execution root. Retained bytes are summed
+from manifest-owned regular files in each root, including simultaneous local
+spool and destination quarantine copies. Missing or uninspectable ownership
+evidence is conservative debt, never a zero-byte assumption.
+
 ### Remote filesystem qualification
 
 Normal CLI output is admitted from the filesystem type observed through the

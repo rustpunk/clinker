@@ -78,6 +78,13 @@ maximum-sized attempt plus the bounded 4 MiB manifest. The diagnostic reports
 the exact minimum and a paste-ready `sweep_byte_limit` setting; this prevents a
 valid admitted attempt from becoming permanently too large for cleanup.
 
+Aggregate admission counts physical manifest-owned staging and quarantine
+files across every destination and local-spool root. Temporary local and
+destination copies both count while both exist; an uninspectable size fails
+admission instead of being treated as zero. Count and byte inventory, expiry
+cleanup, the limit check, and attempt-root creation are serialized across the
+same root set, so concurrent runs cannot both consume the final retained slot.
+
 ### Publication modes and destination profiles
 
 `direct` writes each artifact into restrictive quarantine on its destination
