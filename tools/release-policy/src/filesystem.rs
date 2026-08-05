@@ -2695,8 +2695,7 @@ fn has_step_evidence_path(step: &serde_json::Map<String, Value>) -> bool {
 }
 
 fn direct_locked_command(run: &str, command: &str) -> bool {
-    let tokens = run.split_whitespace().collect::<Vec<_>>();
-    [
+    let expected = [
         "cargo",
         "run",
         "--quiet",
@@ -2707,10 +2706,59 @@ fn direct_locked_command(run: &str, command: &str) -> bool {
         "--",
         "filesystem",
         command,
-    ]
-    .windows(2)
-    .all(|pair| tokens.windows(2).any(|candidate| candidate == pair))
-        && tokens.first() == Some(&"cargo")
+        "--profile",
+        "${{ matrix.profile }}",
+        "--evidence",
+        "${EVIDENCE_PATH}",
+    ];
+    shell_free_argv(run).is_some_and(|argv| {
+        argv.iter()
+            .map(String::as_str)
+            .eq(expected.iter().copied())
+    })
+}
+
+fn shell_free_argv(run: &str) -> Option<Vec<String>> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Single,
+        Double,
+    }
+
+    let mut argv = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut characters = run.chars().peekable();
+    while let Some(character) = characters.next() {
+        if matches!(character, '\n' | '\r' | '\\' | '`')
+            || (character == '$' && characters.peek() == Some(&'('))
+        {
+            return None;
+        }
+        match quote {
+            Some(Quote::Single) if character == '\'' => quote = None,
+            Some(Quote::Double) if character == '"' => quote = None,
+            Some(_) => token.push(character),
+            None if character == '\'' => quote = Some(Quote::Single),
+            None if character == '"' => quote = Some(Quote::Double),
+            None if character.is_whitespace() => {
+                if !token.is_empty() {
+                    argv.push(std::mem::take(&mut token));
+                }
+            }
+            None if matches!(character, ';' | '&' | '|' | '<' | '>' | '(' | ')') => {
+                return None;
+            }
+            None => token.push(character),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !token.is_empty() {
+        argv.push(token);
+    }
+    Some(argv)
 }
 
 fn minimal_status(profile: &str, status: &str, failed_step: &str, cleanup_success: bool) -> Value {
@@ -3062,8 +3110,25 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ChildResult, Termination, classify_mountpoint_termination, require_semantic_success,
+        ChildResult, Termination, classify_mountpoint_termination, direct_locked_command,
+        require_semantic_success,
     };
+
+    const DIRECT_PROVISION: &str = "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem provision-and-run --profile \"${{ matrix.profile }}\" --evidence \"${EVIDENCE_PATH}\"";
+
+    #[test]
+    fn direct_filesystem_command_requires_one_exact_shell_free_argv() {
+        assert!(direct_locked_command(DIRECT_PROVISION, "provision-and-run"));
+        for invalid in [
+            "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --offline --locked -- filesystem provision-and-run --profile \"${{ matrix.profile }}\" --evidence \"${EVIDENCE_PATH}\"",
+            "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem provision-and-run --profile \"${{ matrix.profile }}\" --evidence \"${EVIDENCE_PATH}\" --verbose",
+            "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem provision-and-run --profile \"${{ matrix.profile }}\" --evidence \"${EVIDENCE_PATH}\" && true",
+            "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem provision-and-run --profile \"${{ matrix.profile }}\" --evidence \"${EVIDENCE_PATH}\"; true",
+            "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem provision-and-run --profile \"${{ matrix.profile }}\" --evidence \"$(printf bad)\"",
+        ] {
+            assert!(!direct_locked_command(invalid, "provision-and-run"));
+        }
+    }
 
     #[test]
     fn util_linux_mountpoint_exit_contract_distinguishes_absent_mounts() {
