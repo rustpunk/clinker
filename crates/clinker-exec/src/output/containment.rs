@@ -205,7 +205,7 @@ impl AnchoredDirectory {
     }
 
     pub(crate) fn entries(&self, limit: usize) -> Result<Vec<ContainedEntry>, ContainmentError> {
-        let result = self.anchor.entries(&self.path, limit)?;
+        let result = self.bounded_entries(limit)?;
         if result.complete {
             Ok(result.entries)
         } else {
@@ -218,7 +218,13 @@ impl AnchoredDirectory {
     }
 
     pub(crate) fn bounded_entries(&self, limit: usize) -> Result<BoundedEntries, ContainmentError> {
-        self.anchor.entries(&self.path, limit)
+        let probe_limit = limit.saturating_add(1);
+        let mut result = self.anchor.entries(&self.path, probe_limit)?;
+        if result.entries.len() > limit {
+            result.entries.truncate(limit);
+            result.complete = false;
+        }
+        Ok(result)
     }
 
     pub(crate) fn remove_file(&self, leaf: &str) -> Result<(), ContainmentError> {
@@ -927,7 +933,24 @@ mod tests {
 
     use clinker_plan::security::validate_path;
 
-    use super::{ContainmentError, OutputContainment, PromotionDisposition};
+    use super::{AnchoredDirectory, ContainmentError, OutputContainment, PromotionDisposition};
+
+    #[test]
+    fn bounded_enumeration_reports_an_exactly_full_directory_as_complete() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        std::fs::write(root.path().join("first"), b"").expect("first fixture");
+        std::fs::write(root.path().join("second"), b"").expect("second fixture");
+        let validated = validate_path(Path::new("."), root.path(), false)
+            .expect("root fixture should validate");
+        let directory = AnchoredDirectory::open(&validated).expect("open anchored fixture");
+
+        let entries = directory
+            .bounded_entries(2)
+            .expect("enumerate exactly full directory");
+
+        assert!(entries.complete);
+        assert_eq!(entries.entries.len(), 2);
+    }
 
     #[test]
     fn post_rename_sync_failure_reports_visible_destination() {

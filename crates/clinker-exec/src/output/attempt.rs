@@ -1234,14 +1234,8 @@ impl AttemptQuery {
                 ));
                 continue;
             }
-            let inspection = inspect_owned_attempt(
-                root,
-                &name,
-                observed_unix_ms,
-                &self.policy,
-                &mut budget,
-                &mut elapsed_ms,
-            );
+            let inspection =
+                inspect_owned_attempt(root, &name, observed_unix_ms, &self.policy, &mut budget);
             if inspection
                 .cleanup_debt
                 .iter()
@@ -1295,7 +1289,7 @@ impl AttemptQuery {
         validate_execution_id(execution_id)?;
         let root = self.root(root_identifier)?;
         let started = Instant::now();
-        let mut elapsed = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let elapsed = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let mut budget = QueryBudget::new(&self.policy);
         budget.observe_time(elapsed())?;
         budget
@@ -1311,7 +1305,6 @@ impl AttemptQuery {
             observed_unix_ms,
             &self.policy,
             &mut budget,
-            &mut elapsed,
         ))
     }
 
@@ -1611,10 +1604,7 @@ impl AttemptQuery {
         };
 
         if cursor.as_deref() == Some(OWNER_METADATA_CURSOR) {
-            let entries = match attempt_root
-                .directory
-                .bounded_entries(budget.remaining_entries_as_usize())
-            {
+            let entries = match attempt_root.directory.bounded_entries(2) {
                 Ok(entries) => entries,
                 Err(_) => {
                     report.disposition = PurgeDisposition::Partial;
@@ -1635,7 +1625,7 @@ impl AttemptQuery {
                 report.disposition = PurgeDisposition::Partial;
                 report.cleanup_debt.push(CleanupDebt::new(
                     CleanupDebtKind::EntryBudget,
-                    "entry budget stopped owner-metadata retry",
+                    "owner-metadata retry found more than its two terminal children",
                 ));
                 report.continuation = Some(self.continuation(
                     &request.root_identifier,
@@ -1647,17 +1637,6 @@ impl AttemptQuery {
             }
             let mut names = std::collections::BTreeSet::new();
             for entry in entries.entries {
-                if let Err(debt) = budget.visit(entry.kind, entry.size_bytes, elapsed_ms()) {
-                    report.disposition = PurgeDisposition::Partial;
-                    report.cleanup_debt.push(debt);
-                    report.continuation = Some(self.continuation(
-                        &request.root_identifier,
-                        &selector_name,
-                        Some(OWNER_METADATA_CURSOR.to_owned()),
-                    ));
-                    report.bounds = budget.bounds();
-                    return Ok(report);
-                }
                 let Ok(name) = entry.name.into_string() else {
                     report.disposition = PurgeDisposition::Partial;
                     report.cleanup_debt.push(CleanupDebt::new(
@@ -1796,7 +1775,7 @@ impl AttemptQuery {
 
         let mut entries = match attempt_root
             .directory
-            .bounded_entries(budget.remaining_entries_as_usize())
+            .bounded_entries(MANIFEST_MAX_ARTIFACTS.saturating_add(3))
         {
             Ok(entries) => entries,
             Err(_) => {
@@ -1814,15 +1793,6 @@ impl AttemptQuery {
             .sort_by(|left, right| left.name.cmp(&right.name));
         let mut observed = BTreeMap::new();
         for entry in entries.entries {
-            if let Err(debt) = budget.visit(entry.kind, entry.size_bytes, elapsed_ms()) {
-                report.disposition = PurgeDisposition::Partial;
-                report.cleanup_debt.push(debt);
-                report.continuation =
-                    Some(self.continuation(&request.root_identifier, &selector_name, cursor));
-                let _ = FileExt::unlock(&lock);
-                report.bounds = budget.bounds();
-                return Ok(report);
-            }
             let Ok(name) = entry.name.into_string() else {
                 report.cleanup_debt.push(CleanupDebt::new(
                     CleanupDebtKind::InvalidOwnership,
@@ -1838,7 +1808,7 @@ impl AttemptQuery {
             report.disposition = PurgeDisposition::Partial;
             report.cleanup_debt.push(CleanupDebt::new(
                 CleanupDebtKind::EntryBudget,
-                "entry budget stopped purge ownership validation",
+                "attempt exceeds the bounded manifest ownership inventory",
             ));
             report.continuation =
                 Some(self.continuation(&request.root_identifier, &selector_name, cursor));
@@ -1857,7 +1827,25 @@ impl AttemptQuery {
             report.bounds = budget.bounds();
             return Ok(report);
         }
-        let manifest = match read_manifest_from_anchor(&attempt_root.directory, observed_unix_ms) {
+        let manifest_bytes = match read_manifest_bytes_from_anchor(&attempt_root.directory) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                report.cleanup_debt.push(manifest_cleanup_debt(&error));
+                let _ = FileExt::unlock(&lock);
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+        };
+        if let Err(debt) = budget.consume_bytes(manifest_bytes.len()) {
+            report.disposition = PurgeDisposition::Partial;
+            report.cleanup_debt.push(debt);
+            report.continuation =
+                Some(self.continuation(&request.root_identifier, &selector_name, cursor));
+            let _ = FileExt::unlock(&lock);
+            report.bounds = budget.bounds();
+            return Ok(report);
+        }
+        let manifest = match AttemptManifest::from_bytes(&manifest_bytes, observed_unix_ms) {
             Ok(manifest) => manifest,
             Err(error) => {
                 report.cleanup_debt.push(manifest_cleanup_debt(&error));
@@ -1947,6 +1935,16 @@ impl AttemptQuery {
                 report.bounds = budget.bounds();
                 return Ok(report);
             }
+            if let Err(debt) = budget.visit(ContainedEntryKind::File, None, elapsed_ms()) {
+                report.disposition = PurgeDisposition::Partial;
+                report.cleanup_debt.push(debt);
+                report.continuation =
+                    Some(self.continuation(&request.root_identifier, &selector_name, last_removed));
+                let _ = attempt_root.directory.sync();
+                let _ = FileExt::unlock(&lock);
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
             if observed.contains_key(&artifact.artifact_id) {
                 if attempt_root
                     .directory
@@ -1985,10 +1983,7 @@ impl AttemptQuery {
             report.bounds = budget.bounds();
             return Ok(report);
         }
-        let final_entries = match attempt_root
-            .directory
-            .bounded_entries(budget.remaining_entries_as_usize())
-        {
+        let final_entries = match attempt_root.directory.bounded_entries(2) {
             Ok(entries) => entries,
             Err(_) => {
                 report.disposition = PurgeDisposition::Partial;
@@ -2007,16 +2002,6 @@ impl AttemptQuery {
         let final_complete = final_entries.complete;
         let mut final_names = std::collections::BTreeSet::new();
         for entry in final_entries.entries {
-            if let Err(debt) = budget.visit(entry.kind, entry.size_bytes, elapsed_ms()) {
-                report.disposition = PurgeDisposition::Partial;
-                report.cleanup_debt.push(debt);
-                report.continuation =
-                    Some(self.continuation(&request.root_identifier, &selector_name, last_removed));
-                let _ = attempt_root.directory.sync();
-                let _ = FileExt::unlock(&lock);
-                report.bounds = budget.bounds();
-                return Ok(report);
-            }
             let Ok(name) = entry.name.into_string() else {
                 report.disposition = PurgeDisposition::Partial;
                 report.cleanup_debt.push(CleanupDebt::new(
@@ -2230,8 +2215,8 @@ impl QueryBudget {
 
     fn visit(
         &mut self,
-        kind: ContainedEntryKind,
-        size_bytes: Option<u64>,
+        _kind: ContainedEntryKind,
+        _size_bytes: Option<u64>,
         elapsed_ms: u64,
     ) -> Result<(), CleanupDebt> {
         if self
@@ -2267,31 +2252,33 @@ impl QueryBudget {
                         "entry accounting overflow stopped the query",
                     )
                 })?;
-        if kind == ContainedEntryKind::File {
-            let bytes = size_bytes.ok_or_else(|| {
+        Ok(())
+    }
+
+    fn consume_bytes(&mut self, bytes: usize) -> Result<(), CleanupDebt> {
+        let bytes = u64::try_from(bytes).map_err(|_| {
+            CleanupDebt::new(
+                CleanupDebtKind::ByteBudget,
+                "considered-byte accounting overflow stopped the query",
+            )
+        })?;
+        let next = self
+            .bounds
+            .considered_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| {
                 CleanupDebt::new(
-                    CleanupDebtKind::Operational,
-                    "regular-file metadata omitted its byte length",
+                    CleanupDebtKind::ByteBudget,
+                    "considered-byte accounting overflow stopped the query",
                 )
             })?;
-            let next = self
-                .bounds
-                .considered_bytes
-                .checked_add(bytes)
-                .ok_or_else(|| {
-                    CleanupDebt::new(
-                        CleanupDebtKind::ByteBudget,
-                        "considered-byte accounting overflow stopped the query",
-                    )
-                })?;
-            if next > self.byte_limit {
-                return Err(CleanupDebt::new(
-                    CleanupDebtKind::ByteBudget,
-                    "considered-byte budget stopped the query",
-                ));
-            }
-            self.bounds.considered_bytes = next;
+        if next > self.byte_limit {
+            return Err(CleanupDebt::new(
+                CleanupDebtKind::ByteBudget,
+                "considered-byte budget stopped the query",
+            ));
         }
+        self.bounds.considered_bytes = next;
         Ok(())
     }
 
@@ -2322,17 +2309,13 @@ impl QueryBudget {
     }
 }
 
-fn inspect_owned_attempt<F>(
+fn inspect_owned_attempt(
     root: &OwnedAttemptRoot,
     execution_id: &str,
     observed_unix_ms: u64,
     policy: &ResolvedPublicationPolicy,
     budget: &mut QueryBudget,
-    elapsed_ms: &mut F,
-) -> AttemptInspection
-where
-    F: FnMut() -> u64,
-{
+) -> AttemptInspection {
     let mut inspection = AttemptInspection {
         execution_id: execution_id.to_owned(),
         disposition: CleanupDisposition::Kept,
@@ -2364,7 +2347,7 @@ where
     inspection.physical_path = Some(attempt_root.path.clone());
     let mut entries = match attempt_root
         .directory
-        .bounded_entries(budget.remaining_entries_as_usize())
+        .bounded_entries(MANIFEST_MAX_ARTIFACTS.saturating_add(3))
     {
         Ok(entries) => entries,
         Err(_) => {
@@ -2381,11 +2364,6 @@ where
         .sort_by(|left, right| left.name.cmp(&right.name));
     let mut observed = BTreeMap::new();
     for entry in entries.entries {
-        if let Err(debt) = budget.visit(entry.kind, entry.size_bytes, elapsed_ms()) {
-            inspection.cleanup_debt.push(debt);
-            inspection.bounds = budget.bounds();
-            return inspection;
-        }
         let Ok(name) = entry.name.into_string() else {
             inspection.cleanup_debt.push(CleanupDebt::new(
                 CleanupDebtKind::InvalidOwnership,
@@ -2403,7 +2381,7 @@ where
     if !entries.complete {
         inspection.cleanup_debt.push(CleanupDebt::new(
             CleanupDebtKind::EntryBudget,
-            "entry budget stopped attempt inspection",
+            "attempt exceeds the bounded manifest ownership inventory",
         ));
         inspection.bounds = budget.bounds();
         return inspection;
@@ -2432,7 +2410,20 @@ where
         ));
     }
 
-    let manifest = match read_manifest_from_anchor(&attempt_root.directory, observed_unix_ms) {
+    let manifest_bytes = match read_manifest_bytes_from_anchor(&attempt_root.directory) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            inspection.cleanup_debt.push(manifest_cleanup_debt(&error));
+            inspection.bounds = budget.bounds();
+            return inspection;
+        }
+    };
+    if let Err(debt) = budget.consume_bytes(manifest_bytes.len()) {
+        inspection.cleanup_debt.push(debt);
+        inspection.bounds = budget.bounds();
+        return inspection;
+    }
+    let manifest = match AttemptManifest::from_bytes(&manifest_bytes, observed_unix_ms) {
         Ok(manifest) => manifest,
         Err(error) => {
             inspection.cleanup_debt.push(manifest_cleanup_debt(&error));
@@ -4245,6 +4236,11 @@ fn read_manifest_from_anchor(
     directory: &AnchoredDirectory,
     observed_unix_ms: u64,
 ) -> Result<AttemptManifest, AttemptError> {
+    let bytes = read_manifest_bytes_from_anchor(directory)?;
+    AttemptManifest::from_bytes(&bytes, observed_unix_ms)
+}
+
+fn read_manifest_bytes_from_anchor(directory: &AnchoredDirectory) -> Result<Vec<u8>, AttemptError> {
     let mut file = directory.open_file("manifest.json")?;
     let mut bytes = Vec::new();
     std::io::Read::by_ref(&mut file)
@@ -4255,7 +4251,7 @@ fn read_manifest_from_anchor(
             path: directory.path().join("manifest.json"),
             source,
         })?;
-    AttemptManifest::from_bytes(&bytes, observed_unix_ms)
+    Ok(bytes)
 }
 
 fn containment_kind(error: &ContainmentError) -> Option<std::io::ErrorKind> {
