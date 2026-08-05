@@ -1300,20 +1300,36 @@ fn provision_smb(
         return Err(missing("Samba server did not become ready"));
     }
     wait_for_smb_listener()?;
-    let mount = observe(
+    let mount_arguments = [
+        OsString::from("mount"),
+        OsString::from("-t"),
+        OsString::from("cifs"),
+        OsString::from("//127.0.0.1/clinker"),
+        state.mount_root.as_os_str().to_owned(),
+        OsString::from("-o"),
+        OsString::from("guest,vers=3.1.1,cache=strict,strictsync,mfsymlinks,noperm"),
+    ];
+    let mut mount = observe(
         "sudo",
-        &[
-            OsString::from("mount"),
-            OsString::from("-t"),
-            OsString::from("cifs"),
-            OsString::from("//127.0.0.1/clinker"),
-            state.mount_root.as_os_str().to_owned(),
-            OsString::from("-o"),
-            OsString::from("guest,vers=3.1.1,cache=strict,strictsync,mfsymlinks,noperm"),
-        ],
+        &mount_arguments,
         inherited_environment(&[]),
-        Duration::from_secs(120),
+        Duration::from_secs(15),
     )?;
+    for _ in 1..20 {
+        if mount.termination == Termination::Exited(Some(0))
+            && !mount.stdout_truncated
+            && !mount.stderr_truncated
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+        mount = observe(
+            "sudo",
+            &mount_arguments,
+            inherited_environment(&[]),
+            Duration::from_secs(15),
+        )?;
+    }
     write_child_observation(&protocol_path.with_file_name("mount.txt"), &mount)?;
     if mount.termination != Termination::Exited(Some(0))
         || mount.stdout_truncated

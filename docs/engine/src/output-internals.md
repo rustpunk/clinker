@@ -183,8 +183,9 @@ The same local, identity-bound control pauses before copy, file sync, rename,
 and parent-directory sync. For every applicable mode/stage pair, the harness
 stops the exact NFS service or Samba PID, force-lazy-detaches the client mount,
 releases the operation, observes a bounded non-success, restarts and remounts
-the exact profile, and reopens its retained manifest. It then exercises bounded
-list, inspect, purge preview, and purge execution. A separate attempt fills the
+the exact profile, and reopens its retained manifest. SMB remount uses a bounded
+retry while detached kernel client state is released. The harness then exercises
+bounded list, inspect, purge preview, and purge execution. A separate attempt fills the
 mounted bounded backing until the operating system returns `ENOSPC`; the final
 must remain absent and operator cleanup must remove the staging attempt.
 Deterministic `EDQUOT` coverage is recorded only as `seam_covered` unless a real
