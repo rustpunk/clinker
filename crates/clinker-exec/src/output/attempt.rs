@@ -3348,6 +3348,18 @@ impl AttemptPublication {
         };
         let publication_source =
             self.validated_artifact_in_root(&publication_root_key, &publication_leaf)?;
+        let entry = ArtifactManifest::new(
+            &artifact_id,
+            &registration.producer_label,
+            &registration.logical_leaf,
+            0,
+            &"0".repeat(64),
+            ArtifactState::Staging,
+        )?;
+        let mut next = self.manifest.clone();
+        next.artifacts.push(entry);
+        next.artifact_count = next.artifacts.len();
+        self.persist_replacement(next, self.fault == Some(AttemptFault::ManifestReplace))?;
         let destination_boundary = OutputContainment::for_profile(
             registration.destination.clone(),
             containment_profile(profile),
@@ -3385,18 +3397,6 @@ impl AttemptPublication {
             let _ = self.remove_artifact_in_root(source_key, source_leaf);
             return Err(error.into());
         }
-        let entry = ArtifactManifest::new(
-            &artifact_id,
-            &registration.producer_label,
-            &registration.logical_leaf,
-            0,
-            &"0".repeat(64),
-            ArtifactState::Staging,
-        )?;
-        let mut next = self.manifest.clone();
-        next.artifacts.push(entry);
-        next.artifact_count = next.artifacts.len();
-        self.persist_replacement(next, false)?;
         self.artifacts.push(ArtifactRuntime {
             kind: registration.kind,
             artifact_id: artifact_id.clone(),
@@ -3529,26 +3529,8 @@ impl AttemptPublication {
             ));
         }
         let artifact_id = format!("artifact-{:08x}", self.artifacts.len() + 1);
-        let attempt_root = self
-            .attempt_root
-            .as_ref()
-            .ok_or(AttemptError::InvalidTransition("attempt root was removed"))?;
-        let source = validate_path(Path::new(&artifact_id), &attempt_root.path, false)
-            .map_err(|_| AttemptError::InvalidManifest("artifact path failed validation"))?;
+        let source = self.validated_artifact_in_root(&self.owner_root_key, &artifact_id)?;
         registry.ensure_destination_available(producer_label, destination.as_path())?;
-        let destination_boundary =
-            OutputContainment::for_profile(destination.clone(), "local-filesystem")?;
-        let reservation = destination_boundary.reserve_for_attempt(disposition)?;
-        let file = attempt_root.directory.create_file(&artifact_id)?;
-        if let Err(error) = registry.register_attempt_output(
-            producer_label.to_owned(),
-            destination.as_path().to_path_buf(),
-            reservation,
-            source.clone(),
-        ) {
-            let _ = attempt_root.directory.remove_file(&artifact_id);
-            return Err(error.into());
-        }
         let entry = ArtifactManifest::new(
             &artifact_id,
             producer_label,
@@ -3560,7 +3542,20 @@ impl AttemptPublication {
         let mut next = self.manifest.clone();
         next.artifacts.push(entry);
         next.artifact_count = next.artifacts.len();
-        self.persist_replacement(next, false)?;
+        self.persist_replacement(next, self.fault == Some(AttemptFault::ManifestReplace))?;
+        let destination_boundary =
+            OutputContainment::for_profile(destination.clone(), "local-filesystem")?;
+        let reservation = destination_boundary.reserve_for_attempt(disposition)?;
+        let file = self.create_artifact_in_root(&self.owner_root_key, &artifact_id)?;
+        if let Err(error) = registry.register_attempt_output(
+            producer_label.to_owned(),
+            destination.as_path().to_path_buf(),
+            reservation,
+            source.clone(),
+        ) {
+            let _ = self.remove_artifact_in_root(&self.owner_root_key, &artifact_id);
+            return Err(error.into());
+        }
         self.artifacts.push(ArtifactRuntime {
             kind: ArtifactKind::Primary,
             artifact_id: artifact_id.clone(),

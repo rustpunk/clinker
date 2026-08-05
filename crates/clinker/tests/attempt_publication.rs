@@ -1513,6 +1513,31 @@ fn quota_fault_is_an_explicit_seam_and_never_a_mounted_observation() {
 }
 
 #[test]
+fn staging_intent_must_persist_before_artifact_or_registry_side_effects() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let registry = OutputStagingRegistry::default();
+    let mut attempt = begin(root.path());
+    let attempt_root = attempt.attempt_root().to_path_buf();
+    attempt.set_fault_for_testing(AttemptFault::ManifestReplace);
+
+    attempt
+        .stage_direct(
+            &registry,
+            validated(root.path(), "result.bin"),
+            "primary-output",
+            "result.bin",
+            PromotionDisposition::Replace,
+        )
+        .expect_err("manifest intent failure must stop staging first");
+
+    let retained = AttemptManifest::read(attempt.manifest_path(), 1_000)
+        .expect("previous canonical manifest remains durable");
+    assert!(retained.artifacts().is_empty());
+    assert!(!attempt_root.join("artifact-00000001").exists());
+    assert!(registry.pending_paths("primary-output").is_empty());
+}
+
+#[test]
 fn qualification_control_has_no_pipeline_configuration_route() {
     let error =
         ClinkerToml::parse("[storage.publication]\nqualification_control = \"control.sock\"\n")
