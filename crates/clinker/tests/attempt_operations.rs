@@ -147,7 +147,7 @@ fn purge_help_makes_preview_the_default_and_execution_explicit() {
     let help = stdout(&output);
     assert!(help.contains("--execute"), "{help}");
     assert!(!help.contains("--root"), "{help}");
-    assert!(!help.contains("--path"), "{help}");
+    assert!(help.contains("--path-execution-id"), "{help}");
     assert!(!help.contains("--force"), "{help}");
 }
 
@@ -381,8 +381,17 @@ fn invalid_manifest_refusal_uses_typed_e371_recovery_data() {
 
 #[test]
 fn bounded_inspection_uses_typed_e372_and_exit_four() {
-    let (workspace, output_root) = write_workspace("sweep_byte_limit = \"1B\"\n");
+    let (workspace, output_root) =
+        write_workspace("max_attempt_bytes = \"1B\"\nsweep_byte_limit = \"4194305B\"\n");
     seed_incomplete_attempt(&output_root, EXECUTION_ID);
+    std::fs::write(
+        output_root
+            .join(".clinker-attempts")
+            .join(EXECUTION_ID)
+            .join("artifact-00000001"),
+        vec![b'x'; 4 * 1024 * 1024 + 2],
+    )
+    .expect("oversized retained artifact fixture");
 
     let inspect = clinker_in(
         workspace.path(),
@@ -468,17 +477,16 @@ fn continuation_output_preserves_the_exact_selector_and_execution_mode() {
     let resume_argv = root["resume_argv"]
         .as_array()
         .expect("bounded purge should emit structured resume arguments");
-    assert!(
-        continuation
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
-        "continuation must use a lowercase URL-safe alphabet: {continuation}"
+    let continuation_value: serde_json::Value =
+        serde_json::from_str(continuation).expect("raw continuation is canonical JSON");
+    assert_eq!(
+        continuation_value["schema"],
+        "clinker.attempt-continuation/v1"
     );
-    assert!(!continuation.starts_with('{'));
     assert_eq!(root["diagnostics"][0]["diagnostic_code"], "E372");
     assert!(root["diagnostics"][0].get("execution_id").is_none());
     assert!(resume.contains("attempts purge pipeline.yaml --expired --execute"));
-    assert!(resume.ends_with(&format!("--continuation {continuation}")));
+    assert!(resume.contains("--continuation"));
     assert_eq!(
         resume_argv,
         &[
@@ -493,6 +501,13 @@ fn continuation_output_preserves_the_exact_selector_and_execution_mode() {
         ]
         .map(serde_json::Value::from)
     );
+    let resume_args = resume_argv
+        .iter()
+        .skip(1)
+        .map(|value| value.as_str().expect("resume argument"))
+        .collect::<Vec<_>>();
+    let resumed = clinker_in(workspace.path(), &resume_args);
+    assert_ne!(resumed.status.code(), Some(1), "{}", stderr(&resumed));
 }
 
 #[test]
@@ -558,6 +573,132 @@ fn list_before_the_first_run_treats_a_missing_local_destination_as_empty() {
     assert!(list.status.success(), "{}", stderr(&list));
     let value: serde_json::Value = serde_json::from_slice(&list.stdout).expect("compact JSON");
     assert_eq!(value["roots"], serde_json::json!([]));
+}
+
+#[test]
+fn attempts_replay_source_discovery_for_every_fanout_destination_root() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    for source in ["input-a.csv", "input-b.csv"] {
+        std::fs::write(workspace.path().join(source), "value\nexample\n").expect("source fixture");
+    }
+    std::fs::write(
+        workspace.path().join("clinker.toml"),
+        "[storage.publication]\nfailed_retention_seconds = 0\nmin_free_bytes = \"1B\"\n",
+    )
+    .expect("workspace config");
+    std::fs::write(
+        workspace.path().join("pipeline.yaml"),
+        r#"pipeline:
+  name: fanout_attempt_roots
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      glob: input-*.csv
+      schema:
+        - { name: value, type: string }
+  - type: output
+    name: result
+    input: source
+    config:
+      name: result
+      type: csv
+      path: output/{source_file}/result.csv
+"#,
+    )
+    .expect("pipeline fixture");
+    for root in ["output/input-a", "output/input-b"] {
+        let root = workspace.path().join(root);
+        std::fs::create_dir_all(&root).expect("fanout destination root");
+        seed_incomplete_attempt(&root, EXECUTION_ID);
+    }
+
+    let list = clinker_in(
+        workspace.path(),
+        &["attempts", "list", "pipeline.yaml", "--format", "json"],
+    );
+    assert!(list.status.success(), "{}", stderr(&list));
+    let value: serde_json::Value = serde_json::from_slice(&list.stdout).expect("compact JSON");
+    let roots = value["roots"].as_array().expect("fanout roots");
+    assert_eq!(roots.len(), 2);
+    assert!(
+        roots
+            .iter()
+            .all(|root| root["attempts"][0]["execution_id"] == EXECUTION_ID)
+    );
+}
+
+#[test]
+fn attempts_default_anchor_matches_a_nested_pipeline_directory() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let nested = workspace.path().join("nested");
+    let output_root = nested.join("output");
+    std::fs::create_dir_all(&output_root).expect("nested output root");
+    std::fs::write(nested.join("input.csv"), "value\nexample\n").expect("nested input");
+    std::fs::write(nested.join("pipeline.yaml"), PIPELINE).expect("nested pipeline");
+    std::fs::write(
+        nested.join("clinker.toml"),
+        "[storage.publication]\nfailed_retention_seconds = 0\nmin_free_bytes = \"1B\"\n",
+    )
+    .expect("nested workspace config");
+    seed_incomplete_attempt(&output_root, EXECUTION_ID);
+
+    let list = clinker_in(
+        workspace.path(),
+        &[
+            "attempts",
+            "list",
+            "nested/pipeline.yaml",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(list.status.success(), "{}", stderr(&list));
+    let value: serde_json::Value = serde_json::from_slice(&list.stdout).expect("compact JSON");
+    assert_eq!(value["pipeline"], "nested/pipeline.yaml");
+    assert_eq!(
+        value["roots"][0]["attempts"][0]["execution_id"],
+        EXECUTION_ID
+    );
+}
+
+#[test]
+fn expired_purge_uses_a_separate_execution_identity_for_path_reconstruction() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let output_root = workspace.path().join("output").join(EXECUTION_ID);
+    std::fs::create_dir_all(&output_root).expect("execution-scoped output root");
+    std::fs::write(workspace.path().join("input.csv"), "value\nexample\n").expect("input fixture");
+    std::fs::write(
+        workspace.path().join("clinker.toml"),
+        "[storage.publication]\nfailed_retention_seconds = 0\ncreation_grace_seconds = 1\nmin_free_bytes = \"1B\"\n",
+    )
+    .expect("workspace config");
+    std::fs::write(
+        workspace.path().join("pipeline.yaml"),
+        PIPELINE.replace("output/result.csv", "output/{execution_id}/result.csv"),
+    )
+    .expect("execution-scoped pipeline");
+    seed_incomplete_attempt(&output_root, EXECUTION_ID);
+    let attempt_root = output_root.join(".clinker-attempts").join(EXECUTION_ID);
+
+    let purge = clinker_in(
+        workspace.path(),
+        &[
+            "attempts",
+            "purge",
+            "pipeline.yaml",
+            "--expired",
+            "--path-execution-id",
+            EXECUTION_ID,
+            "--execute",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(purge.status.success(), "{}", stderr(&purge));
+    assert!(!attempt_root.exists());
 }
 
 #[test]

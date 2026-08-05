@@ -338,9 +338,9 @@ for the shorthand these forms expand from.
 Inspect and clean up retained publication attempts owned by a pipeline:
 
 ```bash
-clinker attempts list <PIPELINE> [--continuation <TOKEN>] [--show-paths] [--format text|json]
-clinker attempts inspect <PIPELINE> --execution-id <ID> [--show-paths] [--format text|json]
-clinker attempts purge <PIPELINE> (--execution-id <ID> | --expired) [--execute] [--continuation <TOKEN>] [--show-paths] [--format text|json]
+clinker attempts list <PIPELINE> [--path-execution-id <ID>] [--continuation <TOKEN>] [--show-paths] [--format text|json]
+clinker attempts inspect <PIPELINE> --execution-id <ID> [--path-execution-id <ID>] [--show-paths] [--format text|json]
+clinker attempts purge <PIPELINE> (--execution-id <ID> | --expired) [--path-execution-id <ID>] [--execute] [--continuation <TOKEN>] [--show-paths] [--format text|json]
 ```
 
 `<PIPELINE>` is required and must be a traversal-free, workspace-relative
@@ -352,10 +352,14 @@ override.
 When the original run used path- or overlay-affecting options, repeat them on
 the attempt command: `--base-dir`, `--allow-absolute-paths`, `--rules-path`,
 `--channel`, repeatable `--group`, and `--no-auto-groups`. Output templates that
-use run identity also require the matching `--execution-id`, `--batch-id`, or
-`--timestamp`. On `list`, `--execution-id` supplies template identity only; it
-does not filter the page. These values recompile typed `ValidatedPath` roots and
-never grant authority to a caller-supplied deletion path.
+use run identity also require the matching `--path-execution-id`, `--batch-id`,
+or `--timestamp`. The path identity is deliberately distinct from inspect and
+purge's `--execution-id` selector, so `purge --expired` can reconstruct an
+execution-scoped destination without changing its selector. Attempt operations
+replay file-source discovery for `{source_file}` and `{source_path}` fan-out and
+anchor a pipeline without `--base-dir` at the pipeline's own directory, matching
+`run`. These values recompile typed `ValidatedPath` roots and never grant
+authority to a caller-supplied deletion path.
 
 `list` and `inspect` never mutate retained state. `purge` is also non-mutating
 by default: it reports the attempts that the current retention policy admits.
@@ -369,7 +373,7 @@ remain keep decisions even with `--execute`.
 | `inspect --execution-id <ID>` | Reports one canonical execution ID across those roots. |
 | `purge --execution-id <ID>` | Previews one logical execution; add `--execute` to remove only positively owned, eligible files. |
 | `purge --expired` | Previews all policy-expired attempts admitted by the bounded page; add `--execute` to clean them. |
-| `--continuation <TOKEN>` | Resumes the exact plan-, root-, and selector-bound page emitted by a partial result. Tokens use an opaque URL-safe alphabet; paste them unchanged. |
+| `--continuation <TOKEN>` | Resumes the exact plan-, root-, and selector-bound page emitted by a partial result. JSON `resume_argv` is authoritative; the text command applies platform quoting to the raw opaque token. |
 | `--show-paths` | Adds sanitized workspace-relative attempt paths. Machine-local prefixes and sensitive-looking components remain redacted. |
 | `--format json` | Emits one compact JSON object with stable field order and logical identifiers. The default is deterministic human-readable text. |
 

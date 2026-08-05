@@ -1589,6 +1589,8 @@ impl AttemptQuery {
                 )
             }
             PurgeSelector::Expired => {
+                let retry_cursor =
+                    continuation.and_then(|continuation| continuation.cursor.clone());
                 let preview = self.preview(request, observed_unix_ms, continuation)?;
                 if preview.selected_execution_ids.is_empty() {
                     return Ok(PurgeReport {
@@ -1654,7 +1656,11 @@ impl AttemptQuery {
                     report.bounds = child.bounds;
                     if child.disposition != PurgeDisposition::Removed {
                         report.disposition = child.disposition;
-                        report.continuation = child.continuation;
+                        report.continuation = Some(self.continuation(
+                            &request.root_identifier,
+                            &purge_selector_name(&request.selector),
+                            retry_cursor.clone(),
+                        ));
                         break;
                     }
                 }

@@ -126,6 +126,14 @@ not the current desired retained count. A configuration downgrade therefore
 still returns physical attempts through advancing continuation tokens while
 also reporting that the aggregate count exceeds current policy.
 
+The operator query recompiles with the same default anchor as `run` (the
+pipeline file's directory when no base is explicit) and replays bounded
+file-source discovery before rendering per-source output paths. Execution ID
+used in a path template is a separate typed input from an exact purge selector,
+which lets expired cleanup reconstruct an execution-scoped root. Continuations
+cross the CLI as their canonical raw bytes; structured argument arrays are the
+authoritative automation surface and text commands apply platform quoting.
+
 ### Remote filesystem qualification
 
 Normal CLI output is admitted from the filesystem type observed through the

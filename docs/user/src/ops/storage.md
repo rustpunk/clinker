@@ -139,11 +139,12 @@ clinker attempts purge pipelines/orders.yaml --expired --execute
 ```
 
 Repeat any path or overlay identity used by the run (`--base-dir`, absolute-path
-permission, rules root, channel/groups, batch identity, or timestamp) so the
-command recompiles the same typed owned roots. Attempt commands do not accept a
-raw cleanup path. Continuation tokens are opaque and URL-safe; JSON output also
-provides structured recovery/resume argument arrays for shell-independent
-automation.
+permission, rules root, channel/groups, `--path-execution-id`, batch identity,
+or timestamp) so the command recompiles the same typed owned roots. File-backed
+fan-out roots are reconstructed by replaying source discovery. Attempt commands
+do not accept a raw cleanup path. Continuation tokens are opaque raw values;
+JSON output provides authoritative structured recovery/resume argument arrays
+for shell-independent automation.
 
 Output is path-free by default and reports logical root, execution, and artifact
 IDs. `--show-paths` adds only sanitized workspace-relative paths; machine-local
