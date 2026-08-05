@@ -190,6 +190,81 @@ fn list_and_inspect_compile_the_pipeline_and_hide_physical_paths_by_default() {
 }
 
 #[test]
+fn inspect_reuses_base_absolute_and_run_scoped_template_identity() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let output_root = workspace.path().join("absolute-output").join(EXECUTION_ID);
+    std::fs::create_dir_all(&output_root).expect("resolved output root");
+    std::fs::write(workspace.path().join("input.csv"), "value\nexample\n")
+        .expect("input fixture");
+    std::fs::write(
+        workspace.path().join("clinker.toml"),
+        "[storage.publication]\nfailed_retention_seconds = 0\ncreation_grace_seconds = 1\nmin_free_bytes = \"1B\"\n",
+    )
+    .expect("workspace config");
+    std::fs::write(
+        workspace.path().join("pipeline.yaml"),
+        format!(
+            r#"pipeline:
+  name: run_identity
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: input.csv
+      schema:
+        - {{ name: value, type: string }}
+  - type: output
+    name: result
+    input: source
+    config:
+      name: result
+      type: csv
+      path: {}/{{execution_id}}/result.csv
+"#,
+            workspace.path().join("absolute-output").display()
+        ),
+    )
+    .expect("pipeline fixture");
+    seed_incomplete_attempt(&output_root, EXECUTION_ID);
+    std::fs::write(
+        output_root
+            .join(".clinker-attempts")
+            .join(EXECUTION_ID)
+            .join("unexpected"),
+        b"unowned",
+    )
+    .expect("cleanup-debt fixture");
+
+    let base_dir = workspace.path().to_string_lossy().into_owned();
+    let inspect = clinker(&[
+        "attempts",
+        "inspect",
+        "pipeline.yaml",
+        "--execution-id",
+        EXECUTION_ID,
+        "--base-dir",
+        &base_dir,
+        "--allow-absolute-paths",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(inspect.status.code(), Some(4), "{}", stderr(&inspect));
+    let value: serde_json::Value = serde_json::from_slice(&inspect.stdout).expect("compact JSON");
+    assert_eq!(value["roots"].as_array().map(Vec::len), Some(1));
+    let recovery = value["roots"][0]["diagnostics"][0]["recovery_argv"]
+        .as_array()
+        .expect("structured recovery arguments");
+    assert!(recovery.iter().any(|value| value == "--base-dir"));
+    assert!(
+        recovery
+            .iter()
+            .any(|value| value == "--allow-absolute-paths")
+    );
+}
+
+#[test]
 fn show_paths_is_workspace_relative_and_redacts_sensitive_components() {
     let (workspace, original_root) = write_workspace("");
     let sensitive_root = workspace.path().join("secret-token-output");

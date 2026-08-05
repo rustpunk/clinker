@@ -349,6 +349,14 @@ then derives its finite destination-parent roots from the compiled config.
 There is no option for supplying a storage root, deletion path, or safety
 override.
 
+When the original run used path- or overlay-affecting options, repeat them on
+the attempt command: `--base-dir`, `--allow-absolute-paths`, `--rules-path`,
+`--channel`, repeatable `--group`, and `--no-auto-groups`. Output templates that
+use run identity also require the matching `--execution-id`, `--batch-id`, or
+`--timestamp`. On `list`, `--execution-id` supplies template identity only; it
+does not filter the page. These values recompile typed `ValidatedPath` roots and
+never grant authority to a caller-supplied deletion path.
+
 `list` and `inspect` never mutate retained state. `purge` is also non-mutating
 by default: it reports the attempts that the current retention policy admits.
 Only `--execute` performs bounded cleanup. Live locks, invalid ownership,
@@ -361,14 +369,15 @@ remain keep decisions even with `--execute`.
 | `inspect --execution-id <ID>` | Reports one canonical execution ID across those roots. |
 | `purge --execution-id <ID>` | Previews one logical execution; add `--execute` to remove only positively owned, eligible files. |
 | `purge --expired` | Previews all policy-expired attempts admitted by the bounded page; add `--execute` to clean them. |
-| `--continuation <TOKEN>` | Resumes the exact plan-, root-, and selector-bound page emitted by a partial result. Tokens are opaque; paste them unchanged. |
+| `--continuation <TOKEN>` | Resumes the exact plan-, root-, and selector-bound page emitted by a partial result. Tokens use an opaque URL-safe alphabet; paste them unchanged. |
 | `--show-paths` | Adds sanitized workspace-relative attempt paths. Machine-local prefixes and sensitive-looking components remain redacted. |
 | `--format json` | Emits one compact JSON object with stable field order and logical identifiers. The default is deterministic human-readable text. |
 
 Default output is path-free. It contains the logical root ID, execution ID,
 lifecycle state, eligibility, artifact IDs, cleanup debt, and exact bounds.
-The compact JSON form carries the same fields. Neither form includes record
-values, credentials, secrets, or raw debug data.
+The compact JSON form carries the same fields plus shell-independent
+`recovery_argv` and `resume_argv` arrays. Neither form includes record values,
+credentials, secrets, or raw debug data.
 
 Safety refusals and incomplete cleanup exit with status 4 and use the stable
 E371 or E372 data. The report includes its logical failure code, registry-owned
