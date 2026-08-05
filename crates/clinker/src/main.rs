@@ -1549,6 +1549,38 @@ fn run_unix_ms() -> Result<u64, PipelineError> {
     })
 }
 
+#[derive(Clone, Copy)]
+enum PublicationFailureKind {
+    Readiness,
+    ReadinessAndAbandonment,
+    CleanupDebt(usize),
+    Incomplete(usize),
+    Publish,
+}
+
+fn publication_failure_diagnostic(execution_id: &str, failure: PublicationFailureKind) -> String {
+    let reason = match failure {
+        PublicationFailureKind::Readiness => "output readiness failed",
+        PublicationFailureKind::ReadinessAndAbandonment => {
+            "output readiness failed and the abandoned state could not be persisted"
+        }
+        PublicationFailureKind::CleanupDebt(count) => {
+            return format!(
+                "output publication completed with {count} cleanup debt item(s) for execution {execution_id}; run `clinker attempts inspect <pipeline> --execution-id {execution_id}` with the same identity options"
+            );
+        }
+        PublicationFailureKind::Incomplete(count) => {
+            return format!(
+                "output publication was incomplete with {count} cleanup debt item(s) for execution {execution_id}; run `clinker attempts inspect <pipeline> --execution-id {execution_id}` with the same identity options"
+            );
+        }
+        PublicationFailureKind::Publish => "output publication failed",
+    };
+    format!(
+        "{reason} for execution {execution_id}; run `clinker attempts inspect <pipeline> --execution-id {execution_id}` with the same identity options"
+    )
+}
+
 fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Resolve CLINKER_ENV
     if let Some(env_name) = args
@@ -2801,14 +2833,17 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         })?;
     } else {
         match run_attempt.mark_all_ready() {
-            Err(error) => {
-                let detail = error.to_string();
-                if let Err(abandon_error) = run_attempt.abandon() {
-                    publication_failure = Some(format!(
-                        "output readiness failed: {detail}; attempt state could not be abandoned: {abandon_error}"
+            Err(_) => {
+                if run_attempt.abandon().is_err() {
+                    publication_failure = Some(publication_failure_diagnostic(
+                        &execution_id,
+                        PublicationFailureKind::ReadinessAndAbandonment,
                     ));
                 } else {
-                    publication_failure = Some(format!("output readiness failed: {detail}"));
+                    publication_failure = Some(publication_failure_diagnostic(
+                        &execution_id,
+                        PublicationFailureKind::Readiness,
+                    ));
                 }
             }
             Ok(()) => match run_attempt.publish_run(&output_staging, &shutdown_token) {
@@ -2821,8 +2856,9 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     cleanup_debt_count,
                     ..
                 })) => {
-                    publication_failure = Some(format!(
-                        "output publication completed with {cleanup_debt_count} cleanup debt item(s)"
+                    publication_failure = Some(publication_failure_diagnostic(
+                        &execution_id,
+                        PublicationFailureKind::CleanupDebt(cleanup_debt_count),
                     ));
                 }
                 Ok(Some(
@@ -2831,22 +2867,33 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                         ..
                     },
                 )) => {
-                    publication_failure = Some(format!(
-                        "output publication was incomplete with {cleanup_debt_count} cleanup debt item(s); inspect execution {execution_id}"
+                    publication_failure = Some(publication_failure_diagnostic(
+                        &execution_id,
+                        PublicationFailureKind::Incomplete(cleanup_debt_count),
                     ));
                 }
-                Err(error) => publication_failure = Some(error.to_string()),
+                Err(_) => {
+                    publication_failure = Some(publication_failure_diagnostic(
+                        &execution_id,
+                        PublicationFailureKind::Publish,
+                    ));
+                }
             },
         }
     }
 
-    tracing::info!(
-        "Pipeline complete: {} total, {} ok, {} written, {} dlq",
-        counters.total_count,
-        counters.ok_count,
-        counters.records_written,
-        counters.dlq_count
-    );
+    if let Some(error) = &publication_failure {
+        tracing::error!(execution_id = %execution_id, "{error}");
+        eprintln!("{error}");
+    } else {
+        tracing::info!(
+            "Pipeline complete: {} total, {} ok, {} written, {} dlq",
+            counters.total_count,
+            counters.ok_count,
+            counters.records_written,
+            counters.dlq_count
+        );
+    }
 
     // Per-stage actual spill volume at end-of-run, so an operator can compare
     // each stage's real spilled bytes against the pre-run `--explain` per-stage
@@ -2963,7 +3010,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 .map(|o| o.path.clone())
                 .collect(),
             dlq_path,
-            error: None,
+            error: publication_failure.clone(),
             retraction: clinker_exec::metrics::RetractionMetrics::from(&counters.retraction),
             per_source_record_counts: report.per_source_record_counts.clone(),
             per_source_dlq_counts: report.per_source_dlq_counts.clone(),
@@ -6031,9 +6078,29 @@ fn diag_message(
 mod tests {
     use super::*;
 
+    #[test]
+    fn publication_failure_diagnostics_are_path_safe_and_actionable() {
+        let execution_id = "018f47a2-9a41-7a27-b4d6-4f7137e3c273";
+        for failure in [
+            PublicationFailureKind::Readiness,
+            PublicationFailureKind::ReadinessAndAbandonment,
+            PublicationFailureKind::CleanupDebt(2),
+            PublicationFailureKind::Incomplete(1),
+            PublicationFailureKind::Publish,
+        ] {
+            let rendered = publication_failure_diagnostic(execution_id, failure);
+            assert!(rendered.contains(execution_id), "{rendered}");
+            assert!(rendered.contains("clinker attempts inspect"), "{rendered}");
+            assert!(!rendered.contains("/tmp/"), "{rendered}");
+            assert!(!rendered.contains("\\Users\\"), "{rendered}");
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_argument_quoting_round_trips_through_cmd() {
+        use std::os::windows::process::CommandExt;
+
         let expected = [
             "argument with spaces",
             r#"say "hello""#,
@@ -6057,8 +6124,13 @@ mod tests {
         argv.extend(expected.iter().map(|value| (*value).to_owned()));
 
         let command = render_attempt_command(&argv);
-        let output = std::process::Command::new("cmd.exe")
-            .args(["/D", "/S", "/C", &command])
+        let mut process = std::process::Command::new("cmd.exe");
+        process.args(["/D", "/S", "/C"]);
+        // cmd.exe requires one additional pair of quotes around the complete
+        // raw command after `/C`; `raw_arg` avoids Command::arg quoting that
+        // wrapper a second time.
+        process.raw_arg(format!("\"{command}\""));
+        let output = process
             .env("CLINKER_ARGV_PROBE_OUTPUT", &output_path)
             .output()
             .expect("cmd.exe should launch the argv probe");

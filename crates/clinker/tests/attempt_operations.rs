@@ -1065,7 +1065,7 @@ fn attempt_owned_replace_and_no_replace_share_the_race_safe_destination_reservat
             .expect("artifact registration")
         };
         let first_registry = OutputStagingRegistry::default();
-        let (_first_attempt, _first_writers) = AttemptPublication::create_run(
+        let (_first_attempt, _first_writers) = AttemptPublication::create_run_for_testing(
             policy.clone(),
             &first_registry,
             EXECUTION_ID,
@@ -1075,7 +1075,7 @@ fn attempt_owned_replace_and_no_replace_share_the_race_safe_destination_reservat
         )
         .expect("first publisher reserves destination");
         let second_registry = OutputStagingRegistry::default();
-        let error = AttemptPublication::create_run(
+        let error = AttemptPublication::create_run_for_testing(
             policy,
             &second_registry,
             "018f47a2-9a41-7a27-b4d6-4f7137e3c160",

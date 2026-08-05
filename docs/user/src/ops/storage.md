@@ -39,6 +39,9 @@ always has.
 destination qualification, retained attempts, and bounded cleanup. It is
 optional; the defaults use destination-local quarantine (`mode = "direct"`),
 the local filesystem profile, and 24-hour retention for failed attempts.
+NFS and SMB profiles are accepted only when the operating system identifies
+the matching filesystem family; an unidentifiable remote drive is rejected
+rather than guessed.
 
 ```toml
 [storage.publication]

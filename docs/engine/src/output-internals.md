@@ -98,6 +98,9 @@ selected mode.
 `destination_profile` is explicit: `local` (the default), `nfs_v4_1`, or
 `smb_3_1_1`. A detected share under `local`, or a detected protocol that does
 not match the qualified share profile, fails before publication effects. The
+probe distinguishes NFS, SMB/CIFS, and other network or userspace mounts;
+platforms that report only an undifferentiated remote drive fail closed for
+the qualified NFS and SMB profiles. The
 remaining strict keys are `failed_retention_seconds`,
 `creation_grace_seconds`, `max_attempt_bytes`, `retained_byte_limit`,
 `retained_attempt_limit`, `min_free_bytes`, `sweep_entry_limit`,

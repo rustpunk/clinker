@@ -3733,6 +3733,7 @@ struct RootReceiptInput {
 
 #[derive(Clone, Copy)]
 enum AdmissionObservation {
+    #[cfg(feature = "test-utils")]
     Provided,
     SystemClock,
 }
@@ -3740,6 +3741,7 @@ enum AdmissionObservation {
 impl AdmissionObservation {
     fn after_lock(self, created_unix_ms: u64) -> Result<u64, AttemptError> {
         match self {
+            #[cfg(feature = "test-utils")]
             Self::Provided => Ok(created_unix_ms),
             Self::SystemClock => {
                 let observed = SystemTime::now()
@@ -3771,6 +3773,30 @@ impl RunAttemptPublication {
     /// Create one empty run-owned attempt over a finite set of compiled
     /// destination-parent roots.
     pub fn create(
+        policy: ResolvedPublicationPolicy,
+        execution_id: &str,
+        created_unix_ms: u64,
+        eligible_after_unix_ms: u64,
+        destination_roots: Vec<ValidatedPath>,
+    ) -> Result<Self, AttemptError> {
+        AttemptPublication::create_dynamic_run(
+            policy,
+            execution_id,
+            created_unix_ms,
+            eligible_after_unix_ms,
+            destination_roots,
+            None,
+            AdmissionObservation::SystemClock,
+        )
+        .map(|attempt| Self {
+            inner: Arc::new(Mutex::new(attempt)),
+        })
+    }
+
+    /// Deterministic admission seam for tests that use synthetic timestamps.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn create_for_testing(
         policy: ResolvedPublicationPolicy,
         execution_id: &str,
         created_unix_ms: u64,
@@ -4011,6 +4037,48 @@ impl AttemptPublication {
         eligible_after_unix_ms: u64,
         registrations: Vec<ArtifactRegistration>,
     ) -> Result<(Self, Vec<AttemptArtifactWriter>), AttemptError> {
+        Self::create_run_with_observation(
+            policy,
+            registry,
+            execution_id,
+            created_unix_ms,
+            eligible_after_unix_ms,
+            registrations,
+            AdmissionObservation::SystemClock,
+        )
+    }
+
+    /// Deterministic admission seam for tests that use synthetic timestamps.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn create_run_for_testing(
+        policy: ResolvedPublicationPolicy,
+        registry: &OutputStagingRegistry,
+        execution_id: &str,
+        created_unix_ms: u64,
+        eligible_after_unix_ms: u64,
+        registrations: Vec<ArtifactRegistration>,
+    ) -> Result<(Self, Vec<AttemptArtifactWriter>), AttemptError> {
+        Self::create_run_with_observation(
+            policy,
+            registry,
+            execution_id,
+            created_unix_ms,
+            eligible_after_unix_ms,
+            registrations,
+            AdmissionObservation::Provided,
+        )
+    }
+
+    fn create_run_with_observation(
+        policy: ResolvedPublicationPolicy,
+        registry: &OutputStagingRegistry,
+        execution_id: &str,
+        created_unix_ms: u64,
+        eligible_after_unix_ms: u64,
+        registrations: Vec<ArtifactRegistration>,
+        admission_observation: AdmissionObservation,
+    ) -> Result<(Self, Vec<AttemptArtifactWriter>), AttemptError> {
         validate_execution_id(execution_id)?;
         if registrations.is_empty() || registrations.len() > MANIFEST_MAX_ARTIFACTS {
             return Err(AttemptError::InvalidManifest(
@@ -4045,7 +4113,7 @@ impl AttemptPublication {
             eligible_after_unix_ms,
             destination_roots.into_values().collect(),
             None,
-            AdmissionObservation::Provided,
+            admission_observation,
         )?;
 
         let mut writers = Vec::with_capacity(registrations.len());

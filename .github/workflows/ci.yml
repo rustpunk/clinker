@@ -247,7 +247,7 @@ jobs:
   # Positive remote-publication evidence is limited to these disposable,
   # self-provisioned Linux loopback profiles. A missing package, mount,
   # lifecycle/capacity observation, or teardown fails its cell and leaves the
-  # schema-2 evidence explicitly ineligible for a support claim. Each server
+  # schema-3 evidence explicitly ineligible for a support claim. Each server
   # root is backed by a mounted 64 MiB tmpfs so ENOSPC is observed through the
   # mounted client rather than inferred from an injected fault.
   filesystem-matrix:

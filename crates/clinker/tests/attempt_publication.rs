@@ -174,7 +174,7 @@ fn run_attempt_owns_every_artifact_kind_across_bounded_destination_roots() {
         ),
     ];
 
-    let (mut attempt, mut writers) = AttemptPublication::create_run(
+    let (mut attempt, mut writers) = AttemptPublication::create_run_for_testing(
         policy,
         &registry,
         EXECUTION_ID,
@@ -367,7 +367,7 @@ fn failed_direct_multi_root_attempt_is_inspectable_and_purgeable_per_root() {
         registration(ArtifactKind::Primary, first.path(), "first.bin", "first"),
         registration(ArtifactKind::Sidecar, second.path(), "second.bin", "second"),
     ];
-    let (mut attempt, mut writers) = AttemptPublication::create_run(
+    let (mut attempt, mut writers) = AttemptPublication::create_run_for_testing(
         policy.clone(),
         &registry,
         EXECUTION_ID,
@@ -425,7 +425,7 @@ fn failed_local_then_publish_multi_root_attempt_is_purgeable_per_root() {
         registration(ArtifactKind::Primary, first.path(), "first.bin", "first"),
         registration(ArtifactKind::Dlq, second.path(), "errors.bin", "errors"),
     ];
-    let (mut attempt, mut writers) = AttemptPublication::create_run(
+    let (mut attempt, mut writers) = AttemptPublication::create_run_for_testing(
         policy.clone(),
         &registry,
         EXECUTION_ID,
@@ -477,7 +477,7 @@ fn local_then_publish_refuses_same_spool_and_destination_before_attempt_creation
         Some(root.path()),
         1_024,
     );
-    let error = AttemptPublication::create_run(
+    let error = AttemptPublication::create_run_for_testing(
         policy,
         &registry,
         EXECUTION_ID,
@@ -505,7 +505,7 @@ fn duplicate_run_registration_refuses_before_attempt_creation() {
         registration(ArtifactKind::Sidecar, root.path(), "same.bin", "sidecar"),
     ];
 
-    let error = AttemptPublication::create_run(
+    let error = AttemptPublication::create_run_for_testing(
         policy,
         &registry,
         EXECUTION_ID,
@@ -536,7 +536,7 @@ fn aggregate_retained_limits_fail_before_attempt_creation() {
         } else {
             retained_policy(root.path(), 8, 1_024, 600)
         };
-        let error = AttemptPublication::create_run(
+        let error = AttemptPublication::create_run_for_testing(
             resolved,
             &registry,
             new_execution_id,
@@ -573,7 +573,7 @@ fn aggregate_admission_purges_eligible_attempts_before_counting() {
     let retained_root = retained.attempt_root().to_path_buf();
     drop(retained);
     let new_execution_id = "018f47a2-9a41-7a27-b4d6-4f7137e3c261";
-    let (attempt, writers) = AttemptPublication::create_run(
+    let (attempt, writers) = AttemptPublication::create_run_for_testing(
         retained_policy(root.path(), 1, 8_000_000_000, 1),
         &registry,
         new_execution_id,
@@ -613,7 +613,7 @@ fn concurrent_aggregate_admission_allows_exactly_one_attempt_at_the_count_limit(
             std::thread::spawn(move || {
                 let registry = OutputStagingRegistry::default();
                 barrier.wait();
-                AttemptPublication::create_run(
+                AttemptPublication::create_run_for_testing(
                     policy,
                     &registry,
                     execution_id,
@@ -661,7 +661,7 @@ fn concurrent_aggregate_admission_reserves_estimated_bytes_until_sizes_are_exact
             std::thread::spawn(move || {
                 let registry = OutputStagingRegistry::default();
                 barrier.wait();
-                AttemptPublication::create_run(
+                AttemptPublication::create_run_for_testing(
                     policy,
                     &registry,
                     execution_id,
@@ -710,7 +710,7 @@ fn receipt_backed_admission_refreshes_a_stale_creation_observation() {
     let registry = OutputStagingRegistry::default();
     let policy = retained_policy(root.path(), 8, 8_000_000_000, 1);
     let newer_execution_id = "018f47a2-9a41-7a27-b4d6-4f7137e3c267";
-    let (newer_attempt, newer_writers) = AttemptPublication::create_run(
+    let (newer_attempt, newer_writers) = AttemptPublication::create_run_for_testing(
         policy.clone(),
         &registry,
         newer_execution_id,
@@ -741,6 +741,62 @@ fn receipt_backed_admission_refreshes_a_stale_creation_observation() {
     admitted.abandon().expect("retain admitted attempt");
 }
 
+#[test]
+fn public_run_constructors_refresh_a_stale_creation_observation() {
+    for use_shared_handle in [false, true] {
+        let root = tempfile::tempdir().expect("temporary destination");
+        let registry = OutputStagingRegistry::default();
+        let policy = retained_policy(root.path(), 8, 8_000_000_000, 1);
+        let newer_execution_id = if use_shared_handle {
+            "018f47a2-9a41-7a27-b4d6-4f7137e3c269"
+        } else {
+            "018f47a2-9a41-7a27-b4d6-4f7137e3c270"
+        };
+        let (newer_attempt, newer_writers) = AttemptPublication::create_run_for_testing(
+            policy.clone(),
+            &registry,
+            newer_execution_id,
+            2_000,
+            u64::MAX,
+            vec![registration(
+                ArtifactKind::Primary,
+                root.path(),
+                "newer.bin",
+                "newer-output",
+            )],
+        )
+        .expect("create an attempt newer than the caller observation");
+        drop(newer_writers);
+        drop(newer_attempt);
+
+        if use_shared_handle {
+            RunAttemptPublication::create(
+                policy,
+                "018f47a2-9a41-7a27-b4d6-4f7137e3c271",
+                1_000,
+                u64::MAX,
+                vec![validated(root.path(), ".")],
+            )
+            .expect("shared-handle admission must observe time after locking");
+        } else {
+            AttemptPublication::create_run(
+                policy,
+                &registry,
+                "018f47a2-9a41-7a27-b4d6-4f7137e3c272",
+                1_000,
+                u64::MAX,
+                vec![registration(
+                    ArtifactKind::Primary,
+                    root.path(),
+                    "current.bin",
+                    "current-output",
+                )],
+            )
+            .expect("pre-registered admission must observe time after locking");
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn authored_legacy_lock_leaf_cannot_replace_the_internal_admission_mutex() {
@@ -750,7 +806,7 @@ fn authored_legacy_lock_leaf_cannot_replace_the_internal_admission_mutex() {
     let registry = OutputStagingRegistry::default();
     let policy = retained_policy(root.path(), 8, 8_000_000_000, 100);
     let legacy_leaf = ".clinker-attempt-admission.lock";
-    let (mut attempt, mut writers) = AttemptPublication::create_run(
+    let (mut attempt, mut writers) = AttemptPublication::create_run_for_testing(
         policy.clone(),
         &registry,
         EXECUTION_ID,
@@ -813,7 +869,7 @@ fn authored_legacy_lock_leaf_cannot_replace_the_internal_admission_mutex() {
         std::thread::spawn(move || {
             let registry = OutputStagingRegistry::default();
             barrier.wait();
-            AttemptPublication::create_run(
+            AttemptPublication::create_run_for_testing(
                 policy,
                 &registry,
                 execution_id,
@@ -869,7 +925,7 @@ fn aggregate_bytes_include_staging_copies_across_every_owned_root() {
         .resolve(destination.path(), 100, 8_000_000_000)
         .expect("resolve multi-root retained policy");
     let registry = OutputStagingRegistry::default();
-    let (mut retained, mut writers) = AttemptPublication::create_run(
+    let (mut retained, mut writers) = AttemptPublication::create_run_for_testing(
         policy.clone(),
         &registry,
         EXECUTION_ID,
@@ -895,7 +951,7 @@ fn aggregate_bytes_include_staging_copies_across_every_owned_root() {
         .expect_err("retain both the local source and destination copy");
     drop(retained);
 
-    let error = AttemptPublication::create_run(
+    let error = AttemptPublication::create_run_for_testing(
         policy,
         &registry,
         "018f47a2-9a41-7a27-b4d6-4f7137e3c264",
@@ -934,7 +990,7 @@ fn local_then_publish_copies_in_bounded_chunks_and_verifies_destination() {
         "result.bin",
         "primary",
     )];
-    let (mut attempt, mut writers) = AttemptPublication::create_run(
+    let (mut attempt, mut writers) = AttemptPublication::create_run_for_testing(
         policy,
         &registry,
         EXECUTION_ID,
@@ -1003,7 +1059,7 @@ fn local_then_publish_copy_and_digest_failures_never_fallback_to_direct() {
             "result.bin",
             "primary",
         )];
-        let (mut attempt, mut writers) = AttemptPublication::create_run(
+        let (mut attempt, mut writers) = AttemptPublication::create_run_for_testing(
             policy,
             &registry,
             EXECUTION_ID,
@@ -1090,7 +1146,7 @@ fn qualification_control_binds_every_real_stage_to_attempt_artifact_and_mode() {
             (mode == PublicationMode::LocalThenPublish).then_some(spool.path()),
             64,
         );
-        let (mut attempt, mut writers) = AttemptPublication::create_run(
+        let (mut attempt, mut writers) = AttemptPublication::create_run_for_testing(
             policy,
             &registry,
             EXECUTION_ID,
@@ -1179,7 +1235,7 @@ fn qualification_control_fails_closed_on_malformed_duplicate_missing_or_cross_at
         let destination = tempfile::tempdir().expect("destination");
         let registry = OutputStagingRegistry::default();
         let policy = resolved_policy(destination.path(), PublicationMode::Direct, None, 64);
-        let (mut attempt, mut writers) = AttemptPublication::create_run(
+        let (mut attempt, mut writers) = AttemptPublication::create_run_for_testing(
             policy,
             &registry,
             EXECUTION_ID,
@@ -1416,7 +1472,7 @@ fn matrix_attempt(
 ) {
     let registry = OutputStagingRegistry::default();
     let policy = resolved_policy(destination, mode, spool, 256 * 1024 * 1024);
-    let (attempt, writers) = AttemptPublication::create_run(
+    let (attempt, writers) = AttemptPublication::create_run_for_testing(
         policy,
         &registry,
         execution_id,
@@ -1740,7 +1796,7 @@ fn matrix_admission_policy(
 ) -> ResolvedPublicationPolicy {
     let destination_profile = match profile {
         "linux-nfsv4.1-loopback-ci" => "nfs_v4_1",
-        "linux-smb3.1.1-loopback-ci" => "smb3_1_1",
+        "linux-smb3.1.1-loopback-ci" => "smb_3_1_1",
         _ => panic!("unsupported qualification profile"),
     };
     let (retained_attempt_limit, retained_byte_limit) = match scenario {
@@ -2323,7 +2379,7 @@ fn quota_fault_is_an_explicit_seam_and_never_a_mounted_observation() {
         .expect_err("quota seam must fail closed");
     match error {
         clinker_exec::output::attempt::AttemptError::Io { source, .. } => {
-            assert_eq!(source.raw_os_error(), Some(122));
+            assert_eq!(source.kind(), std::io::ErrorKind::QuotaExceeded);
         }
         other => panic!("quota seam returned the wrong error: {other}"),
     }

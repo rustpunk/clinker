@@ -39,7 +39,10 @@ pub use composition::{
 pub use discovery::{DiscoveredFile, DiscoveryError, DiscoveryOutcome, discover};
 pub use error::*;
 pub use format::*;
-pub use fs_type::{FsKind, case_sensitive_dir, classify, collision_key, same_device};
+pub use fs_type::{
+    FilesystemFamily, FsKind, case_sensitive_dir, classify, classify_family, collision_key,
+    same_device,
+};
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use output::*;
 pub use output_mapping::{MappingEntry, OutputMapping};

@@ -186,6 +186,7 @@ pub enum DestinationProfile {
     /// A qualified NFSv4.1 destination.
     NfsV4_1,
     /// A qualified SMB3.1.1 destination.
+    #[serde(rename = "smb_3_1_1")]
     Smb3_1_1,
 }
 
@@ -333,24 +334,25 @@ impl PublicationPolicy {
         estimated_attempt_bytes: u64,
         observed_free_bytes: u64,
     ) -> Result<ResolvedPublicationPolicy, StorageConfigError> {
-        let fs_kind = crate::config::fs_type::classify(destination_root).map_err(|error| {
-            StorageConfigError::PublicationDestinationUnprobeable {
-                path: destination_root.to_path_buf(),
-                source: error.to_string(),
-            }
-        })?;
-        self.resolve_for_fs_kind(
+        let filesystem_family =
+            crate::config::fs_type::classify_family(destination_root).map_err(|error| {
+                StorageConfigError::PublicationDestinationUnprobeable {
+                    path: destination_root.to_path_buf(),
+                    source: error.to_string(),
+                }
+            })?;
+        self.resolve_for_filesystem_family(
             destination_root,
-            fs_kind,
+            filesystem_family,
             estimated_attempt_bytes,
             observed_free_bytes,
         )
     }
 
-    fn resolve_for_fs_kind(
+    fn resolve_for_filesystem_family(
         &self,
         _destination_root: &Path,
-        fs_kind: crate::config::FsKind,
+        filesystem_family: crate::config::FilesystemFamily,
         estimated_attempt_bytes: u64,
         observed_free_bytes: u64,
     ) -> Result<ResolvedPublicationPolicy, StorageConfigError> {
@@ -362,10 +364,10 @@ impl PublicationPolicy {
                 min_free_bytes: self.min_free_bytes.0,
             })?;
 
-        match (self.destination_profile, fs_kind) {
-            (DestinationProfile::Local, crate::config::FsKind::Local)
-            | (DestinationProfile::NfsV4_1, crate::config::FsKind::Network)
-            | (DestinationProfile::Smb3_1_1, crate::config::FsKind::Network) => {}
+        match (self.destination_profile, filesystem_family) {
+            (DestinationProfile::Local, crate::config::FilesystemFamily::Local)
+            | (DestinationProfile::NfsV4_1, crate::config::FilesystemFamily::Nfs)
+            | (DestinationProfile::Smb3_1_1, crate::config::FilesystemFamily::Smb) => {}
             (profile, detected) => {
                 return Err(StorageConfigError::PublicationProfileMismatch { profile, detected });
             }
@@ -1316,7 +1318,7 @@ pub enum StorageConfigError {
     /// The selected destination profile disagrees with detection.
     PublicationProfileMismatch {
         profile: DestinationProfile,
-        detected: crate::config::FsKind,
+        detected: crate::config::FilesystemFamily,
     },
     /// Local-then-publish was selected without a local spool.
     PublicationLocalSpoolRequired,
@@ -1429,8 +1431,10 @@ impl std::fmt::Display for StorageConfigError {
             ),
             Self::PublicationProfileMismatch { profile, detected } => write!(
                 f,
-                "storage.publication.destination_profile = \"{}\" does not match the detected {detected:?} filesystem; for a qualified share use `[storage.publication]\ndestination_profile = \"nfs_v4_1\"` or `[storage.publication]\ndestination_profile = \"smb_3_1_1\"`",
-                profile.as_str()
+                "storage.publication.destination_profile = \"{}\" does not match the detected {} filesystem; {}",
+                profile.as_str(),
+                detected.as_str(),
+                detected.publication_correction()
             ),
             Self::PublicationLocalSpoolRequired => write!(
                 f,
@@ -1504,9 +1508,9 @@ mod tests {
         let policy = PublicationPolicy::default();
 
         let error = policy
-            .resolve_for_fs_kind(
+            .resolve_for_filesystem_family(
                 destination.path(),
-                crate::config::FsKind::Network,
+                crate::config::FilesystemFamily::Nfs,
                 1,
                 u64::MAX,
             )
@@ -1514,15 +1518,59 @@ mod tests {
 
         let rendered = error.to_string();
         assert!(rendered.contains("destination_profile"), "{rendered}");
-        assert!(
-            rendered.contains("destination_profile = \"nfs_v4_1\""),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("destination_profile = \"smb_3_1_1\""),
-            "{rendered}"
-        );
+        assert!(rendered.contains("detected nfs filesystem"), "{rendered}");
         assert!(!attempt_root.exists());
+    }
+
+    #[test]
+    fn qualified_publication_profiles_reject_other_network_families() {
+        let destination = tempfile::tempdir().unwrap();
+        for (configured, accepted, rejected) in [
+            (
+                DestinationProfile::NfsV4_1,
+                crate::config::FilesystemFamily::Nfs,
+                [
+                    crate::config::FilesystemFamily::Smb,
+                    crate::config::FilesystemFamily::OtherNetwork,
+                ],
+            ),
+            (
+                DestinationProfile::Smb3_1_1,
+                crate::config::FilesystemFamily::Smb,
+                [
+                    crate::config::FilesystemFamily::Nfs,
+                    crate::config::FilesystemFamily::OtherNetwork,
+                ],
+            ),
+        ] {
+            let policy = PublicationPolicy {
+                destination_profile: configured,
+                ..PublicationPolicy::default()
+            };
+            policy
+                .resolve_for_filesystem_family(destination.path(), accepted, 1, u64::MAX)
+                .expect("matching filesystem family should be admitted");
+            for detected in rejected {
+                let error = policy
+                    .resolve_for_filesystem_family(destination.path(), detected, 1, u64::MAX)
+                    .expect_err("a different network family must fail closed");
+                assert!(matches!(
+                    error,
+                    StorageConfigError::PublicationProfileMismatch { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn documented_smb_profile_spelling_parses() {
+        let document =
+            ClinkerToml::parse("[storage.publication]\ndestination_profile = \"smb_3_1_1\"\n")
+                .expect("documented SMB profile should parse");
+        assert_eq!(
+            document.storage.publication.destination_profile,
+            DestinationProfile::Smb3_1_1
+        );
     }
 
     #[test]
