@@ -1457,7 +1457,7 @@ fn require_semantic_success(
 
 fn controlled_publication_test(
     state: &EnvironmentState,
-    environment: BTreeMap<OsString, OsString>,
+    mut environment: BTreeMap<OsString, OsString>,
     control_log: &Path,
 ) -> Result<ChildResult, GateError> {
     let endpoint = state.scratch.join("publication-control.sock");
@@ -1470,6 +1470,10 @@ fn controlled_publication_test(
     listener
         .set_nonblocking(true)
         .map_err(|error| GateError::io("bound publication control acceptance", &error))?;
+    environment.insert(
+        OsString::from("CLINKER_FILESYSTEM_CONTROL_ENDPOINT"),
+        endpoint.as_os_str().to_owned(),
+    );
 
     let worker = thread::spawn(move || {
         observe(

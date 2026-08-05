@@ -1328,11 +1328,10 @@ fn matrix_wait(reader: &mut BufReader<UnixStream>, action: &str, scenario: &str)
 }
 
 #[cfg(target_os = "linux")]
-fn matrix_connection(mount_root: &Path, scenario: &str, mode: PublicationMode) -> UnixStream {
-    let endpoint = mount_root
-        .parent()
-        .expect("matrix mount has a disposable parent")
-        .join("publication-control.sock");
+fn matrix_connection(scenario: &str, mode: PublicationMode) -> UnixStream {
+    let endpoint = std::env::var_os("CLINKER_FILESYSTEM_CONTROL_ENDPOINT")
+        .map(PathBuf::from)
+        .expect("publication matrix control endpoint must be provided");
     let mut stream = UnixStream::connect(endpoint).expect("connect publication matrix control");
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -1545,7 +1544,7 @@ fn matrix_success(destination: &Path, mode: PublicationMode, spool: Option<&Path
     );
     let execution_id = matrix_execution_id(index);
     let leaf = format!("{scenario}.bin");
-    let mut stream = matrix_connection(destination, &scenario, mode);
+    let mut stream = matrix_connection(&scenario, mode);
     let mut reader = BufReader::new(stream.try_clone().expect("clone matrix endpoint"));
     let (mut attempt, mut writers, registry) = matrix_attempt(
         destination,
@@ -1614,7 +1613,7 @@ fn matrix_ordinary_failure(
     let execution_id = matrix_execution_id(index);
     let leaf = format!("{scenario}.bin");
     std::fs::write(destination.join(&leaf), b"existing final").expect("preexisting final");
-    let mut stream = matrix_connection(destination, &scenario, mode);
+    let mut stream = matrix_connection(&scenario, mode);
     let mut reader = BufReader::new(stream.try_clone().expect("clone matrix endpoint"));
     let (mut attempt, mut writers, registry) = matrix_attempt(
         destination,
@@ -1683,7 +1682,7 @@ fn matrix_interruption(
     let scenario = format!("interruption-{mode_name}-{stage}");
     let execution_id = matrix_execution_id(index);
     let leaf = format!("{scenario}.bin");
-    let mut stream = matrix_connection(destination, &scenario, mode);
+    let mut stream = matrix_connection(&scenario, mode);
     let mut reader = BufReader::new(stream.try_clone().expect("clone matrix endpoint"));
     let (mut attempt, mut writers, registry) = matrix_attempt(
         destination,
@@ -1763,7 +1762,7 @@ fn matrix_enospc(destination: &Path, index: u64) {
     let scenario = "capacity-enospc";
     let execution_id = matrix_execution_id(index);
     let leaf = "capacity-enospc.bin";
-    let mut stream = matrix_connection(destination, scenario, PublicationMode::Direct);
+    let mut stream = matrix_connection(scenario, PublicationMode::Direct);
     let mut reader = BufReader::new(stream.try_clone().expect("clone matrix endpoint"));
     let (attempt, mut writers, _registry) = matrix_attempt(
         destination,
@@ -1970,7 +1969,7 @@ fn matrix_admission_contention(destination: &Path, profile: &str, scenario: &str
         assert_eq!(cleanup.disposition(), CleanupDisposition::Removed);
     }
 
-    let mut stream = matrix_connection(destination, scenario, PublicationMode::Direct);
+    let mut stream = matrix_connection(scenario, PublicationMode::Direct);
     let mut reader = BufReader::new(stream.try_clone().expect("clone admission endpoint"));
     matrix_send(
         &mut stream,

@@ -706,6 +706,10 @@ fn redundant_teardown_accepts_durable_failure_cleanup() {
 fn bounded_child_accepts_only_the_filesystem_semantic_environment_additions() {
     let mut environment = BTreeMap::new();
     for (name, value) in [
+        (
+            "CLINKER_FILESYSTEM_CONTROL_ENDPOINT",
+            "/tmp/publication-control.sock",
+        ),
         ("CLINKER_FILESYSTEM_PROFILE", NFS),
         ("CLINKER_FILESYSTEM_ROOT", "/tmp/mount"),
         ("CARGO_INCREMENTAL", "0"),
@@ -727,6 +731,7 @@ fn bounded_child_accepts_only_the_filesystem_semantic_environment_additions() {
     );
     let stdout = String::from_utf8(output.stdout).expect("environment output");
     for name in [
+        "CLINKER_FILESYSTEM_CONTROL_ENDPOINT=",
         "CLINKER_FILESYSTEM_PROFILE=",
         "CLINKER_FILESYSTEM_ROOT=",
         "CARGO_INCREMENTAL=0",
