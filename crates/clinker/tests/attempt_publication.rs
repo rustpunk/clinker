@@ -1961,26 +1961,20 @@ fn remove_matrix_namespace(root: &Path) {
 }
 
 #[cfg(target_os = "linux")]
-fn wait_for_retained_execution(root: &Path, expected: &str) {
-    let namespace = root.join(".clinker-attempts");
+fn wait_for_retained_manifest(root: &Path, execution_id: &str) -> AttemptManifest {
+    let manifest_path = root
+        .join(".clinker-attempts")
+        .join(execution_id)
+        .join("manifest.json");
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let expected = vec![std::ffi::OsString::from(expected)];
     loop {
-        let retained = std::fs::read_dir(&namespace).map(|entries| {
-            let mut retained = entries
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_name() != ".admission.lock")
-                .map(|entry| entry.file_name())
-                .collect::<Vec<_>>();
-            retained.sort();
-            retained
-        });
-        if retained.as_ref().is_ok_and(|actual| actual == &expected) {
-            return;
+        let retained = AttemptManifest::read(&manifest_path, 100_000_000);
+        if let Ok(manifest) = retained {
+            return manifest;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "mounted roots did not converge on the admitted execution: {retained:?}"
+            "mounted root did not expose the admitted manifest: {retained:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -2046,11 +2040,7 @@ fn matrix_admission_contention(destination: &Path, profile: &str, scenario: &str
         &second_execution
     };
     for root in [&first_root, &second_root] {
-        let namespace = root.join(".clinker-attempts");
-        wait_for_retained_execution(root, admitted_execution);
-        let attempt_root = namespace.join(admitted_execution);
-        let manifest = AttemptManifest::read(&attempt_root.join("manifest.json"), 100_000_000)
-            .expect("mounted admitted manifest readback");
+        let manifest = wait_for_retained_manifest(root, admitted_execution);
         assert_eq!(manifest.execution_id(), admitted_execution);
         assert_eq!(manifest.admitted_bytes(), 100);
     }
