@@ -273,6 +273,7 @@ pub enum AttemptState {
 pub enum ArtifactState {
     Staging,
     Ready,
+    Promoting,
     Published,
     VisibleUnsynchronized,
     Unpublished,
@@ -287,6 +288,12 @@ pub struct ArtifactManifest {
     size_bytes: u64,
     blake3_hex: String,
     state: ArtifactState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    destination_root_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_leaf: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quarantine_leaf: Option<String>,
 }
 
 impl ArtifactManifest {
@@ -305,6 +312,9 @@ impl ArtifactManifest {
             size_bytes,
             blake3_hex: blake3_hex.to_owned(),
             state,
+            destination_root_id: None,
+            final_leaf: None,
+            quarantine_leaf: None,
         };
         artifact.validate()?;
         Ok(artifact)
@@ -316,6 +326,19 @@ impl ArtifactManifest {
 
     pub fn state(&self) -> ArtifactState {
         self.state
+    }
+
+    fn with_destination(
+        mut self,
+        destination_root_id: String,
+        final_leaf: String,
+        quarantine_leaf: String,
+    ) -> Result<Self, AttemptError> {
+        self.destination_root_id = Some(destination_root_id);
+        self.final_leaf = Some(final_leaf);
+        self.quarantine_leaf = Some(quarantine_leaf);
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn encoded_len(&self) -> Result<usize, AttemptError> {
@@ -343,6 +366,34 @@ impl ArtifactManifest {
         {
             return Err(AttemptError::InvalidManifest(
                 "logical_leaf must be one relative path component",
+            ));
+        }
+        match (
+            &self.destination_root_id,
+            &self.final_leaf,
+            &self.quarantine_leaf,
+        ) {
+            (Some(root_id), Some(final_leaf), Some(quarantine_leaf)) => {
+                validate_root_identifier(root_id)?;
+                if Path::new(final_leaf).is_absolute()
+                    || Path::new(final_leaf).components().count() != 1
+                {
+                    return Err(AttemptError::InvalidManifest(
+                        "final_leaf must be one relative path component",
+                    ));
+                }
+                validate_artifact_leaf(quarantine_leaf)?;
+            }
+            (None, None, None) => {}
+            _ => {
+                return Err(AttemptError::InvalidManifest(
+                    "artifact destination identity must be complete",
+                ));
+            }
+        }
+        if self.state == ArtifactState::Promoting && self.destination_root_id.is_none() {
+            return Err(AttemptError::InvalidManifest(
+                "promoting artifact is missing destination identity",
             ));
         }
         if self.blake3_hex.len() != 64
@@ -535,6 +586,7 @@ pub enum AttemptFault {
     DestinationFileSync,
     Digest,
     ManifestReplace,
+    PromotionInterrupted,
     BeforeRename,
     DirectorySync,
 }
@@ -790,6 +842,7 @@ pub struct AttemptInspection {
     created_unix_ms: Option<u64>,
     eligible_after_unix_ms: Option<u64>,
     artifact_ids: Vec<String>,
+    artifact_states: Vec<(String, ArtifactState)>,
     cleanup_debt: Vec<CleanupDebt>,
     bounds: AttemptQueryBounds,
     physical_path: Option<PathBuf>,
@@ -842,6 +895,12 @@ impl AttemptInspection {
     /// named by the durable manifest.
     pub fn artifact_ids(&self) -> &[String] {
         &self.artifact_ids
+    }
+
+    /// Reconciled per-artifact state from durable intent and handle-relative
+    /// final/quarantine observations.
+    pub fn artifact_states(&self) -> &[(String, ArtifactState)] {
+        &self.artifact_states
     }
 
     /// Conservative reasons this attempt remains retained.
@@ -1266,6 +1325,11 @@ impl AttemptQuery {
                         list.cleanup_debt.push(debt);
                     }
                 }
+            }
+            if let Err(debt) = budget.check_time(elapsed_ms()) {
+                list.cleanup_debt.push(debt);
+                list.continuation =
+                    Some(self.continuation(root_identifier, "list", Some(name.clone())));
             }
             if list.continuation.is_some() {
                 break;
@@ -2398,6 +2462,7 @@ fn inspect_owned_attempt(
         created_unix_ms: None,
         eligible_after_unix_ms: None,
         artifact_ids: Vec::new(),
+        artifact_states: Vec::new(),
         cleanup_debt: Vec::new(),
         bounds: budget.bounds(),
         physical_path: None,
@@ -2538,7 +2603,16 @@ fn inspect_owned_attempt(
     let expected = manifest
         .artifacts
         .iter()
-        .map(|artifact| artifact.artifact_id.as_str())
+        .map(|artifact| {
+            if artifact.destination_root_id.as_deref() == Some(root.identifier.as_str()) {
+                artifact
+                    .quarantine_leaf
+                    .as_deref()
+                    .unwrap_or(artifact.artifact_id.as_str())
+            } else {
+                artifact.artifact_id.as_str()
+            }
+        })
         .chain(["live.lock", "manifest.json"])
         .collect::<std::collections::BTreeSet<_>>();
     if observed
@@ -2551,14 +2625,19 @@ fn inspect_owned_attempt(
         ));
     }
     for artifact in &manifest.artifacts {
-        match observed.get(&artifact.artifact_id) {
+        let quarantine_leaf =
+            if artifact.destination_root_id.as_deref() == Some(root.identifier.as_str()) {
+                artifact
+                    .quarantine_leaf
+                    .as_deref()
+                    .unwrap_or(artifact.artifact_id.as_str())
+            } else {
+                artifact.artifact_id.as_str()
+            };
+        match observed.get(quarantine_leaf) {
             Some(ContainedEntryKind::File) => {
                 inspection.artifact_ids.push(artifact.artifact_id.clone());
-                if attempt_root
-                    .directory
-                    .open_file(&artifact.artifact_id)
-                    .is_err()
-                {
+                if attempt_root.directory.open_file(quarantine_leaf).is_err() {
                     inspection.cleanup_debt.push(CleanupDebt::new(
                         CleanupDebtKind::Operational,
                         "owned artifact could not be opened through its retained handle",
@@ -2571,6 +2650,16 @@ fn inspect_owned_attempt(
                 "manifest-owned artifact is not a regular file",
             )),
         }
+        let reconciled = match reconcile_promoting_artifact(root, &attempt_root, artifact, budget) {
+            Ok(state) => state,
+            Err(debt) => {
+                inspection.cleanup_debt.push(debt);
+                artifact.state
+            }
+        };
+        inspection
+            .artifact_states
+            .push((artifact.artifact_id.clone(), reconciled));
     }
 
     match attempt_root.directory.open_file("live.lock") {
@@ -2609,6 +2698,106 @@ fn inspect_owned_attempt(
     });
     inspection.bounds = budget.bounds();
     inspection
+}
+
+fn reconcile_promoting_artifact(
+    root: &OwnedAttemptRoot,
+    attempt_root: &AttemptRoot,
+    artifact: &ArtifactManifest,
+    budget: &mut QueryBudget,
+) -> Result<ArtifactState, CleanupDebt> {
+    if artifact.state != ArtifactState::Promoting
+        || artifact.destination_root_id.as_deref() != Some(root.identifier.as_str())
+    {
+        return Ok(artifact.state);
+    }
+    let final_leaf = artifact.final_leaf.as_deref().ok_or_else(|| {
+        CleanupDebt::new(
+            CleanupDebtKind::InvalidManifest,
+            "promotion intent is missing its final leaf",
+        )
+    })?;
+    let quarantine_leaf = artifact.quarantine_leaf.as_deref().ok_or_else(|| {
+        CleanupDebt::new(
+            CleanupDebtKind::InvalidManifest,
+            "promotion intent is missing its quarantine leaf",
+        )
+    })?;
+    let destination = AnchoredDirectory::open(&root.destination).map_err(|_| {
+        CleanupDebt::new(
+            CleanupDebtKind::Operational,
+            "promotion destination could not be opened through its retained root",
+        )
+    })?;
+    match destination.open_file(final_leaf) {
+        Ok(mut file) => {
+            consume_reconciliation_bytes(&file, budget)?;
+            let (size, digest) =
+                digest_file(&mut file, &root.destination.as_path().join(final_leaf)).map_err(
+                    |_| {
+                        CleanupDebt::new(
+                            CleanupDebtKind::Operational,
+                            "visible promotion evidence could not be digested",
+                        )
+                    },
+                )?;
+            if size == artifact.size_bytes && digest == artifact.blake3_hex {
+                Ok(ArtifactState::VisibleUnsynchronized)
+            } else {
+                Err(CleanupDebt::new(
+                    CleanupDebtKind::InvalidOwnership,
+                    "visible promotion evidence does not match durable intent",
+                ))
+            }
+        }
+        Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => {
+            let mut file = attempt_root
+                .directory
+                .open_file(quarantine_leaf)
+                .map_err(|_| {
+                    CleanupDebt::new(
+                        CleanupDebtKind::Operational,
+                        "neither final nor quarantine promotion evidence could be reopened",
+                    )
+                })?;
+            consume_reconciliation_bytes(&file, budget)?;
+            let (size, digest) = digest_file(&mut file, &attempt_root.path.join(quarantine_leaf))
+                .map_err(|_| {
+                CleanupDebt::new(
+                    CleanupDebtKind::Operational,
+                    "quarantine promotion evidence could not be digested",
+                )
+            })?;
+            if size == artifact.size_bytes && digest == artifact.blake3_hex {
+                Ok(ArtifactState::Unpublished)
+            } else {
+                Err(CleanupDebt::new(
+                    CleanupDebtKind::InvalidOwnership,
+                    "quarantine promotion evidence does not match durable intent",
+                ))
+            }
+        }
+        Err(_) => Err(CleanupDebt::new(
+            CleanupDebtKind::Operational,
+            "promotion destination could not be inspected handle-relatively",
+        )),
+    }
+}
+
+fn consume_reconciliation_bytes(file: &File, budget: &mut QueryBudget) -> Result<(), CleanupDebt> {
+    let size = file.metadata().map_err(|_| {
+        CleanupDebt::new(
+            CleanupDebtKind::Operational,
+            "promotion evidence size could not be inspected",
+        )
+    })?;
+    let size = usize::try_from(size.len()).map_err(|_| {
+        CleanupDebt::new(
+            CleanupDebtKind::ByteBudget,
+            "promotion evidence exceeds the addressable byte budget",
+        )
+    })?;
+    budget.consume_bytes(size)
 }
 
 fn cleanup_eligible(
@@ -2732,6 +2921,20 @@ fn validate_continuation(continuation: &AttemptContinuation) -> Result<(), Attem
     Ok(())
 }
 
+fn validate_root_identifier(identifier: &str) -> Result<(), AttemptError> {
+    if identifier.len() == 64
+        && identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err(AttemptError::InvalidManifest(
+            "destination_root_id must be 64 lowercase hexadecimal characters",
+        ))
+    }
+}
+
 fn continuation_binding(
     plan_hash: &[u8; 32],
     root_identifier: &str,
@@ -2767,6 +2970,7 @@ fn legacy_inspection(execution_id: &str, disposition: CleanupDisposition) -> Att
         created_unix_ms: None,
         eligible_after_unix_ms: None,
         artifact_ids: Vec::new(),
+        artifact_states: Vec::new(),
         cleanup_debt: Vec::new(),
         bounds: AttemptQueryBounds::default(),
         physical_path: None,
@@ -3348,6 +3552,7 @@ impl AttemptPublication {
         };
         let publication_source =
             self.validated_artifact_in_root(&publication_root_key, &publication_leaf)?;
+        let final_leaf = destination_leaf(&registration.destination)?;
         let entry = ArtifactManifest::new(
             &artifact_id,
             &registration.producer_label,
@@ -3355,6 +3560,11 @@ impl AttemptPublication {
             0,
             &"0".repeat(64),
             ArtifactState::Staging,
+        )?
+        .with_destination(
+            owned_root_identifier(destination_root.as_path()),
+            final_leaf,
+            publication_leaf.clone(),
         )?;
         let mut next = self.manifest.clone();
         next.artifacts.push(entry);
@@ -3531,6 +3741,8 @@ impl AttemptPublication {
         let artifact_id = format!("artifact-{:08x}", self.artifacts.len() + 1);
         let source = self.validated_artifact_in_root(&self.owner_root_key, &artifact_id)?;
         registry.ensure_destination_available(producer_label, destination.as_path())?;
+        let destination_root = destination_parent(&destination)?;
+        let final_leaf = destination_leaf(&destination)?;
         let entry = ArtifactManifest::new(
             &artifact_id,
             producer_label,
@@ -3538,6 +3750,11 @@ impl AttemptPublication {
             0,
             &"0".repeat(64),
             ArtifactState::Staging,
+        )?
+        .with_destination(
+            owned_root_identifier(destination_root.as_path()),
+            final_leaf,
+            artifact_id.clone(),
         )?;
         let mut next = self.manifest.clone();
         next.artifacts.push(entry);
@@ -3689,6 +3906,9 @@ impl AttemptPublication {
             if self.fault == Some(AttemptFault::Digest) {
                 return Err(AttemptError::Injected("destination artifact digest"));
             }
+            drop(destination_file);
+            let mut destination_file =
+                self.open_artifact_in_root(&publication_root_key, publication_leaf)?;
             let (destination_size, destination_digest) =
                 digest_file(&mut destination_file, publication_source.as_path())?;
             let source_digest = source_hasher.finalize().to_hex().to_string();
@@ -3777,62 +3997,53 @@ impl AttemptPublication {
         publishing.state = AttemptState::Publishing;
         self.persist_replacement(publishing, false)?;
         let mode = self.publication_mode();
-        let execution_id = self.execution_id.clone();
         let artifact_ids = self
             .artifacts
             .iter()
             .map(|artifact| artifact.artifact_id.clone())
             .collect::<Vec<_>>();
-        let outcome_result = match self.fault {
+        let fault = self.fault;
+        let mut barrier = |index: usize, stage: AttemptCommitStage| {
+            let artifact_id = artifact_ids.get(index).ok_or_else(|| {
+                std::io::Error::other("publication stage referenced an unknown artifact")
+            })?;
+            if stage == AttemptCommitStage::Rename {
+                let mut intent = self.manifest.clone();
+                let artifact = intent.artifacts.get_mut(index).ok_or_else(|| {
+                    std::io::Error::other("publication intent referenced an unknown artifact")
+                })?;
+                artifact.state = ArtifactState::Promoting;
+                self.persist_replacement(intent, false)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                if fault == Some(AttemptFault::PromotionInterrupted) {
+                    return Err(std::io::Error::other(
+                        "injected interruption after durable promotion intent",
+                    ));
+                }
+            }
+            let stage = match stage {
+                AttemptCommitStage::Rename => AttemptTestStage::Rename,
+                AttemptCommitStage::ParentDirectorySynchronization => {
+                    AttemptTestStage::ParentDirectorySynchronization
+                }
+            };
+            self.await_qualification_release(artifact_id, stage)
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        };
+        let outcome_result = match fault {
             Some(AttemptFault::BeforeRename) => {
-                registry.commit_all_inner(Some(0), None, None, None)
+                registry.commit_all_inner(Some(0), None, None, Some(&mut barrier))
             }
             Some(AttemptFault::DirectorySync) => {
-                registry.commit_all_inner(None, Some(0), None, None)
+                registry.commit_all_inner(None, Some(0), None, Some(&mut barrier))
             }
-            _ => {
-                #[cfg(target_os = "linux")]
-                if self.qualification_stage_control.is_some() {
-                    let control = &mut self.qualification_stage_control;
-                    let mut barrier = |index: usize, stage: AttemptCommitStage| {
-                        let artifact_id = artifact_ids.get(index).ok_or_else(|| {
-                            std::io::Error::other(
-                                "qualification stage referenced an unknown artifact",
-                            )
-                        })?;
-                        let stage = match stage {
-                            AttemptCommitStage::Rename => AttemptTestStage::Rename,
-                            AttemptCommitStage::ParentDirectorySynchronization => {
-                                AttemptTestStage::ParentDirectorySynchronization
-                            }
-                        };
-                        control
-                            .as_mut()
-                            .expect("control presence was checked")
-                            .await_release(AttemptTestEvent {
-                                execution_id: execution_id.clone(),
-                                artifact_id: artifact_id.clone(),
-                                publication_mode: mode,
-                                stage,
-                            })
-                            .map_err(|error| std::io::Error::other(error.to_string()))
-                    };
-                    registry.commit_all_with_stage_control(&mut barrier)
-                } else {
-                    registry.commit_all()
-                }
-                #[cfg(not(target_os = "linux"))]
-                registry.commit_all()
-            }
+            _ => registry.commit_all_with_stage_control(&mut barrier),
         };
         let outcome = match outcome_result {
             Ok(outcome) => outcome,
             Err(error) => {
                 let mut incomplete = self.manifest.clone();
                 incomplete.state = AttemptState::Incomplete;
-                for artifact in &mut incomplete.artifacts {
-                    artifact.state = ArtifactState::Unpublished;
-                }
                 self.persist_replacement(incomplete, false)?;
                 self.terminal = true;
                 return Err(error.into());
@@ -4233,6 +4444,17 @@ fn destination_parent(destination: &ValidatedPath) -> Result<ValidatedPath, Atte
         .map_err(|_| AttemptError::InvalidManifest("destination parent failed validation"))
 }
 
+fn destination_leaf(destination: &ValidatedPath) -> Result<String, AttemptError> {
+    destination
+        .as_path()
+        .file_name()
+        .and_then(|leaf| leaf.to_str())
+        .map(str::to_owned)
+        .ok_or(AttemptError::InvalidManifest(
+            "artifact destination leaf is not valid UTF-8",
+        ))
+}
+
 fn destination_root_key(path: &Path) -> String {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -4369,6 +4591,20 @@ fn validate_artifact_id(artifact_id: &str) -> Result<(), AttemptError> {
         ));
     }
     Ok(())
+}
+
+fn validate_artifact_leaf(leaf: &str) -> Result<(), AttemptError> {
+    if !leaf.is_empty()
+        && leaf.len() <= 64
+        && !Path::new(leaf).is_absolute()
+        && Path::new(leaf).components().count() == 1
+    {
+        Ok(())
+    } else {
+        Err(AttemptError::InvalidManifest(
+            "quarantine_leaf must be one bounded relative path component",
+        ))
+    }
 }
 
 fn validate_text(

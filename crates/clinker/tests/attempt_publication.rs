@@ -1477,6 +1477,61 @@ fn injected_boundaries_leave_exact_non_success_state() {
     }
 }
 
+#[test]
+fn fresh_query_reconciles_durable_promotion_intent_from_handles() {
+    for final_visible in [false, true] {
+        let root = tempfile::tempdir().expect("temporary destination");
+        let registry = OutputStagingRegistry::default();
+        let mut attempt = begin(root.path());
+        let (artifact_id, mut file) = attempt
+            .stage_direct(
+                &registry,
+                validated(root.path(), "result.bin"),
+                "primary-output",
+                "result.bin",
+                PromotionDisposition::Replace,
+            )
+            .expect("stage artifact");
+        file.write_all(b"promotion evidence")
+            .expect("write fixture");
+        drop(file);
+        attempt.mark_ready(&artifact_id).expect("ready artifact");
+        attempt.set_fault_for_testing(AttemptFault::PromotionInterrupted);
+        attempt
+            .publish(&registry, &ShutdownToken::detached())
+            .expect_err("promotion interruption must not fabricate an outcome");
+        let attempt_root = attempt.attempt_root().to_path_buf();
+        let retained = AttemptManifest::read(attempt.manifest_path(), 400_000)
+            .expect("durable promotion intent");
+        assert_eq!(retained.artifacts()[0].state(), ArtifactState::Promoting);
+        drop(attempt);
+        drop(registry);
+
+        if final_visible {
+            std::fs::rename(
+                attempt_root.join(&artifact_id),
+                root.path().join("result.bin"),
+            )
+            .expect("simulate rename before process loss");
+        }
+        let policy = bounded_policy(root.path(), 0, 1_000, 8_000_000_000, 2_000);
+        let query = query(root.path(), &policy, "promotion_reconciliation");
+        let root_id = query.owned_root_ids()[0].to_owned();
+        let inspection = query
+            .inspect(&root_id, EXECUTION_ID, 400_000)
+            .expect("fresh handle-relative inspection");
+        let expected = if final_visible {
+            ArtifactState::VisibleUnsynchronized
+        } else {
+            ArtifactState::Unpublished
+        };
+        assert_eq!(
+            inspection.artifact_states(),
+            &[(artifact_id.clone(), expected)]
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn quota_fault_is_an_explicit_seam_and_never_a_mounted_observation() {
@@ -1918,13 +1973,8 @@ fn bounded_attempt_listing_stops_at_exact_entry_byte_and_monotonic_time_limits()
         .expect("bounded entry listing");
     assert_eq!(entry_page.considered_entries(), 1);
     assert!(entry_page.considered_bytes() <= entry_policy.sweep_byte_limit());
-    assert!(entry_page.continuation().is_some());
-    assert!(
-        entry_page
-            .cleanup_debt()
-            .iter()
-            .any(|debt| debt.kind() == CleanupDebtKind::EntryBudget)
-    );
+    assert!(entry_page.continuation().is_none());
+    assert!(entry_page.cleanup_debt().is_empty());
 
     let byte_policy = bounded_policy(root.path(), 86_400, 1_000, 1, 2_000);
     let byte_query = query(root.path(), &byte_policy, "byte_budget");
@@ -2126,6 +2176,15 @@ fn continuation_is_versioned_plan_root_selector_bound_and_single_use() {
     let second = tempfile::tempdir().expect("second destination");
     let first_attempt = begin(first.path());
     drop(first_attempt);
+    let second_attempt_id = "018f47a2-9a41-7a27-b4d6-4f7137e3c160";
+    let second_attempt = AttemptPublication::create(
+        validated(first.path(), "."),
+        second_attempt_id,
+        1_000,
+        301_000,
+    )
+    .expect("second bounded attempt");
+    drop(second_attempt);
     let policy = bounded_policy(first.path(), 86_400, 1, 8_000_000_000, 2_000);
     let query = AttemptQuery::new(
         &compiled_plan("continuation_binding"),
@@ -2416,19 +2475,15 @@ fn purge_is_metadata_last_resumable_and_idempotent_after_partial_progress() {
     let attempt_root = attempt.attempt_root().to_path_buf();
     drop(attempt);
 
-    let policy = bounded_policy(root.path(), 86_400, 1_000, 8_000_000_000, 2);
+    let policy = bounded_policy(root.path(), 86_400, 2, 8_000_000_000, 2_000);
     let query = query(root.path(), &policy, "partial_purge");
     let root_id = query.owned_root_ids()[0].to_owned();
     let request = query
         .purge_execution(&root_id, EXECUTION_ID)
         .expect("typed purge request");
     let shutdown = ShutdownToken::detached();
-    let mut calls = 0_u64;
     let partial = query
-        .execute_with_elapsed(&request, 400_000, None, &shutdown, || {
-            calls += 1;
-            if calls <= 7 { 0 } else { 2 }
-        })
+        .execute(&request, 400_000, None, &shutdown)
         .expect("bounded partial purge");
     assert_eq!(partial.disposition(), PurgeDisposition::Partial);
     assert_eq!(partial.removed_artifact_count(), 1);
