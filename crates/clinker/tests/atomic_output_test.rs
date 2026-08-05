@@ -13,6 +13,7 @@ fn assert_abandoned_attempt(root: &std::path::Path, expected_leaf: &str) {
     let attempts = std::fs::read_dir(&namespace)
         .expect("retained attempt namespace")
         .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .collect::<Vec<_>>();
     assert_eq!(attempts.len(), 1, "one run must own one retained attempt");
     let attempt_root = attempts[0].path();
@@ -91,14 +92,26 @@ nodes:
         "rows: {body}"
     );
 
-    // Sweep the dir for hidden partial/reservation files — none should remain.
+    // Successful publication leaves no attempt receipt. The internal admission
+    // mutex remains in its reserved namespace so later processes serialize on
+    // the same inode generation.
+    let admission_namespace = dir.path().join(".clinker-attempts");
+    let admission_entries = std::fs::read_dir(&admission_namespace)
+        .expect("internal admission namespace")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(admission_entries, [".admission.lock"]);
+
+    // Sweep the dir for hidden partial/reservation files — only the internal
+    // admission namespace may remain.
     let tmp_leftovers: Vec<PathBuf> = std::fs::read_dir(dir.path())
         .expect("readdir")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(".clinker-") || n.starts_with(".tmp"))
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                (n.starts_with(".clinker-") && n != ".clinker-attempts") || n.starts_with(".tmp")
+            })
         })
         .collect();
     assert!(
@@ -960,6 +973,11 @@ nodes:
     include_unmapped: true
 "#;
     std::fs::write(&pipeline_path, pipeline).expect("write pipeline");
+    std::fs::write(
+        dir.path().join("clinker.toml"),
+        "[storage.publication]\nmax_attempt_bytes = \"1MB\"\nretained_byte_limit = \"8MB\"\n",
+    )
+    .expect("write bounded concurrent-attempt policy");
 
     // Pre-touch the bare path so every process must walk to a suffix.
     std::fs::write(dir.path().join("out.csv"), "").expect("touch bare");

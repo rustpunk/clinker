@@ -4277,7 +4277,8 @@ impl AttemptPublication {
             final_leaf,
             publication_leaf.clone(),
         )?;
-        let mut next = self.manifest.clone();
+        let previous = self.manifest.clone();
+        let mut next = previous.clone();
         next.artifacts.push(entry);
         next.artifact_count = next.artifacts.len();
         self.persist_replacement(next, self.fault == Some(AttemptFault::ManifestReplace))?;
@@ -4285,7 +4286,18 @@ impl AttemptPublication {
             registration.destination.clone(),
             containment_profile(profile),
         )?;
-        let reservation = destination_boundary.reserve_for_attempt(registration.disposition)?;
+        let reservation = match destination_boundary.reserve_for_attempt(registration.disposition) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                // Unique-suffix publication retries destination collisions. Remove
+                // the intent that belongs to the rejected candidate before the
+                // caller allocates a new artifact identifier. If rollback cannot
+                // be persisted, fail with that error so the candidate is not
+                // retried against ambiguous durable state.
+                self.persist_replacement(previous, false)?;
+                return Err(error.into());
+            }
+        };
         let (local_source, file, copied_from_local) = match mode {
             PublicationMode::Direct => {
                 let file =
