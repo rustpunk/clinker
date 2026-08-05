@@ -1408,7 +1408,7 @@ fn semantic_test(state: &EnvironmentState, evidence: &Path) -> Result<SemanticLo
 
     let publication_log = log_directory(evidence).join("publication-test.txt");
     let control_log = log_directory(evidence).join("publication-control.txt");
-    let result = controlled_publication_test(state, environment, &control_log)?;
+    let result = controlled_publication_test(state, environment, &control_log, &publication_log)?;
     let publication = require_semantic_success(
         &publication_log,
         &result,
@@ -1459,6 +1459,7 @@ fn controlled_publication_test(
     state: &EnvironmentState,
     mut environment: BTreeMap<OsString, OsString>,
     control_log: &Path,
+    publication_log: &Path,
 ) -> Result<ChildResult, GateError> {
     let endpoint = state.scratch.join("publication-control.sock");
     if endpoint.exists() {
@@ -1508,6 +1509,7 @@ fn controlled_publication_test(
     let child_result = worker
         .join()
         .map_err(|_| missing("mounted publication child thread panicked"))??;
+    write_child_observation(publication_log, &child_result)?;
     control?;
     if !endpoint_removed {
         return Err(missing("publication control endpoint cleanup failed"));
