@@ -1788,6 +1788,43 @@ fn anchored_cleanup_rejects_linked_artifacts_without_mutating_outside_data() {
     assert!(attempt_root.join("manifest.json").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn readiness_reopen_rejects_artifact_leaf_substitution() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let outside = tempfile::tempdir().expect("outside directory");
+    let outside_canary = outside.path().join("canary.bin");
+    std::fs::write(&outside_canary, b"outside").expect("outside canary");
+    let registry = OutputStagingRegistry::default();
+    let mut attempt = begin(root.path());
+    let (artifact_id, mut file) = attempt
+        .stage_direct(
+            &registry,
+            validated(root.path(), "result.bin"),
+            "out",
+            "result.bin",
+            PromotionDisposition::Replace,
+        )
+        .expect("stage artifact");
+    file.write_all(b"owned").expect("write artifact");
+    drop(file);
+
+    let artifact_path = attempt.attempt_root().join(&artifact_id);
+    std::fs::remove_file(&artifact_path).expect("remove admitted artifact");
+    std::os::unix::fs::symlink(&outside_canary, &artifact_path)
+        .expect("substitute artifact symlink");
+
+    let error = attempt
+        .mark_ready(&artifact_id)
+        .expect_err("handle-relative no-follow reopen must reject substitution");
+    assert!(
+        error.to_string().contains("security_policy")
+            || error.to_string().contains("containment"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&outside_canary).unwrap(), b"outside");
+}
+
 #[test]
 fn attempt_creation_and_cleanup_reject_replaced_directory_components() {
     let root = tempfile::tempdir().expect("temporary destination");

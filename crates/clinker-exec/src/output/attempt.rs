@@ -3347,6 +3347,27 @@ impl AttemptPublication {
             .map_err(AttemptError::from)
     }
 
+    fn open_artifact_in_root(&self, root_key: &str, leaf: &str) -> Result<File, AttemptError> {
+        if root_key == self.owner_root_key {
+            return self
+                .attempt_root
+                .as_ref()
+                .ok_or(AttemptError::InvalidTransition("attempt root was removed"))?
+                .directory
+                .open_file(leaf)
+                .map_err(AttemptError::from);
+        }
+        self.additional_roots
+            .get(root_key)
+            .ok_or(AttemptError::InvalidTransition(
+                "destination attempt root is missing",
+            ))?
+            .root
+            .directory
+            .open_file(leaf)
+            .map_err(AttemptError::from)
+    }
+
     fn remove_artifact_in_root(&self, root_key: &str, leaf: &str) -> Result<(), AttemptError> {
         if root_key == self.owner_root_key {
             return self
@@ -3489,11 +3510,19 @@ impl AttemptPublication {
                 source: std::io::Error::from_raw_os_error(libc::EDQUOT),
             });
         }
-        let mut local_file = File::open(local_path).map_err(|source| AttemptError::Io {
-            operation: "open staged artifact",
-            path: local_path.to_path_buf(),
-            source,
-        })?;
+        let local_leaf = local_source
+            .as_path()
+            .file_name()
+            .and_then(|leaf| leaf.to_str())
+            .ok_or(AttemptError::InvalidManifest(
+                "local artifact leaf is not UTF-8",
+            ))?;
+        let local_root_key = if copied_from_local {
+            self.owner_root_key.as_str()
+        } else {
+            publication_root_key.as_str()
+        };
+        let mut local_file = self.open_artifact_in_root(local_root_key, local_leaf)?;
         if !copied_from_local {
             self.await_qualification_release(artifact_id, AttemptTestStage::FileSynchronization)?;
         }
@@ -3573,11 +3602,11 @@ impl AttemptPublication {
                     path: publication_source.as_path().to_path_buf(),
                     source,
                 })?;
-            drop(destination_file);
             if self.fault == Some(AttemptFault::Digest) {
                 return Err(AttemptError::Injected("destination artifact digest"));
             }
-            let (destination_size, destination_digest) = digest_file(publication_source.as_path())?;
+            let (destination_size, destination_digest) =
+                digest_file(&mut destination_file, publication_source.as_path())?;
             let source_digest = source_hasher.finalize().to_hex().to_string();
             if copied != local_size
                 || destination_size != local_size
@@ -3593,7 +3622,7 @@ impl AttemptPublication {
             if self.fault == Some(AttemptFault::Digest) {
                 return Err(AttemptError::Injected("artifact digest"));
             }
-            digest_file(local_path)?
+            digest_file(&mut local_file, local_path)?
         };
         let mut next = self.manifest.clone();
         let entry = next
@@ -4171,9 +4200,9 @@ fn containment_profile(profile: DestinationProfile) -> &'static str {
     }
 }
 
-fn digest_file(path: &Path) -> Result<(u64, String), AttemptError> {
-    let mut file = File::open(path).map_err(|source| AttemptError::Io {
-        operation: "open artifact for digest",
+fn digest_file(file: &mut File, path: &Path) -> Result<(u64, String), AttemptError> {
+    file.rewind().map_err(|source| AttemptError::Io {
+        operation: "rewind artifact for digest",
         path: path.to_path_buf(),
         source,
     })?;

@@ -49,20 +49,7 @@ impl PendingStage {
     fn preflight(&self) -> Result<(), ContainmentError> {
         match self {
             Self::DestinationLocal(staged) => staged.preflight(),
-            Self::AttemptOwned {
-                reservation,
-                source_path,
-                ..
-            } => {
-                std::fs::File::open(source_path)
-                    .and_then(|file| file.sync_all())
-                    .map_err(|source| ContainmentError::Io {
-                        operation: "sync-attempt-artifact",
-                        path: source_path.clone(),
-                        source,
-                    })?;
-                reservation.preflight()
-            }
+            Self::AttemptOwned { reservation, .. } => reservation.preflight(),
         }
     }
 

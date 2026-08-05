@@ -548,9 +548,11 @@ impl OutputContainment {
         reservation: Option<Reservation>,
     ) -> Result<(), ContainmentError> {
         if let Some(reservation) = reservation {
+            self.parent.remove_leaf(&reservation.leaf)?;
+            self.parent
+                .sync(parent_path_of(self.destination.as_path()))?;
             let _ = FileExt::unlock(&reservation.file);
             drop(reservation.file);
-            self.parent.remove_leaf(&reservation.leaf)?;
         }
         Ok(())
     }
@@ -691,9 +693,7 @@ impl StagedOutput {
         &mut self,
         fail_cleanup: bool,
     ) -> Result<(), ContainmentError> {
-        if let Some(reservation) = self.reservation.take() {
-            let _ = FileExt::unlock(&reservation.file);
-            drop(reservation.file);
+        if let Some(reservation) = self.reservation.as_ref() {
             if fail_cleanup {
                 self.state = PublicationState::Finalized;
                 let source = ContainmentError::io(
@@ -706,17 +706,32 @@ impl StagedOutput {
                 );
                 return Err(ContainmentError::PublishedCleanup {
                     path: self.destination.destination.as_path().to_path_buf(),
-                    stale_path: reservation.path,
+                    stale_path: reservation.path.clone(),
                     source: Box::new(source),
                 });
             }
-            if let Err(source) = self.destination.parent.remove_leaf(&reservation.leaf) {
+            if let Err(source) = self
+                .destination
+                .parent
+                .remove_leaf(&reservation.leaf)
+                .and_then(|()| {
+                    self.destination
+                        .parent
+                        .sync(parent_path_of(self.destination.destination.as_path()))
+                })
+            {
                 return Err(ContainmentError::PublishedCleanup {
                     path: self.destination.destination.as_path().to_path_buf(),
-                    stale_path: reservation.path,
+                    stale_path: reservation.path.clone(),
                     source: Box::new(source),
                 });
             }
+            let reservation = self
+                .reservation
+                .take()
+                .expect("reservation remained present until locked release completed");
+            let _ = FileExt::unlock(&reservation.file);
+            drop(reservation.file);
         }
         self.state = PublicationState::Finalized;
         Ok(())
@@ -725,10 +740,15 @@ impl StagedOutput {
     /// Remove an unpublishable quarantine and release its destination lock.
     pub(crate) fn discard(mut self) -> Result<(), ContainmentError> {
         self.destination.parent.remove_leaf(&self.quarantine_leaf)?;
+        if let Some(reservation) = self.reservation.as_ref() {
+            self.destination.parent.remove_leaf(&reservation.leaf)?;
+            self.destination
+                .parent
+                .sync(parent_path_of(self.destination.destination.as_path()))?;
+        }
         if let Some(reservation) = self.reservation.take() {
             let _ = FileExt::unlock(&reservation.file);
             drop(reservation.file);
-            self.destination.parent.remove_leaf(&reservation.leaf)?;
         }
         self.state = PublicationState::Finalized;
         Ok(())
@@ -754,10 +774,16 @@ impl StagedOutput {
 
 impl Drop for StagedOutput {
     fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.as_ref() {
+            let _ = self.destination.parent.remove_leaf(&reservation.leaf);
+            let _ = self
+                .destination
+                .parent
+                .sync(parent_path_of(self.destination.destination.as_path()));
+        }
         if let Some(reservation) = self.reservation.take() {
             let _ = FileExt::unlock(&reservation.file);
             drop(reservation.file);
-            let _ = self.destination.parent.remove_leaf(&reservation.leaf);
         }
     }
 }
@@ -797,9 +823,7 @@ impl AttemptDestinationReservation {
         &mut self,
         fail_cleanup: bool,
     ) -> Result<(), ContainmentError> {
-        if let Some(reservation) = self.reservation.take() {
-            let _ = FileExt::unlock(&reservation.file);
-            drop(reservation.file);
+        if let Some(reservation) = self.reservation.as_ref() {
             if fail_cleanup {
                 let source = ContainmentError::io(
                     "remove-destination-reservation",
@@ -811,17 +835,32 @@ impl AttemptDestinationReservation {
                 );
                 return Err(ContainmentError::PublishedCleanup {
                     path: self.destination.destination.as_path().to_path_buf(),
-                    stale_path: reservation.path,
+                    stale_path: reservation.path.clone(),
                     source: Box::new(source),
                 });
             }
-            if let Err(source) = self.destination.parent.remove_leaf(&reservation.leaf) {
+            if let Err(source) = self
+                .destination
+                .parent
+                .remove_leaf(&reservation.leaf)
+                .and_then(|()| {
+                    self.destination
+                        .parent
+                        .sync(parent_path_of(self.destination.destination.as_path()))
+                })
+            {
                 return Err(ContainmentError::PublishedCleanup {
                     path: self.destination.destination.as_path().to_path_buf(),
-                    stale_path: reservation.path,
+                    stale_path: reservation.path.clone(),
                     source: Box::new(source),
                 });
             }
+            let reservation = self
+                .reservation
+                .take()
+                .expect("reservation remained present until locked release completed");
+            let _ = FileExt::unlock(&reservation.file);
+            drop(reservation.file);
         }
         Ok(())
     }
@@ -829,10 +868,16 @@ impl AttemptDestinationReservation {
 
 impl Drop for AttemptDestinationReservation {
     fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.as_ref() {
+            let _ = self.destination.parent.remove_leaf(&reservation.leaf);
+            let _ = self
+                .destination
+                .parent
+                .sync(parent_path_of(self.destination.destination.as_path()));
+        }
         if let Some(reservation) = self.reservation.take() {
             let _ = FileExt::unlock(&reservation.file);
             drop(reservation.file);
-            let _ = self.destination.parent.remove_leaf(&reservation.leaf);
         }
     }
 }
@@ -966,6 +1011,38 @@ mod tests {
             .expect("next boundary");
         next.stage(PromotionDisposition::Replace)
             .expect("dropping the first publisher releases the reservation");
+    }
+
+    #[test]
+    fn completed_publisher_cannot_unlink_the_next_publishers_reservation() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        let destination = || {
+            validate_path(Path::new("result.bin"), root.path(), false)
+                .expect("destination fixture should validate")
+        };
+        let first_boundary = OutputContainment::for_profile(destination(), "local-filesystem")
+            .expect("first boundary");
+        let mut first = first_boundary
+            .reserve_for_attempt(PromotionDisposition::Replace)
+            .expect("first publisher reserves destination");
+        first
+            .finalize_with_cleanup_fault(false)
+            .expect("first publisher removes its reservation while locked");
+
+        let second_boundary = OutputContainment::for_profile(destination(), "local-filesystem")
+            .expect("second boundary");
+        let second = second_boundary
+            .reserve_for_attempt(PromotionDisposition::Replace)
+            .expect("second publisher acquires a new reservation generation");
+        drop(first);
+
+        let third_boundary = OutputContainment::for_profile(destination(), "local-filesystem")
+            .expect("third boundary");
+        let error = third_boundary
+            .reserve_for_attempt(PromotionDisposition::Replace)
+            .expect_err("third publisher must observe the second publishers live reservation");
+        assert!(error.to_string().contains("reserved"), "{error}");
+        drop(second);
     }
 
     #[cfg(target_os = "macos")]
