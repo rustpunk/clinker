@@ -527,7 +527,17 @@ impl OutputContainment {
                 Err(ContainmentError::Io { source, .. })
                     if source.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 =>
                 {
-                    let existing = self.parent.open_existing_leaf(&leaf, &path)?;
+                    let existing = match self.parent.open_existing_leaf(&leaf, &path) {
+                        Ok(existing) => existing,
+                        Err(error)
+                            if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) =>
+                        {
+                            // The previous owner released the name between
+                            // our create-new result and this fallback open.
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let old_enough = existing
                         .metadata()
                         .and_then(|metadata| metadata.modified())
