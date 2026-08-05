@@ -69,6 +69,90 @@ liveness is established by the lock plus grace rule rather than by silently
 deleting a file that might belong to a live run. Output publication does not use
 `.backup` entries.
 
+### Attempt-owned publication modes
+
+Output publication is resolved from the strict `[storage.publication]` block
+before an attempt directory or output leaf is created. The run-owned attempt
+uses the invocation's existing execution ID and registers primary, per-source
+fan-out, split, dead-letter, and metadata-sidecar artifacts in one bounded
+ledger. A bounded map of compiled destination parents lets one run target more
+than one directory without inventing a common filesystem root. Duplicate
+destinations are rejected before attempt creation.
+
+`mode = "direct"` is the default. Each writer receives an owner-only file in
+the attempt directory on its destination filesystem. Publication synchronizes
+that file and promotes it by same-filesystem rename; it never copies and never
+falls back to another mode.
+
+`mode = "local_then_publish"` requires `local_spool_dir` on a local filesystem.
+The writer first produces and synchronizes an owner-only local file. The
+publisher then copies it in bounded 1 MiB chunks into the destination attempt
+directory, synchronizes the destination file, and verifies both the checked
+byte count and BLAKE3 digest before marking the artifact ready. The local copy
+is unlinked only after the destination-owned manifest state is durable. The final leaf
+is still reached solely by destination-local promotion; no copy writes directly
+to a visible final. A copy, synchronization, digest, manifest, rename, or
+directory-sync failure retains truthful incomplete state and never changes the
+selected mode.
+
+`destination_profile` is explicit: `local` (the default), `nfs_v4_1`, or
+`smb_3_1_1`. A detected share under `local`, or a detected protocol that does
+not match the qualified share profile, fails before publication effects. The
+probe distinguishes NFS, SMB/CIFS, and other network or userspace mounts;
+platforms that report only an undifferentiated remote drive fail closed for
+the qualified NFS and SMB profiles. The
+remaining strict keys are `failed_retention_seconds`,
+`creation_grace_seconds`, `max_attempt_bytes`, `retained_byte_limit`,
+`retained_attempt_limit`, `min_free_bytes`, `sweep_entry_limit`,
+`sweep_byte_limit`, and `sweep_time_limit_ms`. Their fixed defaults and hard
+ceilings are enforced during policy resolution; only failed-attempt retention
+permits zero. Resolution also requires `sweep_byte_limit` to cover
+`max_attempt_bytes` plus the bounded 4 MiB manifest, so a valid maximum-sized
+attempt cannot permanently stall cleanup paging.
+
+Free space is observed once at admission and compared with the checked attempt
+estimate plus `min_free_bytes`. That observation is advisory. It reserves no
+blocks or quota, proves no completion guarantee, and does not suppress a later
+`ENOSPC` or `EDQUOT` from a write or synchronization call. Default attempt
+results carry logical execution/artifact IDs, logical leaves, and exact
+published, visible-unsynchronized, or unpublished states. Physical paths are
+available only through an explicit opt-in intended for sanitized diagnostics.
+
+Aggregate retained-attempt admission acquires handle-relative lock files under
+each root's internal `.clinker-attempts` namespace in canonical root order and
+holds them through inventory, eligible cleanup, limit checks, and creation of
+every execution root. The lock never occupies an author-addressable final
+leaf, and namespace paging recognizes it as internal metadata. Each new root
+manifest durably carries the admitted byte estimate before those locks are
+released. Inventory sums manifest-owned regular files across roots and charges
+at least one per-execution reservation until every artifact size is exact;
+simultaneous local-spool and destination quarantine copies still count
+physically. Missing or uninspectable ownership evidence is conservative debt,
+never a zero-byte assumption.
+Namespace enumeration is bounded by the publication policy's fixed maximum,
+not the current desired retained count. A configuration downgrade therefore
+still returns physical attempts through advancing continuation tokens while
+also reporting that the aggregate count exceeds current policy.
+
+The operator query recompiles with the same default anchor as `run` (the
+pipeline file's directory when no base is explicit) and replays bounded
+file-source discovery before rendering per-source output paths. Execution ID
+used in a path template is a separate typed input from an exact purge selector,
+which lets expired cleanup reconstruct an execution-scoped root. Continuations
+cross the CLI as their canonical raw bytes; structured argument arrays are the
+authoritative automation surface and text commands apply platform quoting.
+
+Run-owned manifests also replicate a bounded historical-root receipt into the
+stable pipeline root. The receipt is bound to the compiled-plan hash, stores
+only typed logical source name/path pairs needed by `{source_file}` and
+`{source_path}`, and records sorted path-free identifiers for the execution's
+output and spool roots. It contains no direct deletion path. When live source
+discovery no longer finds a retained failure's inputs, operator compilation
+re-renders the authored templates from the receipt, validates the resulting
+paths, and requires their identifiers to match exactly. The stable replica is
+itself ordinary manifest ownership: successful publication removes it, while
+bounded purge removes it only after the same ownership checks as other roots.
+
 ### Remote filesystem qualification
 
 Normal CLI output is admitted from the filesystem type observed through the
@@ -86,17 +170,47 @@ tokens:
   authorizes I/O as the configured guest identity.
 
 The dedicated CI matrix provisions each server and mount inside its runner,
-executes a real `clinker run` success and failed-overwrite preservation on the
-mounted share, plus focused confinement, lock exclusion, synchronized
-promotion/visibility, cancellation, cross-filesystem refusal, and cleanup-
-liveness checks. It tears the environment down on every exit. Its per-profile
-artifact records the
-runner image and kernel, exact client/server package versions, effective mount
-options, negotiated protocol observations, lock behavior, synchronization and
-failure-injection results, and teardown status.
+places the exported root on a mounted 64 MiB temporary filesystem, and executes
+both publication modes. Success pauses after the exact `Complete` manifest and
+final are synchronized but before normal attempt cleanup. The harness reopens
+both through the mounted client, releases cleanup, and then proves the final is
+still present while the successful attempt root and manifest are absent. This
+barrier is installed only through a programmatic Linux qualification API; YAML,
+the ordinary CLI, and environment configuration cannot enable it, and success
+still creates no receipt or sidecar.
+
+The same local, identity-bound control pauses before copy, file sync, rename,
+and parent-directory sync. For every applicable mode/stage pair, the harness
+withdraws the exact NFS export or stops the exact Samba PID, force-lazy-detaches
+the client mount, releases the operation, observes a bounded non-success,
+restores and remounts the exact profile, and reopens its retained manifest. SMB
+remount uses a bounded retry while detached kernel client state is released.
+The harness then exercises
+bounded list, inspect, purge preview, and purge execution. A separate attempt fills the
+mounted bounded backing until the operating system returns `ENOSPC`; the final
+must remain absent and operator cleanup must remove the staging attempt.
+Deterministic `EDQUOT` coverage is recorded only as `seam_covered` unless a real
+quota is separately provisioned and observed.
+
+Evidence uses `clinker.filesystem-matrix-evidence/3`. It records the runner and
+kernel, exact package and protocol observations, mount and lock behavior, the
+six unchanged edge outcomes, six lifecycle classes, ordered success and
+interruption readbacks, real capacity behavior, recovery, persistence,
+operator cleanup, and environment teardown. Teardown and bounded evidence/log
+upload run unconditionally for passing, failing, timed-out, and interrupted
+matrix cells. Legacy schema 1 or any missing, unknown, or truncated proof is
+ineligible.
+
+The byte-range/OFD lock observation remains separate from publication
+admission. A dedicated production admission-lock section records independent
+test-binary processes calling `RunAttemptPublication::create` on the mounted
+profile with opposite multi-root order. Both the retained-count and
+retained-byte scenarios require bounded completion, exactly one admission, one
+rejection, and readback of the same retained execution from every mounted root.
 
 A profile is support-eligible only when that exact cell writes `status: passed`,
-`support_eligible: true`, and successful teardown evidence. Missing packages or
+`support_eligible: true`, and successful client-mount, bounded-backing, service,
+and workspace teardown evidence. Missing packages or
 administrative capability, mount/provision failure, incomplete observations, a
 semantic failure, or cleanup failure leaves `status: incomplete` and cannot be
 interpreted as support. These loopback results do not certify a corporate

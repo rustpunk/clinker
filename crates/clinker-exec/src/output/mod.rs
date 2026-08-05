@@ -6,6 +6,7 @@
 //! `clinker-exec` so both the binary crate and the executor can reach it
 //! without re-implementing the policy.
 
+pub mod attempt;
 pub mod containment;
 pub mod open;
 pub mod sidecar;

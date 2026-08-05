@@ -6,11 +6,11 @@ Clinker uses structured exit codes to communicate the outcome of a pipeline run.
 
 | Code | Meaning | Description |
 |------|---------|-------------|
-| 0 | Success | Pipeline completed. All records processed successfully. |
-| 1 | Configuration error | Invalid YAML, CXL syntax error, type mismatch, or DAG wiring problem. Fix the pipeline configuration. |
+| 0 | Success | Pipeline completed successfully, or an attempt operation completed without cleanup debt. A purge preview that safely selects nothing is also successful. |
+| 1 | Configuration or argument error | Invalid YAML, CXL syntax error, type mismatch, DAG wiring problem, invalid attempt selector, or invalid continuation. Fix the pipeline configuration or command arguments. |
 | 2 | Partial success | Pipeline ran to completion, but some records were routed to the dead-letter queue. Check the DLQ file. |
 | 3 | Evaluation error | CXL runtime error during record processing (e.g., division by zero, type coercion failure). |
-| 4 | I/O error | File not found, permission denied, disk full, or input format mismatch. |
+| 4 | Infrastructure or retained cleanup debt | File/format failure, disk full, or an attempt operation stopped with bounded, ambiguous, live, or otherwise retryable cleanup debt. This status never means completed-with-DLQ. |
 
 ## Understanding exit code 2
 
@@ -79,7 +79,7 @@ Error: division by zero in node 'compute_ratio'
 emit ratio = if count == 0 then 0 else total / count
 ```
 
-### Exit code 4: I/O error
+### Exit code 4: Infrastructure or retained cleanup debt
 
 File system or format errors:
 
@@ -94,8 +94,21 @@ Common causes:
 - Output file already exists (use `--force` to overwrite)
 - Disk full during output writing
 - Input file format does not match the declared type (e.g., invalid CSV)
+- A retained-attempt query reached its entry, byte, or monotonic-time bound
+- Cleanup kept an attempt because ownership, liveness, manifest, clock, or
+  filesystem evidence was ambiguous
 
-**Action:** Fix file paths, permissions, or disk space, then re-run.
+For `clinker attempts`, exit 4 includes path-free cleanup debt plus E371
+(unsafe or invalid attempt refused) or E372 (cleanup incomplete or budget
+exhausted) when the debt belongs to a logical execution. Follow the emitted
+retry advice and pasteable `clinker attempts inspect <workspace-relative.yaml>
+--execution-id <id>` command. If a continuation is present, paste its exact
+resume command to continue the bounded page. Do not treat status 4 as authority
+to delete a directory manually.
+
+**Action:** Fix file paths, permissions, or disk space for run failures. For
+attempt operations, inspect the named logical execution and resolve the stated
+debt before retrying or executing another bounded purge.
 
 ## Plan-time diagnostic codes
 

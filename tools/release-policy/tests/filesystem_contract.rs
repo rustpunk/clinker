@@ -46,6 +46,14 @@ jobs:
         env:
           EVIDENCE_PATH: ${{ runner.temp }}/filesystem-${{ matrix.profile }}.json
         run: cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem teardown --profile "${{ matrix.profile }}" --evidence "${EVIDENCE_PATH}"
+      - name: Upload profile evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: filesystem-${{ matrix.profile }}-evidence
+          path: ${{ runner.temp }}/filesystem-${{ matrix.profile }}*
+          if-no-files-found: error
+          retention-days: 14
 "#,
     )
     .expect("workflow fixture");
@@ -131,6 +139,21 @@ fn self_test_rejects_invalid_runner_topology_or_missing_direct_teardown() {
         (
             "workspace-evidence",
             base.replacen("${{ runner.temp }}", "${{ github.workspace }}", 1),
+        ),
+        (
+            "missing-upload",
+            base.replace(
+                "      - name: Upload profile evidence\n        if: always()\n        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n        with:\n          name: filesystem-${{ matrix.profile }}-evidence\n          path: ${{ runner.temp }}/filesystem-${{ matrix.profile }}*\n          if-no-files-found: error\n          retention-days: 14\n",
+                "",
+            ),
+        ),
+        (
+            "conditional-upload",
+            base.replacen(
+                "      - name: Upload profile evidence\n        if: always()\n",
+                "      - name: Upload profile evidence\n        if: failure()\n",
+                1,
+            ),
         ),
     ] {
         let path = root.path().join(format!("{name}.yml"));
@@ -226,7 +249,7 @@ fn exact_teardown_argv_cannot_upgrade_absent_or_incomplete_evidence() {
     fs::write(
         &evidence_path,
         format!(
-            "{{\"schema\":\"clinker.filesystem-matrix-evidence/v1\",\"profile\":\"{SMB}\",\"status\":\"incomplete\",\"support_eligible\":false,\"cleanup_success\":false}}\n"
+            "{{\"schema\":\"clinker.filesystem-matrix-evidence/3\",\"profile\":\"{SMB}\",\"status\":\"incomplete\",\"support_eligible\":false,\"cleanup_success\":false}}\n"
         ),
     )
     .unwrap();
@@ -347,6 +370,28 @@ fn mount_contract_requires_exact_loopback_protocol_and_lock_options() {
 
 fn complete_semantic_evidence() -> Value {
     json!({
+        "admission_lock_results": {
+            "api": "RunAttemptPublication::create",
+            "count_limit": {
+                "bounded_completion": "pass",
+                "estimated_attempt_bytes": 100,
+                "exactly_one_admitted": "pass",
+                "independent_processes": "pass",
+                "mounted_root_readback": "pass",
+                "opposite_root_order": "pass",
+                "retained_attempt_limit": 1
+            },
+            "lock": "fs4::FileExt::lock",
+            "retained_byte_limit": {
+                "bounded_completion": "pass",
+                "estimated_attempt_bytes": 100,
+                "exactly_one_admitted": "pass",
+                "independent_processes": "pass",
+                "mounted_root_readback": "pass",
+                "opposite_root_order": "pass",
+                "retained_byte_limit": 150
+            }
+        },
         "ci_identity": {
             "job": "filesystem-matrix",
             "repository": "rustpunk/clinker",
@@ -358,6 +403,7 @@ fn complete_semantic_evidence() -> Value {
         },
         "cleanup_observations": [
             "post_teardown_mount=absent",
+            "post_teardown_backing_mount=absent",
             "workspace_cleanup=pass",
             "cleanup_success=true"
         ],
@@ -371,8 +417,8 @@ fn complete_semantic_evidence() -> Value {
             "child_timeout=no_passing_evidence"
         ],
         "locations": {
-            "local_workspace": "/workspace",
-            "mounted_share": "/runner/mount"
+            "local_workspace": "repository_workspace",
+            "mounted_share": "profile_mount_root"
         },
         "lock_observations": [
             "holder=acquired",
@@ -393,17 +439,72 @@ fn complete_semantic_evidence() -> Value {
             "image_version": "20260801.1",
             "kernel": "6.11"
         },
-        "schema": "clinker.filesystem-matrix-evidence/v1",
-        "semantic_results": {
-            "confinement": "pass",
-            "rename_visibility": "pass",
-            "cancellation_no_final": "pass",
-            "sync_durability": "pass",
-            "cross_filesystem_no_copy": "pass",
-            "cleanup_liveness": "pass",
-            "test_filter": "remote_filesystem_matrix_semantics",
-            "test_log": "semantic-test.txt"
+        "capacity_results": {
+            "backing": "mounted_tmpfs_64_mib",
+            "edquot_seam": "seam_covered",
+            "enospc_final_absent": "pass",
+            "enospc_manifest_state": "staging",
+            "enospc_operator_cleanup": "pass",
+            "enospc_raw_os_error": 28,
+            "mounted_enospc": "pass",
+            "quota": "seam_covered"
         },
+        "edge_outcomes": {
+            "cancellation_no_final": "pass",
+            "cleanup_liveness": "pass",
+            "confinement": "pass",
+            "cross_filesystem_no_copy": "pass",
+            "rename_visibility": "pass",
+            "sync_durability": "pass"
+        },
+        "prohibitions": [
+            "copy_fallback_to_visible_final=absent",
+            "publication_mode_fallback=absent",
+            "cross_artifact_atomicity_claim=absent",
+            "cross_execution_staging_ownership=absent",
+            "raw_deletion_path_authority=absent"
+        ],
+        "publication_results": {
+            "lifecycle_classes": [
+                "success", "ordinary_failure", "interruption",
+                "ambiguity_durability_uncertainty", "purge_cleanup", "support_eligibility"
+            ],
+            "modes": ["direct", "local_then_publish"],
+            "operator_results": [
+                "list=pass", "inspect=pass", "purge_preview=pass",
+                "purge_execute=pass", "cleanup_debt=none"
+            ],
+            "persistence_results": [
+                "ordinary_failure=retained_manifest",
+                "interruption=retained_manifest",
+                "ambiguity_durability_uncertainty=retained_manifest"
+            ],
+            "recovery_results": [
+                "direct:file_synchronization=recovered_revalidated_completed_manifest_reopened",
+                "direct:rename=recovered_revalidated_completed_manifest_reopened",
+                "direct:parent_directory_synchronization=recovered_revalidated_completed_manifest_reopened",
+                "local_then_publish:copy=recovered_revalidated_completed_manifest_reopened",
+                "local_then_publish:file_synchronization=recovered_revalidated_completed_manifest_reopened",
+                "local_then_publish:rename=recovered_revalidated_completed_manifest_reopened",
+                "local_then_publish:parent_directory_synchronization=recovered_revalidated_completed_manifest_reopened"
+            ],
+            "stage_results": [
+                "direct:file_synchronization=interrupted_retained",
+                "direct:rename=interrupted_retained",
+                "direct:parent_directory_synchronization=interrupted_retained",
+                "local_then_publish:copy=interrupted_retained",
+                "local_then_publish:file_synchronization=interrupted_retained",
+                "local_then_publish:rename=interrupted_retained",
+                "local_then_publish:parent_directory_synchronization=interrupted_retained"
+            ],
+            "success_results": [
+                "direct=pre_cleanup_final_and_complete_manifest,post_cleanup_final_present_attempt_absent",
+                "local_then_publish=pre_cleanup_final_and_complete_manifest,post_cleanup_final_present_attempt_absent"
+            ],
+            "test_filter": "remote_filesystem_publication_matrix",
+            "test_log": "publication-test.txt"
+        },
+        "schema": "clinker.filesystem-matrix-evidence/3",
         "status": "semantic_pass",
         "support_eligible": false
     })
@@ -473,6 +574,24 @@ fn positive_transition_requires_complete_semantics_and_successful_teardown() {
     );
     assert_eq!(missing_lock["support_eligible"], false);
 
+    let mut missing_admission = complete_semantic_evidence();
+    missing_admission
+        .as_object_mut()
+        .expect("semantic evidence object")
+        .remove("admission_lock_results");
+    assert!(
+        clinker_release_policy::filesystem::finalize_qualification(&mut missing_admission, true)
+            .is_err()
+    );
+
+    let mut forged_admission = complete_semantic_evidence();
+    forged_admission["admission_lock_results"]["retained_byte_limit"]["exactly_one_admitted"] =
+        json!("forged");
+    assert!(
+        clinker_release_policy::filesystem::finalize_qualification(&mut forged_admission, true)
+            .is_err()
+    );
+
     let mut complete = complete_semantic_evidence();
     clinker_release_policy::filesystem::finalize_qualification(&mut complete, true)
         .expect("complete teardown may finalize evidence");
@@ -495,13 +614,70 @@ fn positive_transition_requires_complete_semantics_and_successful_teardown() {
 }
 
 #[test]
+fn v3_rejects_legacy_unknown_or_truncated_lifecycle_capacity_and_operator_evidence() {
+    let mut legacy = complete_semantic_evidence();
+    legacy["schema"] = json!("clinker.filesystem-matrix-evidence/v1");
+    assert!(clinker_release_policy::filesystem::finalize_qualification(&mut legacy, true).is_err());
+
+    for path in [
+        "capacity_results",
+        "admission_lock_results",
+        "edge_outcomes",
+        "prohibitions",
+        "publication_results",
+    ] {
+        let mut missing = complete_semantic_evidence();
+        missing
+            .as_object_mut()
+            .expect("evidence object")
+            .remove(path);
+        assert!(
+            clinker_release_policy::filesystem::finalize_qualification(&mut missing, true).is_err(),
+            "missing {path}"
+        );
+    }
+
+    for field in [
+        "stage_results",
+        "recovery_results",
+        "operator_results",
+        "persistence_results",
+        "success_results",
+    ] {
+        let mut truncated = complete_semantic_evidence();
+        truncated["publication_results"][field]
+            .as_array_mut()
+            .expect("result array")
+            .pop();
+        assert!(
+            clinker_release_policy::filesystem::finalize_qualification(&mut truncated, true)
+                .is_err(),
+            "truncated {field}"
+        );
+    }
+
+    let mut injected_capacity = complete_semantic_evidence();
+    injected_capacity["capacity_results"]["mounted_enospc"] = json!("injected");
+    assert!(
+        clinker_release_policy::filesystem::finalize_qualification(&mut injected_capacity, true)
+            .is_err()
+    );
+
+    let mut unknown = complete_semantic_evidence();
+    unknown["publication_results"]["unexpected"] = json!("pass");
+    assert!(
+        clinker_release_policy::filesystem::finalize_qualification(&mut unknown, true).is_err()
+    );
+}
+
+#[test]
 fn redundant_teardown_accepts_durable_failure_cleanup() {
     let root = TempDir::new().expect("temporary root");
     let evidence_path = root.path().join("filesystem.json");
     fs::write(
         &evidence_path,
         format!(
-            "{{\"cleanup_success\":true,\"failed_step\":\"server-and-mount\",\"profile\":\"{SMB}\",\"schema\":\"clinker.filesystem-matrix-evidence/v1\",\"status\":\"failed\",\"support_eligible\":false}}"
+            "{{\"cleanup_success\":true,\"failed_step\":\"server-and-mount\",\"profile\":\"{SMB}\",\"schema\":\"clinker.filesystem-matrix-evidence/3\",\"status\":\"failed\",\"support_eligible\":false}}"
         ),
     )
     .expect("failed evidence");
@@ -530,6 +706,10 @@ fn redundant_teardown_accepts_durable_failure_cleanup() {
 fn bounded_child_accepts_only_the_filesystem_semantic_environment_additions() {
     let mut environment = BTreeMap::new();
     for (name, value) in [
+        (
+            "CLINKER_FILESYSTEM_CONTROL_ENDPOINT",
+            "/tmp/publication-control.sock",
+        ),
         ("CLINKER_FILESYSTEM_PROFILE", NFS),
         ("CLINKER_FILESYSTEM_ROOT", "/tmp/mount"),
         ("CARGO_INCREMENTAL", "0"),
@@ -551,6 +731,7 @@ fn bounded_child_accepts_only_the_filesystem_semantic_environment_additions() {
     );
     let stdout = String::from_utf8(output.stdout).expect("environment output");
     for name in [
+        "CLINKER_FILESYSTEM_CONTROL_ENDPOINT=",
         "CLINKER_FILESYSTEM_PROFILE=",
         "CLINKER_FILESYSTEM_ROOT=",
         "CARGO_INCREMENTAL=0",

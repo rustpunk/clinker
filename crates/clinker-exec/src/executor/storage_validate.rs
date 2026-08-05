@@ -484,7 +484,11 @@ mod tests {
     use clinker_plan::config::SpillConfig;
 
     fn storage_with(spill: SpillConfig, staging: StagingPolicy) -> StorageConfig {
-        StorageConfig { spill, staging }
+        StorageConfig {
+            spill,
+            staging,
+            publication: Default::default(),
+        }
     }
 
     #[test]

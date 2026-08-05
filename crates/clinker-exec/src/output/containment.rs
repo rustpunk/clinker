@@ -111,6 +111,16 @@ pub enum ContainmentError {
     },
 }
 
+fn containment_kind(error: &ContainmentError) -> Option<std::io::ErrorKind> {
+    match error {
+        ContainmentError::Io { source, .. }
+        | ContainmentError::VisibleButUnsynced { source, .. } => Some(source.kind()),
+        ContainmentError::SecurityPolicy { .. }
+        | ContainmentError::PolicyRequired { .. }
+        | ContainmentError::PublishedCleanup { .. } => None,
+    }
+}
+
 impl ContainmentError {
     fn security(code: &'static str, path: &Path, detail: &'static str) -> Self {
         Self::SecurityPolicy {
@@ -137,6 +147,115 @@ pub struct OutputContainment {
     parent: platform::DirectoryAnchor,
 }
 
+/// Kind observed for one child through a retained directory handle.
+// Some native targets cannot expose every filesystem entry kind, while the
+// shared cleanup policy still needs the complete conservative vocabulary.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContainedEntryKind {
+    File,
+    Directory,
+    LinkOrReparse,
+    Other,
+}
+
+/// A bounded child-directory entry returned by handle-relative enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ContainedEntry {
+    pub(crate) name: OsString,
+    pub(crate) kind: ContainedEntryKind,
+    pub(crate) size_bytes: Option<u64>,
+}
+
+/// Exact result of a handle-relative enumeration stopped at a caller budget.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BoundedEntries {
+    pub(crate) entries: Vec<ContainedEntry>,
+    pub(crate) complete: bool,
+}
+
+/// A retained, link-free directory used for attempt ownership and deletion.
+#[derive(Debug)]
+pub(crate) struct AnchoredDirectory {
+    path: PathBuf,
+    anchor: platform::DirectoryAnchor,
+}
+
+impl AnchoredDirectory {
+    pub(crate) fn open(path: &ValidatedPath) -> Result<Self, ContainmentError> {
+        let path = absolute_path(path.as_path())?;
+        let anchor = platform::DirectoryAnchor::open(&path)?;
+        Ok(Self { path, anchor })
+    }
+
+    pub(crate) fn create_child(&self, leaf: &str) -> Result<Self, ContainmentError> {
+        let leaf = checked_child(leaf, &self.path)?;
+        let path = self.path.join(&leaf);
+        let anchor = self.anchor.create_child(&leaf, &path)?;
+        Ok(Self { path, anchor })
+    }
+
+    pub(crate) fn open_child(&self, leaf: &str) -> Result<Self, ContainmentError> {
+        let leaf = checked_child(leaf, &self.path)?;
+        let path = self.path.join(&leaf);
+        let anchor = self.anchor.open_child(&leaf, &path)?;
+        Ok(Self { path, anchor })
+    }
+
+    pub(crate) fn create_file(&self, leaf: &str) -> Result<File, ContainmentError> {
+        let leaf = checked_child(leaf, &self.path)?;
+        self.anchor
+            .open_leaf(&leaf, OpenDisposition::CreateNew, &self.path.join(&leaf))
+    }
+
+    pub(crate) fn open_file(&self, leaf: &str) -> Result<File, ContainmentError> {
+        let leaf = checked_child(leaf, &self.path)?;
+        self.anchor
+            .open_existing_leaf(&leaf, &self.path.join(&leaf))
+    }
+
+    pub(crate) fn entries(&self, limit: usize) -> Result<Vec<ContainedEntry>, ContainmentError> {
+        let result = self.bounded_entries(limit)?;
+        if result.complete {
+            Ok(result.entries)
+        } else {
+            Err(ContainmentError::security(
+                "contained_directory_entry_limit",
+                &self.path,
+                "contained directory exceeds its bounded entry limit",
+            ))
+        }
+    }
+
+    pub(crate) fn bounded_entries(&self, limit: usize) -> Result<BoundedEntries, ContainmentError> {
+        let probe_limit = limit.saturating_add(1);
+        let mut result = self.anchor.entries(&self.path, probe_limit)?;
+        if result.entries.len() > limit {
+            result.entries.truncate(limit);
+            result.complete = false;
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn remove_file(&self, leaf: &str) -> Result<(), ContainmentError> {
+        let leaf = checked_child(leaf, &self.path)?;
+        self.anchor.remove_leaf(&leaf)
+    }
+
+    pub(crate) fn remove_child(&self, leaf: &str) -> Result<(), ContainmentError> {
+        let leaf = checked_child(leaf, &self.path)?;
+        self.anchor.remove_child(&leaf, &self.path.join(&leaf))
+    }
+
+    pub(crate) fn sync(&self) -> Result<(), ContainmentError> {
+        self.anchor.sync(&self.path)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// A destination-local hidden output that is ready for atomic publication.
 ///
 /// The destination boundary and its retained parent handle stay alive from
@@ -151,6 +270,20 @@ pub struct StagedOutput {
     disposition: PromotionDisposition,
     reservation: Option<Reservation>,
     state: PublicationState,
+}
+
+/// Destination reservation retained while an attempt-owned artifact is
+/// written outside the destination directory.
+///
+/// This is the reservation half of [`StagedOutput`]. It deliberately reuses
+/// the same final-leaf lock and handle-relative promotion boundary while the
+/// artifact bytes remain owned by an [`AttemptPublication`](super::attempt::AttemptPublication)
+/// root.
+#[derive(Debug)]
+pub(crate) struct AttemptDestinationReservation {
+    destination: OutputContainment,
+    disposition: PromotionDisposition,
+    reservation: Option<Reservation>,
 }
 
 #[derive(Debug)]
@@ -248,45 +381,7 @@ impl OutputContainment {
         self,
         disposition: PromotionDisposition,
     ) -> Result<(StagedOutput, File), ContainmentError> {
-        if disposition == PromotionDisposition::NoReplace && self.destination_exists()? {
-            return Err(ContainmentError::io(
-                "reserve-destination-leaf",
-                self.destination.as_path(),
-                std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "destination already exists",
-                ),
-            ));
-        }
-        let mut reservation_leaf = OsString::from(".clinker-");
-        reservation_leaf.push(&self.leaf);
-        reservation_leaf.push(".reservation");
-        let reservation_path = parent_path_of(self.destination.as_path()).join(&reservation_leaf);
-        let mut reservation = Some(self.acquire_reservation(reservation_leaf, reservation_path)?);
-        // The destination can appear after the initial existence check while
-        // this caller waits for the previous publisher to release its
-        // reservation. Revalidate after acquiring the reservation so a
-        // no-replace caller never stages against a name that is now occupied.
-        if disposition == PromotionDisposition::NoReplace {
-            match self.destination_exists() {
-                Ok(false) => {}
-                Ok(true) => {
-                    self.release_reservation(reservation.take())?;
-                    return Err(ContainmentError::io(
-                        "reserve-destination-leaf",
-                        self.destination.as_path(),
-                        std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            "destination appeared before its reservation was acquired",
-                        ),
-                    ));
-                }
-                Err(error) => {
-                    self.release_reservation(reservation.take())?;
-                    return Err(error);
-                }
-            }
-        }
+        let reservation = Some(self.reserve_destination(disposition)?);
         let parent_path = self
             .destination
             .as_path()
@@ -335,6 +430,66 @@ impl OutputContainment {
         ))
     }
 
+    /// Retain the ordinary destination reservation for an attempt-owned
+    /// quarantine file.
+    pub(crate) fn reserve_for_attempt(
+        self,
+        disposition: PromotionDisposition,
+    ) -> Result<AttemptDestinationReservation, ContainmentError> {
+        let reservation = self.reserve_destination(disposition)?;
+        Ok(AttemptDestinationReservation {
+            destination: self,
+            disposition,
+            reservation: Some(reservation),
+        })
+    }
+
+    fn reserve_destination(
+        &self,
+        disposition: PromotionDisposition,
+    ) -> Result<Reservation, ContainmentError> {
+        if disposition == PromotionDisposition::NoReplace && self.destination_exists()? {
+            return Err(ContainmentError::io(
+                "reserve-destination-leaf",
+                self.destination.as_path(),
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination already exists",
+                ),
+            ));
+        }
+        let mut reservation_leaf = OsString::from(".clinker-");
+        reservation_leaf.push(&self.leaf);
+        reservation_leaf.push(".reservation");
+        let reservation_path = parent_path_of(self.destination.as_path()).join(&reservation_leaf);
+        let reservation = self.acquire_reservation(reservation_leaf, reservation_path)?;
+        // The destination can appear after the initial existence check while
+        // this caller waits for the previous publisher to release its
+        // reservation. Revalidate after acquiring the reservation so a
+        // no-replace caller never stages against a name that is now occupied.
+        if disposition == PromotionDisposition::NoReplace {
+            match self.destination_exists() {
+                Ok(false) => {}
+                Ok(true) => {
+                    self.release_reservation(Some(reservation))?;
+                    return Err(ContainmentError::io(
+                        "reserve-destination-leaf",
+                        self.destination.as_path(),
+                        std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "destination appeared before its reservation was acquired",
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    self.release_reservation(Some(reservation))?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(reservation)
+    }
+
     fn acquire_reservation(
         &self,
         leaf: OsString,
@@ -372,7 +527,17 @@ impl OutputContainment {
                 Err(ContainmentError::Io { source, .. })
                     if source.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 =>
                 {
-                    let existing = self.parent.open_existing_leaf(&leaf, &path)?;
+                    let existing = match self.parent.open_existing_leaf(&leaf, &path) {
+                        Ok(existing) => existing,
+                        Err(error)
+                            if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) =>
+                        {
+                            // The previous owner released the name between
+                            // our create-new result and this fallback open.
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let old_enough = existing
                         .metadata()
                         .and_then(|metadata| metadata.modified())
@@ -388,7 +553,17 @@ impl OutputContainment {
                             ),
                         ));
                     }
-                    self.parent.remove_leaf(&leaf)?;
+                    // The previous owner removes the name before releasing its
+                    // handle. If that happens between our open and unlink, we
+                    // hold the old inode but the directory entry is already
+                    // gone. Treat that as successful stale-name recovery and
+                    // retry the create-new acquisition below.
+                    match self.parent.remove_leaf(&leaf) {
+                        Ok(()) => {}
+                        Err(error)
+                            if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => {}
+                        Err(error) => return Err(error),
+                    }
                     let _ = FileExt::unlock(&existing);
                 }
                 Err(error) => return Err(error),
@@ -409,9 +584,11 @@ impl OutputContainment {
         reservation: Option<Reservation>,
     ) -> Result<(), ContainmentError> {
         if let Some(reservation) = reservation {
+            self.parent.remove_leaf(&reservation.leaf)?;
+            self.parent
+                .sync(parent_path_of(self.destination.as_path()))?;
             let _ = FileExt::unlock(&reservation.file);
             drop(reservation.file);
-            self.parent.remove_leaf(&reservation.leaf)?;
         }
         Ok(())
     }
@@ -440,6 +617,16 @@ impl OutputContainment {
         disposition: PromotionDisposition,
         fail_after_rename: bool,
     ) -> Result<(), ContainmentError> {
+        self.promote_from_with_sync_barrier(source, disposition, fail_after_rename, None)
+    }
+
+    pub(crate) fn promote_from_with_sync_barrier(
+        &self,
+        source: ValidatedPath,
+        disposition: PromotionDisposition,
+        fail_after_rename: bool,
+        before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
+    ) -> Result<(), ContainmentError> {
         let source_path = absolute_path(source.as_path())?;
         let source_leaf = normal_leaf(&source_path)?;
         let source_parent_path = source_path.parent().ok_or_else(|| {
@@ -458,6 +645,7 @@ impl OutputContainment {
             &source_path,
             self.destination.as_path(),
             fail_after_rename,
+            before_parent_directory_sync,
         )
     }
 }
@@ -501,6 +689,14 @@ impl StagedOutput {
     }
 
     pub(crate) fn publish(&mut self, fail_after_rename: bool) -> Result<(), ContainmentError> {
+        self.publish_with_sync_barrier(fail_after_rename, None)
+    }
+
+    pub(crate) fn publish_with_sync_barrier(
+        &mut self,
+        fail_after_rename: bool,
+        before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
+    ) -> Result<(), ContainmentError> {
         let result = self.destination.parent.promote(
             &self.destination.parent,
             &self.quarantine_leaf,
@@ -509,6 +705,7 @@ impl StagedOutput {
             &self.quarantine_path,
             self.destination.destination.as_path(),
             fail_after_rename,
+            before_parent_directory_sync,
         );
         match result {
             Ok(()) => self.state = PublicationState::Published,
@@ -532,9 +729,7 @@ impl StagedOutput {
         &mut self,
         fail_cleanup: bool,
     ) -> Result<(), ContainmentError> {
-        if let Some(reservation) = self.reservation.take() {
-            let _ = FileExt::unlock(&reservation.file);
-            drop(reservation.file);
+        if let Some(reservation) = self.reservation.as_ref() {
             if fail_cleanup {
                 self.state = PublicationState::Finalized;
                 let source = ContainmentError::io(
@@ -547,17 +742,32 @@ impl StagedOutput {
                 );
                 return Err(ContainmentError::PublishedCleanup {
                     path: self.destination.destination.as_path().to_path_buf(),
-                    stale_path: reservation.path,
+                    stale_path: reservation.path.clone(),
                     source: Box::new(source),
                 });
             }
-            if let Err(source) = self.destination.parent.remove_leaf(&reservation.leaf) {
+            if let Err(source) = self
+                .destination
+                .parent
+                .remove_leaf(&reservation.leaf)
+                .and_then(|()| {
+                    self.destination
+                        .parent
+                        .sync(parent_path_of(self.destination.destination.as_path()))
+                })
+            {
                 return Err(ContainmentError::PublishedCleanup {
                     path: self.destination.destination.as_path().to_path_buf(),
-                    stale_path: reservation.path,
+                    stale_path: reservation.path.clone(),
                     source: Box::new(source),
                 });
             }
+            let reservation = self
+                .reservation
+                .take()
+                .expect("reservation remained present until locked release completed");
+            let _ = FileExt::unlock(&reservation.file);
+            drop(reservation.file);
         }
         self.state = PublicationState::Finalized;
         Ok(())
@@ -566,10 +776,15 @@ impl StagedOutput {
     /// Remove an unpublishable quarantine and release its destination lock.
     pub(crate) fn discard(mut self) -> Result<(), ContainmentError> {
         self.destination.parent.remove_leaf(&self.quarantine_leaf)?;
+        if let Some(reservation) = self.reservation.as_ref() {
+            self.destination.parent.remove_leaf(&reservation.leaf)?;
+            self.destination
+                .parent
+                .sync(parent_path_of(self.destination.destination.as_path()))?;
+        }
         if let Some(reservation) = self.reservation.take() {
             let _ = FileExt::unlock(&reservation.file);
             drop(reservation.file);
-            self.destination.parent.remove_leaf(&reservation.leaf)?;
         }
         self.state = PublicationState::Finalized;
         Ok(())
@@ -595,10 +810,116 @@ impl StagedOutput {
 
 impl Drop for StagedOutput {
     fn drop(&mut self) {
+        // A finalized value that still owns a reservation represents the
+        // deterministic post-publication cleanup-failure seam. Preserve that
+        // stale leaf as the cleanup debt reports; ordinary error paths remain
+        // eligible for this best-effort retry while their state is nonterminal.
+        if self.state != PublicationState::Finalized
+            && let Some(reservation) = self.reservation.as_ref()
+        {
+            let _ = self.destination.parent.remove_leaf(&reservation.leaf);
+            let _ = self
+                .destination
+                .parent
+                .sync(parent_path_of(self.destination.destination.as_path()));
+        }
         if let Some(reservation) = self.reservation.take() {
             let _ = FileExt::unlock(&reservation.file);
             drop(reservation.file);
+        }
+    }
+}
+
+impl AttemptDestinationReservation {
+    pub(crate) fn preflight(&self) -> Result<(), ContainmentError> {
+        if self.disposition == PromotionDisposition::NoReplace
+            && self.destination.destination_exists()?
+        {
+            return Err(ContainmentError::io(
+                "preflight-destination-leaf",
+                self.destination.destination.as_path(),
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination appeared after its reservation was acquired",
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_from_with_sync_barrier(
+        &self,
+        source: ValidatedPath,
+        fail_after_rename: bool,
+        before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
+    ) -> Result<(), ContainmentError> {
+        self.destination.promote_from_with_sync_barrier(
+            source,
+            self.disposition,
+            fail_after_rename,
+            before_parent_directory_sync,
+        )
+    }
+
+    pub(crate) fn finalize_with_cleanup_fault(
+        &mut self,
+        fail_cleanup: bool,
+    ) -> Result<(), ContainmentError> {
+        if let Some(reservation) = self.reservation.as_ref() {
+            if fail_cleanup {
+                let source = ContainmentError::io(
+                    "remove-destination-reservation",
+                    &reservation.path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected reservation cleanup failure",
+                    ),
+                );
+                return Err(ContainmentError::PublishedCleanup {
+                    path: self.destination.destination.as_path().to_path_buf(),
+                    stale_path: reservation.path.clone(),
+                    source: Box::new(source),
+                });
+            }
+            if let Err(source) = self
+                .destination
+                .parent
+                .remove_leaf(&reservation.leaf)
+                .and_then(|()| {
+                    self.destination
+                        .parent
+                        .sync(parent_path_of(self.destination.destination.as_path()))
+                })
+            {
+                return Err(ContainmentError::PublishedCleanup {
+                    path: self.destination.destination.as_path().to_path_buf(),
+                    stale_path: reservation.path.clone(),
+                    source: Box::new(source),
+                });
+            }
+            let reservation = self
+                .reservation
+                .take()
+                .expect("reservation remained present until locked release completed");
+            let _ = FileExt::unlock(&reservation.file);
+            drop(reservation.file);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AttemptDestinationReservation {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.as_ref() {
             let _ = self.destination.parent.remove_leaf(&reservation.leaf);
+            let _ = self
+                .destination
+                .parent
+                .sync(parent_path_of(self.destination.destination.as_path()));
+        }
+        if let Some(reservation) = self.reservation.take() {
+            let _ = FileExt::unlock(&reservation.file);
+            drop(reservation.file);
         }
     }
 }
@@ -628,6 +949,18 @@ fn normal_leaf(path: &Path) -> Result<OsString, ContainmentError> {
     }
 }
 
+fn checked_child(leaf: &str, parent: &Path) -> Result<OsString, ContainmentError> {
+    let path = Path::new(leaf);
+    match (path.components().next(), path.components().count()) {
+        (Some(Component::Normal(name)), 1) if !name.is_empty() => Ok(name.to_os_string()),
+        _ => Err(ContainmentError::security(
+            "invalid_contained_child",
+            parent,
+            "contained child must be one normal path component",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "macos")]
@@ -636,7 +969,24 @@ mod tests {
 
     use clinker_plan::security::validate_path;
 
-    use super::{ContainmentError, OutputContainment, PromotionDisposition};
+    use super::{AnchoredDirectory, ContainmentError, OutputContainment, PromotionDisposition};
+
+    #[test]
+    fn bounded_enumeration_reports_an_exactly_full_directory_as_complete() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        std::fs::write(root.path().join("first"), b"").expect("first fixture");
+        std::fs::write(root.path().join("second"), b"").expect("second fixture");
+        let validated = validate_path(Path::new("."), root.path(), false)
+            .expect("root fixture should validate");
+        let directory = AnchoredDirectory::open(&validated).expect("open anchored fixture");
+
+        let entries = directory
+            .bounded_entries(2)
+            .expect("enumerate exactly full directory");
+
+        assert!(entries.complete);
+        assert_eq!(entries.entries.len(), 2);
+    }
 
     #[test]
     fn post_rename_sync_failure_reports_visible_destination() {
@@ -722,6 +1072,38 @@ mod tests {
             .expect("dropping the first publisher releases the reservation");
     }
 
+    #[test]
+    fn completed_publisher_cannot_unlink_the_next_publishers_reservation() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        let destination = || {
+            validate_path(Path::new("result.bin"), root.path(), false)
+                .expect("destination fixture should validate")
+        };
+        let first_boundary = OutputContainment::for_profile(destination(), "local-filesystem")
+            .expect("first boundary");
+        let mut first = first_boundary
+            .reserve_for_attempt(PromotionDisposition::Replace)
+            .expect("first publisher reserves destination");
+        first
+            .finalize_with_cleanup_fault(false)
+            .expect("first publisher removes its reservation while locked");
+
+        let second_boundary = OutputContainment::for_profile(destination(), "local-filesystem")
+            .expect("second boundary");
+        let second = second_boundary
+            .reserve_for_attempt(PromotionDisposition::Replace)
+            .expect("second publisher acquires a new reservation generation");
+        drop(first);
+
+        let third_boundary = OutputContainment::for_profile(destination(), "local-filesystem")
+            .expect("third boundary");
+        let error = third_boundary
+            .reserve_for_attempt(PromotionDisposition::Replace)
+            .expect_err("third publisher must observe the second publishers live reservation");
+        assert!(error.to_string().contains("reserved"), "{error}");
+        drop(second);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_no_replace_publishes_only_to_a_free_destination() {
@@ -762,18 +1144,22 @@ mod tests {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use std::ffi::OsStr;
+    use std::ffi::{CString, OsStr, OsString};
     use std::fs::File;
-    use std::os::fd::OwnedFd;
+    use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::{Component, Path};
 
     use nix::errno::Errno;
-    use nix::fcntl::{OFlag, RenameFlags, openat, renameat, renameat2};
-    use nix::sys::stat::{Mode, fstat};
+    use nix::fcntl::{AtFlags, OFlag, RenameFlags, openat, renameat, renameat2};
+    use nix::sys::stat::{Mode, SFlag, fstat, fstatat};
     use nix::sys::statfs::{NFS_SUPER_MAGIC, fstatfs};
     use nix::unistd::{UnlinkatFlags, unlinkat};
 
-    use super::{ContainmentError, FilesystemProfile, OpenDisposition, PromotionDisposition};
+    use super::{
+        BoundedEntries, ContainedEntry, ContainedEntryKind, ContainmentError, FilesystemProfile,
+        OpenDisposition, PromotionDisposition,
+    };
 
     const CIFS_SUPER_MAGIC: u32 = 0xff53_4d42;
     const SMB2_SUPER_MAGIC: u32 = 0xfe53_4d42;
@@ -783,6 +1169,17 @@ mod platform {
     pub(super) struct DirectoryAnchor {
         file: File,
         device: u64,
+    }
+
+    struct DirectoryStream(*mut libc::DIR);
+
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: the pointer was returned by fdopendir and is closed once.
+                unsafe { libc::closedir(self.0) };
+            }
+        }
     }
 
     impl DirectoryAnchor {
@@ -917,6 +1314,146 @@ mod platform {
                 .map_err(|error| nix_io("remove-contained-leaf", Path::new(leaf), error))
         }
 
+        pub(super) fn create_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            let name = c_string(leaf, display_path)?;
+            // SAFETY: the retained directory and one-component name satisfy mkdirat.
+            let result = unsafe { libc::mkdirat(self.file.as_raw_fd(), name.as_ptr(), 0o700) };
+            if result != 0 {
+                return Err(ContainmentError::io(
+                    "create-contained-directory",
+                    display_path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            self.open_child(leaf, display_path)
+        }
+
+        pub(super) fn open_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            let fd = openat(
+                &self.file,
+                leaf,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| component_error(display_path, error))?;
+            let stat = fstat(&fd)
+                .map_err(|error| nix_io("inspect-contained-directory", display_path, error))?;
+            Ok(Self {
+                file: File::from(fd),
+                device: stat.st_dev as u64,
+            })
+        }
+
+        pub(super) fn entries(
+            &self,
+            display_path: &Path,
+            limit: usize,
+        ) -> Result<BoundedEntries, ContainmentError> {
+            let cloned = self.file.try_clone().map_err(|source| {
+                ContainmentError::io("clone-contained-directory", display_path, source)
+            })?;
+            // SAFETY: fdopendir takes ownership of the cloned descriptor.
+            let raw_fd = cloned.into_raw_fd();
+            let directory = DirectoryStream(unsafe { libc::fdopendir(raw_fd) });
+            if directory.0.is_null() {
+                // SAFETY: fdopendir failed and therefore did not take ownership.
+                unsafe { libc::close(raw_fd) };
+                return Err(ContainmentError::io(
+                    "enumerate-contained-directory",
+                    display_path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            // `dup`/`try_clone` shares the directory offset with the retained
+            // anchor. Reset the new stream so every bounded query observes a
+            // fresh snapshot from the first child.
+            // SAFETY: `directory` owns a successful `fdopendir` result.
+            unsafe { libc::rewinddir(directory.0) };
+            let mut entries = Vec::new();
+            loop {
+                if entries.len() == limit {
+                    return Ok(BoundedEntries {
+                        entries,
+                        complete: false,
+                    });
+                }
+                Errno::clear();
+                // SAFETY: directory remains valid until closedir below.
+                let entry = unsafe { libc::readdir(directory.0) };
+                if entry.is_null() {
+                    let error = Errno::last_raw();
+                    if error != 0 {
+                        return Err(ContainmentError::io(
+                            "enumerate-contained-directory",
+                            display_path,
+                            std::io::Error::from_raw_os_error(error),
+                        ));
+                    }
+                    return Ok(BoundedEntries {
+                        entries,
+                        complete: true,
+                    });
+                }
+                // SAFETY: d_name is NUL-terminated for a successful readdir result.
+                let bytes = unsafe {
+                    std::ffi::CStr::from_ptr((*entry).d_name.as_ptr())
+                        .to_bytes()
+                        .to_vec()
+                };
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                let name = OsString::from_vec(bytes);
+                let stat = fstatat(&self.file, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
+                    .map_err(|error| nix_io("inspect-contained-entry", display_path, error))?;
+                let kind = match SFlag::from_bits_truncate(stat.st_mode) {
+                    SFlag::S_IFREG => ContainedEntryKind::File,
+                    SFlag::S_IFDIR => ContainedEntryKind::Directory,
+                    SFlag::S_IFLNK => ContainedEntryKind::LinkOrReparse,
+                    _ => ContainedEntryKind::Other,
+                };
+                let size_bytes = if kind == ContainedEntryKind::File {
+                    Some(stat.st_size.try_into().map_err(|_| {
+                        ContainmentError::security(
+                            "invalid_contained_file_size",
+                            display_path,
+                            "regular-file metadata reported a negative byte length",
+                        )
+                    })?)
+                } else {
+                    None
+                };
+                entries.push(ContainedEntry {
+                    name,
+                    kind,
+                    size_bytes,
+                });
+            }
+        }
+
+        pub(super) fn remove_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<(), ContainmentError> {
+            unlinkat(&self.file, leaf, UnlinkatFlags::RemoveDir)
+                .map_err(|error| nix_io("remove-contained-directory", display_path, error))
+        }
+
+        pub(super) fn sync(&self, display_path: &Path) -> Result<(), ContainmentError> {
+            self.file.sync_all().map_err(|source| {
+                ContainmentError::io("sync-contained-directory", display_path, source)
+            })
+        }
+
         #[allow(clippy::too_many_arguments)]
         pub(super) fn promote(
             &self,
@@ -927,6 +1464,7 @@ mod platform {
             source_path: &Path,
             destination_path: &Path,
             fail_after_rename: bool,
+            before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
         ) -> Result<(), ContainmentError> {
             let source_fd: OwnedFd = openat(
                 &source_parent.file,
@@ -965,6 +1503,14 @@ mod platform {
             }
             .map_err(|error| nix_io("atomic-promotion", destination_path, error))?;
 
+            if let Some(before_parent_directory_sync) = before_parent_directory_sync {
+                before_parent_directory_sync().map_err(|source| {
+                    ContainmentError::VisibleButUnsynced {
+                        path: destination_path.to_path_buf(),
+                        source,
+                    }
+                })?;
+            }
             if fail_after_rename {
                 return Err(ContainmentError::VisibleButUnsynced {
                     path: destination_path.to_path_buf(),
@@ -1034,6 +1580,16 @@ mod platform {
         )
     }
 
+    fn c_string(name: &OsStr, path: &Path) -> Result<CString, ContainmentError> {
+        CString::new(name.as_bytes()).map_err(|_| {
+            ContainmentError::security(
+                "nul_path_component",
+                path,
+                "output path component contains a NUL byte",
+            )
+        })
+    }
+
     #[cfg(test)]
     mod tests {
         use super::{
@@ -1057,19 +1613,33 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use std::ffi::{CString, OsStr};
+    use std::ffi::{CString, OsStr, OsString};
     use std::fs::File;
     use std::mem::MaybeUninit;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::{Component, Path};
 
-    use super::{ContainmentError, FilesystemProfile, OpenDisposition, PromotionDisposition};
+    use super::{
+        BoundedEntries, ContainedEntry, ContainedEntryKind, ContainmentError, FilesystemProfile,
+        OpenDisposition, PromotionDisposition,
+    };
 
     #[derive(Debug)]
     pub(super) struct DirectoryAnchor {
         file: File,
         device: u64,
+    }
+
+    struct DirectoryStream(*mut libc::DIR);
+
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: the pointer was returned by fdopendir and is closed once.
+                unsafe { libc::closedir(self.0) };
+            }
+        }
     }
 
     impl DirectoryAnchor {
@@ -1258,6 +1828,186 @@ mod platform {
             }
         }
 
+        pub(super) fn create_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            let name = c_string(leaf, display_path)?;
+            // SAFETY: retained parent and one-component name satisfy mkdirat.
+            let result = unsafe { libc::mkdirat(self.file.as_raw_fd(), name.as_ptr(), 0o700) };
+            if result != 0 {
+                return Err(ContainmentError::io(
+                    "create-contained-directory",
+                    display_path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            self.open_child(leaf, display_path)
+        }
+
+        pub(super) fn open_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            let name = c_string(leaf, display_path)?;
+            // SAFETY: retained parent and one-component name satisfy openat.
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(component_error(
+                    display_path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: successful openat returned a fresh descriptor.
+            let file = unsafe { File::from_raw_fd(fd) };
+            let stat = file_stat(&file, display_path)?;
+            Ok(Self {
+                file,
+                device: stat.st_dev as u64,
+            })
+        }
+
+        pub(super) fn entries(
+            &self,
+            display_path: &Path,
+            limit: usize,
+        ) -> Result<BoundedEntries, ContainmentError> {
+            let cloned = self.file.try_clone().map_err(|source| {
+                ContainmentError::io("clone-contained-directory", display_path, source)
+            })?;
+            // SAFETY: fdopendir takes ownership of the cloned descriptor.
+            let raw_fd = cloned.into_raw_fd();
+            let directory = DirectoryStream(unsafe { libc::fdopendir(raw_fd) });
+            if directory.0.is_null() {
+                // SAFETY: fdopendir failed and therefore did not take ownership.
+                unsafe { libc::close(raw_fd) };
+                return Err(ContainmentError::io(
+                    "enumerate-contained-directory",
+                    display_path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            // `dup`/`try_clone` shares the directory offset with the retained
+            // anchor. Reset the new stream so every bounded query observes a
+            // fresh snapshot from the first child.
+            // SAFETY: `directory` owns a successful `fdopendir` result.
+            unsafe { libc::rewinddir(directory.0) };
+            let mut entries = Vec::new();
+            loop {
+                if entries.len() == limit {
+                    return Ok(BoundedEntries {
+                        entries,
+                        complete: false,
+                    });
+                }
+                // SAFETY: platform errno pointer is valid for this thread.
+                unsafe { *libc::__error() = 0 };
+                // SAFETY: directory remains valid until closedir below.
+                let entry = unsafe { libc::readdir(directory.0) };
+                if entry.is_null() {
+                    // SAFETY: platform errno pointer is valid for this thread.
+                    let error = unsafe { *libc::__error() };
+                    if error != 0 {
+                        return Err(ContainmentError::io(
+                            "enumerate-contained-directory",
+                            display_path,
+                            std::io::Error::from_raw_os_error(error),
+                        ));
+                    }
+                    return Ok(BoundedEntries {
+                        entries,
+                        complete: true,
+                    });
+                }
+                // SAFETY: d_name is NUL-terminated for a successful readdir result.
+                let bytes = unsafe {
+                    std::ffi::CStr::from_ptr((*entry).d_name.as_ptr())
+                        .to_bytes()
+                        .to_vec()
+                };
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                let name = OsString::from_vec(bytes);
+                let c_name = c_string(&name, display_path)?;
+                let mut stat = MaybeUninit::<libc::stat>::uninit();
+                // SAFETY: pointers are valid and AT_SYMLINK_NOFOLLOW preserves entry type.
+                let result = unsafe {
+                    libc::fstatat(
+                        self.file.as_raw_fd(),
+                        c_name.as_ptr(),
+                        stat.as_mut_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if result != 0 {
+                    return Err(ContainmentError::io(
+                        "inspect-contained-entry",
+                        display_path,
+                        std::io::Error::last_os_error(),
+                    ));
+                }
+                // SAFETY: successful fstatat initialized stat.
+                let stat = unsafe { stat.assume_init() };
+                let kind = match stat.st_mode & libc::S_IFMT {
+                    libc::S_IFREG => ContainedEntryKind::File,
+                    libc::S_IFDIR => ContainedEntryKind::Directory,
+                    libc::S_IFLNK => ContainedEntryKind::LinkOrReparse,
+                    _ => ContainedEntryKind::Other,
+                };
+                let size_bytes = if kind == ContainedEntryKind::File {
+                    Some(stat.st_size.try_into().map_err(|_| {
+                        ContainmentError::security(
+                            "invalid_contained_file_size",
+                            display_path,
+                            "regular-file metadata reported a negative byte length",
+                        )
+                    })?)
+                } else {
+                    None
+                };
+                entries.push(ContainedEntry {
+                    name,
+                    kind,
+                    size_bytes,
+                });
+            }
+        }
+
+        pub(super) fn remove_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<(), ContainmentError> {
+            let leaf = c_string(leaf, display_path)?;
+            // SAFETY: retained parent and one-component name satisfy unlinkat.
+            let result =
+                unsafe { libc::unlinkat(self.file.as_raw_fd(), leaf.as_ptr(), libc::AT_REMOVEDIR) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(ContainmentError::io(
+                    "remove-contained-directory",
+                    display_path,
+                    std::io::Error::last_os_error(),
+                ))
+            }
+        }
+
+        pub(super) fn sync(&self, display_path: &Path) -> Result<(), ContainmentError> {
+            self.file.sync_all().map_err(|source| {
+                ContainmentError::io("sync-contained-directory", display_path, source)
+            })
+        }
+
         #[allow(clippy::too_many_arguments)]
         pub(super) fn promote(
             &self,
@@ -1268,6 +2018,7 @@ mod platform {
             source_path: &Path,
             destination_path: &Path,
             fail_after_rename: bool,
+            before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
         ) -> Result<(), ContainmentError> {
             let source_leaf = c_string(source_leaf, source_path)?;
             let destination_leaf = c_string(destination_leaf, destination_path)?;
@@ -1321,6 +2072,14 @@ mod platform {
                     destination_path,
                     std::io::Error::last_os_error(),
                 ));
+            }
+            if let Some(before_parent_directory_sync) = before_parent_directory_sync {
+                before_parent_directory_sync().map_err(|source| {
+                    ContainmentError::VisibleButUnsynced {
+                        path: destination_path.to_path_buf(),
+                        source,
+                    }
+                })?;
             }
             if fail_after_rename {
                 return Err(ContainmentError::VisibleButUnsynced {
@@ -1407,35 +2166,39 @@ mod platform {
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::fs::File;
     use std::mem::{MaybeUninit, size_of};
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::path::{Component, Path, PathBuf};
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_INFORMATION, FILE_NON_DIRECTORY_FILE,
-        FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE_IF, FILE_RENAME_INFORMATION,
-        FILE_SYNCHRONOUS_IO_NONALERT, FileDispositionInformation, FileRenameInformation,
-        NtCreateFile, NtSetInformationFile,
+        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DIRECTORY_INFORMATION, FILE_DISPOSITION_INFORMATION,
+        FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE_IF,
+        FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileDirectoryInformation,
+        FileDispositionInformation, FileRenameInformation, NtCreateFile, NtQueryDirectoryFile,
+        NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
         ERROR_INVALID_NAME, HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE,
-        RtlNtStatusToDosError, STATUS_SUCCESS, UNICODE_STRING,
+        RtlNtStatusToDosError, STATUS_NO_MORE_FILES, STATUS_SUCCESS, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo, FlushFileBuffers,
-        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
-        OPEN_EXISTING, SYNCHRONIZE,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo,
+        FlushFileBuffers, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+        GetVolumeInformationByHandleW, OPEN_EXISTING, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-    use super::{ContainmentError, FilesystemProfile, OpenDisposition, PromotionDisposition};
+    use super::{
+        BoundedEntries, ContainedEntry, ContainedEntryKind, ContainmentError, FilesystemProfile,
+        OpenDisposition, PromotionDisposition,
+    };
 
     #[derive(Debug)]
     pub(super) struct DirectoryAnchor {
@@ -1622,6 +2385,176 @@ mod platform {
             }
         }
 
+        pub(super) fn create_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            let handle = open_file_at(
+                &self.handle,
+                leaf,
+                FILE_LIST_DIRECTORY | FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | SYNCHRONIZE,
+                FILE_CREATE,
+                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            )
+            .map_err(|source| {
+                ContainmentError::io("create-contained-directory", display_path, source)
+            })?;
+            reject_directory_reparse(&handle, display_path)?;
+            let canonical = final_path(&handle, display_path)?;
+            let volume_serial = volume_serial(&handle, display_path)?;
+            Ok(Self {
+                handle,
+                canonical,
+                volume_serial,
+            })
+        }
+
+        pub(super) fn open_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            let handle = open_file_at(
+                &self.handle,
+                leaf,
+                FILE_LIST_DIRECTORY | FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | SYNCHRONIZE,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            )
+            .map_err(|source| {
+                ContainmentError::io("open-contained-directory", display_path, source)
+            })?;
+            reject_directory_reparse(&handle, display_path)?;
+            let canonical = final_path(&handle, display_path)?;
+            let volume_serial = volume_serial(&handle, display_path)?;
+            Ok(Self {
+                handle,
+                canonical,
+                volume_serial,
+            })
+        }
+
+        pub(super) fn entries(
+            &self,
+            display_path: &Path,
+            limit: usize,
+        ) -> Result<BoundedEntries, ContainmentError> {
+            let mut entries = Vec::new();
+            let mut restart = true;
+            loop {
+                if entries.len() == limit {
+                    return Ok(BoundedEntries {
+                        entries,
+                        complete: false,
+                    });
+                }
+                let mut storage = vec![0_u64; 8192];
+                let mut status_block = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
+                // SAFETY: the retained directory handle and storage remain valid
+                // for this synchronous, single-entry query.
+                let status = unsafe {
+                    NtQueryDirectoryFile(
+                        self.handle.as_raw_handle() as HANDLE,
+                        std::ptr::null_mut(),
+                        None,
+                        std::ptr::null(),
+                        &mut status_block,
+                        storage.as_mut_ptr().cast(),
+                        (storage.len() * size_of::<u64>()) as u32,
+                        FileDirectoryInformation,
+                        true,
+                        std::ptr::null(),
+                        restart,
+                    )
+                };
+                restart = false;
+                if status == STATUS_NO_MORE_FILES {
+                    return Ok(BoundedEntries {
+                        entries,
+                        complete: true,
+                    });
+                }
+                if status != STATUS_SUCCESS {
+                    return Err(ContainmentError::io(
+                        "enumerate-contained-directory",
+                        display_path,
+                        std::io::Error::from_raw_os_error(unsafe {
+                            RtlNtStatusToDosError(status) as i32
+                        }),
+                    ));
+                }
+                // SAFETY: a successful query initialized one directory record.
+                let info = unsafe { &*storage.as_ptr().cast::<FILE_DIRECTORY_INFORMATION>() };
+                let length = info.FileNameLength as usize / size_of::<u16>();
+                // SAFETY: FileNameLength describes initialized UTF-16 storage in this record.
+                let name = OsString::from_wide(unsafe {
+                    std::slice::from_raw_parts(info.FileName.as_ptr(), length)
+                });
+                if name == OsStr::new(".") || name == OsStr::new("..") {
+                    continue;
+                }
+                let kind = if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    ContainedEntryKind::LinkOrReparse
+                } else if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                    ContainedEntryKind::Directory
+                } else if info.FileAttributes & FILE_ATTRIBUTE_NORMAL != 0 {
+                    ContainedEntryKind::File
+                } else {
+                    // Ordinary files can carry archive/hidden bits instead of NORMAL.
+                    ContainedEntryKind::File
+                };
+                let size_bytes = if kind == ContainedEntryKind::File {
+                    Some(info.EndOfFile.try_into().map_err(|_| {
+                        ContainmentError::security(
+                            "invalid_contained_file_size",
+                            display_path,
+                            "regular-file metadata reported a negative byte length",
+                        )
+                    })?)
+                } else {
+                    None
+                };
+                entries.push(ContainedEntry {
+                    name,
+                    kind,
+                    size_bytes,
+                });
+            }
+        }
+
+        pub(super) fn remove_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<(), ContainmentError> {
+            let handle = open_file_at(
+                &self.handle,
+                leaf,
+                FILE_GENERIC_READ | DELETE | SYNCHRONIZE,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            )
+            .map_err(|source| {
+                ContainmentError::io("open-contained-directory-for-removal", display_path, source)
+            })?;
+            reject_directory_reparse(&handle, display_path)?;
+            delete_handle(&handle, display_path, "remove-contained-directory")
+        }
+
+        pub(super) fn sync(&self, display_path: &Path) -> Result<(), ContainmentError> {
+            // SAFETY: retained directory handle is valid for the duration of this call.
+            if unsafe { FlushFileBuffers(self.handle.as_raw_handle() as HANDLE) } == 0 {
+                Err(ContainmentError::io(
+                    "sync-contained-directory",
+                    display_path,
+                    std::io::Error::last_os_error(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
         #[allow(clippy::too_many_arguments)]
         pub(super) fn promote(
             &self,
@@ -1632,6 +2565,7 @@ mod platform {
             source_path: &Path,
             destination_path: &Path,
             fail_after_rename: bool,
+            before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
         ) -> Result<(), ContainmentError> {
             let source_handle = open_file_at(
                 &source_parent.handle,
@@ -1701,6 +2635,14 @@ mod platform {
                         RtlNtStatusToDosError(status) as i32
                     }),
                 ));
+            }
+            if let Some(before_parent_directory_sync) = before_parent_directory_sync {
+                before_parent_directory_sync().map_err(|source| {
+                    ContainmentError::VisibleButUnsynced {
+                        path: destination_path.to_path_buf(),
+                        source,
+                    }
+                })?;
             }
             if fail_after_rename {
                 return Err(ContainmentError::VisibleButUnsynced {
@@ -1870,6 +2812,53 @@ mod platform {
         }
     }
 
+    fn reject_directory_reparse(handle: &OwnedHandle, path: &Path) -> Result<(), ContainmentError> {
+        let attributes = attributes(handle, path)?;
+        if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ContainmentError::security(
+                "linked_or_replaced_ancestor",
+                path,
+                "contained directory is a reparse point or was replaced",
+            ));
+        }
+        if attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(ContainmentError::security(
+                "non_directory_ancestor",
+                path,
+                "contained directory entry is not a directory",
+            ));
+        }
+        Ok(())
+    }
+
+    fn delete_handle(
+        handle: &OwnedHandle,
+        path: &Path,
+        operation: &'static str,
+    ) -> Result<(), ContainmentError> {
+        let disposition = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
+        let mut status_block = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
+        // SAFETY: handle carries DELETE access and pointers reference initialized storage.
+        let status = unsafe {
+            NtSetInformationFile(
+                handle.as_raw_handle() as HANDLE,
+                &mut status_block,
+                (&disposition as *const FILE_DISPOSITION_INFORMATION).cast(),
+                size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
+                FileDispositionInformation,
+            )
+        };
+        if status == STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(ContainmentError::io(
+                operation,
+                path,
+                std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) as i32 }),
+            ))
+        }
+    }
+
     fn attributes(
         handle: &OwnedHandle,
         path: &Path,
@@ -1965,7 +2954,9 @@ mod platform {
     use std::fs::File;
     use std::path::{Path, PathBuf};
 
-    use super::{ContainmentError, FilesystemProfile, OpenDisposition, PromotionDisposition};
+    use super::{
+        BoundedEntries, ContainmentError, FilesystemProfile, OpenDisposition, PromotionDisposition,
+    };
 
     #[derive(Debug)]
     pub(super) struct DirectoryAnchor {
@@ -2031,6 +3022,42 @@ mod platform {
             })
         }
 
+        pub(super) fn create_child(
+            &self,
+            _leaf: &OsStr,
+            _display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            unsupported_directory()
+        }
+
+        pub(super) fn open_child(
+            &self,
+            _leaf: &OsStr,
+            _display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            unsupported_directory()
+        }
+
+        pub(super) fn entries(
+            &self,
+            _display_path: &Path,
+            _limit: usize,
+        ) -> Result<BoundedEntries, ContainmentError> {
+            unsupported_directory()
+        }
+
+        pub(super) fn remove_child(
+            &self,
+            _leaf: &OsStr,
+            _display_path: &Path,
+        ) -> Result<(), ContainmentError> {
+            unsupported_directory()
+        }
+
+        pub(super) fn sync(&self, _display_path: &Path) -> Result<(), ContainmentError> {
+            unsupported_directory()
+        }
+
         #[allow(clippy::too_many_arguments)]
         pub(super) fn promote(
             &self,
@@ -2041,6 +3068,7 @@ mod platform {
             _source_path: &Path,
             _destination_path: &Path,
             _fail_after_rename: bool,
+            _before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
         ) -> Result<(), ContainmentError> {
             Err(ContainmentError::PolicyRequired {
                 profile: "local-filesystem".to_owned(),
@@ -2056,5 +3084,12 @@ mod platform {
             FilesystemProfile::LinuxNfsV41LoopbackCi => "linux-nfsv4.1-loopback-ci",
             FilesystemProfile::LinuxSmb311LoopbackCi => "linux-smb3.1.1-loopback-ci",
         }
+    }
+
+    fn unsupported_directory<T>() -> Result<T, ContainmentError> {
+        Err(ContainmentError::PolicyRequired {
+            profile: "local-filesystem".to_owned(),
+            detail: "attempt cleanup is unavailable without a handle-relative directory implementation",
+        })
     }
 }

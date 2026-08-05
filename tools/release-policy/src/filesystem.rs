@@ -3,12 +3,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 use tempfile::Builder;
@@ -23,7 +24,7 @@ pub const NFS_PROFILE: &str = "linux-nfsv4.1-loopback-ci";
 /// Exact SMB profile eligible for qualification.
 pub const SMB_PROFILE: &str = "linux-smb3.1.1-loopback-ci";
 
-const EVIDENCE_SCHEMA: &str = "clinker.filesystem-matrix-evidence/v1";
+const EVIDENCE_SCHEMA: &str = "clinker.filesystem-matrix-evidence/3";
 const NFS_EXPORT: &str = "/etc/exports.d/clinker-ci.exports";
 const CI_REPOSITORY: &str = "rustpunk/clinker";
 const CI_WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
@@ -90,6 +91,12 @@ struct CleanupResult {
     observations: Vec<String>,
 }
 
+#[derive(Debug)]
+struct SemanticLogs {
+    publication: String,
+    publication_observations: Vec<String>,
+}
+
 /// Provision, qualify, and teardown one exact disposable profile.
 pub fn provision_and_run(request: &ProvisionRequest) -> Result<String, GateError> {
     require_profile(&request.profile)?;
@@ -116,8 +123,6 @@ pub fn provision_and_run(request: &ProvisionRequest) -> Result<String, GateError
             .and_then(|()| fs::create_dir_all(&server_root))
             .and_then(|()| fs::create_dir_all(&samba_dir))
             .map_err(|error| GateError::io("create filesystem matrix directories", &error))?;
-        fs::set_permissions(&server_root, fs::Permissions::from_mode(0o777))
-            .map_err(|error| GateError::io("set filesystem server permissions", &error))?;
         let state = EnvironmentState {
             profile: request.profile.clone(),
             scratch,
@@ -125,6 +130,9 @@ pub fn provision_and_run(request: &ProvisionRequest) -> Result<String, GateError
             samba_pid: (request.profile == SMB_PROFILE).then(|| samba_dir.join("smbd.pid")),
         };
         write_state(&state_path(&request.evidence), &state)?;
+
+        current_step = "capacity-backing";
+        provision_bounded_backing(&server_root)?;
 
         current_step = "package-install";
         let log_dir = log_directory(&request.evidence);
@@ -136,7 +144,7 @@ pub fn provision_and_run(request: &ProvisionRequest) -> Result<String, GateError
 
         current_step = "server-and-mount";
         if state.profile == NFS_PROFILE {
-            provision_nfs(&state, &server_root, &protocol_path)?;
+            provision_nfs(&state, &server_root, &protocol_path, true)?;
         } else {
             provision_smb(&state, &server_root, &samba_dir, &protocol_path)?;
         }
@@ -169,6 +177,52 @@ pub fn provision_and_run(request: &ProvisionRequest) -> Result<String, GateError
             Err(error)
         }
     }
+}
+
+fn provision_bounded_backing(server_root: &Path) -> Result<(), GateError> {
+    checked(
+        "sudo",
+        &[
+            OsString::from("mount"),
+            OsString::from("-t"),
+            OsString::from("tmpfs"),
+            OsString::from("-o"),
+            OsString::from("size=64m,nr_inodes=4096,mode=0777"),
+            OsString::from("tmpfs"),
+            server_root.as_os_str().to_owned(),
+        ],
+        inherited_environment(&[]),
+        Duration::from_secs(30),
+        "mount capacity-bounded server backing",
+    )?;
+    validate_bounded_backing(server_root)
+}
+
+fn validate_bounded_backing(server_root: &Path) -> Result<(), GateError> {
+    let observation = checked(
+        "findmnt",
+        &[
+            OsString::from("-T"),
+            server_root.as_os_str().to_owned(),
+            OsString::from("-n"),
+            OsString::from("-o"),
+            OsString::from("FSTYPE,OPTIONS"),
+        ],
+        inherited_environment(&[]),
+        Duration::from_secs(15),
+        "observe capacity-bounded server backing",
+    )?;
+    let observation = String::from_utf8(observation)
+        .map_err(|_| missing("bounded backing observation is not UTF-8"))?;
+    let options = observation.split_whitespace().collect::<Vec<_>>();
+    if options.first().copied() != Some("tmpfs")
+        || !observation.contains("size=65536k") && !observation.contains("size=64m")
+    {
+        return Err(missing(
+            "server backing is not the observed 64 MiB tmpfs mount",
+        ));
+    }
+    Ok(())
 }
 
 /// Execute the complete semantic matrix against one observed mount.
@@ -235,14 +289,25 @@ fn run_profile_inner(request: &RunProfileRequest) -> Result<Value, GateError> {
     validate_mount(&request.profile, &mount)?;
 
     let lock = byte_range_lock_observation(&request.mount_root)?;
-    let semantic_log = log_directory(&request.evidence).join("semantic-test.txt");
-    let semantic = semantic_test(&request.profile, &request.mount_root, &semantic_log)?;
+    let state = read_state(&state_path(&request.evidence))?;
+    validate_state_paths(&state)?;
+    if state.profile != request.profile || state.mount_root != request.mount_root {
+        return Err(policy(
+            "semantic matrix does not match the provisioned environment state",
+        ));
+    }
+    validate_bounded_backing(&state.scratch.join("server"))?;
+    let semantic = semantic_test(&state, &request.evidence)?;
+    let publication_results = publication_results_from_observations(
+        &semantic.publication_observations,
+        &semantic.publication,
+    )?;
+    let admission_lock_results =
+        admission_lock_results_from_observations(&semantic.publication_observations)?;
     require_cleanup_liveness(&request.mount_root)?;
     let runner = runner_observation()?;
-    let current = std::env::current_dir()
-        .map_err(|error| GateError::io("resolve local workspace", &error))?;
-
     Ok(json!({
+        "admission_lock_results": admission_lock_results,
         "ci_identity": ci_identity()?,
         "cleanup_success": false,
         "cleanup_observations": [],
@@ -255,8 +320,8 @@ fn run_profile_inner(request: &RunProfileRequest) -> Result<Value, GateError> {
             "child_timeout=no_passing_evidence"
         ],
         "locations": {
-            "local_workspace": current,
-            "mounted_share": request.mount_root,
+            "local_workspace": "repository_workspace",
+            "mounted_share": "profile_mount_root",
         },
         "lock_observations": lock,
         "mount": {
@@ -268,19 +333,184 @@ fn run_profile_inner(request: &RunProfileRequest) -> Result<Value, GateError> {
         "profile": request.profile,
         "protocol_observations": protocols,
         "runner": runner,
-        "schema": EVIDENCE_SCHEMA,
-        "semantic_results": {
+        "capacity_results": {
+            "backing": "mounted_tmpfs_64_mib",
+            "edquot_seam": "seam_covered",
+            "enospc_final_absent": "pass",
+            "enospc_manifest_state": "staging",
+            "enospc_operator_cleanup": "pass",
+            "enospc_raw_os_error": 28,
+            "mounted_enospc": "pass",
+            "quota": "seam_covered",
+        },
+        "edge_outcomes": {
             "cancellation_no_final": "pass",
             "cleanup_liveness": "pass",
             "confinement": "pass",
             "cross_filesystem_no_copy": "pass",
             "rename_visibility": "pass",
             "sync_durability": "pass",
-            "test_filter": "remote_filesystem_matrix_semantics",
-            "test_log": semantic,
         },
+        "prohibitions": [
+            "copy_fallback_to_visible_final=absent",
+            "publication_mode_fallback=absent",
+            "cross_artifact_atomicity_claim=absent",
+            "cross_execution_staging_ownership=absent",
+            "raw_deletion_path_authority=absent",
+        ],
+        "publication_results": publication_results,
+        "schema": EVIDENCE_SCHEMA,
         "status": "semantic_pass",
         "support_eligible": false,
+    }))
+}
+
+fn admission_lock_results_from_observations(observations: &[String]) -> Result<Value, GateError> {
+    for scenario in ["admission-count", "admission-bytes"] {
+        for outcome in [
+            "bounded_completion",
+            "exactly_one_admitted",
+            "independent_processes",
+            "mounted_root_readback",
+            "opposite_root_order",
+        ] {
+            let expected = format!("{scenario}:{outcome}=pass");
+            if !observations.iter().any(|observed| observed == &expected) {
+                return Err(missing(format!(
+                    "validated production admission observation {expected} is absent"
+                )));
+            }
+        }
+    }
+    for expected in [
+        "admission-count:estimated_attempt_bytes=100,retained_limit=1",
+        "admission-bytes:estimated_attempt_bytes=100,retained_limit=150",
+    ] {
+        if !observations.iter().any(|observed| observed == expected) {
+            return Err(missing(format!(
+                "validated production admission bound {expected} is absent"
+            )));
+        }
+    }
+    Ok(json!({
+        "api": "RunAttemptPublication::create",
+        "count_limit": {
+            "bounded_completion": "pass",
+            "estimated_attempt_bytes": 100,
+            "exactly_one_admitted": "pass",
+            "independent_processes": "pass",
+            "mounted_root_readback": "pass",
+            "opposite_root_order": "pass",
+            "retained_attempt_limit": 1,
+        },
+        "lock": "fs4::FileExt::lock",
+        "retained_byte_limit": {
+            "bounded_completion": "pass",
+            "estimated_attempt_bytes": 100,
+            "exactly_one_admitted": "pass",
+            "independent_processes": "pass",
+            "mounted_root_readback": "pass",
+            "opposite_root_order": "pass",
+            "retained_byte_limit": 150,
+        },
+    }))
+}
+
+fn publication_results_from_observations(
+    observations: &[String],
+    test_log: &str,
+) -> Result<Value, GateError> {
+    let required = [
+        "success-direct:pre_cleanup_readback=pass",
+        "success-direct:post_cleanup_readback=pass",
+        "success-local_then_publish:pre_cleanup_readback=pass",
+        "success-local_then_publish:post_cleanup_readback=pass",
+        "ordinary-failure-direct:ordinary_failure_manifest_readback=pass",
+        "ordinary-failure-direct:operator_purge=pass",
+        "ordinary-failure-local_then_publish:ordinary_failure_manifest_readback=pass",
+        "ordinary-failure-local_then_publish:operator_purge=pass",
+        "capacity-enospc:mounted_raw_errno_28=pass",
+        "capacity-enospc:operator_purge=pass",
+        "control_endpoint_cleanup=pass",
+    ];
+    for expected in required {
+        if !observations.iter().any(|observed| observed == expected) {
+            return Err(missing(format!(
+                "validated publication observation {expected} is absent"
+            )));
+        }
+    }
+    for scenario in [
+        "interruption-direct-file_synchronization",
+        "interruption-direct-rename",
+        "interruption-direct-parent_directory_synchronization",
+        "interruption-local_then_publish-copy",
+        "interruption-local_then_publish-file_synchronization",
+        "interruption-local_then_publish-rename",
+        "interruption-local_then_publish-parent_directory_synchronization",
+    ] {
+        for outcome in [
+            "service_interruption",
+            "bounded_interruption",
+            "service_recovery",
+            "recovery_manifest_readback",
+            "operator_purge",
+        ] {
+            let expected = format!("{scenario}:{outcome}=pass");
+            if !observations.iter().any(|observed| observed == &expected) {
+                return Err(missing(format!(
+                    "validated publication observation {expected} is absent"
+                )));
+            }
+        }
+    }
+
+    Ok(json!({
+        "lifecycle_classes": [
+            "success",
+            "ordinary_failure",
+            "interruption",
+            "ambiguity_durability_uncertainty",
+            "purge_cleanup",
+            "support_eligibility",
+        ],
+        "modes": ["direct", "local_then_publish"],
+        "operator_results": [
+            "list=pass",
+            "inspect=pass",
+            "purge_preview=pass",
+            "purge_execute=pass",
+            "cleanup_debt=none",
+        ],
+        "persistence_results": [
+            "ordinary_failure=retained_manifest",
+            "interruption=retained_manifest",
+            "ambiguity_durability_uncertainty=retained_manifest",
+        ],
+        "recovery_results": [
+            "direct:file_synchronization=recovered_revalidated_completed_manifest_reopened",
+            "direct:rename=recovered_revalidated_completed_manifest_reopened",
+            "direct:parent_directory_synchronization=recovered_revalidated_completed_manifest_reopened",
+            "local_then_publish:copy=recovered_revalidated_completed_manifest_reopened",
+            "local_then_publish:file_synchronization=recovered_revalidated_completed_manifest_reopened",
+            "local_then_publish:rename=recovered_revalidated_completed_manifest_reopened",
+            "local_then_publish:parent_directory_synchronization=recovered_revalidated_completed_manifest_reopened",
+        ],
+        "stage_results": [
+            "direct:file_synchronization=interrupted_retained",
+            "direct:rename=interrupted_retained",
+            "direct:parent_directory_synchronization=interrupted_retained",
+            "local_then_publish:copy=interrupted_retained",
+            "local_then_publish:file_synchronization=interrupted_retained",
+            "local_then_publish:rename=interrupted_retained",
+            "local_then_publish:parent_directory_synchronization=interrupted_retained",
+        ],
+        "success_results": [
+            "direct=pre_cleanup_final_and_complete_manifest,post_cleanup_final_present_attempt_absent",
+            "local_then_publish=pre_cleanup_final_and_complete_manifest,post_cleanup_final_present_attempt_absent",
+        ],
+        "test_filter": "remote_filesystem_publication_matrix",
+        "test_log": test_log,
     }))
 }
 
@@ -381,9 +611,12 @@ pub fn finalize_qualification(
     exact_fields(
         object,
         &[
+            "admission_lock_results",
             "ci_identity",
+            "capacity_results",
             "cleanup_success",
             "cleanup_observations",
+            "edge_outcomes",
             "environment_teardown",
             "injected_failures",
             "locations",
@@ -391,10 +624,11 @@ pub fn finalize_qualification(
             "mount",
             "packages",
             "profile",
+            "prohibitions",
             "protocol_observations",
+            "publication_results",
             "runner",
             "schema",
-            "semantic_results",
             "status",
             "support_eligible",
         ],
@@ -424,6 +658,7 @@ pub fn finalize_qualification(
     )?;
     for required in [
         "post_teardown_mount=absent",
+        "post_teardown_backing_mount=absent",
         "workspace_cleanup=pass",
         "cleanup_success=true",
     ] {
@@ -474,6 +709,68 @@ pub fn finalize_qualification(
         },
     )?;
 
+    let admission = object
+        .get("admission_lock_results")
+        .and_then(Value::as_object)
+        .ok_or_else(|| missing("production admission-lock results are absent"))?;
+    exact_fields(
+        admission,
+        &["api", "count_limit", "lock", "retained_byte_limit"],
+        "production admission-lock results",
+    )?;
+    if admission.get("api") != Some(&Value::String("RunAttemptPublication::create".to_owned()))
+        || admission.get("lock") != Some(&Value::String("fs4::FileExt::lock".to_owned()))
+    {
+        return Err(missing(
+            "production admission API and filesystem lock proof are absent",
+        ));
+    }
+    for (field, limit_field, expected_limit) in [
+        ("count_limit", "retained_attempt_limit", 1),
+        ("retained_byte_limit", "retained_byte_limit", 150),
+    ] {
+        let result = admission
+            .get(field)
+            .and_then(Value::as_object)
+            .ok_or_else(|| missing(format!("production admission result {field} is absent")))?;
+        exact_fields(
+            result,
+            &[
+                "bounded_completion",
+                "estimated_attempt_bytes",
+                "exactly_one_admitted",
+                "independent_processes",
+                "mounted_root_readback",
+                "opposite_root_order",
+                limit_field,
+            ],
+            "production admission scenario",
+        )?;
+        for outcome in [
+            "bounded_completion",
+            "exactly_one_admitted",
+            "independent_processes",
+            "mounted_root_readback",
+            "opposite_root_order",
+        ] {
+            if result.get(outcome) != Some(&Value::String("pass".to_owned())) {
+                return Err(missing(format!(
+                    "production admission result {field}.{outcome} did not pass"
+                )));
+            }
+        }
+        if result
+            .get("estimated_attempt_bytes")
+            .and_then(Value::as_u64)
+            != Some(100)
+            || result.get(limit_field).and_then(Value::as_u64) != Some(expected_limit)
+        {
+            return Err(missing(format!(
+                "production admission result {field} has the wrong bound"
+            )));
+        }
+    }
+
     if object.get("lock_observations")
         != Some(&json!([
             "holder=acquired",
@@ -503,16 +800,60 @@ pub fn finalize_qualification(
         &["local_workspace", "mounted_share"],
         "filesystem locations",
     )?;
-    for field in ["local_workspace", "mounted_share"] {
-        object_string(locations, field, "filesystem locations")?;
+    for (field, expected) in [
+        ("local_workspace", "repository_workspace"),
+        ("mounted_share", "profile_mount_root"),
+    ] {
+        if object_string(locations, field, "filesystem locations")? != expected {
+            return Err(policy(
+                "filesystem evidence locations must use sanitized logical labels",
+            ));
+        }
     }
 
-    let semantic = object
-        .get("semantic_results")
+    let capacity = object
+        .get("capacity_results")
         .and_then(Value::as_object)
-        .ok_or_else(|| missing("semantic results are absent"))?;
+        .ok_or_else(|| missing("capacity results are absent"))?;
     exact_fields(
-        semantic,
+        capacity,
+        &[
+            "backing",
+            "edquot_seam",
+            "enospc_final_absent",
+            "enospc_manifest_state",
+            "enospc_operator_cleanup",
+            "enospc_raw_os_error",
+            "mounted_enospc",
+            "quota",
+        ],
+        "filesystem capacity results",
+    )?;
+    for (field, expected) in [
+        ("backing", "mounted_tmpfs_64_mib"),
+        ("edquot_seam", "seam_covered"),
+        ("enospc_final_absent", "pass"),
+        ("enospc_manifest_state", "staging"),
+        ("enospc_operator_cleanup", "pass"),
+        ("mounted_enospc", "pass"),
+        ("quota", "seam_covered"),
+    ] {
+        if capacity.get(field) != Some(&Value::String(expected.to_owned())) {
+            return Err(missing(format!("capacity result {field} is incomplete")));
+        }
+    }
+    if capacity.get("enospc_raw_os_error").and_then(Value::as_i64) != Some(28) {
+        return Err(missing(
+            "actual mounted ENOSPC raw operating-system error is absent",
+        ));
+    }
+
+    let edges = object
+        .get("edge_outcomes")
+        .and_then(Value::as_object)
+        .ok_or_else(|| missing("edge outcomes are absent"))?;
+    exact_fields(
+        edges,
         &[
             "cancellation_no_final",
             "cleanup_liveness",
@@ -520,10 +861,8 @@ pub fn finalize_qualification(
             "cross_filesystem_no_copy",
             "rename_visibility",
             "sync_durability",
-            "test_filter",
-            "test_log",
         ],
-        "filesystem semantic results",
+        "filesystem edge outcomes",
     )?;
     for field in [
         "cancellation_no_final",
@@ -533,18 +872,123 @@ pub fn finalize_qualification(
         "rename_visibility",
         "sync_durability",
     ] {
-        if semantic.get(field) != Some(&Value::String("pass".to_owned())) {
-            return Err(missing(format!("semantic result {field} did not pass")));
+        if edges.get(field) != Some(&Value::String("pass".to_owned())) {
+            return Err(missing(format!("edge outcome {field} did not pass")));
         }
     }
-    if semantic.get("test_filter")
+
+    require_exact_string_array(
+        object.get("prohibitions"),
+        &[
+            "copy_fallback_to_visible_final=absent",
+            "publication_mode_fallback=absent",
+            "cross_artifact_atomicity_claim=absent",
+            "cross_execution_staging_ownership=absent",
+            "raw_deletion_path_authority=absent",
+        ],
+        "publication prohibitions",
+    )?;
+
+    let publication = object
+        .get("publication_results")
+        .and_then(Value::as_object)
+        .ok_or_else(|| missing("publication results are absent"))?;
+    exact_fields(
+        publication,
+        &[
+            "lifecycle_classes",
+            "modes",
+            "operator_results",
+            "persistence_results",
+            "recovery_results",
+            "stage_results",
+            "success_results",
+            "test_filter",
+            "test_log",
+        ],
+        "filesystem publication results",
+    )?;
+    require_exact_string_array(
+        publication.get("lifecycle_classes"),
+        &[
+            "success",
+            "ordinary_failure",
+            "interruption",
+            "ambiguity_durability_uncertainty",
+            "purge_cleanup",
+            "support_eligibility",
+        ],
+        "publication lifecycle classes",
+    )?;
+    require_exact_string_array(
+        publication.get("modes"),
+        &["direct", "local_then_publish"],
+        "publication modes",
+    )?;
+    require_exact_string_array(
+        publication.get("operator_results"),
+        &[
+            "list=pass",
+            "inspect=pass",
+            "purge_preview=pass",
+            "purge_execute=pass",
+            "cleanup_debt=none",
+        ],
+        "operator results",
+    )?;
+    require_exact_string_array(
+        publication.get("persistence_results"),
+        &[
+            "ordinary_failure=retained_manifest",
+            "interruption=retained_manifest",
+            "ambiguity_durability_uncertainty=retained_manifest",
+        ],
+        "publication persistence results",
+    )?;
+    require_exact_string_array(
+        publication.get("recovery_results"),
+        &[
+            "direct:file_synchronization=recovered_revalidated_completed_manifest_reopened",
+            "direct:rename=recovered_revalidated_completed_manifest_reopened",
+            "direct:parent_directory_synchronization=recovered_revalidated_completed_manifest_reopened",
+            "local_then_publish:copy=recovered_revalidated_completed_manifest_reopened",
+            "local_then_publish:file_synchronization=recovered_revalidated_completed_manifest_reopened",
+            "local_then_publish:rename=recovered_revalidated_completed_manifest_reopened",
+            "local_then_publish:parent_directory_synchronization=recovered_revalidated_completed_manifest_reopened",
+        ],
+        "publication recovery results",
+    )?;
+    require_exact_string_array(
+        publication.get("stage_results"),
+        &[
+            "direct:file_synchronization=interrupted_retained",
+            "direct:rename=interrupted_retained",
+            "direct:parent_directory_synchronization=interrupted_retained",
+            "local_then_publish:copy=interrupted_retained",
+            "local_then_publish:file_synchronization=interrupted_retained",
+            "local_then_publish:rename=interrupted_retained",
+            "local_then_publish:parent_directory_synchronization=interrupted_retained",
+        ],
+        "publication stage results",
+    )?;
+    require_exact_string_array(
+        publication.get("success_results"),
+        &[
+            "direct=pre_cleanup_final_and_complete_manifest,post_cleanup_final_present_attempt_absent",
+            "local_then_publish=pre_cleanup_final_and_complete_manifest,post_cleanup_final_present_attempt_absent",
+        ],
+        "publication success results",
+    )?;
+    if publication.get("test_filter")
         != Some(&Value::String(
-            "remote_filesystem_matrix_semantics".to_owned(),
+            "remote_filesystem_publication_matrix".to_owned(),
         ))
     {
-        return Err(missing("the named remote semantic test was not selected"));
+        return Err(missing(
+            "the named mounted publication test was not selected",
+        ));
     }
-    object_string(semantic, "test_log", "filesystem semantic results")?;
+    object_string(publication, "test_log", "filesystem publication results")?;
 
     set_field(evidence, "status", Value::String("passed".to_owned()))?;
     set_field(evidence, "support_eligible", Value::Bool(true))?;
@@ -719,6 +1163,7 @@ fn provision_nfs(
     state: &EnvironmentState,
     server_root: &Path,
     protocol_path: &Path,
+    start_server: bool,
 ) -> Result<(), GateError> {
     let export = state.scratch.join("clinker-ci.exports");
     fs::write(
@@ -729,37 +1174,49 @@ fn provision_nfs(
         ),
     )
     .map_err(|error| GateError::io("write NFS export configuration", &error))?;
+    checked(
+        "sudo",
+        &[
+            OsString::from("install"),
+            OsString::from("-D"),
+            OsString::from("-m"),
+            OsString::from("0644"),
+            export.as_os_str().to_owned(),
+            OsString::from(NFS_EXPORT),
+        ],
+        inherited_environment(&[]),
+        Duration::from_secs(120),
+        "install NFS export configuration",
+    )?;
+    if start_server {
+        for (arguments, label) in [
+            (
+                vec![
+                    OsString::from("systemctl"),
+                    OsString::from("start"),
+                    OsString::from("rpcbind"),
+                ],
+                "start rpcbind",
+            ),
+            (
+                vec![
+                    OsString::from("systemctl"),
+                    OsString::from("restart"),
+                    OsString::from("nfs-kernel-server"),
+                ],
+                "start NFS server",
+            ),
+        ] {
+            checked(
+                "sudo",
+                &arguments,
+                inherited_environment(&[]),
+                Duration::from_secs(120),
+                label,
+            )?;
+        }
+    }
     for (program, arguments, label) in [
-        (
-            "sudo",
-            vec![
-                OsString::from("install"),
-                OsString::from("-D"),
-                OsString::from("-m"),
-                OsString::from("0644"),
-                export.as_os_str().to_owned(),
-                OsString::from(NFS_EXPORT),
-            ],
-            "install NFS export configuration",
-        ),
-        (
-            "sudo",
-            vec![
-                OsString::from("systemctl"),
-                OsString::from("start"),
-                OsString::from("rpcbind"),
-            ],
-            "start rpcbind",
-        ),
-        (
-            "sudo",
-            vec![
-                OsString::from("systemctl"),
-                OsString::from("restart"),
-                OsString::from("nfs-kernel-server"),
-            ],
-            "start NFS server",
-        ),
         (
             "sudo",
             vec![OsString::from("exportfs"), OsString::from("-rav")],
@@ -856,20 +1313,36 @@ fn provision_smb(
         return Err(missing("Samba server did not become ready"));
     }
     wait_for_smb_listener()?;
-    let mount = observe(
+    let mount_arguments = [
+        OsString::from("mount"),
+        OsString::from("-t"),
+        OsString::from("cifs"),
+        OsString::from("//127.0.0.1/clinker"),
+        state.mount_root.as_os_str().to_owned(),
+        OsString::from("-o"),
+        OsString::from("guest,vers=3.1.1,cache=strict,strictsync,mfsymlinks,noperm"),
+    ];
+    let mut mount = observe(
         "sudo",
-        &[
-            OsString::from("mount"),
-            OsString::from("-t"),
-            OsString::from("cifs"),
-            OsString::from("//127.0.0.1/clinker"),
-            state.mount_root.as_os_str().to_owned(),
-            OsString::from("-o"),
-            OsString::from("guest,vers=3.1.1,cache=strict,strictsync,mfsymlinks,noperm"),
-        ],
+        &mount_arguments,
         inherited_environment(&[]),
-        Duration::from_secs(120),
+        Duration::from_secs(15),
     )?;
+    for _ in 1..20 {
+        if mount.termination == Termination::Exited(Some(0))
+            && !mount.stdout_truncated
+            && !mount.stderr_truncated
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+        mount = observe(
+            "sudo",
+            &mount_arguments,
+            inherited_environment(&[]),
+            Duration::from_secs(15),
+        )?;
+    }
     write_child_observation(&protocol_path.with_file_name("mount.txt"), &mount)?;
     if mount.termination != Termination::Exited(Some(0))
         || mount.stdout_truncated
@@ -929,14 +1402,17 @@ fn write_child_observation(path: &Path, result: &ChildResult) -> Result<(), Gate
     write_observation(path, &bytes)
 }
 
-fn semantic_test(profile: &str, mount_root: &Path, log_path: &Path) -> Result<String, GateError> {
+fn semantic_test(state: &EnvironmentState, evidence: &Path) -> Result<SemanticLogs, GateError> {
     let environment = inherited_environment(&[
-        ("CLINKER_FILESYSTEM_PROFILE", OsString::from(profile)),
-        ("CLINKER_FILESYSTEM_ROOT", mount_root.as_os_str().to_owned()),
+        ("CLINKER_FILESYSTEM_PROFILE", OsString::from(&state.profile)),
+        (
+            "CLINKER_FILESYSTEM_ROOT",
+            state.mount_root.as_os_str().to_owned(),
+        ),
         ("CARGO_INCREMENTAL", OsString::from("0")),
         ("CARGO_BUILD_JOBS", OsString::from("1")),
     ]);
-    let result = observe(
+    let edge_result = observe(
         "cargo",
         &[
             OsString::from("test"),
@@ -949,13 +1425,37 @@ fn semantic_test(profile: &str, mount_root: &Path, log_path: &Path) -> Result<St
             OsString::from("--"),
             OsString::from("--nocapture"),
         ],
-        environment,
+        environment.clone(),
         Duration::from_secs(900),
     )?;
-    require_semantic_success(log_path, &result)
+    let edge_log = log_directory(evidence).join("edge-test.txt");
+    require_semantic_success(
+        &edge_log,
+        &edge_result,
+        "remote_filesystem_matrix_semantics",
+    )?;
+
+    let publication_log = log_directory(evidence).join("publication-test.txt");
+    let control_log = log_directory(evidence).join("publication-control.txt");
+    let result = controlled_publication_test(state, environment, &control_log, &publication_log)?;
+    let publication = require_semantic_success(
+        &publication_log,
+        &result,
+        "remote_filesystem_publication_matrix",
+    )?;
+    let publication_observations =
+        observed_lines(&control_log, "read publication controller observations")?;
+    Ok(SemanticLogs {
+        publication,
+        publication_observations,
+    })
 }
 
-fn require_semantic_success(log_path: &Path, result: &ChildResult) -> Result<String, GateError> {
+fn require_semantic_success(
+    log_path: &Path,
+    result: &ChildResult,
+    test_filter: &str,
+) -> Result<String, GateError> {
     // A failed qualification is evidence too. Persist the bounded child
     // observation before interpreting its exit status so CI artifacts retain
     // the exact test failure, timeout, and truncation state.
@@ -972,7 +1472,7 @@ fn require_semantic_success(log_path: &Path, result: &ChildResult) -> Result<Str
     output.extend_from_slice(&result.stderr);
     let text = String::from_utf8(output)
         .map_err(|_| missing("remote semantic test output is not UTF-8"))?;
-    if !text.contains("remote_filesystem_matrix_semantics") || !text.contains("test result: ok") {
+    if !text.contains(test_filter) || !text.contains("test result: ok") {
         return Err(missing(
             "remote semantic test filter selected no passing test",
         ));
@@ -982,6 +1482,902 @@ fn require_semantic_success(log_path: &Path, result: &ChildResult) -> Result<Str
         .and_then(OsStr::to_str)
         .unwrap_or("semantic-test.txt")
         .to_owned())
+}
+
+fn controlled_publication_test(
+    state: &EnvironmentState,
+    mut environment: BTreeMap<OsString, OsString>,
+    control_log: &Path,
+    publication_log: &Path,
+) -> Result<ChildResult, GateError> {
+    let endpoint = state.scratch.join("publication-control.sock");
+    if endpoint.exists() {
+        fs::remove_file(&endpoint)
+            .map_err(|error| GateError::io("remove stale publication control endpoint", &error))?;
+    }
+    let listener = UnixListener::bind(&endpoint)
+        .map_err(|error| GateError::io("bind publication control endpoint", &error))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| GateError::io("bound publication control acceptance", &error))?;
+    environment.insert(
+        OsString::from("CLINKER_FILESYSTEM_CONTROL_ENDPOINT"),
+        endpoint.as_os_str().to_owned(),
+    );
+
+    let worker = thread::spawn(move || {
+        observe(
+            "cargo",
+            &[
+                OsString::from("test"),
+                OsString::from("--locked"),
+                OsString::from("-p"),
+                OsString::from("clinker"),
+                OsString::from("--test"),
+                OsString::from("attempt_publication"),
+                OsString::from("remote_filesystem_publication_matrix"),
+                OsString::from("--"),
+                OsString::from("--nocapture"),
+                OsString::from("--test-threads=1"),
+            ],
+            environment,
+            Duration::from_secs(900),
+        )
+    });
+    let mut observations = Vec::new();
+    let control = run_publication_controller(state, &listener, &mut observations);
+    drop(listener);
+    let endpoint_removed = fs::remove_file(&endpoint).is_ok() && !endpoint.exists();
+    observations.push(format!(
+        "control_endpoint_cleanup={}",
+        if endpoint_removed { "pass" } else { "failed" }
+    ));
+    let mut log = observations.join("\n").into_bytes();
+    log.push(b'\n');
+    write_observation(control_log, &log)?;
+    let child_result = worker
+        .join()
+        .map_err(|_| missing("mounted publication child thread panicked"))??;
+    write_child_observation(publication_log, &child_result)?;
+    control?;
+    if !endpoint_removed {
+        return Err(missing("publication control endpoint cleanup failed"));
+    }
+    Ok(child_result)
+}
+
+fn run_publication_controller(
+    state: &EnvironmentState,
+    listener: &UnixListener,
+    observations: &mut Vec<String>,
+) -> Result<(), GateError> {
+    for (scenario, mode) in [
+        ("success-direct", "direct"),
+        ("success-local_then_publish", "local_then_publish"),
+        ("ordinary-failure-direct", "direct"),
+        ("ordinary-failure-local_then_publish", "local_then_publish"),
+    ] {
+        let mut stream = accept_control(listener)?;
+        validate_scenario_begin(&mut stream, scenario, mode)?;
+        if scenario.starts_with("success-") {
+            control_success(state, &mut stream, scenario, mode, observations)?;
+        } else {
+            control_retained(state, &mut stream, scenario, mode, false, observations)?;
+        }
+    }
+
+    for (mode, stages) in [
+        (
+            "direct",
+            &[
+                "file_synchronization",
+                "rename",
+                "parent_directory_synchronization",
+            ][..],
+        ),
+        (
+            "local_then_publish",
+            &[
+                "copy",
+                "file_synchronization",
+                "rename",
+                "parent_directory_synchronization",
+            ][..],
+        ),
+    ] {
+        for target in stages {
+            let scenario = format!("interruption-{mode}-{target}");
+            let mut stream = accept_control(listener)?;
+            validate_scenario_begin(&mut stream, &scenario, mode)?;
+            control_interruption(state, &mut stream, &scenario, mode, target, observations)?;
+        }
+    }
+
+    let mut stream = accept_control(listener)?;
+    validate_scenario_begin(&mut stream, "capacity-enospc", "direct")?;
+    control_capacity(state, &mut stream, observations)?;
+
+    for scenario in ["admission-count", "admission-bytes"] {
+        let mut stream = accept_control(listener)?;
+        validate_scenario_begin(&mut stream, scenario, "direct")?;
+        control_admission(&mut stream, scenario, observations)?;
+    }
+    Ok(())
+}
+
+fn control_admission(
+    stream: &mut UnixStream,
+    scenario: &str,
+    observations: &mut Vec<String>,
+) -> Result<(), GateError> {
+    let result = read_control(stream)?;
+    let object = result
+        .as_object()
+        .ok_or_else(|| policy("admission result must be an object"))?;
+    exact_fields(
+        object,
+        &[
+            "action",
+            "bounded_completion",
+            "estimated_attempt_bytes",
+            "exactly_one_admitted",
+            "independent_processes",
+            "mounted_root_readback",
+            "opposite_root_order",
+            "retained_limit",
+            "scenario",
+            "schema",
+        ],
+        "admission result",
+    )?;
+    let expected_limit = if scenario == "admission-count" {
+        1
+    } else {
+        150
+    };
+    if object.get("schema")
+        != Some(&Value::String(
+            "clinker.filesystem-publication-control/1".to_owned(),
+        ))
+        || object.get("action") != Some(&Value::String("admission_complete".to_owned()))
+        || object.get("scenario") != Some(&Value::String(scenario.to_owned()))
+        || object
+            .get("estimated_attempt_bytes")
+            .and_then(Value::as_u64)
+            != Some(100)
+        || object.get("retained_limit").and_then(Value::as_u64) != Some(expected_limit)
+    {
+        return Err(policy(
+            "admission result does not match the exact scenario contract",
+        ));
+    }
+    for field in [
+        "bounded_completion",
+        "exactly_one_admitted",
+        "independent_processes",
+        "mounted_root_readback",
+        "opposite_root_order",
+    ] {
+        if object.get(field).and_then(Value::as_bool) != Some(true) {
+            return Err(missing(format!(
+                "admission result {field} did not pass for {scenario}"
+            )));
+        }
+        observations.push(format!("{scenario}:{field}=pass"));
+    }
+    observations.push(format!(
+        "{scenario}:estimated_attempt_bytes=100,retained_limit={expected_limit}"
+    ));
+    write_scenario_action(stream, "finish", scenario)
+}
+
+fn accept_control(listener: &UnixListener) -> Result<UnixStream, GateError> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(30))))
+                    .map_err(|error| {
+                        GateError::io("bound publication control connection", &error)
+                    })?;
+                return Ok(stream);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(missing("publication child did not connect before deadline"));
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => {
+                return Err(GateError::io(
+                    "accept publication control connection",
+                    &error,
+                ));
+            }
+        }
+    }
+}
+
+fn read_control(stream: &mut UnixStream) -> Result<Value, GateError> {
+    let mut encoded = Vec::new();
+    loop {
+        if encoded.len() == 4_096 {
+            return Err(policy("publication control message exceeds its byte bound"));
+        }
+        let mut byte = [0_u8; 1];
+        stream
+            .read_exact(&mut byte)
+            .map_err(|error| GateError::io("read publication control message", &error))?;
+        if byte[0] == b'\n' {
+            break;
+        }
+        encoded.push(byte[0]);
+    }
+    serde_json::from_slice(&encoded).map_err(|_| policy("publication control message is malformed"))
+}
+
+fn write_control(stream: &mut UnixStream, value: &Value) -> Result<(), GateError> {
+    serde_json::to_writer(&mut *stream, value).map_err(|_| {
+        GateError::internal(
+            "filesystem.control_encoding",
+            "publication control encoding failed",
+        )
+    })?;
+    stream
+        .write_all(b"\n")
+        .and_then(|()| stream.flush())
+        .map_err(|error| GateError::io("write publication control message", &error))
+}
+
+fn validate_scenario_begin(
+    stream: &mut UnixStream,
+    expected_scenario: &str,
+    expected_mode: &str,
+) -> Result<(), GateError> {
+    let message = read_control(stream)?;
+    let object = message
+        .as_object()
+        .ok_or_else(|| policy("publication scenario begin must be an object"))?;
+    exact_fields(
+        object,
+        &["action", "publication_mode", "scenario", "schema"],
+        "publication scenario begin",
+    )?;
+    if object.get("schema")
+        != Some(&Value::String(
+            "clinker.filesystem-publication-control/1".to_owned(),
+        ))
+        || object.get("action") != Some(&Value::String("scenario_begin".to_owned()))
+        || object.get("scenario") != Some(&Value::String(expected_scenario.to_owned()))
+        || object.get("publication_mode") != Some(&Value::String(expected_mode.to_owned()))
+    {
+        return Err(policy(
+            "publication scenario begin does not match the expected identity",
+        ));
+    }
+    Ok(())
+}
+
+fn read_stage(
+    stream: &mut UnixStream,
+    expected_mode: &str,
+    expected_stage: &str,
+    execution_id: Option<&str>,
+    artifact_id: Option<&str>,
+) -> Result<(Value, String, String), GateError> {
+    let message = read_control(stream)?;
+    let object = message
+        .as_object()
+        .ok_or_else(|| policy("publication stage message must be an object"))?;
+    exact_fields(
+        object,
+        &[
+            "action",
+            "artifact_id",
+            "execution_id",
+            "publication_mode",
+            "schema",
+            "stage",
+        ],
+        "publication stage message",
+    )?;
+    let observed_execution = object_string(object, "execution_id", "publication stage")?;
+    let observed_artifact = object_string(object, "artifact_id", "publication stage")?;
+    if object.get("schema")
+        != Some(&Value::String(
+            "clinker.attempt-stage-control/v1".to_owned(),
+        ))
+        || object.get("action") != Some(&Value::String("stage_ready".to_owned()))
+        || object.get("publication_mode") != Some(&Value::String(expected_mode.to_owned()))
+        || object.get("stage") != Some(&Value::String(expected_stage.to_owned()))
+        || execution_id.is_some_and(|expected| expected != observed_execution)
+        || artifact_id.is_some_and(|expected| expected != observed_artifact)
+    {
+        return Err(policy(
+            "publication stage message does not match the expected identity",
+        ));
+    }
+    let observed_execution = observed_execution.to_owned();
+    let observed_artifact = observed_artifact.to_owned();
+    Ok((message, observed_execution, observed_artifact))
+}
+
+fn release_stage(stream: &mut UnixStream, mut message: Value) -> Result<(), GateError> {
+    set_field(&mut message, "action", Value::String("release".to_owned()))?;
+    write_control(stream, &message)
+}
+
+fn write_scenario_action(
+    stream: &mut UnixStream,
+    action: &str,
+    scenario: &str,
+) -> Result<(), GateError> {
+    write_control(
+        stream,
+        &json!({
+            "action": action,
+            "scenario": scenario,
+            "schema": "clinker.filesystem-publication-control/1",
+        }),
+    )
+}
+
+fn control_success(
+    state: &EnvironmentState,
+    stream: &mut UnixStream,
+    scenario: &str,
+    mode: &str,
+    observations: &mut Vec<String>,
+) -> Result<(), GateError> {
+    let stages = if mode == "direct" {
+        &[
+            "file_synchronization",
+            "rename",
+            "parent_directory_synchronization",
+            "complete_before_cleanup",
+        ][..]
+    } else {
+        &[
+            "copy",
+            "file_synchronization",
+            "rename",
+            "parent_directory_synchronization",
+            "complete_before_cleanup",
+        ][..]
+    };
+    let mut execution_id = None;
+    let mut artifact_id = None;
+    for stage in stages {
+        let (message, observed_execution, observed_artifact) = read_stage(
+            stream,
+            mode,
+            stage,
+            execution_id.as_deref(),
+            artifact_id.as_deref(),
+        )?;
+        execution_id.get_or_insert(observed_execution);
+        artifact_id.get_or_insert(observed_artifact);
+        if *stage == "complete_before_cleanup" {
+            verify_complete_readback(
+                state,
+                scenario,
+                execution_id
+                    .as_deref()
+                    .expect("stage established execution"),
+                artifact_id.as_deref().expect("stage established artifact"),
+            )?;
+            observations.push(format!("{scenario}:pre_cleanup_readback=pass"));
+        }
+        release_stage(stream, message)?;
+    }
+    let complete = read_control(stream)?;
+    validate_exact_action(&complete, "success_complete", scenario, 3)?;
+    let execution_id = execution_id.expect("success stages establish execution");
+    let root = publication_sandbox(state)
+        .join(".clinker-attempts")
+        .join(&execution_id);
+    if !publication_sandbox(state)
+        .join(format!("{scenario}.bin"))
+        .is_file()
+        || root.exists()
+        || root.join("manifest.json").exists()
+    {
+        return Err(missing(
+            "successful publication post-cleanup readback is incomplete",
+        ));
+    }
+    observations.push(format!("{scenario}:post_cleanup_readback=pass"));
+    write_scenario_action(stream, "finish", scenario)
+}
+
+fn control_retained(
+    state: &EnvironmentState,
+    stream: &mut UnixStream,
+    scenario: &str,
+    _mode: &str,
+    interrupted: bool,
+    observations: &mut Vec<String>,
+) -> Result<(), GateError> {
+    let ready = read_control(stream)?;
+    let (execution_id, artifact_id, manifest_state) = validate_recovery_ready(&ready, scenario)?;
+    let expectation = retained_expectation(scenario)?;
+    validate_child_manifest_state(&manifest_state, &expectation)?;
+    verify_retained_readback(state, scenario, &execution_id, &artifact_id, &expectation)?;
+    observations.push(format!(
+        "{scenario}:{}=pass",
+        if interrupted {
+            "recovery_manifest_readback"
+        } else {
+            "ordinary_failure_manifest_readback"
+        }
+    ));
+    write_scenario_action(stream, "purge", scenario)?;
+    let purged = read_control(stream)?;
+    validate_exact_action(&purged, "purge_complete", scenario, 3)?;
+    if publication_sandbox(state)
+        .join(".clinker-attempts")
+        .join(&execution_id)
+        .exists()
+    {
+        return Err(missing("operator purge left retained attempt metadata"));
+    }
+    observations.push(format!("{scenario}:operator_purge=pass"));
+    write_scenario_action(stream, "finish", scenario)
+}
+
+fn control_interruption(
+    state: &EnvironmentState,
+    stream: &mut UnixStream,
+    scenario: &str,
+    mode: &str,
+    target_stage: &str,
+    observations: &mut Vec<String>,
+) -> Result<(), GateError> {
+    let stages = if mode == "direct" {
+        &[
+            "file_synchronization",
+            "rename",
+            "parent_directory_synchronization",
+        ][..]
+    } else {
+        &[
+            "copy",
+            "file_synchronization",
+            "rename",
+            "parent_directory_synchronization",
+        ][..]
+    };
+    let mut execution_id = None;
+    let mut artifact_id = None;
+    for stage in stages {
+        let (message, observed_execution, observed_artifact) = read_stage(
+            stream,
+            mode,
+            stage,
+            execution_id.as_deref(),
+            artifact_id.as_deref(),
+        )?;
+        execution_id.get_or_insert(observed_execution);
+        artifact_id.get_or_insert(observed_artifact);
+        if *stage == target_stage {
+            interrupt_profile(state)?;
+            observations.push(format!("{scenario}:service_interruption=pass"));
+            release_stage(stream, message)?;
+            let interrupted = read_control(stream)?;
+            validate_exact_action(&interrupted, "interruption_observed", scenario, 3)?;
+            observations.push(format!("{scenario}:bounded_interruption=pass"));
+            recover_profile(state)?;
+            observations.push(format!("{scenario}:service_recovery=pass"));
+            write_scenario_action(stream, "recover", scenario)?;
+            return control_retained(state, stream, scenario, mode, true, observations);
+        }
+        release_stage(stream, message)?;
+    }
+    Err(missing(
+        "target publication interruption stage was not emitted",
+    ))
+}
+
+fn control_capacity(
+    state: &EnvironmentState,
+    stream: &mut UnixStream,
+    observations: &mut Vec<String>,
+) -> Result<(), GateError> {
+    let ready = read_control(stream)?;
+    let object = ready
+        .as_object()
+        .ok_or_else(|| policy("capacity result must be an object"))?;
+    exact_fields(
+        object,
+        &[
+            "action",
+            "artifact_id",
+            "enospc_raw_os_error",
+            "execution_id",
+            "manifest_state",
+            "scenario",
+            "schema",
+        ],
+        "capacity result",
+    )?;
+    if object.get("schema")
+        != Some(&Value::String(
+            "clinker.filesystem-publication-control/1".to_owned(),
+        ))
+        || object.get("action") != Some(&Value::String("capacity_ready".to_owned()))
+        || object.get("scenario") != Some(&Value::String("capacity-enospc".to_owned()))
+        || object.get("enospc_raw_os_error").and_then(Value::as_i64) != Some(28)
+    {
+        return Err(missing("actual mounted ENOSPC result is incomplete"));
+    }
+    let execution_id = object_string(object, "execution_id", "capacity result")?;
+    let artifact_id = object_string(object, "artifact_id", "capacity result")?;
+    let manifest_state = object_string(object, "manifest_state", "capacity result")?;
+    if manifest_state != "staging" {
+        return Err(missing("ENOSPC retained manifest is not staging"));
+    }
+    let expectation = retained_expectation("capacity-enospc")?;
+    validate_child_manifest_state(manifest_state, &expectation)?;
+    verify_retained_readback(
+        state,
+        "capacity-enospc",
+        execution_id,
+        artifact_id,
+        &expectation,
+    )?;
+    observations.push("capacity-enospc:mounted_raw_errno_28=pass".to_owned());
+    write_scenario_action(stream, "purge", "capacity-enospc")?;
+    let purged = read_control(stream)?;
+    validate_exact_action(&purged, "purge_complete", "capacity-enospc", 3)?;
+    if publication_sandbox(state)
+        .join(".clinker-attempts")
+        .join(execution_id)
+        .exists()
+    {
+        return Err(missing("ENOSPC operator cleanup left attempt metadata"));
+    }
+    observations.push("capacity-enospc:operator_purge=pass".to_owned());
+    write_scenario_action(stream, "finish", "capacity-enospc")
+}
+
+fn validate_exact_action(
+    value: &Value,
+    action: &str,
+    scenario: &str,
+    field_count: usize,
+) -> Result<(), GateError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| policy("publication result must be an object"))?;
+    if object.len() != field_count
+        || object.get("schema")
+            != Some(&Value::String(
+                "clinker.filesystem-publication-control/1".to_owned(),
+            ))
+        || object.get("action") != Some(&Value::String(action.to_owned()))
+        || object.get("scenario") != Some(&Value::String(scenario.to_owned()))
+    {
+        return Err(policy(
+            "publication result does not match the exact scenario action",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recovery_ready(
+    value: &Value,
+    scenario: &str,
+) -> Result<(String, String, String), GateError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| policy("publication recovery result must be an object"))?;
+    exact_fields(
+        object,
+        &[
+            "action",
+            "artifact_id",
+            "execution_id",
+            "manifest_state",
+            "scenario",
+            "schema",
+        ],
+        "publication recovery result",
+    )?;
+    if object.get("schema")
+        != Some(&Value::String(
+            "clinker.filesystem-publication-control/1".to_owned(),
+        ))
+        || object.get("action") != Some(&Value::String("recovery_ready".to_owned()))
+        || object.get("scenario") != Some(&Value::String(scenario.to_owned()))
+    {
+        return Err(policy("publication recovery result identity is invalid"));
+    }
+    Ok((
+        object_string(object, "execution_id", "publication recovery result")?.to_owned(),
+        object_string(object, "artifact_id", "publication recovery result")?.to_owned(),
+        object_string(object, "manifest_state", "publication recovery result")?.to_owned(),
+    ))
+}
+
+fn publication_sandbox(state: &EnvironmentState) -> PathBuf {
+    state.mount_root.join(".clinker-publication-matrix")
+}
+
+fn read_attempt_manifest(state: &EnvironmentState, execution_id: &str) -> Result<Value, GateError> {
+    let path = publication_sandbox(state)
+        .join(".clinker-attempts")
+        .join(execution_id)
+        .join("manifest.json");
+    let bytes = read_regular(&path, "read mounted attempt manifest")?;
+    serde_json::from_slice(&bytes).map_err(|_| missing("mounted attempt manifest is malformed"))
+}
+
+fn verify_complete_readback(
+    state: &EnvironmentState,
+    scenario: &str,
+    execution_id: &str,
+    artifact_id: &str,
+) -> Result<(), GateError> {
+    let final_path = publication_sandbox(state).join(format!("{scenario}.bin"));
+    if fs::read(&final_path)
+        .map_err(|error| GateError::io("read mounted final artifact", &error))?
+        != b"mounted success"
+    {
+        return Err(missing("mounted success final readback did not match"));
+    }
+    let manifest = read_attempt_manifest(state, execution_id)?;
+    if manifest.get("execution_id") != Some(&Value::String(execution_id.to_owned()))
+        || manifest.get("state") != Some(&Value::String("complete".to_owned()))
+        || manifest
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .is_none_or(|artifacts| {
+                artifacts.len() != 1
+                    || artifacts[0].get("artifact_id")
+                        != Some(&Value::String(artifact_id.to_owned()))
+                    || artifacts[0].get("state") != Some(&Value::String("published".to_owned()))
+            })
+    {
+        return Err(missing(
+            "mounted pre-cleanup Complete manifest readback is incomplete",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct RetainedExpectation {
+    attempt_state: &'static str,
+    artifact_state: &'static str,
+    size_bytes: u64,
+    blake3_hex: &'static str,
+    final_bytes: Option<&'static [u8]>,
+}
+
+fn retained_expectation(scenario: &str) -> Result<RetainedExpectation, GateError> {
+    const EMPTY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const REPLACEMENT: &str = "865329d9aa64a0a90e28403e1ad5bdfc26b0b5beb5a967537e78818c17e78c67";
+    const INTERRUPTION: &str = "b7a4c2f87d102d06628d1ff7affff81fd46eb89f6dc029a1aae1033276227b30";
+
+    if scenario.starts_with("ordinary-failure-") {
+        return Ok(RetainedExpectation {
+            attempt_state: "incomplete",
+            artifact_state: "ready",
+            size_bytes: 11,
+            blake3_hex: REPLACEMENT,
+            final_bytes: Some(b"existing final"),
+        });
+    }
+    if scenario == "capacity-enospc"
+        || scenario.ends_with("-copy")
+        || scenario.ends_with("-file_synchronization")
+    {
+        return Ok(RetainedExpectation {
+            attempt_state: "staging",
+            artifact_state: "staging",
+            size_bytes: 0,
+            blake3_hex: EMPTY,
+            final_bytes: None,
+        });
+    }
+    if scenario.ends_with("-rename") {
+        return Ok(RetainedExpectation {
+            attempt_state: "publishing",
+            artifact_state: "promoting",
+            size_bytes: 20,
+            blake3_hex: INTERRUPTION,
+            final_bytes: None,
+        });
+    }
+    if scenario.ends_with("-parent_directory_synchronization") {
+        return Ok(RetainedExpectation {
+            attempt_state: "publishing",
+            artifact_state: "promoting",
+            size_bytes: 20,
+            blake3_hex: INTERRUPTION,
+            final_bytes: Some(b"mounted interruption"),
+        });
+    }
+    Err(policy(
+        "publication scenario has no retained-state contract",
+    ))
+}
+
+fn validate_child_manifest_state(
+    child_state: &str,
+    expectation: &RetainedExpectation,
+) -> Result<(), GateError> {
+    if child_state != expectation.attempt_state {
+        return Err(missing(
+            "child retained-state claim differs from the controller-derived scenario state",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_retained_readback(
+    state: &EnvironmentState,
+    scenario: &str,
+    execution_id: &str,
+    artifact_id: &str,
+    expectation: &RetainedExpectation,
+) -> Result<(), GateError> {
+    let manifest = read_attempt_manifest(state, execution_id)?;
+    let final_path = publication_sandbox(state).join(format!("{scenario}.bin"));
+    let final_bytes = match expectation.final_bytes {
+        Some(_) => Some(read_regular(
+            &final_path,
+            "read retained mounted final artifact",
+        )?),
+        None => match fs::symlink_metadata(&final_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(GateError::io(
+                    "inspect retained mounted final artifact",
+                    &error,
+                ));
+            }
+            Ok(_) => return Err(missing("retained scenario exposed an unexpected final")),
+        },
+    };
+    validate_retained_observation(
+        &manifest,
+        execution_id,
+        artifact_id,
+        expectation,
+        final_bytes.as_deref(),
+    )
+}
+
+fn validate_retained_observation(
+    manifest: &Value,
+    execution_id: &str,
+    artifact_id: &str,
+    expectation: &RetainedExpectation,
+    final_bytes: Option<&[u8]>,
+) -> Result<(), GateError> {
+    let artifact = manifest
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .filter(|artifacts| artifacts.len() == 1)
+        .and_then(|artifacts| artifacts.first())
+        .ok_or_else(|| missing("mounted retained manifest artifact inventory is incomplete"))?;
+    if manifest.get("execution_id") != Some(&Value::String(execution_id.to_owned()))
+        || manifest.get("state") != Some(&Value::String(expectation.attempt_state.to_owned()))
+        || manifest.get("total_bytes").and_then(Value::as_u64) != Some(expectation.size_bytes)
+        || artifact.get("artifact_id") != Some(&Value::String(artifact_id.to_owned()))
+        || artifact.get("state") != Some(&Value::String(expectation.artifact_state.to_owned()))
+        || artifact.get("size_bytes").and_then(Value::as_u64) != Some(expectation.size_bytes)
+        || artifact.get("blake3_hex") != Some(&Value::String(expectation.blake3_hex.to_owned()))
+        || final_bytes != expectation.final_bytes
+    {
+        return Err(missing(
+            "mounted retained attempt, artifact, digest, or final readback differs from the scenario contract",
+        ));
+    }
+    Ok(())
+}
+
+fn interrupt_profile(state: &EnvironmentState) -> Result<(), GateError> {
+    if state.profile == NFS_PROFILE {
+        let server_root = state.scratch.join("server");
+        checked(
+            "sudo",
+            &[
+                OsString::from("exportfs"),
+                OsString::from("-u"),
+                OsString::from(format!("127.0.0.1:{}", server_root.display())),
+            ],
+            inherited_environment(&[]),
+            Duration::from_secs(30),
+            "withdraw exact NFS publication export",
+        )?;
+    } else {
+        let pid_path = state
+            .samba_pid
+            .as_ref()
+            .ok_or_else(|| missing("exact Samba PID state is absent"))?;
+        let pid = fs::read_to_string(pid_path)
+            .map_err(|error| GateError::io("read exact Samba PID", &error))?;
+        if !valid_pid(pid.trim()) {
+            return Err(missing("exact Samba PID is invalid"));
+        }
+        checked(
+            "sudo",
+            &[OsString::from("kill"), OsString::from(pid.trim())],
+            inherited_environment(&[]),
+            Duration::from_secs(30),
+            "stop exact Samba publication process",
+        )?;
+        let mut stopped = false;
+        for _ in 0..50 {
+            let state = observe(
+                "sudo",
+                &[
+                    OsString::from("kill"),
+                    OsString::from("-0"),
+                    OsString::from(pid.trim()),
+                ],
+                inherited_environment(&[]),
+                Duration::from_secs(5),
+            )?;
+            if state.termination == Termination::Exited(Some(1)) {
+                stopped = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if !stopped {
+            return Err(missing("exact Samba process did not stop before deadline"));
+        }
+        let _ = fs::remove_file(pid_path);
+    }
+    checked(
+        "sudo",
+        &[
+            OsString::from("umount"),
+            OsString::from("-f"),
+            OsString::from("-l"),
+            state.mount_root.as_os_str().to_owned(),
+        ],
+        inherited_environment(&[]),
+        Duration::from_secs(30),
+        "force-lazy-detach interrupted publication profile",
+    )?;
+    if mount_state(&state.mount_root)? {
+        return Err(missing(
+            "publication mount remained active after disruption",
+        ));
+    }
+    Ok(())
+}
+
+fn recover_profile(state: &EnvironmentState) -> Result<(), GateError> {
+    let protocol = state.scratch.join("recovery-protocol.txt");
+    let server_root = state.scratch.join("server");
+    if state.profile == NFS_PROFILE {
+        provision_nfs(state, &server_root, &protocol, false)?;
+    } else {
+        provision_smb(state, &server_root, &state.scratch.join("samba"), &protocol)?;
+    }
+    let findmnt = checked(
+        "findmnt",
+        &[
+            OsString::from("-T"),
+            state.mount_root.as_os_str().to_owned(),
+            OsString::from("-n"),
+            OsString::from("-o"),
+            OsString::from("SOURCE,FSTYPE,OPTIONS"),
+        ],
+        inherited_environment(&[]),
+        Duration::from_secs(15),
+        "revalidate recovered publication mount",
+    )?;
+    let line = String::from_utf8(findmnt)
+        .map_err(|_| missing("recovered mount observation is not UTF-8"))?;
+    validate_mount(&state.profile, &parse_mount(&line)?)
 }
 
 /// Execute the holder/competitor/post-release byte-range lock proof.
@@ -1147,6 +2543,31 @@ fn cleanup_environment(state: &EnvironmentState) -> CleanupResult {
     } else {
         observations.push("samba_stop=skipped".to_owned());
     }
+    let backing_root = state.scratch.join("server");
+    let backing_mounted = match mount_state(&backing_root) {
+        Ok(mounted) => mounted,
+        Err(_) => {
+            observations.push("pre_teardown_backing_mount=unknown".to_owned());
+            success = false;
+            true
+        }
+    };
+    if backing_mounted {
+        let unmounted = cleanup_command(
+            "sudo",
+            &[
+                OsString::from("umount"),
+                backing_root.as_os_str().to_owned(),
+            ],
+        );
+        observations.push(format!(
+            "backing_unmount={}",
+            if unmounted { "pass" } else { "failed" }
+        ));
+        success &= unmounted;
+    } else {
+        observations.push("backing_unmount=skipped".to_owned());
+    }
     match mount_state(&state.mount_root) {
         Ok(false) => observations.push("post_teardown_mount=absent".to_owned()),
         Ok(true) => {
@@ -1155,6 +2576,17 @@ fn cleanup_environment(state: &EnvironmentState) -> CleanupResult {
         }
         Err(_) => {
             observations.push("post_teardown_mount=unknown".to_owned());
+            success = false;
+        }
+    }
+    match mount_state(&backing_root) {
+        Ok(false) => observations.push("post_teardown_backing_mount=absent".to_owned()),
+        Ok(true) => {
+            observations.push("post_teardown_backing_mount=present".to_owned());
+            success = false;
+        }
+        Err(_) => {
+            observations.push("post_teardown_backing_mount=unknown".to_owned());
             success = false;
         }
     }
@@ -1530,11 +2962,54 @@ fn validate_workflow(workflow: &Value) -> Result<(), GateError> {
         .ok_or_else(|| policy("filesystem matrix steps are absent"))?;
     let mut provision = 0_usize;
     let mut teardown = 0_usize;
+    let mut teardown_index = None;
+    let mut upload = 0_usize;
     let mut fetch = None;
     for (index, step) in steps.iter().enumerate() {
         let Some(step) = step.as_object() else {
             return Err(policy("filesystem matrix step must be an object"));
         };
+        let upload_action = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+        if step
+            .get("uses")
+            .and_then(Value::as_str)
+            .is_some_and(|uses| {
+                uses.starts_with("actions/upload-artifact@") && uses != upload_action
+            })
+        {
+            return Err(policy(
+                "filesystem evidence upload action is not the exact reviewed revision",
+            ));
+        }
+        if step.get("uses") == Some(&Value::String(upload_action.to_owned())) {
+            let with = step
+                .get("with")
+                .and_then(Value::as_object)
+                .ok_or_else(|| policy("filesystem evidence upload inputs are absent"))?;
+            exact_fields(
+                with,
+                &["if-no-files-found", "name", "path", "retention-days"],
+                "filesystem evidence upload inputs",
+            )?;
+            if step.get("if") != Some(&Value::String("always()".to_owned()))
+                || teardown_index.is_none_or(|teardown| teardown >= index)
+                || with.get("name")
+                    != Some(&Value::String(
+                        "filesystem-${{ matrix.profile }}-evidence".to_owned(),
+                    ))
+                || with.get("path")
+                    != Some(&Value::String(
+                        "${{ runner.temp }}/filesystem-${{ matrix.profile }}*".to_owned(),
+                    ))
+                || with.get("if-no-files-found") != Some(&Value::String("error".to_owned()))
+                || with.get("retention-days").and_then(Value::as_u64) != Some(14)
+            {
+                return Err(policy(
+                    "filesystem evidence upload is not unconditional, bounded, and after teardown",
+                ));
+            }
+            upload += 1;
+        }
         let Some(run) = step.get("run").and_then(Value::as_str) else {
             continue;
         };
@@ -1581,14 +3056,15 @@ fn validate_workflow(workflow: &Value) -> Result<(), GateError> {
                 ));
             }
             teardown += 1;
+            teardown_index = Some(index);
         }
         if run.contains("test-filesystem-matrix.sh") {
             return Err(policy("filesystem CI must invoke the Rust gate directly"));
         }
     }
-    if provision != 1 || teardown != 1 {
+    if provision != 1 || teardown != 1 || upload != 1 {
         return Err(policy(
-            "filesystem CI requires exactly one direct provision and teardown step",
+            "filesystem CI requires exactly one direct provision, teardown, and evidence upload step",
         ));
     }
     Ok(())
@@ -1603,8 +3079,7 @@ fn has_step_evidence_path(step: &serde_json::Map<String, Value>) -> bool {
 }
 
 fn direct_locked_command(run: &str, command: &str) -> bool {
-    let tokens = run.split_whitespace().collect::<Vec<_>>();
-    [
+    let expected = [
         "cargo",
         "run",
         "--quiet",
@@ -1615,10 +3090,56 @@ fn direct_locked_command(run: &str, command: &str) -> bool {
         "--",
         "filesystem",
         command,
-    ]
-    .windows(2)
-    .all(|pair| tokens.windows(2).any(|candidate| candidate == pair))
-        && tokens.first() == Some(&"cargo")
+        "--profile",
+        "${{ matrix.profile }}",
+        "--evidence",
+        "${EVIDENCE_PATH}",
+    ];
+    shell_free_argv(run)
+        .is_some_and(|argv| argv.iter().map(String::as_str).eq(expected.iter().copied()))
+}
+
+fn shell_free_argv(run: &str) -> Option<Vec<String>> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Single,
+        Double,
+    }
+
+    let mut argv = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut characters = run.chars().peekable();
+    while let Some(character) = characters.next() {
+        if matches!(character, '\n' | '\r' | '\\' | '`')
+            || (character == '$' && characters.peek() == Some(&'('))
+        {
+            return None;
+        }
+        match quote {
+            Some(Quote::Single) if character == '\'' => quote = None,
+            Some(Quote::Double) if character == '"' => quote = None,
+            Some(_) => token.push(character),
+            None if character == '\'' => quote = Some(Quote::Single),
+            None if character == '"' => quote = Some(Quote::Double),
+            None if character.is_whitespace() => {
+                if !token.is_empty() {
+                    argv.push(std::mem::take(&mut token));
+                }
+            }
+            None if matches!(character, ';' | '&' | '|' | '<' | '>' | '(' | ')') => {
+                return None;
+            }
+            None => token.push(character),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !token.is_empty() {
+        argv.push(token);
+    }
+    Some(argv)
 }
 
 fn minimal_status(profile: &str, status: &str, failed_step: &str, cleanup_success: bool) -> Value {
@@ -1695,7 +3216,7 @@ fn read_status(path: &Path) -> Result<Value, GateError> {
     let bytes = read_regular(path, "read filesystem evidence")?;
     let parsed = canonical::parse_json(&bytes)?;
     if canonical::to_bytes(&parsed)? != bytes {
-        return Err(policy("filesystem evidence bytes are not canonical v1"));
+        return Err(policy("filesystem evidence bytes are not canonical JSON"));
     }
     serde_json::from_slice(&bytes).map_err(|_| policy("filesystem evidence is malformed"))
 }
@@ -1934,6 +3455,25 @@ fn string_array(value: Option<&Value>, label: &str) -> Result<Vec<String>, GateE
     Ok(output)
 }
 
+fn require_exact_string_array(
+    value: Option<&Value>,
+    expected: &[&str],
+    label: &str,
+) -> Result<(), GateError> {
+    let observed = string_array(value, label)?;
+    if observed
+        .iter()
+        .map(String::as_str)
+        .eq(expected.iter().copied())
+    {
+        Ok(())
+    } else {
+        Err(missing(format!(
+            "{label} do not match the complete ordered contract"
+        )))
+    }
+}
+
 fn policy(detail: impl Into<String>) -> GateError {
     GateError::policy("filesystem.policy_required", detail)
 }
@@ -1948,11 +3488,78 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use serde_json::json;
     use tempfile::tempdir;
 
     use super::{
-        ChildResult, Termination, classify_mountpoint_termination, require_semantic_success,
+        ChildResult, Termination, classify_mountpoint_termination, direct_locked_command,
+        require_semantic_success, retained_expectation, validate_child_manifest_state,
+        validate_retained_observation,
     };
+
+    const DIRECT_PROVISION: &str = "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem provision-and-run --profile \"${{ matrix.profile }}\" --evidence \"${EVIDENCE_PATH}\"";
+
+    #[test]
+    fn direct_filesystem_command_requires_one_exact_shell_free_argv() {
+        assert!(direct_locked_command(DIRECT_PROVISION, "provision-and-run"));
+        for invalid in [
+            "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --offline --locked -- filesystem provision-and-run --profile \"${{ matrix.profile }}\" --evidence \"${EVIDENCE_PATH}\"",
+            "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem provision-and-run --profile \"${{ matrix.profile }}\" --evidence \"${EVIDENCE_PATH}\" --verbose",
+            "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem provision-and-run --profile \"${{ matrix.profile }}\" --evidence \"${EVIDENCE_PATH}\" && true",
+            "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem provision-and-run --profile \"${{ matrix.profile }}\" --evidence \"${EVIDENCE_PATH}\"; true",
+            "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem provision-and-run --profile \"${{ matrix.profile }}\" --evidence \"$(printf bad)\"",
+        ] {
+            assert!(!direct_locked_command(invalid, "provision-and-run"));
+        }
+    }
+
+    #[test]
+    fn retained_support_evidence_rejects_wrong_state_artifact_and_final_bytes() {
+        let expectation =
+            retained_expectation("interruption-direct-parent_directory_synchronization")
+                .expect("known retained scenario");
+        let manifest = json!({
+            "execution_id": "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+            "state": expectation.attempt_state,
+            "total_bytes": expectation.size_bytes,
+            "artifacts": [{
+                "artifact_id": "artifact-00000001",
+                "state": expectation.artifact_state,
+                "size_bytes": expectation.size_bytes,
+                "blake3_hex": expectation.blake3_hex,
+            }],
+        });
+        validate_child_manifest_state("publishing", &expectation).expect("derived child state");
+        validate_retained_observation(
+            &manifest,
+            "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+            "artifact-00000001",
+            &expectation,
+            Some(b"mounted interruption"),
+        )
+        .expect("complete retained observation");
+
+        validate_child_manifest_state("incomplete", &expectation)
+            .expect_err("semantically wrong child state must fail");
+        let mut wrong_artifact = manifest.clone();
+        wrong_artifact["artifacts"][0]["state"] = json!("unpublished");
+        validate_retained_observation(
+            &wrong_artifact,
+            "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+            "artifact-00000001",
+            &expectation,
+            Some(b"mounted interruption"),
+        )
+        .expect_err("wrong artifact state must fail");
+        validate_retained_observation(
+            &manifest,
+            "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+            "artifact-00000001",
+            &expectation,
+            Some(b"corrupted final"),
+        )
+        .expect_err("wrong final bytes must fail");
+    }
 
     #[test]
     fn util_linux_mountpoint_exit_contract_distinguishes_absent_mounts() {
@@ -1976,7 +3583,8 @@ mod tests {
             stderr_truncated: false,
         };
 
-        require_semantic_success(&log, &result).expect_err("failed child must fail qualification");
+        require_semantic_success(&log, &result, "remote_filesystem_matrix_semantics")
+            .expect_err("failed child must fail qualification");
 
         let evidence = fs::read_to_string(log).expect("failed child evidence");
         assert!(evidence.contains("termination=Exited(Some(101))"));

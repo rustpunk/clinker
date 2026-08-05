@@ -280,6 +280,19 @@ fn remote_filesystem_matrix_semantics() {
         .expect("destination-local matrix sandbox");
     let sandbox_path = sandbox.path().to_path_buf();
 
+    let destination_profile = match profile.as_str() {
+        "linux-nfsv4.1-loopback-ci" => "nfs_v4_1",
+        "linux-smb3.1.1-loopback-ci" => "smb_3_1_1",
+        _ => unreachable!("profile was validated above"),
+    };
+    std::fs::write(
+        sandbox.path().join("clinker.toml"),
+        format!(
+            "[storage.publication]\ndestination_profile = \"{destination_profile}\"\nmax_attempt_bytes = \"1MB\"\nmin_free_bytes = \"1B\"\n"
+        ),
+    )
+    .expect("matrix publication profile");
+
     // Exercise the actual CLI admission, writer, ledger, and promotion path on
     // the mounted share. Direct boundary checks below remain focused fault
     // coverage; this run is the qualification evidence for production wiring.

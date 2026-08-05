@@ -2,20 +2,86 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use clinker_plan::config::{ConfigError, IfExistsPolicy};
+use clinker_plan::config::{ConfigError, IfExistsPolicy, ResolvedPublicationPolicy};
 use clinker_plan::error::PipelineError;
+use clinker_plan::security::{ValidatedPath, check_overwrite, validate_path};
 
-use super::containment::{ContainmentError, StagedOutput};
-use super::open::{containment_error, open_output};
+use super::attempt::{ArtifactKind, ArtifactRegistration, AttemptError, RunAttemptPublication};
+use super::containment::{
+    AttemptDestinationReservation, ContainmentError, PromotionDisposition, StagedOutput,
+};
+use super::open::{containment_error, open_output, open_output_with_policy};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AttemptCommitStage {
+    Rename,
+    ParentDirectorySynchronization,
+}
 
 #[derive(Debug)]
 struct PendingOutput {
     name: String,
     final_path: PathBuf,
-    staged: StagedOutput,
+    staged: PendingStage,
+}
+
+#[derive(Debug)]
+enum PendingStage {
+    DestinationLocal(StagedOutput),
+    AttemptOwned {
+        reservation: AttemptDestinationReservation,
+        source: ValidatedPath,
+        source_path: PathBuf,
+    },
+}
+
+impl PendingStage {
+    fn partial_path(&self) -> &std::path::Path {
+        match self {
+            Self::DestinationLocal(staged) => staged.partial_path(),
+            Self::AttemptOwned { source_path, .. } => source_path,
+        }
+    }
+
+    fn preflight(&self) -> Result<(), ContainmentError> {
+        match self {
+            Self::DestinationLocal(staged) => staged.preflight(),
+            Self::AttemptOwned { reservation, .. } => reservation.preflight(),
+        }
+    }
+
+    fn publish(
+        &mut self,
+        fail_after_rename: bool,
+        before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
+    ) -> Result<(), ContainmentError> {
+        match self {
+            Self::DestinationLocal(staged) => {
+                staged.publish_with_sync_barrier(fail_after_rename, before_parent_directory_sync)
+            }
+            Self::AttemptOwned {
+                reservation,
+                source,
+                ..
+            } => reservation.publish_from_with_sync_barrier(
+                source.clone(),
+                fail_after_rename,
+                before_parent_directory_sync,
+            ),
+        }
+    }
+
+    fn finalize_with_cleanup_fault(&mut self, fail_cleanup: bool) -> Result<(), ContainmentError> {
+        match self {
+            Self::DestinationLocal(staged) => staged.finalize_with_cleanup_fault(fail_cleanup),
+            Self::AttemptOwned { reservation, .. } => {
+                reservation.finalize_with_cleanup_fault(fail_cleanup)
+            }
+        }
+    }
 }
 
 /// An operator-visible partial retained after an unsuccessful run.
@@ -82,12 +148,35 @@ struct RegistryState {
 /// Split writers may create files from executor-owned threads, so clones all
 /// point to the same synchronized ledger. Publication remains owned by the CLI
 /// after the executor has dropped every writer.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct OutputStagingRegistry {
     state: Arc<Mutex<RegistryState>>,
+    attempt: Option<RunAttemptPublication>,
+}
+
+impl Default for OutputStagingRegistry {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RegistryState::default())),
+            attempt: None,
+        }
+    }
 }
 
 impl OutputStagingRegistry {
+    /// Attach the shared output ledger to one run-owned publication attempt.
+    pub fn for_run_attempt(attempt: RunAttemptPublication) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RegistryState::default())),
+            attempt: Some(attempt),
+        }
+    }
+
+    /// Whether dynamic artifacts are owned by a run attempt.
+    pub(crate) fn has_run_attempt(&self) -> bool {
+        self.attempt.is_some()
+    }
+
     /// Stage one resolved output without touching its final leaf.
     ///
     /// # Errors
@@ -99,12 +188,140 @@ impl OutputStagingRegistry {
         name: impl Into<String>,
         policy: IfExistsPolicy,
         cli_force: bool,
+        path_for_n: F,
+    ) -> Result<(PathBuf, File), PipelineError>
+    where
+        F: FnMut(Option<u64>) -> Result<PathBuf, ConfigError>,
+    {
+        self.stage_output_inner(None, name.into(), policy, cli_force, path_for_n)
+    }
+
+    /// Stage one resolved output through an already validated publication
+    /// policy.
+    ///
+    /// This typed entry point replaces detected-filesystem routing for the
+    /// run-owned attempt path while preserving the shared collision ledger.
+    pub fn stage_output_with_policy<F>(
+        &self,
+        publication: &ResolvedPublicationPolicy,
+        name: impl Into<String>,
+        policy: IfExistsPolicy,
+        cli_force: bool,
+        path_for_n: F,
+    ) -> Result<(PathBuf, File), PipelineError>
+    where
+        F: FnMut(Option<u64>) -> Result<PathBuf, ConfigError>,
+    {
+        self.stage_output_inner(
+            Some(publication),
+            name.into(),
+            policy,
+            cli_force,
+            path_for_n,
+        )
+    }
+
+    /// Stage one dynamically resolved artifact through this run's owned
+    /// attempt and the ordinary collision-policy vocabulary.
+    pub fn stage_attempt_output<F>(
+        &self,
+        kind: ArtifactKind,
+        name: impl Into<String>,
+        policy: IfExistsPolicy,
+        cli_force: bool,
         mut path_for_n: F,
     ) -> Result<(PathBuf, File), PipelineError>
     where
         F: FnMut(Option<u64>) -> Result<PathBuf, ConfigError>,
     {
         let name = name.into();
+        let bare = path_for_n(None).map_err(PipelineError::Config)?;
+        let disposition = match policy {
+            IfExistsPolicy::Overwrite => PromotionDisposition::Replace,
+            IfExistsPolicy::Error if cli_force => PromotionDisposition::Replace,
+            IfExistsPolicy::Error | IfExistsPolicy::UniqueSuffix => PromotionDisposition::NoReplace,
+        };
+        let stage = |path: PathBuf| self.stage_attempt_candidate(kind, &name, disposition, path);
+        match policy {
+            IfExistsPolicy::Overwrite => stage(bare),
+            IfExistsPolicy::Error => match stage(bare.clone()) {
+                Err(error) if !cli_force && attempt_is_already_exists(&error) => {
+                    Err(attempt_existing_output_error(&bare))
+                }
+                result => result,
+            },
+            IfExistsPolicy::UniqueSuffix => {
+                match stage(bare.clone()) {
+                    Ok(output) => return Ok(output),
+                    Err(error) if attempt_is_already_exists(&error) => {}
+                    Err(error) => return Err(error),
+                }
+                for n in 1_u64..=u64::MAX {
+                    let candidate = path_for_n(Some(n)).map_err(PipelineError::Config)?;
+                    match stage(candidate) {
+                        Ok(output) => return Ok(output),
+                        Err(error) if attempt_is_already_exists(&error) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(PipelineError::Io(std::io::Error::other(
+                    "exhausted u64 collision counter for unique_suffix policy",
+                )))
+            }
+        }
+    }
+
+    fn stage_attempt_candidate(
+        &self,
+        kind: ArtifactKind,
+        name: &str,
+        disposition: PromotionDisposition,
+        final_path: PathBuf,
+    ) -> Result<(PathBuf, File), PipelineError> {
+        let attempt = self
+            .attempt
+            .as_ref()
+            .ok_or_else(|| PipelineError::Internal {
+                op: "attempt-publication",
+                node: name.to_owned(),
+                detail: "attempt-owned output registry has no run attempt".to_owned(),
+            })?;
+        let base = std::env::current_dir().map_err(PipelineError::Io)?;
+        let destination =
+            validate_path(&final_path, &base, final_path.is_absolute()).map_err(|diagnostic| {
+                PipelineError::Config(ConfigError::Validation(format!(
+                    "{}: {}",
+                    diagnostic.code, diagnostic.message
+                )))
+            })?;
+        let logical_leaf = final_path
+            .file_name()
+            .and_then(|leaf| leaf.to_str())
+            .ok_or_else(|| {
+                PipelineError::Config(ConfigError::Validation(
+                    "output artifact leaf must be valid UTF-8".to_owned(),
+                ))
+            })?;
+        let registration =
+            ArtifactRegistration::new(kind, name, logical_leaf, destination, disposition)
+                .map_err(attempt_error_to_pipeline)?;
+        let writer = attempt
+            .stage(self, registration)
+            .map_err(attempt_error_to_pipeline)?;
+        Ok((final_path, writer.into_file()))
+    }
+
+    fn stage_output_inner<F>(
+        &self,
+        publication: Option<&ResolvedPublicationPolicy>,
+        name: String,
+        policy: IfExistsPolicy,
+        cli_force: bool,
+        mut path_for_n: F,
+    ) -> Result<(PathBuf, File), PipelineError>
+    where
+        F: FnMut(Option<u64>) -> Result<PathBuf, ConfigError>,
+    {
         let mut state = self
             .state
             .lock()
@@ -125,10 +342,19 @@ impl OutputStagingRegistry {
             Some(bare)
         };
         let (final_path, file, staged) = if let Some(bare) = bare {
-            open_output(policy, cli_force, |n| match n {
-                None => Ok(bare.clone()),
-                Some(n) => path_for_n(Some(n)),
-            })?
+            if let Some(publication) = publication {
+                open_output_with_policy(publication, policy, cli_force, |n| match n {
+                    None => Ok(bare.clone()),
+                    Some(n) => path_for_n(Some(n)),
+                })?
+            } else {
+                open_output(policy, cli_force, |n| match n {
+                    None => Ok(bare.clone()),
+                    Some(n) => path_for_n(Some(n)),
+                })?
+            }
+        } else if let Some(publication) = publication {
+            open_output_with_policy(publication, policy, cli_force, path_for_n)?
         } else {
             open_output(policy, cli_force, path_for_n)?
         };
@@ -142,9 +368,55 @@ impl OutputStagingRegistry {
         state.pending.push(PendingOutput {
             name,
             final_path: final_path.clone(),
-            staged,
+            staged: PendingStage::DestinationLocal(staged),
         });
         Ok((final_path, file))
+    }
+
+    /// Register an attempt-owned artifact for the ordinary publication gate.
+    pub(crate) fn register_attempt_output(
+        &self,
+        name: String,
+        final_path: PathBuf,
+        reservation: AttemptDestinationReservation,
+        source: ValidatedPath,
+    ) -> Result<(), PipelineError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = destination_key(&final_path)?;
+        if let Some((first_name, first_path)) = state.claims.get(&key) {
+            return Err(collision_error(&name, &final_path, first_name, first_path));
+        }
+        state.claims.insert(key, (name.clone(), final_path.clone()));
+        let source_path = source.as_path().to_path_buf();
+        state.pending.push(PendingOutput {
+            name,
+            final_path,
+            staged: PendingStage::AttemptOwned {
+                reservation,
+                source,
+                source_path,
+            },
+        });
+        Ok(())
+    }
+
+    pub(crate) fn ensure_destination_available(
+        &self,
+        name: &str,
+        final_path: &std::path::Path,
+    ) -> Result<(), PipelineError> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = destination_key(final_path)?;
+        if let Some((first_name, first_path)) = state.claims.get(&key) {
+            return Err(collision_error(name, final_path, first_name, first_path));
+        }
+        Ok(())
     }
 
     /// Snapshot all hidden files that remain pending. This is used to report
@@ -197,14 +469,22 @@ impl OutputStagingRegistry {
     /// Stops at the first failed promotion and reports every visible,
     /// unsynchronized, and unpublished path without attempting set rollback.
     pub fn commit_all(&self) -> Result<PublicationOutcome, PipelineError> {
-        self.commit_all_inner(None, None, None)
+        self.commit_all_inner(None, None, None, None)
     }
 
-    fn commit_all_inner(
+    pub(crate) fn commit_all_with_stage_control(
+        &self,
+        control: &mut dyn FnMut(usize, AttemptCommitStage) -> std::io::Result<()>,
+    ) -> Result<PublicationOutcome, PipelineError> {
+        self.commit_all_inner(None, None, None, Some(control))
+    }
+
+    pub(crate) fn commit_all_inner(
         &self,
         fail_before_rename_at: Option<usize>,
         fail_after_rename_at: Option<usize>,
         fail_cleanup_at: Option<usize>,
+        mut control: Option<&mut dyn FnMut(usize, AttemptCommitStage) -> std::io::Result<()>>,
     ) -> Result<PublicationOutcome, PipelineError> {
         let pending = {
             let mut state = self
@@ -225,6 +505,14 @@ impl OutputStagingRegistry {
         let mut cleanup_debt = Vec::new();
         let mut index = 0_usize;
         while let Some(mut entry) = remaining.pop_front() {
+            if let Some(control) = control.as_deref_mut()
+                && let Err(error) = control(index, AttemptCommitStage::Rename)
+            {
+                remaining.push_front(entry);
+                self.restore_pending(remaining.into());
+                self.record_committed(&published, &visible_unsynchronized);
+                return Err(PipelineError::Io(error));
+            }
             if fail_before_rename_at == Some(index) {
                 remaining.push_front(entry);
                 let unpublished = partials_from(remaining.iter());
@@ -238,7 +526,14 @@ impl OutputStagingRegistry {
                     error: "injected failure before destination rename".to_owned(),
                 });
             }
-            match entry.staged.publish(fail_after_rename_at == Some(index)) {
+            let mut before_parent_directory_sync = || match control.as_deref_mut() {
+                Some(control) => control(index, AttemptCommitStage::ParentDirectorySynchronization),
+                None => Ok(()),
+            };
+            match entry.staged.publish(
+                fail_after_rename_at == Some(index),
+                Some(&mut before_parent_directory_sync),
+            ) {
                 Ok(()) => {
                     let identity = (entry.name.clone(), entry.final_path.clone());
                     if let Err(error) = entry
@@ -318,7 +613,7 @@ impl OutputStagingRegistry {
         &self,
         fail_after_rename_at: usize,
     ) -> Result<PublicationOutcome, PipelineError> {
-        self.commit_all_inner(None, Some(fail_after_rename_at), None)
+        self.commit_all_inner(None, Some(fail_after_rename_at), None, None)
     }
 
     #[cfg(test)]
@@ -326,7 +621,7 @@ impl OutputStagingRegistry {
         &self,
         fail_before_rename_at: usize,
     ) -> Result<PublicationOutcome, PipelineError> {
-        self.commit_all_inner(Some(fail_before_rename_at), None, None)
+        self.commit_all_inner(Some(fail_before_rename_at), None, None, None)
     }
 
     #[cfg(test)]
@@ -334,7 +629,7 @@ impl OutputStagingRegistry {
         &self,
         fail_cleanup_at: usize,
     ) -> Result<PublicationOutcome, PipelineError> {
-        self.commit_all_inner(None, None, Some(fail_cleanup_at))
+        self.commit_all_inner(None, None, Some(fail_cleanup_at), None)
     }
 
     /// Publish the ledger only for a complete, non-interrupted execution.
@@ -380,6 +675,28 @@ fn destination_key(path: &std::path::Path) -> Result<String, PipelineError> {
     Ok(clinker_plan::config::collision_key(
         &absolute.to_string_lossy(),
     ))
+}
+
+fn attempt_error_to_pipeline(error: AttemptError) -> PipelineError {
+    match error {
+        AttemptError::Containment(error) => containment_error(error),
+        AttemptError::Pipeline(error) => error,
+        other => PipelineError::Config(ConfigError::Validation(other.to_string())),
+    }
+}
+
+fn attempt_is_already_exists(error: &PipelineError) -> bool {
+    matches!(error, PipelineError::Io(source) if source.kind() == std::io::ErrorKind::AlreadyExists)
+}
+
+fn attempt_existing_output_error(path: &Path) -> PipelineError {
+    let detail = match check_overwrite(path) {
+        Err(diagnostic) => diagnostic.message,
+        Ok(()) => format!(
+            "output file already exists: {path:?} — use --force or set if_exists: overwrite"
+        ),
+    };
+    PipelineError::Config(ConfigError::Validation(format!("E-SEC-001: {detail}")))
 }
 
 fn partials_from<'a>(entries: impl Iterator<Item = &'a PendingOutput>) -> Vec<PartialOutput> {

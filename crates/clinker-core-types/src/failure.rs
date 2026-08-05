@@ -197,6 +197,12 @@ failure_registry! {
     "attempt.publication.finalization_failed", Publication, RetryWithBackoff, "attempt artifact finalization failed";
     "attempt.publication.manifest_failed", Publication, RetryWithBackoff, "attempt manifest persistence failed";
     "attempt.publication.promotion_failed", Publication, PolicyRequired, "artifact promotion failed";
+    "attempt.retention.ownership_refused", SecurityPolicy, PolicyRequired, "attempt ownership could not be proven";
+    "attempt.retention.manifest_invalid", SecurityPolicy, PolicyRequired, "attempt manifest is invalid or unreadable";
+    "attempt.retention.live", Publication, PolicyRequired, "attempt is still live";
+    "attempt.retention.clock_ambiguous", Publication, PolicyRequired, "attempt retention time is ambiguous";
+    "attempt.retention.budget_exhausted", Publication, RetryWithBackoff, "attempt cleanup budget was exhausted";
+    "attempt.retention.cleanup_failed", Infrastructure, RetryWithBackoff, "attempt cleanup did not complete";
     "observability.configuration.invalid", Observability, DoNotRetry, "observability configuration is invalid";
     "observability.configuration.policy_required", Observability, PolicyRequired, "observability policy is required";
     "observability.delivery.failed", Observability, RetryWithBackoff, "observability delivery failed";

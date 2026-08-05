@@ -246,8 +246,10 @@ jobs:
 
   # Positive remote-publication evidence is limited to these disposable,
   # self-provisioned Linux loopback profiles. A missing package, mount,
-  # observation, semantic result, or teardown fails its cell and leaves the
-  # uploaded evidence explicitly ineligible for a support claim.
+  # lifecycle/capacity observation, or teardown fails its cell and leaves the
+  # schema-3 evidence explicitly ineligible for a support claim. Each server
+  # root is backed by a mounted 64 MiB tmpfs so ENOSPC is observed through the
+  # mounted client rather than inferred from an injected fault.
   filesystem-matrix:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -295,7 +297,7 @@ jobs:
           --profile "${{ matrix.profile }}"
           --evidence "${EVIDENCE_PATH}"
 
-      - name: Upload profile evidence
+      - name: Unconditionally upload bounded profile evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

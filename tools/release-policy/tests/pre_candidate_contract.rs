@@ -701,6 +701,28 @@ fn write_filesystem_evidence(root: &Path, profile: &str, relative_path: &str) {
     write_canonical_json(
         &root.join(relative_path),
         &json!({
+            "admission_lock_results": {
+                "api": "RunAttemptPublication::create",
+                "count_limit": {
+                    "bounded_completion": "pass",
+                    "estimated_attempt_bytes": 100,
+                    "exactly_one_admitted": "pass",
+                    "independent_processes": "pass",
+                    "mounted_root_readback": "pass",
+                    "opposite_root_order": "pass",
+                    "retained_attempt_limit": 1
+                },
+                "lock": "fs4::FileExt::lock",
+                "retained_byte_limit": {
+                    "bounded_completion": "pass",
+                    "estimated_attempt_bytes": 100,
+                    "exactly_one_admitted": "pass",
+                    "independent_processes": "pass",
+                    "mounted_root_readback": "pass",
+                    "opposite_root_order": "pass",
+                    "retained_byte_limit": 150
+                }
+            },
             "ci_identity": {
                 "job": "filesystem-matrix",
                 "repository": "rustpunk/clinker",
@@ -712,6 +734,7 @@ fn write_filesystem_evidence(root: &Path, profile: &str, relative_path: &str) {
             },
             "cleanup_observations": [
                 "post_teardown_mount=absent",
+                "post_teardown_backing_mount=absent",
                 "workspace_cleanup=pass",
                 "cleanup_success=true"
             ],
@@ -724,24 +747,79 @@ fn write_filesystem_evidence(root: &Path, profile: &str, relative_path: &str) {
                 "cancel_before_promotion=no_final",
                 "child_timeout=no_passing_evidence"
             ],
-            "locations": {"local_workspace": "/workspace", "mounted_share": "/runner/mount"},
+            "locations": {"local_workspace": "repository_workspace", "mounted_share": "profile_mount_root"},
             "lock_observations": ["holder=acquired", "competitor=blocked", "post_release=acquired"],
             "mount": {"source": source, "filesystem": filesystem, "options": options},
             "packages": packages,
             "profile": profile,
             "protocol_observations": protocol,
             "runner": {"os": "Linux", "image_os": "ubuntu24", "image_version": "20260801.1", "kernel": "6.11"},
-            "schema": "clinker.filesystem-matrix-evidence/v1",
-            "semantic_results": {
-                "confinement": "pass",
-                "rename_visibility": "pass",
-                "cancellation_no_final": "pass",
-                "sync_durability": "pass",
-                "cross_filesystem_no_copy": "pass",
-                "cleanup_liveness": "pass",
-                "test_filter": "remote_filesystem_matrix_semantics",
-                "test_log": "semantic-test.txt"
+            "capacity_results": {
+                "backing": "mounted_tmpfs_64_mib",
+                "edquot_seam": "seam_covered",
+                "enospc_final_absent": "pass",
+                "enospc_manifest_state": "staging",
+                "enospc_operator_cleanup": "pass",
+                "enospc_raw_os_error": 28,
+                "mounted_enospc": "pass",
+                "quota": "seam_covered"
             },
+            "edge_outcomes": {
+                "cancellation_no_final": "pass",
+                "cleanup_liveness": "pass",
+                "confinement": "pass",
+                "cross_filesystem_no_copy": "pass",
+                "rename_visibility": "pass",
+                "sync_durability": "pass"
+            },
+            "prohibitions": [
+                "copy_fallback_to_visible_final=absent",
+                "publication_mode_fallback=absent",
+                "cross_artifact_atomicity_claim=absent",
+                "cross_execution_staging_ownership=absent",
+                "raw_deletion_path_authority=absent"
+            ],
+            "publication_results": {
+                "lifecycle_classes": [
+                    "success", "ordinary_failure", "interruption",
+                    "ambiguity_durability_uncertainty", "purge_cleanup", "support_eligibility"
+                ],
+                "modes": ["direct", "local_then_publish"],
+                "operator_results": [
+                    "list=pass", "inspect=pass", "purge_preview=pass",
+                    "purge_execute=pass", "cleanup_debt=none"
+                ],
+                "persistence_results": [
+                    "ordinary_failure=retained_manifest",
+                    "interruption=retained_manifest",
+                    "ambiguity_durability_uncertainty=retained_manifest"
+                ],
+                "recovery_results": [
+                    "direct:file_synchronization=recovered_revalidated_completed_manifest_reopened",
+                    "direct:rename=recovered_revalidated_completed_manifest_reopened",
+                    "direct:parent_directory_synchronization=recovered_revalidated_completed_manifest_reopened",
+                    "local_then_publish:copy=recovered_revalidated_completed_manifest_reopened",
+                    "local_then_publish:file_synchronization=recovered_revalidated_completed_manifest_reopened",
+                    "local_then_publish:rename=recovered_revalidated_completed_manifest_reopened",
+                    "local_then_publish:parent_directory_synchronization=recovered_revalidated_completed_manifest_reopened"
+                ],
+                "stage_results": [
+                    "direct:file_synchronization=interrupted_retained",
+                    "direct:rename=interrupted_retained",
+                    "direct:parent_directory_synchronization=interrupted_retained",
+                    "local_then_publish:copy=interrupted_retained",
+                    "local_then_publish:file_synchronization=interrupted_retained",
+                    "local_then_publish:rename=interrupted_retained",
+                    "local_then_publish:parent_directory_synchronization=interrupted_retained"
+                ],
+                "success_results": [
+                    "direct=pre_cleanup_final_and_complete_manifest,post_cleanup_final_present_attempt_absent",
+                    "local_then_publish=pre_cleanup_final_and_complete_manifest,post_cleanup_final_present_attempt_absent"
+                ],
+                "test_filter": "remote_filesystem_publication_matrix",
+                "test_log": "publication-test.txt"
+            },
+            "schema": "clinker.filesystem-matrix-evidence/3",
             "status": "passed",
             "support_eligible": true
         }),

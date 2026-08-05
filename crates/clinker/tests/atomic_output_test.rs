@@ -8,6 +8,34 @@ fn clinker_bin() -> &'static str {
     env!("CARGO_BIN_EXE_clinker")
 }
 
+fn assert_abandoned_attempt(root: &std::path::Path, expected_leaf: &str) {
+    let namespace = root.join(".clinker-attempts");
+    let attempts = std::fs::read_dir(&namespace)
+        .expect("retained attempt namespace")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 1, "one run must own one retained attempt");
+    let attempt_root = attempts[0].path();
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(attempt_root.join("manifest.json")).expect("retained manifest"),
+    )
+    .expect("valid retained manifest");
+    assert_eq!(manifest["state"], "abandoned");
+    let artifact = manifest["artifacts"]
+        .as_array()
+        .expect("artifact array")
+        .iter()
+        .find(|artifact| artifact["logical_leaf"] == expected_leaf)
+        .unwrap_or_else(|| panic!("missing retained artifact {expected_leaf}: {manifest}"));
+    assert_eq!(artifact["state"], "unpublished");
+    let artifact_id = artifact["artifact_id"].as_str().expect("artifact id");
+    assert!(
+        attempt_root.join(artifact_id).is_file(),
+        "attempt-owned artifact bytes must remain inspectable"
+    );
+}
+
 #[test]
 fn successful_run_leaves_final_path_only() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -64,14 +92,26 @@ nodes:
         "rows: {body}"
     );
 
-    // Sweep the dir for hidden partial/reservation files — none should remain.
+    // Successful publication leaves no attempt receipt. The internal admission
+    // mutex remains in its reserved namespace so later processes serialize on
+    // the same inode generation.
+    let admission_namespace = dir.path().join(".clinker-attempts");
+    let admission_entries = std::fs::read_dir(&admission_namespace)
+        .expect("internal admission namespace")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(admission_entries, [".admission.lock"]);
+
+    // Sweep the dir for hidden partial/reservation files — only the internal
+    // admission namespace may remain.
     let tmp_leftovers: Vec<PathBuf> = std::fs::read_dir(dir.path())
         .expect("readdir")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(".clinker-") || n.starts_with(".tmp"))
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                (n.starts_with(".clinker-") && n != ".clinker-attempts") || n.starts_with(".tmp")
+            })
         })
         .collect();
     assert!(
@@ -195,21 +235,7 @@ nodes:
         "overwrite must leave the previous final untouched until success"
     );
 
-    // A destination-local hidden file remains so an operator can inspect the
-    // attempted replacement.
-    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-        .expect("readdir")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(".clinker-out.csv-") && n.ends_with(".partial"))
-        })
-        .collect();
-    assert!(
-        !leftovers.is_empty(),
-        "temp file must be preserved after runtime failure"
-    );
+    assert_abandoned_attempt(dir.path(), "out.csv");
 }
 
 #[test]
@@ -841,16 +867,7 @@ nodes:
         std::fs::read_to_string(dir.path().join("result_0001.csv")).expect("read previous segment"),
         "previous segment\n"
     );
-    assert!(
-        std::fs::read_dir(dir.path())
-            .expect("read output directory")
-            .filter_map(Result::ok)
-            .any(|entry| entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".clinker-result_0001.csv-")),
-        "failed split must retain a hidden segment partial"
-    );
+    assert_abandoned_attempt(dir.path(), "result_0001.csv");
 }
 
 #[test]
@@ -914,14 +931,8 @@ nodes:
         "previous primary\n"
     );
     assert!(
-        std::fs::read_dir(dir.path())
-            .expect("read output directory")
-            .filter_map(Result::ok)
-            .any(|entry| entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".clinker-out.csv-")),
-        "primary quarantine must remain inspectable"
+        !dir.path().join(".clinker-attempts").exists(),
+        "invalid DLQ destination root must refuse before output attempt creation"
     );
 }
 
@@ -962,6 +973,11 @@ nodes:
     include_unmapped: true
 "#;
     std::fs::write(&pipeline_path, pipeline).expect("write pipeline");
+    std::fs::write(
+        dir.path().join("clinker.toml"),
+        "[storage.publication]\nmax_attempt_bytes = \"1MB\"\nretained_byte_limit = \"8MB\"\n",
+    )
+    .expect("write bounded concurrent-attempt policy");
 
     // Pre-touch the bare path so every process must walk to a suffix.
     std::fs::write(dir.path().join("out.csv"), "").expect("touch bare");

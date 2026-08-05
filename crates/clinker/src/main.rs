@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 
 use clinker_exec::executor::PipelineExecutor;
 use clinker_exec::metrics::{self, ExecutionMetrics};
@@ -32,6 +33,7 @@ QUICK START:
   clinker run pipeline.yaml --dry-run -n 10
   clinker run pipeline.yaml --explain
   clinker run pipeline.yaml --channel acme-corp
+  clinker attempts list pipeline.yaml
 
 ENVIRONMENT VARIABLES:
   CLINKER_ENV                   Active environment for when: conditions
@@ -42,7 +44,7 @@ EXIT CODES:
   1  Configuration, schema, or CXL compilation error
   2  Pipeline completed but DLQ entries were produced
   3  CXL evaluation error
-  4  I/O or format error"
+  4  Infrastructure failure or retained-attempt cleanup debt"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -89,6 +91,24 @@ NDJSON archives.")]
     Metrics {
         #[command(subcommand)]
         subcommand: MetricsCommands,
+    },
+    /// Inspect and purge retained publication attempts.
+    #[command(
+        long_about = "\
+Inspect retained publication attempts owned by a freshly compiled pipeline. \
+List and inspect never mutate attempt state. Purge is a preview unless \
+--execute is supplied, and every operation remains bounded by \
+[storage.publication].",
+        after_long_help = "\
+EXAMPLES:
+  clinker attempts list pipelines/orders.yaml
+  clinker attempts inspect pipelines/orders.yaml --execution-id 018f47a2-9a41-7a27-b4d6-4f7137e3c159
+  clinker attempts purge pipelines/orders.yaml --expired
+  clinker attempts purge pipelines/orders.yaml --expired --execute"
+    )]
+    Attempts {
+        #[command(subcommand)]
+        subcommand: AttemptsCommands,
     },
     /// Explain pipeline field provenance or error codes
     #[command(
@@ -189,6 +209,128 @@ EXAMPLES:
   clinker config --resolved pipeline.yaml > pipeline.canonical.yaml"
     )]
     Config(ConfigArgs),
+}
+
+/// Subcommands for `clinker attempts`.
+#[derive(Subcommand, Debug)]
+pub enum AttemptsCommands {
+    /// List retained attempts owned by the compiled pipeline.
+    List(AttemptsListArgs),
+    /// Inspect one execution across every owned destination root.
+    Inspect(AttemptsInspectArgs),
+    /// Preview or execute bounded metadata-last cleanup.
+    Purge(AttemptsPurgeArgs),
+}
+
+/// Output format for retained-attempt operations.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AttemptsFormat {
+    /// Deterministic human-readable records.
+    Text,
+    /// Compact JSON for tooling consumption.
+    Json,
+}
+
+/// Arguments for `clinker attempts list`.
+#[derive(Parser, Debug)]
+pub struct AttemptsListArgs {
+    /// Workspace-relative pipeline YAML used to derive owned roots.
+    pub pipeline: PathBuf,
+    #[command(flatten)]
+    pub identity: AttemptIdentityArgs,
+    /// Resume one bounded page using the exact opaque token previously emitted.
+    #[arg(long)]
+    pub continuation: Option<String>,
+    /// Include sanitized workspace-relative attempt paths.
+    #[arg(long)]
+    pub show_paths: bool,
+    /// Render deterministic text or compact JSON.
+    #[arg(long, value_enum, default_value_t = AttemptsFormat::Text)]
+    pub format: AttemptsFormat,
+}
+
+/// Arguments for `clinker attempts inspect`.
+#[derive(Parser, Debug)]
+pub struct AttemptsInspectArgs {
+    /// Workspace-relative pipeline YAML used to derive owned roots.
+    pub pipeline: PathBuf,
+    /// Canonical execution identity to inspect.
+    #[arg(long)]
+    pub execution_id: String,
+    #[command(flatten)]
+    pub identity: AttemptIdentityArgs,
+    /// Include sanitized workspace-relative attempt paths.
+    #[arg(long)]
+    pub show_paths: bool,
+    /// Render deterministic text or compact JSON.
+    #[arg(long, value_enum, default_value_t = AttemptsFormat::Text)]
+    pub format: AttemptsFormat,
+}
+
+/// Arguments for `clinker attempts purge`.
+#[derive(Parser, Debug)]
+pub struct AttemptsPurgeArgs {
+    /// Workspace-relative pipeline YAML used to derive owned roots.
+    pub pipeline: PathBuf,
+    /// Purge one canonical execution identity.
+    #[arg(long)]
+    pub execution_id: Option<String>,
+    #[command(flatten)]
+    pub identity: AttemptIdentityArgs,
+    /// Purge every policy-expired attempt admitted by this bounded page.
+    #[arg(long)]
+    pub expired: bool,
+    /// Perform cleanup. Without this flag, purge is always a preview.
+    #[arg(long)]
+    pub execute: bool,
+    /// Resume one bounded page using the exact opaque token previously emitted.
+    #[arg(long)]
+    pub continuation: Option<String>,
+    /// Include sanitized workspace-relative attempt paths in preview evidence.
+    #[arg(long)]
+    pub show_paths: bool,
+    /// Render deterministic text or compact JSON.
+    #[arg(long, value_enum, default_value_t = AttemptsFormat::Text)]
+    pub format: AttemptsFormat,
+}
+
+/// Run identity inputs needed to recompile the exact set of owned attempt
+/// roots. These mirror the path- and overlay-affecting `run` options; no raw
+/// destination path is accepted as cleanup authority.
+#[derive(Args, Debug)]
+pub struct AttemptIdentityArgs {
+    /// Workspace root used by the original run.
+    #[arg(long, help_heading = "Paths")]
+    pub base_dir: Option<PathBuf>,
+    /// Permit absolute paths in YAML config, matching `clinker run`.
+    #[arg(long, help_heading = "Paths")]
+    pub allow_absolute_paths: bool,
+    /// CXL module search path used by the original run.
+    #[arg(long, help_heading = "Paths")]
+    pub rules_path: Option<PathBuf>,
+    /// Channel overlay applied by the original run.
+    #[arg(long, help_heading = "Configuration")]
+    pub channel: Option<String>,
+    /// Explicit group overlay applied by the original run (repeatable).
+    #[arg(long = "group", value_name = "NAME", help_heading = "Configuration")]
+    pub groups: Vec<String>,
+    /// Suppress selector-derived groups, matching `clinker run`.
+    #[arg(long = "no-auto-groups", help_heading = "Configuration")]
+    pub no_auto_groups: bool,
+    /// Execution identity used only to reconstruct run-scoped output paths.
+    /// This is distinct from an inspect or purge selector.
+    #[arg(long, help_heading = "Configuration")]
+    pub path_execution_id: Option<String>,
+    /// Batch identity used by an output path template in the original run.
+    #[arg(long, help_heading = "Configuration")]
+    pub batch_id: Option<String>,
+    /// Timestamp token used by an output path template in the original run.
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DDTHH-MM-SSZ",
+        help_heading = "Configuration"
+    )]
+    pub timestamp: Option<String>,
 }
 
 /// Subcommands for `clinker channels`.
@@ -634,7 +776,21 @@ fn pipeline_error_exit_code(error: &PipelineError) -> u8 {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let attempts_invocation = std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "attempts");
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let exit_code = if attempts_invocation && error.use_stderr() {
+                1
+            } else {
+                u8::try_from(error.exit_code()).unwrap_or(1)
+            };
+            let _ = error.print();
+            return ExitCode::from(exit_code);
+        }
+    };
 
     match &cli.command {
         Commands::Run(args) => {
@@ -668,6 +824,18 @@ fn main() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("clinker metrics error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Commands::Attempts { subcommand } => {
+            tracing_subscriber::fmt()
+                .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+                .init();
+            match run_attempts(subcommand) {
+                Ok(code) => ExitCode::from(code),
+                Err(error) => {
+                    eprintln!("clinker attempts error: {error}");
                     ExitCode::FAILURE
                 }
             }
@@ -1332,6 +1500,149 @@ fn storage_validation_error(e: clinker_exec::executor::StorageValidationError) -
 /// verify mismatch, a disk-cap overflow, and a plain I/O failure.
 fn staging_error(e: clinker_channel::StagingError) -> PipelineError {
     PipelineError::Config(clinker_plan::config::ConfigError::Validation(e.to_string()))
+}
+
+struct RunAttemptAbandonGuard(clinker_exec::output::attempt::RunAttemptPublication);
+
+impl Drop for RunAttemptAbandonGuard {
+    fn drop(&mut self) {
+        let _ = self.0.abandon();
+    }
+}
+
+fn insert_publication_root(
+    roots: &mut std::collections::BTreeMap<
+        std::path::PathBuf,
+        clinker_plan::security::ValidatedPath,
+    >,
+    destination: &std::path::Path,
+) -> Result<(), PipelineError> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let base = std::env::current_dir().map_err(PipelineError::Io)?;
+    let root = clinker_plan::security::validate_path(parent, &base, parent.is_absolute()).map_err(
+        |diagnostic| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                "{}: {}",
+                diagnostic.code, diagnostic.message
+            )))
+        },
+    )?;
+    roots.insert(root.as_path().to_path_buf(), root);
+    Ok(())
+}
+
+fn run_unix_ms() -> Result<u64, PipelineError> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                "system clock is earlier than the Unix epoch".to_owned(),
+            ))
+        })?;
+    u64::try_from(duration.as_millis()).map_err(|_| {
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+            "system clock exceeds the supported publication range".to_owned(),
+        ))
+    })
+}
+
+#[derive(Clone)]
+enum PublicationFailureKind {
+    Readiness,
+    ReadinessAndAbandonment,
+    CleanupDebt(usize),
+    Incomplete(usize),
+    Publish(String),
+}
+
+fn publication_failure_diagnostic(execution_id: &str, failure: PublicationFailureKind) -> String {
+    let reason = match failure {
+        PublicationFailureKind::Readiness => "output readiness failed",
+        PublicationFailureKind::ReadinessAndAbandonment => {
+            "output readiness failed and the abandoned state could not be persisted"
+        }
+        PublicationFailureKind::CleanupDebt(count) => {
+            return format!(
+                "output publication completed with {count} cleanup debt item(s) for execution {execution_id}; run `clinker attempts inspect <pipeline> --execution-id {execution_id}` with the same identity options"
+            );
+        }
+        PublicationFailureKind::Incomplete(count) => {
+            return format!(
+                "output publication was incomplete with {count} cleanup debt item(s) for execution {execution_id}; run `clinker attempts inspect <pipeline> --execution-id {execution_id}` with the same identity options"
+            );
+        }
+        PublicationFailureKind::Publish(category) => {
+            return format!(
+                "output publication failed ({category}) for execution {execution_id}; run `clinker attempts inspect <pipeline> --execution-id {execution_id}` with the same identity options"
+            );
+        }
+    };
+    format!(
+        "{reason} for execution {execution_id}; run `clinker attempts inspect <pipeline> --execution-id {execution_id}` with the same identity options"
+    )
+}
+
+fn publication_error_category(error: &clinker_exec::output::attempt::AttemptError) -> String {
+    use clinker_exec::output::attempt::AttemptError;
+
+    match error {
+        AttemptError::Containment(error) => {
+            use clinker_exec::output::containment::ContainmentError;
+            match error {
+                ContainmentError::SecurityPolicy { code, .. } => {
+                    format!("containment security policy {code}")
+                }
+                ContainmentError::PolicyRequired { profile, .. } => {
+                    format!("unqualified destination profile {profile}")
+                }
+                ContainmentError::Io {
+                    operation, source, ..
+                } => format!(
+                    "containment {operation}: kind={:?}, os_code={:?}",
+                    source.kind(),
+                    source.raw_os_error()
+                ),
+                ContainmentError::VisibleButUnsynced { source, .. } => format!(
+                    "destination synchronization: kind={:?}, os_code={:?}",
+                    source.kind(),
+                    source.raw_os_error()
+                ),
+                ContainmentError::PublishedCleanup { .. } => {
+                    "published cleanup operation".to_owned()
+                }
+            }
+        }
+        AttemptError::Pipeline(PipelineError::Io(source)) => format!(
+            "I/O operation: kind={:?}, os_code={:?}",
+            source.kind(),
+            source.raw_os_error()
+        ),
+        AttemptError::Io {
+            operation, source, ..
+        } => format!(
+            "{operation}: kind={:?}, os_code={:?}",
+            source.kind(),
+            source.raw_os_error()
+        ),
+        AttemptError::Pipeline(_) => "pipeline operation".to_owned(),
+        AttemptError::Serialize(_) | AttemptError::Deserialize(_) => "manifest encoding".to_owned(),
+        AttemptError::InvalidManifest(_)
+        | AttemptError::InvalidTransition(_)
+        | AttemptError::InvalidQuery(_)
+        | AttemptError::InvalidContinuation(_) => "invalid durable state".to_owned(),
+        AttemptError::Injected(_) | AttemptError::QualificationControl(_) => {
+            "qualification control".to_owned()
+        }
+        AttemptError::RegistrationCollision { .. } => "destination collision".to_owned(),
+        AttemptError::IntegrityMismatch { .. } => "integrity verification".to_owned(),
+        AttemptError::AttemptByteLimitExceeded { .. }
+        | AttemptError::AggregateAdmissionUnproven(_)
+        | AttemptError::RetainedAttemptLimitExceeded { .. }
+        | AttemptError::RetainedByteLimitExceeded { .. } => "publication admission".to_owned(),
+    }
 }
 
 fn run(args: &RunArgs) -> Result<u8, PipelineError> {
@@ -2061,11 +2372,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // and preserve hidden partials for inspection.
     let mut writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>> =
         std::collections::HashMap::new();
-    let output_staging = clinker_exec::output::staging::OutputStagingRegistry::default();
     let mut fan_out_destinations: std::collections::HashMap<
         String,
         Vec<(std::sync::Arc<str>, std::path::PathBuf, std::path::PathBuf)>,
     > = std::collections::HashMap::new();
+    let mut historical_source_identities = std::collections::BTreeSet::new();
     for output in pipeline_config.output_configs() {
         if !output_is_fan_out(compiled_plan.dag(), &output.name) {
             continue;
@@ -2080,6 +2391,19 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             std::collections::HashMap::new();
         let mut rendered = Vec::with_capacity(files.len());
         for source_path in files {
+            if let Some(source_name) = &upstream_source {
+                historical_source_identities.insert(
+                    clinker_exec::output::attempt::HistoricalSourceIdentity::new(
+                        source_name.clone(),
+                        source_path.to_string_lossy().into_owned(),
+                    )
+                    .map_err(|error| {
+                        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                            error.to_string(),
+                        ))
+                    })?,
+                );
+            }
             let source_key: std::sync::Arc<str> =
                 std::sync::Arc::from(source_path.to_string_lossy().into_owned());
             let source_file = source_path
@@ -2113,6 +2437,121 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         }
         fan_out_destinations.insert(output.name.clone(), rendered);
     }
+
+    // Resolve publication against every compiled destination parent before
+    // the first output reservation or attempt file is created. The estimate
+    // is deliberately the effective configured ceiling (the lower of the
+    // per-attempt and retained-byte limits): admission is advisory, but a run
+    // admitted below its own enforced byte ceiling could otherwise fail merely
+    // because formatting expands the source representation.
+    let mut publication_roots = std::collections::BTreeMap::new();
+    for output in pipeline_config.output_configs() {
+        if let Some(destinations) = fan_out_destinations.get(&output.name) {
+            for (_, destination, _) in destinations {
+                insert_publication_root(&mut publication_roots, destination)?;
+            }
+        } else {
+            let destination =
+                std::path::PathBuf::from(output.render_runtime_path("<merged>", "<merged>")?);
+            insert_publication_root(&mut publication_roots, &destination)?;
+        }
+    }
+    if let Some(dlq) = &pipeline_config.error_handling.dlq {
+        if let Some(path) = &dlq.path {
+            insert_publication_root(&mut publication_roots, std::path::Path::new(path))?;
+        }
+        for per_source in dlq.per_source.values() {
+            if let Some(path) = &per_source.path {
+                insert_publication_root(&mut publication_roots, std::path::Path::new(path))?;
+            }
+        }
+    }
+    if publication_roots.is_empty() {
+        return Err(PipelineError::Config(
+            clinker_plan::config::ConfigError::Validation(
+                "compiled pipeline has no file destination roots".to_owned(),
+            ),
+        ));
+    }
+    let estimated_attempt_bytes = storage_config
+        .publication
+        .max_attempt_bytes
+        .0
+        .min(storage_config.publication.retained_byte_limit.0);
+    let mut publication_policy = None;
+    for root in publication_roots.values() {
+        let observed_free_bytes = clinker_exec::output::attempt::observed_available_space(
+            root.as_path(),
+        )
+        .map_err(|error| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                error.to_string(),
+            ))
+        })?;
+        let resolved = storage_config
+            .publication
+            .resolve(root.as_path(), estimated_attempt_bytes, observed_free_bytes)
+            .map_err(|error| {
+                PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                    error.to_string(),
+                ))
+            })?;
+        if publication_policy
+            .as_ref()
+            .map(
+                |current: &clinker_plan::config::ResolvedPublicationPolicy| {
+                    current.explain().observed_free_bytes > observed_free_bytes
+                },
+            )
+            .unwrap_or(true)
+        {
+            publication_policy = Some(resolved);
+        }
+    }
+    let publication_policy = publication_policy.expect("non-empty roots resolve one policy");
+    let created_unix_ms = run_unix_ms()?;
+    let eligible_after_unix_ms = created_unix_ms
+        .checked_add(
+            publication_policy
+                .creation_grace_seconds()
+                .checked_mul(1_000)
+                .ok_or_else(|| {
+                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                        "storage.publication creation grace overflows the durable clock".to_owned(),
+                    ))
+                })?,
+        )
+        .ok_or_else(|| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                "publication attempt eligibility overflows the durable clock".to_owned(),
+            ))
+        })?;
+    let receipt_root =
+        clinker_plan::security::validate_path(std::path::Path::new("."), &workspace_root, false)
+            .map_err(|diagnostic| {
+                PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                    diagnostic.message,
+                ))
+            })?;
+    let run_attempt =
+        clinker_exec::output::attempt::RunAttemptPublication::create_with_root_receipt(
+            publication_policy,
+            &compiled_plan,
+            receipt_root,
+            historical_source_identities.into_iter().collect(),
+            &execution_id,
+            created_unix_ms,
+            eligible_after_unix_ms,
+            publication_roots.into_values().collect(),
+        )
+        .map_err(|error| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                error.to_string(),
+            ))
+        })?;
+    let _attempt_guard = RunAttemptAbandonGuard(run_attempt.clone());
+    let output_staging =
+        clinker_exec::output::staging::OutputStagingRegistry::for_run_attempt(run_attempt.clone());
     let mut fan_out_writers: std::collections::HashMap<
         String,
         std::collections::HashMap<std::sync::Arc<str>, Box<dyn std::io::Write + Send>>,
@@ -2162,7 +2601,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                         }
                     })
                 };
-                let (_final_path, file) = output_staging.stage_output(
+                let (_final_path, file) = output_staging.stage_attempt_output(
+                    clinker_exec::output::attempt::ArtifactKind::FanOut,
                     output.name.clone(),
                     output.if_exists,
                     false,
@@ -2196,7 +2636,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     }
                 })
             };
-        let (_final_path, handle) = output_staging.stage_output(
+        let (_final_path, handle) = output_staging.stage_attempt_output(
+            clinker_exec::output::attempt::ArtifactKind::Primary,
             output.name.clone(),
             output.if_exists,
             false,
@@ -2312,14 +2753,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             // the exact inputs the failure saw (cleanup = on_success); only
             // cleanup = always reaps them on failure.
             source_stager.cleanup(false);
-            for pending in output_staging.partials() {
-                tracing::warn!(
-                    output = %pending.name,
-                    final_path = %pending.final_path.display(),
-                    partial_path = %pending.partial_path.display(),
-                    "pipeline failed; partial output preserved at temp path",
-                );
-            }
+            run_attempt.abandon().map_err(|attempt_error| {
+                PipelineError::Io(std::io::Error::other(format!(
+                    "pipeline failed and attempt state could not be persisted: {attempt_error}"
+                )))
+            })?;
             return Err(e);
         }
     };
@@ -2352,7 +2790,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     continue;
                 }
                 let bare = target_path.clone();
-                let (_final_path, dlq_handle) = output_staging.stage_output(
+                let (_final_path, dlq_handle) = output_staging.stage_attempt_output(
+                    clinker_exec::output::attempt::ArtifactKind::Dlq,
                     "dead-letter output",
                     clinker_plan::config::IfExistsPolicy::Overwrite,
                     false,
@@ -2392,6 +2831,15 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             let hash_full = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
             let hash_short = hash_full[..8.min(hash_full.len())].to_string();
             for target in targets {
+                let resolved_path = if output.authored_path_was_absolute() {
+                    target.clone()
+                } else {
+                    let current_dir = std::env::current_dir().map_err(PipelineError::Io)?;
+                    target
+                        .strip_prefix(current_dir)
+                        .unwrap_or(&target)
+                        .to_path_buf()
+                };
                 let sidecar = clinker_exec::output::sidecar::OutputSidecar {
                     pipeline_path: args.config.to_string_lossy().into_owned(),
                     pipeline_hash: hash_full.clone(),
@@ -2404,7 +2852,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     execution_id: Some(execution_id.clone()),
                     batch_id: Some(batch_id.clone()),
                     output_name: output.name.clone(),
-                    resolved_path: target.to_string_lossy().into_owned(),
+                    resolved_path: resolved_path.to_string_lossy().into_owned(),
                     record_count: None,
                     bytes_written: None,
                     dlq_counts: dlq_counts.clone(),
@@ -2415,7 +2863,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 let sidecar_path =
                     clinker_exec::output::sidecar::OutputSidecar::sidecar_path(&target);
                 let bare = sidecar_path.clone();
-                let (_, mut handle) = output_staging.stage_output(
+                let (_, mut handle) = output_staging.stage_attempt_output(
+                    clinker_exec::output::attempt::ArtifactKind::Sidecar,
                     format!("metadata sidecar for output {:?}", output.name),
                     clinker_plan::config::IfExistsPolicy::Overwrite,
                     false,
@@ -2431,109 +2880,84 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     })();
     if let Err(error) = publication_preparation {
         source_stager.cleanup(false);
-        for pending in output_staging.partials() {
-            tracing::warn!(
-                output = %pending.name,
-                final_path = %pending.final_path.display(),
-                partial_path = %pending.partial_path.display(),
-                "publication preparation failed; hidden output preserved",
-            );
-        }
+        run_attempt.abandon().map_err(|attempt_error| {
+            PipelineError::Io(std::io::Error::other(format!(
+                "publication preparation failed and attempt state could not be persisted: {attempt_error}"
+            )))
+        })?;
         return Err(error);
     }
 
     let mut publication_failure: Option<String> = None;
     if report.interrupted {
-        for pending in output_staging.partials() {
-            tracing::warn!(
-                output = %pending.name,
-                final_path = %pending.final_path.display(),
-                partial_path = %pending.partial_path.display(),
-                "pipeline was interrupted; hidden output was not published",
-            );
-        }
-    } else if !shutdown_token.try_begin_publication() {
-        report.interrupted = true;
-        for pending in output_staging.partials() {
-            tracing::warn!(
-                output = %pending.name,
-                final_path = %pending.final_path.display(),
-                partial_path = %pending.partial_path.display(),
-                "shutdown won before publication; hidden output was not published",
-            );
-        }
+        run_attempt.abandon().map_err(|error| {
+            PipelineError::Io(std::io::Error::other(format!(
+                "interrupted attempt state could not be persisted: {error}"
+            )))
+        })?;
     } else {
-        use clinker_exec::output::staging::PublicationOutcome;
-        match output_staging.commit_all() {
-            Ok(PublicationOutcome::Complete { cleanup_debt, .. }) if cleanup_debt.is_empty() => {}
-            Ok(PublicationOutcome::Complete { cleanup_debt, .. }) => {
-                for debt in &cleanup_debt {
-                    tracing::error!(
-                        output = %debt.name,
-                        final_path = %debt.final_path.display(),
-                        stale_path = %debt.stale_path.display(),
-                        detail = %debt.detail,
-                        "output published with transaction cleanup debt",
-                    );
+        match run_attempt.mark_all_ready() {
+            Err(_) => {
+                if run_attempt.abandon().is_err() {
+                    publication_failure = Some(publication_failure_diagnostic(
+                        &execution_id,
+                        PublicationFailureKind::ReadinessAndAbandonment,
+                    ));
+                } else {
+                    publication_failure = Some(publication_failure_diagnostic(
+                        &execution_id,
+                        PublicationFailureKind::Readiness,
+                    ));
                 }
-                publication_failure = Some(format!(
-                    "output publication completed with {} cleanup debt item(s)",
-                    cleanup_debt.len()
-                ));
             }
-            Ok(PublicationOutcome::Incomplete {
-                published,
-                visible_unsynchronized,
-                unpublished,
-                cleanup_debt,
-                error,
-            }) => {
-                for (name, path) in &published {
-                    tracing::error!(output = %name, final_path = %path.display(), "output is visible and synchronized");
+            Ok(()) => match run_attempt.publish_run(&output_staging, &shutdown_token) {
+                Ok(None) => report.interrupted = true,
+                Ok(Some(clinker_exec::output::attempt::AttemptPublicationOutcome::Complete {
+                    cleanup_debt_count: 0,
+                    ..
+                })) => {}
+                Ok(Some(clinker_exec::output::attempt::AttemptPublicationOutcome::Complete {
+                    cleanup_debt_count,
+                    ..
+                })) => {
+                    publication_failure = Some(publication_failure_diagnostic(
+                        &execution_id,
+                        PublicationFailureKind::CleanupDebt(cleanup_debt_count),
+                    ));
                 }
-                for (name, path) in &visible_unsynchronized {
-                    tracing::error!(output = %name, final_path = %path.display(), "output is visible but parent synchronization failed");
+                Ok(Some(
+                    clinker_exec::output::attempt::AttemptPublicationOutcome::Incomplete {
+                        cleanup_debt_count,
+                        ..
+                    },
+                )) => {
+                    publication_failure = Some(publication_failure_diagnostic(
+                        &execution_id,
+                        PublicationFailureKind::Incomplete(cleanup_debt_count),
+                    ));
                 }
-                for pending in &unpublished {
-                    tracing::error!(
-                        output = %pending.name,
-                        final_path = %pending.final_path.display(),
-                        partial_path = %pending.partial_path.display(),
-                        "output remains unpublished in quarantine",
-                    );
+                Err(error) => {
+                    publication_failure = Some(publication_failure_diagnostic(
+                        &execution_id,
+                        PublicationFailureKind::Publish(publication_error_category(&error)),
+                    ));
                 }
-                for debt in &cleanup_debt {
-                    tracing::error!(
-                        output = %debt.name,
-                        final_path = %debt.final_path.display(),
-                        stale_path = %debt.stale_path.display(),
-                        detail = %debt.detail,
-                        "publication also left cleanup debt",
-                    );
-                }
-                publication_failure = Some(error);
-            }
-            Err(error) => {
-                for pending in output_staging.partials() {
-                    tracing::error!(
-                        output = %pending.name,
-                        final_path = %pending.final_path.display(),
-                        partial_path = %pending.partial_path.display(),
-                        "publication preflight failed; output remains unpublished",
-                    );
-                }
-                publication_failure = Some(error.to_string());
-            }
+            },
         }
     }
 
-    tracing::info!(
-        "Pipeline complete: {} total, {} ok, {} written, {} dlq",
-        counters.total_count,
-        counters.ok_count,
-        counters.records_written,
-        counters.dlq_count
-    );
+    if let Some(error) = &publication_failure {
+        tracing::error!(execution_id = %execution_id, "{error}");
+        eprintln!("{error}");
+    } else {
+        tracing::info!(
+            "Pipeline complete: {} total, {} ok, {} written, {} dlq",
+            counters.total_count,
+            counters.ok_count,
+            counters.records_written,
+            counters.dlq_count
+        );
+    }
 
     // Per-stage actual spill volume at end-of-run, so an operator can compare
     // each stage's real spilled bytes against the pre-run `--explain` per-stage
@@ -2650,7 +3074,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 .map(|o| o.path.clone())
                 .collect(),
             dlq_path,
-            error: None,
+            error: publication_failure.clone(),
             retraction: clinker_exec::metrics::RetractionMetrics::from(&counters.retraction),
             per_source_record_counts: report.per_source_record_counts.clone(),
             per_source_dlq_counts: report.per_source_dlq_counts.clone(),
@@ -3129,6 +3553,1599 @@ fn hostname_string() -> String {
             std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string())
         })
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+#[derive(Debug)]
+struct AttemptCommandError(String);
+
+impl AttemptCommandError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl std::fmt::Display for AttemptCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AttemptCommandError {}
+
+struct AttemptCommandContext {
+    query: Option<clinker_exec::output::attempt::AttemptQuery>,
+    root_ids: Vec<String>,
+    workspace_root: PathBuf,
+    pipeline: String,
+    identity_argv: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AttemptOperationView {
+    operation: &'static str,
+    pipeline: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<&'static str>,
+    roots: Vec<AttemptRootView>,
+}
+
+#[derive(Serialize)]
+struct AttemptRootView {
+    root_id: String,
+    disposition: String,
+    attempts: Vec<AttemptInspectionView>,
+    selected_execution_ids: Vec<String>,
+    removed_execution_ids: Vec<String>,
+    kept_execution_ids: Vec<String>,
+    removed_artifact_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume_argv: Option<Vec<String>>,
+    cleanup_debt: Vec<AttemptDebtView>,
+    diagnostics: Vec<AttemptDiagnosticView>,
+    bounds: AttemptBoundsView,
+}
+
+#[derive(Serialize)]
+struct AttemptInspectionView {
+    execution_id: String,
+    disposition: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eligible_after_unix_ms: Option<u64>,
+    artifact_ids: Vec<String>,
+    eligible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    cleanup_debt: Vec<AttemptDebtView>,
+    diagnostics: Vec<AttemptDiagnosticView>,
+    bounds: AttemptBoundsView,
+}
+
+#[derive(Serialize)]
+struct AttemptDebtView {
+    kind: &'static str,
+    detail: &'static str,
+}
+
+#[derive(Serialize)]
+struct AttemptDiagnosticView {
+    diagnostic_code: &'static str,
+    failure_code: &'static str,
+    failure_category: &'static str,
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact_id: Option<String>,
+    final_visibility: &'static str,
+    durability_uncertain: bool,
+    retry_advice: &'static str,
+    recovery_command: String,
+    recovery_argv: Vec<String>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct AttemptBoundsView {
+    considered_entries: u64,
+    considered_bytes: u64,
+    elapsed_ms: u64,
+}
+
+impl From<clinker_exec::output::attempt::AttemptQueryBounds> for AttemptBoundsView {
+    fn from(bounds: clinker_exec::output::attempt::AttemptQueryBounds) -> Self {
+        Self {
+            considered_entries: bounds.considered_entries(),
+            considered_bytes: bounds.considered_bytes(),
+            elapsed_ms: bounds.elapsed_ms(),
+        }
+    }
+}
+
+fn run_attempts(command: &AttemptsCommands) -> Result<u8, AttemptCommandError> {
+    if matches!(command, AttemptsCommands::Purge(args) if args.execute) {
+        clinker_exec::pipeline::shutdown::install_signal_handler().map_err(|error| {
+            AttemptCommandError::new(format!("cannot install cleanup signal handler: {error}"))
+        })?;
+    }
+    match command {
+        AttemptsCommands::List(args) => run_attempts_list(args),
+        AttemptsCommands::Inspect(args) => run_attempts_inspect(args),
+        AttemptsCommands::Purge(args) => run_attempts_purge(args),
+    }
+}
+
+fn run_attempts_list(args: &AttemptsListArgs) -> Result<u8, AttemptCommandError> {
+    if let Some(execution_id) = args.identity.path_execution_id.as_deref() {
+        validate_execution_selector(execution_id)?;
+    }
+    let context = compile_attempt_context(
+        &args.pipeline,
+        &args.identity,
+        args.identity.path_execution_id.as_deref(),
+    )?;
+    let continuation = decode_attempt_continuation(args.continuation.as_deref())?;
+    let observed_unix_ms = observed_unix_ms()?;
+    let mut roots = Vec::new();
+    let Some(query) = context.query.as_ref() else {
+        if continuation.is_some() {
+            return Err(AttemptCommandError::new(
+                "--continuation cannot be used because the compiled pipeline has no existing owned roots",
+            ));
+        }
+        render_attempt_operation(
+            AttemptOperationView {
+                operation: "list",
+                pipeline: context.pipeline,
+                mode: None,
+                roots,
+            },
+            args.format,
+        )?;
+        return Ok(0);
+    };
+
+    if let Some(continuation) = continuation.as_ref() {
+        let mut last_error = None;
+        for root_id in &context.root_ids {
+            match query.list(root_id, observed_unix_ms, Some(continuation)) {
+                Ok(list) => {
+                    roots.push(list_root_view(root_id, &list, args.show_paths, &context)?);
+                    last_error = None;
+                    break;
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(AttemptCommandError::new(format!(
+                "invalid --continuation: {error}"
+            )));
+        }
+    } else {
+        for root_id in &context.root_ids {
+            let list = query
+                .list(root_id, observed_unix_ms, None)
+                .map_err(attempt_query_error)?;
+            roots.push(list_root_view(root_id, &list, args.show_paths, &context)?);
+        }
+    }
+    let has_debt = roots.iter().any(root_has_debt);
+    render_attempt_operation(
+        AttemptOperationView {
+            operation: "list",
+            pipeline: context.pipeline,
+            mode: None,
+            roots,
+        },
+        args.format,
+    )?;
+    Ok(if has_debt { 4 } else { 0 })
+}
+
+fn run_attempts_inspect(args: &AttemptsInspectArgs) -> Result<u8, AttemptCommandError> {
+    validate_execution_selector(&args.execution_id)?;
+    if let Some(execution_id) = args.identity.path_execution_id.as_deref() {
+        validate_execution_selector(execution_id)?;
+    }
+    let context = compile_attempt_context(
+        &args.pipeline,
+        &args.identity,
+        args.identity
+            .path_execution_id
+            .as_deref()
+            .or(Some(args.execution_id.as_str())),
+    )?;
+    let observed_unix_ms = observed_unix_ms()?;
+    let mut roots = Vec::new();
+    if let Some(query) = context.query.as_ref() {
+        for root_id in &context.root_ids {
+            let inspection = query
+                .inspect(root_id, &args.execution_id, observed_unix_ms)
+                .map_err(attempt_query_error)?;
+            let bounds = inspection.bounds().into();
+            let cleanup_debt = debt_views(inspection.cleanup_debt());
+            let diagnostics = inspection_diagnostic_views(
+                &inspection,
+                clinker_core_types::diagnostic::AttemptOperation::Inspect,
+                &context,
+            );
+            roots.push(AttemptRootView {
+                root_id: root_id.clone(),
+                disposition: cleanup_disposition_name(inspection.disposition()).to_owned(),
+                attempts: vec![inspection_view(
+                    &inspection,
+                    args.show_paths,
+                    &context,
+                    clinker_core_types::diagnostic::AttemptOperation::Inspect,
+                )],
+                selected_execution_ids: Vec::new(),
+                removed_execution_ids: Vec::new(),
+                kept_execution_ids: Vec::new(),
+                removed_artifact_count: 0,
+                continuation: None,
+                resume_command: None,
+                resume_argv: None,
+                cleanup_debt,
+                diagnostics,
+                bounds,
+            });
+        }
+    }
+    let has_debt = roots.iter().any(root_has_debt);
+    render_attempt_operation(
+        AttemptOperationView {
+            operation: "inspect",
+            pipeline: context.pipeline,
+            mode: None,
+            roots,
+        },
+        args.format,
+    )?;
+    Ok(if has_debt { 4 } else { 0 })
+}
+
+fn run_attempts_purge(args: &AttemptsPurgeArgs) -> Result<u8, AttemptCommandError> {
+    match (&args.execution_id, args.expired) {
+        (Some(_), true) | (None, false) => {
+            return Err(AttemptCommandError::new(
+                "purge requires exactly one selector: --execution-id <id> or --expired",
+            ));
+        }
+        (Some(execution_id), false) => validate_execution_selector(execution_id)?,
+        (None, true) => {}
+    }
+    if let Some(execution_id) = args.identity.path_execution_id.as_deref() {
+        validate_execution_selector(execution_id)?;
+    }
+    let context = compile_attempt_context(
+        &args.pipeline,
+        &args.identity,
+        args.identity
+            .path_execution_id
+            .as_deref()
+            .or(args.execution_id.as_deref()),
+    )?;
+    let continuation = decode_attempt_continuation(args.continuation.as_deref())?;
+    let observed_unix_ms = observed_unix_ms()?;
+    let mut roots = Vec::new();
+    let Some(query) = context.query.as_ref() else {
+        if continuation.is_some() {
+            return Err(AttemptCommandError::new(
+                "--continuation cannot be used because the compiled pipeline has no existing owned roots",
+            ));
+        }
+        render_attempt_operation(
+            AttemptOperationView {
+                operation: "purge",
+                pipeline: context.pipeline,
+                mode: Some(if args.execute { "execute" } else { "preview" }),
+                roots,
+            },
+            args.format,
+        )?;
+        return Ok(0);
+    };
+
+    let shutdown = clinker_exec::pipeline::shutdown::ShutdownToken::new();
+    if let Some(continuation) = continuation.as_ref() {
+        let mut last_error = None;
+        for root_id in &context.root_ids {
+            match purge_root_view(
+                query,
+                root_id,
+                args,
+                observed_unix_ms,
+                Some(continuation),
+                &shutdown,
+                &context,
+            ) {
+                Ok(root) => {
+                    roots.push(root);
+                    last_error = None;
+                    break;
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(AttemptCommandError::new(format!(
+                "invalid --continuation: {error}"
+            )));
+        }
+    } else {
+        for root_id in &context.root_ids {
+            roots.push(purge_root_view(
+                query,
+                root_id,
+                args,
+                observed_unix_ms,
+                None,
+                &shutdown,
+                &context,
+            )?);
+        }
+    }
+    let has_debt = roots.iter().any(root_has_debt);
+    render_attempt_operation(
+        AttemptOperationView {
+            operation: "purge",
+            pipeline: context.pipeline,
+            mode: Some(if args.execute { "execute" } else { "preview" }),
+            roots,
+        },
+        args.format,
+    )?;
+    Ok(if has_debt { 4 } else { 0 })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn purge_root_view(
+    query: &clinker_exec::output::attempt::AttemptQuery,
+    root_id: &str,
+    args: &AttemptsPurgeArgs,
+    observed_unix_ms: u64,
+    continuation: Option<&clinker_exec::output::attempt::AttemptContinuation>,
+    shutdown: &clinker_exec::pipeline::shutdown::ShutdownToken,
+    context: &AttemptCommandContext,
+) -> Result<AttemptRootView, AttemptCommandError> {
+    let request = match args.execution_id.as_deref() {
+        Some(execution_id) => query.purge_execution(root_id, execution_id),
+        None => query.purge_expired(root_id),
+    }
+    .map_err(attempt_query_error)?;
+
+    if args.execute {
+        let report = query
+            .execute(&request, observed_unix_ms, continuation, shutdown)
+            .map_err(attempt_query_error)?;
+        let diagnostics = root_diagnostic_views(
+            report.cleanup_debt(),
+            clinker_core_types::diagnostic::AttemptOperation::Purge,
+            context,
+        );
+        let continuation = encode_attempt_continuation(report.continuation())?;
+        let resume_command = continuation
+            .as_deref()
+            .map(|continuation| purge_resume_command(args, &context.pipeline, continuation));
+        let resume_argv = continuation
+            .as_deref()
+            .map(|continuation| purge_resume_argv(args, &context.pipeline, continuation));
+        Ok(AttemptRootView {
+            root_id: root_id.to_owned(),
+            disposition: purge_disposition_name(report.disposition()).to_owned(),
+            attempts: Vec::new(),
+            selected_execution_ids: report.selected_execution_ids().to_vec(),
+            removed_execution_ids: report.removed_execution_ids().to_vec(),
+            kept_execution_ids: report.kept_execution_ids().to_vec(),
+            removed_artifact_count: report.removed_artifact_count(),
+            continuation,
+            resume_command,
+            resume_argv,
+            cleanup_debt: debt_views(report.cleanup_debt()),
+            diagnostics,
+            bounds: report.bounds().into(),
+        })
+    } else {
+        let preview = query
+            .preview(&request, observed_unix_ms, continuation)
+            .map_err(attempt_query_error)?;
+        let attempts = preview
+            .inspections()
+            .iter()
+            .map(|inspection| {
+                inspection_view(
+                    inspection,
+                    args.show_paths,
+                    context,
+                    clinker_core_types::diagnostic::AttemptOperation::Purge,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut diagnostics = preview
+            .inspections()
+            .iter()
+            .flat_map(|inspection| {
+                inspection_diagnostic_views(
+                    inspection,
+                    clinker_core_types::diagnostic::AttemptOperation::Purge,
+                    context,
+                )
+            })
+            .collect::<Vec<_>>();
+        diagnostics.extend(root_diagnostic_views(
+            preview.cleanup_debt(),
+            clinker_core_types::diagnostic::AttemptOperation::Purge,
+            context,
+        ));
+        let kept_execution_ids = preview
+            .inspections()
+            .iter()
+            .map(|inspection| inspection.execution_id().to_owned())
+            .collect();
+        let continuation = encode_attempt_continuation(preview.continuation())?;
+        let resume_command = continuation
+            .as_deref()
+            .map(|continuation| purge_resume_command(args, &context.pipeline, continuation));
+        let resume_argv = continuation
+            .as_deref()
+            .map(|continuation| purge_resume_argv(args, &context.pipeline, continuation));
+        Ok(AttemptRootView {
+            root_id: root_id.to_owned(),
+            disposition: "preview".to_owned(),
+            attempts,
+            selected_execution_ids: preview.selected_execution_ids().to_vec(),
+            removed_execution_ids: Vec::new(),
+            kept_execution_ids,
+            removed_artifact_count: 0,
+            continuation,
+            resume_command,
+            resume_argv,
+            cleanup_debt: debt_views(preview.cleanup_debt()),
+            diagnostics,
+            bounds: preview.bounds().into(),
+        })
+    }
+}
+
+fn list_root_view(
+    root_id: &str,
+    list: &clinker_exec::output::attempt::AttemptList,
+    show_paths: bool,
+    context: &AttemptCommandContext,
+) -> Result<AttemptRootView, AttemptCommandError> {
+    let attempts = list
+        .entries()
+        .iter()
+        .map(|entry| {
+            inspection_view(
+                entry.inspection(),
+                show_paths,
+                context,
+                clinker_core_types::diagnostic::AttemptOperation::List,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut diagnostics = list
+        .entries()
+        .iter()
+        .flat_map(|entry| {
+            inspection_diagnostic_views(
+                entry.inspection(),
+                clinker_core_types::diagnostic::AttemptOperation::List,
+                context,
+            )
+        })
+        .collect::<Vec<_>>();
+    diagnostics.extend(root_diagnostic_views(
+        list.cleanup_debt(),
+        clinker_core_types::diagnostic::AttemptOperation::List,
+        context,
+    ));
+    let continuation = encode_attempt_continuation(list.continuation())?;
+    let resume_argv = continuation.as_deref().map(|continuation| {
+        let mut argv = vec![
+            "clinker".to_owned(),
+            "attempts".to_owned(),
+            "list".to_owned(),
+            context.pipeline.clone(),
+        ];
+        argv.extend(context.identity_argv.iter().cloned());
+        argv.extend(["--continuation".to_owned(), continuation.to_owned()]);
+        argv
+    });
+    let resume_command = resume_argv.as_deref().map(render_attempt_command);
+    Ok(AttemptRootView {
+        root_id: root_id.to_owned(),
+        disposition: "listed".to_owned(),
+        attempts,
+        selected_execution_ids: Vec::new(),
+        removed_execution_ids: Vec::new(),
+        kept_execution_ids: Vec::new(),
+        removed_artifact_count: 0,
+        continuation,
+        resume_command,
+        resume_argv,
+        cleanup_debt: debt_views(list.cleanup_debt()),
+        diagnostics,
+        bounds: AttemptBoundsView {
+            considered_entries: list.considered_entries(),
+            considered_bytes: list.considered_bytes(),
+            elapsed_ms: list.elapsed_ms(),
+        },
+    })
+}
+
+fn inspection_view(
+    inspection: &clinker_exec::output::attempt::AttemptInspection,
+    show_paths: bool,
+    context: &AttemptCommandContext,
+    operation: clinker_core_types::diagnostic::AttemptOperation,
+) -> AttemptInspectionView {
+    let path = show_paths
+        .then(|| {
+            inspection.physical_path_for_sanitized_output(
+                clinker_exec::output::attempt::SanitizedPathOptIn,
+            )
+        })
+        .flatten()
+        .map(|path| sanitize_attempt_path(path, &context.workspace_root));
+    AttemptInspectionView {
+        execution_id: inspection.execution_id().to_owned(),
+        disposition: cleanup_disposition_name(inspection.disposition()),
+        state: inspection.state().map(attempt_state_name),
+        created_unix_ms: inspection.created_unix_ms(),
+        eligible_after_unix_ms: inspection.eligible_after_unix_ms(),
+        artifact_ids: inspection.artifact_ids().to_vec(),
+        eligible: inspection.is_eligible(),
+        path,
+        cleanup_debt: debt_views(inspection.cleanup_debt()),
+        diagnostics: inspection_diagnostic_views(inspection, operation, context),
+        bounds: inspection.bounds().into(),
+    }
+}
+
+fn inspection_diagnostic_views(
+    inspection: &clinker_exec::output::attempt::AttemptInspection,
+    operation: clinker_core_types::diagnostic::AttemptOperation,
+    context: &AttemptCommandContext,
+) -> Vec<AttemptDiagnosticView> {
+    let (artifact_id, final_visibility, durability_uncertain) =
+        diagnostic_artifact_evidence(inspection.artifact_states());
+    inspection
+        .cleanup_debt()
+        .iter()
+        .filter_map(|debt| {
+            clinker_core_types::diagnostic::AttemptDiagnosticData::for_failure(
+                failure_code_for_debt(debt.kind()),
+                operation,
+                inspection.execution_id(),
+                artifact_id,
+                final_visibility,
+                durability_uncertain,
+                &context.pipeline,
+            )
+        })
+        .map(|diagnostic| {
+            let mut recovery_argv = diagnostic.recovery_argv().to_vec();
+            recovery_argv.extend(context.identity_argv.iter().cloned());
+            AttemptDiagnosticView {
+                diagnostic_code: diagnostic.diagnostic_code(),
+                failure_code: diagnostic.failure_code(),
+                failure_category: diagnostic.failure_category().as_str(),
+                operation: diagnostic.operation().as_str(),
+                execution_id: Some(diagnostic.execution_id().to_owned()),
+                artifact_id: diagnostic.artifact_id().map(str::to_owned),
+                final_visibility: diagnostic.final_visibility().as_str(),
+                durability_uncertain: diagnostic.durability_uncertain(),
+                retry_advice: diagnostic.retry_advice().as_str(),
+                recovery_command: render_attempt_command(&recovery_argv),
+                recovery_argv,
+            }
+        })
+        .collect()
+}
+
+fn diagnostic_artifact_evidence(
+    artifact_states: &[(String, clinker_exec::output::attempt::ArtifactState)],
+) -> (
+    Option<&str>,
+    clinker_core_types::diagnostic::FinalVisibility,
+    bool,
+) {
+    use clinker_exec::output::attempt::ArtifactState;
+
+    if let Some((artifact_id, _)) = artifact_states
+        .iter()
+        .find(|(_, state)| *state == ArtifactState::VisibleUnsynchronized)
+    {
+        return (
+            Some(artifact_id),
+            clinker_core_types::diagnostic::FinalVisibility::Some,
+            true,
+        );
+    }
+    if let Some((artifact_id, _)) = artifact_states
+        .iter()
+        .find(|(_, state)| *state == ArtifactState::Promoting)
+    {
+        return (
+            Some(artifact_id),
+            clinker_core_types::diagnostic::FinalVisibility::Unknown,
+            true,
+        );
+    }
+    if let Some((artifact_id, _)) = artifact_states
+        .iter()
+        .find(|(_, state)| *state == ArtifactState::Published)
+    {
+        return (
+            Some(artifact_id),
+            clinker_core_types::diagnostic::FinalVisibility::Some,
+            false,
+        );
+    }
+    (
+        artifact_states
+            .first()
+            .map(|(artifact_id, _)| artifact_id.as_str()),
+        clinker_core_types::diagnostic::FinalVisibility::None,
+        false,
+    )
+}
+
+fn root_diagnostic_views(
+    debt: &[clinker_exec::output::attempt::CleanupDebt],
+    operation: clinker_core_types::diagnostic::AttemptOperation,
+    context: &AttemptCommandContext,
+) -> Vec<AttemptDiagnosticView> {
+    debt.iter()
+        .filter_map(|debt| {
+            let failure_code = failure_code_for_debt(debt.kind());
+            let failure = clinker_core_types::FailureClassification::for_code(failure_code)?;
+            let diagnostic_code = match debt.kind() {
+                clinker_exec::output::attempt::CleanupDebtKind::EntryBudget
+                | clinker_exec::output::attempt::CleanupDebtKind::ByteBudget
+                | clinker_exec::output::attempt::CleanupDebtKind::TimeBudget => "E372",
+                _ => "E371",
+            };
+            let mut recovery_argv = vec![
+                "clinker".to_owned(),
+                "attempts".to_owned(),
+                "list".to_owned(),
+                context.pipeline.clone(),
+            ];
+            recovery_argv.extend(context.identity_argv.iter().cloned());
+            Some(AttemptDiagnosticView {
+                diagnostic_code,
+                failure_code: failure.code(),
+                failure_category: failure.category().as_str(),
+                operation: operation.as_str(),
+                execution_id: None,
+                artifact_id: None,
+                final_visibility: clinker_core_types::diagnostic::FinalVisibility::Unknown.as_str(),
+                durability_uncertain: true,
+                retry_advice: failure.retry_advice().as_str(),
+                recovery_command: render_attempt_command(&recovery_argv),
+                recovery_argv,
+            })
+        })
+        .collect()
+}
+
+fn debt_views(debt: &[clinker_exec::output::attempt::CleanupDebt]) -> Vec<AttemptDebtView> {
+    debt.iter()
+        .map(|debt| AttemptDebtView {
+            kind: cleanup_debt_kind_name(debt.kind()),
+            detail: debt.detail(),
+        })
+        .collect()
+}
+
+fn render_attempt_operation(
+    view: AttemptOperationView,
+    format: AttemptsFormat,
+) -> Result<(), AttemptCommandError> {
+    match format {
+        AttemptsFormat::Json => {
+            let json = serde_json::to_string(&view).map_err(|error| {
+                AttemptCommandError::new(format!("cannot encode attempt result: {error}"))
+            })?;
+            println!("{json}");
+        }
+        AttemptsFormat::Text => render_attempt_text(&view),
+    }
+    Ok(())
+}
+
+fn render_attempt_text(view: &AttemptOperationView) {
+    println!("operation: {}", view.operation);
+    println!("pipeline: {}", view.pipeline);
+    if let Some(mode) = view.mode {
+        println!("mode: {mode}");
+    }
+    if view.roots.is_empty() {
+        println!("attempts: none");
+        return;
+    }
+    for root in &view.roots {
+        println!("root: {}", root.root_id);
+        println!("  disposition: {}", root.disposition);
+        for attempt in &root.attempts {
+            println!("  execution: {}", attempt.execution_id);
+            println!("    disposition: {}", attempt.disposition);
+            println!("    state: {}", attempt.state.unwrap_or("absent"));
+            println!("    eligible: {}", attempt.eligible);
+            println!("    artifacts: {}", attempt.artifact_ids.len());
+            for artifact_id in &attempt.artifact_ids {
+                println!("      - {artifact_id}");
+            }
+            if let Some(path) = &attempt.path {
+                println!("    path: {path}");
+            }
+            for diagnostic in &attempt.diagnostics {
+                render_attempt_diagnostic_text(diagnostic, "    ");
+            }
+        }
+        if !root.selected_execution_ids.is_empty() {
+            println!("  selected: {}", root.selected_execution_ids.join(","));
+        }
+        if !root.removed_execution_ids.is_empty() {
+            println!("  removed: {}", root.removed_execution_ids.join(","));
+        }
+        if !root.kept_execution_ids.is_empty() {
+            println!("  kept: {}", root.kept_execution_ids.join(","));
+        }
+        println!("  removed_artifacts: {}", root.removed_artifact_count);
+        for debt in &root.cleanup_debt {
+            println!("  debt: {} ({})", debt.kind, debt.detail);
+        }
+        for diagnostic in &root.diagnostics {
+            render_attempt_diagnostic_text(diagnostic, "  ");
+        }
+        if let Some(continuation) = &root.continuation {
+            println!("  continuation: {continuation}");
+        }
+        if let Some(resume_command) = &root.resume_command {
+            println!("  resume: {resume_command}");
+        }
+        println!(
+            "  bounds: entries={} bytes={} elapsed_ms={}",
+            root.bounds.considered_entries, root.bounds.considered_bytes, root.bounds.elapsed_ms
+        );
+    }
+}
+
+fn render_attempt_diagnostic_text(diagnostic: &AttemptDiagnosticView, indent: &str) {
+    println!("{indent}diagnostic: {}", diagnostic.diagnostic_code);
+    println!("{indent}failure: {}", diagnostic.failure_code);
+    println!("{indent}retry: {}", diagnostic.retry_advice);
+    println!("{indent}recover: {}", diagnostic.recovery_command);
+}
+
+fn compile_attempt_context(
+    pipeline: &std::path::Path,
+    identity: &AttemptIdentityArgs,
+    execution_id: Option<&str>,
+) -> Result<AttemptCommandContext, AttemptCommandError> {
+    let pipeline_display = workspace_pipeline_display(pipeline)?;
+    let (workspace_root, pipeline_dir, validated_pipeline) =
+        if let Some(base_dir) = identity.base_dir.as_deref() {
+            let workspace_root = base_dir.canonicalize().map_err(|error| {
+                AttemptCommandError::new(format!("cannot resolve workspace root: {error}"))
+            })?;
+            let validated_pipeline =
+                clinker_plan::security::validate_path(pipeline, &workspace_root, false)
+                    .map_err(|diagnostic| AttemptCommandError::new(diagnostic.message))?;
+            let pipeline_parent = validated_pipeline
+                .as_path()
+                .parent()
+                .unwrap_or(&workspace_root)
+                .canonicalize()
+                .map_err(|error| {
+                    AttemptCommandError::new(format!("cannot resolve pipeline directory: {error}"))
+                })?;
+            let pipeline_dir = pipeline_parent
+                .strip_prefix(&workspace_root)
+                .map_err(|_| AttemptCommandError::new("pipeline must remain within the workspace"))?
+                .to_path_buf();
+            (workspace_root, pipeline_dir, validated_pipeline)
+        } else {
+            let current_dir = std::env::current_dir().map_err(|error| {
+                AttemptCommandError::new(format!("cannot resolve current directory: {error}"))
+            })?;
+            let pipeline_path = current_dir.join(pipeline).canonicalize().map_err(|error| {
+                AttemptCommandError::new(format!("cannot resolve pipeline: {error}"))
+            })?;
+            let workspace_root = pipeline_path
+                .parent()
+                .ok_or_else(|| AttemptCommandError::new("pipeline has no parent directory"))?
+                .to_path_buf();
+            let pipeline_leaf = pipeline_path
+                .file_name()
+                .ok_or_else(|| AttemptCommandError::new("pipeline has no file name"))?;
+            let validated_pipeline = clinker_plan::security::validate_path(
+                std::path::Path::new(pipeline_leaf),
+                &workspace_root,
+                false,
+            )
+            .map_err(|diagnostic| AttemptCommandError::new(diagnostic.message))?;
+            (workspace_root, PathBuf::new(), validated_pipeline)
+        };
+    let pipeline_path = validated_pipeline.as_path();
+    if !pipeline_path.is_file() {
+        return Err(AttemptCommandError::new(format!(
+            "pipeline does not exist or is not a file: {pipeline_display}"
+        )));
+    }
+    let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
+        .map_err(|error| AttemptCommandError::new(error.to_string()))?;
+    let overlay_resolution = if identity.channel.is_none() && identity.groups.is_empty() {
+        None
+    } else {
+        let catalog =
+            clinker_plan::resources::WorkspaceCatalog::load(&workspace_root, &clinker_toml.catalog)
+                .map_err(|error| AttemptCommandError::new(error.to_string()))?;
+        let pipeline_id =
+            catalog_pipeline_id(&workspace_root, &clinker_toml.catalog, pipeline_path)
+                .map_err(AttemptCommandError::new)?;
+        Some(
+            clinker_channel::resolve_target_channel(
+                &workspace_root,
+                &catalog,
+                &clinker_toml.group,
+                &pipeline_id,
+                identity.channel.as_deref(),
+                &identity.groups,
+                !identity.no_auto_groups,
+            )
+            .map_err(|error| {
+                AttemptCommandError::new(format!("overlay resolution failed: {error}"))
+            })?,
+        )
+    };
+    let empty_patches = indexmap::IndexMap::new();
+    let source_patches = overlay_resolution
+        .as_ref()
+        .and_then(clinker_channel::OverlayResolution::source_patches)
+        .unwrap_or(&empty_patches);
+    let mut pipeline_config =
+        clinker_plan::config::load_config_with_vars_and_patches(pipeline_path, &[], source_patches)
+            .map_err(|error| AttemptCommandError::new(error.to_string()))?;
+    let template_context = clinker_plan::config::path_template::TemplateContext {
+        source_name_default: None,
+        source_name_by_node: std::collections::HashMap::new(),
+        channel: overlay_resolution
+            .as_ref()
+            .and_then(|overlay| overlay.channel_id()),
+        pipeline_hash: pipeline_config.source_hash,
+        timestamp: identity.timestamp.as_deref(),
+        execution_id,
+        batch_id: identity.batch_id.as_deref(),
+        n: None,
+        unique_suffix_width: 0,
+    };
+    clinker_plan::config::path_template::resolve_output_path_templates_in_place(
+        &mut pipeline_config,
+        &template_context,
+    )
+    .map_err(|error| AttemptCommandError::new(error.to_string()))?;
+    let mut compile_context = clinker_plan::config::CompileContext::with_pipeline_dir(
+        workspace_root.clone(),
+        pipeline_dir.clone(),
+    );
+    compile_context.allow_absolute_paths = identity.allow_absolute_paths;
+    if let Some(overlay) = &overlay_resolution {
+        compile_context.overlay_ops = overlay.op_stream().to_vec();
+    }
+    let clinker_plan::resources::CompositionDiscovery { fields, identities } =
+        clinker_plan::resources::collect_cxl_fields_with_composition_identities(
+            &pipeline_config.nodes,
+            compile_context.workspace_root(),
+            &compile_context.pipeline_dir,
+        )
+        .map_err(|error| AttemptCommandError::new(error.to_string()))?;
+    compile_context.composition_body_identities = identities;
+    let direct_imports = clinker_plan::resources::collect_direct_imports(&fields)
+        .map_err(|error| AttemptCommandError::new(error.to_string()))?;
+    if !direct_imports.is_empty() {
+        let catalog = clinker_plan::resources::WorkspaceCatalog::load(
+            compile_context.workspace_root(),
+            &clinker_toml.catalog,
+        )
+        .map_err(|error| AttemptCommandError::new(error.to_string()))?;
+        let rules_root = catalog
+            .select_rules_root(
+                identity.rules_path.as_deref(),
+                pipeline_config
+                    .pipeline
+                    .rules_path
+                    .as_deref()
+                    .map(std::path::Path::new),
+            )
+            .map_err(|error| AttemptCommandError::new(error.to_string()))?;
+        compile_context.cxl_modules = clinker_plan::resources::compile_module_closure(
+            &catalog,
+            &rules_root,
+            &direct_imports,
+            clinker_plan::resources::ModuleLimits::default(),
+        )
+        .map_err(|error| AttemptCommandError::new(error.to_string()))?;
+    }
+    if let Some(overlay) = &overlay_resolution {
+        resolve_overlay_config_before_compile(&pipeline_config, &mut compile_context, overlay)
+            .map_err(|error| AttemptCommandError::new(error.to_string()))?;
+    }
+    let mut compiled_plan = pipeline_config
+        .compile(&compile_context)
+        .map_err(|diagnostics| {
+            let rendered = diagnostics
+                .iter()
+                .map(|diagnostic| format!("[{}] {}", diagnostic.code, diagnostic.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            AttemptCommandError::new(format!("pipeline compilation failed: {rendered}"))
+        })?;
+    if let Some(overlay) = &overlay_resolution {
+        let result = overlay.apply_config_and_vars(&mut compiled_plan, &pipeline_config);
+        let errors = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == clinker_core_types::Severity::Error)
+            .map(|diagnostic| format!("[{}] {}", diagnostic.code, diagnostic.message))
+            .collect::<Vec<_>>();
+        if !errors.is_empty() {
+            return Err(AttemptCommandError::new(format!(
+                "overlay application failed: {}",
+                errors.join("; ")
+            )));
+        }
+    }
+
+    let pipeline_base = workspace_root.join(&pipeline_dir);
+    let receipt_root =
+        clinker_plan::security::validate_path(std::path::Path::new("."), &pipeline_base, false)
+            .map_err(|diagnostic| AttemptCommandError::new(diagnostic.message))?;
+    let historical_receipts = clinker_exec::output::attempt::discover_retained_root_receipts(
+        &compiled_plan,
+        &receipt_root,
+        execution_id,
+        observed_unix_ms()?,
+    )
+    .map_err(attempt_query_error)?;
+    let mut source_files_by_name = std::collections::BTreeMap::new();
+    for body in pipeline_config.source_bodies() {
+        let source = &body.source;
+        if !source.transport.is_file() {
+            source_files_by_name.insert(source.name.clone(), Vec::new());
+            continue;
+        }
+        let outcome = match clinker_plan::config::discovery::discover(source, &pipeline_base) {
+            Ok(outcome) => Some(outcome),
+            Err(clinker_plan::config::discovery::DiscoveryError::NoMatch { .. })
+                if historical_receipts.iter().any(|receipt| {
+                    receipt
+                        .historical_sources()
+                        .iter()
+                        .any(|identity| identity.source_name() == source.name)
+                }) =>
+            {
+                None
+            }
+            Err(error) => {
+                return Err(AttemptCommandError::new(format!(
+                    "source '{}' discovery failed while reconstructing attempt roots: {error}",
+                    source.name
+                )));
+            }
+        };
+        source_files_by_name.insert(
+            source.name.clone(),
+            outcome
+                .as_ref()
+                .map_or(
+                    &[][..],
+                    clinker_plan::config::discovery::DiscoveryOutcome::files,
+                )
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+    let mut destination_roots = std::collections::BTreeMap::new();
+    for output in compiled_plan.config().output_configs() {
+        if output.has_per_record_path_tokens() {
+            let upstream_source = upstream_source_for_output(compiled_plan.dag(), &output.name)
+                .ok_or_else(|| {
+                    AttemptCommandError::new(format!(
+                        "output {:?} has per-source path tokens but no reconstructible file source",
+                        output.name
+                    ))
+                })?;
+            let files = source_files_by_name.get(&upstream_source).ok_or_else(|| {
+                AttemptCommandError::new(format!(
+                    "output {:?} references undiscovered source {upstream_source:?}",
+                    output.name
+                ))
+            })?;
+            if files.is_empty()
+                && !historical_receipts.iter().any(|receipt| {
+                    receipt
+                        .historical_sources()
+                        .iter()
+                        .any(|identity| identity.source_name() == upstream_source)
+                })
+            {
+                return Err(AttemptCommandError::new(format!(
+                    "output {:?} has per-source path tokens but source {upstream_source:?} has no discovered files",
+                    output.name
+                )));
+            }
+            for source_path in files {
+                let source_file = source_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("source");
+                let rendered = output
+                    .render_runtime_path(source_file, &source_path.to_string_lossy())
+                    .map_err(|error| AttemptCommandError::new(error.to_string()))?;
+                insert_attempt_root(
+                    &mut destination_roots,
+                    &rendered,
+                    &pipeline_base,
+                    identity.allow_absolute_paths,
+                )?;
+            }
+        } else {
+            insert_attempt_root(
+                &mut destination_roots,
+                &output.path,
+                &pipeline_base,
+                identity.allow_absolute_paths,
+            )?;
+        }
+    }
+    if let Some(dlq) = &compiled_plan.config().error_handling.dlq {
+        if let Some(path) = &dlq.path {
+            insert_attempt_root(
+                &mut destination_roots,
+                path,
+                &pipeline_base,
+                identity.allow_absolute_paths,
+            )?;
+        }
+        for source in dlq.per_source.values() {
+            if let Some(path) = &source.path {
+                insert_attempt_root(
+                    &mut destination_roots,
+                    path,
+                    &pipeline_base,
+                    identity.allow_absolute_paths,
+                )?;
+            }
+        }
+    }
+    if destination_roots.is_empty() && historical_receipts.is_empty() {
+        return Err(AttemptCommandError::new(
+            "compiled pipeline has no file destination roots",
+        ));
+    }
+
+    let policy = clinker_toml.storage.publication;
+    let mut resolved_policy = None;
+    for root in destination_roots
+        .values()
+        .filter(|root| root.as_path().is_dir())
+    {
+        let resolved = policy
+            .resolve(root.as_path(), 0, u64::MAX)
+            .map_err(|error| AttemptCommandError::new(error.to_string()))?;
+        resolved_policy.get_or_insert(resolved);
+    }
+    if resolved_policy.is_none() {
+        let resolved = policy
+            .resolve(&pipeline_base, 0, u64::MAX)
+            .map_err(|error| AttemptCommandError::new(error.to_string()))?;
+        resolved_policy = Some(resolved);
+    }
+    if let Some(spool) = resolved_policy
+        .as_ref()
+        .and_then(clinker_plan::config::ResolvedPublicationPolicy::local_spool_dir)
+    {
+        let root = clinker_plan::security::validate_path(std::path::Path::new("."), spool, false)
+            .map_err(|diagnostic| AttemptCommandError::new(diagnostic.message))?;
+        destination_roots.insert(root.as_path().to_path_buf(), root);
+    }
+    for receipt in &historical_receipts {
+        for root in reconstruct_historical_receipt_roots(
+            &compiled_plan,
+            receipt,
+            &pipeline_base,
+            identity.allow_absolute_paths,
+            resolved_policy
+                .as_ref()
+                .and_then(clinker_plan::config::ResolvedPublicationPolicy::local_spool_dir),
+        )? {
+            destination_roots.insert(root.as_path().to_path_buf(), root);
+        }
+    }
+    if !historical_receipts.is_empty() {
+        destination_roots.insert(receipt_root.as_path().to_path_buf(), receipt_root);
+    }
+
+    let existing_roots = destination_roots
+        .into_values()
+        .filter(|root| root.as_path().is_dir())
+        .collect::<Vec<_>>();
+    let query = if existing_roots.is_empty() {
+        None
+    } else {
+        Some(
+            clinker_exec::output::attempt::AttemptQuery::new(
+                &compiled_plan,
+                resolved_policy
+                    .as_ref()
+                    .expect("publication policy was resolved above"),
+                existing_roots,
+            )
+            .map_err(attempt_query_error)?,
+        )
+    };
+    let root_ids = query
+        .as_ref()
+        .map(|query| {
+            query
+                .owned_root_ids()
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(AttemptCommandContext {
+        query,
+        root_ids,
+        workspace_root,
+        pipeline: pipeline_display,
+        identity_argv: attempt_identity_argv(identity),
+    })
+}
+
+fn attempt_identity_argv(identity: &AttemptIdentityArgs) -> Vec<String> {
+    let mut argv = Vec::new();
+    if let Some(base_dir) = &identity.base_dir {
+        argv.extend([
+            "--base-dir".to_owned(),
+            base_dir.to_string_lossy().into_owned(),
+        ]);
+    }
+    if identity.allow_absolute_paths {
+        argv.push("--allow-absolute-paths".to_owned());
+    }
+    if let Some(rules_path) = &identity.rules_path {
+        argv.extend([
+            "--rules-path".to_owned(),
+            rules_path.to_string_lossy().into_owned(),
+        ]);
+    }
+    if let Some(channel) = &identity.channel {
+        argv.extend(["--channel".to_owned(), channel.clone()]);
+    }
+    for group in &identity.groups {
+        argv.extend(["--group".to_owned(), group.clone()]);
+    }
+    if identity.no_auto_groups {
+        argv.push("--no-auto-groups".to_owned());
+    }
+    if let Some(execution_id) = &identity.path_execution_id {
+        argv.extend(["--path-execution-id".to_owned(), execution_id.clone()]);
+    }
+    if let Some(batch_id) = &identity.batch_id {
+        argv.extend(["--batch-id".to_owned(), batch_id.clone()]);
+    }
+    if let Some(timestamp) = &identity.timestamp {
+        argv.extend(["--timestamp".to_owned(), timestamp.clone()]);
+    }
+    argv
+}
+
+fn insert_attempt_root(
+    roots: &mut std::collections::BTreeMap<PathBuf, clinker_plan::security::ValidatedPath>,
+    authored_path: &str,
+    pipeline_base: &std::path::Path,
+    allow_absolute_paths: bool,
+) -> Result<(), AttemptCommandError> {
+    let path = std::path::Path::new(authored_path);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let parent_text = parent.to_string_lossy();
+    if parent_text.contains(['{', '}']) || authored_path.contains("{source_path}") {
+        return Err(AttemptCommandError::new(format!(
+            "attempt operations require a static destination directory; {authored_path:?} can resolve to more than one directory"
+        )));
+    }
+    let validated = clinker_plan::security::validate_path(
+        parent,
+        pipeline_base,
+        allow_absolute_paths && parent.is_absolute(),
+    )
+    .map_err(|diagnostic| AttemptCommandError::new(diagnostic.message))?;
+    roots.insert(validated.as_path().to_path_buf(), validated);
+    Ok(())
+}
+
+fn reconstruct_historical_receipt_roots(
+    compiled_plan: &clinker_plan::plan::CompiledPlan,
+    receipt: &clinker_exec::output::attempt::RetainedRootReceipt,
+    pipeline_base: &std::path::Path,
+    allow_absolute_paths: bool,
+    local_spool_dir: Option<&std::path::Path>,
+) -> Result<Vec<clinker_plan::security::ValidatedPath>, AttemptCommandError> {
+    let mut roots = std::collections::BTreeMap::new();
+    for output in compiled_plan.config().output_configs() {
+        if output.has_per_record_path_tokens() {
+            let upstream_source = upstream_source_for_output(compiled_plan.dag(), &output.name)
+                .ok_or_else(|| {
+                    AttemptCommandError::new(format!(
+                        "output {:?} has historical path tokens but no reconstructible file source",
+                        output.name
+                    ))
+                })?;
+            let sources = receipt
+                .historical_sources()
+                .iter()
+                .filter(|identity| identity.source_name() == upstream_source)
+                .collect::<Vec<_>>();
+            if sources.is_empty() {
+                return Err(AttemptCommandError::new(format!(
+                    "retained execution {} has no historical source identity for output {:?}",
+                    receipt.execution_id(),
+                    output.name
+                )));
+            }
+            for identity in sources {
+                let source_path = std::path::Path::new(identity.source_path());
+                let source_file = source_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("source");
+                let rendered = output
+                    .render_runtime_path(source_file, identity.source_path())
+                    .map_err(|error| AttemptCommandError::new(error.to_string()))?;
+                insert_attempt_root(&mut roots, &rendered, pipeline_base, allow_absolute_paths)?;
+            }
+        } else {
+            insert_attempt_root(
+                &mut roots,
+                &output.path,
+                pipeline_base,
+                allow_absolute_paths,
+            )?;
+        }
+    }
+    if let Some(dlq) = &compiled_plan.config().error_handling.dlq {
+        if let Some(path) = &dlq.path {
+            insert_attempt_root(&mut roots, path, pipeline_base, allow_absolute_paths)?;
+        }
+        for source in dlq.per_source.values() {
+            if let Some(path) = &source.path {
+                insert_attempt_root(&mut roots, path, pipeline_base, allow_absolute_paths)?;
+            }
+        }
+    }
+    if let Some(spool) = local_spool_dir {
+        let root = clinker_plan::security::validate_path(std::path::Path::new("."), spool, false)
+            .map_err(|diagnostic| AttemptCommandError::new(diagnostic.message))?;
+        roots.insert(root.as_path().to_path_buf(), root);
+    }
+    let roots = roots.into_values().collect::<Vec<_>>();
+    receipt
+        .authenticate_roots(&roots)
+        .map_err(attempt_query_error)?;
+    Ok(roots)
+}
+
+fn workspace_pipeline_display(pipeline: &std::path::Path) -> Result<String, AttemptCommandError> {
+    if pipeline.is_absolute()
+        || pipeline.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(AttemptCommandError::new(
+            "pipeline must be a traversal-free workspace-relative .yaml or .yml path",
+        ));
+    }
+    let display = pipeline.to_string_lossy();
+    if display.is_empty()
+        || display.contains(['\\', '\0', '\n', '\r'])
+        || !(display.ends_with(".yaml") || display.ends_with(".yml"))
+    {
+        return Err(AttemptCommandError::new(
+            "pipeline must be a traversal-free workspace-relative .yaml or .yml path",
+        ));
+    }
+    Ok(display.into_owned())
+}
+
+fn validate_execution_selector(execution_id: &str) -> Result<(), AttemptCommandError> {
+    let valid = execution_id.len() == 36
+        && execution_id
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => byte == b'-',
+                _ => byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase(),
+            });
+    if valid {
+        Ok(())
+    } else {
+        Err(AttemptCommandError::new(
+            "--execution-id must be a canonical lowercase UUID",
+        ))
+    }
+}
+
+fn observed_unix_ms() -> Result<u64, AttemptCommandError> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| AttemptCommandError::new("system clock is earlier than the Unix epoch"))?;
+    u64::try_from(duration.as_millis())
+        .map_err(|_| AttemptCommandError::new("system clock exceeds the supported range"))
+}
+
+fn decode_attempt_continuation(
+    continuation: Option<&str>,
+) -> Result<Option<clinker_exec::output::attempt::AttemptContinuation>, AttemptCommandError> {
+    continuation
+        .map(|value| {
+            clinker_exec::output::attempt::AttemptContinuation::from_bytes(value.as_bytes())
+                .map_err(|error| {
+                    AttemptCommandError::new(format!("invalid --continuation: {error}"))
+                })
+        })
+        .transpose()
+}
+
+fn encode_attempt_continuation(
+    continuation: Option<&clinker_exec::output::attempt::AttemptContinuation>,
+) -> Result<Option<String>, AttemptCommandError> {
+    continuation
+        .map(|continuation| {
+            let bytes = continuation.to_bytes().map_err(attempt_query_error)?;
+            String::from_utf8(bytes)
+                .map_err(|_| AttemptCommandError::new("attempt continuation is not valid UTF-8"))
+        })
+        .transpose()
+}
+
+fn purge_resume_command(args: &AttemptsPurgeArgs, pipeline: &str, continuation: &str) -> String {
+    render_attempt_command(&purge_resume_argv(args, pipeline, continuation))
+}
+
+fn purge_resume_argv(args: &AttemptsPurgeArgs, pipeline: &str, continuation: &str) -> Vec<String> {
+    let mut argv = vec![
+        "clinker".to_owned(),
+        "attempts".to_owned(),
+        "purge".to_owned(),
+        pipeline.to_owned(),
+    ];
+    match args.execution_id.as_deref() {
+        Some(execution_id) => {
+            argv.push("--execution-id".to_owned());
+            argv.push(execution_id.to_owned());
+        }
+        None => argv.push("--expired".to_owned()),
+    }
+    if args.execute {
+        argv.push("--execute".to_owned());
+    }
+    argv.extend(attempt_identity_argv(&args.identity));
+    argv.push("--continuation".to_owned());
+    argv.push(continuation.to_owned());
+    argv
+}
+
+fn render_attempt_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|argument| quote_attempt_argument(argument))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(not(windows))]
+fn quote_attempt_argument(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        return value.to_owned();
+    }
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for character in value.chars() {
+        if character == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(character);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+#[cfg(windows)]
+fn quote_attempt_argument(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        return value.to_owned();
+    }
+    quote_windows_argument(value)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn quote_windows_argument(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0_usize;
+    for character in value.chars() {
+        match character {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..backslashes {
+                    quoted.push('\\');
+                    quoted.push('\\');
+                }
+                quoted.push('\\');
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    quoted.push('\\');
+                }
+                backslashes = 0;
+                quoted.push(character);
+            }
+        }
+    }
+    for _ in 0..backslashes {
+        quoted.push('\\');
+        quoted.push('\\');
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn attempt_query_error(error: clinker_exec::output::attempt::AttemptError) -> AttemptCommandError {
+    AttemptCommandError::new(error.to_string())
+}
+
+fn root_has_debt(root: &AttemptRootView) -> bool {
+    !root.cleanup_debt.is_empty()
+        || root
+            .attempts
+            .iter()
+            .any(|attempt| !attempt.cleanup_debt.is_empty())
+        || root.continuation.is_some()
+}
+
+fn sanitize_attempt_path(path: &std::path::Path, workspace_root: &std::path::Path) -> String {
+    let Ok(relative) = path.strip_prefix(workspace_root) else {
+        return "<redacted-outside-workspace>".to_owned();
+    };
+    let mut sanitized = PathBuf::new();
+    for component in relative.components() {
+        let text = component.as_os_str().to_string_lossy();
+        let lowercase = text.to_ascii_lowercase();
+        if [
+            "secret",
+            "token",
+            "password",
+            "credential",
+            "apikey",
+            "api_key",
+        ]
+        .iter()
+        .any(|marker| lowercase.contains(marker))
+        {
+            sanitized.push("<redacted>");
+        } else {
+            sanitized.push(component.as_os_str());
+        }
+    }
+    if sanitized.as_os_str().is_empty() {
+        ".".to_owned()
+    } else {
+        sanitized.to_string_lossy().into_owned()
+    }
+}
+
+fn attempt_state_name(state: clinker_exec::output::attempt::AttemptState) -> &'static str {
+    use clinker_exec::output::attempt::AttemptState;
+    match state {
+        AttemptState::Staging => "staging",
+        AttemptState::Ready => "ready",
+        AttemptState::Publishing => "publishing",
+        AttemptState::Complete => "complete",
+        AttemptState::Incomplete => "incomplete",
+        AttemptState::Abandoned => "abandoned",
+    }
+}
+
+fn cleanup_disposition_name(
+    disposition: clinker_exec::output::attempt::CleanupDisposition,
+) -> &'static str {
+    use clinker_exec::output::attempt::CleanupDisposition;
+    match disposition {
+        CleanupDisposition::Removed => "removed",
+        CleanupDisposition::AlreadyAbsent => "already_absent",
+        CleanupDisposition::Kept => "kept",
+    }
+}
+
+fn purge_disposition_name(
+    disposition: clinker_exec::output::attempt::PurgeDisposition,
+) -> &'static str {
+    use clinker_exec::output::attempt::PurgeDisposition;
+    match disposition {
+        PurgeDisposition::Removed => "removed",
+        PurgeDisposition::AlreadyAbsent => "already_absent",
+        PurgeDisposition::Kept => "kept",
+        PurgeDisposition::Partial => "partial",
+    }
+}
+
+fn cleanup_debt_kind_name(kind: clinker_exec::output::attempt::CleanupDebtKind) -> &'static str {
+    use clinker_exec::output::attempt::CleanupDebtKind;
+    match kind {
+        CleanupDebtKind::EntryBudget => "entry_budget",
+        CleanupDebtKind::ByteBudget => "byte_budget",
+        CleanupDebtKind::TimeBudget => "time_budget",
+        CleanupDebtKind::MonotonicClock => "monotonic_clock",
+        CleanupDebtKind::LiveAttempt => "live_attempt",
+        CleanupDebtKind::InvalidOwnership => "invalid_ownership",
+        CleanupDebtKind::InvalidManifest => "invalid_manifest",
+        CleanupDebtKind::UnknownChild => "unknown_child",
+        CleanupDebtKind::UnsafeEntry => "unsafe_entry",
+        CleanupDebtKind::ClockAmbiguous => "clock_ambiguous",
+        CleanupDebtKind::Operational => "operational",
+        CleanupDebtKind::Interrupted => "interrupted",
+    }
+}
+
+fn failure_code_for_debt(kind: clinker_exec::output::attempt::CleanupDebtKind) -> &'static str {
+    use clinker_exec::output::attempt::CleanupDebtKind;
+    match kind {
+        CleanupDebtKind::InvalidManifest => "attempt.retention.manifest_invalid",
+        CleanupDebtKind::LiveAttempt => "attempt.retention.live",
+        CleanupDebtKind::MonotonicClock | CleanupDebtKind::ClockAmbiguous => {
+            "attempt.retention.clock_ambiguous"
+        }
+        CleanupDebtKind::EntryBudget
+        | CleanupDebtKind::ByteBudget
+        | CleanupDebtKind::TimeBudget
+        | CleanupDebtKind::Interrupted => "attempt.retention.budget_exhausted",
+        CleanupDebtKind::Operational => "attempt.retention.cleanup_failed",
+        CleanupDebtKind::InvalidOwnership
+        | CleanupDebtKind::UnknownChild
+        | CleanupDebtKind::UnsafeEntry => "attempt.retention.ownership_refused",
+    }
 }
 
 /// `clinker config` — inspect / canonicalize a pipeline config.
@@ -4124,6 +6141,104 @@ fn diag_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_failure_diagnostics_are_path_safe_and_actionable() {
+        let execution_id = "018f47a2-9a41-7a27-b4d6-4f7137e3c273";
+        for failure in [
+            PublicationFailureKind::Readiness,
+            PublicationFailureKind::ReadinessAndAbandonment,
+            PublicationFailureKind::CleanupDebt(2),
+            PublicationFailureKind::Incomplete(1),
+            PublicationFailureKind::Publish("I/O operation".to_owned()),
+        ] {
+            let rendered = publication_failure_diagnostic(execution_id, failure);
+            assert!(rendered.contains(execution_id), "{rendered}");
+            assert!(rendered.contains("clinker attempts inspect"), "{rendered}");
+            assert!(!rendered.contains("/tmp/"), "{rendered}");
+            assert!(!rendered.contains("\\Users\\"), "{rendered}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_argument_quoting_round_trips_through_cmd() {
+        use std::os::windows::process::CommandExt;
+
+        let expected = [
+            "argument with spaces",
+            r#"say "hello""#,
+            r"C:\",
+            r"C:\Program Files\",
+            "",
+        ];
+        let output_dir = tempfile::tempdir().expect("temporary output directory");
+        let output_path = output_dir.path().join("argv.json");
+        let mut argv = vec![
+            std::env::current_exe()
+                .expect("current test executable")
+                .into_os_string()
+                .into_string()
+                .expect("test executable path should be Unicode"),
+            "--exact".to_owned(),
+            "tests::windows_argument_probe".to_owned(),
+            "--ignored".to_owned(),
+            "--".to_owned(),
+        ];
+        argv.extend(expected.iter().map(|value| (*value).to_owned()));
+
+        let command = render_attempt_command(&argv);
+        let mut process = std::process::Command::new("cmd.exe");
+        process.args(["/D", "/S", "/C"]);
+        // cmd.exe requires one additional pair of quotes around the complete
+        // raw command after `/C`; `raw_arg` avoids Command::arg quoting that
+        // wrapper a second time.
+        process.raw_arg(format!("\"{command}\""));
+        let output = process
+            .env("CLINKER_ARGV_PROBE_OUTPUT", &output_path)
+            .output()
+            .expect("cmd.exe should launch the argv probe");
+        assert!(
+            output.status.success(),
+            "argv probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let actual: Vec<String> = serde_json::from_slice(
+            &std::fs::read(output_path).expect("argv probe should write its captured arguments"),
+        )
+        .expect("argv probe output should be JSON");
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "launched by windows_argument_quoting_round_trips_through_cmd"]
+    fn windows_argument_probe() {
+        let output_path = std::env::var_os("CLINKER_ARGV_PROBE_OUTPUT")
+            .expect("argv probe output path should be provided");
+        let actual = std::env::args()
+            .skip_while(|argument| argument != "--")
+            .skip(1)
+            .collect::<Vec<_>>();
+        std::fs::write(
+            output_path,
+            serde_json::to_vec(&actual).expect("captured arguments should serialize"),
+        )
+        .expect("captured arguments should be written");
+    }
+
+    #[test]
+    fn windows_argument_quoting_preserves_quotes_and_trailing_backslashes() {
+        assert_eq!(quote_windows_argument(""), "\"\"");
+        assert_eq!(
+            quote_windows_argument(r#"C:\Program Files\"#),
+            "\"C:\\Program Files\\\\\""
+        );
+        assert_eq!(
+            quote_windows_argument(r#"say "hello"\"#),
+            "\"say \\\"hello\\\"\\\\\""
+        );
+    }
 
     #[test]
     fn line_byte_range_handles_lf_crlf_and_lone_cr() {

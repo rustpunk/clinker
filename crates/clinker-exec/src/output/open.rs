@@ -7,7 +7,9 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use clinker_plan::config::{ConfigError, IfExistsPolicy};
+use clinker_plan::config::{
+    ConfigError, DestinationProfile, IfExistsPolicy, ResolvedPublicationPolicy,
+};
 use clinker_plan::error::PipelineError;
 use clinker_plan::security::{check_overwrite, validate_path};
 
@@ -27,6 +29,35 @@ use super::containment::{ContainmentError, OutputContainment, PromotionDispositi
 pub fn open_output<F>(
     policy: IfExistsPolicy,
     cli_force: bool,
+    path_for_n: F,
+) -> Result<(PathBuf, File, StagedOutput), PipelineError>
+where
+    F: FnMut(Option<u64>) -> Result<PathBuf, ConfigError>,
+{
+    open_output_inner(None, policy, cli_force, path_for_n)
+}
+
+/// Open an output through a validated publication policy.
+///
+/// This is the policy-driven routing seam for run-owned attempts. The legacy
+/// [`open_output`] entry point remains only until its CLI call site is migrated;
+/// it performs detected-filesystem admission to preserve existing behavior.
+pub fn open_output_with_policy<F>(
+    publication: &ResolvedPublicationPolicy,
+    policy: IfExistsPolicy,
+    cli_force: bool,
+    path_for_n: F,
+) -> Result<(PathBuf, File, StagedOutput), PipelineError>
+where
+    F: FnMut(Option<u64>) -> Result<PathBuf, ConfigError>,
+{
+    open_output_inner(Some(publication), policy, cli_force, path_for_n)
+}
+
+fn open_output_inner<F>(
+    publication: Option<&ResolvedPublicationPolicy>,
+    policy: IfExistsPolicy,
+    cli_force: bool,
     mut path_for_n: F,
 ) -> Result<(PathBuf, File, StagedOutput), PipelineError>
 where
@@ -35,18 +66,20 @@ where
     let bare = path_for_n(None).map_err(PipelineError::Config)?;
 
     match policy {
-        IfExistsPolicy::Overwrite => stage_candidate(bare, PromotionDisposition::Replace),
+        IfExistsPolicy::Overwrite => {
+            stage_candidate(bare, PromotionDisposition::Replace, publication)
+        }
         IfExistsPolicy::Error => {
             if cli_force {
-                return stage_candidate(bare, PromotionDisposition::Replace);
+                return stage_candidate(bare, PromotionDisposition::Replace, publication);
             }
-            match stage_candidate(bare.clone(), PromotionDisposition::NoReplace) {
+            match stage_candidate(bare.clone(), PromotionDisposition::NoReplace, publication) {
                 Err(error) if is_already_exists(&error) => Err(existing_output_error(&bare)),
                 result => result,
             }
         }
         IfExistsPolicy::UniqueSuffix => {
-            match stage_candidate(bare.clone(), PromotionDisposition::NoReplace) {
+            match stage_candidate(bare.clone(), PromotionDisposition::NoReplace, publication) {
                 Ok(output) => return Ok(output),
                 Err(error) if is_already_exists(&error) => {}
                 Err(error) => return Err(error),
@@ -54,7 +87,7 @@ where
 
             for n in 1u64..=u64::MAX {
                 let candidate = path_for_n(Some(n)).map_err(PipelineError::Config)?;
-                match stage_candidate(candidate, PromotionDisposition::NoReplace) {
+                match stage_candidate(candidate, PromotionDisposition::NoReplace, publication) {
                     Ok(output) => return Ok(output),
                     Err(error) if is_already_exists(&error) => continue,
                     Err(error) => return Err(error),
@@ -86,13 +119,17 @@ pub fn append_suffix_before_ext(path: &Path, suffix: &str) -> PathBuf {
 fn stage_candidate(
     path: PathBuf,
     disposition: PromotionDisposition,
+    publication: Option<&ResolvedPublicationPolicy>,
 ) -> Result<(PathBuf, File, StagedOutput), PipelineError> {
-    let boundary = contained_boundary(&path)?;
+    let boundary = contained_boundary(&path, publication)?;
     let (staged, file) = boundary.stage(disposition).map_err(containment_error)?;
     Ok((path, file, staged))
 }
 
-fn contained_boundary(path: &Path) -> Result<OutputContainment, PipelineError> {
+fn contained_boundary(
+    path: &Path,
+    publication: Option<&ResolvedPublicationPolicy>,
+) -> Result<OutputContainment, PipelineError> {
     let base = std::env::current_dir().map_err(PipelineError::Io)?;
     let validated = validate_path(path, &base, path.is_absolute()).map_err(|diagnostic| {
         PipelineError::Config(ConfigError::Validation(format!(
@@ -100,7 +137,18 @@ fn contained_boundary(path: &Path) -> Result<OutputContainment, PipelineError> {
             diagnostic.code, diagnostic.message
         )))
     })?;
-    OutputContainment::for_profile(validated, "detected-filesystem").map_err(containment_error)
+    let profile = publication.map_or("detected-filesystem", |policy| {
+        containment_profile(policy.destination_profile())
+    });
+    OutputContainment::for_profile(validated, profile).map_err(containment_error)
+}
+
+fn containment_profile(profile: DestinationProfile) -> &'static str {
+    match profile {
+        DestinationProfile::Local => "local-filesystem",
+        DestinationProfile::NfsV4_1 => "linux-nfsv4.1-loopback-ci",
+        DestinationProfile::Smb3_1_1 => "linux-smb3.1.1-loopback-ci",
+    }
 }
 
 pub(crate) fn containment_error(error: ContainmentError) -> PipelineError {

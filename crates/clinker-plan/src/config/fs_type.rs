@@ -53,6 +53,64 @@ pub enum FsKind {
     Network,
 }
 
+/// Filesystem family used to verify a configured publication destination.
+///
+/// Publication profiles distinguish NFS from SMB because each profile is
+/// qualified independently. Other network and userspace filesystems remain
+/// explicit so they cannot be mistaken for either qualified family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesystemFamily {
+    /// A local, durable filesystem.
+    Local,
+    /// An in-memory filesystem.
+    InMemory,
+    /// An NFS mount. The configured profile carries the qualified protocol
+    /// version; the portable filesystem probe identifies the transport family.
+    Nfs,
+    /// An SMB or CIFS mount. The configured profile carries the qualified
+    /// protocol version; the portable filesystem probe identifies the family.
+    Smb,
+    /// A network or userspace mount that is neither identifiable NFS nor SMB.
+    OtherNetwork,
+}
+
+impl FilesystemFamily {
+    /// Stable diagnostic spelling for the detected family.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::InMemory => "in_memory",
+            Self::Nfs => "nfs",
+            Self::Smb => "smb",
+            Self::OtherNetwork => "other_network",
+        }
+    }
+
+    pub(crate) fn publication_correction(self) -> &'static str {
+        match self {
+            Self::Local => "use `[storage.publication]\ndestination_profile = \"local\"`",
+            Self::Nfs => {
+                "use `[storage.publication]\ndestination_profile = \"nfs_v4_1\"` only after qualifying this NFS destination"
+            }
+            Self::Smb => {
+                "use `[storage.publication]\ndestination_profile = \"smb_3_1_1\"` only after qualifying this SMB destination"
+            }
+            Self::InMemory => "choose a durable local or qualified network destination",
+            Self::OtherNetwork => {
+                "choose a local, qualified NFSv4.1, or qualified SMB3.1.1 destination"
+            }
+        }
+    }
+
+    fn kind(self) -> FsKind {
+        match self {
+            Self::Local => FsKind::Local,
+            Self::InMemory => FsKind::InMemory,
+            Self::Nfs | Self::Smb | Self::OtherNetwork => FsKind::Network,
+        }
+    }
+}
+
 /// Classify the filesystem backing `path`.
 ///
 /// `path` must exist (it is the thing being probed); a non-existent path or a
@@ -66,6 +124,20 @@ pub enum FsKind {
 /// path does not exist, cannot be stat'd / queried, or the OS call returns an
 /// error.
 pub fn classify(path: &Path) -> io::Result<FsKind> {
+    classify_family(path).map(FilesystemFamily::kind)
+}
+
+/// Classify the filesystem family backing a publication destination.
+///
+/// Unlike [`classify`], this preserves the distinction between NFS, SMB, and
+/// other network transports so a configured qualified profile cannot accept a
+/// different network filesystem merely because both are remote.
+///
+/// # Errors
+///
+/// Returns the underlying [`io::Error`] when the path is missing or the
+/// platform probe fails.
+pub fn classify_family(path: &Path) -> io::Result<FilesystemFamily> {
     // Enforce the documented "path must exist" contract uniformly. Unix
     // statfs(2) already errors on a missing path, but the Windows volume query
     // resolves the path's drive root and would succeed for a non-existent
@@ -79,7 +151,7 @@ pub fn classify(path: &Path) -> io::Result<FsKind> {
             ),
         ));
     }
-    classify_impl(path)
+    classify_family_impl(path)
 }
 
 /// Whether two existing paths reside on the same physical device / volume.
@@ -252,7 +324,7 @@ pub fn collision_key(path: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-fn classify_impl(path: &Path) -> io::Result<FsKind> {
+fn classify_family_impl(path: &Path) -> io::Result<FilesystemFamily> {
     use nix::sys::statfs::{
         FUSE_SUPER_MAGIC, NFS_SUPER_MAGIC, SMB_SUPER_MAGIC, TMPFS_MAGIC, statfs,
     };
@@ -279,16 +351,15 @@ fn classify_impl(path: &Path) -> io::Result<FsKind> {
     let fuse = FUSE_SUPER_MAGIC.0 as u64;
 
     Ok(if raw == tmpfs || raw == RAMFS_MAGIC {
-        FsKind::InMemory
-    } else if raw == nfs
-        || raw == smb
-        || raw == SMB2_MAGIC_NUMBER
-        || raw == CIFS_MAGIC_NUMBER
-        || raw == fuse
-    {
-        FsKind::Network
+        FilesystemFamily::InMemory
+    } else if raw == nfs {
+        FilesystemFamily::Nfs
+    } else if raw == smb || raw == SMB2_MAGIC_NUMBER || raw == CIFS_MAGIC_NUMBER {
+        FilesystemFamily::Smb
+    } else if raw == fuse {
+        FilesystemFamily::OtherNetwork
     } else {
-        FsKind::Local
+        FilesystemFamily::Local
     })
 }
 
@@ -297,7 +368,7 @@ fn classify_impl(path: &Path) -> io::Result<FsKind> {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_vendor = "apple")]
-fn classify_impl(path: &Path) -> io::Result<FsKind> {
+fn classify_family_impl(path: &Path) -> io::Result<FilesystemFamily> {
     use nix::sys::statfs::statfs;
 
     // Darwin's `f_type` is undocumented and shifts between releases, so the
@@ -309,11 +380,13 @@ fn classify_impl(path: &Path) -> io::Result<FsKind> {
     let name = st.filesystem_type_name().to_ascii_lowercase();
 
     Ok(match name.as_str() {
-        "nfs" | "smbfs" | "cifs" | "webdav" | "ftp" | "afpfs" => FsKind::Network,
+        "nfs" => FilesystemFamily::Nfs,
+        "smbfs" | "cifs" => FilesystemFamily::Smb,
+        "webdav" | "ftp" | "afpfs" => FilesystemFamily::OtherNetwork,
         // FUSE mounts on macOS report the backing implementation's name
         // (e.g. "macfuse", "osxfuse", or a "fuse"-prefixed string).
-        n if n.contains("fuse") => FsKind::Network,
-        _ => FsKind::Local,
+        n if n.contains("fuse") => FilesystemFamily::OtherNetwork,
+        _ => FilesystemFamily::Local,
     })
 }
 
@@ -322,7 +395,7 @@ fn classify_impl(path: &Path) -> io::Result<FsKind> {
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
-fn classify_impl(path: &Path) -> io::Result<FsKind> {
+fn classify_family_impl(path: &Path) -> io::Result<FilesystemFamily> {
     use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
     use windows_sys::Win32::System::WindowsProgramming::{DRIVE_RAMDISK, DRIVE_REMOTE};
 
@@ -335,9 +408,12 @@ fn classify_impl(path: &Path) -> io::Result<FsKind> {
     // code that requires GetLastError).
     let drive_type = unsafe { GetDriveTypeW(root_wide.as_ptr()) };
     Ok(match drive_type {
-        DRIVE_REMOTE => FsKind::Network,
-        DRIVE_RAMDISK => FsKind::InMemory,
-        _ => FsKind::Local,
+        // GetDriveTypeW does not expose the remote transport. Keep it
+        // unqualified so Windows cannot silently accept an NFS or SMB profile
+        // without protocol-family evidence.
+        DRIVE_REMOTE => FilesystemFamily::OtherNetwork,
+        DRIVE_RAMDISK => FilesystemFamily::InMemory,
+        _ => FilesystemFamily::Local,
     })
 }
 
@@ -349,11 +425,11 @@ fn classify_impl(path: &Path) -> io::Result<FsKind> {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
-fn classify_impl(path: &Path) -> io::Result<FsKind> {
+fn classify_family_impl(path: &Path) -> io::Result<FilesystemFamily> {
     // Still require the path to exist so the contract ("must be probeable")
     // holds uniformly across targets.
     std::fs::metadata(path)?;
-    Ok(FsKind::Local)
+    Ok(FilesystemFamily::Local)
 }
 
 #[cfg(unix)]

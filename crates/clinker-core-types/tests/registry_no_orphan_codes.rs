@@ -43,6 +43,29 @@ use std::path::{Path, PathBuf};
 
 use clinker_core_types::diagnostic::is_registered;
 
+#[test]
+fn attempt_diagnostic_codes_are_registered_once_with_stable_meanings() {
+    let rows: Vec<_> = clinker_core_types::diagnostic::REGISTRY
+        .iter()
+        .filter(|entry| matches!(entry.code, "E371" | "E372"))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "E371 and E372 must each have one registry row"
+    );
+    assert_eq!(rows[0].code, "E371");
+    assert_eq!(
+        rows[0].meaning,
+        "Unsafe or invalid retained attempt refused"
+    );
+    assert_eq!(rows[1].code, "E372");
+    assert_eq!(
+        rows[1].meaning,
+        "Attempt cleanup incomplete or budget exhausted"
+    );
+}
+
 /// A code literal found in source, with where it was found.
 struct Site {
     code: String,

@@ -8,6 +8,11 @@
 
 use std::process::Command;
 
+use clinker_plan::config::{
+    ClinkerToml, DestinationProfile, PublicationCapacity, PublicationMode,
+    PublicationSupportStatus, StorageConfigError,
+};
+
 fn clinker_bin() -> &'static str {
     env!("CARGO_BIN_EXE_clinker")
 }
@@ -574,4 +579,279 @@ fn tempdir_path() -> std::path::PathBuf {
     base.push(name);
     std::fs::create_dir_all(&base).expect("create tempdir");
     base
+}
+
+#[test]
+fn publication_omission_resolves_exact_defaults_as_advisory() {
+    let destination = tempdir_path();
+    let doc = ClinkerToml::parse("").expect("parse default workspace config");
+
+    let resolved = doc
+        .storage
+        .publication
+        .resolve(&destination, 1_000_000_000, 8_000_000_000)
+        .expect("resolve default publication policy");
+    let explain = resolved.explain();
+
+    assert_eq!(resolved.mode(), PublicationMode::Direct);
+    assert_eq!(resolved.destination_profile(), DestinationProfile::Local);
+    assert_eq!(resolved.failed_retention_seconds(), 86_400);
+    assert_eq!(resolved.creation_grace_seconds(), 300);
+    assert_eq!(resolved.max_attempt_bytes(), 4_000_000_000);
+    assert_eq!(resolved.retained_byte_limit(), 8_000_000_000);
+    assert_eq!(resolved.retained_attempt_limit(), 8);
+    assert_eq!(resolved.min_free_bytes(), 2_000_000_000);
+    assert_eq!(resolved.sweep_entry_limit(), 1_000);
+    assert_eq!(resolved.sweep_byte_limit(), 8_000_000_000);
+    assert_eq!(resolved.sweep_time_limit_ms(), 2_000);
+    assert_eq!(explain.capacity, PublicationCapacity::AdvisoryObservation);
+    assert_eq!(explain.estimated_attempt_bytes, 1_000_000_000);
+    assert_eq!(explain.observed_free_bytes, 8_000_000_000);
+    assert_eq!(explain.support_status, PublicationSupportStatus::Supported);
+    assert!(!resolved.reserves_capacity());
+    assert!(!resolved.guarantees_completion());
+    assert!(resolved.late_enospc_or_edquot_possible());
+
+    let _ = std::fs::remove_dir_all(&destination);
+}
+
+#[test]
+fn publication_zero_retention_and_exact_modes_are_valid() {
+    let destination = tempdir_path();
+    let spool = destination.join("spool");
+    std::fs::create_dir(&spool).expect("create spool");
+    let config = format!(
+        r#"
+[storage.publication]
+mode = "local_then_publish"
+destination_profile = "local"
+local_spool_dir = "{}"
+failed_retention_seconds = 0
+creation_grace_seconds = 3600
+max_attempt_bytes = "16GB"
+retained_byte_limit = "64GB"
+retained_attempt_limit = 128
+min_free_bytes = "64GB"
+sweep_entry_limit = 10000
+sweep_byte_limit = "64GB"
+sweep_time_limit_ms = 30000
+"#,
+        spool.display().to_string().replace('\\', "\\\\")
+    );
+
+    let doc = ClinkerToml::parse(&config).expect("parse exact maximum values");
+    let resolved = doc
+        .storage
+        .publication
+        .resolve(&destination, 16_000_000_000, 80_000_000_000)
+        .expect("resolve exact maximum values");
+
+    assert_eq!(resolved.mode(), PublicationMode::LocalThenPublish);
+    assert_eq!(resolved.failed_retention_seconds(), 0);
+    assert_eq!(resolved.local_spool_dir(), Some(spool.as_path()));
+
+    let _ = std::fs::remove_dir_all(&destination);
+}
+
+#[test]
+fn publication_rejects_strict_schema_and_hard_limit_violations() {
+    for (body, needle) in [
+        ("unknown = true", "unknown"),
+        ("mode = \"copy\"", "mode"),
+        ("destination_profile = \"network\"", "destination_profile"),
+        ("failed_retention_seconds = -1", "failed_retention_seconds"),
+        (
+            "failed_retention_seconds = \"one day\"",
+            "failed_retention_seconds",
+        ),
+        ("retained_attempt_limit = -1", "retained_attempt_limit"),
+        (
+            "max_attempt_bytes = \"18446744073709551615GB\"",
+            "max_attempt_bytes",
+        ),
+    ] {
+        let err = ClinkerToml::parse(&format!("[storage.publication]\n{body}\n")).expect_err(body);
+        assert!(
+            err.to_string().contains(needle),
+            "error for {body:?} must name {needle:?}: {err}"
+        );
+    }
+
+    let destination = tempdir_path();
+    for (body, needle, correction) in [
+        (
+            "failed_retention_seconds = 604801",
+            "failed_retention_seconds",
+            "failed_retention_seconds = 604800",
+        ),
+        (
+            "creation_grace_seconds = 3601",
+            "creation_grace_seconds",
+            "creation_grace_seconds = 3600",
+        ),
+        (
+            "max_attempt_bytes = \"17GB\"",
+            "max_attempt_bytes",
+            "max_attempt_bytes = \"16GB\"",
+        ),
+        (
+            "retained_byte_limit = \"65GB\"",
+            "retained_byte_limit",
+            "retained_byte_limit = \"64GB\"",
+        ),
+        (
+            "retained_attempt_limit = 129",
+            "retained_attempt_limit",
+            "retained_attempt_limit = 128",
+        ),
+        (
+            "min_free_bytes = \"65GB\"",
+            "min_free_bytes",
+            "min_free_bytes = \"64GB\"",
+        ),
+        (
+            "sweep_entry_limit = 10001",
+            "sweep_entry_limit",
+            "sweep_entry_limit = 10000",
+        ),
+        (
+            "sweep_byte_limit = \"65GB\"",
+            "sweep_byte_limit",
+            "sweep_byte_limit = \"64GB\"",
+        ),
+        (
+            "sweep_time_limit_ms = 30001",
+            "sweep_time_limit_ms",
+            "sweep_time_limit_ms = 30000",
+        ),
+    ] {
+        let doc = ClinkerToml::parse(&format!("[storage.publication]\n{body}\n"))
+            .expect("parse value for resolved validation");
+        let err = doc
+            .storage
+            .publication
+            .resolve(&destination, 1, u64::MAX)
+            .expect_err(body);
+        let rendered = err.to_string();
+        assert!(rendered.contains(needle), "{rendered}");
+        assert!(rendered.contains(correction), "{rendered}");
+    }
+
+    let _ = std::fs::remove_dir_all(&destination);
+}
+
+#[test]
+fn publication_rejects_missing_spool_estimate_and_advisory_capacity() {
+    let destination = tempdir_path();
+    let local_then_publish =
+        ClinkerToml::parse("[storage.publication]\nmode = \"local_then_publish\"\n")
+            .expect("parse local_then_publish");
+    let spool_err = local_then_publish
+        .storage
+        .publication
+        .resolve(&destination, 1, u64::MAX)
+        .expect_err("missing spool must fail");
+    assert!(spool_err.to_string().contains("local_spool_dir"));
+    assert!(
+        spool_err
+            .to_string()
+            .contains("local_spool_dir = \"/path/to/local/spool\"")
+    );
+
+    let small_attempt = ClinkerToml::parse(
+        "[storage.publication]\nmax_attempt_bytes = \"1GB\"\nretained_byte_limit = \"2GB\"\nmin_free_bytes = \"2GB\"\n",
+    )
+    .expect("parse bounded policy");
+    let estimate_err = small_attempt
+        .storage
+        .publication
+        .resolve(&destination, 1_000_000_001, u64::MAX)
+        .expect_err("estimate over max attempt must fail");
+    assert!(estimate_err.to_string().contains("max_attempt_bytes"));
+
+    let retained_err = ClinkerToml::parse(
+        "[storage.publication]\nmax_attempt_bytes = \"4GB\"\nretained_byte_limit = \"1GB\"\n",
+    )
+    .expect("parse retained limit")
+    .storage
+    .publication
+    .resolve(&destination, 2_000_000_000, u64::MAX)
+    .expect_err("estimate over retained byte limit must fail");
+    assert!(retained_err.to_string().contains("retained_byte_limit"));
+
+    let capacity_err = small_attempt
+        .storage
+        .publication
+        .resolve(&destination, 1_000_000_000, 2_999_999_999)
+        .expect_err("observed free below estimate plus headroom must fail");
+    let rendered = capacity_err.to_string();
+    assert!(rendered.contains("observed_free_bytes"), "{rendered}");
+    assert!(rendered.contains("advisory"), "{rendered}");
+    assert!(rendered.contains("does not reserve capacity"), "{rendered}");
+
+    let overflow_err = small_attempt
+        .storage
+        .publication
+        .resolve(&destination, u64::MAX, u64::MAX)
+        .expect_err("checked capacity addition must not wrap");
+    assert!(matches!(
+        overflow_err,
+        StorageConfigError::PublicationCapacityOverflow { .. }
+    ));
+
+    let _ = std::fs::remove_dir_all(&destination);
+}
+
+#[test]
+fn publication_requires_one_maximum_attempt_to_fit_in_a_cleanup_page() {
+    let destination = tempdir_path();
+    let doc = ClinkerToml::parse(
+        "[storage.publication]\nmax_attempt_bytes = \"2MB\"\nsweep_byte_limit = \"6MB\"\n",
+    )
+    .expect("parse sweep relationship");
+
+    let error = doc
+        .storage
+        .publication
+        .resolve(&destination, 1, u64::MAX)
+        .expect_err("manifest overhead must fit beside the maximum attempt");
+    let rendered = error.to_string();
+    assert!(rendered.contains("sweep_byte_limit 6000000"), "{rendered}");
+    assert!(rendered.contains("max_attempt_bytes 2000000"), "{rendered}");
+    assert!(
+        rendered.contains("bounded manifest overhead 4194304"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("sweep_byte_limit = \"6194304B\""),
+        "{rendered}"
+    );
+
+    let _ = std::fs::remove_dir_all(&destination);
+}
+
+#[test]
+fn invalid_publication_key_fails_before_attempt_creation() {
+    let tmp = tempdir_path();
+    let pipeline = tmp.join("pipeline.yaml");
+    std::fs::write(&pipeline, PIPELINE_YAML).expect("write pipeline yaml");
+    std::fs::write(
+        tmp.join("clinker.toml"),
+        "[storage.publication]\nmode = \"direct\"\ncopy_buffer_bytes = 1048576\n",
+    )
+    .expect("write clinker.toml");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&pipeline)
+        .current_dir(&tmp)
+        .output()
+        .expect("spawn clinker");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("copy_buffer_bytes"), "{stderr}");
+    assert!(!tmp.join(".clinker-attempts").exists());
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }

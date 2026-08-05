@@ -39,7 +39,10 @@ pub use composition::{
 pub use discovery::{DiscoveredFile, DiscoveryError, DiscoveryOutcome, discover};
 pub use error::*;
 pub use format::*;
-pub use fs_type::{FsKind, case_sensitive_dir, classify, collision_key, same_device};
+pub use fs_type::{
+    FilesystemFamily, FsKind, case_sensitive_dir, classify, classify_family, collision_key,
+    same_device,
+};
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use output::*;
 pub use output_mapping::{MappingEntry, OutputMapping};
@@ -58,9 +61,11 @@ pub use scoped_var::*;
 pub use sort::*;
 pub use source::*;
 pub use storage::{
-    ChannelLayout, Cleanup, ClinkerToml, CompressMode, GroupLayout, OnExisting, ShardScheme,
-    SpillConfig, StagedPath, StagingMatcher, StagingPolicy, StagingVerify, StorageConfig,
-    StorageConfigError,
+    ChannelLayout, Cleanup, ClinkerToml, CompressMode, DestinationProfile, GroupLayout, OnExisting,
+    PUBLICATION_MANIFEST_MAX_BYTES, PUBLICATION_MAX_RETAINED_ATTEMPTS, PublicationCapacity,
+    PublicationExplain, PublicationMode, PublicationPolicy, PublicationSupportStatus,
+    ResolvedPublicationPolicy, ShardScheme, SpillConfig, StagedPath, StagingMatcher, StagingPolicy,
+    StagingVerify, StorageConfig, StorageConfigError,
 };
 pub use transform::*;
 pub use utils::*;

@@ -333,6 +333,88 @@ for the shorthand these forms expand from.
 
 ---
 
+## clinker attempts
+
+Inspect and clean up retained publication attempts owned by a pipeline:
+
+```bash
+clinker attempts list <PIPELINE> [--path-execution-id <ID>] [--continuation <TOKEN>] [--show-paths] [--format text|json]
+clinker attempts inspect <PIPELINE> --execution-id <ID> [--path-execution-id <ID>] [--show-paths] [--format text|json]
+clinker attempts purge <PIPELINE> (--execution-id <ID> | --expired) [--path-execution-id <ID>] [--execute] [--continuation <TOKEN>] [--show-paths] [--format text|json]
+```
+
+`<PIPELINE>` is required and must be a traversal-free, workspace-relative
+`.yaml` or `.yml` path. Every invocation reloads and compiles that pipeline,
+then derives its finite destination-parent roots from the compiled config.
+There is no option for supplying a storage root, deletion path, or safety
+override.
+
+When the original run used path- or overlay-affecting options, repeat them on
+the attempt command: `--base-dir`, `--allow-absolute-paths`, `--rules-path`,
+`--channel`, repeatable `--group`, and `--no-auto-groups`. Output templates that
+use run identity also require the matching `--path-execution-id`, `--batch-id`,
+or `--timestamp`. The path identity is deliberately distinct from inspect and
+purge's `--execution-id` selector, so `purge --expired` can reconstruct an
+execution-scoped destination without changing its selector. Attempt operations
+replay file-source discovery for `{source_file}` and `{source_path}` fan-out and
+anchor a pipeline without `--base-dir` at the pipeline's own directory, matching
+`run`. These values recompile typed `ValidatedPath` roots and never grant
+authority to a caller-supplied deletion path.
+
+`list` and `inspect` never mutate retained state. `purge` is also non-mutating
+by default: it reports the attempts that the current retention policy admits.
+Only `--execute` performs bounded cleanup. Live locks, invalid ownership,
+unsupported filesystem entries, ambiguous clocks, and unreadable manifests
+remain keep decisions even with `--execute`.
+
+| Command or flag | Behavior |
+| --- | --- |
+| `list` | Lists retained attempts across all existing roots owned by the freshly compiled pipeline. |
+| `inspect --execution-id <ID>` | Reports one canonical execution ID across those roots. |
+| `purge --execution-id <ID>` | Previews one logical execution; add `--execute` to remove only positively owned, eligible files. |
+| `purge --expired` | Previews all policy-expired attempts admitted by the bounded page; add `--execute` to clean them. |
+| `--continuation <TOKEN>` | Resumes the exact plan-, root-, and selector-bound page emitted by a partial result. JSON `resume_argv` is authoritative; the text command applies platform quoting to the raw opaque token. |
+| `--show-paths` | Adds sanitized workspace-relative attempt paths. Machine-local prefixes and sensitive-looking components remain redacted. |
+| `--format json` | Emits one compact JSON object with stable field order and logical identifiers. The default is deterministic human-readable text. |
+
+Default output is path-free. It contains the logical root ID, execution ID,
+lifecycle state, eligibility, artifact IDs, cleanup debt, and exact bounds.
+The compact JSON form carries the same fields plus shell-independent
+`recovery_argv` and `resume_argv` arrays. Neither form includes record values,
+credentials, secrets, or raw debug data.
+
+Safety refusals and incomplete cleanup exit with status 4 and use the stable
+E371 or E372 data. The report includes its logical failure code, registry-owned
+retry advice, and a pasteable workspace-relative recovery command, for example:
+
+```text
+diagnostic: E371
+failure: attempt.retention.manifest_invalid
+retry: policy_required
+recover: clinker attempts inspect pipelines/orders.yaml --execution-id 018f47a2-9a41-7a27-b4d6-4f7137e3c159
+```
+
+Examples:
+
+```bash
+# Path-free, non-mutating inventory
+clinker attempts list pipelines/orders.yaml
+
+# Inspect one retained execution as compact JSON
+clinker attempts inspect pipelines/orders.yaml \
+  --execution-id 018f47a2-9a41-7a27-b4d6-4f7137e3c159 \
+  --format json
+
+# Preview expired cleanup, then perform the same bounded selection
+clinker attempts purge pipelines/orders.yaml --expired
+clinker attempts purge pipelines/orders.yaml --expired --execute
+```
+
+See [Storage & Spill Location](storage.md#output-publication-and-retained-attempts)
+for retention, bounds, destination qualification, and cleanup ordering.
+
+---
+
 ## Environment Variables
 
 | Variable | Description |

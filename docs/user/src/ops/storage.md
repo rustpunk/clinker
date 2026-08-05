@@ -22,11 +22,156 @@ compress = "auto"            # optional; auto | off | on   (default = auto)
 enabled  = false             # opt-in; default off
 dir      = "/var/clinker/staging"   # required when enabled
 patterns = ["/mnt/nfs/data/**"]     # which sources to stage
+
+[storage.publication]
+mode = "direct"                    # direct | local_then_publish
+destination_profile = "local"     # local | nfs_v4_1 | smb_3_1_1
+failed_retention_seconds = 86400   # 24 hours; zero is allowed
 ```
 
 The whole block is optional. With no `clinker.toml`, or a `clinker.toml` that
 omits `[storage]`, Clinker spills to the OS temp directory exactly as it
 always has.
+
+## Output publication and retained attempts
+
+`[storage.publication]` is the only author-facing block for output publication,
+destination qualification, retained attempts, and bounded cleanup. It is
+optional; the defaults use destination-local quarantine (`mode = "direct"`),
+the local filesystem profile, and 24-hour retention for failed attempts.
+NFS and SMB profiles are accepted only when the operating system identifies
+the matching filesystem family; an unidentifiable remote drive is rejected
+rather than guessed.
+
+```toml
+[storage.publication]
+mode = "direct"
+destination_profile = "local"
+failed_retention_seconds = 86400
+creation_grace_seconds = 300
+max_attempt_bytes = "4GB"
+retained_byte_limit = "8GB"
+retained_attempt_limit = 8
+min_free_bytes = "2GB"
+sweep_entry_limit = 1000
+sweep_byte_limit = "8GB"
+sweep_time_limit_ms = 2000
+```
+
+| Setting | Default | Hard limit | Meaning |
+| --- | ---: | ---: | --- |
+| `failed_retention_seconds` | 86,400 (24 hours) | 604,800 (7 days) | How long incomplete, abandoned, or otherwise failed terminal attempts remain. Zero is valid and makes them immediately eligible after the live lock is released. |
+| `creation_grace_seconds` | 300 | 3,600 | Grace period before a non-terminal attempt can be considered abandoned. |
+| `max_attempt_bytes` | 4 GB | 16 GB | Maximum admitted estimate for one publication attempt. |
+| `retained_byte_limit` | 8 GB | 64 GB | Aggregate retained-attempt byte ceiling used by policy. |
+| `retained_attempt_limit` | 8 | 128 | Aggregate retained-attempt count ceiling. |
+| `min_free_bytes` | 2 GB | 64 GB | Additional free-space headroom required by admission. |
+| `sweep_entry_limit` | 1,000 | 10,000 | Maximum directory entries considered by one cleanup page. |
+| `sweep_byte_limit` | 8 GB | 64 GB | Maximum regular-file bytes considered by one cleanup page. Must be at least `max_attempt_bytes + 4,194,304B` so one maximum attempt and its bounded manifest can always make progress. |
+| `sweep_time_limit_ms` | 2,000 | 30,000 | Maximum monotonic elapsed time for one cleanup page. |
+
+The capacity observation is advisory. It is a one-time comparison of the
+attempt estimate plus `min_free_bytes` against observed free space; it reserves
+no blocks or quota. A later write or synchronization can still fail with
+`ENOSPC` or `EDQUOT`, and Clinker retains exact attempt state rather than
+claiming publication succeeded.
+
+Configuration resolution rejects a sweep budget that cannot inspect one
+maximum-sized attempt plus the bounded 4 MiB manifest. The diagnostic reports
+the exact minimum and a paste-ready `sweep_byte_limit` setting; this prevents a
+valid admitted attempt from becoming permanently too large for cleanup.
+
+Aggregate admission counts physical manifest-owned staging and quarantine
+files across every destination and local-spool root. Temporary local and
+destination copies both count while both exist; an uninspectable size fails
+admission instead of being treated as zero. Count and byte inventory, expiry
+cleanup, the limit check, and attempt-root creation are serialized across the
+same root set, so concurrent runs cannot both consume the final retained slot.
+Before releasing that serialization boundary, Clinker records the admitted
+estimate in every owned attempt root. A later process charges at least one
+copy of that reservation for the execution until exact artifact sizes replace
+it. Admission locks live only inside the internal `.clinker-attempts`
+namespace, so an authored output leaf cannot replace the mutex.
+Lowering `retained_attempt_limit` does not hide attempts that were admitted by
+an earlier configuration. Listing and expired purging continue to page over
+the bounded physical namespace and report policy debt until the retained count
+is back within the new limit.
+
+### Publication modes and destination profiles
+
+`direct` writes each artifact into restrictive quarantine on its destination
+filesystem, synchronizes it, and only then promotes it to the final leaf.
+`local_then_publish` requires `local_spool_dir`; Clinker writes and verifies the
+local copy, copies and verifies it into destination-local quarantine, and
+promotes only that destination copy. There is no copy fallback that writes
+directly to a visible final, and no automatic mode fallback. A destination
+profile mismatch fails closed.
+
+The supported destination profile is a qualification claim, not a spelling
+that makes an arbitrary mount safe. NFSv4.1 and SMB3.1.1 support requires an
+actual mounted destination qualified with the selected profile, including real
+late-failure behavior. Hosted qualification also runs the ordinary publication
+admission API from independent processes against each mounted profile, in
+opposite multi-root order, and requires exactly one process to enter the final
+retained-count and retained-byte slot without deadlock. This production lock
+proof is separate from the filesystem's byte-range/OFD lock probe. Release evidence for low space must observe a real
+`ENOSPC`. Injected `EDQUOT` is useful seam coverage but is non-qualifying unless
+a real quota is provisioned and the filesystem reports `EDQUOT` during the
+mounted test.
+
+Publication truth is per artifact. Earlier artifacts can be synchronized and
+visible while a later promotion fails, so an output set is never described as
+atomically published across artifacts. Quarantine ownership is scoped to one
+execution ID; attempts never share writable staging ownership.
+
+### Retention and metadata-last cleanup
+
+Every retained attempt has a restrictive owner manifest and live lock. Cleanup
+accepts only roots derived from a freshly compiled workspace-relative pipeline,
+canonical execution IDs or the typed `expired` selector, and bound opaque
+continuations. It never accepts a raw deletion path.
+
+Cleanup keeps data on any ambiguity. It opens entries through retained,
+no-follow handles, verifies the supported manifest and allowed children,
+acquires the live lock, checks wall-clock eligibility, and stays within the
+configured entry, byte, and monotonic-time limits. Owned artifact bytes are
+removed first. Clinker then revalidates the directory, removes the owner
+manifest and liveness metadata last, and removes the now-empty attempt root.
+A crash or refusal before that sequence finishes remains explicit cleanup debt
+for a bounded retry.
+
+Use the non-mutating operator surface to inspect or preview retained state:
+
+```bash
+clinker attempts list pipelines/orders.yaml
+clinker attempts inspect pipelines/orders.yaml \
+  --execution-id 018f47a2-9a41-7a27-b4d6-4f7137e3c159
+clinker attempts purge pipelines/orders.yaml --expired
+clinker attempts purge pipelines/orders.yaml --expired --execute
+```
+
+Repeat any path or overlay identity used by the run (`--base-dir`, absolute-path
+permission, rules root, channel/groups, `--path-execution-id`, batch identity,
+or timestamp) so the command recompiles the same typed owned roots. File-backed
+fan-out roots normally replay source discovery. A retained failure also keeps
+a bounded, plan-bound receipt containing the logical source identities used by
+`{source_file}` and `{source_path}` plus path-free identifiers for every owned
+output or spool root. If a source is later removed or its directory is renamed,
+attempt commands re-render those authored templates and require the resulting
+validated roots to match the receipt exactly before listing, inspection, or
+purge. Successful publication removes the receipt with the rest of the attempt.
+Attempt commands do not accept a raw cleanup path. Continuation tokens are opaque raw values;
+JSON output provides authoritative structured recovery/resume argument arrays
+for shell-independent automation.
+
+Output is path-free by default and reports logical root, execution, and artifact
+IDs. `--show-paths` adds only sanitized workspace-relative paths; machine-local
+prefixes, sensitive-looking components, credentials, secrets, record values,
+and raw staging detail remain redacted. Successful operations exit 0. Invalid
+selectors, pipelines, and continuations exit 1. Bounded partial work or any
+cleanup debt exits 4 with E371/E372 retry and workspace-relative recovery
+guidance. See the [attempt command reference](cli-reference.md#clinker-attempts)
+and [exit-code contract](exit-codes.md#exit-code-reference).
 
 ## `storage.spill.dir` — where spill files go
 
