@@ -144,7 +144,7 @@ pub fn provision_and_run(request: &ProvisionRequest) -> Result<String, GateError
 
         current_step = "server-and-mount";
         if state.profile == NFS_PROFILE {
-            provision_nfs(&state, &server_root, &protocol_path)?;
+            provision_nfs(&state, &server_root, &protocol_path, true)?;
         } else {
             provision_smb(&state, &server_root, &samba_dir, &protocol_path)?;
         }
@@ -1163,6 +1163,7 @@ fn provision_nfs(
     state: &EnvironmentState,
     server_root: &Path,
     protocol_path: &Path,
+    start_server: bool,
 ) -> Result<(), GateError> {
     let export = state.scratch.join("clinker-ci.exports");
     fs::write(
@@ -1173,37 +1174,49 @@ fn provision_nfs(
         ),
     )
     .map_err(|error| GateError::io("write NFS export configuration", &error))?;
+    checked(
+        "sudo",
+        &[
+            OsString::from("install"),
+            OsString::from("-D"),
+            OsString::from("-m"),
+            OsString::from("0644"),
+            export.as_os_str().to_owned(),
+            OsString::from(NFS_EXPORT),
+        ],
+        inherited_environment(&[]),
+        Duration::from_secs(120),
+        "install NFS export configuration",
+    )?;
+    if start_server {
+        for (arguments, label) in [
+            (
+                vec![
+                    OsString::from("systemctl"),
+                    OsString::from("start"),
+                    OsString::from("rpcbind"),
+                ],
+                "start rpcbind",
+            ),
+            (
+                vec![
+                    OsString::from("systemctl"),
+                    OsString::from("restart"),
+                    OsString::from("nfs-kernel-server"),
+                ],
+                "start NFS server",
+            ),
+        ] {
+            checked(
+                "sudo",
+                &arguments,
+                inherited_environment(&[]),
+                Duration::from_secs(120),
+                label,
+            )?;
+        }
+    }
     for (program, arguments, label) in [
-        (
-            "sudo",
-            vec![
-                OsString::from("install"),
-                OsString::from("-D"),
-                OsString::from("-m"),
-                OsString::from("0644"),
-                export.as_os_str().to_owned(),
-                OsString::from(NFS_EXPORT),
-            ],
-            "install NFS export configuration",
-        ),
-        (
-            "sudo",
-            vec![
-                OsString::from("systemctl"),
-                OsString::from("start"),
-                OsString::from("rpcbind"),
-            ],
-            "start rpcbind",
-        ),
-        (
-            "sudo",
-            vec![
-                OsString::from("systemctl"),
-                OsString::from("restart"),
-                OsString::from("nfs-kernel-server"),
-            ],
-            "start NFS server",
-        ),
         (
             "sudo",
             vec![OsString::from("exportfs"), OsString::from("-rav")],
@@ -2345,7 +2358,7 @@ fn recover_profile(state: &EnvironmentState) -> Result<(), GateError> {
     let protocol = state.scratch.join("recovery-protocol.txt");
     let server_root = state.scratch.join("server");
     if state.profile == NFS_PROFILE {
-        provision_nfs(state, &server_root, &protocol)?;
+        provision_nfs(state, &server_root, &protocol, false)?;
     } else {
         provision_smb(state, &server_root, &state.scratch.join("samba"), &protocol)?;
     }

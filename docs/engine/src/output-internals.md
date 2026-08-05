@@ -183,7 +183,7 @@ The same local, identity-bound control pauses before copy, file sync, rename,
 and parent-directory sync. For every applicable mode/stage pair, the harness
 withdraws the exact NFS export or stops the exact Samba PID, force-lazy-detaches
 the client mount, releases the operation, observes a bounded non-success,
-restarts and remounts the exact profile, and reopens its retained manifest. SMB
+restores and remounts the exact profile, and reopens its retained manifest. SMB
 remount uses a bounded retry while detached kernel client state is released.
 The harness then exercises
 bounded list, inspect, purge preview, and purge execution. A separate attempt fills the

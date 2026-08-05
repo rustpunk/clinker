@@ -1969,7 +1969,7 @@ fn wait_for_retained_execution(root: &Path, expected: &str) {
         let retained = std::fs::read_dir(&namespace).map(|entries| {
             let mut retained = entries
                 .filter_map(Result::ok)
-                .filter(|entry| entry.path().is_dir())
+                .filter(|entry| entry.file_name() != ".admission.lock")
                 .map(|entry| entry.file_name())
                 .collect::<Vec<_>>();
             retained.sort();
@@ -2049,10 +2049,6 @@ fn matrix_admission_contention(destination: &Path, profile: &str, scenario: &str
         let namespace = root.join(".clinker-attempts");
         wait_for_retained_execution(root, admitted_execution);
         let attempt_root = namespace.join(admitted_execution);
-        assert!(
-            attempt_root.is_dir(),
-            "mounted root must retain admitted attempt"
-        );
         let manifest = AttemptManifest::read(&attempt_root.join("manifest.json"), 100_000_000)
             .expect("mounted admitted manifest readback");
         assert_eq!(manifest.execution_id(), admitted_execution);
