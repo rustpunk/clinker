@@ -1480,11 +1480,35 @@ fn matrix_execute_purge(
         let request = query
             .purge_execution(&root_id, execution_id)
             .expect("select exact mounted attempt");
-        let report = query
-            .execute(&request, 100_000_000, None, &ShutdownToken::detached())
-            .expect("execute exact mounted purge");
-        assert_eq!(report.disposition(), PurgeDisposition::Removed);
-        assert!(report.cleanup_debt().is_empty());
+        let mut continuation = None;
+        let mut removed = false;
+        for _ in 0..4 {
+            let report = query
+                .execute(
+                    &request,
+                    100_000_000,
+                    continuation.as_ref(),
+                    &ShutdownToken::detached(),
+                )
+                .expect("execute exact mounted purge");
+            match report.disposition() {
+                PurgeDisposition::Removed => {
+                    assert!(report.cleanup_debt().is_empty());
+                    removed = true;
+                    break;
+                }
+                PurgeDisposition::Partial => {
+                    continuation = Some(
+                        report
+                            .continuation()
+                            .expect("partial mounted purge must be resumable")
+                            .clone(),
+                    );
+                }
+                disposition => panic!("mounted purge did not advance: {disposition:?}"),
+            }
+        }
+        assert!(removed, "mounted purge did not complete within four pages");
     }
     assert!(
         !destination
