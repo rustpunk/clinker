@@ -917,6 +917,7 @@ fn matrix_operator_proof(
     execution_id: &str,
     plan_name: &str,
 ) -> AttemptState {
+    let (expected_state, expected_artifact_state) = matrix_retained_states(plan_name);
     let policy = resolved_policy(destination, mode, spool, 256 * 1024 * 1024);
     let mut roots = vec![validated(destination, ".")];
     if let Some(spool) = spool {
@@ -940,7 +941,11 @@ fn matrix_operator_proof(
             .inspect(&root_id, execution_id, 100_000_000)
             .expect("inspect mounted retained attempt");
         let state = inspected.state().expect("retained state");
-        assert_ne!(state, AttemptState::Complete);
+        assert_eq!(state, expected_state);
+        assert_eq!(
+            inspected.artifact_states(),
+            &[("artifact-00000001".to_owned(), expected_artifact_state)]
+        );
         assert_eq!(observed_state.get_or_insert(state), &state);
         assert!(inspected.cleanup_debt().is_empty());
         let request = query
@@ -953,6 +958,29 @@ fn matrix_operator_proof(
         assert!(preview.cleanup_debt().is_empty());
     }
     observed_state.expect("at least one mounted operator root")
+}
+
+#[cfg(target_os = "linux")]
+fn matrix_retained_states(plan_name: &str) -> (AttemptState, ArtifactState) {
+    if plan_name == "capacity-enospc"
+        || plan_name.ends_with("-copy")
+        || plan_name.ends_with("-file_synchronization")
+    {
+        return (AttemptState::Staging, ArtifactState::Staging);
+    }
+    if plan_name.starts_with("ordinary-failure-") {
+        return (AttemptState::Incomplete, ArtifactState::Unpublished);
+    }
+    if plan_name.ends_with("-rename") {
+        return (AttemptState::Publishing, ArtifactState::Unpublished);
+    }
+    if plan_name.ends_with("-parent_directory_synchronization") {
+        return (
+            AttemptState::Publishing,
+            ArtifactState::VisibleUnsynchronized,
+        );
+    }
+    panic!("scenario has no retained-state contract: {plan_name}");
 }
 
 #[cfg(target_os = "linux")]

@@ -94,6 +94,7 @@ struct CleanupResult {
 #[derive(Debug)]
 struct SemanticLogs {
     publication: String,
+    publication_observations: Vec<String>,
 }
 
 /// Provision, qualify, and teardown one exact disposable profile.
@@ -297,6 +298,10 @@ fn run_profile_inner(request: &RunProfileRequest) -> Result<Value, GateError> {
     }
     validate_bounded_backing(&state.scratch.join("server"))?;
     let semantic = semantic_test(&state, &request.evidence)?;
+    let publication_results = publication_results_from_observations(
+        &semantic.publication_observations,
+        &semantic.publication,
+    )?;
     require_cleanup_liveness(&request.mount_root)?;
     let runner = runner_observation()?;
     Ok(json!({
@@ -350,56 +355,108 @@ fn run_profile_inner(request: &RunProfileRequest) -> Result<Value, GateError> {
             "cross_execution_staging_ownership=absent",
             "raw_deletion_path_authority=absent",
         ],
-        "publication_results": {
-            "lifecycle_classes": [
-                "success",
-                "ordinary_failure",
-                "interruption",
-                "ambiguity_durability_uncertainty",
-                "purge_cleanup",
-                "support_eligibility",
-            ],
-            "modes": ["direct", "local_then_publish"],
-            "operator_results": [
-                "list=pass",
-                "inspect=pass",
-                "purge_preview=pass",
-                "purge_execute=pass",
-                "cleanup_debt=none",
-            ],
-            "persistence_results": [
-                "ordinary_failure=retained_manifest",
-                "interruption=retained_manifest",
-                "ambiguity_durability_uncertainty=retained_manifest",
-            ],
-            "recovery_results": [
-                "direct:file_synchronization=recovered_revalidated_completed_manifest_reopened",
-                "direct:rename=recovered_revalidated_completed_manifest_reopened",
-                "direct:parent_directory_synchronization=recovered_revalidated_completed_manifest_reopened",
-                "local_then_publish:copy=recovered_revalidated_completed_manifest_reopened",
-                "local_then_publish:file_synchronization=recovered_revalidated_completed_manifest_reopened",
-                "local_then_publish:rename=recovered_revalidated_completed_manifest_reopened",
-                "local_then_publish:parent_directory_synchronization=recovered_revalidated_completed_manifest_reopened",
-            ],
-            "stage_results": [
-                "direct:file_synchronization=interrupted_retained",
-                "direct:rename=interrupted_retained",
-                "direct:parent_directory_synchronization=interrupted_retained",
-                "local_then_publish:copy=interrupted_retained",
-                "local_then_publish:file_synchronization=interrupted_retained",
-                "local_then_publish:rename=interrupted_retained",
-                "local_then_publish:parent_directory_synchronization=interrupted_retained",
-            ],
-            "success_results": [
-                "direct=pre_cleanup_final_and_complete_manifest,post_cleanup_final_present_attempt_absent",
-                "local_then_publish=pre_cleanup_final_and_complete_manifest,post_cleanup_final_present_attempt_absent",
-            ],
-            "test_filter": "remote_filesystem_publication_matrix",
-            "test_log": semantic.publication,
-        },
+        "publication_results": publication_results,
         "schema": EVIDENCE_SCHEMA,
         "status": "semantic_pass",
         "support_eligible": false,
+    }))
+}
+
+fn publication_results_from_observations(
+    observations: &[String],
+    test_log: &str,
+) -> Result<Value, GateError> {
+    let required = [
+        "success-direct:pre_cleanup_readback=pass",
+        "success-direct:post_cleanup_readback=pass",
+        "success-local_then_publish:pre_cleanup_readback=pass",
+        "success-local_then_publish:post_cleanup_readback=pass",
+        "ordinary-failure-direct:ordinary_failure_manifest_readback=pass",
+        "ordinary-failure-direct:operator_purge=pass",
+        "ordinary-failure-local_then_publish:ordinary_failure_manifest_readback=pass",
+        "ordinary-failure-local_then_publish:operator_purge=pass",
+        "capacity-enospc:mounted_raw_errno_28=pass",
+        "capacity-enospc:operator_purge=pass",
+        "control_endpoint_cleanup=pass",
+    ];
+    for expected in required {
+        if !observations.iter().any(|observed| observed == expected) {
+            return Err(missing(format!(
+                "validated publication observation {expected} is absent"
+            )));
+        }
+    }
+    for scenario in [
+        "interruption-direct-file_synchronization",
+        "interruption-direct-rename",
+        "interruption-direct-parent_directory_synchronization",
+        "interruption-local_then_publish-copy",
+        "interruption-local_then_publish-file_synchronization",
+        "interruption-local_then_publish-rename",
+        "interruption-local_then_publish-parent_directory_synchronization",
+    ] {
+        for outcome in [
+            "service_interruption",
+            "bounded_interruption",
+            "service_recovery",
+            "recovery_manifest_readback",
+            "operator_purge",
+        ] {
+            let expected = format!("{scenario}:{outcome}=pass");
+            if !observations.iter().any(|observed| observed == &expected) {
+                return Err(missing(format!(
+                    "validated publication observation {expected} is absent"
+                )));
+            }
+        }
+    }
+
+    Ok(json!({
+        "lifecycle_classes": [
+            "success",
+            "ordinary_failure",
+            "interruption",
+            "ambiguity_durability_uncertainty",
+            "purge_cleanup",
+            "support_eligibility",
+        ],
+        "modes": ["direct", "local_then_publish"],
+        "operator_results": [
+            "list=pass",
+            "inspect=pass",
+            "purge_preview=pass",
+            "purge_execute=pass",
+            "cleanup_debt=none",
+        ],
+        "persistence_results": [
+            "ordinary_failure=retained_manifest",
+            "interruption=retained_manifest",
+            "ambiguity_durability_uncertainty=retained_manifest",
+        ],
+        "recovery_results": [
+            "direct:file_synchronization=recovered_revalidated_completed_manifest_reopened",
+            "direct:rename=recovered_revalidated_completed_manifest_reopened",
+            "direct:parent_directory_synchronization=recovered_revalidated_completed_manifest_reopened",
+            "local_then_publish:copy=recovered_revalidated_completed_manifest_reopened",
+            "local_then_publish:file_synchronization=recovered_revalidated_completed_manifest_reopened",
+            "local_then_publish:rename=recovered_revalidated_completed_manifest_reopened",
+            "local_then_publish:parent_directory_synchronization=recovered_revalidated_completed_manifest_reopened",
+        ],
+        "stage_results": [
+            "direct:file_synchronization=interrupted_retained",
+            "direct:rename=interrupted_retained",
+            "direct:parent_directory_synchronization=interrupted_retained",
+            "local_then_publish:copy=interrupted_retained",
+            "local_then_publish:file_synchronization=interrupted_retained",
+            "local_then_publish:rename=interrupted_retained",
+            "local_then_publish:parent_directory_synchronization=interrupted_retained",
+        ],
+        "success_results": [
+            "direct=pre_cleanup_final_and_complete_manifest,post_cleanup_final_present_attempt_absent",
+            "local_then_publish=pre_cleanup_final_and_complete_manifest,post_cleanup_final_present_attempt_absent",
+        ],
+        "test_filter": "remote_filesystem_publication_matrix",
+        "test_log": test_log,
     }))
 }
 
@@ -1240,7 +1297,12 @@ fn semantic_test(state: &EnvironmentState, evidence: &Path) -> Result<SemanticLo
         &result,
         "remote_filesystem_publication_matrix",
     )?;
-    Ok(SemanticLogs { publication })
+    let publication_observations =
+        observed_lines(&control_log, "read publication controller observations")?;
+    Ok(SemanticLogs {
+        publication,
+        publication_observations,
+    })
 }
 
 fn require_semantic_success(
@@ -1615,23 +1677,9 @@ fn control_retained(
 ) -> Result<(), GateError> {
     let ready = read_control(stream)?;
     let (execution_id, artifact_id, manifest_state) = validate_recovery_ready(&ready, scenario)?;
-    verify_retained_readback(state, &execution_id, &artifact_id, &manifest_state)?;
-    let final_path = publication_sandbox(state).join(format!("{scenario}.bin"));
-    if interrupted {
-        let expected_visible = scenario.ends_with("parent_directory_synchronization");
-        if final_path.exists() != expected_visible {
-            return Err(missing(
-                "interrupted publication final visibility does not match its exact stage",
-            ));
-        }
-    } else if fs::read(&final_path)
-        .map_err(|error| GateError::io("read ordinary-failure mounted final", &error))?
-        != b"existing final"
-    {
-        return Err(missing(
-            "ordinary publication failure did not preserve the existing final",
-        ));
-    }
+    let expectation = retained_expectation(scenario)?;
+    validate_child_manifest_state(&manifest_state, &expectation)?;
+    verify_retained_readback(state, scenario, &execution_id, &artifact_id, &expectation)?;
     observations.push(format!(
         "{scenario}:{}=pass",
         if interrupted {
@@ -1745,13 +1793,15 @@ fn control_capacity(
     if manifest_state != "staging" {
         return Err(missing("ENOSPC retained manifest is not staging"));
     }
-    verify_retained_readback(state, execution_id, artifact_id, manifest_state)?;
-    if publication_sandbox(state)
-        .join("capacity-enospc.bin")
-        .exists()
-    {
-        return Err(missing("ENOSPC exposed a visible final artifact"));
-    }
+    let expectation = retained_expectation("capacity-enospc")?;
+    validate_child_manifest_state(manifest_state, &expectation)?;
+    verify_retained_readback(
+        state,
+        "capacity-enospc",
+        execution_id,
+        artifact_id,
+        &expectation,
+    )?;
     observations.push("capacity-enospc:mounted_raw_errno_28=pass".to_owned());
     write_scenario_action(stream, "purge", "capacity-enospc")?;
     let purged = read_control(stream)?;
@@ -1872,28 +1922,136 @@ fn verify_complete_readback(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct RetainedExpectation {
+    attempt_state: &'static str,
+    artifact_state: &'static str,
+    size_bytes: u64,
+    blake3_hex: &'static str,
+    final_bytes: Option<&'static [u8]>,
+}
+
+fn retained_expectation(scenario: &str) -> Result<RetainedExpectation, GateError> {
+    const EMPTY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const REPLACEMENT: &str =
+        "865329d9aa64a0a90e28403e1ad5bdfc26b0b5beb5a967537e78818c17e78c67";
+    const INTERRUPTION: &str =
+        "b7a4c2f87d102d06628d1ff7affff81fd46eb89f6dc029a1aae1033276227b30";
+
+    if scenario.starts_with("ordinary-failure-") {
+        return Ok(RetainedExpectation {
+            attempt_state: "incomplete",
+            artifact_state: "promoting",
+            size_bytes: 11,
+            blake3_hex: REPLACEMENT,
+            final_bytes: Some(b"existing final"),
+        });
+    }
+    if scenario == "capacity-enospc"
+        || scenario.ends_with("-copy")
+        || scenario.ends_with("-file_synchronization")
+    {
+        return Ok(RetainedExpectation {
+            attempt_state: "staging",
+            artifact_state: "staging",
+            size_bytes: 0,
+            blake3_hex: EMPTY,
+            final_bytes: None,
+        });
+    }
+    if scenario.ends_with("-rename") {
+        return Ok(RetainedExpectation {
+            attempt_state: "publishing",
+            artifact_state: "promoting",
+            size_bytes: 20,
+            blake3_hex: INTERRUPTION,
+            final_bytes: None,
+        });
+    }
+    if scenario.ends_with("-parent_directory_synchronization") {
+        return Ok(RetainedExpectation {
+            attempt_state: "publishing",
+            artifact_state: "promoting",
+            size_bytes: 20,
+            blake3_hex: INTERRUPTION,
+            final_bytes: Some(b"mounted interruption"),
+        });
+    }
+    Err(policy("publication scenario has no retained-state contract"))
+}
+
+fn validate_child_manifest_state(
+    child_state: &str,
+    expectation: &RetainedExpectation,
+) -> Result<(), GateError> {
+    if child_state != expectation.attempt_state {
+        return Err(missing(
+            "child retained-state claim differs from the controller-derived scenario state",
+        ));
+    }
+    Ok(())
+}
+
 fn verify_retained_readback(
     state: &EnvironmentState,
+    scenario: &str,
     execution_id: &str,
     artifact_id: &str,
-    expected_state: &str,
+    expectation: &RetainedExpectation,
 ) -> Result<(), GateError> {
-    if expected_state == "complete" {
-        return Err(missing("non-success scenario reported Complete state"));
-    }
     let manifest = read_attempt_manifest(state, execution_id)?;
+    let final_path = publication_sandbox(state).join(format!("{scenario}.bin"));
+    let final_bytes = match expectation.final_bytes {
+        Some(_) => Some(read_regular(
+            &final_path,
+            "read retained mounted final artifact",
+        )?),
+        None => match fs::symlink_metadata(&final_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(GateError::io(
+                    "inspect retained mounted final artifact",
+                    &error,
+                ));
+            }
+            Ok(_) => return Err(missing("retained scenario exposed an unexpected final")),
+        },
+    };
+    validate_retained_observation(
+        &manifest,
+        execution_id,
+        artifact_id,
+        expectation,
+        final_bytes.as_deref(),
+    )
+}
+
+fn validate_retained_observation(
+    manifest: &Value,
+    execution_id: &str,
+    artifact_id: &str,
+    expectation: &RetainedExpectation,
+    final_bytes: Option<&[u8]>,
+) -> Result<(), GateError> {
+    let artifact = manifest
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .filter(|artifacts| artifacts.len() == 1)
+        .and_then(|artifacts| artifacts.first())
+        .ok_or_else(|| missing("mounted retained manifest artifact inventory is incomplete"))?;
     if manifest.get("execution_id") != Some(&Value::String(execution_id.to_owned()))
-        || manifest.get("state") != Some(&Value::String(expected_state.to_owned()))
-        || manifest
-            .get("artifacts")
-            .and_then(Value::as_array)
-            .is_none_or(|artifacts| {
-                artifacts.len() != 1
-                    || artifacts[0].get("artifact_id")
-                        != Some(&Value::String(artifact_id.to_owned()))
-            })
+        || manifest.get("state") != Some(&Value::String(expectation.attempt_state.to_owned()))
+        || manifest.get("total_bytes").and_then(Value::as_u64) != Some(expectation.size_bytes)
+        || artifact.get("artifact_id") != Some(&Value::String(artifact_id.to_owned()))
+        || artifact.get("state") != Some(&Value::String(expectation.artifact_state.to_owned()))
+        || artifact.get("size_bytes").and_then(Value::as_u64) != Some(expectation.size_bytes)
+        || artifact.get("blake3_hex")
+            != Some(&Value::String(expectation.blake3_hex.to_owned()))
+        || final_bytes != expectation.final_bytes
     {
-        return Err(missing("mounted retained manifest readback is incomplete"));
+        return Err(missing(
+            "mounted retained attempt, artifact, digest, or final readback differs from the scenario contract",
+        ));
     }
     Ok(())
 }
@@ -3107,11 +3265,13 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use serde_json::json;
     use tempfile::tempdir;
 
     use super::{
         ChildResult, Termination, classify_mountpoint_termination, direct_locked_command,
-        require_semantic_success,
+        require_semantic_success, retained_expectation, validate_child_manifest_state,
+        validate_retained_observation,
     };
 
     const DIRECT_PROVISION: &str = "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem provision-and-run --profile \"${{ matrix.profile }}\" --evidence \"${EVIDENCE_PATH}\"";
@@ -3128,6 +3288,56 @@ mod tests {
         ] {
             assert!(!direct_locked_command(invalid, "provision-and-run"));
         }
+    }
+
+    #[test]
+    fn retained_support_evidence_rejects_wrong_state_artifact_and_final_bytes() {
+        let expectation = retained_expectation(
+            "interruption-direct-parent_directory_synchronization",
+        )
+        .expect("known retained scenario");
+        let manifest = json!({
+            "execution_id": "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+            "state": expectation.attempt_state,
+            "total_bytes": expectation.size_bytes,
+            "artifacts": [{
+                "artifact_id": "artifact-00000001",
+                "state": expectation.artifact_state,
+                "size_bytes": expectation.size_bytes,
+                "blake3_hex": expectation.blake3_hex,
+            }],
+        });
+        validate_child_manifest_state("publishing", &expectation)
+            .expect("derived child state");
+        validate_retained_observation(
+            &manifest,
+            "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+            "artifact-00000001",
+            &expectation,
+            Some(b"mounted interruption"),
+        )
+        .expect("complete retained observation");
+
+        validate_child_manifest_state("incomplete", &expectation)
+            .expect_err("semantically wrong child state must fail");
+        let mut wrong_artifact = manifest.clone();
+        wrong_artifact["artifacts"][0]["state"] = json!("unpublished");
+        validate_retained_observation(
+            &wrong_artifact,
+            "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+            "artifact-00000001",
+            &expectation,
+            Some(b"mounted interruption"),
+        )
+        .expect_err("wrong artifact state must fail");
+        validate_retained_observation(
+            &manifest,
+            "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+            "artifact-00000001",
+            &expectation,
+            Some(b"corrupted final"),
+        )
+        .expect_err("wrong final bytes must fail");
     }
 
     #[test]
