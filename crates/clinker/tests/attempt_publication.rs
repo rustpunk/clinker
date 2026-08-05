@@ -1498,12 +1498,11 @@ fn matrix_execute_purge(
                     break;
                 }
                 PurgeDisposition::Partial => {
-                    continuation = Some(
-                        report
-                            .continuation()
-                            .expect("partial mounted purge must be resumable")
-                            .clone(),
+                    assert!(
+                        !report.cleanup_debt().is_empty(),
+                        "partial mounted purge must explain its cleanup debt"
                     );
+                    continuation = report.continuation().cloned();
                 }
                 disposition => panic!("mounted purge did not advance: {disposition:?}"),
             }
