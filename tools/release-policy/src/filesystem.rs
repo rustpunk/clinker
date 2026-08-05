@@ -2256,12 +2256,12 @@ fn interrupt_profile(state: &EnvironmentState) -> Result<(), GateError> {
         "sudo",
         &[
             OsString::from("umount"),
-            OsString::from("-f"),
+            OsString::from("-l"),
             state.mount_root.as_os_str().to_owned(),
         ],
         inherited_environment(&[]),
         Duration::from_secs(30),
-        "force-detach mounted publication profile",
+        "lazy-detach mounted publication profile",
     )?;
     if state.profile == NFS_PROFILE {
         checked(
