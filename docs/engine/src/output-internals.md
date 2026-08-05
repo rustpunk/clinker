@@ -181,7 +181,7 @@ still creates no receipt or sidecar.
 
 The same local, identity-bound control pauses before copy, file sync, rename,
 and parent-directory sync. For every applicable mode/stage pair, the harness
-force-lazy-detaches the client mount, stops the exact NFS service or Samba PID,
+stops the exact NFS service or Samba PID, force-lazy-detaches the client mount,
 releases the operation, observes a bounded non-success, restarts and remounts
 the exact profile, and reopens its retained manifest. It then exercises bounded
 list, inspect, purge preview, and purge execution. A separate attempt fills the

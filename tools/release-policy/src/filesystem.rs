@@ -2252,18 +2252,6 @@ fn validate_retained_observation(
 }
 
 fn interrupt_profile(state: &EnvironmentState) -> Result<(), GateError> {
-    checked(
-        "sudo",
-        &[
-            OsString::from("umount"),
-            OsString::from("-f"),
-            OsString::from("-l"),
-            state.mount_root.as_os_str().to_owned(),
-        ],
-        inherited_environment(&[]),
-        Duration::from_secs(30),
-        "force-lazy-detach mounted publication profile",
-    )?;
     if state.profile == NFS_PROFILE {
         checked(
             "sudo",
@@ -2316,6 +2304,18 @@ fn interrupt_profile(state: &EnvironmentState) -> Result<(), GateError> {
         }
         let _ = fs::remove_file(pid_path);
     }
+    checked(
+        "sudo",
+        &[
+            OsString::from("umount"),
+            OsString::from("-f"),
+            OsString::from("-l"),
+            state.mount_root.as_os_str().to_owned(),
+        ],
+        inherited_environment(&[]),
+        Duration::from_secs(30),
+        "force-lazy-detach interrupted publication profile",
+    )?;
     if mount_state(&state.mount_root)? {
         return Err(missing(
             "publication mount remained active after disruption",
