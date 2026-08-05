@@ -1612,7 +1612,6 @@ fn matrix_ordinary_failure(
     );
     let execution_id = matrix_execution_id(index);
     let leaf = format!("{scenario}.bin");
-    std::fs::write(destination.join(&leaf), b"existing final").expect("preexisting final");
     let mut stream = matrix_connection(&scenario, mode);
     let mut reader = BufReader::new(stream.try_clone().expect("clone matrix endpoint"));
     let (mut attempt, mut writers, registry) = matrix_attempt(
@@ -1629,6 +1628,8 @@ fn matrix_ordinary_failure(
         .expect("write colliding artifact");
     let artifact_id = writers[0].artifact_id().to_owned();
     drop(writers);
+    std::fs::write(destination.join(&leaf), b"existing final")
+        .expect("create destination collision after reservation");
     attempt
         .mark_ready(&artifact_id)
         .expect("failure becomes ready");
