@@ -841,6 +841,7 @@ pub struct AttemptInspection {
     state: Option<AttemptState>,
     created_unix_ms: Option<u64>,
     eligible_after_unix_ms: Option<u64>,
+    retained_bytes: Option<u64>,
     artifact_ids: Vec<String>,
     artifact_states: Vec<(String, ArtifactState)>,
     cleanup_debt: Vec<CleanupDebt>,
@@ -889,6 +890,11 @@ impl AttemptInspection {
     /// Persisted creation-grace timestamp, when ownership parsed successfully.
     pub fn eligible_after_unix_ms(&self) -> Option<u64> {
         self.eligible_after_unix_ms
+    }
+
+    /// Durable logical artifact bytes owned by this attempt.
+    pub fn retained_bytes(&self) -> Option<u64> {
+        self.retained_bytes
     }
 
     /// Stable logical artifact identities physically observed in this root and
@@ -1114,6 +1120,14 @@ struct OwnedAttemptRoot {
     destination: ValidatedPath,
 }
 
+#[derive(Clone, Debug)]
+struct RetainedInventoryEntry {
+    root_identifier: String,
+    execution_id: String,
+    retained_bytes: u64,
+    eligible: bool,
+}
+
 /// Compiled-plan-bound entry point for retained-attempt operations.
 #[derive(Debug)]
 pub struct AttemptQuery {
@@ -1124,6 +1138,32 @@ pub struct AttemptQuery {
 }
 
 impl AttemptQuery {
+    fn for_admission(
+        policy: &ResolvedPublicationPolicy,
+        destination_roots: Vec<ValidatedPath>,
+    ) -> Result<Self, AttemptError> {
+        if destination_roots.is_empty() {
+            return Err(AttemptError::AggregateAdmissionUnproven(
+                "admission has no owned roots",
+            ));
+        }
+        let mut roots = destination_roots
+            .into_iter()
+            .map(|destination| OwnedAttemptRoot {
+                identifier: owned_root_identifier(destination.as_path()),
+                destination,
+            })
+            .collect::<Vec<_>>();
+        roots.sort_by(|left, right| left.identifier.cmp(&right.identifier));
+        roots.dedup_by(|left, right| left.identifier == right.identifier);
+        Ok(Self {
+            plan_hash: *blake3::hash(b"clinker-retained-attempt-admission/v1").as_bytes(),
+            policy: policy.clone(),
+            roots,
+            consumed_continuations: Mutex::new(std::collections::BTreeSet::new()),
+        })
+    }
+
     /// Bind retained-attempt operations to one freshly compiled plan, one
     /// resolved publication policy, and a finite set of validated roots.
     ///
@@ -2448,6 +2488,144 @@ impl QueryBudget {
     }
 }
 
+fn enforce_retained_attempt_admission(
+    policy: &ResolvedPublicationPolicy,
+    roots: Vec<ValidatedPath>,
+    observed_unix_ms: u64,
+) -> Result<(), AttemptError> {
+    let query = AttemptQuery::for_admission(policy, roots.clone())?;
+    for entry in collect_retained_inventory(&query, observed_unix_ms)?
+        .into_iter()
+        .filter(|entry| entry.eligible)
+    {
+        let request = query.purge_execution(&entry.root_identifier, &entry.execution_id)?;
+        let mut continuation = None;
+        let mut seen = std::collections::BTreeSet::new();
+        loop {
+            let report = query.execute(
+                &request,
+                observed_unix_ms,
+                continuation.as_ref(),
+                &ShutdownToken::detached(),
+            )?;
+            if matches!(
+                report.disposition(),
+                PurgeDisposition::Removed | PurgeDisposition::AlreadyAbsent
+            ) {
+                break;
+            }
+            let Some(next) = report.continuation().cloned() else {
+                return Err(AttemptError::AggregateAdmissionUnproven(
+                    "eligible retained attempt could not be removed",
+                ));
+            };
+            if !seen.insert(next.to_bytes()?) {
+                return Err(AttemptError::AggregateAdmissionUnproven(
+                    "retained cleanup continuation did not advance",
+                ));
+            }
+            continuation = Some(next);
+        }
+    }
+
+    let inventory = collect_retained_inventory(
+        &AttemptQuery::for_admission(policy, roots)?,
+        observed_unix_ms,
+    )?;
+    let mut retained = BTreeMap::new();
+    for entry in inventory {
+        match retained.entry(entry.execution_id) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(entry.retained_bytes);
+            }
+            std::collections::btree_map::Entry::Occupied(slot)
+                if *slot.get() == entry.retained_bytes => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(AttemptError::AggregateAdmissionUnproven(
+                    "replicated retained manifests disagree on byte ownership",
+                ));
+            }
+        }
+    }
+    let retained_count = u64::try_from(retained.len()).map_err(|_| {
+        AttemptError::AggregateAdmissionUnproven("retained attempt count overflowed")
+    })?;
+    if retained_count >= policy.retained_attempt_limit() {
+        return Err(AttemptError::RetainedAttemptLimitExceeded {
+            retained: retained_count,
+            limit: policy.retained_attempt_limit(),
+        });
+    }
+    let retained_bytes = retained.values().try_fold(0_u64, |total, bytes| {
+        total
+            .checked_add(*bytes)
+            .ok_or(AttemptError::AggregateAdmissionUnproven(
+                "retained byte accounting overflowed",
+            ))
+    })?;
+    let admission_bytes = policy.explain().estimated_attempt_bytes;
+    if retained_bytes
+        .checked_add(admission_bytes)
+        .is_none_or(|total| total > policy.retained_byte_limit())
+    {
+        return Err(AttemptError::RetainedByteLimitExceeded {
+            retained_bytes,
+            admission_bytes,
+            limit: policy.retained_byte_limit(),
+        });
+    }
+    Ok(())
+}
+
+fn collect_retained_inventory(
+    query: &AttemptQuery,
+    observed_unix_ms: u64,
+) -> Result<Vec<RetainedInventoryEntry>, AttemptError> {
+    let root_ids = query
+        .owned_root_ids()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut inventory = Vec::new();
+    for root_identifier in root_ids {
+        let mut continuation = None;
+        let mut seen = std::collections::BTreeSet::new();
+        loop {
+            let page = query.list(&root_identifier, observed_unix_ms, continuation.as_ref())?;
+            let bounded_stop = page.cleanup_debt().iter().all(|debt| {
+                matches!(
+                    debt.kind(),
+                    CleanupDebtKind::EntryBudget | CleanupDebtKind::TimeBudget
+                )
+            });
+            if !page.cleanup_debt().is_empty() && (!bounded_stop || page.continuation().is_none()) {
+                return Err(AttemptError::AggregateAdmissionUnproven(
+                    "retained inventory contains ambiguous cleanup debt",
+                ));
+            }
+            inventory.extend(page.entries().iter().map(|entry| {
+                let inspection = entry.inspection();
+                RetainedInventoryEntry {
+                    root_identifier: root_identifier.clone(),
+                    execution_id: inspection.execution_id().to_owned(),
+                    retained_bytes: inspection.retained_bytes().unwrap_or(0),
+                    eligible: inspection.is_eligible(),
+                }
+            }));
+            let Some(next) = page.continuation().cloned() else {
+                break;
+            };
+            if !seen.insert(next.to_bytes()?) {
+                return Err(AttemptError::AggregateAdmissionUnproven(
+                    "retained inventory continuation did not advance",
+                ));
+            }
+            continuation = Some(next);
+        }
+    }
+    Ok(inventory)
+}
+
 fn inspect_owned_attempt(
     root: &OwnedAttemptRoot,
     execution_id: &str,
@@ -2461,6 +2639,7 @@ fn inspect_owned_attempt(
         state: None,
         created_unix_ms: None,
         eligible_after_unix_ms: None,
+        retained_bytes: None,
         artifact_ids: Vec::new(),
         artifact_states: Vec::new(),
         cleanup_debt: Vec::new(),
@@ -2600,6 +2779,7 @@ fn inspect_owned_attempt(
     inspection.state = Some(manifest.state);
     inspection.created_unix_ms = Some(manifest.created_unix_ms);
     inspection.eligible_after_unix_ms = Some(manifest.eligible_after_unix_ms);
+    inspection.retained_bytes = Some(manifest.total_bytes);
     let expected = manifest
         .artifacts
         .iter()
@@ -2969,6 +3149,7 @@ fn legacy_inspection(execution_id: &str, disposition: CleanupDisposition) -> Att
         state: None,
         created_unix_ms: None,
         eligible_after_unix_ms: None,
+        retained_bytes: None,
         artifact_ids: Vec::new(),
         artifact_states: Vec::new(),
         cleanup_debt: Vec::new(),
@@ -3410,6 +3591,13 @@ impl AttemptPublication {
                 "local spool and destination parent must be distinct",
             ));
         }
+        let mut admission_roots = roots.values().cloned().collect::<Vec<_>>();
+        if !admission_roots.iter().any(|root| {
+            destination_root_key(root.as_path()) == destination_root_key(owner_root.as_path())
+        }) {
+            admission_roots.push(owner_root.clone());
+        }
+        enforce_retained_attempt_admission(&policy, admission_roots, created_unix_ms)?;
         let owner_profile = match policy.mode() {
             PublicationMode::Direct => policy.destination_profile(),
             PublicationMode::LocalThenPublish => DestinationProfile::Local,
@@ -4415,6 +4603,18 @@ pub enum AttemptError {
     AttemptByteLimitExceeded {
         actual_bytes: u64,
         admitted_bytes: u64,
+    },
+    #[error("retained-attempt admission could not be proven: {0}")]
+    AggregateAdmissionUnproven(&'static str),
+    #[error("retained attempt count {retained} reaches the configured limit {limit}")]
+    RetainedAttemptLimitExceeded { retained: u64, limit: u64 },
+    #[error(
+        "retained attempt bytes {retained_bytes} plus admission {admission_bytes} exceed the configured limit {limit}"
+    )]
+    RetainedByteLimitExceeded {
+        retained_bytes: u64,
+        admission_bytes: u64,
+        limit: u64,
     },
     #[error("attempt manifest serialization failed: {0}")]
     Serialize(serde_json::Error),

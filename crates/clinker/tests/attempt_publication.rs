@@ -77,6 +77,23 @@ fn bounded_policy(
         .expect("resolve bounded publication fixture")
 }
 
+fn retained_policy(
+    destination_root: &Path,
+    retained_attempt_limit: u64,
+    retained_byte_limit: u64,
+    estimated_attempt_bytes: u64,
+) -> ResolvedPublicationPolicy {
+    let config = format!(
+        "[storage.publication]\nfailed_retention_seconds = 0\nmax_attempt_bytes = \"{estimated_attempt_bytes}B\"\nretained_byte_limit = \"{retained_byte_limit}B\"\nretained_attempt_limit = {retained_attempt_limit}\nmin_free_bytes = \"1B\"\n"
+    );
+    ClinkerToml::parse(&config)
+        .expect("parse retained publication fixture")
+        .storage
+        .publication
+        .resolve(destination_root, estimated_attempt_bytes, 8_000_000_000)
+        .expect("resolve retained publication fixture")
+}
+
 fn compiled_plan(name: &str) -> CompiledPlan {
     let yaml = format!(
         r#"pipeline:
@@ -453,6 +470,80 @@ fn duplicate_run_registration_refuses_before_attempt_creation() {
 
     assert!(error.to_string().contains("collision"), "{error}");
     assert!(!root.path().join(".clinker-attempts").exists());
+}
+
+#[test]
+fn aggregate_retained_limits_fail_before_attempt_creation() {
+    let new_execution_id = "018f47a2-9a41-7a27-b4d6-4f7137e3c260";
+    for (case, expected) in [(0, "retained attempt count"), (1, "retained attempt bytes")] {
+        let root = tempfile::tempdir().expect("temporary destination");
+        let registry = OutputStagingRegistry::default();
+        let mut retained = begin(root.path());
+        if case == 1 {
+            stage_ready(&mut retained, &registry, root.path(), &[b'x'; 500]);
+        }
+        let retained_root = retained.attempt_root().to_path_buf();
+        drop(retained);
+        let resolved = if case == 0 {
+            retained_policy(root.path(), 1, 8_000_000_000, 1)
+        } else {
+            retained_policy(root.path(), 8, 1_024, 600)
+        };
+        let error = AttemptPublication::create_run(
+            resolved,
+            &registry,
+            new_execution_id,
+            1_000,
+            301_000,
+            vec![registration(
+                ArtifactKind::Primary,
+                root.path(),
+                "new.bin",
+                "new-output",
+            )],
+        )
+        .expect_err("aggregate admission must fail closed");
+
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(retained_root.exists());
+        assert!(
+            !root
+                .path()
+                .join(".clinker-attempts")
+                .join(new_execution_id)
+                .exists(),
+            "rejected admission must not create its attempt root"
+        );
+    }
+}
+
+#[test]
+fn aggregate_admission_purges_eligible_attempts_before_counting() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let registry = OutputStagingRegistry::default();
+    let retained = AttemptPublication::create(validated(root.path(), "."), EXECUTION_ID, 1, 1)
+        .expect("eligible retained attempt");
+    let retained_root = retained.attempt_root().to_path_buf();
+    drop(retained);
+    let new_execution_id = "018f47a2-9a41-7a27-b4d6-4f7137e3c261";
+    let (attempt, writers) = AttemptPublication::create_run(
+        retained_policy(root.path(), 1, 8_000_000_000, 1),
+        &registry,
+        new_execution_id,
+        1_000,
+        301_000,
+        vec![registration(
+            ArtifactKind::Primary,
+            root.path(),
+            "new.bin",
+            "new-output",
+        )],
+    )
+    .expect("eligible debt is removed before aggregate admission");
+
+    assert!(!retained_root.exists());
+    assert_eq!(attempt.execution_id(), new_execution_id);
+    drop(writers);
 }
 
 #[test]
