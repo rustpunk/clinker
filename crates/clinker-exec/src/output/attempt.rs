@@ -32,7 +32,8 @@ use crate::pipeline::shutdown::ShutdownToken;
 const MANIFEST_SCHEMA: &str = "clinker.attempt-manifest/v1";
 const CONTINUATION_SCHEMA: &str = "clinker.attempt-continuation/v1";
 const OWNER_METADATA_CURSOR: &str = "owner-metadata-last";
-const ADMISSION_LOCK_LEAF: &str = ".clinker-attempt-admission.lock";
+const ATTEMPT_NAMESPACE_LEAF: &str = ".clinker-attempts";
+const ADMISSION_LOCK_LEAF: &str = ".admission.lock";
 const PRODUCER_MAX_CHARS: usize = 96;
 const PRODUCER_MAX_ENCODED_BYTES: usize = 192;
 const LOGICAL_MAX_CHARS: usize = 384;
@@ -429,6 +430,8 @@ pub struct AttemptManifest {
     state: AttemptState,
     artifact_count: usize,
     total_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    admitted_bytes: u64,
     artifacts: Vec<ArtifactManifest>,
 }
 
@@ -455,6 +458,7 @@ impl AttemptManifest {
             state,
             artifact_count: artifacts.len(),
             total_bytes,
+            admitted_bytes: 0,
             artifacts,
         };
         manifest.validate(None)?;
@@ -522,8 +526,20 @@ impl AttemptManifest {
         self.total_bytes
     }
 
+    /// Durable aggregate byte reservation held while physical ownership is
+    /// not yet exact.
+    pub fn admitted_bytes(&self) -> u64 {
+        self.admitted_bytes
+    }
+
     pub fn artifacts(&self) -> &[ArtifactManifest] {
         &self.artifacts
+    }
+
+    fn with_admitted_bytes(mut self, admitted_bytes: u64) -> Result<Self, AttemptError> {
+        self.admitted_bytes = admitted_bytes;
+        self.validate(None)?;
+        Ok(self)
     }
 
     fn validate(&self, observed_unix_ms: Option<u64>) -> Result<(), AttemptError> {
@@ -846,6 +862,7 @@ pub struct AttemptInspection {
     created_unix_ms: Option<u64>,
     eligible_after_unix_ms: Option<u64>,
     retained_bytes: Option<u64>,
+    admitted_bytes: u64,
     artifact_ids: Vec<String>,
     artifact_states: Vec<(String, ArtifactState)>,
     cleanup_debt: Vec<CleanupDebt>,
@@ -1129,6 +1146,7 @@ struct RetainedInventoryEntry {
     root_identifier: String,
     execution_id: String,
     retained_bytes: u64,
+    admitted_bytes: u64,
     eligible: bool,
 }
 
@@ -1273,7 +1291,7 @@ impl AttemptQuery {
                 return Ok(list);
             }
         };
-        let namespace = match destination.open_child(".clinker-attempts") {
+        let namespace = match destination.open_child(ATTEMPT_NAMESPACE_LEAF) {
             Ok(namespace) => namespace,
             Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => {
                 list.bounds = budget.bounds();
@@ -1290,9 +1308,10 @@ impl AttemptQuery {
         };
         let configured_limit =
             usize::try_from(self.policy.retained_attempt_limit()).unwrap_or(usize::MAX);
-        let mut namespace_entries = match namespace.bounded_entries(
-            usize::try_from(PUBLICATION_MAX_RETAINED_ATTEMPTS).unwrap_or(usize::MAX),
-        ) {
+        let namespace_limit = usize::try_from(PUBLICATION_MAX_RETAINED_ATTEMPTS)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let mut namespace_entries = match namespace.bounded_entries(namespace_limit) {
             Ok(entries) => entries,
             Err(_) => {
                 list.cleanup_debt.push(CleanupDebt::new(
@@ -1303,7 +1322,18 @@ impl AttemptQuery {
                 return Ok(list);
             }
         };
-        if namespace_entries.entries.len() > configured_limit {
+        let retained_entries = namespace_entries
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.kind == ContainedEntryKind::Directory
+                    && entry
+                        .name
+                        .to_str()
+                        .is_some_and(|name| validate_execution_id(name).is_ok())
+            })
+            .count();
+        if retained_entries > configured_limit {
             list.cleanup_debt.push(CleanupDebt::new(
                 CleanupDebtKind::EntryBudget,
                 "attempt namespace exceeds the configured retained-attempt limit",
@@ -1327,6 +1357,9 @@ impl AttemptQuery {
                 ));
                 continue;
             };
+            if name == ADMISSION_LOCK_LEAF && entry.kind == ContainedEntryKind::File {
+                continue;
+            }
             if cursor.as_ref().is_some_and(|cursor| name <= *cursor) {
                 continue;
             }
@@ -2542,12 +2575,13 @@ fn enforce_retained_attempt_admission(
     )?;
     let mut retained = BTreeMap::new();
     for entry in inventory {
-        let bytes = retained.entry(entry.execution_id).or_insert(0_u64);
-        *bytes = bytes.checked_add(entry.retained_bytes).ok_or(
+        let usage = retained.entry(entry.execution_id).or_insert((0_u64, 0_u64));
+        usage.0 = usage.0.checked_add(entry.retained_bytes).ok_or(
             AttemptError::AggregateAdmissionUnproven(
                 "retained byte accounting overflowed across owned roots",
             ),
         )?;
+        usage.1 = usage.1.max(entry.admitted_bytes);
     }
     let retained_count = u64::try_from(retained.len()).map_err(|_| {
         AttemptError::AggregateAdmissionUnproven("retained attempt count overflowed")
@@ -2558,9 +2592,9 @@ fn enforce_retained_attempt_admission(
             limit: policy.retained_attempt_limit(),
         });
     }
-    let retained_bytes = retained.values().try_fold(0_u64, |total, bytes| {
+    let retained_bytes = retained.values().try_fold(0_u64, |total, usage| {
         total
-            .checked_add(*bytes)
+            .checked_add(usage.0.max(usage.1))
             .ok_or(AttemptError::AggregateAdmissionUnproven(
                 "retained byte accounting overflowed",
             ))
@@ -2594,16 +2628,26 @@ fn lock_admission_roots(roots: &[ValidatedPath]) -> Result<AdmissionLocks, Attem
     let mut files = Vec::with_capacity(canonical_roots.len());
     for root in canonical_roots.into_values() {
         let directory = AnchoredDirectory::open(&root)?;
-        let file = match directory.create_file(ADMISSION_LOCK_LEAF) {
+        let namespace = match directory.create_child(ATTEMPT_NAMESPACE_LEAF) {
+            Ok(namespace) => namespace,
+            Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::AlreadyExists) => {
+                directory.open_child(ATTEMPT_NAMESPACE_LEAF)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let file = match namespace.create_file(ADMISSION_LOCK_LEAF) {
             Ok(file) => file,
             Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::AlreadyExists) => {
-                directory.open_file(ADMISSION_LOCK_LEAF)?
+                namespace.open_file(ADMISSION_LOCK_LEAF)?
             }
             Err(error) => return Err(error.into()),
         };
         FileExt::lock(&file).map_err(|source| AttemptError::Io {
             operation: "lock retained-attempt admission root",
-            path: root.as_path().join(ADMISSION_LOCK_LEAF),
+            path: root
+                .as_path()
+                .join(ATTEMPT_NAMESPACE_LEAF)
+                .join(ADMISSION_LOCK_LEAF),
             source,
         })?;
         files.push(file);
@@ -2649,6 +2693,7 @@ fn collect_retained_inventory(
                     root_identifier: root_identifier.clone(),
                     execution_id: inspection.execution_id().to_owned(),
                     retained_bytes,
+                    admitted_bytes: inspection.admitted_bytes,
                     eligible: inspection.is_eligible(),
                 });
             }
@@ -2680,6 +2725,7 @@ fn inspect_owned_attempt(
         created_unix_ms: None,
         eligible_after_unix_ms: None,
         retained_bytes: None,
+        admitted_bytes: 0,
         artifact_ids: Vec::new(),
         artifact_states: Vec::new(),
         cleanup_debt: Vec::new(),
@@ -2831,6 +2877,7 @@ fn inspect_owned_attempt(
     inspection.state = Some(manifest.state);
     inspection.created_unix_ms = Some(manifest.created_unix_ms);
     inspection.eligible_after_unix_ms = Some(manifest.eligible_after_unix_ms);
+    inspection.admitted_bytes = manifest.admitted_bytes;
     let mut retained_bytes = Some(0_u64);
     let expected = manifest
         .artifacts
@@ -3251,6 +3298,7 @@ fn legacy_inspection(execution_id: &str, disposition: CleanupDisposition) -> Att
         created_unix_ms: None,
         eligible_after_unix_ms: None,
         retained_bytes: None,
+        admitted_bytes: 0,
         artifact_ids: Vec::new(),
         artifact_states: Vec::new(),
         cleanup_debt: Vec::new(),
@@ -3274,10 +3322,10 @@ pub struct AttemptRoot {
 impl AttemptRoot {
     fn create(destination_root: &ValidatedPath, execution_id: &str) -> Result<Self, AttemptError> {
         let destination = AnchoredDirectory::open(destination_root)?;
-        let namespace = match destination.create_child(".clinker-attempts") {
+        let namespace = match destination.create_child(ATTEMPT_NAMESPACE_LEAF) {
             Ok(namespace) => namespace,
             Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::AlreadyExists) => {
-                destination.open_child(".clinker-attempts")?
+                destination.open_child(ATTEMPT_NAMESPACE_LEAF)?
             }
             Err(error) => return Err(error.into()),
         };
@@ -3297,7 +3345,7 @@ impl AttemptRoot {
         execution_id: &str,
     ) -> Result<Option<Self>, AttemptError> {
         let destination = AnchoredDirectory::open(destination_root)?;
-        let namespace = match destination.open_child(".clinker-attempts") {
+        let namespace = match destination.open_child(ATTEMPT_NAMESPACE_LEAF) {
             Ok(namespace) => namespace,
             Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => {
                 return Ok(None);
@@ -3333,7 +3381,7 @@ impl AttemptRoot {
         namespace.remove_child(&execution_id)?;
         namespace.sync()?;
         drop(namespace);
-        match destination.remove_child(".clinker-attempts") {
+        match destination.remove_child(ATTEMPT_NAMESPACE_LEAF) {
             Ok(()) => destination.sync().map_err(AttemptError::from),
             Err(error)
                 if matches!(
@@ -3441,6 +3489,7 @@ impl RunAttemptPublication {
         if artifact_ids.is_empty() {
             let mut ready = attempt.manifest.clone();
             ready.state = AttemptState::Ready;
+            ready.admitted_bytes = 0;
             return attempt.persist_replacement(ready, false);
         }
         for artifact_id in artifact_ids {
@@ -3521,6 +3570,7 @@ impl AttemptPublication {
             execution_id,
             created_unix_ms,
             eligible_after_unix_ms,
+            0,
         )
     }
 
@@ -3530,6 +3580,7 @@ impl AttemptPublication {
         execution_id: &str,
         created_unix_ms: u64,
         eligible_after_unix_ms: u64,
+        admitted_bytes: u64,
     ) -> Result<Self, AttemptError> {
         validate_execution_id(execution_id)?;
         let owner_root_key = destination_root_key(destination_root.as_path());
@@ -3547,7 +3598,8 @@ impl AttemptPublication {
             eligible_after_unix_ms,
             AttemptState::Staging,
             Vec::new(),
-        )?;
+        )?
+        .with_admitted_bytes(admitted_bytes)?;
         let mut publication = Self {
             execution_id: execution_id.to_owned(),
             manifest_path: attempt_root.path.join("manifest.json"),
@@ -3710,6 +3762,7 @@ impl AttemptPublication {
             execution_id,
             created_unix_ms,
             eligible_after_unix_ms,
+            policy.explain().estimated_attempt_bytes,
         )?;
         attempt.policy = Some(policy);
         attempt.destination_root_keys.clear();
@@ -4253,6 +4306,7 @@ impl AttemptPublication {
             .all(|artifact| artifact.state == ArtifactState::Ready)
         {
             next.state = AttemptState::Ready;
+            next.admitted_bytes = 0;
         }
         self.persist_replacement(next, self.fault == Some(AttemptFault::ManifestReplace))?;
 
@@ -4848,6 +4902,10 @@ fn validate_execution_id(execution_id: &str) -> Result<(), AttemptError> {
         ));
     }
     Ok(())
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 fn read_manifest_from_anchor(

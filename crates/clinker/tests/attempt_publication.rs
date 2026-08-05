@@ -306,7 +306,9 @@ fn assert_root_local_recovery(
         ]
     );
     for root in roots {
-        assert!(!root.join(".clinker-attempts").exists());
+        let namespace = root.join(".clinker-attempts");
+        assert_eq!(attempt_directory_count(&namespace), 0);
+        assert!(namespace.join(".admission.lock").is_file());
     }
 }
 
@@ -591,7 +593,182 @@ fn concurrent_aggregate_admission_allows_exactly_one_attempt_at_the_count_limit(
 
     assert_eq!(admitted, 1);
     let namespace = root.path().join(".clinker-attempts");
-    assert_eq!(std::fs::read_dir(namespace).unwrap().count(), 1);
+    assert_eq!(attempt_directory_count(&namespace), 1);
+}
+
+#[test]
+fn concurrent_aggregate_admission_reserves_estimated_bytes_until_sizes_are_exact() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let root_path = root.path().to_path_buf();
+    let policy = retained_policy(root.path(), 8, 150, 100);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let execution_ids = [
+        "018f47a2-9a41-7a27-b4d6-4f7137e3c265",
+        "018f47a2-9a41-7a27-b4d6-4f7137e3c266",
+    ];
+    let threads = execution_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, execution_id)| {
+            let root_path = root_path.clone();
+            let policy = policy.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let registry = OutputStagingRegistry::default();
+                barrier.wait();
+                AttemptPublication::create_run(
+                    policy,
+                    &registry,
+                    execution_id,
+                    1_000,
+                    301_000,
+                    vec![registration(
+                        ArtifactKind::Primary,
+                        &root_path,
+                        &format!("execution-{index}.bin"),
+                        &format!("execution-{index}"),
+                    )],
+                )
+                .is_ok()
+            })
+        })
+        .collect::<Vec<_>>();
+    let admitted = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("admission thread"))
+        .filter(|admitted| *admitted)
+        .count();
+
+    assert_eq!(admitted, 1);
+    assert_eq!(
+        attempt_directory_count(&root.path().join(".clinker-attempts")),
+        1
+    );
+    let retained_manifest = std::fs::read_dir(root.path().join(".clinker-attempts"))
+        .expect("attempt namespace")
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().is_dir())
+        .map(|entry| entry.path().join("manifest.json"))
+        .expect("one retained attempt manifest");
+    assert_eq!(
+        AttemptManifest::read(&retained_manifest, 1_000)
+            .expect("reserved manifest")
+            .admitted_bytes(),
+        100
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn authored_legacy_lock_leaf_cannot_replace_the_internal_admission_mutex() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = tempfile::tempdir().expect("temporary destination");
+    let registry = OutputStagingRegistry::default();
+    let policy = retained_policy(root.path(), 8, 8_000_000_000, 100);
+    let legacy_leaf = ".clinker-attempt-admission.lock";
+    let (mut attempt, mut writers) = AttemptPublication::create_run(
+        policy.clone(),
+        &registry,
+        EXECUTION_ID,
+        1_000,
+        301_000,
+        vec![registration(
+            ArtifactKind::Primary,
+            root.path(),
+            legacy_leaf,
+            "legacy-authored-output",
+        )],
+    )
+    .expect("legacy authored leaf remains legal");
+    let mutex = root
+        .path()
+        .join(".clinker-attempts")
+        .join(".admission.lock");
+    let mutex_generation = std::fs::metadata(&mutex)
+        .expect("internal admission mutex")
+        .ino();
+    writers[0]
+        .file_mut()
+        .write_all(b"authored output")
+        .expect("write legacy authored leaf");
+    let artifact_id = writers[0].artifact_id().to_owned();
+    drop(writers);
+    attempt
+        .mark_ready(&artifact_id)
+        .expect("ready authored leaf");
+    assert!(
+        attempt
+            .publish(&registry, &ShutdownToken::detached())
+            .expect("publish authored leaf")
+            .expect("publication gate")
+            .is_complete()
+    );
+
+    assert_eq!(
+        std::fs::read(root.path().join(legacy_leaf)).unwrap(),
+        b"authored output"
+    );
+    assert_eq!(
+        std::fs::metadata(&mutex)
+            .expect("stable internal admission mutex")
+            .ino(),
+        mutex_generation
+    );
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let threads = [
+        "018f47a2-9a41-7a27-b4d6-4f7137e3c267",
+        "018f47a2-9a41-7a27-b4d6-4f7137e3c268",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, execution_id)| {
+        let root_path = root.path().to_path_buf();
+        let policy = retained_policy(root.path(), 1, 8_000_000_000, 1);
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            let registry = OutputStagingRegistry::default();
+            barrier.wait();
+            AttemptPublication::create_run(
+                policy,
+                &registry,
+                execution_id,
+                1_000,
+                301_000,
+                vec![registration(
+                    ArtifactKind::Primary,
+                    &root_path,
+                    &format!("post-legacy-{index}.bin"),
+                    &format!("post-legacy-{index}"),
+                )],
+            )
+            .is_ok()
+        })
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(
+        threads
+            .into_iter()
+            .map(|thread| thread.join().expect("admission thread"))
+            .filter(|admitted| *admitted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::metadata(mutex)
+            .expect("unchanged internal admission mutex")
+            .ino(),
+        mutex_generation
+    );
+}
+
+fn attempt_directory_count(namespace: &Path) -> usize {
+    std::fs::read_dir(namespace)
+        .expect("attempt namespace")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .count()
 }
 
 #[test]
@@ -900,8 +1077,15 @@ fn qualification_control_binds_every_real_stage_to_attempt_artifact_and_mode() {
         );
         assert!(!manifest_path.exists());
         assert!(!attempt_root.exists());
-        assert!(!destination.path().join(".clinker-attempts").exists());
-        assert!(!spool.path().join(".clinker-attempts").exists());
+        let mut owned_roots = vec![destination.path()];
+        if mode == PublicationMode::LocalThenPublish {
+            owned_roots.push(spool.path());
+        }
+        for root in owned_roots {
+            let namespace = root.join(".clinker-attempts");
+            assert_eq!(attempt_directory_count(&namespace), 0);
+            assert!(namespace.join(".admission.lock").is_file());
+        }
     }
 }
 

@@ -799,14 +799,22 @@ nodes:
             stderr(&run)
         );
     }
-    assert!(
-        !workspace.path().join("output/.clinker-attempts").exists(),
-        "successful publication must remove attempt metadata last"
-    );
-    assert!(
-        !workspace.path().join("spool/.clinker-attempts").exists(),
-        "successful local spool ownership must also be removed"
-    );
+    for root in [
+        workspace.path().join("output"),
+        workspace.path().join("spool"),
+    ] {
+        let namespace = root.join(".clinker-attempts");
+        assert!(namespace.join(".admission.lock").is_file());
+        assert_eq!(
+            std::fs::read_dir(&namespace)
+                .expect("internal attempt namespace")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_dir())
+                .count(),
+            0,
+            "successful publication must remove attempt ownership directories"
+        );
+    }
 }
 
 #[test]

@@ -115,12 +115,17 @@ results carry logical execution/artifact IDs, logical leaves, and exact
 published, visible-unsynchronized, or unpublished states. Physical paths are
 available only through an explicit opt-in intended for sanitized diagnostics.
 
-Aggregate retained-attempt admission acquires handle-relative root lock files
-in canonical root order and holds them through inventory, eligible cleanup,
-limit checks, and creation of every execution root. Retained bytes are summed
-from manifest-owned regular files in each root, including simultaneous local
-spool and destination quarantine copies. Missing or uninspectable ownership
-evidence is conservative debt, never a zero-byte assumption.
+Aggregate retained-attempt admission acquires handle-relative lock files under
+each root's internal `.clinker-attempts` namespace in canonical root order and
+holds them through inventory, eligible cleanup, limit checks, and creation of
+every execution root. The lock never occupies an author-addressable final
+leaf, and namespace paging recognizes it as internal metadata. Each new root
+manifest durably carries the admitted byte estimate before those locks are
+released. Inventory sums manifest-owned regular files across roots and charges
+at least one per-execution reservation until every artifact size is exact;
+simultaneous local-spool and destination quarantine copies still count
+physically. Missing or uninspectable ownership evidence is conservative debt,
+never a zero-byte assumption.
 Namespace enumeration is bounded by the publication policy's fixed maximum,
 not the current desired retained count. A configuration downgrade therefore
 still returns physical attempts through advancing continuation tokens while
