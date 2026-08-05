@@ -3458,7 +3458,8 @@ struct AttemptDiagnosticView {
     failure_code: &'static str,
     failure_category: &'static str,
     operation: &'static str,
-    execution_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     artifact_id: Option<String>,
     final_visibility: &'static str,
@@ -3571,10 +3572,9 @@ fn run_attempts_inspect(args: &AttemptsInspectArgs) -> Result<u8, AttemptCommand
                 .map_err(attempt_query_error)?;
             let bounds = inspection.bounds().into();
             let cleanup_debt = debt_views(inspection.cleanup_debt());
-            let diagnostics = diagnostic_views(
-                inspection.cleanup_debt(),
+            let diagnostics = inspection_diagnostic_views(
+                &inspection,
                 clinker_core_types::diagnostic::AttemptOperation::Inspect,
-                inspection.execution_id(),
                 &context.pipeline,
             );
             roots.push(AttemptRootView {
@@ -3716,18 +3716,11 @@ fn purge_root_view(
         let report = query
             .execute(&request, observed_unix_ms, continuation, shutdown)
             .map_err(attempt_query_error)?;
-        let diagnostic_execution = report
-            .kept_execution_ids()
-            .first()
-            .or_else(|| report.selected_execution_ids().first());
-        let diagnostics = diagnostic_execution.map_or_else(Vec::new, |execution_id| {
-            diagnostic_views(
-                report.cleanup_debt(),
-                clinker_core_types::diagnostic::AttemptOperation::Purge,
-                execution_id,
-                &context.pipeline,
-            )
-        });
+        let diagnostics = root_diagnostic_views(
+            report.cleanup_debt(),
+            clinker_core_types::diagnostic::AttemptOperation::Purge,
+            &context.pipeline,
+        );
         let continuation = encode_attempt_continuation(report.continuation())?;
         let resume_command = continuation
             .as_deref()
@@ -3766,18 +3759,22 @@ fn purge_root_view(
                 )
             })
             .collect::<Vec<_>>();
-        let diagnostics = preview
+        let mut diagnostics = preview
             .inspections()
             .iter()
             .flat_map(|inspection| {
-                diagnostic_views(
-                    inspection.cleanup_debt(),
+                inspection_diagnostic_views(
+                    inspection,
                     clinker_core_types::diagnostic::AttemptOperation::Purge,
-                    inspection.execution_id(),
                     &context.pipeline,
                 )
             })
-            .collect();
+            .collect::<Vec<_>>();
+        diagnostics.extend(root_diagnostic_views(
+            preview.cleanup_debt(),
+            clinker_core_types::diagnostic::AttemptOperation::Purge,
+            &context.pipeline,
+        ));
         let kept_execution_ids = preview
             .inspections()
             .iter()
@@ -3826,18 +3823,22 @@ fn list_root_view(
             )
         })
         .collect::<Vec<_>>();
-    let diagnostics = list
+    let mut diagnostics = list
         .entries()
         .iter()
         .flat_map(|entry| {
-            diagnostic_views(
-                entry.inspection().cleanup_debt(),
+            inspection_diagnostic_views(
+                entry.inspection(),
                 clinker_core_types::diagnostic::AttemptOperation::List,
-                entry.execution_id(),
                 &context.pipeline,
             )
         })
-        .collect();
+        .collect::<Vec<_>>();
+    diagnostics.extend(root_diagnostic_views(
+        list.cleanup_debt(),
+        clinker_core_types::diagnostic::AttemptOperation::List,
+        &context.pipeline,
+    ));
     let continuation = encode_attempt_continuation(list.continuation())?;
     let resume_argv = continuation.as_deref().map(|continuation| {
         vec![
@@ -3895,31 +3896,33 @@ fn inspection_view(
         eligible: inspection.is_eligible(),
         path,
         cleanup_debt: debt_views(inspection.cleanup_debt()),
-        diagnostics: diagnostic_views(
-            inspection.cleanup_debt(),
+        diagnostics: inspection_diagnostic_views(
+            inspection,
             operation,
-            inspection.execution_id(),
             &context.pipeline,
         ),
         bounds: inspection.bounds().into(),
     }
 }
 
-fn diagnostic_views(
-    debt: &[clinker_exec::output::attempt::CleanupDebt],
+fn inspection_diagnostic_views(
+    inspection: &clinker_exec::output::attempt::AttemptInspection,
     operation: clinker_core_types::diagnostic::AttemptOperation,
-    execution_id: &str,
     pipeline: &str,
 ) -> Vec<AttemptDiagnosticView> {
-    debt.iter()
+    let (artifact_id, final_visibility, durability_uncertain) =
+        diagnostic_artifact_evidence(inspection.artifact_states());
+    inspection
+        .cleanup_debt()
+        .iter()
         .filter_map(|debt| {
             clinker_core_types::diagnostic::AttemptDiagnosticData::for_failure(
                 failure_code_for_debt(debt.kind()),
                 operation,
-                execution_id,
-                None,
-                clinker_core_types::diagnostic::FinalVisibility::None,
-                false,
+                inspection.execution_id(),
+                artifact_id,
+                final_visibility,
+                durability_uncertain,
                 pipeline,
             )
         })
@@ -3928,13 +3931,97 @@ fn diagnostic_views(
             failure_code: diagnostic.failure_code(),
             failure_category: diagnostic.failure_category().as_str(),
             operation: diagnostic.operation().as_str(),
-            execution_id: diagnostic.execution_id().to_owned(),
+            execution_id: Some(diagnostic.execution_id().to_owned()),
             artifact_id: diagnostic.artifact_id().map(str::to_owned),
             final_visibility: diagnostic.final_visibility().as_str(),
             durability_uncertain: diagnostic.durability_uncertain(),
             retry_advice: diagnostic.retry_advice().as_str(),
             recovery_command: diagnostic.recovery_command().to_owned(),
             recovery_argv: diagnostic.recovery_argv().to_vec(),
+        })
+        .collect()
+}
+
+fn diagnostic_artifact_evidence(
+    artifact_states: &[(String, clinker_exec::output::attempt::ArtifactState)],
+) -> (
+    Option<&str>,
+    clinker_core_types::diagnostic::FinalVisibility,
+    bool,
+) {
+    use clinker_exec::output::attempt::ArtifactState;
+
+    if let Some((artifact_id, _)) = artifact_states
+        .iter()
+        .find(|(_, state)| *state == ArtifactState::VisibleUnsynchronized)
+    {
+        return (
+            Some(artifact_id),
+            clinker_core_types::diagnostic::FinalVisibility::Some,
+            true,
+        );
+    }
+    if let Some((artifact_id, _)) = artifact_states
+        .iter()
+        .find(|(_, state)| *state == ArtifactState::Promoting)
+    {
+        return (
+            Some(artifact_id),
+            clinker_core_types::diagnostic::FinalVisibility::Unknown,
+            true,
+        );
+    }
+    if let Some((artifact_id, _)) = artifact_states
+        .iter()
+        .find(|(_, state)| *state == ArtifactState::Published)
+    {
+        return (
+            Some(artifact_id),
+            clinker_core_types::diagnostic::FinalVisibility::Some,
+            false,
+        );
+    }
+    (
+        artifact_states.first().map(|(artifact_id, _)| artifact_id.as_str()),
+        clinker_core_types::diagnostic::FinalVisibility::None,
+        false,
+    )
+}
+
+fn root_diagnostic_views(
+    debt: &[clinker_exec::output::attempt::CleanupDebt],
+    operation: clinker_core_types::diagnostic::AttemptOperation,
+    pipeline: &str,
+) -> Vec<AttemptDiagnosticView> {
+    debt.iter()
+        .filter_map(|debt| {
+            let failure_code = failure_code_for_debt(debt.kind());
+            let failure = clinker_core_types::FailureClassification::for_code(failure_code)?;
+            let diagnostic_code = match debt.kind() {
+                clinker_exec::output::attempt::CleanupDebtKind::EntryBudget
+                | clinker_exec::output::attempt::CleanupDebtKind::ByteBudget
+                | clinker_exec::output::attempt::CleanupDebtKind::TimeBudget => "E372",
+                _ => "E371",
+            };
+            let recovery_argv = vec![
+                "clinker".to_owned(),
+                "attempts".to_owned(),
+                "list".to_owned(),
+                pipeline.to_owned(),
+            ];
+            Some(AttemptDiagnosticView {
+                diagnostic_code,
+                failure_code: failure.code(),
+                failure_category: failure.category().as_str(),
+                operation: operation.as_str(),
+                execution_id: None,
+                artifact_id: None,
+                final_visibility: clinker_core_types::diagnostic::FinalVisibility::Unknown.as_str(),
+                durability_uncertain: true,
+                retry_advice: failure.retry_advice().as_str(),
+                recovery_command: render_attempt_command(&recovery_argv),
+                recovery_argv,
+            })
         })
         .collect()
 }

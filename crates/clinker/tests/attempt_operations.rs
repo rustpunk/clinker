@@ -76,6 +76,14 @@ fn write_workspace(publication: &str) -> (tempfile::TempDir, PathBuf) {
 }
 
 fn seed_incomplete_attempt(output_root: &Path, execution_id: &str) {
+    seed_incomplete_attempt_with_fault(output_root, execution_id, AttemptFault::BeforeRename);
+}
+
+fn seed_incomplete_attempt_with_fault(
+    output_root: &Path,
+    execution_id: &str,
+    fault: AttemptFault,
+) {
     let registry = OutputStagingRegistry::default();
     let mut attempt =
         AttemptPublication::create(validated(output_root, "."), execution_id, 1_000, 2_000)
@@ -96,7 +104,7 @@ fn seed_incomplete_attempt(output_root: &Path, execution_id: &str) {
     attempt
         .mark_ready(&artifact_id)
         .expect("mark artifact ready");
-    attempt.set_fault_for_testing(AttemptFault::BeforeRename);
+    attempt.set_fault_for_testing(fault);
     let outcome = attempt
         .publish(&registry, &ShutdownToken::new())
         .expect("publish attempt")
@@ -324,6 +332,39 @@ fn bounded_inspection_uses_typed_e372_and_exit_four() {
 }
 
 #[test]
+fn diagnostics_derive_visibility_and_durability_from_artifact_evidence() {
+    let (workspace, output_root) = write_workspace("");
+    seed_incomplete_attempt_with_fault(&output_root, EXECUTION_ID, AttemptFault::DirectorySync);
+    std::fs::write(
+        output_root
+            .join(".clinker-attempts")
+            .join(EXECUTION_ID)
+            .join("unexpected"),
+        b"not owned by the manifest",
+    )
+    .expect("unexpected child fixture");
+
+    let inspect = clinker_in(
+        workspace.path(),
+        &[
+            "attempts",
+            "inspect",
+            "pipeline.yaml",
+            "--execution-id",
+            EXECUTION_ID,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(inspect.status.code(), Some(4), "{}", stderr(&inspect));
+    let value: serde_json::Value = serde_json::from_slice(&inspect.stdout).expect("compact JSON");
+    let diagnostic = &value["roots"][0]["diagnostics"][0];
+    assert_eq!(diagnostic["final_visibility"], "some");
+    assert_eq!(diagnostic["durability_uncertain"], true);
+    assert_eq!(diagnostic["artifact_id"], "artifact-00000001");
+}
+
+#[test]
 fn continuation_output_preserves_the_exact_selector_and_execution_mode() {
     let (workspace, output_root) = write_workspace("sweep_entry_limit = 1\n");
     seed_incomplete_attempt(&output_root, EXECUTION_ID);
@@ -359,6 +400,8 @@ fn continuation_output_preserves_the_exact_selector_and_execution_mode() {
         "continuation must use a lowercase URL-safe alphabet: {continuation}"
     );
     assert!(!continuation.starts_with('{'));
+    assert_eq!(root["diagnostics"][0]["diagnostic_code"], "E372");
+    assert!(root["diagnostics"][0].get("execution_id").is_none());
     assert!(resume.contains("attempts purge pipeline.yaml --expired --execute"));
     assert!(resume.ends_with(&format!("--continuation {continuation}")));
     assert_eq!(
