@@ -288,7 +288,7 @@ fn remote_filesystem_matrix_semantics() {
     std::fs::write(
         sandbox.path().join("clinker.toml"),
         format!(
-            "[storage.publication]\ndestination_profile = \"{destination_profile}\"\nmin_free_bytes = \"1B\"\n"
+            "[storage.publication]\ndestination_profile = \"{destination_profile}\"\nmax_attempt_bytes = \"1MB\"\nmin_free_bytes = \"1B\"\n"
         ),
     )
     .expect("matrix publication profile");
