@@ -2135,7 +2135,7 @@ fn retained_expectation(scenario: &str) -> Result<RetainedExpectation, GateError
     if scenario.starts_with("ordinary-failure-") {
         return Ok(RetainedExpectation {
             attempt_state: "incomplete",
-            artifact_state: "promoting",
+            artifact_state: "ready",
             size_bytes: 11,
             blake3_hex: REPLACEMENT,
             final_bytes: Some(b"existing final"),

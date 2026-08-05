@@ -1442,7 +1442,7 @@ fn matrix_retained_states(plan_name: &str) -> (AttemptState, ArtifactState) {
         return (AttemptState::Staging, ArtifactState::Staging);
     }
     if plan_name.starts_with("ordinary-failure-") {
-        return (AttemptState::Incomplete, ArtifactState::Unpublished);
+        return (AttemptState::Incomplete, ArtifactState::Ready);
     }
     if plan_name.ends_with("-rename") {
         return (AttemptState::Publishing, ArtifactState::Unpublished);
