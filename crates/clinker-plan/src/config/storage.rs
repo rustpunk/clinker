@@ -115,7 +115,7 @@ const MAX_MAX_ATTEMPT_BYTES: u64 = 16 * GIGABYTE;
 const DEFAULT_RETAINED_BYTE_LIMIT: u64 = 8 * GIGABYTE;
 const MAX_RETAINED_BYTE_LIMIT: u64 = 64 * GIGABYTE;
 const DEFAULT_RETAINED_ATTEMPT_LIMIT: u64 = 8;
-const MAX_RETAINED_ATTEMPT_LIMIT: u64 = 128;
+pub const PUBLICATION_MAX_RETAINED_ATTEMPTS: u64 = 128;
 const DEFAULT_MIN_FREE_BYTES: u64 = 2 * GIGABYTE;
 const MAX_MIN_FREE_BYTES: u64 = 64 * GIGABYTE;
 const DEFAULT_SWEEP_ENTRY_LIMIT: u64 = 1_000;
@@ -445,7 +445,7 @@ impl PublicationPolicy {
         validate_publication_bound(
             "retained_attempt_limit",
             self.retained_attempt_limit,
-            MAX_RETAINED_ATTEMPT_LIMIT,
+            PUBLICATION_MAX_RETAINED_ATTEMPTS,
             false,
             "retained_attempt_limit = 128",
         )?;

@@ -59,10 +59,10 @@ pub use sort::*;
 pub use source::*;
 pub use storage::{
     ChannelLayout, Cleanup, ClinkerToml, CompressMode, DestinationProfile, GroupLayout, OnExisting,
-    PublicationCapacity, PublicationExplain, PublicationMode, PublicationPolicy,
-    PublicationSupportStatus, PUBLICATION_MANIFEST_MAX_BYTES, ResolvedPublicationPolicy,
-    ShardScheme, SpillConfig, StagedPath, StagingMatcher, StagingPolicy, StagingVerify,
-    StorageConfig, StorageConfigError,
+    PUBLICATION_MANIFEST_MAX_BYTES, PUBLICATION_MAX_RETAINED_ATTEMPTS, PublicationCapacity,
+    PublicationExplain, PublicationMode, PublicationPolicy, PublicationSupportStatus,
+    ResolvedPublicationPolicy, ShardScheme, SpillConfig, StagedPath, StagingMatcher, StagingPolicy,
+    StagingVerify, StorageConfig, StorageConfigError,
 };
 pub use transform::*;
 pub use utils::*;

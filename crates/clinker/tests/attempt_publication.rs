@@ -67,7 +67,7 @@ fn bounded_policy(
     time_limit_ms: u64,
 ) -> ResolvedPublicationPolicy {
     let config = format!(
-        "[storage.publication]\nfailed_retention_seconds = {failed_retention_seconds}\nsweep_entry_limit = {entry_limit}\nsweep_byte_limit = \"{byte_limit}B\"\nsweep_time_limit_ms = {time_limit_ms}\n"
+        "[storage.publication]\nfailed_retention_seconds = {failed_retention_seconds}\nmax_attempt_bytes = \"1B\"\nsweep_entry_limit = {entry_limit}\nsweep_byte_limit = \"{byte_limit}B\"\nsweep_time_limit_ms = {time_limit_ms}\n"
     );
     ClinkerToml::parse(&config)
         .expect("parse bounded publication fixture")
@@ -2235,7 +2235,14 @@ fn orphan_cleanup_is_metadata_last_and_idempotent() {
 #[test]
 fn bounded_attempt_listing_stops_at_exact_entry_byte_and_monotonic_time_limits() {
     let root = tempfile::tempdir().expect("temporary destination");
-    let attempt = begin(root.path());
+    let registry = OutputStagingRegistry::default();
+    let mut attempt = begin(root.path());
+    stage_ready(
+        &mut attempt,
+        &registry,
+        root.path(),
+        &vec![b'x'; 4 * 1024 * 1024 + 2],
+    );
     drop(attempt);
 
     let entry_policy = bounded_policy(root.path(), 86_400, 1, 8_000_000_000, 2_000);
@@ -2249,13 +2256,13 @@ fn bounded_attempt_listing_stops_at_exact_entry_byte_and_monotonic_time_limits()
     assert!(entry_page.continuation().is_none());
     assert!(entry_page.cleanup_debt().is_empty());
 
-    let byte_policy = bounded_policy(root.path(), 86_400, 1_000, 1, 2_000);
+    let byte_policy = bounded_policy(root.path(), 86_400, 1_000, 4 * 1024 * 1024 + 1, 2_000);
     let byte_query = query(root.path(), &byte_policy, "byte_budget");
     let root_id = byte_query.owned_root_ids()[0].to_owned();
     let byte_page = byte_query
         .list(&root_id, 400_000, None)
         .expect("bounded byte listing");
-    assert!(byte_page.considered_bytes() <= 1);
+    assert!(byte_page.considered_bytes() <= 4 * 1024 * 1024 + 1);
     assert!(
         byte_page
             .cleanup_debt()
@@ -2322,6 +2329,83 @@ fn bounded_attempt_listing_advances_across_more_attempts_than_one_page() {
     }
 
     assert_eq!(observed, execution_ids);
+}
+
+#[test]
+fn downgraded_retention_limit_still_pages_and_purges_the_physical_namespace() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let execution_ids = (0..8)
+        .map(|index| format!("018f47a2-9a41-7a27-b4d6-{index:012x}"))
+        .collect::<Vec<_>>();
+    let seed = || {
+        for execution_id in &execution_ids {
+            let attempt =
+                AttemptPublication::create(validated(root.path(), "."), execution_id, 1, 1)
+                    .expect("retained attempt fixture");
+            drop(attempt);
+        }
+    };
+    seed();
+    let config = "[storage.publication]\nfailed_retention_seconds = 0\nmax_attempt_bytes = \"1B\"\nretained_attempt_limit = 4\nsweep_entry_limit = 2\n";
+    let policy = ClinkerToml::parse(config)
+        .expect("parse downgraded policy")
+        .storage
+        .publication
+        .resolve(root.path(), 1, 8_000_000_000)
+        .expect("resolve downgraded policy");
+    let list_query = query(root.path(), &policy, "downgraded_retention");
+    let root_id = list_query.owned_root_ids()[0].to_owned();
+    let mut continuation = None;
+    let mut listed = Vec::new();
+    let mut continuations = std::collections::BTreeSet::new();
+    loop {
+        let page = list_query
+            .list(&root_id, 400_000, continuation.as_ref())
+            .expect("list downgraded namespace page");
+        if listed.is_empty() {
+            assert!(
+                page.cleanup_debt()
+                    .iter()
+                    .any(|debt| { debt.detail().contains("configured retained-attempt limit") })
+            );
+        }
+        for entry in page.entries() {
+            let execution_id = entry.inspection().execution_id().to_owned();
+            listed.push(execution_id.clone());
+            let request = list_query
+                .purge_execution(&root_id, &execution_id)
+                .expect("select listed attempt");
+            let report = list_query
+                .execute(&request, 400_000, None, &ShutdownToken::detached())
+                .expect("purge listed attempt");
+            assert_eq!(report.disposition(), PurgeDisposition::Removed);
+        }
+        continuation = page.continuation().cloned();
+        let Some(token) = continuation.as_ref() else {
+            break;
+        };
+        assert!(continuations.insert(token.to_bytes().unwrap()));
+    }
+    assert_eq!(listed, execution_ids);
+
+    seed();
+    let purge_policy = retained_policy(root.path(), 4, 8_000_000_000, 1);
+    let purge_query = query(root.path(), &purge_policy, "downgraded_retention_purge");
+    let root_id = purge_query.owned_root_ids()[0].to_owned();
+    let request = purge_query
+        .purge_expired(&root_id)
+        .expect("select expired downgraded namespace");
+    let report = purge_query
+        .execute(&request, 400_000, None, &ShutdownToken::detached())
+        .expect("purge expired downgraded namespace");
+    assert_eq!(report.removed_execution_ids().len(), execution_ids.len());
+    assert!(
+        purge_query
+            .list(&root_id, 400_000, None)
+            .expect("list empty namespace")
+            .entries()
+            .is_empty()
+    );
 }
 
 #[test]

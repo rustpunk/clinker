@@ -121,6 +121,10 @@ limit checks, and creation of every execution root. Retained bytes are summed
 from manifest-owned regular files in each root, including simultaneous local
 spool and destination quarantine copies. Missing or uninspectable ownership
 evidence is conservative debt, never a zero-byte assumption.
+Namespace enumeration is bounded by the publication policy's fixed maximum,
+not the current desired retained count. A configuration downgrade therefore
+still returns physical attempts through advancing continuation tokens while
+also reporting that the aggregate count exceeds current policy.
 
 ### Remote filesystem qualification
 

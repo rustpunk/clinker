@@ -84,6 +84,10 @@ destination copies both count while both exist; an uninspectable size fails
 admission instead of being treated as zero. Count and byte inventory, expiry
 cleanup, the limit check, and attempt-root creation are serialized across the
 same root set, so concurrent runs cannot both consume the final retained slot.
+Lowering `retained_attempt_limit` does not hide attempts that were admitted by
+an earlier configuration. Listing and expired purging continue to page over
+the bounded physical namespace and report policy debt until the retained count
+is back within the new limit.
 
 ### Publication modes and destination profiles
 

@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clinker_plan::config::{
-    DestinationProfile, PUBLICATION_MANIFEST_MAX_BYTES, PublicationMode, ResolvedPublicationPolicy,
+    DestinationProfile, PUBLICATION_MANIFEST_MAX_BYTES, PUBLICATION_MAX_RETAINED_ATTEMPTS,
+    PublicationMode, ResolvedPublicationPolicy,
 };
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::CompiledPlan;
@@ -1287,27 +1288,32 @@ impl AttemptQuery {
                 return Ok(list);
             }
         };
-        let inventory_limit =
+        let configured_limit =
             usize::try_from(self.policy.retained_attempt_limit()).unwrap_or(usize::MAX);
-        let mut namespace_entries =
-            match namespace.bounded_entries(inventory_limit.saturating_add(1)) {
-                Ok(entries) => entries,
-                Err(_) => {
-                    list.cleanup_debt.push(CleanupDebt::new(
-                        CleanupDebtKind::Operational,
-                        "attempt namespace enumeration failed",
-                    ));
-                    list.bounds = budget.bounds();
-                    return Ok(list);
-                }
-            };
-        if !namespace_entries.complete || namespace_entries.entries.len() > inventory_limit {
+        let mut namespace_entries = match namespace.bounded_entries(
+            usize::try_from(PUBLICATION_MAX_RETAINED_ATTEMPTS).unwrap_or(usize::MAX),
+        ) {
+            Ok(entries) => entries,
+            Err(_) => {
+                list.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::Operational,
+                    "attempt namespace enumeration failed",
+                ));
+                list.bounds = budget.bounds();
+                return Ok(list);
+            }
+        };
+        if namespace_entries.entries.len() > configured_limit {
             list.cleanup_debt.push(CleanupDebt::new(
                 CleanupDebtKind::EntryBudget,
-                "attempt namespace exceeds the aggregate retained-attempt inventory bound",
+                "attempt namespace exceeds the configured retained-attempt limit",
             ));
-            list.bounds = budget.bounds();
-            return Ok(list);
+        }
+        if !namespace_entries.complete {
+            list.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::EntryBudget,
+                "attempt namespace exceeds the hard retained-attempt inventory bound",
+            ));
         }
         namespace_entries
             .entries
@@ -1377,13 +1383,6 @@ impl AttemptQuery {
             if list.continuation.is_some() {
                 break;
             }
-        }
-        if list.continuation.is_none() && !namespace_entries.complete {
-            list.cleanup_debt.push(CleanupDebt::new(
-                CleanupDebtKind::EntryBudget,
-                "entry budget stopped attempt namespace enumeration",
-            ));
-            list.continuation = Some(self.continuation(root_identifier, "list", last_cursor));
         }
         list.bounds = budget.bounds();
         Ok(list)
