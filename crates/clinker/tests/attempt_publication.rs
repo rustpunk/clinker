@@ -1831,7 +1831,16 @@ fn matrix_interruption(
     );
     matrix_wait(&mut reader, "finish", &scenario);
     if destination.join(&leaf).exists() {
-        std::fs::remove_file(destination.join(leaf)).expect("remove interrupted visible final");
+        std::fs::remove_file(destination.join(&leaf)).expect("remove interrupted visible final");
+    }
+    let stale_reservation = destination.join(format!(".clinker-{leaf}.reservation"));
+    match std::fs::remove_file(&stale_reservation) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "remove reconciled interruption reservation {}: {error}",
+            stale_reservation.display()
+        ),
     }
 }
 
