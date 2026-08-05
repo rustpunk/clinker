@@ -4710,9 +4710,10 @@ fn render_attempt_command(argv: &[String]) -> String {
 
 #[cfg(not(windows))]
 fn quote_attempt_argument(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
     {
         return value.to_owned();
     }
@@ -4731,13 +4732,48 @@ fn quote_attempt_argument(value: &str) -> String {
 
 #[cfg(windows)]
 fn quote_attempt_argument(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
     {
         return value.to_owned();
     }
-    format!("\"{}\"", value.replace('"', "\"\""))
+    quote_windows_argument(value)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn quote_windows_argument(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0_usize;
+    for character in value.chars() {
+        match character {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..backslashes {
+                    quoted.push('\\');
+                    quoted.push('\\');
+                }
+                quoted.push('\\');
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    quoted.push('\\');
+                }
+                backslashes = 0;
+                quoted.push(character);
+            }
+        }
+    }
+    for _ in 0..backslashes {
+        quoted.push('\\');
+        quoted.push('\\');
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn attempt_query_error(error: clinker_exec::output::attempt::AttemptError) -> AttemptCommandError {
@@ -5849,6 +5885,79 @@ fn diag_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_argument_quoting_round_trips_through_cmd() {
+        let expected = [
+            "argument with spaces",
+            r#"say "hello""#,
+            r"C:\",
+            r"C:\Program Files\",
+            "",
+        ];
+        let output_dir = tempfile::tempdir().expect("temporary output directory");
+        let output_path = output_dir.path().join("argv.json");
+        let mut argv = vec![
+            std::env::current_exe()
+                .expect("current test executable")
+                .into_os_string()
+                .into_string()
+                .expect("test executable path should be Unicode"),
+            "--exact".to_owned(),
+            "tests::windows_argument_probe".to_owned(),
+            "--ignored".to_owned(),
+            "--".to_owned(),
+        ];
+        argv.extend(expected.iter().map(|value| (*value).to_owned()));
+
+        let command = render_attempt_command(&argv);
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/S", "/C", &command])
+            .env("CLINKER_ARGV_PROBE_OUTPUT", &output_path)
+            .output()
+            .expect("cmd.exe should launch the argv probe");
+        assert!(
+            output.status.success(),
+            "argv probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let actual: Vec<String> = serde_json::from_slice(
+            &std::fs::read(output_path).expect("argv probe should write its captured arguments"),
+        )
+        .expect("argv probe output should be JSON");
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "launched by windows_argument_quoting_round_trips_through_cmd"]
+    fn windows_argument_probe() {
+        let output_path = std::env::var_os("CLINKER_ARGV_PROBE_OUTPUT")
+            .expect("argv probe output path should be provided");
+        let actual = std::env::args()
+            .skip_while(|argument| argument != "--")
+            .skip(1)
+            .collect::<Vec<_>>();
+        std::fs::write(
+            output_path,
+            serde_json::to_vec(&actual).expect("captured arguments should serialize"),
+        )
+        .expect("captured arguments should be written");
+    }
+
+    #[test]
+    fn windows_argument_quoting_preserves_quotes_and_trailing_backslashes() {
+        assert_eq!(quote_windows_argument(""), "\"\"");
+        assert_eq!(
+            quote_windows_argument(r#"C:\Program Files\"#),
+            "\"C:\\Program Files\\\\\""
+        );
+        assert_eq!(
+            quote_windows_argument(r#"say "hello"\"#),
+            "\"say \\\"hello\\\"\\\\\""
+        );
+    }
 
     #[test]
     fn line_byte_range_handles_lf_crlf_and_lone_cr() {

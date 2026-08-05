@@ -495,9 +495,10 @@ fn render_command(argv: &[String]) -> String {
 
 #[cfg(not(windows))]
 fn quote_command_argument(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
     {
         return value.to_owned();
     }
@@ -517,13 +518,48 @@ fn quote_command_argument(value: &str) -> String {
 
 #[cfg(windows)]
 fn quote_command_argument(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
     {
         return value.to_owned();
     }
-    format!("\"{}\"", value.replace('"', "\"\""))
+    quote_windows_argument(value)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn quote_windows_argument(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0_usize;
+    for character in value.chars() {
+        match character {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..backslashes {
+                    quoted.push('\\');
+                    quoted.push('\\');
+                }
+                quoted.push('\\');
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    quoted.push('\\');
+                }
+                backslashes = 0;
+                quoted.push(character);
+            }
+        }
+    }
+    for _ in 0..backslashes {
+        quoted.push('\\');
+        quoted.push('\\');
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// A span plus an optional human-readable label. Analogous to
@@ -719,6 +755,19 @@ impl Diagnostic {
 mod diagnostic_tests {
     use super::*;
     use std::num::NonZeroU32;
+
+    #[test]
+    fn windows_recovery_quoting_preserves_quotes_and_trailing_backslashes() {
+        assert_eq!(quote_windows_argument(""), "\"\"");
+        assert_eq!(
+            quote_windows_argument(r#"C:\Program Files\"#),
+            "\"C:\\Program Files\\\\\""
+        );
+        assert_eq!(
+            quote_windows_argument(r#"say "hello"\"#),
+            "\"say \\\"hello\\\"\\\\\""
+        );
+    }
 
     fn fake_file() -> FileId {
         FileId::new(NonZeroU32::new(1).unwrap())
