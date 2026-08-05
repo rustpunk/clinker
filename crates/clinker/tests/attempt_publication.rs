@@ -2449,7 +2449,14 @@ fn purge_byte_budget_charges_manifest_evidence_not_artifact_payloads() {
         .len();
     assert!(manifest_bytes < 2_048);
 
-    let policy = bounded_policy(root.path(), 0, 1_000, 2_048, 2_000);
+    let minimum_recoverable_sweep_bytes = MANIFEST_MAX_BYTES as u64 + 1;
+    let policy = bounded_policy(
+        root.path(),
+        0,
+        1_000,
+        minimum_recoverable_sweep_bytes,
+        2_000,
+    );
     let query = query(root.path(), &policy, "payload_independent_budget");
     let root_id = query.owned_root_ids()[0].to_owned();
     let request = query
