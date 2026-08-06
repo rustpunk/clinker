@@ -19,6 +19,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::sync::{Arc, LazyLock};
+#[cfg(feature = "test-utils")]
+use std::sync::{Mutex, OnceLock};
 
 use clinker_record::{FieldMetadata, GroupByKey, PipelineCounters, Record, SchemaBuilder, Value};
 use cxl::eval::{EvalContext, ProgramEvaluator, SkipReason, StableEvalContext};
@@ -33,6 +35,94 @@ use clinker_plan::plan::EntityRef;
 /// [`crate::executor::correlation_dispatch`]. The commit subtree reaches it
 /// through this module path, so the re-export preserves that surface.
 pub(crate) use crate::executor::correlation_dispatch::commit_correlation_buffers;
+
+#[cfg(feature = "test-utils")]
+const DISPATCH_FAULT_TARGET_MAX_BYTES: usize = 256;
+
+#[cfg(feature = "test-utils")]
+#[derive(Default)]
+struct DispatchFaultState {
+    next_id: u64,
+    armed: Option<ArmedDispatchFault>,
+}
+
+#[cfg(feature = "test-utils")]
+struct ArmedDispatchFault {
+    id: u64,
+    target_node: String,
+}
+
+#[cfg(feature = "test-utils")]
+static DISPATCH_FAULT: OnceLock<Mutex<DispatchFaultState>> = OnceLock::new();
+
+/// Run-scoped owner for one process-local dispatch mismatch fault.
+///
+/// This seam exists only with `test-utils`, rejects concurrent arms, and is
+/// consumed exactly once when the named logical node reaches the dispatcher.
+/// Dropping an unconsumed guard disarms only the generation it created.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub struct DispatchFaultGuard {
+    id: u64,
+}
+
+#[cfg(feature = "test-utils")]
+impl DispatchFaultGuard {
+    /// Route one matching non-Route node through the Route dispatcher guard.
+    pub fn route_mismatch_once(target_node: impl Into<String>) -> Result<Self, &'static str> {
+        let target_node = target_node.into();
+        if target_node.is_empty() || target_node.len() > DISPATCH_FAULT_TARGET_MAX_BYTES {
+            return Err("dispatch fault target is outside its byte bound");
+        }
+        let mut state = dispatch_fault_state();
+        if state.armed.is_some() {
+            return Err("a dispatch fault is already armed");
+        }
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or("dispatch fault generation is exhausted")?;
+        let id = state.next_id;
+        state.armed = Some(ArmedDispatchFault { id, target_node });
+        Ok(Self { id })
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl Drop for DispatchFaultGuard {
+    fn drop(&mut self) {
+        let mut state = dispatch_fault_state();
+        if state
+            .armed
+            .as_ref()
+            .is_some_and(|fault| fault.id == self.id)
+        {
+            state.armed = None;
+        }
+    }
+}
+
+#[cfg(feature = "test-utils")]
+fn dispatch_fault_state() -> std::sync::MutexGuard<'static, DispatchFaultState> {
+    DISPATCH_FAULT
+        .get_or_init(|| Mutex::new(DispatchFaultState::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(feature = "test-utils")]
+fn take_route_mismatch_fault(node: &PlanNode) -> bool {
+    let mut state = dispatch_fault_state();
+    if state
+        .armed
+        .as_ref()
+        .is_some_and(|fault| fault.target_node == node.name())
+    {
+        state.armed = None;
+        return true;
+    }
+    false
+}
 
 /// Stand-in `$source.file` value for dispatch sites that have no
 /// originating source record (Combine/finalize/post-aggregate emits with
@@ -4125,6 +4215,10 @@ pub(crate) fn dispatch_plan_node(
         return Ok(());
     }
     let node = current_dag.graph[node_idx].clone();
+    #[cfg(feature = "test-utils")]
+    if take_route_mismatch_fault(&node) {
+        return crate::executor::route_dispatch::dispatch_route(ctx, current_dag, node_idx, &node);
+    }
     match node {
         PlanNode::Source { .. } => {
             crate::executor::source_dispatch::dispatch_source(ctx, current_dag, node_idx, &node)?;

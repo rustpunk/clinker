@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use clinker_bench_support::io::SharedBuffer;
+use clinker_core_types::{FailureCategory, RetryAdvice};
 use clinker_exec::executor::{
     DispatchFaultGuard, PipelineExecutor, PipelineRunParams, SourceReaders, WriterRegistry,
     single_file_reader,
@@ -14,6 +14,7 @@ use clinker_exec::output::attempt::{
     ArtifactKind, ArtifactState, AttemptQuery, AttemptState, CleanupDebtKind, RunAttemptPublication,
 };
 use clinker_exec::output::staging::OutputStagingRegistry;
+use clinker_exec::pipeline::shutdown::ShutdownToken;
 use clinker_plan::config::{
     ClinkerToml, CompileContext, IfExistsPolicy, ResolvedPublicationPolicy, load_config_from_str,
 };
@@ -23,6 +24,7 @@ use fs4::FileExt;
 use serial_test::serial;
 
 const EXECUTION_ID: &str = "018f47a2-9a41-7a27-b4d6-4f7137e3c159";
+const CONTROL_EXECUTION_ID: &str = "018f47a2-9a41-7a27-b4d6-4f7137e3c160";
 const PIPELINE_YAML: &str = r#"
 pipeline:
   name: invariant_dispatch_mismatch
@@ -76,7 +78,7 @@ fn validated(root: &Path, relative: &str) -> ValidatedPath {
 
 fn publication_policy(destination_root: &Path) -> ResolvedPublicationPolicy {
     ClinkerToml::parse(
-        "[storage.publication]\nfailed_retention_seconds = 300\nmax_attempt_bytes = \"1M\"\n",
+        "[storage.publication]\nfailed_retention_seconds = 300\nmax_attempt_bytes = \"1MB\"\n",
     )
     .expect("parse publication policy")
     .storage
@@ -112,7 +114,7 @@ fn spill_entries(root: &Path) -> Vec<String> {
 
 #[test]
 #[serial]
-fn dispatch_mismatch_is_returned_and_attempt_is_retained() {
+fn route_tracer_dispatch_mismatch_is_returned_and_attempt_is_retained() {
     let destination = tempfile::tempdir().expect("create destination root");
     let spill_root = tempfile::tempdir().expect("create spill root");
     let final_path = destination.path().join("output.csv");
@@ -171,6 +173,15 @@ fn dispatch_mismatch_is_returned_and_attempt_is_retained() {
     }))
     .expect("dispatch mismatch must return instead of unwinding");
     let error = run.expect_err("armed non-Route dispatch must fail");
+    let classification = error
+        .failure_classification()
+        .expect("dispatch mismatch has a shared classification");
+    assert_eq!(classification.code(), "runtime.invariant.dispatch_mismatch");
+    assert_eq!(
+        classification.category(),
+        FailureCategory::InternalInvariant
+    );
+    assert_eq!(classification.retry_advice(), RetryAdvice::PolicyRequired);
     assert!(
         matches!(
             error,
@@ -246,26 +257,68 @@ fn dispatch_mismatch_is_returned_and_attempt_is_retained() {
     FileExt::try_lock(&live_lock).expect("failed attempt live lock must be released");
     FileExt::unlock(&live_lock).expect("unlock retained attempt live lock");
 
-    let control_output = SharedBuffer::new();
-    let control_writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        "out".to_owned(),
-        Box::new(control_output.clone()) as Box<dyn Write + Send>,
-    )]);
+    let control_final = destination.path().join("control.csv");
+    let control_attempt = RunAttemptPublication::create_for_testing(
+        policy,
+        CONTROL_EXECUTION_ID,
+        2_000,
+        302_000,
+        vec![validated(destination.path(), ".")],
+    )
+    .expect("create control run attempt");
+    let control_staging = OutputStagingRegistry::for_run_attempt(control_attempt.clone());
+    let staged_control_final = control_final.clone();
+    let (_, control_writer) = control_staging
+        .stage_attempt_output(
+            ArtifactKind::Primary,
+            "out",
+            IfExistsPolicy::Overwrite,
+            false,
+            move |_| Ok(staged_control_final.clone()),
+        )
+        .expect("stage control attempt output");
+    let control_writers = WriterRegistry {
+        single: HashMap::from([(
+            "out".to_owned(),
+            Box::new(control_writer) as Box<dyn Write + Send>,
+        )]),
+        output_staging: control_staging.clone(),
+        auto_commit_staged: false,
+        ..WriterRegistry::default()
+    };
     PipelineExecutor::run_plan_with_readers_writers(
         &plan,
         readers(Arc::new(AtomicBool::new(false))),
         control_writers,
         &PipelineRunParams {
-            execution_id: "dispatch-control".to_owned(),
+            execution_id: CONTROL_EXECUTION_ID.to_owned(),
             batch_id: "dispatch-control".to_owned(),
             spill_root_dir: Some(spill_root.path().to_path_buf()),
             ..PipelineRunParams::default()
         },
     )
     .expect("unarmed control run must succeed");
+    control_attempt
+        .mark_all_ready()
+        .expect("ready control attempt");
+    let publication = control_attempt
+        .publish_run(&control_staging, &ShutdownToken::detached())
+        .expect("publish control attempt")
+        .expect("control publication gate must win");
+    assert!(publication.is_complete());
     assert_eq!(
-        control_output.as_string(),
+        std::fs::read_to_string(&control_final).expect("read published control final"),
         "id,renamed\n1,alpha\n2,beta\n",
         "one-shot fault must not affect the control run",
+    );
+    drop(control_staging);
+    drop(control_attempt);
+    assert!(
+        !destination
+            .path()
+            .join(".clinker-attempts")
+            .join(CONTROL_EXECUTION_ID)
+            .exists(),
+        "successful control publication must remove its completed attempt",
     );
 }

@@ -44,6 +44,9 @@ pub(crate) mod window_runtime;
 
 pub use batch_handoff::DEFAULT_BATCH_SIZE;
 use context::build_stable_eval_context;
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub use dispatch::DispatchFaultGuard;
 pub use dlq::DlqEntry;
 pub(crate) use dlq::TypeErrorEvent;
 use ingest::{IngestTaskOutcome, ingest_source};
@@ -791,20 +794,7 @@ impl PipelineExecutor {
             ingest_handles.push(handle);
         }
 
-        let DispatchOutcome {
-            counters,
-            dlq_entries,
-            peak_rss_bytes,
-            mut watermarks,
-            per_source_rollback_cursors,
-            per_source_record_counts,
-            per_source_dlq_counts,
-            cumulative_spill_bytes,
-            per_stage_spill_bytes,
-            peak_consumer_usage_bytes,
-            mut interrupted,
-            advisories,
-        } = Self::execute_dag(
+        let dispatch_outcome = match Self::execute_dag(
             &DagExecInputs {
                 config,
                 source_configs: &source_configs,
@@ -823,7 +813,35 @@ impl PipelineExecutor {
             },
             &mut collector,
             counters,
-        )?;
+        ) {
+            Ok(outcome) => outcome,
+            Err(dispatch_error) => {
+                // `execute_dag` has already dropped or drained every receiver,
+                // so each finite source worker can now finish. Join all of
+                // them before returning the original dispatcher failure: a
+                // detached ingest thread would keep reader and spill handles
+                // alive beyond the failed run's lifecycle boundary.
+                for handle in ingest_handles {
+                    let _ = handle.join();
+                }
+                return Err(dispatch_error);
+            }
+        };
+
+        let DispatchOutcome {
+            counters,
+            dlq_entries,
+            peak_rss_bytes,
+            mut watermarks,
+            per_source_rollback_cursors,
+            per_source_record_counts,
+            per_source_dlq_counts,
+            cumulative_spill_bytes,
+            per_stage_spill_bytes,
+            peak_consumer_usage_bytes,
+            mut interrupted,
+            advisories,
+        } = dispatch_outcome;
 
         // Collect ingest-task outcomes: per-source row counts and the
         // per-(source, file) watermark observations each task captured
