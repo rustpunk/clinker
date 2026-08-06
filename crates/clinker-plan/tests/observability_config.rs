@@ -288,12 +288,36 @@ fn rejects_before_effects() {
             "mode = \"none\"",
         ),
         (
+            minimal_policy(
+                "mode = \"none\"\nbearer_token = \"private-token\"",
+                &canonical,
+            ),
+            "observability.otlp.auth.bearer_token",
+            "mode = \"none\"",
+        ),
+        (
+            minimal_policy(
+                "mode = \"reference\"\nreference = \"telemetry/production\"\nenvironment = \"PRIVATE_TOKEN\"",
+                &canonical,
+            ),
+            "observability.otlp.auth.environment",
+            "mode = \"none\"",
+        ),
+        (
             minimal_policy("mode = \"basic\"\npassword = \"private-token\"", &canonical),
             "observability.otlp.auth.mode",
             "mode = \"none\"",
         ),
         (
             minimal_policy("mode = \"reference\"\nreference = \"\"", &canonical),
+            "observability.otlp.auth.reference",
+            "telemetry/production",
+        ),
+        (
+            minimal_policy(
+                "mode = \"reference\"\nreference = \"Bearer private-token\"",
+                &canonical,
+            ),
             "observability.otlp.auth.reference",
             "telemetry/production",
         ),
@@ -315,6 +339,14 @@ fn rejects_before_effects() {
         ),
         (
             valid.replace(
+                "[observability]\n",
+                "[observability]\narena_bytes = \"99999999999999999999GB\"\n",
+            ),
+            "observability.arena_bytes",
+            "4MB",
+        ),
+        (
+            valid.replace(
                 "[observability.lineage]\n",
                 "[observability.lineage]\nqueue_bytes = 0\n",
             ),
@@ -328,6 +360,14 @@ fn rejects_before_effects() {
             ),
             "observability.lineage.max_event_bytes",
             "64KB",
+        ),
+        (
+            valid.replace(
+                "[observability.lineage]\n",
+                "[observability.lineage]\nqueue_bytes = \"99999999999999999999GB\"\n",
+            ),
+            "observability.lineage.queue_bytes",
+            "1MB",
         ),
         (
             valid.replace(
@@ -430,5 +470,32 @@ catalog_name = "src"
     let (rendered, _) = reject(&secret_bearing);
     assert!(!rendered.contains("private-token"), "{rendered}");
     assert!(!rendered.contains("authorization"), "{rendered}");
+
+    let private_replacement = format!(
+        "{valid}\n[[observability.field_policy]]\nevent = \"run.completed\"\nfield = \"customer_id\"\naction = \"replace\"\nreplacement = \"private-token\"\n"
+    );
+    let private_replacement = ClinkerToml::parse(&private_replacement)
+        .unwrap()
+        .resolve_observability(None)
+        .unwrap();
+    assert!(!format!("{private_replacement:?}").contains("private-token"));
+
+    let unrelated = format!("{valid}\n[storage.staging]\nenabled = \"not-a-boolean\"\n");
+    let unrelated = ClinkerToml::parse(&unrelated).expect_err("storage type error remains storage");
+    assert!(unrelated.classification().is_none());
+
+    let local = minimal_policy("mode = \"none\"", "").replace(
+        "[observability.lineage]\n",
+        "[observability.lineage]\nidentity_mode = \"local_diagnostic_paths\"\n",
+    );
+    let local = ClinkerToml::parse(&local)
+        .expect("exact local compatibility mode parses")
+        .resolve_observability(None)
+        .expect("local compatibility mode needs no external binding");
+    assert_eq!(
+        local.lineage().unwrap().identity_mode(),
+        LineageIdentityMode::LocalDiagnosticPaths
+    );
+    assert!(local.lineage().unwrap().datasets().is_empty());
     assert_eq!(sentinel.path().read_dir().unwrap().count(), 0);
 }

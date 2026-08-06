@@ -182,6 +182,159 @@ jq -s 'group_by(.pipeline_name) | map({
 })' metrics/archive.ndjson
 ```
 
+## Workspace OTLP and lineage policy
+
+Deployment observability is optional and disabled when `clinker.toml` has no
+`[observability]` table. It is workspace policy, not pipeline YAML, and does
+not participate in the compiled plan's semantic fingerprint. A present table
+is one complete policy: callers may supply a complete resolved replacement
+only when the workspace table is absent; individual fields are never merged.
+
+The workspace loader validates this policy without opening a source, output,
+attempt directory, worker, credential provider, or network connection. It
+keeps the Collector endpoint as length-bounded raw text exactly as authored.
+The network admission boundary parses that text later, before any delivery
+effect; scheme, authority, credentials, paths, query strings, fragments,
+normalization, and the fixed OTLP signal routes are deliberately not decided
+by the workspace parser. Collector reachability is not a configuration
+admission check.
+
+A complete fixed-capacity example is:
+
+```toml
+[observability]
+arena_bytes = "4MB"
+ordinary_lane_bytes = "3MB"
+high_severity_lane_bytes = "1MB"
+max_batch_bytes = "256KB"
+max_attributes_per_event = 32
+max_attribute_bytes = "4KB"
+drop_policy = "drop-newest"
+sample_every = 1
+rate_limit_per_second = 1000
+rate_limit_burst = 1000
+flush_timeout_ms = 15000
+
+[observability.otlp]
+endpoint = "https://collector.example.com"
+connect_timeout_ms = 1000
+request_timeout_ms = 5000
+retry_max_attempts = 3
+retry_total_timeout_ms = 10000
+max_response_bytes = "64KB"
+
+[observability.otlp.auth]
+mode = "none"
+
+[observability.lineage]
+queue_bytes = "1MB"
+max_event_bytes = "64KB"
+drop_policy = "drop-newest"
+flush_timeout_ms = 5000
+identity_mode = "external"
+
+[[observability.lineage.dataset]]
+node = "source_customers"
+canonical_datasource = "s3://warehouse/customers"
+
+[[observability.lineage.dataset]]
+node = "output_customers"
+catalog_namespace = "analytics"
+catalog_name = "customers_clean"
+
+[[observability.field_policy]]
+event = "run.completed"
+field = "records_written"
+action = "allow"
+
+[[observability.field_policy]]
+event = "transform.customer_seen"
+field = "customer_id"
+action = "hash"
+
+[[observability.field_policy]]
+event = "transform.customer_seen"
+field = "email"
+action = "replace"
+replacement = "[redacted]"
+```
+
+Byte-size strings use decimal units (`1KB = 1,000` bytes and
+`1MB = 1,000,000` bytes). The fixed defaults and hard ceilings are:
+
+| Key | Default | Hard ceiling or relationship |
+|-----|---------|------------------------------|
+| `arena_bytes` | 4 MiB | 64 MiB; equals the exact sum of both lane caps |
+| `ordinary_lane_bytes` | 3 MiB | 64 MiB and disjoint from the high-severity lane |
+| `high_severity_lane_bytes` | 1 MiB | 64 MiB and disjoint from the ordinary lane |
+| `max_batch_bytes` | 256 KiB | 1 MiB and no larger than either lane |
+| `max_attributes_per_event` | 32 | 256 |
+| `max_attribute_bytes` | 4 KiB | 64 KiB |
+| `sample_every` | 1 | 1,000,000 |
+| `rate_limit_per_second` | 1,000 | 1,000,000 |
+| `rate_limit_burst` | 1,000 | 1,000,000 |
+| `flush_timeout_ms` | 15,000 | 60,000 |
+| `otlp.connect_timeout_ms` | 1,000 | 60,000 and no greater than request timeout |
+| `otlp.request_timeout_ms` | 5,000 | 60,000 and no greater than retry total |
+| `otlp.retry_max_attempts` | 3 | 10 |
+| `otlp.retry_total_timeout_ms` | 10,000 | 60,000 and no greater than flush timeout |
+| `otlp.max_response_bytes` | 64 KiB | 1 MiB |
+| `lineage.queue_bytes` | 1 MiB | 64 MiB, reserved independently of the telemetry arena |
+| `lineage.max_event_bytes` | 64 KiB | 1 MiB and no larger than its lineage queue |
+| `lineage.flush_timeout_ms` | 5,000 | 60,000 |
+
+Both delivery paths admit with `drop_policy = "drop-newest"`; there is no
+blocking, unbounded, or disk-spool spelling. The telemetry arena contains two
+disjoint lanes. The lineage queue is a separate reservation and cannot be
+expressed as an alias of either telemetry lane or the arena.
+
+### Authentication and privacy
+
+Authentication is always explicit. Credential-free delivery uses exactly:
+
+```toml
+[observability.otlp.auth]
+mode = "none"
+```
+
+Referenced delivery retains one provider-neutral logical name:
+
+```toml
+[observability.otlp.auth]
+mode = "reference"
+reference = "telemetry/production"
+```
+
+The reference is not a credential. A later run-local authentication provider
+must resolve it before effects. Inline headers, bearer/basic values,
+environment-variable names, and mixed auth variants are rejected; omission
+does not mean anonymous delivery. Diagnostics name the authored field and show
+a safe corrected table without echoing an endpoint, credential value, record
+value, or physical path.
+
+Event fields are denied by default. Each `[[observability.field_policy]]`
+entry selects exactly one dotted event/field pair and one `allow`, `hash`, or
+`replace` action. `replacement` is required only for `replace`, and duplicate
+rules for the same pair are invalid.
+
+### Lineage identity
+
+`identity_mode = "external"` is the default. Every externally emitted source
+or output node needs exactly one binding: either `canonical_datasource`, or
+the complete `catalog_namespace`/`catalog_name` pair. Missing, duplicate,
+partial, and mixed bindings fail validation; Clinker does not synthesize an
+external identity from a working directory, worker path, temporary root, URL,
+attempt identifier, or path hash.
+
+The only path-derived compatibility mode is the exact, explicit value below.
+It accepts no external dataset bindings and is for labeled local diagnostics,
+not external delivery:
+
+```toml
+[observability.lineage]
+identity_mode = "local_diagnostic_paths"
+```
+
 ## Operational recommendations
 
 - **Always enable metrics in production.** The overhead is negligible (one small JSON write at the end of each run).

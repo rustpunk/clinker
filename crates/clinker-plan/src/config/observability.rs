@@ -197,10 +197,18 @@ struct OtlpConfig {
 
 /// Exact secret-free authentication choice recorded by workspace policy.
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
-enum ObservabilityAuthConfig {
+#[serde(deny_unknown_fields)]
+struct ObservabilityAuthConfig {
+    mode: ObservabilityAuthMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reference: Option<String>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ObservabilityAuthMode {
     None,
-    Reference { reference: String },
+    Reference,
 }
 
 /// Author form for the independently bounded lineage delivery path.
@@ -580,12 +588,26 @@ impl std::fmt::Debug for LineageDatasetIdentity {
 }
 
 /// One validated exact event-field privacy action.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ResolvedFieldPolicy {
     event: Box<str>,
     field: Box<str>,
     action: FieldPolicyAction,
     replacement: Option<Box<str>>,
+}
+
+impl std::fmt::Debug for ResolvedFieldPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedFieldPolicy")
+            .field("event", &self.event)
+            .field("field", &self.field)
+            .field("action", &self.action)
+            .field(
+                "replacement",
+                &self.replacement.as_ref().map(|_| "<configured>"),
+            )
+            .finish()
+    }
 }
 
 impl ResolvedFieldPolicy {
@@ -641,6 +663,47 @@ impl ObservabilityConfigError {
     pub fn classification(&self) -> &FailureClassification {
         &self.classification
     }
+
+    /// Convert a serde/TOML failure inside the observability subtree into a
+    /// field-local diagnostic without copying the rejected value or parser
+    /// source excerpt into the error.
+    pub(crate) fn from_toml_parse(text: &str, error: &toml::de::Error) -> Self {
+        let auth_table = table_body(text, "observability.otlp.auth");
+        if auth_table.is_some_and(|body| authored_key(body, "mode").is_none()) {
+            return Self::invalid(
+                "observability.otlp.auth.mode",
+                "is required; omission never selects anonymous delivery",
+                auth_correction(),
+            );
+        }
+
+        let offset = error.span().map_or(text.len(), |span| span.start);
+        let (table, line) = authored_location(text, offset);
+        let key = key_on_line(line);
+        let field = match (table.as_str(), key.as_deref()) {
+            ("observability.otlp.auth", Some(key)) => {
+                format!("observability.otlp.auth.{key}")
+            }
+            ("observability.lineage.dataset", Some(key)) => {
+                format!("observability.lineage.dataset.{key}")
+            }
+            ("observability.field_policy", Some(key)) => {
+                format!("observability.field_policy.{key}")
+            }
+            (table, Some(key)) if table.starts_with("observability") => {
+                format!("{table}.{key}")
+            }
+            (table, None) if table.starts_with("observability") => table.to_owned(),
+            _ => "observability".to_owned(),
+        };
+
+        let correction = parse_correction(&field, key.as_deref());
+        Self::invalid(
+            field,
+            "has an unknown, missing, or malformed value in the strict observability policy",
+            correction,
+        )
+    }
 }
 
 impl std::fmt::Display for ObservabilityConfigError {
@@ -654,6 +717,20 @@ impl std::fmt::Display for ObservabilityConfigError {
 }
 
 impl std::error::Error for ObservabilityConfigError {}
+
+pub(crate) fn is_observability_toml_error(text: &str, error: &toml::de::Error) -> bool {
+    let offset = error.span().map_or(text.len(), |span| span.start);
+    let (table, _) = authored_location(text, offset);
+    if table.starts_with("observability") {
+        return true;
+    }
+
+    let has_observability = text.lines().any(|line| line.trim() == "[observability]");
+    has_observability
+        && (!text.contains("[observability.otlp]")
+            || !text.contains("[observability.otlp.auth]")
+            || !text.contains("[observability.lineage]"))
+}
 
 impl ObservabilityConfig {
     pub(crate) fn resolve(&self) -> Result<ResolvedObservabilityPolicy, ObservabilityConfigError> {
@@ -840,13 +917,27 @@ impl OtlpConfig {
             ));
         }
 
-        let auth = match &self.auth {
-            ObservabilityAuthConfig::None => ObservabilityAuth::None,
-            ObservabilityAuthConfig::Reference { reference } => {
+        let auth = match (self.auth.mode, self.auth.reference.as_deref()) {
+            (ObservabilityAuthMode::None, None) => ObservabilityAuth::None,
+            (ObservabilityAuthMode::None, Some(_)) => {
+                return Err(ObservabilityConfigError::invalid(
+                    "observability.otlp.auth.reference",
+                    "is not accepted when `mode = \"none\"`",
+                    "use `[observability.otlp.auth]\nmode = \"none\"` with no other field",
+                ));
+            }
+            (ObservabilityAuthMode::Reference, Some(reference)) => {
                 validate_logical_reference(reference)?;
                 ObservabilityAuth::Reference {
-                    reference: reference.clone().into_boxed_str(),
+                    reference: reference.into(),
                 }
+            }
+            (ObservabilityAuthMode::Reference, None) => {
+                return Err(ObservabilityConfigError::invalid(
+                    "observability.otlp.auth.reference",
+                    "is required when `mode = \"reference\"`",
+                    "use `[observability.otlp.auth]\nmode = \"reference\"\nreference = \"telemetry/production\"`",
+                ));
             }
         };
 
@@ -1181,4 +1272,141 @@ fn bounded_nonzero_u32(
         "must be a positive value within the documented hard ceiling",
         correction,
     ))
+}
+
+fn auth_correction() -> &'static str {
+    "use `[observability.otlp.auth]\nmode = \"none\"`, or `mode = \"reference\"` with exactly one `reference = \"telemetry/production\"`"
+}
+
+fn parse_correction(field: &str, key: Option<&str>) -> Box<str> {
+    let correction = if field.starts_with("observability.otlp.auth") {
+        auth_correction().to_owned()
+    } else {
+        match field {
+            "observability.drop_policy" | "observability.lineage.drop_policy" => {
+                "set `drop_policy = \"drop-newest\"`".to_owned()
+            }
+            "observability.lineage.identity_mode" => {
+                "set `identity_mode = \"external\"`, or explicitly select `identity_mode = \"local_diagnostic_paths\"` for local-only compatibility".to_owned()
+            }
+            "observability.otlp.endpoint" => {
+                "set `endpoint = \"https://collector.example.com\"` as bounded raw text"
+                    .to_owned()
+            }
+            "observability.arena_bytes" => "set `arena_bytes = \"4MB\"`".to_owned(),
+            "observability.ordinary_lane_bytes" => {
+                "set `ordinary_lane_bytes = \"3MB\"`".to_owned()
+            }
+            "observability.high_severity_lane_bytes" => {
+                "set `high_severity_lane_bytes = \"1MB\"`".to_owned()
+            }
+            "observability.max_batch_bytes" => {
+                "set `max_batch_bytes = \"256KB\"`".to_owned()
+            }
+            "observability.max_attributes_per_event" => {
+                "set `max_attributes_per_event = 32`".to_owned()
+            }
+            "observability.max_attribute_bytes" => {
+                "set `max_attribute_bytes = \"4KB\"`".to_owned()
+            }
+            "observability.sample_every" => "set `sample_every = 1`".to_owned(),
+            "observability.rate_limit_per_second" => {
+                "set `rate_limit_per_second = 1000`".to_owned()
+            }
+            "observability.rate_limit_burst" => {
+                "set `rate_limit_burst = 1000`".to_owned()
+            }
+            "observability.flush_timeout_ms" => {
+                "set `flush_timeout_ms = 15000`".to_owned()
+            }
+            "observability.otlp.connect_timeout_ms" => {
+                "set `connect_timeout_ms = 1000`".to_owned()
+            }
+            "observability.otlp.request_timeout_ms" => {
+                "set `request_timeout_ms = 5000`".to_owned()
+            }
+            "observability.otlp.retry_max_attempts" => {
+                "set `retry_max_attempts = 3`".to_owned()
+            }
+            "observability.otlp.retry_total_timeout_ms" => {
+                "set `retry_total_timeout_ms = 10000`".to_owned()
+            }
+            "observability.otlp.max_response_bytes" => {
+                "set `max_response_bytes = \"64KB\"`".to_owned()
+            }
+            "observability.lineage.queue_bytes" => {
+                "set `queue_bytes = \"1MB\"` under `[observability.lineage]`".to_owned()
+            }
+            "observability.lineage.max_event_bytes" => {
+                "set `max_event_bytes = \"64KB\"` under `[observability.lineage]`"
+                    .to_owned()
+            }
+            "observability.lineage.flush_timeout_ms" => {
+                "set `flush_timeout_ms = 5000` under `[observability.lineage]`".to_owned()
+            }
+            "observability.field_policy.action" => {
+                "set `action = \"allow\"`, `\"hash\"`, or `\"replace\"`".to_owned()
+            }
+            _ => key.map_or_else(
+                || "supply the complete documented `[observability]` policy".to_owned(),
+                |key| format!("remove `{key}` or replace it with the documented exact key"),
+            ),
+        }
+    };
+    correction.into_boxed_str()
+}
+
+fn table_body<'a>(text: &'a str, requested: &str) -> Option<&'a str> {
+    let header = format!("[{requested}]");
+    let start = text.find(&header)? + header.len();
+    let tail = &text[start..];
+    let end = tail.find("\n[").map_or(tail.len(), |relative| relative + 1);
+    Some(&tail[..end])
+}
+
+fn authored_key<'a>(body: &'a str, requested: &str) -> Option<&'a str> {
+    body.lines().find_map(|line| {
+        let key = key_on_line(line)?;
+        (key == requested).then_some(key)
+    })
+}
+
+fn authored_location(text: &str, offset: usize) -> (String, &str) {
+    let safe_offset = offset.min(text.len());
+    let line_index = text[..safe_offset]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let lines: Vec<_> = text.lines().collect();
+    let line = lines
+        .get(line_index)
+        .copied()
+        .or_else(|| lines.last().copied())
+        .unwrap_or("");
+
+    let mut table = String::new();
+    for candidate in lines.iter().take(line_index.saturating_add(1)) {
+        let trimmed = candidate.trim();
+        if let Some(inner) = trimmed
+            .strip_prefix("[[")
+            .and_then(|value| value.strip_suffix("]]"))
+        {
+            table = inner.to_owned();
+        } else if let Some(inner) = trimmed
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        {
+            table = inner.to_owned();
+        }
+    }
+    (table, line)
+}
+
+fn key_on_line(line: &str) -> Option<&str> {
+    let key = line.split_once('=')?.0.trim();
+    (!key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'))
+    .then_some(key)
 }

@@ -60,7 +60,15 @@ impl ClinkerToml {
     /// Returns [`StorageConfigError::Parse`] when the text is not valid TOML
     /// or contains a key whose type does not match the schema.
     pub fn parse(text: &str) -> Result<Self, StorageConfigError> {
-        toml::from_str(text).map_err(|e| StorageConfigError::Parse(e.to_string()))
+        toml::from_str(text).map_err(|error| {
+            if super::observability::is_observability_toml_error(text, &error) {
+                StorageConfigError::Observability(
+                    super::observability::ObservabilityConfigError::from_toml_parse(text, &error),
+                )
+            } else {
+                StorageConfigError::Parse(error.to_string())
+            }
+        })
     }
 
     /// Resolve an absent policy as disabled or one present policy atomically.
@@ -1308,6 +1316,9 @@ pub enum StorageConfigError {
     Read { path: PathBuf, source: String },
     /// `clinker.toml` is not valid TOML, or a storage key has the wrong type.
     Parse(String),
+    /// The strict observability subtree is malformed or fails deterministic
+    /// policy validation. Its diagnostic never includes rejected values.
+    Observability(super::observability::ObservabilityConfigError),
     /// `storage.spill.dir` points at a path that does not exist.
     SpillDirMissing { path: PathBuf },
     /// `storage.spill.dir` exists but is a file, not a directory.
@@ -1391,6 +1402,7 @@ impl std::fmt::Display for StorageConfigError {
                 write!(f, "failed to read {}: {source}", path.display())
             }
             Self::Parse(msg) => write!(f, "invalid clinker.toml: {msg}"),
+            Self::Observability(error) => write!(f, "invalid clinker.toml: {error}"),
             Self::SpillDirMissing { path } => write!(
                 f,
                 "storage.spill.dir {} does not exist; create it or point at an existing volume",
@@ -1516,6 +1528,17 @@ impl std::fmt::Display for StorageConfigError {
 }
 
 impl std::error::Error for StorageConfigError {}
+
+impl StorageConfigError {
+    /// Registered machine classification when this failure belongs to the
+    /// optional observability configuration boundary.
+    pub fn classification(&self) -> Option<&clinker_core_types::FailureClassification> {
+        match self {
+            Self::Observability(error) => Some(error.classification()),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
