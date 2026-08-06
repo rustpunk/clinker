@@ -188,6 +188,20 @@ Status: **Verified.** The second command needs the section 4 fd floor: it
 failed at `ulimit -n 1024` and passes at 65536. Apply the raise-only
 snippet from section 4 first rather than prefixing a fixed `ulimit -n`.
 
+The optional machine protocol and external child-process boundary have two
+focused real-binary gates:
+
+```bash
+cargo test --locked --offline -p clinker --test machine_supervision
+cargo test --locked --offline -p clinker --test machine_protocol_cli
+```
+
+Status: **Verified.** The first gate proves concurrent bounded pipe drains,
+explicit deadline escalation, direct-child reaping, fail-closed terminal/status
+reconciliation, unchanged finals after control loss, and fresh-process retry.
+The second pins the schema, identity, lifecycle, typed failure, cancellation,
+DLQ, and publication-event contract.
+
 ## 6. Formatting Command
 
 ```bash

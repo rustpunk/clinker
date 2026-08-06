@@ -11,6 +11,15 @@ Clinker uses structured exit codes to communicate the outcome of a pipeline run.
 | 2 | Partial success | Pipeline ran to completion, but some records were routed to the dead-letter queue. Check the DLQ file. |
 | 3 | Evaluation error | CXL runtime error during record processing (e.g., division by zero, type coercion failure). |
 | 4 | Infrastructure or retained cleanup debt | File/format failure, disk full, or an attempt operation stopped with bounded, ambiguous, live, or otherwise retryable cleanup debt. This status never means completed-with-DLQ. |
+| 130 | Cancelled | Graceful SIGINT or SIGTERM cancellation won before publication. Final paths for the current attempt remain unchanged. |
+
+For an ordinary standalone run, these statuses are the complete process
+result. A `--machine ndjson-v1` consumer must additionally require exactly one
+supported terminal event whose result and embedded exit, where present, match
+the actual child status and current-attempt artifact evidence. EOF, malformed
+or unsupported output, a duplicate or missing terminal, forced termination,
+or any mismatch is an incomplete attempt even if an older final already
+exists. See [Running Clinker Directly or Under a Supervisor](orchestrator-contract.md).
 
 ## Understanding exit code 2
 

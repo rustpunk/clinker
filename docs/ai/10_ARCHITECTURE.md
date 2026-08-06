@@ -147,6 +147,23 @@ Practical guidance:
 - Keep path security APIs proof-oriented. `ValidatedPath` has private internals and should remain the handoff type for trusted filesystem paths.
 - Keep channel and composition overrides at declared boundaries. `clinker-channel` docs explicitly forbid mid-graph patching and sealed composition internals access.
 
+### Optional machine process boundary
+
+The ordinary architecture is still `clinker run <CONFIG>` as one finite
+synchronous process. `--machine ndjson-v1 --batch-id <ID>` is an opt-in CLI-edge
+serializer in `crates/clinker/src/machine.rs`, not a worker runtime. One owner
+assigns sequence, bounds advisory progress, and emits terminal truth only after
+the existing cancellation/publication decision is known.
+
+An external parent owns concurrent stdout/stderr drains, overall and graceful
+cancellation deadlines, independent heartbeat, platform process-tree policy,
+fresh-process retry, and direct-child reaping. It accepts success only when the
+supported terminal, actual process status, and current-attempt artifact truth
+reconcile. Progress is not a heartbeat or resume cursor, and individually
+atomic artifacts do not imply set-wide atomic publication. The executable
+contract is covered by `crates/clinker/tests/machine_protocol_cli.rs` and
+`crates/clinker/tests/machine_supervision.rs`.
+
 ## Public API Surfaces
 
 The following are reachable surfaces future agents should recognize. Rust

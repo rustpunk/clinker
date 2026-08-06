@@ -36,6 +36,28 @@ to [open questions](80_OPEN_QUESTIONS.md) rather than promoting it here.
 - **Verification:** Inspect source construction and run the relevant executor
   or transport tests from [the command guide](50_TESTING_AND_COMMANDS.md).
 
+### External supervision stays at the process edge
+
+- **Scope:** Optional machine mode, workflow adapters, scheduling, retry,
+  heartbeat, deadlines, cancellation escalation, and process-tree lifetime.
+- **Invariant:** Clinker may emit one opt-in bounded lifecycle stream for one
+  finite process, but it does not own a supervisor, worker, daemon, scheduler,
+  workflow SDK, POSIX process group, or Windows Job Object. An external parent
+  drains both pipes concurrently, heartbeats independently, enforces an overall
+  deadline plus bounded graceful-cancellation period, reaps the child, and
+  launches a fresh process for every retry.
+- **Rationale:** Keeping durable workflow and platform job control external
+  preserves the finite synchronous execution model and prevents advisory
+  progress from becoming accidental resume or exactly-once state.
+- **Evidence:** `crates/clinker/src/machine.rs`,
+  `crates/clinker/tests/machine_protocol_cli.rs`,
+  `crates/clinker/tests/machine_supervision.rs`, and the
+  [supervision contract](../user/src/ops/orchestrator-contract.md).
+- **Exceptions:** None. A future shipped adapter or process-tree owner requires
+  an explicit architecture and dependency decision.
+- **Verification:** Run both focused machine integration tests from the command
+  guide and confirm process-launching helper code remains under `tests/support`.
+
 ### Compiled topology is authoritative
 
 - **Scope:** Planning, executor entry points, topology, plan consumers, and
