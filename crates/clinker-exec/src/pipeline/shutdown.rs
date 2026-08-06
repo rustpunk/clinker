@@ -12,7 +12,7 @@
 //! production SIGINT handling intact while eliminating the global mutable
 //! state that previously caused tests to race against each other.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// A handle to a per-execution shutdown flag. Cheap to clone — clones share
@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 #[derive(Clone, Debug)]
 pub struct ShutdownToken {
     state: Arc<AtomicU8>,
+    progress_checkpoints: Arc<AtomicU64>,
 }
 
 const ACTIVE: u8 = 0;
@@ -40,7 +41,10 @@ impl ShutdownToken {
     pub fn new() -> Self {
         let state = Arc::new(AtomicU8::new(ACTIVE));
         register(&state);
-        Self { state }
+        Self {
+            state,
+            progress_checkpoints: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// Create a token that is NOT registered with the signal handler. Useful
@@ -48,6 +52,7 @@ impl ShutdownToken {
     pub fn detached() -> Self {
         Self {
             state: Arc::new(AtomicU8::new(ACTIVE)),
+            progress_checkpoints: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -60,7 +65,17 @@ impl ShutdownToken {
 
     /// Check whether shutdown has been requested on this token.
     pub fn is_requested(&self) -> bool {
+        self.progress_checkpoints.fetch_add(1, Ordering::Relaxed);
         self.state.load(Ordering::SeqCst) == CANCELLED
+    }
+
+    /// Number of existing cancellation checkpoints observed by this run.
+    ///
+    /// This monotonic value is advisory liveness evidence only. It is never a
+    /// resume cursor and does not participate in the cancellation/publication
+    /// state machine.
+    pub fn progress_checkpoints(&self) -> u64 {
+        self.progress_checkpoints.load(Ordering::Relaxed)
     }
 
     /// Atomically cross the point of no return immediately before publication.

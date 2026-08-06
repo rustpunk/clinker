@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use clinker_core_types::FailureClassification;
 use serde::Serialize;
 
 use clinker_exec::executor::PipelineExecutor;
@@ -895,6 +896,12 @@ fn main() -> ExitCode {
             };
             if let Some(emitter) = machine.as_ref()
                 && let Err(error) = emitter.emit_started()
+            {
+                eprintln!("clinker: cannot write machine protocol: {error}");
+                return ExitCode::from(4);
+            }
+            if let Some(emitter) = machine.as_ref()
+                && let Err(error) = emitter.emit_progress_transition("planning")
             {
                 eprintln!("clinker: cannot write machine protocol: {error}");
                 return ExitCode::from(4);
@@ -2344,6 +2351,9 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         emitter
             .emit_plan_resolved(fingerprint)
             .map_err(PipelineError::Io)?;
+        emitter
+            .emit_progress_transition("executing")
+            .map_err(PipelineError::Io)?;
     }
 
     if args.dry_run && args.dry_run_n.is_none() {
@@ -2873,13 +2883,20 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     // post-overlay config — so the context it recompiles under must NOT carry
     // the overlay ops again (they would double-apply and collide). For a plain
     // run this is identical to `compile_ctx.clone()` (the op stream is empty).
-    let mut report = match PipelineExecutor::run_plan_with_readers_writers_in_context(
+    let machine_progress =
+        machine.map(|emitter| emitter.start_execution_progress(shutdown_token.clone()));
+    let execution_result = PipelineExecutor::run_plan_with_readers_writers_in_context(
         &compiled_plan,
         readers,
         registry,
         &run_params,
         compile_ctx.without_overlay_ops(),
-    ) {
+    );
+    let mut machine_control_error = machine_progress.and_then(|worker| worker.finish().err());
+    if let Some(error) = &machine_control_error {
+        tracing::warn!(error = %error, "machine progress channel failed");
+    }
+    let mut report = match execution_result {
         Ok(report) => report,
         Err(e) => {
             // Live lineage: the executor failed — close the run out as FAIL with the
@@ -2917,6 +2934,16 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             return Err(e);
         }
     };
+
+    if let Some(emitter) = machine
+        && let Err(error) = emitter.emit_progress_transition("finalizing")
+    {
+        tracing::warn!(error = %error, "machine finalization transition failed");
+        machine_control_error.get_or_insert(error);
+    }
+    if machine_control_error.is_some() {
+        report.interrupted = true;
+    }
 
     let counters = &report.counters;
     let dlq_entries = &report.dlq_entries;
@@ -3045,6 +3072,8 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     }
 
     let mut publication_failure: Option<String> = None;
+    let mut publication_failure_code: Option<&'static str> = None;
+    let mut publication_outcome = None;
     if report.interrupted {
         run_attempt.abandon().map_err(|error| {
             PipelineError::Io(std::io::Error::other(format!(
@@ -3054,6 +3083,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     } else {
         match run_attempt.mark_all_ready() {
             Err(_) => {
+                publication_failure_code = Some("attempt.publication.finalization_failed");
                 if run_attempt.abandon().is_err() {
                     publication_failure = Some(publication_failure_diagnostic(
                         &execution_id,
@@ -3066,39 +3096,50 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                     ));
                 }
             }
-            Ok(()) => match run_attempt.publish_run(&output_staging, &shutdown_token) {
+            Ok(()) => {
+                if let Some(emitter) = machine
+                    && let Err(error) = emitter.emit_progress_transition("publishing")
+                {
+                    tracing::warn!(error = %error, "machine publication transition failed");
+                    machine_control_error.get_or_insert(error);
+                }
+                match run_attempt.publish_run(&output_staging, &shutdown_token) {
                 Ok(None) => report.interrupted = true,
-                Ok(Some(clinker_exec::output::attempt::AttemptPublicationOutcome::Complete {
+                Ok(Some(outcome @ clinker_exec::output::attempt::AttemptPublicationOutcome::Complete {
                     cleanup_debt_count: 0,
                     ..
-                })) => {}
-                Ok(Some(clinker_exec::output::attempt::AttemptPublicationOutcome::Complete {
+                })) => publication_outcome = Some(outcome),
+                Ok(Some(outcome @ clinker_exec::output::attempt::AttemptPublicationOutcome::Complete {
                     cleanup_debt_count,
                     ..
                 })) => {
+                    publication_failure_code = Some("attempt.publication.finalization_failed");
                     publication_failure = Some(publication_failure_diagnostic(
                         &execution_id,
                         PublicationFailureKind::CleanupDebt(cleanup_debt_count),
                     ));
+                    publication_outcome = Some(outcome);
                 }
-                Ok(Some(
-                    clinker_exec::output::attempt::AttemptPublicationOutcome::Incomplete {
-                        cleanup_debt_count,
-                        ..
-                    },
-                )) => {
+                Ok(Some(outcome @ clinker_exec::output::attempt::AttemptPublicationOutcome::Incomplete {
+                    cleanup_debt_count,
+                    ..
+                })) => {
+                    publication_failure_code = Some("attempt.publication.promotion_failed");
                     publication_failure = Some(publication_failure_diagnostic(
                         &execution_id,
                         PublicationFailureKind::Incomplete(cleanup_debt_count),
                     ));
+                    publication_outcome = Some(outcome);
                 }
                 Err(error) => {
+                    publication_failure_code = Some("attempt.publication.promotion_failed");
                     publication_failure = Some(publication_failure_diagnostic(
                         &execution_id,
                         PublicationFailureKind::Publish(publication_error_category(&error)),
                     ));
                 }
-            },
+                }
+            }
         }
     }
 
@@ -3250,6 +3291,22 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 exit_code = execution_metrics.exit_code,
                 "metrics spool write failed — emitting inline"
             );
+        }
+    }
+
+    if let Some(emitter) = machine {
+        let terminal_result = if let Some(code) = publication_failure_code {
+            let failure = FailureClassification::for_code(code)
+                .expect("publication failures use registered codes");
+            emitter.emit_failed_with_publication(exit_code, &failure, publication_outcome.as_ref())
+        } else {
+            emitter.emit_completed_with_publication(exit_code, publication_outcome.as_ref())
+        };
+        if let Err(error) = terminal_result {
+            if publication_failure.is_none() {
+                return Err(PipelineError::Io(error));
+            }
+            tracing::warn!(error = %error, "machine terminal write failed after publication failure");
         }
     }
 

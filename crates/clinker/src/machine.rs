@@ -1,10 +1,14 @@
 //! Sole ownership of the optional machine-run stream.
 
 use std::io::{self, BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::Duration;
 
 use clinker_core_types::FailureClassification;
+use clinker_exec::output::attempt::{ArtifactKind, ArtifactState, AttemptPublicationOutcome};
 use clinker_exec::pipeline::shutdown::ShutdownToken;
+use clinker_exec::progress::{BoundedProgress, ProgressSnapshot};
 
 use crate::{MachineFormat, RunArgs};
 
@@ -25,6 +29,21 @@ struct MachineState {
     sequence: u64,
     plan_identity: serde_json::Value,
     terminal_reserved: bool,
+    progress: BoundedProgress,
+}
+
+pub(crate) struct MachineProgressWorker {
+    stop: mpsc::SyncSender<()>,
+    handle: thread::JoinHandle<io::Result<()>>,
+}
+
+impl MachineProgressWorker {
+    pub(crate) fn finish(self) -> io::Result<()> {
+        let _ = self.stop.try_send(());
+        self.handle
+            .join()
+            .map_err(|_| io::Error::other("machine progress worker panicked"))?
+    }
 }
 
 impl MachineEmitter {
@@ -64,6 +83,7 @@ impl MachineEmitter {
                 sequence: 0,
                 plan_identity: serde_json::json!({"status": "pending"}),
                 terminal_reserved: false,
+                progress: BoundedProgress::default(),
             })),
             shutdown: ShutdownToken::new(),
         }
@@ -100,7 +120,51 @@ impl MachineEmitter {
         })
     }
 
+    pub(crate) fn emit_progress_transition(&self, phase: &str) -> io::Result<()> {
+        self.with_state(|state| {
+            let snapshot = state.progress.transition(phase);
+            state.write_progress(snapshot, None)
+        })
+    }
+
+    fn emit_periodic(&self, checkpoints: u64) -> io::Result<()> {
+        self.with_state(|state| {
+            let Some(snapshot) = state.progress.periodic("executing") else {
+                return Ok(());
+            };
+            state.write_progress(snapshot, Some(checkpoints))
+        })
+    }
+
+    pub(crate) fn start_execution_progress(&self, token: ShutdownToken) -> MachineProgressWorker {
+        let emitter = self.clone();
+        let (stop, receiver) = mpsc::sync_channel(1);
+        let handle = thread::spawn(move || {
+            let mut observed = token.progress_checkpoints();
+            loop {
+                match receiver.recv_timeout(Duration::from_millis(20)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                let checkpoints = token.progress_checkpoints();
+                if checkpoints > observed {
+                    observed = checkpoints;
+                    emitter.emit_periodic(checkpoints)?;
+                }
+            }
+        });
+        MachineProgressWorker { stop, handle }
+    }
+
     pub(crate) fn emit_completed(&self, exit_code: u8) -> io::Result<()> {
+        self.emit_completed_with_publication(exit_code, None)
+    }
+
+    pub(crate) fn emit_completed_with_publication(
+        &self,
+        exit_code: u8,
+        publication: Option<&AttemptPublicationOutcome>,
+    ) -> io::Result<()> {
         self.with_state(|state| {
             if !state.reserve_terminal() {
                 return Ok(());
@@ -113,10 +177,13 @@ impl MachineEmitter {
             } else {
                 "success"
             };
-            let fields = serde_json::Map::from_iter([
+            let mut fields = serde_json::Map::from_iter([
                 ("result".to_owned(), serde_json::json!(result)),
                 ("exit_code".to_owned(), serde_json::json!(exit_code)),
             ]);
+            if let Some(publication) = publication {
+                fields.insert("publication".to_owned(), publication_value(publication));
+            }
             state.write_event("completed", fields)
         })
     }
@@ -126,6 +193,15 @@ impl MachineEmitter {
         exit_code: u8,
         failure: &FailureClassification,
     ) -> io::Result<()> {
+        self.emit_failed_with_publication(exit_code, failure, None)
+    }
+
+    pub(crate) fn emit_failed_with_publication(
+        &self,
+        exit_code: u8,
+        failure: &FailureClassification,
+        publication: Option<&AttemptPublicationOutcome>,
+    ) -> io::Result<()> {
         self.with_state(|state| {
             if !state.reserve_terminal() {
                 return Ok(());
@@ -134,7 +210,7 @@ impl MachineEmitter {
                 state.plan_identity =
                     serde_json::json!({"status": "unavailable", "reason": "admission_failed"});
             }
-            let fields = serde_json::Map::from_iter([
+            let mut fields = serde_json::Map::from_iter([
                 (
                     "failure".to_owned(),
                     serde_json::json!({
@@ -146,6 +222,9 @@ impl MachineEmitter {
                 ),
                 ("exit_code".to_owned(), serde_json::json!(exit_code)),
             ]);
+            if let Some(publication) = publication {
+                fields.insert("publication".to_owned(), publication_value(publication));
+            }
             state.write_event("failed", fields)
         })
     }
@@ -191,6 +270,13 @@ impl MachineState {
         event: &'static str,
         fields: serde_json::Map<String, serde_json::Value>,
     ) -> io::Result<()> {
+        #[cfg(debug_assertions)]
+        if injected_write_failure(event, &fields) {
+            return Err(io::Error::other(format!(
+                "injected machine write failure at {event}"
+            )));
+        }
+
         let mut object = serde_json::Map::new();
         object.insert("protocol".to_owned(), serde_json::json!("clinker.run"));
         object.insert("schema".to_owned(), serde_json::json!(1));
@@ -214,6 +300,99 @@ impl MachineState {
         self.writer.flush()?;
         self.sequence = self.sequence.saturating_add(1);
         Ok(())
+    }
+
+    fn write_progress(
+        &mut self,
+        snapshot: ProgressSnapshot,
+        checkpoints: Option<u64>,
+    ) -> io::Result<()> {
+        let mut progress = serde_json::json!({
+            "phase": snapshot.phase(),
+            "kind": snapshot.kind().as_str(),
+            "elapsed_ms": snapshot.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        });
+        if let Some(checkpoints) = checkpoints {
+            progress["checkpoints"] = serde_json::json!(checkpoints);
+        }
+        let fields = serde_json::Map::from_iter([
+            ("progress".to_owned(), progress),
+            (
+                "truncation".to_owned(),
+                serde_json::json!({
+                    "detail": snapshot.detail_truncated(),
+                    "events": snapshot.event_limit_reached(),
+                }),
+            ),
+        ]);
+        self.write_event("progress", fields)
+    }
+}
+
+fn publication_value(outcome: &AttemptPublicationOutcome) -> serde_json::Value {
+    let (cleanup_debt_count, complete) = match outcome {
+        AttemptPublicationOutcome::Complete {
+            cleanup_debt_count, ..
+        } => (*cleanup_debt_count, true),
+        AttemptPublicationOutcome::Incomplete {
+            cleanup_debt_count, ..
+        } => (*cleanup_debt_count, false),
+    };
+    let artifacts = outcome
+        .artifacts()
+        .iter()
+        .map(|artifact| {
+            serde_json::json!({
+                "artifact_id": artifact.artifact_id(),
+                "kind": artifact_kind(artifact.kind()),
+                "state": artifact_state(artifact.state()),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "complete": complete,
+        "cleanup_debt_count": cleanup_debt_count,
+        "artifacts": artifacts,
+    })
+}
+
+fn artifact_kind(kind: ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::Primary => "primary",
+        ArtifactKind::FanOut => "fan_out",
+        ArtifactKind::Split => "split",
+        ArtifactKind::Dlq => "dlq",
+        ArtifactKind::Sidecar => "sidecar",
+    }
+}
+
+fn artifact_state(state: ArtifactState) -> &'static str {
+    match state {
+        ArtifactState::Staging => "staging",
+        ArtifactState::Ready => "ready",
+        ArtifactState::Promoting => "promoting",
+        ArtifactState::Published => "published",
+        ArtifactState::VisibleUnsynchronized => "visible_unsynchronized",
+        ArtifactState::Unpublished => "unpublished",
+    }
+}
+
+#[cfg(debug_assertions)]
+fn injected_write_failure(
+    event: &str,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let Some(point) = std::env::var_os("CLINKER_TEST_MACHINE_WRITE_FAILURE") else {
+        return false;
+    };
+    match point.to_string_lossy().as_ref() {
+        "finalizing" => {
+            event == "progress"
+                && fields["progress"]["kind"] == "transition"
+                && fields["progress"]["phase"] == "finalizing"
+        }
+        "terminal" => matches!(event, "completed" | "failed" | "cancelled"),
+        _ => false,
     }
 }
 

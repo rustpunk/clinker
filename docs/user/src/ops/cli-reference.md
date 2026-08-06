@@ -24,7 +24,7 @@ clinker run [OPTIONS] <CONFIG>
 | `--threads <N>` | number of CPUs | Size of the executor thread pool. The selected value is also recorded in execution metrics. |
 | `--error-threshold <N>` | `0` | **Accepted but not enforced in the current binary.** Parsing this flag does not stop a run after that many DLQ records. Phase 4 / AUTH-05 owns the D-45 CLI audit that must wire it or replace it with a nonzero tombstone. |
 | `--batch-id <ID>` | UUID v7 | Correlation ID available as `pipeline.batch_id`, in `{batch_id}` output-path templates, and in opt-in output provenance sidecars. It is distinct from the generated execution ID and is not currently a field in the metrics-spool payload. |
-| `--machine ndjson-v1` | -- | Opt into the `clinker.run` schema-1 lifecycle on stdout. Requires a non-empty `--batch-id`; conflicts with plan/dry-run output and with `--lineage -` or `--lineage-events -`. File-based lineage remains compatible. Every line is one compact JSON object. Consumers must reject unsupported schema majors, may ignore additive schema-1 fields, and must require a `completed`, `failed`, or `cancelled` terminal rather than treating EOF as success. |
+| `--machine ndjson-v1` | -- | Opt into the `clinker.run` schema-1 lifecycle on stdout. Requires a non-empty `--batch-id`; conflicts with plan/dry-run output and with `--lineage -` or `--lineage-events -`. File-based lineage remains compatible. Every line is one compact JSON object. The stream includes ordered planning, execution, finalization, and publication transitions; periodic execution observations are advisory and bounded. A completed terminal reports path-free publication truth as artifact ID, kind, state, and cleanup-debt count. Consumers must reject unsupported schema majors, may ignore additive schema-1 fields, and must require a `completed`, `failed`, or `cancelled` terminal rather than treating EOF as success. |
 | `--explain [FORMAT]` | `text` | Print the execution plan and exit without processing data. Accepted formats: `text`, `json`, `dot`. See [Explain Plans](explain.md). |
 | `--lineage <PATH>` | -- | Build column lineage and write it as OpenLineage NDJSON, then exit without processing data. Give a file path, or `-` for stdout. See [Column Lineage](lineage.md). |
 | `--lineage-events <PATH>` | -- | Run the pipeline and emit live OpenLineage run events (a `START` at run begin, then a terminal `COMPLETE` / `FAIL` / `ABORT` with real timing and row counts) as NDJSON to a file path, or `-` for stdout. Cannot be combined with `--lineage`, `--explain`, `--dry-run`, or `-n`. With `-`, normal run output can interleave with the event stream; use a file for clean NDJSON. See [Live run events](lineage.md#live-run-events). |
@@ -68,6 +68,9 @@ clinker run pipeline.yaml --explain dot | dot -Tpng -o plan.png
 
 # Run with a batch ID available to templates and provenance sidecars
 clinker run pipeline.yaml --batch-id "daily-2026-04-11"
+
+# Emit the bounded schema-1 lifecycle for a supervisor
+clinker run pipeline.yaml --machine ndjson-v1 --batch-id "daily-2026-04-11"
 ```
 
 ---

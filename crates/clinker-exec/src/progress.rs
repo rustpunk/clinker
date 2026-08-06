@@ -8,6 +8,9 @@ use std::fmt::Write as FmtWrite;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+const DEFAULT_MAX_MACHINE_EVENTS: usize = 128;
+const DEFAULT_MAX_DETAIL_BYTES: usize = 64;
+
 /// Progress update emitted at chunk boundaries.
 #[derive(Debug, Clone)]
 pub struct ProgressUpdate {
@@ -40,6 +43,145 @@ impl ProgressUpdate {
 /// Callback trait for progress reporting. Testable via VecReporter.
 pub trait ProgressReporter: Send + Sync {
     fn report(&self, update: &ProgressUpdate);
+}
+
+/// Whether a machine progress record marks a lifecycle edge or an advisory
+/// periodic observation inside one phase.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ProgressKind {
+    Transition,
+    Periodic,
+}
+
+impl ProgressKind {
+    /// Stable schema-1 spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transition => "transition",
+            Self::Periodic => "periodic",
+        }
+    }
+}
+
+/// Sanitized, bounded machine-facing progress state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgressSnapshot {
+    phase: String,
+    kind: ProgressKind,
+    elapsed: Duration,
+    detail_truncated: bool,
+    event_limit_reached: bool,
+}
+
+impl ProgressSnapshot {
+    pub fn phase(&self) -> &str {
+        &self.phase
+    }
+
+    pub const fn kind(&self) -> ProgressKind {
+        self.kind
+    }
+
+    pub const fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+
+    pub const fn detail_truncated(&self) -> bool {
+        self.detail_truncated
+    }
+
+    pub const fn event_limit_reached(&self) -> bool {
+        self.event_limit_reached
+    }
+}
+
+/// Coalesces discardable observations before they reach the machine writer.
+///
+/// Required transitions are always returned. Periodic snapshots appear at
+/// most once per second, with 128 ordinary records and one explicit cap
+/// notification by default. Logical detail is truncated on UTF-8 boundaries.
+pub struct BoundedProgress {
+    started: Instant,
+    last_periodic: Option<Instant>,
+    periodic_emitted: usize,
+    max_periodic_events: usize,
+    max_detail_bytes: usize,
+    periodic_limit_reported: bool,
+}
+
+impl Default for BoundedProgress {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_MACHINE_EVENTS, DEFAULT_MAX_DETAIL_BYTES)
+    }
+}
+
+impl BoundedProgress {
+    pub fn new(max_periodic_events: usize, max_detail_bytes: usize) -> Self {
+        Self {
+            started: Instant::now(),
+            last_periodic: None,
+            periodic_emitted: 0,
+            max_periodic_events,
+            max_detail_bytes,
+            periodic_limit_reported: false,
+        }
+    }
+
+    pub fn transition(&mut self, phase: &str) -> ProgressSnapshot {
+        self.snapshot(phase, ProgressKind::Transition, Instant::now(), false)
+    }
+
+    pub fn periodic(&mut self, phase: &str) -> Option<ProgressSnapshot> {
+        self.periodic_at(phase, Instant::now())
+    }
+
+    /// Deterministic-time form used by focused cadence tests.
+    pub fn periodic_at(&mut self, phase: &str, now: Instant) -> Option<ProgressSnapshot> {
+        if self
+            .last_periodic
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+        {
+            return None;
+        }
+        self.last_periodic = Some(now);
+        if self.periodic_emitted >= self.max_periodic_events {
+            if self.periodic_limit_reported {
+                return None;
+            }
+            self.periodic_limit_reported = true;
+            return Some(self.snapshot(phase, ProgressKind::Periodic, now, true));
+        }
+        self.periodic_emitted = self.periodic_emitted.saturating_add(1);
+        Some(self.snapshot(phase, ProgressKind::Periodic, now, false))
+    }
+
+    fn snapshot(
+        &self,
+        phase: &str,
+        kind: ProgressKind,
+        now: Instant,
+        event_limit_reached: bool,
+    ) -> ProgressSnapshot {
+        let (phase, detail_truncated) = truncate_utf8(phase, self.max_detail_bytes);
+        ProgressSnapshot {
+            phase,
+            kind,
+            elapsed: now.duration_since(self.started),
+            detail_truncated,
+            event_limit_reached,
+        }
+    }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value.to_owned(), false);
+    }
+    let mut boundary = max_bytes.min(value.len());
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    (value[..boundary].to_owned(), true)
 }
 
 /// Writes progress to stderr, throttled to 1 update per second.

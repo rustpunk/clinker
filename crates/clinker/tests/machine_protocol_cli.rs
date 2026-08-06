@@ -145,12 +145,15 @@ fn protocol_success_is_one_ordered_machine_only_stream() {
     assert_stream(&stream, "batch-success");
     assert_eq!(stream[0]["event"], "started");
     assert_eq!(stream[0]["plan_identity"]["status"], "pending");
-    assert_eq!(stream[1]["event"], "plan_resolved");
-    assert_eq!(stream[1]["plan_identity"]["status"], "resolved");
-    assert_eq!(stream[1]["plan_identity"]["algorithm"], "blake3");
-    assert_eq!(stream[1]["plan_identity"]["version"], 1);
+    let plan_resolved = stream
+        .iter()
+        .find(|event| event["event"] == "plan_resolved")
+        .expect("plan identity event");
+    assert_eq!(plan_resolved["plan_identity"]["status"], "resolved");
+    assert_eq!(plan_resolved["plan_identity"]["algorithm"], "blake3");
+    assert_eq!(plan_resolved["plan_identity"]["version"], 1);
     assert_eq!(
-        stream[1]["plan_identity"]["digest"]
+        plan_resolved["plan_identity"]["digest"]
             .as_str()
             .expect("digest")
             .len(),
@@ -263,7 +266,7 @@ fn protocol_allows_file_lineage_but_rejects_lineage_stdout() {
     );
     let stream = events(&file_lineage);
     assert_stream(&stream, "lineage-file");
-    assert_eq!(stream[1]["event"], "plan_resolved");
+    assert!(stream.iter().any(|event| event["event"] == "plan_resolved"));
     assert!(directory.path().join("lineage.ndjson").exists());
     assert!(!directory.path().join("lineage-only.csv").exists());
 
@@ -485,8 +488,32 @@ fn machine_protocol_write_failure_before_publication_leaves_final_unchanged() {
         ])
         .output()
         .expect("run broken control channel");
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(130));
     let stream = events(&output);
-    assert!(stream.iter().all(|event| event["event"] != "completed"));
+    assert_eq!(stream.last().expect("terminal")["event"], "cancelled");
+    assert_eq!(stream.iter().filter(|event| terminal(event)).count(), 1);
     assert!(!directory.path().join("must-not-publish.csv").exists());
+}
+
+#[test]
+fn machine_protocol_terminal_write_failure_does_not_undo_published_artifacts() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "published.csv");
+    let output = Command::new(clinker_bin())
+        .current_dir(directory.path())
+        .env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "terminal")
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "terminal-failure",
+        ])
+        .output()
+        .expect("run terminal write failure");
+    assert_eq!(output.status.code(), Some(4));
+    let stream = events(&output);
+    assert!(stream.iter().all(|event| !terminal(event)));
+    assert!(directory.path().join("published.csv").exists());
 }
