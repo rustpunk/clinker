@@ -37,3 +37,4 @@ runtime.resource.memory_budget_exceeded	infrastructure	policy_required
 admission.configuration.memory_budget_unsatisfiable	configuration	do_not_retry
 runtime.resource.spill_failed	infrastructure	retry_with_backoff
 runtime.resource.spill_cap_exceeded	infrastructure	policy_required
+rest.protocol.page_body_limit_reached	source_protocol	policy_required

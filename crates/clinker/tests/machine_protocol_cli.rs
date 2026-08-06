@@ -4,6 +4,8 @@ use std::process::{Command, Output};
 
 use serde_json::Value;
 
+const OVERSIZED_REST_PAGE_BYTES: usize = 64 * 1024 * 1024 + 1;
+
 fn clinker_bin() -> &'static str {
     env!("CARGO_BIN_EXE_clinker")
 }
@@ -384,6 +386,54 @@ fn protocol_failed_terminals_cover_the_exact_retry_vocabulary() {
         terminal["failure"]["code"],
         "rest.protocol.malformed_continuation"
     );
+}
+
+#[test]
+fn protocol_page_body_limit_requires_policy_before_retry() {
+    let directory = fixture();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind server");
+    let url = format!("http://{}", listener.local_addr().expect("server address"));
+    let server = std::thread::spawn(move || {
+        use std::io::{Read as _, Write as _};
+
+        let (mut stream, _) = listener.accept().expect("accept request");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).expect("read request");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {OVERSIZED_REST_PAGE_BYTES}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write response headers");
+
+        let chunk = [b' '; 64 * 1024];
+        let mut remaining = OVERSIZED_REST_PAGE_BYTES;
+        while remaining > 0 {
+            let count = remaining.min(chunk.len());
+            if stream.write_all(&chunk[..count]).is_err() {
+                break;
+            }
+            remaining -= count;
+        }
+        let _ = stream.flush();
+    });
+    write_rest_pipeline(directory.path(), &url, "");
+
+    let output = invoke(
+        directory.path(),
+        &["--machine", "ndjson-v1", "--batch-id", "page-body-limit"],
+    );
+    server.join().expect("server thread");
+    assert_eq!(output.status.code(), Some(4));
+    let stream = events(&output);
+    assert_stream(&stream, "page-body-limit");
+    let terminal = stream.last().expect("failed terminal");
+    assert_eq!(terminal["event"], "failed");
+    assert_eq!(
+        terminal["failure"]["code"],
+        "rest.protocol.page_body_limit_reached"
+    );
+    assert_eq!(terminal["failure"]["category"], "source_protocol");
+    assert_eq!(terminal["failure"]["retry"], "policy_required");
 }
 
 #[test]

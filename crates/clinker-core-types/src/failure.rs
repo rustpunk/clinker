@@ -213,6 +213,7 @@ failure_registry! {
     "admission.configuration.memory_budget_unsatisfiable", Configuration, DoNotRetry, "configured memory budget is below the runtime baseline";
     "runtime.resource.spill_failed", Infrastructure, RetryWithBackoff, "runtime spill storage failed";
     "runtime.resource.spill_cap_exceeded", Infrastructure, PolicyRequired, "configured spill budget was exceeded";
+    "rest.protocol.page_body_limit_reached", SourceProtocol, PolicyRequired, "REST response exceeded the fixed page body limit";
 }
 
 fn registry_entry(code: &str) -> Option<&'static RegistryEntry> {

@@ -355,11 +355,7 @@ impl RestRecordSource {
             self.pages_fetched.saturating_add(1),
             url.diagnostic_target(),
         );
-        let code = if matches!(failure, RequestFailure::HttpStatus(400..=499)) {
-            "rest.http.client_error"
-        } else {
-            "infrastructure.runtime.source_unavailable"
-        };
+        let code = failure.classification_code();
         FormatError::classified(code, message)
     }
 
@@ -528,6 +524,14 @@ enum RequestFailure {
 }
 
 impl RequestFailure {
+    const fn classification_code(self) -> &'static str {
+        match self {
+            Self::HttpStatus(400..=499) => "rest.http.client_error",
+            Self::BodyLimit => "rest.protocol.page_body_limit_reached",
+            _ => "infrastructure.runtime.source_unavailable",
+        }
+    }
+
     fn from_transport(error: &ureq::Error) -> Self {
         match error {
             ureq::Error::StatusCode(status) => Self::HttpStatus(*status),
@@ -914,5 +918,21 @@ mod tests {
             error.classification_code(),
             Some("rest.protocol.malformed_continuation")
         );
+    }
+
+    #[test]
+    fn page_body_limit_is_a_policy_required_protocol_failure() {
+        use clinker_core_types::{FailureCategory, FailureClassification, RetryAdvice};
+
+        let transport_error = ureq::Error::BodyExceedsLimit(MAX_PAGE_BYTES);
+        let request_failure = RequestFailure::from_transport(&transport_error);
+        assert!(matches!(request_failure, RequestFailure::BodyLimit));
+
+        let code = request_failure.classification_code();
+        assert_eq!(code, "rest.protocol.page_body_limit_reached");
+        let classification =
+            FailureClassification::for_code(code).expect("registered page body limit");
+        assert_eq!(classification.category(), FailureCategory::SourceProtocol);
+        assert_eq!(classification.retry_advice(), RetryAdvice::PolicyRequired);
     }
 }
