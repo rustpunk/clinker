@@ -3815,7 +3815,7 @@ fn bind_composition(
     let mut bound_body = BoundBody::empty(resolved_path);
     bound_body.body_scope = body_id.into();
     bound_body.semantic_name = body_file.signature.name.clone();
-    bound_body.content_digest = body_file.content_digest;
+    bound_body.content_digest = body_file.semantic_digest;
     bound_body.graph = body_graph;
     bound_body.topo_order = body_topo;
     bound_body.name_to_idx = body_name_to_idx;

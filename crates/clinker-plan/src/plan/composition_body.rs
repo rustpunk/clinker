@@ -108,7 +108,8 @@ pub struct BoundBody {
     /// User-facing `_compose.name`, retained without its physical path.
     pub semantic_name: String,
 
-    /// BLAKE3 of the exact composition source bytes read during planning.
+    /// BLAKE3 of the canonical parsed composition content, excluding
+    /// deployment-only locators.
     pub content_digest: [u8; 32],
 
     /// Body's mini-DAG of lowered `PlanNode`s. NodeIndices here live

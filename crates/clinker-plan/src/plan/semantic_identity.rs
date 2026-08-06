@@ -364,6 +364,14 @@ nodes:
     }
 
     fn compile_workspace(workspace: &Path, pipeline: &Path) -> CompiledPlan {
+        compile_workspace_with_catalog(workspace, pipeline, &CatalogConfig::default())
+    }
+
+    fn compile_workspace_with_catalog(
+        workspace: &Path,
+        pipeline: &Path,
+        catalog_config: &CatalogConfig,
+    ) -> CompiledPlan {
         let config = load_config(pipeline).expect("load workspace pipeline");
         let pipeline_dir = pipeline
             .parent()
@@ -381,8 +389,8 @@ nodes:
         context.composition_body_identities = identities;
         let roots = collect_direct_imports(&fields).expect("collect direct module roots");
         if !roots.is_empty() {
-            let catalog = WorkspaceCatalog::load(workspace, &CatalogConfig::default())
-                .expect("load workspace catalog");
+            let catalog =
+                WorkspaceCatalog::load(workspace, catalog_config).expect("load workspace catalog");
             let rules_root = catalog
                 .select_rules_root(None, config.pipeline.rules_path.as_deref().map(Path::new))
                 .expect("resolve rules root");
@@ -652,6 +660,26 @@ nodes:
         let first = compile_workspace(workspace.path(), &pipeline)
             .semantic_fingerprint()
             .expect("first module identity");
+        std::fs::write(
+            rules.join("shared/base.cxl"),
+            "# equivalent formatting\r\n\r\nfn bump ( x ) = x + 1\r\n",
+        )
+        .expect("reformat dependency module");
+        let reformatted = compile_workspace(workspace.path(), &pipeline)
+            .semantic_fingerprint()
+            .expect("reformatted module identity");
+        assert_eq!(first, reformatted);
+
+        std::fs::write(
+            rules.join("root.cxl"),
+            "use shared.base\nfn bump(x) = base.bump(x)\n",
+        )
+        .expect("use implicit default alias");
+        let implicit_alias = compile_workspace(workspace.path(), &pipeline)
+            .semantic_fingerprint()
+            .expect("implicit-alias module identity");
+        assert_eq!(first, implicit_alias);
+
         std::fs::write(rules.join("shared/base.cxl"), "fn bump(x) = x + 2\n")
             .expect("change dependency module");
         let second = compile_workspace(workspace.path(), &pipeline)
@@ -693,6 +721,24 @@ nodes:
             .semantic_fingerprint()
             .expect("direct visibility identity");
         assert_ne!(third, visible_dependency);
+
+        let relocated_rules = workspace.path().join("relocated-rules");
+        std::fs::create_dir_all(&relocated_rules).expect("create relocated rules");
+        std::fs::rename(
+            rules.join("shared/base.cxl"),
+            relocated_rules.join("base.cxl"),
+        )
+        .expect("relocate dependency module");
+        let mut relocated_catalog = CatalogConfig::default();
+        relocated_catalog.rules.insert(
+            "shared.base".to_owned(),
+            std::path::PathBuf::from("relocated-rules/base.cxl"),
+        );
+        let relocated =
+            compile_workspace_with_catalog(workspace.path(), &pipeline, &relocated_catalog)
+                .semantic_fingerprint()
+                .expect("relocated module identity");
+        assert_eq!(third, relocated);
     }
 
     #[test]
@@ -740,6 +786,27 @@ nodes:
             .expect("second body identity");
         assert_ne!(first, second);
 
+        std::fs::write(
+            &body,
+            r#"# equivalent composition formatting
+nodes:
+  - config: { cxl: "emit id = id + 2" }
+    input: inp
+    name: mapped
+    type: transform
+_compose:
+  outputs: { out: mapped }
+  inputs:
+    inp: { schema: [{ type: int, name: id }] }
+  name: gate
+"#,
+        )
+        .expect("reformat body");
+        let reformatted = compile_workspace(workspace.path(), &pipeline)
+            .semantic_fingerprint()
+            .expect("reformatted body identity");
+        assert_eq!(second, reformatted);
+
         let relocated = compositions.join("relocated.comp.yaml");
         std::fs::rename(&body, &relocated).expect("relocate body");
         let relocated_yaml = yaml.replace("gate.comp.yaml", "relocated.comp.yaml");
@@ -747,6 +814,6 @@ nodes:
         let relocated_identity = compile_workspace(workspace.path(), &pipeline)
             .semantic_fingerprint()
             .expect("relocated body identity");
-        assert_eq!(second, relocated_identity);
+        assert_eq!(reformatted, relocated_identity);
     }
 }
