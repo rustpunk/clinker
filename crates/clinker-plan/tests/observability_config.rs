@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use clinker_plan::config::{
-    ClinkerToml, CompileContext, FieldPolicyAction, LineageDatasetIdentity,
-    LineageIdentityMode, ObservabilityAuth, ObservabilityDropPolicy, parse_config,
+    ClinkerToml, CompileContext, FieldPolicyAction, LineageDatasetIdentity, LineageIdentityMode,
+    ObservabilityAuth, ObservabilityDropPolicy, parse_config,
 };
 
 const PIPELINE: &str = r#"
@@ -150,10 +150,7 @@ fn resolves_complete_policy() {
         policy.field_policies()[1].action(),
         FieldPolicyAction::Replace
     );
-    assert_eq!(
-        policy.field_policies()[1].replacement(),
-        Some("[redacted]")
-    );
+    assert_eq!(policy.field_policies()[1].replacement(), Some("[redacted]"));
 
     let reference = ClinkerToml::parse(&configured_policy(
         "mode = \"reference\"\nreference = \"telemetry/production\"",

@@ -23,10 +23,10 @@ use std::path::{Path, PathBuf};
 
 /// Top-level `clinker.toml` document.
 ///
-/// The `[storage]`, `[channel]`, and `[group]` tables are modeled. Any other
-/// top-level table is tolerated rather than rejected — this type is consulted
-/// for the storage scaffold and the channel/group layout roots, so unknown
-/// top-level tables (future workspace-discovery keys) pass through untouched.
+/// The `[storage]`, `[observability]`, `[channel]`, and `[group]` tables are
+/// modeled. Any other top-level table is tolerated rather than rejected — this
+/// type is consulted for workspace deployment policy and layout roots, so
+/// unknown top-level tables (future workspace-discovery keys) pass through.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClinkerToml {
     /// Typed workspace resource catalog. Logical names are scoped by kind,
@@ -37,6 +37,10 @@ pub struct ClinkerToml {
     /// OS temp dir, staging off), matching pre-config behavior exactly.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// Complete deployment observability policy. Absence means disabled;
+    /// presence is resolved atomically before any execution effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observability: Option<super::observability::ObservabilityConfig>,
     /// The `[channel]` table: the workspace root under which per-channel
     /// folders live and the directory-sharding scheme used to enumerate them.
     /// Absent → `root = "channel"`, `shard = none` (see [`ChannelLayout`]).
@@ -57,6 +61,29 @@ impl ClinkerToml {
     /// or contains a key whose type does not match the schema.
     pub fn parse(text: &str) -> Result<Self, StorageConfigError> {
         toml::from_str(text).map_err(|e| StorageConfigError::Parse(e.to_string()))
+    }
+
+    /// Resolve an absent policy as disabled or one present policy atomically.
+    ///
+    /// A complete replacement is accepted only when the workspace table is
+    /// absent. Field-by-field merging is deliberately unsupported.
+    pub fn resolve_observability(
+        &self,
+        complete_replacement: Option<super::observability::ResolvedObservabilityPolicy>,
+    ) -> Result<
+        super::observability::ResolvedObservabilityPolicy,
+        super::observability::ObservabilityConfigError,
+    > {
+        match (&self.observability, complete_replacement) {
+            (Some(_), Some(_)) => Err(super::observability::ObservabilityConfigError::invalid(
+                "observability",
+                "conflicts with a complete resolved replacement",
+                "remove the `[observability]` table to use the complete replacement, or omit the replacement to use workspace policy",
+            )),
+            (None, Some(replacement)) => Ok(replacement),
+            (Some(config), None) => config.resolve(),
+            (None, None) => Ok(super::observability::ResolvedObservabilityPolicy::disabled()),
+        }
     }
 
     /// Read and parse the `clinker.toml` at `workspace_root`, returning the
