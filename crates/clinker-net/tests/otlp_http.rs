@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use clinker_core_types::{FailureCategory, RetryAdvice};
 use ureq::http::HeaderMap;
 use ureq::http::header::{AUTHORIZATION, HeaderName, HeaderValue};
 
@@ -17,8 +18,8 @@ mod otlp_under_test;
 
 use otlp_under_test::{
     OtlpAuthentication, OtlpCredentialApplicationError, OtlpCredentialApplicator,
-    OtlpCredentialRequest, OtlpDeliveryBudget, OtlpSignal, admitted_loopback_endpoint,
-    send_otlp_json,
+    OtlpCredentialRequest, OtlpDeliveryBudget, OtlpDeliveryFailureKind, OtlpRetryCause, OtlpSignal,
+    admit_otlp_endpoint, admitted_loopback_endpoint, send_otlp_json,
 };
 
 #[derive(Debug)]
@@ -67,7 +68,7 @@ fn read_request(stream: &mut TcpStream) -> CapturedRequest {
 
 fn spawn_server(
     response_status: u16,
-    response_body: &'static [u8],
+    response_body: Vec<u8>,
 ) -> (std::net::SocketAddr, thread::JoinHandle<CapturedRequest>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind OTLP fixture");
     let address = listener.local_addr().expect("fixture address");
@@ -87,10 +88,87 @@ fn spawn_server(
             .write_all(response.as_bytes())
             .expect("write response headers");
         stream
-            .write_all(response_body)
+            .write_all(&response_body)
             .expect("write response body");
         stream.flush().expect("flush response");
         captured
+    });
+    (address, handle)
+}
+
+struct FixtureResponse {
+    status: u16,
+    body: Vec<u8>,
+    header_delay: Duration,
+    body_delay: Duration,
+}
+
+impl FixtureResponse {
+    fn immediate(status: u16, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            body,
+            header_delay: Duration::ZERO,
+            body_delay: Duration::ZERO,
+        }
+    }
+
+    fn delayed_headers(delay: Duration) -> Self {
+        Self {
+            status: 200,
+            body: br#"{}"#.to_vec(),
+            header_delay: delay,
+            body_delay: Duration::ZERO,
+        }
+    }
+
+    fn delayed_body(delay: Duration) -> Self {
+        Self {
+            status: 200,
+            body: br#"{}"#.to_vec(),
+            header_delay: Duration::ZERO,
+            body_delay: delay,
+        }
+    }
+}
+
+fn spawn_sequence_server(
+    responses: Vec<FixtureResponse>,
+) -> (
+    std::net::SocketAddr,
+    thread::JoinHandle<Vec<CapturedRequest>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind OTLP sequence fixture");
+    let address = listener.local_addr().expect("sequence fixture address");
+    let handle = thread::spawn(move || {
+        let mut workers = Vec::with_capacity(responses.len());
+        for response in responses {
+            let (mut stream, _) = listener.accept().expect("accept OTLP sequence request");
+            workers.push(thread::spawn(move || {
+                let captured = read_request(&mut stream);
+                thread::sleep(response.header_delay);
+                let reason = if response.status == 200 {
+                    "OK"
+                } else {
+                    "Fixture"
+                };
+                let headers = format!(
+                    "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.status,
+                    response.body.len()
+                );
+                let _ = stream.write_all(headers.as_bytes());
+                let _ = stream.flush();
+                thread::sleep(response.body_delay);
+                let _ = stream.write_all(&response.body);
+                let _ = stream.flush();
+                captured
+            }));
+        }
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("join OTLP response worker"))
+            .collect()
     });
     (address, handle)
 }
@@ -108,6 +186,19 @@ fn budget(max_attempts: u32) -> OtlpDeliveryBudget {
     .expect("valid fixture budget")
 }
 
+fn response_budget(max_attempts: u32, max_response_bytes: u64) -> OtlpDeliveryBudget {
+    OtlpDeliveryBudget::new(
+        64 * 1024,
+        max_response_bytes,
+        max_attempts,
+        Duration::from_secs(1),
+        Duration::from_millis(40),
+        Duration::from_millis(1),
+        Duration::from_secs(2),
+    )
+    .expect("valid response fixture budget")
+}
+
 fn logs_payload() -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "resourceLogs": [{
@@ -120,6 +211,34 @@ fn logs_payload() -> Vec<u8> {
         }]
     }))
     .expect("serialize fixture logs")
+}
+
+fn metrics_payload() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "resourceMetrics": [{
+            "scopeMetrics": [{
+                "metrics": [{
+                    "name": "items.processed",
+                    "gauge": {"dataPoints": [{"asInt": "1"}, {"asInt": "2"}]}
+                }]
+            }]
+        }]
+    }))
+    .expect("serialize fixture metrics")
+}
+
+fn traces_payload() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "resourceSpans": [{
+            "scopeSpans": [{
+                "spans": [
+                    {"traceId": "00112233445566778899aabbccddeeff", "spanId": "0011223344556677"},
+                    {"traceId": "ffeeddccbbaa99887766554433221100", "spanId": "7766554433221100"}
+                ]
+            }]
+        }]
+    }))
+    .expect("serialize fixture traces")
 }
 
 struct FixtureCredential {
@@ -175,7 +294,7 @@ fn endpoint_admission_and_successful_post() {
     }
 
     let payload = logs_payload();
-    let (address, handle) = spawn_server(200, br#"{}"#);
+    let (address, handle) = spawn_server(200, br#"{}"#.to_vec());
     let endpoint = admitted_loopback_endpoint(address);
     let outcome = send_otlp_json(
         &endpoint,
@@ -213,7 +332,7 @@ fn endpoint_admission_and_successful_post() {
     let credential = FixtureCredential {
         applied_after_admission: Arc::clone(&applied_after_admission),
     };
-    let (address, handle) = spawn_server(200, br#"{}"#);
+    let (address, handle) = spawn_server(200, br#"{}"#.to_vec());
     let endpoint = admitted_loopback_endpoint(address);
     let outcome = send_otlp_json(
         &endpoint,
@@ -244,4 +363,246 @@ fn endpoint_admission_and_successful_post() {
         request_headers.get(AUTHORIZATION).unwrap(),
         "Bearer fixture-value"
     );
+}
+
+#[test]
+fn logs_metrics_traces_and_fault_matrix() {
+    for (signal, payload, route) in [
+        (OtlpSignal::Logs, logs_payload(), "/v1/logs"),
+        (OtlpSignal::Metrics, metrics_payload(), "/v1/metrics"),
+        (OtlpSignal::Traces, traces_payload(), "/v1/traces"),
+    ] {
+        let (address, handle) = spawn_server(200, br#"{}"#.to_vec());
+        let endpoint = admitted_loopback_endpoint(address);
+        let outcome = send_otlp_json(
+            &endpoint,
+            signal,
+            &payload,
+            &budget(1),
+            &|| false,
+            OtlpAuthentication::None,
+        )
+        .expect("fixed-route OTLP delivery");
+        let captured = handle.join().expect("join fixed-route fixture");
+        assert_eq!(captured.target, route);
+        assert_eq!(captured.body, payload);
+        assert_eq!(outcome.accepted(), 2);
+        assert_eq!(outcome.rejected(), 0);
+        assert!(!captured.headers.contains_key("authorization"));
+    }
+
+    for (signal, payload, rejected_key) in [
+        (OtlpSignal::Logs, logs_payload(), "rejectedLogRecords"),
+        (OtlpSignal::Metrics, metrics_payload(), "rejectedDataPoints"),
+        (OtlpSignal::Traces, traces_payload(), "rejectedSpans"),
+    ] {
+        let response = serde_json::to_vec(&serde_json::json!({
+            "partialSuccess": {rejected_key: "1", "errorMessage": "fixture rejection"}
+        }))
+        .expect("serialize partial-success fixture");
+        let (address, handle) = spawn_server(200, response);
+        let endpoint = admitted_loopback_endpoint(address);
+        let outcome = send_otlp_json(
+            &endpoint,
+            signal,
+            &payload,
+            &budget(1),
+            &|| false,
+            OtlpAuthentication::None,
+        )
+        .expect("signal-specific partial success");
+        handle.join().expect("join partial-success fixture");
+        assert_eq!(outcome.accepted(), 1);
+        assert_eq!(outcome.rejected(), 1);
+    }
+
+    let (address, handle) = spawn_sequence_server(vec![
+        FixtureResponse::immediate(503, br#"{"collector":"unavailable"}"#.to_vec()),
+        FixtureResponse::immediate(200, br#"{}"#.to_vec()),
+    ]);
+    let endpoint = admitted_loopback_endpoint(address);
+    let outcome = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &budget(2),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect("bounded transient-status retry");
+    assert_eq!(outcome.attempts(), 2);
+    assert_eq!(handle.join().expect("join retry fixture").len(), 2);
+
+    for (status, cause) in [
+        (429, OtlpRetryCause::CollectorThrottled),
+        (502, OtlpRetryCause::CollectorUnavailable),
+        (503, OtlpRetryCause::CollectorUnavailable),
+        (504, OtlpRetryCause::CollectorUnavailable),
+    ] {
+        let secret_body = br#"{"authorization":"Bearer must-not-escape"}"#.to_vec();
+        let (address, handle) = spawn_server(status, secret_body);
+        let endpoint = admitted_loopback_endpoint(address);
+        let failure = send_otlp_json(
+            &endpoint,
+            OtlpSignal::Logs,
+            &logs_payload(),
+            &budget(1),
+            &|| false,
+            OtlpAuthentication::None,
+        )
+        .expect_err("retryable status must exhaust the finite one-attempt budget");
+        handle.join().expect("join exhausted-status fixture");
+        assert_eq!(
+            failure.kind(),
+            OtlpDeliveryFailureKind::RetryExhausted(cause)
+        );
+        let classification = failure.classification().expect("classified retry advice");
+        assert_eq!(classification.category(), FailureCategory::Observability);
+        assert_eq!(classification.retry_advice(), RetryAdvice::RetryWithBackoff);
+        assert!(!failure.to_string().contains("must-not-escape"));
+        assert!(!format!("{failure:?}").contains("Bearer must-not-escape"));
+    }
+
+    let (address, handle) = spawn_server(
+        400,
+        br#"{"error":"tenant and credential details must-not-escape"}"#.to_vec(),
+    );
+    let endpoint = admitted_loopback_endpoint(address);
+    let failure = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &budget(3),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect_err("permanent 4xx rejection");
+    handle.join().expect("join permanent-rejection fixture");
+    assert_eq!(failure.kind(), OtlpDeliveryFailureKind::CollectorRejected);
+    assert_eq!(failure.attempts(), 1);
+    assert_eq!(
+        failure
+            .classification()
+            .expect("classified permanent rejection")
+            .retry_advice(),
+        RetryAdvice::PolicyRequired
+    );
+    assert!(!failure.to_string().contains("must-not-escape"));
+
+    let (address, handle) =
+        spawn_server(200, br#"{"partialSuccess":{"rejectedSpans":"1"}}"#.to_vec());
+    let endpoint = admitted_loopback_endpoint(address);
+    let failure = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &budget(1),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect_err("wrong-signal partial success must fail closed");
+    handle.join().expect("join malformed-response fixture");
+    assert_eq!(failure.kind(), OtlpDeliveryFailureKind::MalformedResponse);
+
+    let (address, handle) = spawn_server(200, br#"{}padding"#.to_vec());
+    let endpoint = admitted_loopback_endpoint(address);
+    let failure = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &response_budget(1, 2),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect_err("response cap must fail before parsing");
+    handle.join().expect("join oversized-response fixture");
+    assert_eq!(failure.kind(), OtlpDeliveryFailureKind::ResponseTooLarge);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind connect-failure fixture");
+    let unavailable_address = listener.local_addr().expect("connect-failure address");
+    drop(listener);
+    let endpoint = admitted_loopback_endpoint(unavailable_address);
+    let failure = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &budget(1),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect_err("connect failure must be typed");
+    assert_eq!(
+        failure.kind(),
+        OtlpDeliveryFailureKind::RetryExhausted(OtlpRetryCause::Connect)
+    );
+
+    let shutdown_endpoint = admitted_loopback_endpoint("127.0.0.1:1".parse().unwrap());
+    let failure = send_otlp_json(
+        &shutdown_endpoint,
+        OtlpSignal::Metrics,
+        &metrics_payload(),
+        &budget(2),
+        &|| true,
+        OtlpAuthentication::None,
+    )
+    .expect_err("shutdown must stop before request construction");
+    assert_eq!(failure.kind(), OtlpDeliveryFailureKind::Shutdown);
+    assert_eq!(failure.attempts(), 0);
+    assert!(failure.classification().is_none());
+
+    let (address, handle) = spawn_sequence_server(vec![
+        FixtureResponse::delayed_headers(Duration::from_millis(120)),
+        FixtureResponse::immediate(200, br#"{}"#.to_vec()),
+    ]);
+    let endpoint = admitted_loopback_endpoint(address);
+    let outcome = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Traces,
+        &traces_payload(),
+        &response_budget(2, 4 * 1024),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect("response-header timeout must consume one bounded retry");
+    assert_eq!(outcome.attempts(), 2);
+    assert_eq!(handle.join().expect("join header-timeout fixture").len(), 2);
+
+    let (address, handle) = spawn_sequence_server(vec![
+        FixtureResponse::delayed_body(Duration::from_millis(120)),
+        FixtureResponse::immediate(200, br#"{}"#.to_vec()),
+    ]);
+    let endpoint = admitted_loopback_endpoint(address);
+    let outcome = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Metrics,
+        &metrics_payload(),
+        &response_budget(2, 4 * 1024),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect("response-body timeout must consume one bounded retry");
+    assert_eq!(outcome.attempts(), 2);
+    assert_eq!(handle.join().expect("join body-timeout fixture").len(), 2);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind TLS fixture");
+    let address = listener.local_addr().expect("TLS fixture address");
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept TLS fixture");
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+        let _ = stream.flush();
+    });
+    let endpoint = admit_otlp_endpoint(&format!("https://{address}"))
+        .expect("admit loopback HTTPS origin for TLS failure");
+    let failure = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &budget(1),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect_err("plaintext collector on HTTPS origin must be a TLS failure");
+    handle.join().expect("join TLS fixture");
+    assert_eq!(failure.kind(), OtlpDeliveryFailureKind::Tls);
 }
