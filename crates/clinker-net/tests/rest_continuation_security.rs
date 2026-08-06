@@ -531,9 +531,19 @@ fn offered_continuation_beyond_page_bound_fails_instead_of_truncating() {
     let _guard = network_test_guard();
     let server = TestServer::spawn(vec![ok(&[("Link", "</next>; rel=next")], 1)]);
     let mut reader = reader(&format!("{}/start", server.url), 1);
-    let error = drain_ids(reader.as_mut()).expect_err("page-bound exhaustion must fail");
+    assert!(
+        reader.next_record().expect("first page").is_some(),
+        "first admitted page must produce its record"
+    );
+    let error = reader
+        .next_record()
+        .expect_err("page-bound exhaustion must fail");
+    assert_eq!(
+        error.classification_code(),
+        Some("rest.protocol.page_limit_reached")
+    );
     assert_classification(
-        &error,
+        &error.to_string(),
         "rest.protocol.page_limit_reached",
         "source_protocol",
         "policy_required",

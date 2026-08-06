@@ -230,14 +230,17 @@ impl RestRecordSource {
             None => return Ok(false),
         };
         if self.pages_fetched >= self.cfg.max_pages {
-            return Err(io_err(format!(
-                "{}; rest source {:?}: page_limit_reached max_pages={} next_page={} target={}",
-                ContinuationError::for_code("rest.protocol.page_limit_reached"),
-                self.source_name,
-                self.cfg.max_pages,
-                self.pages_fetched.saturating_add(1),
-                url.diagnostic_target(),
-            )));
+            return Err(FormatError::classified(
+                "rest.protocol.page_limit_reached",
+                format!(
+                    "{}; rest source {:?}: page_limit_reached max_pages={} next_page={} target={}",
+                    ContinuationError::for_code("rest.protocol.page_limit_reached"),
+                    self.source_name,
+                    self.cfg.max_pages,
+                    self.pages_fetched.saturating_add(1),
+                    url.diagnostic_target(),
+                ),
+            ));
         }
         if !self.visited_pages.insert(url.as_str().to_owned()) {
             return Err(continuation_format_error(ContinuationError::for_code(
