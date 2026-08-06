@@ -174,6 +174,22 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_polling_advances_a_separate_advisory_checkpoint() {
+        let token = ShutdownToken::detached();
+        assert_eq!(token.progress_checkpoints(), 0);
+        assert!(!token.is_requested());
+        assert!(!token.is_requested());
+        assert_eq!(token.progress_checkpoints(), 2);
+
+        assert!(token.try_begin_publication());
+        let before = token.progress_checkpoints();
+        token.request();
+        assert_eq!(token.progress_checkpoints(), before);
+        assert!(!token.is_requested());
+        assert_eq!(token.progress_checkpoints(), before + 1);
+    }
+
+    #[test]
     fn test_exit_codes_documented() {
         use crate::exit_codes::*;
         assert_eq!(EXIT_SUCCESS, 0);

@@ -368,3 +368,125 @@ fn protocol_failed_terminals_cover_the_exact_retry_vocabulary() {
         "rest.protocol.malformed_continuation"
     );
 }
+
+#[test]
+fn machine_protocol_zero_record_run_has_full_lifecycle_and_artifact_truth() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "zero.csv");
+    std::fs::write(directory.path().join("input.csv"), "id,name\n").expect("empty input");
+    let output = invoke(
+        directory.path(),
+        &["--machine", "ndjson-v1", "--batch-id", "zero"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stream = events(&output);
+    assert_stream(&stream, "zero");
+    for phase in ["planning", "executing", "finalizing", "publishing"] {
+        assert!(
+            stream.iter().any(|event| {
+                event["event"] == "progress"
+                    && event["progress"]["kind"] == "transition"
+                    && event["progress"]["phase"] == phase
+            }),
+            "missing phase {phase}: {stream:?}"
+        );
+    }
+    let completed = stream.last().expect("completed terminal");
+    assert_eq!(completed["event"], "completed");
+    let artifacts = completed["publication"]["artifacts"]
+        .as_array()
+        .expect("artifact results");
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0]["kind"], "primary");
+    assert_eq!(artifacts[0]["state"], "published");
+    assert_eq!(
+        artifacts[0].as_object().expect("artifact object").len(),
+        3,
+        "only artifact_id, kind, and state are public"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout)
+            .contains(directory.path().to_string_lossy().as_ref())
+    );
+}
+
+#[test]
+fn machine_protocol_dlq_is_completed_with_dlq_and_path_free_artifacts() {
+    let directory = fixture();
+    std::fs::write(directory.path().join("input.csv"), "id,amount\n1,10\n2,0\n")
+        .expect("DLQ input");
+    std::fs::write(
+        directory.path().join("pipeline.yaml"),
+        r#"pipeline: { name: machine_dlq }
+error_handling:
+  strategy: continue
+  dlq: { path: rejected.ndjson }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      path: input.csv
+      type: csv
+      schema:
+        - { name: id, type: int }
+        - { name: amount, type: int }
+  - type: transform
+    name: map
+    input: src
+    config:
+      cxl: "emit amount = if(amount == 0) then (1 / 0) else amount"
+  - type: output
+    name: out
+    input: map
+    config: { name: out, path: out.csv, type: csv }
+"#,
+    )
+    .expect("DLQ pipeline");
+    let output = invoke(
+        directory.path(),
+        &["--machine", "ndjson-v1", "--batch-id", "dlq"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let stream = events(&output);
+    assert_stream(&stream, "dlq");
+    let completed = stream.last().expect("completed terminal");
+    assert_eq!(completed["event"], "completed");
+    assert_eq!(completed["result"], "completed_with_dlq");
+    let artifacts = completed["publication"]["artifacts"]
+        .as_array()
+        .expect("artifact results");
+    assert!(artifacts.iter().any(|artifact| artifact["kind"] == "dlq"));
+    assert!(
+        artifacts
+            .iter()
+            .all(|artifact| artifact["state"] == "published")
+    );
+}
+
+#[test]
+fn machine_protocol_write_failure_before_publication_leaves_final_unchanged() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "must-not-publish.csv");
+    let output = Command::new(clinker_bin())
+        .current_dir(directory.path())
+        .env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "finalizing")
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "broken-control",
+        ])
+        .output()
+        .expect("run broken control channel");
+    assert!(!output.status.success());
+    let stream = events(&output);
+    assert!(stream.iter().all(|event| event["event"] != "completed"));
+    assert!(!directory.path().join("must-not-publish.csv").exists());
+}

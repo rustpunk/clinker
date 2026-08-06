@@ -217,4 +217,37 @@ mod tests {
         assert!(p1.format().contains("Phase 1 indexing"));
         assert!(p2.format().contains("Phase 2 transforming"));
     }
+
+    #[test]
+    fn machine_progress_coalesces_periodic_updates() {
+        let mut progress = BoundedProgress::default();
+        let first = progress.periodic("executing").expect("first snapshot");
+        assert_eq!(first.kind(), ProgressKind::Periodic);
+        assert!(progress.periodic("executing").is_none());
+    }
+
+    #[test]
+    fn machine_progress_bounds_utf8_detail_and_discardable_events() {
+        let mut progress = BoundedProgress::new(1, 5);
+        let transition = progress.transition("éééé");
+        assert_eq!(transition.phase(), "éé");
+        assert!(transition.detail_truncated());
+        assert!(!transition.event_limit_reached());
+
+        assert!(progress.periodic_at("work", Instant::now()).is_some());
+        let later = Instant::now() + Duration::from_secs(2);
+        let capped = progress
+            .periodic_at("work", later)
+            .expect("one cap notification");
+        assert!(capped.event_limit_reached());
+        assert!(
+            progress
+                .periodic_at("ignored", later + Duration::from_secs(2))
+                .is_none()
+        );
+
+        let finalizing = progress.transition("finalizing");
+        assert_eq!(finalizing.kind(), ProgressKind::Transition);
+        assert!(!finalizing.event_limit_reached());
+    }
 }
