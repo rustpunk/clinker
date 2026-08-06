@@ -314,7 +314,7 @@ fn failed_run_publication_reports_already_visible_artifacts() {
             .iter()
             .map(|artifact| artifact.state())
             .collect::<Vec<_>>(),
-        [ArtifactState::Published, ArtifactState::Unpublished]
+        [ArtifactState::Published, ArtifactState::Promoting]
     );
 }
 

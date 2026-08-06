@@ -4932,11 +4932,12 @@ impl AttemptPublication {
                 for (manifest, runtime) in
                     incomplete.artifacts.iter_mut().zip(self.artifacts.iter())
                 {
-                    manifest.state = if registry.is_committed_path(&runtime.final_path) {
-                        ArtifactState::Published
-                    } else {
-                        ArtifactState::Unpublished
-                    };
+                    // A committed ledger entry is definitive. Otherwise retain
+                    // durable promotion intent so a fresh handle-relative query
+                    // can reconcile whether the rename became visible.
+                    if registry.is_committed_path(&runtime.final_path) {
+                        manifest.state = ArtifactState::Published;
+                    }
                 }
                 self.persist_replacement(incomplete, false)?;
                 self.terminal = true;
