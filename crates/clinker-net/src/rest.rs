@@ -411,10 +411,7 @@ impl RestRecordSource {
         let mut attempt: u32 = 0;
         loop {
             if self.shutdown.as_ref().is_some_and(|t| t.is_requested()) {
-                return Err(io_err(format!(
-                    "rest source {:?}: shutdown requested mid-request",
-                    self.source_name
-                )));
+                return Err(FormatError::Interrupted);
             }
             let mut url = start_url.clone();
             let mut redirects = HashSet::from([url.as_str().to_owned()]);
@@ -494,6 +491,9 @@ impl RestRecordSource {
                 };
                 return Ok(PageResponse { body, next_link });
             };
+            if self.shutdown.as_ref().is_some_and(|t| t.is_requested()) {
+                return Err(FormatError::Interrupted);
+            }
             if attempt < self.cfg.retries {
                 attempt = attempt.saturating_add(1);
                 continue;

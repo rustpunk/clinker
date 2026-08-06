@@ -32,6 +32,11 @@ pub enum FormatError {
         code: &'static str,
         message: String,
     },
+    /// The owning run requested cancellation while a blocking reader was
+    /// between bounded operations. This is control flow, not a source or
+    /// transport failure; the executor converts it to
+    /// `PipelineError::Interrupted` at the reader boundary.
+    Interrupted,
     Io(std::io::Error),
     Csv(csv::Error),
     Json(String),
@@ -265,6 +270,7 @@ impl fmt::Display for FormatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Classified { code, message } => write!(f, "[{code}] {message}"),
+            Self::Interrupted => f.write_str("source read interrupted"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Csv(e) => write!(f, "CSV error: {e}"),
             Self::Json(msg) => write!(f, "JSON error: {msg}"),

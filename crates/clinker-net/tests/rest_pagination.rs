@@ -543,3 +543,30 @@ fn shutdown_request_stops_the_reader_at_the_next_page_boundary() {
         "only the first page's rows are emitted before the interrupt"
     );
 }
+
+#[test]
+fn shutdown_between_retries_surfaces_as_typed_interruption() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind retry server");
+    let address = listener.local_addr().expect("retry server address");
+    let token = ShutdownToken::detached();
+    let server_token = token.clone();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept first request");
+        read_request(&mut stream).expect("read first request");
+        server_token.request();
+        let response =
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        stream.write_all(response).expect("write retry response");
+        stream.flush().expect("flush retry response");
+    });
+    let url = format!("http://{address}/rows");
+    let mut reader = build_reader("", 1, &url);
+    reader.set_shutdown_token(token);
+
+    let error = reader
+        .next_record()
+        .expect_err("shutdown between retries must interrupt");
+    handle.join().expect("join retry server");
+
+    assert!(matches!(error, clinker_format::FormatError::Interrupted));
+}

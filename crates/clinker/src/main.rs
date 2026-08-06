@@ -920,11 +920,15 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     let exit_code = pipeline_error_exit_code(&e);
-                    if let Some(emitter) = machine.as_ref()
-                        && let Err(error) =
+                    if let Some(emitter) = machine.as_ref() {
+                        let terminal_result = if matches!(e, PipelineError::Interrupted) {
+                            emitter.emit_completed(exit_code)
+                        } else {
                             emitter.emit_failed(exit_code, &classify_pipeline_error(&e))
-                    {
-                        eprintln!("clinker: cannot write machine terminal event: {error}");
+                        };
+                        if let Err(error) = terminal_result {
+                            eprintln!("clinker: cannot write machine terminal event: {error}");
+                        }
                     }
                     render_pipeline_error(&e, &args.config);
                     ExitCode::from(exit_code)

@@ -701,6 +701,9 @@ fn drive_record_source(
                     )?;
                     break;
                 }
+                Err(clinker_format::FormatError::Interrupted) => {
+                    return Err(PipelineError::Interrupted);
+                }
                 Err(clinker_format::FormatError::DeclaredType(failure)) => {
                     let clinker_format::error::DeclaredTypeFailure {
                         source: _,
