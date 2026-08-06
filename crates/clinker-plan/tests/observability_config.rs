@@ -194,3 +194,241 @@ fn resolves_complete_policy() {
         assert!(!serialized.contains(deployment_key));
     }
 }
+
+fn minimal_policy(auth: &str, datasets: &str) -> String {
+    format!(
+        r#"
+[observability]
+
+[observability.otlp]
+endpoint = "https://collector.example.com"
+
+[observability.otlp.auth]
+{auth}
+
+[observability.lineage]
+
+{datasets}
+"#
+    )
+}
+
+fn canonical_dataset(node: &str) -> String {
+    format!(
+        r#"
+[[observability.lineage.dataset]]
+node = "{node}"
+canonical_datasource = "s3://warehouse/{node}"
+"#
+    )
+}
+
+fn reject(text: &str) -> (String, &'static str) {
+    match ClinkerToml::parse(text) {
+        Ok(document) => {
+            let error = document
+                .resolve_observability(None)
+                .expect_err("configuration must fail before effects");
+            let code = error.classification().code();
+            (error.to_string(), code)
+        }
+        Err(error) => {
+            let code = error
+                .classification()
+                .expect("observability parse failures are classified")
+                .code();
+            (error.to_string(), code)
+        }
+    }
+}
+
+fn assert_rejected(text: &str, field: &str, correction: &str) {
+    let (rendered, code) = reject(text);
+    assert_eq!(code, "observability.configuration.invalid", "{rendered}");
+    assert!(rendered.contains(field), "{rendered}");
+    assert!(rendered.contains(correction), "{rendered}");
+}
+
+#[test]
+fn rejects_before_effects() {
+    let sentinel = tempfile::tempdir().expect("create side-effect sentinel directory");
+    let canonical = canonical_dataset("src");
+    let valid = minimal_policy("mode = \"none\"", &canonical);
+
+    let raw_cases = [
+        (
+            valid.replace(
+                "[observability]\n",
+                "[observability]\nqueue_mode = \"blocking\"\n",
+            ),
+            "observability.queue_mode",
+            "remove `queue_mode`",
+        ),
+        (
+            valid.replace(
+                "[observability.lineage]\n",
+                "[observability.lineage]\narena_bytes = \"1MB\"\n",
+            ),
+            "observability.lineage.arena_bytes",
+            "remove `arena_bytes`",
+        ),
+        (
+            minimal_policy("", &canonical),
+            "observability.otlp.auth.mode",
+            "mode = \"none\"",
+        ),
+        (
+            minimal_policy("mode = \"none\"\nreference = \"private-token\"", &canonical),
+            "observability.otlp.auth.reference",
+            "mode = \"none\"",
+        ),
+        (
+            minimal_policy("mode = \"none\"\nheaders = { authorization = \"private-token\" }", &canonical),
+            "observability.otlp.auth.headers",
+            "mode = \"none\"",
+        ),
+        (
+            minimal_policy("mode = \"basic\"\npassword = \"private-token\"", &canonical),
+            "observability.otlp.auth.mode",
+            "mode = \"none\"",
+        ),
+        (
+            minimal_policy("mode = \"reference\"\nreference = \"\"", &canonical),
+            "observability.otlp.auth.reference",
+            "telemetry/production",
+        ),
+        (
+            valid.replace(
+                "[observability]\n",
+                "[observability]\narena_bytes = 1000\nordinary_lane_bytes = 600\nhigh_severity_lane_bytes = 300\n",
+            ),
+            "observability.arena_bytes",
+            "exact sum",
+        ),
+        (
+            valid.replace(
+                "[observability]\n",
+                "[observability]\nmax_batch_bytes = 0\n",
+            ),
+            "observability.max_batch_bytes",
+            "256KB",
+        ),
+        (
+            valid.replace(
+                "[observability.lineage]\n",
+                "[observability.lineage]\nqueue_bytes = 0\n",
+            ),
+            "observability.lineage.queue_bytes",
+            "1MB",
+        ),
+        (
+            valid.replace(
+                "[observability.lineage]\n",
+                "[observability.lineage]\nmax_event_bytes = \"2MB\"\n",
+            ),
+            "observability.lineage.max_event_bytes",
+            "64KB",
+        ),
+        (
+            valid.replace(
+                "[observability.lineage]\n",
+                "[observability.lineage]\nidentity_mode = \"paths\"\n",
+            ),
+            "observability.lineage.identity_mode",
+            "local_diagnostic_paths",
+        ),
+        (
+            minimal_policy("mode = \"none\"", ""),
+            "observability.lineage.dataset",
+            "exactly one canonical or catalog identity",
+        ),
+        (
+            minimal_policy(
+                "mode = \"none\"",
+                &format!("{canonical}{canonical}"),
+            ),
+            "observability.lineage.dataset.node",
+            "exactly one dataset binding",
+        ),
+        (
+            minimal_policy(
+                "mode = \"none\"",
+                r#"
+[[observability.lineage.dataset]]
+node = "src"
+catalog_namespace = "analytics"
+"#,
+            ),
+            "observability.lineage.dataset.catalog_name",
+            "catalog_name",
+        ),
+        (
+            minimal_policy(
+                "mode = \"none\"",
+                r#"
+[[observability.lineage.dataset]]
+node = "src"
+canonical_datasource = "s3://warehouse/src"
+catalog_namespace = "analytics"
+catalog_name = "src"
+"#,
+            ),
+            "observability.lineage.dataset",
+            "keep only `canonical_datasource`",
+        ),
+        (
+            format!(
+                "{valid}\n[[observability.field_policy]]\nevent = \"run.completed\"\nfield = \"count\"\naction = \"replace\"\n"
+            ),
+            "observability.field_policy.replacement",
+            "[redacted]",
+        ),
+        (
+            format!(
+                "{valid}\n[[observability.field_policy]]\nevent = \"run.completed\"\nfield = \"count\"\naction = \"allow\"\n[[observability.field_policy]]\nevent = \"run.completed\"\nfield = \"count\"\naction = \"hash\"\n"
+            ),
+            "observability.field_policy",
+            "exactly one",
+        ),
+    ];
+
+    for (text, field, correction) in raw_cases {
+        assert_rejected(&text, field, correction);
+    }
+
+    for endpoint in [
+        "http://collector.example.com/path?token=private-token",
+        "opaque collector text with spaces",
+        "HTTPS://Collector.Example.COM:443/root#fragment",
+    ] {
+        let text = valid.replace("https://collector.example.com", endpoint);
+        let policy = ClinkerToml::parse(&text)
+            .expect("raw endpoint text is not interpreted by clinker-plan")
+            .resolve_observability(None)
+            .expect("endpoint admission belongs to the network boundary");
+        assert_eq!(policy.otlp().unwrap().raw_endpoint(), endpoint);
+        assert!(!format!("{policy:?}").contains(endpoint));
+    }
+
+    let empty = valid.replace("https://collector.example.com", "");
+    assert_rejected(
+        &empty,
+        "observability.otlp.endpoint",
+        "https://collector.example.com",
+    );
+    let oversized = valid.replace("https://collector.example.com", &"x".repeat(2_049));
+    assert_rejected(
+        &oversized,
+        "observability.otlp.endpoint",
+        "https://collector.example.com",
+    );
+
+    let secret_bearing = minimal_policy(
+        "mode = \"none\"\nheaders = { authorization = \"private-token\" }",
+        &canonical,
+    );
+    let (rendered, _) = reject(&secret_bearing);
+    assert!(!rendered.contains("private-token"), "{rendered}");
+    assert!(!rendered.contains("authorization"), "{rendered}");
+    assert_eq!(sentinel.path().read_dir().unwrap().count(), 0);
+}
