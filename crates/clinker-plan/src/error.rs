@@ -764,7 +764,7 @@ impl From<crate::runtime_error::SpillError> for PipelineError {
 mod tests {
     use super::*;
     use clinker_core_types::span::Span;
-    use clinker_core_types::{Diagnostic, LabeledSpan};
+    use clinker_core_types::{Diagnostic, FailureCategory, LabeledSpan, RetryAdvice};
 
     fn diag(code: &str, message: &str) -> Diagnostic {
         Diagnostic::error(
@@ -772,6 +772,30 @@ mod tests {
             message,
             LabeledSpan::primary(Span::line_only(4), String::new()),
         )
+    }
+
+    #[test]
+    fn dispatch_mismatch() {
+        let error = PipelineError::DispatchMismatch {
+            dispatcher: "dispatch_route",
+            expected_kind: "route",
+            actual_kind: "transform",
+            node: "normalize_orders".to_owned(),
+        };
+
+        let classification = error
+            .failure_classification()
+            .expect("dispatch mismatches have a registered classification");
+        assert_eq!(classification.code(), "runtime.invariant.dispatch_mismatch");
+        assert_eq!(
+            classification.category(),
+            FailureCategory::InternalInvariant
+        );
+        assert_eq!(classification.retry_advice(), RetryAdvice::PolicyRequired);
+        assert_eq!(
+            error.to_string(),
+            "internal dispatch mismatch in dispatch_route: expected route, got transform at node 'normalize_orders'; contact support with this operator identity"
+        );
     }
 
     #[test]

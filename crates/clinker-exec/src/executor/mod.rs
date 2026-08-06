@@ -1811,6 +1811,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn route_dispatch_mismatch_returns_typed_error() {
+        let config = clinker_plan::config::parse_config(
+            r#"
+pipeline:
+  name: dispatch_mismatch
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      glob: ./*.csv
+      files:
+        on_no_match: skip
+      schema:
+        - { name: id, type: string }
+  - type: transform
+    name: normalize_orders
+    input: orders
+    config:
+      cxl: "emit id = id"
+  - type: output
+    name: out
+    input: normalize_orders
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+        )
+        .expect("pipeline parses");
+        let (dag, ()) = PipelineExecutor::explain_dag(&config).expect("pipeline compiles");
+        let (node_idx, node) = dag
+            .graph
+            .node_indices()
+            .map(|idx| (idx, &dag.graph[idx]))
+            .find(|(_, node)| node.name() == "normalize_orders")
+            .expect("compiled transform exists");
+
+        let error = crate::executor::route_dispatch::dispatch_route(
+            crate::executor::route_dispatch::InertRouteDispatchContext,
+            &dag,
+            node_idx,
+            node,
+        )
+        .expect_err("a transform cannot be dispatched as a route");
+
+        let PipelineError::DispatchMismatch {
+            dispatcher,
+            expected_kind,
+            actual_kind,
+            node,
+        } = &error
+        else {
+            panic!("expected DispatchMismatch, got {error}");
+        };
+        assert_eq!(*dispatcher, "dispatch_route");
+        assert_eq!(*expected_kind, "route");
+        assert_eq!(*actual_kind, "transform");
+        assert_eq!(node, "normalize_orders");
+
+        let classification = error
+            .failure_classification()
+            .expect("dispatch mismatches have a registered classification");
+        assert_eq!(classification.code(), "runtime.invariant.dispatch_mismatch");
+        assert_eq!(classification.category().as_str(), "internal_invariant");
+        assert_eq!(classification.retry_advice().as_str(), "policy_required");
+    }
+
+    #[test]
     fn mapping_advisories_follow_output_declaration_order() {
         let config = clinker_plan::config::parse_config(
             r#"
