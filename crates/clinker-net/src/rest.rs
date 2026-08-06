@@ -35,7 +35,7 @@ use clinker_plan::config::{InputFormat, RestAuth, RestPagination, RestSourceConf
 use clinker_record::{FieldMetadata, Record, Schema, SchemaBuilder, Value};
 use indexmap::IndexMap;
 
-use crate::{io_err, schema_err};
+use crate::schema_err;
 
 use continuation::{AuthorizedUrl, ContinuationError, Origin};
 
@@ -347,14 +347,20 @@ impl RestRecordSource {
         attempt: u32,
         failure: RequestFailure,
     ) -> FormatError {
-        io_err(format!(
+        let message = format!(
             "rest source {:?}: request_failed class={} attempt={} page={} target={}",
             self.source_name,
             failure.as_str(),
             attempt,
             self.pages_fetched.saturating_add(1),
             url.diagnostic_target(),
-        ))
+        );
+        let code = if matches!(failure, RequestFailure::HttpStatus(400..=499)) {
+            "rest.http.client_error"
+        } else {
+            "infrastructure.runtime.source_unavailable"
+        };
+        FormatError::classified(code, message)
     }
 
     fn request_for(

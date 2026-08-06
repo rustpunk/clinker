@@ -792,7 +792,7 @@ fn pipeline_error_exit_code(error: &PipelineError) -> u8 {
 }
 
 fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::FailureClassification {
-    use clinker_core_types::FailureClassification;
+    use clinker_core_types::{FailureClassification, RetryAdvice};
 
     let registered = |code| {
         FailureClassification::for_code(code)
@@ -821,19 +821,26 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
         | PipelineError::CompositionUnknownPort { .. }
         | PipelineError::SchemaMismatch { .. } => registered("runtime.invariant.plan_mismatch"),
         PipelineError::CompositionBodyError { inner, .. } => classify_pipeline_error(inner),
-        PipelineError::Io(_)
-        | PipelineError::Spill(_)
-        | PipelineError::SpillCapExceeded { .. }
-        | PipelineError::ThreadPool(_) => registered("infrastructure.runtime.transient"),
-        PipelineError::Multiple(errors) => errors.first().map_or_else(
-            || registered("runtime.invariant.unknown"),
-            classify_pipeline_error,
-        ),
+        PipelineError::Io(_) | PipelineError::ThreadPool(_) => {
+            registered("infrastructure.runtime.transient")
+        }
+        PipelineError::Spill(_) => registered("runtime.resource.spill_failed"),
+        PipelineError::SpillCapExceeded { .. } => registered("runtime.resource.spill_cap_exceeded"),
+        PipelineError::Multiple(errors) => errors
+            .iter()
+            .map(classify_pipeline_error)
+            .min_by_key(|classification| {
+                let retry_rank = match classification.retry_advice() {
+                    RetryAdvice::DoNotRetry => 0_u8,
+                    RetryAdvice::PolicyRequired => 1,
+                    RetryAdvice::RetryWithBackoff => 2,
+                };
+                (retry_rank, classification.code())
+            })
+            .unwrap_or_else(|| registered("runtime.invariant.unknown")),
         PipelineError::Eval(_)
         | PipelineError::Accumulator { .. }
         | PipelineError::SortOrderViolation { .. }
-        | PipelineError::MemoryBudgetExceeded { .. }
-        | PipelineError::UnsatisfiableMemoryBudget { .. }
         | PipelineError::CombineMissingMatch { .. }
         | PipelineError::CombineRangeKeyOutOfRange { .. }
         | PipelineError::CombineOutputCapExceeded { .. }
@@ -843,6 +850,12 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
         | PipelineError::DlqRateExceeded { .. }
         | PipelineError::TypeErrorThresholdExceeded { .. }
         | PipelineError::CorrelationGroupOverflow { .. } => registered("source.data.invalid"),
+        PipelineError::MemoryBudgetExceeded { .. } => {
+            registered("runtime.resource.memory_budget_exceeded")
+        }
+        PipelineError::UnsatisfiableMemoryBudget { .. } => {
+            registered("admission.configuration.memory_budget_unsatisfiable")
+        }
         PipelineError::Interrupted => registered("runtime.invariant.unknown"),
     }
 }
@@ -6378,6 +6391,87 @@ fn diag_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_failure_classification_distinguishes_policy_from_transience() {
+        use clinker_core_types::RetryAdvice;
+        use clinker_plan::runtime_error::{BudgetCategory, SpillError};
+
+        let cases = [
+            (
+                PipelineError::MemoryBudgetExceeded {
+                    node: "aggregate".to_owned(),
+                    used: 2,
+                    limit: 1,
+                    source: BudgetCategory::Arena,
+                    detail: None,
+                },
+                "runtime.resource.memory_budget_exceeded",
+                RetryAdvice::PolicyRequired,
+            ),
+            (
+                PipelineError::UnsatisfiableMemoryBudget {
+                    limit: 1,
+                    baseline_rss: 2,
+                },
+                "admission.configuration.memory_budget_unsatisfiable",
+                RetryAdvice::DoNotRetry,
+            ),
+            (
+                PipelineError::SpillCapExceeded {
+                    node: "sort".to_owned(),
+                    cap: 1,
+                    attempted: 2,
+                    current: 2,
+                },
+                "runtime.resource.spill_cap_exceeded",
+                RetryAdvice::PolicyRequired,
+            ),
+            (
+                PipelineError::Spill(SpillError::Io(std::io::Error::other("closed"))),
+                "runtime.resource.spill_failed",
+                RetryAdvice::RetryWithBackoff,
+            ),
+        ];
+
+        for (error, expected_code, expected_retry) in cases {
+            let classification = classify_pipeline_error(&error);
+            assert_eq!(classification.code(), expected_code);
+            assert_eq!(classification.retry_advice(), expected_retry);
+        }
+    }
+
+    #[test]
+    fn multiple_failure_classification_is_order_independent_and_fail_closed() {
+        let classify = |errors| classify_pipeline_error(&PipelineError::Multiple(errors));
+        let first = classify(vec![
+            PipelineError::Io(std::io::Error::other("temporary")),
+            PipelineError::SpillCapExceeded {
+                node: "sort".to_owned(),
+                cap: 1,
+                attempted: 2,
+                current: 2,
+            },
+            PipelineError::SortOrderViolation {
+                message: "out of order".to_owned(),
+            },
+        ]);
+        let reversed = classify(vec![
+            PipelineError::SortOrderViolation {
+                message: "out of order".to_owned(),
+            },
+            PipelineError::SpillCapExceeded {
+                node: "sort".to_owned(),
+                cap: 1,
+                attempted: 2,
+                current: 2,
+            },
+            PipelineError::Io(std::io::Error::other("temporary")),
+        ]);
+
+        assert_eq!(first.code(), "source.data.invalid");
+        assert_eq!(first, reversed);
+    }
 
     #[test]
     fn publication_failure_diagnostics_are_path_safe_and_actionable() {

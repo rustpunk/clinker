@@ -287,8 +287,13 @@ fn request_failures_keep_safe_status_and_target_context() {
 
     let error = source
         .next_record()
-        .expect_err("HTTP rejection must fail the source")
-        .to_string();
+        .expect_err("HTTP rejection must fail the source");
+    assert_eq!(
+        error.classification_code(),
+        Some("rest.http.client_error"),
+        "fatal client errors must never be advertised as retryable infrastructure"
+    );
+    let error = error.to_string();
 
     assert!(error.contains("class=http_status_401"), "{error}");
     assert!(error.contains("attempt=1"), "{error}");
@@ -410,6 +415,26 @@ fn transient_body_timeout_retries_the_whole_page() {
         vec![9]
     );
     assert_eq!(server.paths(), ["/start", "/start"]);
+}
+
+#[test]
+fn exhausted_transient_request_keeps_retryable_classification() {
+    let _guard = network_test_guard();
+    let server = TestServer::spawn(vec![response(
+        503,
+        "Service Unavailable",
+        &[],
+        r#"{"error":"temporary"}"#,
+    )]);
+    let mut source = reader_with_retries(&format!("{}/start", server.url), 1, 0);
+
+    let error = source
+        .next_record()
+        .expect_err("exhausted transient response must fail the source");
+    assert_eq!(
+        error.classification_code(),
+        Some("infrastructure.runtime.source_unavailable")
+    );
 }
 
 #[test]

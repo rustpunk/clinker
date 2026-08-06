@@ -38,14 +38,6 @@ pub fn build_rest_source(
     Ok(Box::new(reader))
 }
 
-/// Construct a `FormatError::Io` wrapping a REST read failure, tagged with
-/// the `E221` diagnostic code. The ingest driver propagates a reader error
-/// as a hard pipeline failure (a connect/HTTP/body-read failure is not a
-/// per-row data error), so this is the right channel for those.
-fn io_err(msg: String) -> FormatError {
-    FormatError::Io(std::io::Error::other(format!("[E221] {msg}")))
-}
-
 /// Construct a `FormatError::SchemaInference` for a body-decode/setup
 /// failure that is not an I/O error (malformed pagination body, etc.).
 fn schema_err(msg: String) -> FormatError {
