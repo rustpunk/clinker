@@ -6396,6 +6396,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn classify_dispatch_mismatch() {
+        use clinker_core_types::{FailureCategory, RetryAdvice};
+
+        let error = PipelineError::DispatchMismatch {
+            dispatcher: "dispatch_route",
+            expected_kind: "route",
+            actual_kind: "transform",
+            node: "normalize_orders".to_owned(),
+        };
+
+        let classification = classify_pipeline_error(&error);
+        assert_eq!(classification, error.failure_classification().unwrap());
+        assert_eq!(classification.code(), "runtime.invariant.dispatch_mismatch");
+        assert_eq!(classification.category(), FailureCategory::InternalInvariant);
+        assert_eq!(classification.retry_advice(), RetryAdvice::PolicyRequired);
+    }
+
+    #[test]
     fn runtime_failure_classification_distinguishes_policy_from_transience() {
         use clinker_core_types::RetryAdvice;
         use clinker_plan::runtime_error::{BudgetCategory, SpillError};
