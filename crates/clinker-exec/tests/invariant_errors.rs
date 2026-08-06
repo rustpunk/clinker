@@ -19,8 +19,10 @@ use clinker_plan::config::{
     ClinkerToml, CompileContext, IfExistsPolicy, ResolvedPublicationPolicy, load_config_from_str,
 };
 use clinker_plan::error::PipelineError;
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 use clinker_plan::security::{ValidatedPath, validate_path};
 use fs4::FileExt;
+use petgraph::graph::NodeIndex;
 use serial_test::serial;
 
 const EXECUTION_ID: &str = "018f47a2-9a41-7a27-b4d6-4f7137e3c159";
@@ -110,6 +112,74 @@ fn spill_entries(root: &Path) -> Vec<String> {
         })
         .filter(|name| name.starts_with("clinker-spill-"))
         .collect()
+}
+
+type DispatchMismatchProbe =
+    fn(&ExecutionPlanDag, NodeIndex, &PlanNode) -> Result<(), PipelineError>;
+
+struct DispatchMismatchCase {
+    dispatcher: &'static str,
+    expected_kind: &'static str,
+    invoke: DispatchMismatchProbe,
+}
+
+#[test]
+fn aggregate_and_source_dispatch_mismatches_are_typed() {
+    let plan = load_config_from_str(PIPELINE_YAML)
+        .expect("parse pipeline")
+        .compile(&CompileContext::default())
+        .expect("compile pipeline");
+    let dag = plan.dag();
+    let (node_idx, node) = dag
+        .graph
+        .node_indices()
+        .map(|idx| (idx, &dag.graph[idx]))
+        .find(|(_, node)| node.name() == "rename")
+        .expect("compiled transform exists");
+    let cases = [
+        DispatchMismatchCase {
+            dispatcher: "dispatch_aggregation",
+            expected_kind: "aggregation",
+            invoke: DispatchFaultGuard::dispatch_aggregation_mismatch_for_testing,
+        },
+        DispatchMismatchCase {
+            dispatcher: "dispatch_source",
+            expected_kind: "source",
+            invoke: DispatchFaultGuard::dispatch_source_mismatch_for_testing,
+        },
+    ];
+
+    for case in cases {
+        let returned = catch_unwind(AssertUnwindSafe(|| (case.invoke)(dag, node_idx, node)))
+            .unwrap_or_else(|_| panic!("{} mismatch must return", case.dispatcher));
+        let error = match returned {
+            Ok(()) => panic!("{} must reject a transform", case.dispatcher),
+            Err(error) => error,
+        };
+        let PipelineError::DispatchMismatch {
+            dispatcher,
+            expected_kind,
+            actual_kind,
+            node,
+        } = &error
+        else {
+            panic!("{} returned unexpected error: {error}", case.dispatcher);
+        };
+        assert_eq!(*dispatcher, case.dispatcher);
+        assert_eq!(*expected_kind, case.expected_kind);
+        assert_eq!(*actual_kind, "transform");
+        assert_eq!(node, "rename");
+
+        let classification = error
+            .failure_classification()
+            .expect("dispatch mismatches have a shared classification");
+        assert_eq!(classification.code(), "runtime.invariant.dispatch_mismatch");
+        assert_eq!(
+            classification.category(),
+            FailureCategory::InternalInvariant
+        );
+        assert_eq!(classification.retry_advice(), RetryAdvice::PolicyRequired);
+    }
 }
 
 #[test]
