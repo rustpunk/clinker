@@ -462,6 +462,19 @@ impl OutputStagingRegistry {
             .collect()
     }
 
+    /// Whether the publication ledger recorded this exact final path as
+    /// visible. The attempt layer uses this only when publication itself
+    /// errors before it can return a normal [`PublicationOutcome`], so the
+    /// failure still carries truthful per-artifact visibility.
+    pub(crate) fn is_committed_path(&self, path: &Path) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .committed
+            .iter()
+            .any(|(_, committed)| committed == path)
+    }
+
     /// Publish every staged file after successful pipeline execution.
     ///
     /// # Errors

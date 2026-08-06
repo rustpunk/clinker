@@ -3172,8 +3172,11 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                     publication_failure_code = Some("attempt.publication.promotion_failed");
                     publication_failure = Some(publication_failure_diagnostic(
                         &execution_id,
-                        PublicationFailureKind::Publish(publication_error_category(&error)),
+                        PublicationFailureKind::Publish(publication_error_category(
+                            error.source_error(),
+                        )),
                     ));
+                    publication_outcome = Some(error.outcome().clone());
                 }
                 }
             }

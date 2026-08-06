@@ -491,6 +491,38 @@ impl AttemptPublicationOutcome {
     }
 }
 
+/// Publication error paired with the exact path-free visibility observed at
+/// the failure boundary.
+#[derive(Debug)]
+pub struct AttemptPublicationFailure {
+    source: Box<AttemptError>,
+    outcome: AttemptPublicationOutcome,
+}
+
+impl AttemptPublicationFailure {
+    /// Underlying publication failure.
+    pub fn source_error(&self) -> &AttemptError {
+        self.source.as_ref()
+    }
+
+    /// Per-artifact visibility after the failed publication attempt.
+    pub fn outcome(&self) -> &AttemptPublicationOutcome {
+        &self.outcome
+    }
+}
+
+impl std::fmt::Display for AttemptPublicationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for AttemptPublicationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Explicit capability token for callers that sanitize physical paths before
 /// rendering them outside trusted diagnostics.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -894,6 +926,7 @@ pub enum AttemptFault {
     Digest,
     ManifestReplace,
     PromotionInterrupted,
+    PromotionInterruptedAfterFirst,
     BeforeRename,
     DirectorySync,
 }
@@ -3936,7 +3969,7 @@ impl RunAttemptPublication {
         &self,
         registry: &OutputStagingRegistry,
         shutdown: &ShutdownToken,
-    ) -> Result<Option<AttemptPublicationOutcome>, AttemptError> {
+    ) -> Result<Option<AttemptPublicationOutcome>, AttemptPublicationFailure> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4865,7 +4898,9 @@ impl AttemptPublication {
                 artifact.state = ArtifactState::Promoting;
                 self.persist_replacement(intent, false)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
-                if fault == Some(AttemptFault::PromotionInterrupted) {
+                if fault == Some(AttemptFault::PromotionInterrupted)
+                    || (fault == Some(AttemptFault::PromotionInterruptedAfterFirst) && index == 1)
+                {
                     return Err(std::io::Error::other(
                         "injected interruption after durable promotion intent",
                     ));
@@ -4894,6 +4929,15 @@ impl AttemptPublication {
             Err(error) => {
                 let mut incomplete = self.manifest.clone();
                 incomplete.state = AttemptState::Incomplete;
+                for (manifest, runtime) in
+                    incomplete.artifacts.iter_mut().zip(self.artifacts.iter())
+                {
+                    manifest.state = if registry.is_committed_path(&runtime.final_path) {
+                        ArtifactState::Published
+                    } else {
+                        ArtifactState::Unpublished
+                    };
+                }
                 self.persist_replacement(incomplete, false)?;
                 self.terminal = true;
                 return Err(error.into());
@@ -4958,15 +5002,41 @@ impl AttemptPublication {
     ///
     /// # Errors
     ///
-    /// Returns [`AttemptError`] for invalid transitions, manifest persistence,
-    /// containment, or publication failures.
+    /// Returns [`AttemptPublicationFailure`] for invalid transitions, manifest
+    /// persistence, containment, or publication failures. The failure always
+    /// includes the exact path-free visibility observed at the boundary.
     pub fn publish_run(
         &mut self,
         registry: &OutputStagingRegistry,
         shutdown: &ShutdownToken,
-    ) -> Result<Option<AttemptPublicationOutcome>, AttemptError> {
-        let Some(outcome) = self.publish(registry, shutdown)? else {
-            return Ok(None);
+    ) -> Result<Option<AttemptPublicationOutcome>, AttemptPublicationFailure> {
+        let outcome = match self.publish(registry, shutdown) {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => return Ok(None),
+            Err(source) => {
+                let artifacts = self
+                    .artifacts
+                    .iter()
+                    .map(|runtime| ArtifactPublicationResult {
+                        artifact_id: runtime.artifact_id.clone(),
+                        kind: runtime.kind,
+                        logical_leaf: runtime.logical_leaf.clone(),
+                        state: if registry.is_committed_path(&runtime.final_path) {
+                            ArtifactState::Published
+                        } else {
+                            ArtifactState::Unpublished
+                        },
+                    })
+                    .collect();
+                return Err(AttemptPublicationFailure {
+                    source: Box::new(source),
+                    outcome: AttemptPublicationOutcome::Incomplete {
+                        execution_id: self.execution_id.clone(),
+                        artifacts,
+                        cleanup_debt_count: 0,
+                    },
+                });
+            }
         };
         let cleanup_debt_count = outcome.cleanup_debt().len();
         let artifacts = self

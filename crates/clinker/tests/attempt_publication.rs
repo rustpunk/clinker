@@ -260,6 +260,65 @@ fn run_attempt_owns_every_artifact_kind_across_bounded_destination_roots() {
 }
 
 #[test]
+fn failed_run_publication_reports_already_visible_artifacts() {
+    let root = tempfile::tempdir().expect("destination");
+    let registry = OutputStagingRegistry::default();
+    let policy = resolved_policy(root.path(), PublicationMode::Direct, None, 1_024);
+    let registrations = vec![
+        registration(ArtifactKind::Primary, root.path(), "first.bin", "first"),
+        registration(ArtifactKind::Sidecar, root.path(), "second.bin", "second"),
+    ];
+    let (mut attempt, mut writers) = AttemptPublication::create_run_for_testing(
+        policy,
+        &registry,
+        EXECUTION_ID,
+        1_000,
+        301_000,
+        registrations,
+    )
+    .expect("create run attempt");
+    for writer in &mut writers {
+        writer.file_mut().write_all(b"artifact").expect("write");
+        attempt
+            .mark_ready(writer.artifact_id())
+            .expect("mark artifact ready");
+    }
+    drop(writers);
+    attempt.set_fault_for_testing(AttemptFault::PromotionInterruptedAfterFirst);
+
+    let failure = attempt
+        .publish_run(&registry, &ShutdownToken::detached())
+        .expect_err("second promotion must fail");
+    assert!(matches!(
+        failure.outcome(),
+        clinker_exec::output::attempt::AttemptPublicationOutcome::Incomplete { .. }
+    ));
+    assert_eq!(
+        failure
+            .outcome()
+            .artifacts()
+            .iter()
+            .map(|artifact| artifact.state())
+            .collect::<Vec<_>>(),
+        [ArtifactState::Published, ArtifactState::Unpublished]
+    );
+    assert!(root.path().join("first.bin").is_file());
+    assert!(!root.path().join("second.bin").exists());
+
+    let retained = AttemptManifest::read(attempt.manifest_path(), 400_000)
+        .expect("incomplete manifest remains inspectable");
+    assert_eq!(retained.state(), AttemptState::Incomplete);
+    assert_eq!(
+        retained
+            .artifacts()
+            .iter()
+            .map(|artifact| artifact.state())
+            .collect::<Vec<_>>(),
+        [ArtifactState::Published, ArtifactState::Unpublished]
+    );
+}
+
+#[test]
 fn retained_root_receipt_is_plan_bound_bounded_and_authenticates_reconstructed_roots() {
     let receipt_root = tempfile::tempdir().expect("receipt root");
     let destination = tempfile::tempdir().expect("destination root");
