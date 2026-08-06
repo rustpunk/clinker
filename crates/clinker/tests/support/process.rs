@@ -1,6 +1,6 @@
 //! Bounded direct-child runner used only by CLI integration tests.
 
-use std::io::{self, BufRead as _, BufReader};
+use std::io::{self, BufReader};
 use std::process::{ChildStdout, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use serde_json::Value;
 
 const DEFAULT_TAIL_BYTES: usize = 64 * 1024;
 const DEFAULT_EVENT_LIMIT: usize = 256;
+const MAX_MACHINE_RECORD_BYTES: usize = 16 * 1024;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,7 +242,15 @@ fn drain_protocol(
     event_limit: usize,
     mode: StdoutMode,
 ) -> io::Result<ProtocolDrain> {
-    let mut reader = BufReader::new(stdout);
+    drain_protocol_reader(BufReader::new(stdout), tail_bytes, event_limit, mode)
+}
+
+fn drain_protocol_reader(
+    mut reader: impl io::BufRead,
+    tail_bytes: usize,
+    event_limit: usize,
+    mode: StdoutMode,
+) -> io::Result<ProtocolDrain> {
     let mut line = Vec::new();
     let mut line_count = 0_usize;
     let mut drain = ProtocolDrain {
@@ -250,15 +259,22 @@ fn drain_protocol(
         tail: BoundedTail::new(tail_bytes),
     };
     loop {
-        line.clear();
-        let bytes_read = reader.read_until(b'\n', &mut line)?;
-        if bytes_read == 0 {
+        let Some(record) = read_bounded_record(&mut reader, &mut line, &mut drain.tail)? else {
             break;
-        }
+        };
         line_count = line_count.saturating_add(1);
-        drain.tail.extend(&line);
-        if !line.ends_with(b"\n") && drain.parse_error.is_none() {
+        if record.oversized {
+            drain.parse_error.get_or_insert_with(|| {
+                format!("machine record exceeds {MAX_MACHINE_RECORD_BYTES}-byte limit")
+            });
+        } else if !record.terminated && drain.parse_error.is_none() {
             drain.parse_error = Some("machine record was not newline terminated".to_owned());
+        }
+        if record.oversized {
+            if matches!(mode, StdoutMode::CloseAfterLines(limit) if line_count >= limit) {
+                break;
+            }
+            continue;
         }
         let record = line
             .strip_suffix(b"\n")
@@ -286,6 +302,52 @@ fn drain_protocol(
         }
     }
     Ok(drain)
+}
+
+#[derive(Clone, Copy)]
+struct BoundedRecord {
+    terminated: bool,
+    oversized: bool,
+}
+
+fn read_bounded_record(
+    reader: &mut impl io::BufRead,
+    retained: &mut Vec<u8>,
+    tail: &mut BoundedTail,
+) -> io::Result<Option<BoundedRecord>> {
+    retained.clear();
+    let mut total = 0_usize;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if total == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(BoundedRecord {
+                    terminated: false,
+                    oversized: total > MAX_MACHINE_RECORD_BYTES,
+                }))
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        let segment = &available[..consumed];
+        tail.extend(segment);
+        total = total.saturating_add(segment.len());
+        if retained.len() <= MAX_MACHINE_RECORD_BYTES {
+            let remaining = MAX_MACHINE_RECORD_BYTES
+                .saturating_add(1)
+                .saturating_sub(retained.len());
+            retained.extend_from_slice(&segment[..segment.len().min(remaining)]);
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(BoundedRecord {
+                terminated: true,
+                oversized: total > MAX_MACHINE_RECORD_BYTES,
+            }));
+        }
+    }
 }
 
 fn drain_diagnostics(mut stderr: impl io::Read, tail_bytes: usize) -> io::Result<DiagnosticDrain> {
@@ -321,9 +383,11 @@ fn reconcile(stdout: &ProtocolDrain, status: &ExitStatus, timed_out: bool) -> Co
     for (sequence, event) in stdout.events.iter().enumerate() {
         if event["protocol"] != "clinker.run"
             || event["schema"] != 1
+            || event["event"].as_str().is_none()
             || event["seq"].as_u64() != u64::try_from(sequence).ok()
             || event["batch_id"] != batch_id
             || event["execution_id"] != execution_id
+            || !event["plan_identity"].is_object()
         {
             return ControlledOutcome::Incomplete;
         }
@@ -343,16 +407,22 @@ fn reconcile(stdout: &ProtocolDrain, status: &ExitStatus, timed_out: bool) -> Co
     }
     let terminal = terminals[0];
     match terminal["event"].as_str() {
-        Some("completed") => match (terminal["result"].as_str(), terminal["exit_code"].as_i64()) {
-            (Some("success"), Some(0)) if status_code == 0 => ControlledOutcome::Success,
-            (Some("completed_with_dlq"), Some(2)) if status_code == 2 => {
-                ControlledOutcome::CompletedWithDlq
+        Some("completed") if publication_is_valid(&stdout.events, terminal, true) => {
+            match (terminal["result"].as_str(), terminal["exit_code"].as_i64()) {
+                (Some("success"), Some(0)) if status_code == 0 => ControlledOutcome::Success,
+                (Some("completed_with_dlq"), Some(2)) if status_code == 2 => {
+                    ControlledOutcome::CompletedWithDlq
+                }
+                _ => ControlledOutcome::Incomplete,
             }
-            _ => ControlledOutcome::Incomplete,
-        },
+        }
         Some("failed") => {
             let embedded = terminal["exit_code"].as_i64();
-            if embedded == Some(i64::from(status_code)) && status_code != 0 && status_code != 130 {
+            if embedded == Some(i64::from(status_code))
+                && matches!(status_code, 1 | 3 | 4)
+                && failure_is_valid(&terminal["failure"])
+                && publication_is_valid(&stdout.events, terminal, false)
+            {
                 ControlledOutcome::Failed
             } else {
                 ControlledOutcome::Incomplete
@@ -367,5 +437,164 @@ fn reconcile(stdout: &ProtocolDrain, status: &ExitStatus, timed_out: bool) -> Co
             }
         }
         _ => ControlledOutcome::Incomplete,
+    }
+}
+
+fn failure_is_valid(failure: &Value) -> bool {
+    let Some(code) = failure["code"].as_str() else {
+        return false;
+    };
+    let Some(category) = failure["category"].as_str() else {
+        return false;
+    };
+    let Some(retry) = failure["retry"].as_str() else {
+        return false;
+    };
+    let Some(message) = failure["message"].as_str() else {
+        return false;
+    };
+    code.split('.').count() >= 3
+        && !message.is_empty()
+        && message.len() <= 240
+        && matches!(
+            category,
+            "security_policy"
+                | "source_protocol"
+                | "internal_invariant"
+                | "configuration"
+                | "infrastructure"
+                | "publication"
+                | "observability"
+        )
+        && matches!(
+            retry,
+            "retry_with_backoff" | "do_not_retry" | "policy_required"
+        )
+}
+
+fn publication_is_valid(events: &[Value], terminal: &Value, required: bool) -> bool {
+    let chunks = events
+        .iter()
+        .filter(|event| event["event"] == "publication_artifacts")
+        .collect::<Vec<_>>();
+    let publication = &terminal["publication"];
+    if publication.is_null() {
+        return !required && chunks.is_empty();
+    }
+    let Some(complete) = publication["complete"].as_bool() else {
+        return false;
+    };
+    let Some(cleanup_debt_count) = publication["cleanup_debt_count"].as_u64() else {
+        return false;
+    };
+    let Some(artifact_count) = publication["artifact_count"].as_u64() else {
+        return false;
+    };
+    let Some(state_counts) = publication["state_counts"].as_object() else {
+        return false;
+    };
+    let states = [
+        "staging",
+        "ready",
+        "promoting",
+        "published",
+        "visible_unsynchronized",
+        "unpublished",
+    ];
+    let Some(expected_counts) = states
+        .map(|state| state_counts.get(state).and_then(Value::as_u64))
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    if expected_counts.iter().sum::<u64>() != artifact_count
+        || artifact_count > 4096
+        || (complete
+            && (expected_counts[3] != artifact_count
+                || expected_counts
+                    .iter()
+                    .enumerate()
+                    .any(|(index, count)| index != 3 && *count != 0)))
+        || (required && (!complete || cleanup_debt_count != 0))
+    {
+        return false;
+    }
+    if artifact_count == 0 {
+        return chunks.is_empty();
+    }
+    if chunks.is_empty() {
+        return false;
+    }
+
+    let mut observed_counts = [0_u64; 6];
+    let mut observed_artifacts = 0_u64;
+    let mut ids = std::collections::BTreeSet::new();
+    for (expected_index, event) in chunks.iter().enumerate() {
+        let chunk = &event["publication"];
+        if chunk["chunk_index"].as_u64() != u64::try_from(expected_index).ok()
+            || chunk["chunk_count"].as_u64() != u64::try_from(chunks.len()).ok()
+        {
+            return false;
+        }
+        let Some(artifacts) = chunk["artifacts"]
+            .as_array()
+            .filter(|values| !values.is_empty())
+        else {
+            return false;
+        };
+        for artifact in artifacts {
+            let Some(artifact_id) = artifact["artifact_id"].as_str() else {
+                return false;
+            };
+            let Some(kind) = artifact["kind"].as_str() else {
+                return false;
+            };
+            let Some(state) = artifact["state"].as_str() else {
+                return false;
+            };
+            let Some(state_index) = states.iter().position(|candidate| *candidate == state) else {
+                return false;
+            };
+            if artifact_id.is_empty()
+                || !ids.insert(artifact_id)
+                || !matches!(kind, "primary" | "fan_out" | "split" | "dlq" | "sidecar")
+            {
+                return false;
+            }
+            observed_artifacts = observed_artifacts.saturating_add(1);
+            observed_counts[state_index] = observed_counts[state_index].saturating_add(1);
+        }
+    }
+    observed_artifacts == artifact_count && observed_counts.as_slice() == expected_counts.as_slice()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_machine_record_is_discarded_with_bounded_memory() {
+        let mut bytes = vec![b'x'; MAX_MACHINE_RECORD_BYTES + 512];
+        bytes.push(b'\n');
+        bytes.extend_from_slice(br#"{"event":"after"}"#);
+        bytes.push(b'\n');
+        let drain = drain_protocol_reader(
+            std::io::Cursor::new(&bytes),
+            128,
+            DEFAULT_EVENT_LIMIT,
+            StdoutMode::Drain,
+        )
+        .expect("bounded drain");
+
+        assert!(
+            drain
+                .parse_error
+                .as_deref()
+                .is_some_and(|error| error.contains("exceeds"))
+        );
+        assert_eq!(drain.events, [serde_json::json!({"event": "after"})]);
+        assert_eq!(drain.total_bytes(), bytes.len());
+        assert!(drain.retained_tail().len() <= 128);
     }
 }

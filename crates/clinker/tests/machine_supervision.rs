@@ -5,7 +5,7 @@ mod support;
 use std::io::Read as _;
 use std::net::TcpListener;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use support::process::{ControlledOutcome, ProcessConfig, ProtocolDrain, StdoutMode, run_child};
@@ -231,6 +231,30 @@ fn terminal_and_process_status_must_reconcile_fail_closed() {
         result.outcome_for(&mismatched),
         ControlledOutcome::Incomplete
     );
+
+    let mut missing_inventory = result.stdout.clone();
+    missing_inventory
+        .events_mut()
+        .retain(|event| event["event"] != "publication_artifacts");
+    for (sequence, event) in missing_inventory.events_mut().iter_mut().enumerate() {
+        event["seq"] = serde_json::json!(sequence);
+    }
+    assert_eq!(
+        result.outcome_for(&missing_inventory),
+        ControlledOutcome::Incomplete,
+        "a completed terminal requires its complete artifact inventory"
+    );
+
+    let mut mismatched_inventory = result.stdout.clone();
+    mismatched_inventory
+        .events_mut()
+        .last_mut()
+        .expect("terminal")["publication"]["artifact_count"] = serde_json::json!(2);
+    assert_eq!(
+        result.outcome_for(&mismatched_inventory),
+        ControlledOutcome::Incomplete,
+        "terminal counts must reconcile with artifact chunks"
+    );
 }
 
 #[test]
@@ -269,6 +293,14 @@ fn controlled_terminal_families_match_exit_and_artifact_truth() {
         terminal["failure"]["code"],
         "admission.configuration.invalid"
     );
+    let mut missing_retry = failed_result.stdout.clone();
+    missing_retry.events_mut().last_mut().expect("terminal")["failure"]["retry"] =
+        serde_json::Value::Null;
+    assert_eq!(
+        failed_result.outcome_for(&missing_retry),
+        ControlledOutcome::Incomplete,
+        "failed terminals require the complete typed failure vocabulary"
+    );
 }
 
 #[test]
@@ -296,10 +328,26 @@ fn deadline_expiry_forces_termination_and_reaps_the_child() {
     )
     .expect("existing final");
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
     let address = listener.local_addr().expect("listener address");
     write_hanging_rest_pipeline(directory.path(), address);
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept request");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "child never connected to fixture"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept request: {error}"),
+            }
+        };
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("read timeout");
