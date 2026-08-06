@@ -25,7 +25,9 @@ pub use composition_body::{
 pub use entity::{EntityRef, PlanNodeId, SecondaryMap};
 pub use predicate_support::{PredicateSupport, predicate_support};
 pub use row_type::{ColumnLookup, QualifiedField, Row, RowTail, TailVarId};
-pub use semantic_identity::{SemanticFingerprint, SemanticFingerprintError};
+pub use semantic_identity::{
+    EffectiveRuntimeVariables, SemanticFingerprint, SemanticFingerprintError,
+};
 pub use streaming_eligibility::{StreamingEligibility, qualifies_for_streaming};
 pub use types::{AggregateStrategy, JoinSide};
 

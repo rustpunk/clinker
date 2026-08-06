@@ -39,6 +39,12 @@ Every event carries these fields:
 | `execution_id` | Fresh non-overridable UUIDv7 generated for this process. |
 | `plan_identity` | `pending`, `resolved` with the semantic plan fingerprint, or `unavailable` after admission failure. |
 
+The resolved fingerprint covers the compiled topology, schemas, composition
+and CXL dependencies, winning channel/group config values, and all four
+runtime-variable scopes. It excludes deployment-only file locations and layer
+source formatting, so relocating equivalent inputs does not invalidate a
+pinned plan while a value that can change execution does.
+
 Progress events add a bounded logical phase, kind, elapsed time, optional
 checkpoint count, and truncation flags. They never contain records, secrets,
 source URLs, or physical paths. Failed terminals add a stable failure code,

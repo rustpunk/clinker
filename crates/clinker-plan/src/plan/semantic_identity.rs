@@ -1,6 +1,9 @@
 //! Versioned semantic identity for compiled plans.
 
 use super::CompiledPlan;
+use clinker_record::Value;
+use indexmap::IndexMap;
+use serde::Serialize;
 
 const SEMANTIC_FINGERPRINT_DOMAIN: &[u8] = b"clinker.semantic-fingerprint.v1\0";
 
@@ -8,6 +11,24 @@ const SEMANTIC_FINGERPRINT_DOMAIN: &[u8] = b"clinker.semantic-fingerprint.v1\0";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SemanticFingerprint {
     digest: [u8; 32],
+}
+
+/// Runtime values supplied by the resolved channel/group stack.
+///
+/// These maps are execution inputs even though they do not live in the
+/// compiled pipeline AST. Keeping them in one typed object prevents callers
+/// from advertising a plan identity that omits one of the four variable
+/// scopes later passed to the executor.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EffectiveRuntimeVariables {
+    /// Resolved `$vars.*` values.
+    pub static_vars: IndexMap<String, Value>,
+    /// Resolved `$pipeline.*` values.
+    pub pipeline_vars: IndexMap<String, Value>,
+    /// Resolved `$source.<source>.*` values.
+    pub source_vars: IndexMap<String, IndexMap<String, Value>>,
+    /// Resolved `$record.*` values.
+    pub record_vars: IndexMap<String, Value>,
 }
 
 impl SemanticFingerprint {
@@ -80,6 +101,27 @@ impl CompiledPlan {
     /// Returns [`SemanticFingerprintError`] if the typed plan cannot be
     /// represented by the canonical identity schema.
     pub fn semantic_fingerprint(&self) -> Result<SemanticFingerprint, SemanticFingerprintError> {
+        self.semantic_fingerprint_with_runtime_variables(&EffectiveRuntimeVariables::default())
+    }
+
+    /// Compute the versioned semantic identity of this effective plan and its
+    /// resolved runtime-variable inputs.
+    ///
+    /// The effective values in [`Self::provenance`] are included without
+    /// their source spans or layer-file byte identities. Together with the
+    /// compiled topology and `runtime_variables`, that is the canonical
+    /// semantic equivalent of the selected channel stack: relocation,
+    /// comments, and layer formatting do not change the digest, while a
+    /// winning config or variable value does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SemanticFingerprintError`] if the effective inputs cannot be
+    /// represented by the canonical identity schema.
+    pub fn semantic_fingerprint_with_runtime_variables(
+        &self,
+        runtime_variables: &EffectiveRuntimeVariables,
+    ) -> Result<SemanticFingerprint, SemanticFingerprintError> {
         let nodes = self
             .config()
             .nodes
@@ -135,6 +177,28 @@ impl CompiledPlan {
             })
             .collect::<Vec<_>>();
 
+        let mut resolved_config = self
+            .provenance()
+            .iter()
+            .map(|(_key, address, resolved)| {
+                serde_json::json!({
+                    "address": address.render(),
+                    "value": resolved.value,
+                })
+            })
+            .collect::<Vec<_>>();
+        resolved_config.sort_by(|left, right| {
+            let left = left
+                .get("address")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let right = right
+                .get("address")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            left.cmp(right)
+        });
+
         let mut identity = serde_json::json!({
             "version": SemanticFingerprint::VERSION,
             "pipeline": {
@@ -146,6 +210,8 @@ impl CompiledPlan {
             "nodes": nodes,
             "error_handling": error_handling,
             "bound_schemas": self.bound_schemas(),
+            "resolved_config": resolved_config,
+            "runtime_variables": runtime_variables,
             "dependencies": {
                 "composition_bodies": composition_bodies,
                 "cxl_modules": modules,
@@ -246,12 +312,14 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::config::composition::LayerKind;
     use crate::config::{CompileContext, load_config, parse_config};
     use crate::resources::{
         CatalogConfig, CompositionDiscovery, ModuleLimits, WorkspaceCatalog,
         collect_cxl_fields_with_composition_identities, collect_direct_imports,
         compile_module_closure,
     };
+    use clinker_core_types::Span;
 
     const BASE: &str = r#"
 pipeline:
@@ -451,6 +519,112 @@ nodes:
         assert_eq!(
             first.semantic_fingerprint().expect("first identity"),
             second.semantic_fingerprint().expect("second identity")
+        );
+    }
+
+    #[test]
+    fn semantic_fingerprint_includes_every_runtime_variable_scope() {
+        let plan = compile(BASE);
+        let empty = EffectiveRuntimeVariables::default();
+        let baseline = plan
+            .semantic_fingerprint_with_runtime_variables(&empty)
+            .expect("baseline identity");
+
+        let mut static_vars = EffectiveRuntimeVariables::default();
+        static_vars
+            .static_vars
+            .insert("threshold".to_owned(), Value::Integer(7));
+        let mut pipeline_vars = EffectiveRuntimeVariables::default();
+        pipeline_vars
+            .pipeline_vars
+            .insert("checkpoint".to_owned(), Value::Integer(7));
+        let mut source_vars = EffectiveRuntimeVariables::default();
+        source_vars.source_vars.insert(
+            "src".to_owned(),
+            IndexMap::from_iter([("partition".to_owned(), Value::Integer(7))]),
+        );
+        let mut record_vars = EffectiveRuntimeVariables::default();
+        record_vars
+            .record_vars
+            .insert("quality".to_owned(), Value::Integer(7));
+
+        for variables in [&static_vars, &pipeline_vars, &source_vars, &record_vars] {
+            assert_ne!(
+                baseline,
+                plan.semantic_fingerprint_with_runtime_variables(variables)
+                    .expect("runtime-variable identity")
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_fingerprint_includes_winning_composition_config_value() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let compositions = workspace.path().join("compositions");
+        std::fs::create_dir_all(&compositions).expect("create compositions");
+        std::fs::write(
+            compositions.join("increment.comp.yaml"),
+            r#"
+_compose:
+  name: increment
+  inputs:
+    inp:
+      schema: [{ name: id, type: int }]
+  outputs: { out: mapped }
+  config_schema:
+    amount: { type: int, default: 1 }
+nodes:
+  - type: transform
+    name: mapped
+    input: inp
+    config:
+      cxl: "emit id = id + $config.amount"
+"#,
+        )
+        .expect("write composition");
+        let pipeline = workspace.path().join("pipeline.yaml");
+        std::fs::write(
+            &pipeline,
+            r#"
+pipeline: { name: resolved_config_identity }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      path: input.csv
+      type: csv
+      schema: [{ name: id, type: int }]
+  - type: composition
+    name: increment_call
+    input: src
+    use: compositions/increment.comp.yaml
+    inputs: { inp: src }
+  - type: output
+    name: out
+    input: increment_call
+    config: { name: out, path: output.csv, type: csv }
+"#,
+        )
+        .expect("write pipeline");
+
+        let base = compile_workspace(workspace.path(), &pipeline);
+        let mut overridden = compile_workspace(workspace.path(), &pipeline);
+        overridden
+            .provenance_mut()
+            .get_mut("increment_call", "amount")
+            .expect("composition config provenance")
+            .apply_layer(
+                serde_json::json!(2),
+                LayerKind::ChannelWide,
+                Span::SYNTHETIC,
+            );
+
+        assert_ne!(
+            base.semantic_fingerprint().expect("base identity"),
+            overridden
+                .semantic_fingerprint()
+                .expect("overridden identity")
         );
     }
 

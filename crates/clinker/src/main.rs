@@ -2078,20 +2078,27 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                     ),
                 )
             })?;
-        if let Some(res) = &overlay_resolution {
+        let effective_runtime_variables = if let Some(res) = &overlay_resolution {
             let overlay = res.apply_config_and_vars(&mut compiled_plan, &pipeline_config);
             abort_on_overlay_errors(&overlay)?;
-        }
+            clinker_plan::plan::EffectiveRuntimeVariables {
+                static_vars: overlay.static_vars,
+                pipeline_vars: overlay.pipeline_vars,
+                source_vars: overlay.source_vars,
+                record_vars: overlay.record_vars,
+            }
+        } else {
+            clinker_plan::plan::EffectiveRuntimeVariables::default()
+        };
 
         if let Some(emitter) = machine {
-            let fingerprint =
-                compiled_plan
-                    .semantic_fingerprint()
-                    .map_err(|error| PipelineError::Internal {
-                        op: "machine semantic fingerprint",
-                        node: "pipeline".to_owned(),
-                        detail: error.to_string(),
-                    })?;
+            let fingerprint = compiled_plan
+                .semantic_fingerprint_with_runtime_variables(&effective_runtime_variables)
+                .map_err(|error| PipelineError::Internal {
+                    op: "machine semantic fingerprint",
+                    node: "pipeline".to_owned(),
+                    detail: error.to_string(),
+                })?;
             emitter
                 .emit_plan_resolved(fingerprint)
                 .map_err(PipelineError::Io)?;
@@ -2217,20 +2224,27 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 plan_line_anchors_trusted(cfg, overlay_contributed(overlay_resolution.as_ref())),
             )
         })?;
-        if let Some(res) = &overlay_resolution {
+        let effective_runtime_variables = if let Some(res) = &overlay_resolution {
             let overlay = res.apply_config_and_vars(&mut compiled_plan, cfg);
             abort_on_overlay_errors(&overlay)?;
-        }
+            clinker_plan::plan::EffectiveRuntimeVariables {
+                static_vars: overlay.static_vars,
+                pipeline_vars: overlay.pipeline_vars,
+                source_vars: overlay.source_vars,
+                record_vars: overlay.record_vars,
+            }
+        } else {
+            clinker_plan::plan::EffectiveRuntimeVariables::default()
+        };
 
         if let Some(emitter) = machine {
-            let fingerprint =
-                compiled_plan
-                    .semantic_fingerprint()
-                    .map_err(|error| PipelineError::Internal {
-                        op: "machine semantic fingerprint",
-                        node: "pipeline".to_owned(),
-                        detail: error.to_string(),
-                    })?;
+            let fingerprint = compiled_plan
+                .semantic_fingerprint_with_runtime_variables(&effective_runtime_variables)
+                .map_err(|error| PipelineError::Internal {
+                    op: "machine semantic fingerprint",
+                    node: "pipeline".to_owned(),
+                    detail: error.to_string(),
+                })?;
             emitter
                 .emit_plan_resolved(fingerprint)
                 .map_err(PipelineError::Io)?;
@@ -2339,15 +2353,21 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         channel_record_vars.extend(overlay.record_vars);
     }
 
+    let effective_runtime_variables = clinker_plan::plan::EffectiveRuntimeVariables {
+        static_vars: channel_static_vars,
+        pipeline_vars: channel_pipeline_vars,
+        source_vars: channel_source_vars,
+        record_vars: channel_record_vars,
+    };
+
     if let Some(emitter) = machine {
-        let fingerprint =
-            compiled_plan
-                .semantic_fingerprint()
-                .map_err(|error| PipelineError::Internal {
-                    op: "machine semantic fingerprint",
-                    node: "pipeline".to_owned(),
-                    detail: error.to_string(),
-                })?;
+        let fingerprint = compiled_plan
+            .semantic_fingerprint_with_runtime_variables(&effective_runtime_variables)
+            .map_err(|error| PipelineError::Internal {
+                op: "machine semantic fingerprint",
+                node: "pipeline".to_owned(),
+                detail: error.to_string(),
+            })?;
         emitter
             .emit_plan_resolved(fingerprint)
             .map_err(PipelineError::Io)?;
@@ -2828,10 +2848,10 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     let run_params = clinker_exec::executor::PipelineRunParams {
         execution_id: execution_id.clone(),
         batch_id: batch_id.clone(),
-        pipeline_vars: channel_pipeline_vars,
-        static_vars: channel_static_vars,
-        source_vars: channel_source_vars,
-        record_vars: channel_record_vars,
+        pipeline_vars: effective_runtime_variables.pipeline_vars,
+        static_vars: effective_runtime_variables.static_vars,
+        source_vars: effective_runtime_variables.source_vars,
+        record_vars: effective_runtime_variables.record_vars,
         shutdown_token: Some(shutdown_token.clone()),
         spill_root_dir: spill_root_dir.clone(),
         spill_disk_cap_bytes,
