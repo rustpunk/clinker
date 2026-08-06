@@ -16,6 +16,7 @@ pub(crate) mod document_dlq;
 pub(crate) mod envelope;
 pub(crate) mod envelope_dispatch;
 mod ingest;
+pub(crate) mod invariant;
 pub(crate) mod merge_dispatch;
 pub mod node_buffer;
 pub(crate) mod node_buffer_spill;

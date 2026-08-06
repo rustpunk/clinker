@@ -8,6 +8,12 @@
 
 use std::fmt;
 
+/// Maximum UTF-8 bytes retained from a logical node name in a dispatch
+/// mismatch. The dispatcher truncates before constructing the error; Display
+/// applies the same bound defensively for callers that construct the public
+/// enum directly.
+pub const DISPATCH_MISMATCH_NODE_MAX_BYTES: usize = 128;
+
 /// Top-level pipeline error enum with From impls for subsystem errors.
 #[derive(Debug)]
 pub enum PipelineError {
@@ -70,6 +76,16 @@ pub enum PipelineError {
         op: &'static str,
         node: String,
         detail: String,
+    },
+    /// A specialized runtime dispatcher received a compiled node of another
+    /// closed kind. The tags are fixed literals and `node` is a bounded logical
+    /// name; no record, path, credential, debug payload, or graph index is
+    /// retained.
+    DispatchMismatch {
+        dispatcher: &'static str,
+        expected_kind: &'static str,
+        actual_kind: &'static str,
+        node: String,
     },
     /// Finalize-time accumulator failure (overflow, type mismatch, etc.).
     /// Wraps `AccumulatorError` with the failing transform + binding for
@@ -382,6 +398,40 @@ impl PipelineError {
     pub fn overlay_diagnostics(diags: Vec<clinker_core_types::Diagnostic>) -> Self {
         Self::OverlayDiagnostics(diags)
     }
+
+    /// Return the stable machine classification owned by this typed failure.
+    ///
+    /// Other variants continue through their existing edge-specific adapters;
+    /// the dispatcher mismatch is intentionally registered here so every edge
+    /// uses one code/category/retry tuple without parsing rendered prose.
+    pub fn failure_classification(&self) -> Option<clinker_core_types::FailureClassification> {
+        match self {
+            Self::DispatchMismatch { .. } => clinker_core_types::FailureClassification::for_code(
+                "runtime.invariant.dispatch_mismatch",
+            ),
+            _ => None,
+        }
+    }
+
+    /// Bound and sanitize the sole authored value retained by a dispatch
+    /// mismatch. Reuse the stable failure sanitizer so path-, credential-,
+    /// record-, and Debug-shaped node names collapse to a fixed marker.
+    pub fn bounded_dispatch_node_name(node: &str) -> String {
+        let mut end = node.len().min(DISPATCH_MISMATCH_NODE_MAX_BYTES);
+        while !node.is_char_boundary(end) {
+            end -= 1;
+        }
+        let classification = clinker_core_types::FailureClassification::new(
+            "runtime.invariant.dispatch_mismatch",
+            &node[..end],
+        )
+        .expect("the append-only registry contains runtime.invariant.dispatch_mismatch");
+        if classification.message() == "runtime dispatch invariant failed" {
+            "<redacted-node>".to_owned()
+        } else {
+            classification.message().to_owned()
+        }
+    }
 }
 
 impl fmt::Display for PipelineError {
@@ -442,6 +492,17 @@ impl fmt::Display for PipelineError {
             Self::Internal { op, node, detail } => {
                 write!(f, "internal error in {op} '{node}': {detail}")
             }
+            Self::DispatchMismatch {
+                dispatcher,
+                expected_kind,
+                actual_kind,
+                node,
+            } => write!(
+                f,
+                "internal dispatch mismatch in {dispatcher}: expected {expected_kind}, got \
+                 {actual_kind} at node '{}'; contact support with this operator identity",
+                Self::bounded_dispatch_node_name(node),
+            ),
             Self::Accumulator {
                 transform,
                 binding,
@@ -796,6 +857,19 @@ mod tests {
             error.to_string(),
             "internal dispatch mismatch in dispatch_route: expected route, got transform at node 'normalize_orders'; contact support with this operator identity"
         );
+
+        let sensitive = PipelineError::DispatchMismatch {
+            dispatcher: "dispatch_route",
+            expected_kind: "route",
+            actual_kind: "transform",
+            node: "/srv/private.csv record={token=secret}".to_owned(),
+        }
+        .to_string();
+        assert!(sensitive.contains("<redacted-node>"), "{sensitive}");
+        for forbidden in ["/srv/", "private.csv", "record=", "token=", "secret"] {
+            assert!(!sensitive.contains(forbidden), "{sensitive}");
+        }
+        assert!(sensitive.len() < 320, "{sensitive}");
     }
 
     #[test]

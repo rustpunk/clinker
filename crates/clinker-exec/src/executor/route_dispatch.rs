@@ -26,17 +26,47 @@ use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
+/// Context carrier kept lazy until the node-kind guard has succeeded. Normal
+/// dispatch passes the live executor context directly; unit tests can provide
+/// the inert carrier to prove a mismatch returns before any context access.
+pub(crate) enum RouteDispatchContext<'borrow, 'plan> {
+    Live(&'borrow mut ExecutorContext<'plan>),
+    #[cfg(test)]
+    Inert,
+}
+
+impl<'borrow, 'plan> From<&'borrow mut ExecutorContext<'plan>>
+    for RouteDispatchContext<'borrow, 'plan>
+{
+    fn from(ctx: &'borrow mut ExecutorContext<'plan>) -> Self {
+        Self::Live(ctx)
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct InertRouteDispatchContext;
+
+#[cfg(test)]
+impl<'borrow, 'plan> From<InertRouteDispatchContext> for RouteDispatchContext<'borrow, 'plan> {
+    fn from(_: InertRouteDispatchContext) -> Self {
+        Self::Inert
+    }
+}
+
 /// Execute the `Route` arm for `node_idx`: evaluate each branch predicate
 /// against every input record and emit matching records onto the
 /// corresponding successor port, falling back to the default branch.
 /// Stateless and streaming — records route one at a time without per-record
 /// state accumulation.
-pub(crate) fn dispatch_route(
-    ctx: &mut ExecutorContext<'_>,
+pub(crate) fn dispatch_route<'borrow, 'plan>(
+    ctx: impl Into<RouteDispatchContext<'borrow, 'plan>>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     node: &PlanNode,
-) -> Result<(), PipelineError> {
+) -> Result<(), PipelineError>
+where
+    'plan: 'borrow,
+{
     let PlanNode::Route {
         ref name,
         mode,
@@ -46,7 +76,19 @@ pub(crate) fn dispatch_route(
         ..
     } = *node
     else {
-        unreachable!("dispatch_route called with non-Route node");
+        return Err(crate::executor::invariant::dispatch_mismatch(
+            "dispatch_route",
+            "route",
+            node.kind_name(),
+            node.name(),
+        ));
+    };
+    let ctx = match ctx.into() {
+        RouteDispatchContext::Live(ctx) => ctx,
+        #[cfg(test)]
+        RouteDispatchContext::Inert => {
+            panic!("route dispatcher accessed inert context after accepting a route node")
+        }
     };
     // Body-context Routes that consume an input port have no
     // predecessor in the body's mini-DAG — the records are

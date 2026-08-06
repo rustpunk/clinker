@@ -882,8 +882,8 @@ impl PlanNode {
         Some(dag.graph[first].output_schema_in(dag))
     }
 
-    /// Get the type tag string for id slug construction.
-    pub fn type_tag(&self) -> &'static str {
+    /// Return the closed runtime kind tag for this node.
+    pub fn kind_name(&self) -> &'static str {
         match self {
             PlanNode::Source { .. } => "source",
             PlanNode::Transform { .. } => "transform",
@@ -899,6 +899,11 @@ impl PlanNode {
             PlanNode::Cull { .. } => "cull",
             PlanNode::Envelope { .. } => "envelope",
         }
+    }
+
+    /// Get the type tag string for id slug construction.
+    pub fn type_tag(&self) -> &'static str {
+        self.kind_name()
     }
 
     /// Build the id slug: `"{type}.{name}"`.
