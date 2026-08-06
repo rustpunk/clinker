@@ -36,12 +36,44 @@ nodes:
     input: src
     config:
       name: out
-      path: {output}
+      path: "{output}"
       type: csv
 "#
         ),
     )
     .expect("pipeline fixture");
+}
+
+fn write_rest_pipeline(directory: &std::path::Path, url: &str, pagination: &str) {
+    std::fs::write(
+        directory.join("pipeline.yaml"),
+        format!(
+            r#"pipeline:
+  name: machine_rest_failure
+nodes:
+  - type: source
+    name: api
+    config:
+      name: api
+      type: json
+      options: {{ format: array }}
+      transport:
+        kind: rest
+        url: {url:?}
+        max_pages: 2
+        retries: 0
+        timeout_secs: 1
+{pagination}
+      schema:
+        - {{ name: id, type: int }}
+  - type: output
+    name: out
+    input: api
+    config: {{ name: out, path: out.csv, type: csv }}
+"#
+        ),
+    )
+    .expect("REST pipeline");
 }
 
 fn invoke(directory: &std::path::Path, extra: &[&str]) -> Output {
@@ -99,7 +131,7 @@ fn assert_stream(stream: &[Value], batch_id: &str) {
 #[test]
 fn protocol_success_is_one_ordered_machine_only_stream() {
     let directory = fixture();
-    write_pipeline(directory.path(), "machine.csv");
+    write_pipeline(directory.path(), "{batch_id}-{execution_id}.csv");
     let output = invoke(
         directory.path(),
         &["--machine", "ndjson-v1", "--batch-id", "batch-success"],
@@ -125,7 +157,14 @@ fn protocol_success_is_one_ordered_machine_only_stream() {
         64
     );
     assert_eq!(stream.last().expect("terminal")["event"], "completed");
-    assert!(directory.path().join("machine.csv").exists());
+    let execution_id = stream[0]["execution_id"].as_str().expect("execution id");
+    assert!(
+        directory
+            .path()
+            .join(format!("batch-success-{execution_id}.csv"))
+            .exists(),
+        "the emitted identities must be the output-template identities"
+    );
 }
 
 #[test]
@@ -200,4 +239,132 @@ fn protocol_plain_run_does_not_emit_machine_records() {
     assert!(output.status.success());
     assert!(!String::from_utf8_lossy(&output.stdout).contains("clinker.run"));
     assert!(directory.path().join("plain.csv").exists());
+}
+
+#[test]
+fn protocol_allows_file_lineage_but_rejects_lineage_stdout() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "lineage-only.csv");
+    let file_lineage = invoke(
+        directory.path(),
+        &[
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "lineage-file",
+            "--lineage",
+            "lineage.ndjson",
+        ],
+    );
+    assert!(
+        file_lineage.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&file_lineage.stderr)
+    );
+    let stream = events(&file_lineage);
+    assert_stream(&stream, "lineage-file");
+    assert_eq!(stream[1]["event"], "plan_resolved");
+    assert!(directory.path().join("lineage.ndjson").exists());
+    assert!(!directory.path().join("lineage-only.csv").exists());
+
+    let stdout_lineage = invoke(
+        directory.path(),
+        &[
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "lineage-stdout",
+            "--lineage",
+            "-",
+        ],
+    );
+    assert_eq!(stdout_lineage.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&stdout_lineage.stderr).contains("--lineage -"));
+}
+
+#[test]
+fn protocol_retry_restarts_with_a_fresh_execution_identity() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "{execution_id}.csv");
+    let first = invoke(
+        directory.path(),
+        &["--machine", "ndjson-v1", "--batch-id", "same-batch"],
+    );
+    let second = invoke(
+        directory.path(),
+        &["--machine", "ndjson-v1", "--batch-id", "same-batch"],
+    );
+    assert!(first.status.success() && second.status.success());
+    let first_events = events(&first);
+    let second_events = events(&second);
+    assert_stream(&first_events, "same-batch");
+    assert_stream(&second_events, "same-batch");
+    let first_id = first_events[0]["execution_id"].as_str().expect("first id");
+    let second_id = second_events[0]["execution_id"]
+        .as_str()
+        .expect("second id");
+    assert_ne!(first_id, second_id);
+    assert_eq!(
+        std::fs::read(directory.path().join(format!("{first_id}.csv"))).expect("first output"),
+        std::fs::read(directory.path().join(format!("{second_id}.csv"))).expect("second output")
+    );
+}
+
+#[test]
+fn protocol_failed_terminals_cover_the_exact_retry_vocabulary() {
+    let unavailable = fixture();
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+    let unavailable_url = format!(
+        "http://{}",
+        reserved.local_addr().expect("reserved address")
+    );
+    drop(reserved);
+    write_rest_pipeline(unavailable.path(), &unavailable_url, "");
+    let transient = invoke(
+        unavailable.path(),
+        &["--machine", "ndjson-v1", "--batch-id", "transient"],
+    );
+    let transient_events = events(&transient);
+    assert_stream(&transient_events, "transient");
+    assert_eq!(
+        transient_events.last().expect("transient terminal")["failure"]["retry"],
+        "retry_with_backoff"
+    );
+
+    let policy = fixture();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind server");
+    let url = format!("http://{}", listener.local_addr().expect("server address"));
+    let server = std::thread::spawn(move || {
+        use std::io::{Read as _, Write as _};
+
+        let (mut stream, _) = listener.accept().expect("accept request");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).expect("read request");
+        let body = "[]";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nLink: </next; rel=next\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write response");
+        stream.flush().expect("flush response");
+    });
+    write_rest_pipeline(
+        policy.path(),
+        &url,
+        "        pagination:\n          strategy: link_header",
+    );
+    let policy_output = invoke(
+        policy.path(),
+        &["--machine", "ndjson-v1", "--batch-id", "policy"],
+    );
+    server.join().expect("server thread");
+    let policy_events = events(&policy_output);
+    assert_stream(&policy_events, "policy");
+    let terminal = policy_events.last().expect("policy terminal");
+    assert_eq!(terminal["failure"]["retry"], "policy_required");
+    assert_eq!(
+        terminal["failure"]["code"],
+        "rest.protocol.malformed_continuation"
+    );
 }

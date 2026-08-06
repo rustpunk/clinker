@@ -40,7 +40,7 @@ use crate::{io_err, schema_err};
 use continuation::{AuthorizedUrl, ContinuationError, Origin};
 
 fn continuation_format_error(error: ContinuationError) -> FormatError {
-    io_err(error.to_string())
+    FormatError::classified(error.classification_code(), error.to_string())
 }
 
 /// Per-body cap. Each individual page body is bounded so a misbehaving

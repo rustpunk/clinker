@@ -9,7 +9,10 @@ use clinker_exec::metrics::{self, ExecutionMetrics};
 use clinker_plan::config::utils::parse_memory_limit_bytes_strict;
 use clinker_plan::error::PipelineError;
 
+mod machine;
 mod refactor;
+
+use machine::MachineEmitter;
 
 /// Bounded-memory batch ETL engine for CXL pipelines.
 #[derive(Parser, Debug)]
@@ -483,6 +486,13 @@ pub enum ExplainFormat {
     Dot,
 }
 
+/// Versioned machine-readable run protocol.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum MachineFormat {
+    /// Compact UTF-8 NDJSON using `clinker.run` schema version 1.
+    NdjsonV1,
+}
+
 /// Arguments for `clinker run`.
 #[derive(Parser, Debug)]
 pub struct RunArgs {
@@ -504,6 +514,11 @@ pub struct RunArgs {
     /// Pipeline batch_id, default generated UUID v7
     #[arg(long, help_heading = "Execution")]
     pub batch_id: Option<String>,
+
+    /// Emit one ordered machine lifecycle on stdout. Consumers must reject
+    /// unsupported major schema versions; schema-1 additions are compatible.
+    #[arg(long, value_enum, help_heading = "Output")]
+    pub machine: Option<MachineFormat>,
 
     /// Print execution plan and exit (no data read).
     /// Optionally specify format: text (default), json, dot.
@@ -775,6 +790,62 @@ fn pipeline_error_exit_code(error: &PipelineError) -> u8 {
     }
 }
 
+fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::FailureClassification {
+    use clinker_core_types::FailureClassification;
+
+    let registered = |code| {
+        FailureClassification::for_code(code)
+            .unwrap_or_else(|| FailureClassification::unknown_internal("unregistered failure"))
+    };
+    match error {
+        PipelineError::Format(format_error) => {
+            if let Some(code) = format_error.classification_code() {
+                return registered(code);
+            }
+            if matches!(format_error, clinker_format::FormatError::Io(_)) {
+                registered("infrastructure.runtime.transient")
+            } else {
+                registered("source.data.invalid")
+            }
+        }
+        PipelineError::Config(_)
+        | PipelineError::Schema(_)
+        | PipelineError::PlanDiagnostics { .. }
+        | PipelineError::OverlayDiagnostics(_)
+        | PipelineError::Compilation { .. } => registered("admission.configuration.invalid"),
+        PipelineError::Internal { .. }
+        | PipelineError::MergeSortOrderViolation { .. }
+        | PipelineError::CompositionDepthExceeded { .. }
+        | PipelineError::CompositionBodyMissing { .. }
+        | PipelineError::CompositionUnknownPort { .. }
+        | PipelineError::SchemaMismatch { .. } => registered("runtime.invariant.plan_mismatch"),
+        PipelineError::CompositionBodyError { inner, .. } => classify_pipeline_error(inner),
+        PipelineError::Io(_)
+        | PipelineError::Spill(_)
+        | PipelineError::SpillCapExceeded { .. }
+        | PipelineError::ThreadPool(_) => registered("infrastructure.runtime.transient"),
+        PipelineError::Multiple(errors) => errors.first().map_or_else(
+            || registered("runtime.invariant.unknown"),
+            classify_pipeline_error,
+        ),
+        PipelineError::Eval(_)
+        | PipelineError::Accumulator { .. }
+        | PipelineError::SortOrderViolation { .. }
+        | PipelineError::MemoryBudgetExceeded { .. }
+        | PipelineError::UnsatisfiableMemoryBudget { .. }
+        | PipelineError::CombineMissingMatch { .. }
+        | PipelineError::CombineRangeKeyOutOfRange { .. }
+        | PipelineError::CombineOutputCapExceeded { .. }
+        | PipelineError::EnvelopeMultiHeaderConflict { .. }
+        | PipelineError::EnvelopeHeaderGrainUnmatched { .. }
+        | PipelineError::EnvelopeHeaderMultipleForGrain { .. }
+        | PipelineError::DlqRateExceeded { .. }
+        | PipelineError::TypeErrorThresholdExceeded { .. }
+        | PipelineError::CorrelationGroupOverflow { .. } => registered("source.data.invalid"),
+        PipelineError::Interrupted => registered("runtime.invariant.unknown"),
+    }
+}
+
 fn main() -> ExitCode {
     let attempts_invocation = std::env::args_os()
         .nth(1)
@@ -798,7 +869,15 @@ fn main() -> ExitCode {
                 .log_level
                 .parse::<tracing_subscriber::filter::LevelFilter>()
                 .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO);
-            tracing_subscriber::fmt().with_max_level(filter).init();
+            if args.machine.is_some() {
+                tracing_subscriber::fmt()
+                    .with_max_level(filter)
+                    .with_writer(std::io::stderr)
+                    .with_ansi(false)
+                    .init();
+            } else {
+                tracing_subscriber::fmt().with_max_level(filter).init();
+            }
 
             // Install the process-wide SIGINT/SIGTERM handler before the
             // run starts so an interrupt during a long pipeline trips the
@@ -807,12 +886,41 @@ fn main() -> ExitCode {
                 eprintln!("clinker: failed to install signal handler: {e}");
             }
 
+            let machine = match MachineEmitter::admit(args) {
+                Ok(machine) => machine,
+                Err(message) => {
+                    eprintln!("clinker: {message}");
+                    return ExitCode::from(1);
+                }
+            };
+            if let Some(emitter) = machine.as_ref()
+                && let Err(error) = emitter.emit_started()
+            {
+                eprintln!("clinker: cannot write machine protocol: {error}");
+                return ExitCode::from(4);
+            }
+
             // The executor is fully synchronous — call it directly.
-            match run(args) {
-                Ok(code) => ExitCode::from(code),
+            match run(args, machine.as_ref()) {
+                Ok(code) => {
+                    if let Some(emitter) = machine.as_ref()
+                        && let Err(error) = emitter.emit_completed(code)
+                    {
+                        eprintln!("clinker: cannot write machine terminal event: {error}");
+                        return ExitCode::from(4);
+                    }
+                    ExitCode::from(code)
+                }
                 Err(e) => {
+                    let exit_code = pipeline_error_exit_code(&e);
+                    if let Some(emitter) = machine.as_ref()
+                        && let Err(error) =
+                            emitter.emit_failed(exit_code, &classify_pipeline_error(&e))
+                    {
+                        eprintln!("clinker: cannot write machine terminal event: {error}");
+                    }
                     render_pipeline_error(&e, &args.config);
-                    ExitCode::from(pipeline_error_exit_code(&e))
+                    ExitCode::from(exit_code)
                 }
             }
         }
@@ -1645,7 +1753,7 @@ fn publication_error_category(error: &clinker_exec::output::attempt::AttemptErro
     }
 }
 
-fn run(args: &RunArgs) -> Result<u8, PipelineError> {
+fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineError> {
     // Resolve CLINKER_ENV
     if let Some(env_name) = args
         .env
@@ -1872,8 +1980,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // provenance sidecar. Generated before --explain so resolved-path
     // summaries match the values the actual run would use. The id pair
     // re-rolls per invocation; consumers correlate runs via batch_id.
-    let execution_id = uuid::Uuid::now_v7().to_string();
-    let batch_id = args.resolved_batch_id();
+    let execution_id = machine.map_or_else(
+        || uuid::Uuid::now_v7().to_string(),
+        |emitter| emitter.execution_id(),
+    );
+    let batch_id = machine.map_or_else(|| args.resolved_batch_id(), |emitter| emitter.batch_id());
     let pipeline_hash = pipeline_config.source_hash;
     let timestamp_str = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
     let mut source_name_by_node: std::collections::HashMap<String, String> =
@@ -1963,6 +2074,20 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         if let Some(res) = &overlay_resolution {
             let overlay = res.apply_config_and_vars(&mut compiled_plan, &pipeline_config);
             abort_on_overlay_errors(&overlay)?;
+        }
+
+        if let Some(emitter) = machine {
+            let fingerprint =
+                compiled_plan
+                    .semantic_fingerprint()
+                    .map_err(|error| PipelineError::Internal {
+                        op: "machine semantic fingerprint",
+                        node: "pipeline".to_owned(),
+                        detail: error.to_string(),
+                    })?;
+            emitter
+                .emit_plan_resolved(fingerprint)
+                .map_err(PipelineError::Io)?;
         }
         let dag = compiled_plan.dag();
         let statistics = compiled_plan.statistics();
@@ -2090,6 +2215,20 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             abort_on_overlay_errors(&overlay)?;
         }
 
+        if let Some(emitter) = machine {
+            let fingerprint =
+                compiled_plan
+                    .semantic_fingerprint()
+                    .map_err(|error| PipelineError::Internal {
+                        op: "machine semantic fingerprint",
+                        node: "pipeline".to_owned(),
+                        detail: error.to_string(),
+                    })?;
+            emitter
+                .emit_plan_resolved(fingerprint)
+                .map_err(PipelineError::Io)?;
+        }
+
         let lineage = clinker_lineage::column_lineage(&compiled_plan, &lineage_base_dir);
         let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
         let job = clinker_lineage::Job::for_pipeline(cfg.pipeline.name.clone(), source_hash);
@@ -2191,6 +2330,20 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             channel_source_vars.entry(src).or_default().extend(inner);
         }
         channel_record_vars.extend(overlay.record_vars);
+    }
+
+    if let Some(emitter) = machine {
+        let fingerprint =
+            compiled_plan
+                .semantic_fingerprint()
+                .map_err(|error| PipelineError::Internal {
+                    op: "machine semantic fingerprint",
+                    node: "pipeline".to_owned(),
+                    detail: error.to_string(),
+                })?;
+        emitter
+            .emit_plan_resolved(fingerprint)
+            .map_err(PipelineError::Io)?;
     }
 
     if args.dry_run && args.dry_run_n.is_none() {
@@ -2658,7 +2811,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // with the process-wide signal-handler registry installed in `main`,
     // so a SIGINT/SIGTERM during the run trips it; the executor polls it
     // at operator chunk boundaries and unwinds gracefully.
-    let shutdown_token = clinker_exec::pipeline::shutdown::ShutdownToken::new();
+    let shutdown_token = machine.map_or_else(
+        clinker_exec::pipeline::shutdown::ShutdownToken::new,
+        MachineEmitter::shutdown_token,
+    );
     let run_params = clinker_exec::executor::PipelineRunParams {
         execution_id: execution_id.clone(),
         batch_id: batch_id.clone(),
@@ -2963,7 +3119,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // each stage's real spilled bytes against the pre-run `--explain` per-stage
     // estimate (the calibration loop #176 exists for). Printed only when a stage
     // actually spilled; a run that stayed in memory adds no noise.
-    if !report.per_stage_spill_bytes.is_empty() {
+    if machine.is_none() && !report.per_stage_spill_bytes.is_empty() {
         println!("=== Spill Volume (actual, per stage) ===");
         for (stage, bytes) in &report.per_stage_spill_bytes {
             println!("  {stage} → {bytes} bytes");

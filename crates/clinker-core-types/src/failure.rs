@@ -207,6 +207,7 @@ failure_registry! {
     "observability.configuration.policy_required", Observability, PolicyRequired, "observability policy is required";
     "observability.delivery.failed", Observability, RetryWithBackoff, "observability delivery failed";
     "observability.delivery.rejected", Observability, PolicyRequired, "observability delivery was rejected";
+    "source.data.invalid", SourceProtocol, DoNotRetry, "source data does not satisfy the admitted plan";
 }
 
 fn registry_entry(code: &str) -> Option<&'static RegistryEntry> {
