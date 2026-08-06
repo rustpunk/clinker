@@ -337,6 +337,8 @@ pub struct CompiledCxlModule {
     pub module: Module,
     pub node_count: u32,
     pub imports: BTreeMap<String, LogicalResourceId>,
+    /// BLAKE3 of the exact module source bytes read during planning.
+    pub content_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, Default)]
@@ -370,6 +372,25 @@ impl CompiledModuleRegistry {
     /// Transitive dependencies remain private to their importing module.
     pub fn is_program_visible(&self, id: &str) -> bool {
         self.program_roots.iter().any(|root| root.as_str() == id)
+    }
+
+    /// Deterministic semantic identities for every module in the closure.
+    pub(crate) fn semantic_identities(&self) -> Vec<ModuleSemanticIdentity<'_>> {
+        let mut modules = self.modules.values().collect::<Vec<_>>();
+        modules.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        modules
+            .into_iter()
+            .map(|module| ModuleSemanticIdentity {
+                id: module.id.as_str(),
+                content_digest: module.content_digest,
+                imports: module
+                    .imports
+                    .iter()
+                    .map(|(alias, dependency)| (alias.as_str(), dependency.as_str()))
+                    .collect(),
+                program_visible: self.program_roots.contains(&module.id),
+            })
+            .collect()
     }
 
     /// Resolver-facing export table keyed by logical module identity.
@@ -412,6 +433,14 @@ impl CompiledModuleRegistry {
         }
         Arc::new(registry)
     }
+}
+
+/// Path-independent semantic identity of one admitted CXL module.
+pub(crate) struct ModuleSemanticIdentity<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) content_digest: [u8; 32],
+    pub(crate) imports: Vec<(&'a str, &'a str)>,
+    pub(crate) program_visible: bool,
 }
 
 /// Collect direct `use` declarations from typed executable CXL fields.
@@ -850,6 +879,7 @@ fn compile_one(
             module: parsed.module,
             node_count: parsed.node_count,
             imports,
+            content_digest: *blake3::hash(&bytes).as_bytes(),
         }),
     );
     Ok(())

@@ -272,6 +272,8 @@ pub enum ResourceKind {
 pub struct CompositionFile {
     pub signature: CompositionSignature,
     pub nodes: Vec<Spanned<PipelineNode>>,
+    /// BLAKE3 of the exact composition source bytes read during planning.
+    pub content_digest: [u8; 32],
 }
 
 impl CompositionFile {
@@ -287,7 +289,11 @@ impl CompositionFile {
         source_path: PathBuf,
     ) -> Result<CompositionFile, YamlError> {
         let raw: raw::RawCompositionFile = crate::yaml::from_str(yaml)?;
-        Ok(raw.finalize(file_id, source_path))
+        Ok(raw.finalize(
+            file_id,
+            source_path,
+            *blake3::hash(yaml.as_bytes()).as_bytes(),
+        ))
     }
 }
 

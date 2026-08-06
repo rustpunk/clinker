@@ -2,6 +2,8 @@
 
 use super::CompiledPlan;
 
+const SEMANTIC_FINGERPRINT_DOMAIN: &[u8] = b"clinker.semantic-fingerprint.v1\0";
+
 /// Versioned semantic identity for one effective compiled plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SemanticFingerprint {
@@ -78,8 +80,165 @@ impl CompiledPlan {
     /// Returns [`SemanticFingerprintError`] if the typed plan cannot be
     /// represented by the canonical identity schema.
     pub fn semantic_fingerprint(&self) -> Result<SemanticFingerprint, SemanticFingerprintError> {
-        Ok(SemanticFingerprint { digest: [0; 32] })
+        let nodes = self
+            .config()
+            .nodes
+            .iter()
+            .map(|node| semantic_node(&node.value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut error_handling = serde_json::to_value(&self.config().error_handling)?;
+        if let Some(dlq) = error_handling
+            .as_object_mut()
+            .and_then(|error| error.get_mut("dlq"))
+        {
+            remove_deployment_paths(dlq);
+        }
+
+        let mut composition_bodies = self
+            .composition_bodies()
+            .iter()
+            .map(|(id, body)| {
+                serde_json::json!({
+                    "ordinal": id.0,
+                    "name": body.semantic_name,
+                    "content_digest": digest_hex(body.content_digest),
+                })
+            })
+            .collect::<Vec<_>>();
+        composition_bodies.sort_by_key(|body| {
+            body.get("ordinal")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX)
+        });
+
+        let modules = self
+            .cxl_modules()
+            .semantic_identities()
+            .into_iter()
+            .map(|module| {
+                let imports = module
+                    .imports
+                    .into_iter()
+                    .map(|(alias, dependency)| {
+                        serde_json::json!({
+                            "alias": alias,
+                            "module": dependency,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "id": module.id,
+                    "content_digest": digest_hex(module.content_digest),
+                    "imports": imports,
+                    "program_visible": module.program_visible,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut identity = serde_json::json!({
+            "version": SemanticFingerprint::VERSION,
+            "pipeline": {
+                "name": self.config().pipeline.name,
+                "batch_size": self.config().pipeline.batch_size,
+                "vars": self.config().pipeline.vars,
+                "date_formats": self.config().pipeline.date_formats,
+            },
+            "nodes": nodes,
+            "error_handling": error_handling,
+            "bound_schemas": self.bound_schemas(),
+            "dependencies": {
+                "composition_bodies": composition_bodies,
+                "cxl_modules": modules,
+            },
+        });
+        canonicalize(&mut identity);
+        let encoded = serde_json::to_vec(&identity)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(SEMANTIC_FINGERPRINT_DOMAIN);
+        hasher.update(&(encoded.len() as u64).to_le_bytes());
+        hasher.update(&encoded);
+        Ok(SemanticFingerprint {
+            digest: *hasher.finalize().as_bytes(),
+        })
     }
+}
+
+fn semantic_node(
+    node: &crate::config::PipelineNode,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut value = serde_json::to_value(node)?;
+    let Some(object) = value.as_object_mut() else {
+        return Ok(value);
+    };
+    match object.get("type").and_then(serde_json::Value::as_str) {
+        Some("source") => {
+            if let Some(config) = object
+                .get_mut("config")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                config.remove("path");
+                config.remove("paths");
+                // The resolved schema is represented once in `bound_schemas`.
+                config.remove("schema");
+            }
+        }
+        Some("output") => {
+            if let Some(config) = object
+                .get_mut("config")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                config.remove("path");
+            }
+        }
+        Some("composition") => {
+            object.remove("use");
+            // Resource bindings are deployment locators. The body digest and
+            // typed call-site config carry execution meaning separately.
+            object.remove("resources");
+        }
+        _ => {}
+    }
+    Ok(value)
+}
+
+fn remove_deployment_paths(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                remove_deployment_paths(value);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            object.remove("path");
+            for value in object.values_mut() {
+                remove_deployment_paths(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn canonicalize(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                canonicalize(value);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let mut entries = std::mem::take(object).into_iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, mut value) in entries {
+                canonicalize(&mut value);
+                object.insert(key, value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn digest_hex(digest: [u8; 32]) -> String {
+    blake3::Hash::from_bytes(digest).to_hex().to_string()
 }
 
 #[cfg(test)]
@@ -227,6 +386,11 @@ nodes:
                 "meaningful change must invalidate v1"
             );
         }
+        let continuing = BASE.replace(
+            "nodes:",
+            "error_handling:\n  strategy: continue\n  dlq: { path: deployment/dlq.ndjson }\nnodes:",
+        );
+        assert_ne!(base, fingerprint(&continuing));
     }
 
     #[test]
@@ -330,6 +494,31 @@ nodes:
             .semantic_fingerprint()
             .expect("third module identity");
         assert_ne!(second, third);
+
+        let config = load_config(&pipeline).expect("reload module pipeline");
+        let mut context = CompileContext::default();
+        let catalog = WorkspaceCatalog::load(workspace.path(), &CatalogConfig::default())
+            .expect("reload workspace catalog");
+        let rules_root = catalog
+            .select_rules_root(None, None)
+            .expect("resolve rules root");
+        let direct_roots = [
+            crate::resources::LogicalResourceId::parse("root").expect("root id"),
+            crate::resources::LogicalResourceId::parse("shared.base").expect("dependency id"),
+        ];
+        context.cxl_modules = compile_module_closure(
+            &catalog,
+            &rules_root,
+            &direct_roots,
+            ModuleLimits::default(),
+        )
+        .expect("compile closure with direct dependency visibility");
+        let visible_dependency = config
+            .compile(&context)
+            .expect("compile plan with direct dependency visibility")
+            .semantic_fingerprint()
+            .expect("direct visibility identity");
+        assert_ne!(third, visible_dependency);
     }
 
     #[test]
@@ -376,5 +565,14 @@ nodes:
             .semantic_fingerprint()
             .expect("second body identity");
         assert_ne!(first, second);
+
+        let relocated = compositions.join("relocated.comp.yaml");
+        std::fs::rename(&body, &relocated).expect("relocate body");
+        let relocated_yaml = yaml.replace("gate.comp.yaml", "relocated.comp.yaml");
+        std::fs::write(&pipeline, relocated_yaml).expect("rewrite composition locator");
+        let relocated_identity = compile_workspace(workspace.path(), &pipeline)
+            .semantic_fingerprint()
+            .expect("relocated body identity");
+        assert_eq!(second, relocated_identity);
     }
 }

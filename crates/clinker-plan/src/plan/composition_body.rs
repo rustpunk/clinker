@@ -105,6 +105,12 @@ pub struct BoundBody {
     /// Workspace-relative path used as the `CompositionSymbolTable` key.
     pub signature_path: PathBuf,
 
+    /// User-facing `_compose.name`, retained without its physical path.
+    pub semantic_name: String,
+
+    /// BLAKE3 of the exact composition source bytes read during planning.
+    pub content_digest: [u8; 32],
+
     /// Body's mini-DAG of lowered `PlanNode`s. NodeIndices here live
     /// in their own space — they do not collide with NodeIndices in
     /// the parent scope or in sibling bodies.
@@ -234,6 +240,8 @@ impl BoundBody {
         Self {
             body_scope: BodyScopeId::SENTINEL,
             signature_path,
+            semantic_name: String::new(),
+            content_digest: [0; 32],
             graph: DiGraph::new(),
             topo_order: Vec::new(),
             name_to_idx: HashMap::new(),
