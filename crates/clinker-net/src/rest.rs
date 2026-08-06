@@ -895,4 +895,15 @@ mod tests {
         }
         assert_eq!(count, 2, "each `Item` occurrence becomes its own record");
     }
+
+    #[test]
+    fn continuation_classification_preserves_the_registered_code() {
+        let error = continuation_format_error(ContinuationError::for_code(
+            "rest.protocol.malformed_continuation",
+        ));
+        assert_eq!(
+            error.classification_code(),
+            Some("rest.protocol.malformed_continuation")
+        );
+    }
 }

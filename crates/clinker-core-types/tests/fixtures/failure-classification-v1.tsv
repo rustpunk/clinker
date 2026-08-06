@@ -31,3 +31,4 @@ observability.configuration.invalid	observability	do_not_retry
 observability.configuration.policy_required	observability	policy_required
 observability.delivery.failed	observability	retry_with_backoff
 observability.delivery.rejected	observability	policy_required
+source.data.invalid	source_protocol	do_not_retry
