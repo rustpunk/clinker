@@ -33,7 +33,7 @@ Every event carries these fields:
 |---|---|
 | `protocol` | Always `clinker.run`. |
 | `schema` | Protocol major version. `ndjson-v1` emits `1`. |
-| `event` | Lifecycle kind such as `started`, `plan_resolved`, `progress`, `completed`, `failed`, or `cancelled`. |
+| `event` | Lifecycle kind such as `started`, `plan_resolved`, `progress`, `publication_artifacts`, `completed`, `failed`, or `cancelled`. |
 | `seq` | Zero-based sequence, increasing by exactly one within this process. |
 | `batch_id` | Caller-supplied logical-batch correlation retained across retries. |
 | `execution_id` | Fresh non-overridable UUIDv7 generated for this process. |
@@ -49,9 +49,13 @@ Progress events add a bounded logical phase, kind, elapsed time, optional
 checkpoint count, and truncation flags. They never contain records, secrets,
 source URLs, or physical paths. Failed terminals add a stable failure code,
 broad category, sanitized message, and `retry_with_backoff`, `do_not_retry`, or
-`policy_required` advice. Completed terminals add a result and path-free
-publication evidence. Artifact entries contain only `artifact_id`, `kind`, and
-`state`; publication also reports completeness and cleanup-debt count.
+`policy_required` advice. Before a publication-aware terminal, bounded
+`publication_artifacts` records carry the path-free inventory in ordered
+chunks. Artifact entries contain only `artifact_id`, `kind`, and `state`.
+The terminal carries the attempt's completeness, cleanup-debt count, total
+artifact count, and counts by artifact state. Every NDJSON record, including a
+maximum-cardinality inventory chunk and its terminal summary, is at most 16
+KiB.
 
 A consumer must reject an unsupported `schema` major. Within schema 1 it may
 ignore additive fields and unknown nonterminal event kinds, but those additions
@@ -84,7 +88,10 @@ Publication is atomic per artifact, not for the artifact set. A failure or
 uncontrolled stop during multi-artifact publication can leave an exact subset
 of newly promoted, individually complete finals visible. Consumers that need a
 complete set must wait for reconciled success and verify the expected artifact
-inventory. Never treat a partial terminal stream as set-wide success.
+inventory. Reassemble artifact chunks only when every chunk index from zero to
+`chunk_count - 1` is present in sequence before the terminal and the assembled
+count matches the terminal's `artifact_count` and `state_counts`. Never treat a
+partial terminal stream as set-wide success.
 
 ## Language-neutral adapter loop
 

@@ -14,6 +14,7 @@ use crate::{MachineFormat, RunArgs};
 
 const MAX_EVENT_BYTES: usize = 16 * 1024;
 const MAX_BATCH_ID_BYTES: usize = 256;
+const PUBLICATION_ARTIFACTS_PER_EVENT: usize = 64;
 
 /// One ordered serializer and terminal arbiter for a controlled invocation.
 #[derive(Clone)]
@@ -166,25 +167,19 @@ impl MachineEmitter {
         publication: Option<&AttemptPublicationOutcome>,
     ) -> io::Result<()> {
         self.with_state(|state| {
-            if !state.reserve_terminal() {
-                return Ok(());
-            }
             if exit_code == 130 {
-                return state.write_event("cancelled", serde_json::Map::new());
+                return state.write_terminal_event("cancelled", serde_json::Map::new(), None);
             }
             let result = if exit_code == 2 {
                 "completed_with_dlq"
             } else {
                 "success"
             };
-            let mut fields = serde_json::Map::from_iter([
+            let fields = serde_json::Map::from_iter([
                 ("result".to_owned(), serde_json::json!(result)),
                 ("exit_code".to_owned(), serde_json::json!(exit_code)),
             ]);
-            if let Some(publication) = publication {
-                fields.insert("publication".to_owned(), publication_value(publication));
-            }
-            state.write_event("completed", fields)
+            state.write_terminal_event("completed", fields, publication)
         })
     }
 
@@ -203,14 +198,11 @@ impl MachineEmitter {
         publication: Option<&AttemptPublicationOutcome>,
     ) -> io::Result<()> {
         self.with_state(|state| {
-            if !state.reserve_terminal() {
-                return Ok(());
-            }
             if state.plan_identity["status"] == "pending" {
                 state.plan_identity =
                     serde_json::json!({"status": "unavailable", "reason": "admission_failed"});
             }
-            let mut fields = serde_json::Map::from_iter([
+            let fields = serde_json::Map::from_iter([
                 (
                     "failure".to_owned(),
                     serde_json::json!({
@@ -222,10 +214,7 @@ impl MachineEmitter {
                 ),
                 ("exit_code".to_owned(), serde_json::json!(exit_code)),
             ]);
-            if let Some(publication) = publication {
-                fields.insert("publication".to_owned(), publication_value(publication));
-            }
-            state.write_event("failed", fields)
+            state.write_terminal_event("failed", fields, publication)
         })
     }
 
@@ -270,6 +259,56 @@ impl MachineState {
         event: &'static str,
         fields: serde_json::Map<String, serde_json::Value>,
     ) -> io::Result<()> {
+        let encoded = self.encode_event(event, fields, self.sequence)?;
+        self.write_encoded_event(&encoded)
+    }
+
+    fn write_terminal_event(
+        &mut self,
+        event: &'static str,
+        mut fields: serde_json::Map<String, serde_json::Value>,
+        publication: Option<&AttemptPublicationOutcome>,
+    ) -> io::Result<()> {
+        if self.terminal_reserved {
+            return Ok(());
+        }
+        let mut events = Vec::new();
+        if let Some(publication) = publication {
+            let (artifact_events, summary) = publication_payloads(publication);
+            events.extend(
+                artifact_events
+                    .into_iter()
+                    .map(|fields| ("publication_artifacts", fields)),
+            );
+            fields.insert("publication".to_owned(), summary);
+        }
+        events.push((event, fields));
+
+        // Encode and bound every record before reserving the one terminal slot.
+        // An encoding or size failure therefore cannot poison terminal state
+        // and suppress a later diagnostic terminal.
+        let encoded = events
+            .into_iter()
+            .enumerate()
+            .map(|(offset, (event, fields))| {
+                self.encode_event(event, fields, self.sequence.saturating_add(offset as u64))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        if !self.reserve_terminal() {
+            return Ok(());
+        }
+        for record in encoded {
+            self.write_encoded_event(&record)?;
+        }
+        Ok(())
+    }
+
+    fn encode_event(
+        &self,
+        event: &'static str,
+        fields: serde_json::Map<String, serde_json::Value>,
+        sequence: u64,
+    ) -> io::Result<Vec<u8>> {
         #[cfg(debug_assertions)]
         if injected_write_failure(event, &fields) {
             return Err(io::Error::other(format!(
@@ -281,7 +320,7 @@ impl MachineState {
         object.insert("protocol".to_owned(), serde_json::json!("clinker.run"));
         object.insert("schema".to_owned(), serde_json::json!(1));
         object.insert("event".to_owned(), serde_json::json!(event));
-        object.insert("seq".to_owned(), serde_json::json!(self.sequence));
+        object.insert("seq".to_owned(), serde_json::json!(sequence));
         object.insert("batch_id".to_owned(), serde_json::json!(self.batch_id));
         object.insert(
             "execution_id".to_owned(),
@@ -296,7 +335,11 @@ impl MachineState {
                 "machine event exceeds {MAX_EVENT_BYTES}-byte limit"
             )));
         }
-        self.writer.write_all(&encoded)?;
+        Ok(encoded)
+    }
+
+    fn write_encoded_event(&mut self, encoded: &[u8]) -> io::Result<()> {
+        self.writer.write_all(encoded)?;
         self.writer.flush()?;
         self.sequence = self.sequence.saturating_add(1);
         Ok(())
@@ -329,7 +372,12 @@ impl MachineState {
     }
 }
 
-fn publication_value(outcome: &AttemptPublicationOutcome) -> serde_json::Value {
+fn publication_payloads(
+    outcome: &AttemptPublicationOutcome,
+) -> (
+    Vec<serde_json::Map<String, serde_json::Value>>,
+    serde_json::Value,
+) {
     let (cleanup_debt_count, complete) = match outcome {
         AttemptPublicationOutcome::Complete {
             cleanup_debt_count, ..
@@ -349,11 +397,54 @@ fn publication_value(outcome: &AttemptPublicationOutcome) -> serde_json::Value {
             })
         })
         .collect::<Vec<_>>();
-    serde_json::json!({
+    publication_payloads_from_artifacts(complete, cleanup_debt_count, artifacts)
+}
+
+fn publication_payloads_from_artifacts(
+    complete: bool,
+    cleanup_debt_count: usize,
+    artifacts: Vec<serde_json::Value>,
+) -> (
+    Vec<serde_json::Map<String, serde_json::Value>>,
+    serde_json::Value,
+) {
+    let chunk_count = artifacts.len().div_ceil(PUBLICATION_ARTIFACTS_PER_EVENT);
+    let artifact_events = artifacts
+        .chunks(PUBLICATION_ARTIFACTS_PER_EVENT)
+        .enumerate()
+        .map(|(chunk_index, artifacts)| {
+            serde_json::Map::from_iter([(
+                "publication".to_owned(),
+                serde_json::json!({
+                    "chunk_index": chunk_index,
+                    "chunk_count": chunk_count,
+                    "artifacts": artifacts,
+                }),
+            )])
+        })
+        .collect();
+    let mut state_counts = serde_json::Map::from_iter([
+        ("staging".to_owned(), serde_json::json!(0)),
+        ("ready".to_owned(), serde_json::json!(0)),
+        ("promoting".to_owned(), serde_json::json!(0)),
+        ("published".to_owned(), serde_json::json!(0)),
+        ("visible_unsynchronized".to_owned(), serde_json::json!(0)),
+        ("unpublished".to_owned(), serde_json::json!(0)),
+    ]);
+    for artifact in &artifacts {
+        let Some(key) = artifact["state"].as_str() else {
+            continue;
+        };
+        let count = state_counts[key].as_u64().unwrap_or(0).saturating_add(1);
+        state_counts.insert(key.to_owned(), serde_json::json!(count));
+    }
+    let summary = serde_json::json!({
         "complete": complete,
         "cleanup_debt_count": cleanup_debt_count,
-        "artifacts": artifacts,
-    })
+        "artifact_count": artifacts.len(),
+        "state_counts": state_counts,
+    });
+    (artifact_events, summary)
 }
 
 fn artifact_kind(kind: ArtifactKind) -> &'static str {
@@ -419,5 +510,81 @@ fn stdout_conflict(args: &RunArgs) -> Option<&'static str> {
         Some("--lineage-events -")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> MachineState {
+        MachineState {
+            writer: BufWriter::new(Box::new(Vec::<u8>::new())),
+            batch_id: "batch".to_owned(),
+            execution_id: "018f47a2-9a41-7a27-b4d6-4f7137e3c159".to_owned(),
+            sequence: 0,
+            plan_identity: serde_json::json!({"status": "resolved"}),
+            terminal_reserved: false,
+            progress: BoundedProgress::default(),
+        }
+    }
+
+    #[test]
+    fn maximum_artifact_inventory_is_chunked_below_the_event_limit() {
+        let artifacts = (0..clinker_exec::output::attempt::MANIFEST_MAX_ARTIFACTS)
+            .map(|index| {
+                serde_json::json!({
+                    "artifact_id": format!("artifact-{index:08x}"),
+                    "kind": "fan_out",
+                    "state": "published",
+                })
+            })
+            .collect::<Vec<_>>();
+        let (artifact_events, summary) = publication_payloads_from_artifacts(true, 0, artifacts);
+        assert_eq!(artifact_events.len(), 64);
+        assert_eq!(summary["artifact_count"], 4096);
+        assert_eq!(summary["state_counts"]["published"], 4096);
+
+        let state = state();
+        for (sequence, fields) in artifact_events.into_iter().enumerate() {
+            let encoded = state
+                .encode_event("publication_artifacts", fields, sequence as u64)
+                .expect("bounded publication chunk");
+            assert!(encoded.len() <= MAX_EVENT_BYTES);
+        }
+        let terminal = state
+            .encode_event(
+                "completed",
+                serde_json::Map::from_iter([
+                    ("result".to_owned(), serde_json::json!("success")),
+                    ("exit_code".to_owned(), serde_json::json!(0)),
+                    ("publication".to_owned(), summary),
+                ]),
+                64,
+            )
+            .expect("bounded terminal");
+        assert!(terminal.len() <= MAX_EVENT_BYTES);
+    }
+
+    #[test]
+    fn terminal_is_reserved_only_after_successful_encoding() {
+        let mut state = state();
+        let oversized = serde_json::Map::from_iter([(
+            "detail".to_owned(),
+            serde_json::json!("x".repeat(MAX_EVENT_BYTES)),
+        )]);
+        assert!(
+            state
+                .write_terminal_event("failed", oversized, None)
+                .is_err()
+        );
+        assert!(!state.terminal_reserved);
+        assert_eq!(state.sequence, 0);
+
+        state
+            .write_terminal_event("failed", serde_json::Map::new(), None)
+            .expect("later bounded terminal remains available");
+        assert!(state.terminal_reserved);
+        assert_eq!(state.sequence, 1);
     }
 }

@@ -128,6 +128,20 @@ fn assert_stream(stream: &[Value], batch_id: &str) {
     assert_eq!(stream.iter().filter(|event| terminal(event)).count(), 1);
 }
 
+fn publication_artifacts(stream: &[Value]) -> Vec<Value> {
+    stream
+        .iter()
+        .filter(|event| event["event"] == "publication_artifacts")
+        .flat_map(|event| {
+            event["publication"]["artifacts"]
+                .as_array()
+                .expect("artifact chunk")
+                .iter()
+                .cloned()
+        })
+        .collect()
+}
+
 #[test]
 fn protocol_success_is_one_ordered_machine_only_stream() {
     let directory = fixture();
@@ -400,9 +414,7 @@ fn machine_protocol_zero_record_run_has_full_lifecycle_and_artifact_truth() {
     }
     let completed = stream.last().expect("completed terminal");
     assert_eq!(completed["event"], "completed");
-    let artifacts = completed["publication"]["artifacts"]
-        .as_array()
-        .expect("artifact results");
+    let artifacts = publication_artifacts(&stream);
     assert_eq!(artifacts.len(), 1);
     assert_eq!(artifacts[0]["kind"], "primary");
     assert_eq!(artifacts[0]["state"], "published");
@@ -411,6 +423,8 @@ fn machine_protocol_zero_record_run_has_full_lifecycle_and_artifact_truth() {
         3,
         "only artifact_id, kind, and state are public"
     );
+    assert_eq!(completed["publication"]["artifact_count"], 1);
+    assert_eq!(completed["publication"]["state_counts"]["published"], 1);
     assert!(
         !String::from_utf8_lossy(&output.stdout)
             .contains(directory.path().to_string_lossy().as_ref())
@@ -460,9 +474,7 @@ nodes:
     let completed = stream.last().expect("completed terminal");
     assert_eq!(completed["event"], "completed");
     assert_eq!(completed["result"], "completed_with_dlq");
-    let artifacts = completed["publication"]["artifacts"]
-        .as_array()
-        .expect("artifact results");
+    let artifacts = publication_artifacts(&stream);
     assert!(artifacts.iter().any(|artifact| artifact["kind"] == "dlq"));
     assert!(
         artifacts
