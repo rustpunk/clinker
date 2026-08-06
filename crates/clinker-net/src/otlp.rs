@@ -48,6 +48,8 @@ pub struct OtlpEndpointAdmissionError {
 }
 
 impl OtlpEndpointAdmissionError {
+    /// API classification: workspace-internal exposed API.
+    ///
     /// Return the stable shared failure classification.
     pub const fn classification(&self) -> &FailureClassification {
         &self.classification
@@ -251,6 +253,8 @@ impl OtlpDeliveryBudgetError {
         }
     }
 
+    /// API classification: workspace-internal exposed API.
+    ///
     /// Return the stable shared failure classification.
     pub const fn classification(&self) -> &FailureClassification {
         &self.classification
@@ -438,6 +442,8 @@ impl OtlpDeliveryFailure {
         self.attempts
     }
 
+    /// API classification: workspace-internal exposed API.
+    ///
     /// Return the registered classification when this is a failure rather than shutdown.
     pub const fn classification(&self) -> Option<&FailureClassification> {
         self.classification.as_ref()
@@ -552,12 +558,34 @@ pub fn send_otlp_json(
             Ok(mut response) => {
                 let status = response.status().as_u16();
                 if status == 200 {
-                    let body = response
+                    let body = match response
                         .body_mut()
                         .with_config()
                         .limit(budget.max_response_bytes)
                         .read_to_vec()
-                        .map_err(|error| map_body_error(signal, attempts, &error))?;
+                    {
+                        Ok(body) => body,
+                        Err(error) => match retryable_transport(&error) {
+                            Some(_cause) if attempts < budget.max_attempts => {
+                                wait_for_retry(
+                                    signal,
+                                    attempts,
+                                    budget.retry_backoff,
+                                    deadline,
+                                    shutdown_requested,
+                                )?;
+                                continue;
+                            }
+                            Some(cause) => {
+                                return Err(OtlpDeliveryFailure::new(
+                                    signal,
+                                    OtlpDeliveryFailureKind::RetryExhausted(cause),
+                                    attempts,
+                                ));
+                            }
+                            None => return Err(map_body_error(signal, attempts, &error)),
+                        },
+                    };
                     let rejected = parse_response(signal, &body, item_count).ok_or_else(|| {
                         OtlpDeliveryFailure::new(
                             signal,
@@ -613,7 +641,14 @@ pub fn send_otlp_json(
                         attempts,
                     ));
                 }
-                None => return Err(map_transport_error(signal, attempts, &error)),
+                None => {
+                    return Err(map_transport_error(
+                        signal,
+                        attempts,
+                        endpoint.https_only,
+                        &error,
+                    ));
+                }
             },
         }
     }
@@ -660,7 +695,7 @@ fn send_attempt(
         .timeout_connect(Some(budget.request_timeout.min(remaining)))
         .timeout_send_request(Some(budget.request_timeout.min(remaining)))
         .timeout_send_body(Some(budget.request_timeout.min(remaining)))
-        .timeout_recv_response(Some(budget.request_timeout.min(remaining)))
+        .timeout_recv_response(Some(budget.response_timeout.min(remaining)))
         .timeout_recv_body(Some(budget.response_timeout.min(remaining)))
         .build()
         .into();
@@ -720,10 +755,14 @@ fn retryable_transport(error: &ureq::Error) -> Option<OtlpRetryCause> {
 fn map_transport_error(
     signal: OtlpSignal,
     attempts: u32,
+    https_only: bool,
     error: &ureq::Error,
 ) -> OtlpDeliveryFailure {
     let kind = match error {
         ureq::Error::Tls(_) | ureq::Error::Rustls(_) | ureq::Error::TlsRequired => {
+            OtlpDeliveryFailureKind::Tls
+        }
+        ureq::Error::Io(error) if https_only && error.kind() == std::io::ErrorKind::InvalidData => {
             OtlpDeliveryFailureKind::Tls
         }
         ureq::Error::Timeout(_) => OtlpDeliveryFailureKind::Timeout,
@@ -885,6 +924,7 @@ fn parse_response(signal: OtlpSignal, body: &[u8], sent: u64) -> Option<u64> {
 /// module directly under `cfg(test)` so the production crate never exposes an
 /// HTTP admission path.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn admitted_loopback_endpoint(address: SocketAddr) -> AdmittedOtlpEndpoint {
     let authority = Authority::from_maybe_shared(address.to_string())
         .expect("a loopback socket address is a valid URI authority");

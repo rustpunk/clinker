@@ -199,6 +199,19 @@ fn response_budget(max_attempts: u32, max_response_bytes: u64) -> OtlpDeliveryBu
     .expect("valid response fixture budget")
 }
 
+fn total_timeout_budget() -> OtlpDeliveryBudget {
+    OtlpDeliveryBudget::new(
+        64 * 1024,
+        4 * 1024,
+        2,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        Duration::from_millis(40),
+        Duration::from_millis(40),
+    )
+    .expect("valid total-timeout fixture budget")
+}
+
 fn logs_payload() -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "resourceLogs": [{
@@ -243,6 +256,17 @@ fn traces_payload() -> Vec<u8> {
 
 struct FixtureCredential {
     applied_after_admission: Arc<AtomicBool>,
+}
+
+struct RefusingCredential;
+
+impl OtlpCredentialApplicator for RefusingCredential {
+    fn apply(
+        &self,
+        _request: &mut OtlpCredentialRequest<'_>,
+    ) -> Result<(), OtlpCredentialApplicationError> {
+        Err(OtlpCredentialApplicationError::Unavailable)
+    }
 }
 
 impl OtlpCredentialApplicator for FixtureCredential {
@@ -367,6 +391,56 @@ fn endpoint_admission_and_successful_post() {
 
 #[test]
 fn logs_metrics_traces_and_fault_matrix() {
+    let unreachable_endpoint = admitted_loopback_endpoint("127.0.0.1:1".parse().unwrap());
+    let failure = send_otlp_json(
+        &unreachable_endpoint,
+        OtlpSignal::Logs,
+        br#"{"notResourceLogs":[]}"#,
+        &budget(1),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect_err("wrong-signal payload must fail before request construction");
+    assert_eq!(failure.kind(), OtlpDeliveryFailureKind::InvalidPayload);
+    assert_eq!(failure.attempts(), 0);
+
+    let request_cap = OtlpDeliveryBudget::new(
+        1,
+        4 * 1024,
+        1,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        Duration::ZERO,
+        Duration::from_secs(2),
+    )
+    .expect("valid request-cap fixture budget");
+    let failure = send_otlp_json(
+        &unreachable_endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &request_cap,
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect_err("request cap must fail before request construction");
+    assert_eq!(failure.kind(), OtlpDeliveryFailureKind::RequestTooLarge);
+    assert_eq!(failure.attempts(), 0);
+
+    let failure = send_otlp_json(
+        &unreachable_endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &budget(1),
+        &|| false,
+        OtlpAuthentication::Referenced(&RefusingCredential),
+    )
+    .expect_err("credential refusal must remain typed and sanitized");
+    assert_eq!(
+        failure.kind(),
+        OtlpDeliveryFailureKind::CredentialApplication
+    );
+    assert_eq!(failure.attempts(), 1);
+
     for (signal, payload, route) in [
         (OtlpSignal::Logs, logs_payload(), "/v1/logs"),
         (OtlpSignal::Metrics, metrics_payload(), "/v1/metrics"),
@@ -518,6 +592,21 @@ fn logs_metrics_traces_and_fault_matrix() {
     handle.join().expect("join oversized-response fixture");
     assert_eq!(failure.kind(), OtlpDeliveryFailureKind::ResponseTooLarge);
 
+    let (address, handle) = spawn_server(503, br#"{}"#.to_vec());
+    let endpoint = admitted_loopback_endpoint(address);
+    let failure = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &total_timeout_budget(),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect_err("total worker deadline must bound retry backoff");
+    handle.join().expect("join total-timeout fixture");
+    assert_eq!(failure.kind(), OtlpDeliveryFailureKind::Timeout);
+    assert_eq!(failure.attempts(), 1);
+
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind connect-failure fixture");
     let unavailable_address = listener.local_addr().expect("connect-failure address");
     drop(listener);
@@ -536,9 +625,8 @@ fn logs_metrics_traces_and_fault_matrix() {
         OtlpDeliveryFailureKind::RetryExhausted(OtlpRetryCause::Connect)
     );
 
-    let shutdown_endpoint = admitted_loopback_endpoint("127.0.0.1:1".parse().unwrap());
     let failure = send_otlp_json(
-        &shutdown_endpoint,
+        &unreachable_endpoint,
         OtlpSignal::Metrics,
         &metrics_payload(),
         &budget(2),
