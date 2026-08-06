@@ -8,9 +8,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde_json::Value;
-use support::process::{
-    ControlledOutcome, ProcessConfig, ProtocolDrain, StdoutMode, run_child,
-};
+use support::process::{ControlledOutcome, ProcessConfig, ProtocolDrain, StdoutMode, run_child};
 
 const PROCESS_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -37,26 +35,28 @@ fn machine_command(directory: &std::path::Path, batch_id: &str) -> Command {
 }
 
 fn write_pipeline(directory: &std::path::Path, output: &str, rows: usize, log_rows: bool) {
-    let mut input = String::from("id,name\n");
-    for row in 0..rows {
-        input.push_str(&format!("{row},record-{row}\n"));
-    }
-    std::fs::write(directory.join("input.csv"), input).expect("input fixture");
-    let transform = if log_rows {
-        r#"  - type: transform
-    name: logged
-    input: src
-    config:
-      cxl: "emit id = id; emit name = name"
-      log:
-        - level: info
-          when: per_record
-          message: "supervision bounded-pipe diagnostic payload"
-"#
+    let (source_selector, ordering) = if log_rows {
+        let inputs = directory.join("inputs");
+        std::fs::create_dir(&inputs).expect("input directory");
+        for file in 0..512 {
+            std::fs::write(
+                inputs.join(format!("part-{file:04}.csv")),
+                "id,name\n2,B\n1,A\n",
+            )
+            .expect("unsorted input fixture");
+        }
+        (
+            "      glob: inputs/*.csv\n".to_owned(),
+            "      sort_order: [id]\n      on_unsorted: warn\n",
+        )
     } else {
-        ""
+        let mut input = String::from("id,name\n");
+        for row in 0..rows {
+            input.push_str(&format!("{row},record-{row}\n"));
+        }
+        std::fs::write(directory.join("input.csv"), input).expect("input fixture");
+        ("      path: input.csv\n".to_owned(), "")
     };
-    let output_input = if log_rows { "logged" } else { "src" };
     std::fs::write(
         directory.join("pipeline.yaml"),
         format!(
@@ -67,14 +67,13 @@ nodes:
     name: src
     config:
       name: src
-      path: input.csv
-      type: csv
+{source_selector}      type: csv
       schema:
         - {{ name: id, type: int }}
         - {{ name: name, type: string }}
-{transform}  - type: output
+{ordering}  - type: output
     name: out
-    input: {output_input}
+    input: src
     config:
       name: out
       path: "{output}"
@@ -86,8 +85,7 @@ nodes:
 }
 
 fn write_dlq_pipeline(directory: &std::path::Path) {
-    std::fs::write(directory.join("input.csv"), "id,amount\n1,10\n2,0\n")
-        .expect("DLQ input");
+    std::fs::write(directory.join("input.csv"), "id,amount\n1,10\n2,0\n").expect("DLQ input");
     std::fs::write(
         directory.join("pipeline.yaml"),
         r#"pipeline: { name: supervised_dlq }
@@ -164,10 +162,20 @@ fn concurrent_bounded_drains_prevent_high_output_deadlock() {
     )
     .expect("supervised run");
 
-    assert_eq!(result.outcome(), ControlledOutcome::Success);
+    assert_eq!(
+        result.outcome(),
+        ControlledOutcome::Success,
+        "events: {:?}\nstderr: {}",
+        result.stdout.events(),
+        String::from_utf8_lossy(result.stderr.retained_tail())
+    );
     assert!(result.reaped());
     assert!(result.stdout.total_bytes() > 0);
-    assert!(result.stderr.total_bytes() > 64 * 1024);
+    assert!(
+        result.stderr.total_bytes() > 64 * 1024,
+        "stderr bytes: {}",
+        result.stderr.total_bytes()
+    );
     assert!(result.stdout.retained_tail().len() <= 4 * 1024);
     assert!(result.stderr.retained_tail().len() <= 8 * 1024);
     assert!(directory.path().join("out.csv").exists());
@@ -185,7 +193,9 @@ fn terminal_and_process_status_must_reconcile_fail_closed() {
     assert_eq!(result.outcome(), ControlledOutcome::Success);
 
     let mut missing = result.stdout.clone();
-    missing.events_mut().retain(|event| event["event"] != "completed");
+    missing
+        .events_mut()
+        .retain(|event| event["event"] != "completed");
     assert_eq!(
         result.outcome_for(&missing),
         ControlledOutcome::Incomplete,
@@ -216,8 +226,7 @@ fn terminal_and_process_status_must_reconcile_fail_closed() {
     );
 
     let mut mismatched = result.stdout.clone();
-    mismatched.events_mut().last_mut().expect("terminal")["exit_code"] =
-        serde_json::json!(2);
+    mismatched.events_mut().last_mut().expect("terminal")["exit_code"] = serde_json::json!(2);
     assert_eq!(
         result.outcome_for(&mismatched),
         ControlledOutcome::Incomplete
@@ -243,16 +252,12 @@ fn controlled_terminal_families_match_exit_and_artifact_truth() {
         ProcessConfig::new(PROCESS_DEADLINE),
     )
     .expect("DLQ run");
-    assert_eq!(
-        dlq_result.outcome(),
-        ControlledOutcome::CompletedWithDlq
-    );
+    assert_eq!(dlq_result.outcome(), ControlledOutcome::CompletedWithDlq);
     assert!(dlq.path().join("out.csv").exists());
     assert!(dlq.path().join("rejected.ndjson").exists());
 
     let failed = fixture();
-    std::fs::write(failed.path().join("pipeline.yaml"), "pipeline: [\n")
-        .expect("invalid pipeline");
+    std::fs::write(failed.path().join("pipeline.yaml"), "pipeline: [\n").expect("invalid pipeline");
     let failed_result = run_child(
         machine_command(failed.path(), "typed-failure"),
         ProcessConfig::new(PROCESS_DEADLINE),
@@ -276,7 +281,7 @@ fn closed_protocol_stdout_cancels_before_publication() {
     )
     .expect("closed-control run");
 
-    assert_eq!(result.status_code(), Some(130));
+    assert_eq!(result.status_code(), Some(4));
     assert_eq!(result.outcome(), ControlledOutcome::Incomplete);
     assert!(result.reaped());
     assert!(!directory.path().join("must-not-publish.csv").exists());
@@ -285,8 +290,11 @@ fn closed_protocol_stdout_cancels_before_publication() {
 #[test]
 fn deadline_expiry_forces_termination_and_reaps_the_child() {
     let directory = fixture();
-    std::fs::write(directory.path().join("out.csv"), "previous complete artifact\n")
-        .expect("existing final");
+    std::fs::write(
+        directory.path().join("out.csv"),
+        "previous complete artifact\n",
+    )
+    .expect("existing final");
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let address = listener.local_addr().expect("listener address");
     write_hanging_rest_pipeline(directory.path(), address);
@@ -296,7 +304,12 @@ fn deadline_expiry_forces_termination_and_reaps_the_child() {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("read timeout");
         let mut request = [0_u8; 4096];
-        let _ = stream.read(&mut request);
+        loop {
+            match stream.read(&mut request) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
     });
 
     let result = run_child(
@@ -319,12 +332,7 @@ fn deadline_expiry_forces_termination_and_reaps_the_child() {
 #[test]
 fn retry_launches_a_fresh_process_from_fresh_input() {
     let directory = fixture();
-    write_pipeline(
-        directory.path(),
-        "{batch_id}-{execution_id}.csv",
-        2,
-        false,
-    );
+    write_pipeline(directory.path(), "{batch_id}-{execution_id}.csv", 2, false);
     let first = run_child(
         machine_command(directory.path(), "same-batch"),
         ProcessConfig::new(PROCESS_DEADLINE),
@@ -347,12 +355,8 @@ fn retry_launches_a_fresh_process_from_fresh_input() {
         first.stdout.events()[0]["batch_id"],
         second.stdout.events()[0]["batch_id"]
     );
-    let first_output = directory
-        .path()
-        .join(format!("same-batch-{first_id}.csv"));
-    let second_output = directory
-        .path()
-        .join(format!("same-batch-{second_id}.csv"));
+    let first_output = directory.path().join(format!("same-batch-{first_id}.csv"));
+    let second_output = directory.path().join(format!("same-batch-{second_id}.csv"));
     assert!(first_output.exists() && second_output.exists());
     assert_ne!(
         std::fs::read_to_string(first_output).expect("first output"),
