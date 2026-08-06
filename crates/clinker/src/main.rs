@@ -750,6 +750,7 @@ fn pipeline_error_exit_code(error: &PipelineError) -> u8 {
         | PipelineError::OverlayDiagnostics(_)
         | PipelineError::Compilation { .. }
         | PipelineError::Internal { .. }
+        | PipelineError::DispatchMismatch { .. }
         | PipelineError::SortOrderViolation { .. }
         | PipelineError::MergeSortOrderViolation { .. }
         | PipelineError::SchemaMismatch { .. }
@@ -820,6 +821,13 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
         | PipelineError::CompositionBodyMissing { .. }
         | PipelineError::CompositionUnknownPort { .. }
         | PipelineError::SchemaMismatch { .. } => registered("runtime.invariant.plan_mismatch"),
+        PipelineError::DispatchMismatch { .. } => {
+            error.failure_classification().unwrap_or_else(|| {
+                FailureClassification::unknown_internal(
+                    "dispatch mismatch classification unavailable",
+                )
+            })
+        }
         PipelineError::CompositionBodyError { inner, .. } => classify_pipeline_error(inner),
         PipelineError::Io(_) | PipelineError::ThreadPool(_) => {
             registered("infrastructure.runtime.transient")
@@ -6409,7 +6417,10 @@ mod tests {
         let classification = classify_pipeline_error(&error);
         assert_eq!(classification, error.failure_classification().unwrap());
         assert_eq!(classification.code(), "runtime.invariant.dispatch_mismatch");
-        assert_eq!(classification.category(), FailureCategory::InternalInvariant);
+        assert_eq!(
+            classification.category(),
+            FailureCategory::InternalInvariant
+        );
         assert_eq!(classification.retry_advice(), RetryAdvice::PolicyRequired);
     }
 
