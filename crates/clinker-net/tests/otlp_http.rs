@@ -8,9 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use ureq::http::HeaderMap;
 use ureq::http::header::{AUTHORIZATION, HeaderName, HeaderValue};
 
 #[path = "../src/otlp.rs"]
+#[allow(dead_code)]
 mod otlp_under_test;
 
 use otlp_under_test::{
@@ -231,7 +233,7 @@ fn endpoint_admission_and_successful_post() {
         Some("Bearer fixture-value")
     );
 
-    let mut request_headers = BTreeMap::new();
+    let mut request_headers = HeaderMap::new();
     for (name, value) in captured.headers {
         request_headers.insert(
             HeaderName::from_bytes(name.as_bytes()).expect("typed captured header"),

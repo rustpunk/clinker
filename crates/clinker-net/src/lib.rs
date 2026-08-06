@@ -19,11 +19,19 @@
 //! and admitted under exact normalized-origin policy before another request is
 //! constructed; an offered continuation beyond the page bound fails closed.
 
+mod otlp;
 mod rest;
 
 use clinker_format::FormatError;
 
 use rest::RestRecordSource;
+
+pub use otlp::{
+    AdmittedOtlpEndpoint, OtlpAuthentication, OtlpCredentialApplicationError,
+    OtlpCredentialApplicator, OtlpCredentialRequest, OtlpDeliveryBudget, OtlpDeliveryBudgetError,
+    OtlpDeliveryFailure, OtlpDeliveryFailureKind, OtlpDeliveryOutcome, OtlpEndpointAdmissionError,
+    OtlpRetryCause, OtlpSignal, admit_otlp_endpoint, send_otlp_json,
+};
 
 /// Build the REST record source for a `rest` Source from its declared
 /// node config. The caller (the CLI reader-build) registers the returned
