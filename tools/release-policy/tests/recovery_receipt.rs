@@ -148,22 +148,34 @@ fn duplicate_nested_trailing_and_ambiguous_receipt_blocks_are_rejected() {
 #[test]
 fn missing_duplicate_extra_and_reordered_command_rows_are_rejected() {
     let mut missing = complete_receipt();
-    missing["commands"].as_array_mut().expect("commands").remove(0);
+    missing["commands"]
+        .as_array_mut()
+        .expect("commands")
+        .remove(0);
     assert_rejected(&summary(&missing));
 
     let mut duplicate = complete_receipt();
     let first = duplicate["commands"][0].clone();
-    duplicate["commands"].as_array_mut().expect("commands").push(first);
+    duplicate["commands"]
+        .as_array_mut()
+        .expect("commands")
+        .push(first);
     assert_rejected(&summary(&duplicate));
 
     let mut extra = complete_receipt();
-    extra["commands"].as_array_mut().expect("commands").push(json!({
-        "id":"CMD-22","argv":["cargo","test"],"status":"PASS"
-    }));
+    extra["commands"]
+        .as_array_mut()
+        .expect("commands")
+        .push(json!({
+            "id":"CMD-22","argv":["cargo","test"],"status":"PASS"
+        }));
     assert_rejected(&summary(&extra));
 
     let mut reordered = complete_receipt();
-    reordered["commands"].as_array_mut().expect("commands").swap(0, 1);
+    reordered["commands"]
+        .as_array_mut()
+        .expect("commands")
+        .swap(0, 1);
     assert_rejected(&summary(&reordered));
 }
 
@@ -291,6 +303,10 @@ fn incomplete_reordered_duplicated_and_extra_dependency_closure_is_rejected() {
 
 #[test]
 fn empty_oversized_and_overlong_receipt_values_are_rejected() {
+    let mut non_string = complete_receipt();
+    non_string["plan"] = json!(51);
+    assert_rejected(&summary(&non_string));
+
     let mut empty = complete_receipt();
     empty["checks"][0]["evidence_ids"] = json!([]);
     assert_rejected(&summary(&empty));
@@ -299,6 +315,9 @@ fn empty_oversized_and_overlong_receipt_values_are_rejected() {
     long["commands"][0]["id"] = json!("X".repeat(1025));
     assert_rejected(&summary(&long));
 
-    let oversized = format!("# Summary\n\n{MARKER}\n```json\n{}\n```\n", " ".repeat(1_048_576));
+    let oversized = format!(
+        "# Summary\n\n{MARKER}\n```json\n{}\n```\n",
+        " ".repeat(1_048_576)
+    );
     assert_rejected(&oversized);
 }

@@ -17,6 +17,7 @@ use crate::filesystem::{
 };
 use crate::inventory;
 use crate::limits::{MAX_DECISION_RECORDS, MAX_DIAGNOSTIC_BYTES};
+use crate::recovery;
 use crate::release::{self, CandidateRequest};
 
 #[path = "boundary.rs"]
@@ -241,6 +242,14 @@ fn execute(cli: Cli) -> Result<String, GateError> {
             };
             Ok(format!("{scope} boundary audit passed\n"))
         }
+        Domain::Recovery(RecoveryDomain {
+            operation: RecoveryOperation::ValidateReceipt(arguments),
+        }) => {
+            let repository_root = std::env::current_dir()
+                .map_err(|error| GateError::io("resolve current repository directory", &error))?;
+            recovery::validate_receipt(&arguments.summary, &repository_root)?;
+            Ok("Phase 3 recovery receipt validation passed\n".to_owned())
+        }
         Domain::Publication(arguments) => {
             let PublicationDomain { operation } = *arguments;
             let mut transport = github::ChildGitHubTransport::from_environment();
@@ -312,6 +321,8 @@ enum Domain {
     Gate(GateDomain),
     /// Audit dependency or Rust-only executable boundaries.
     Boundary(BoundaryDomain),
+    /// Validate the exact Phase 3 recovery sign-off receipt.
+    Recovery(RecoveryDomain),
     /// Perform authenticated candidate and protected-publication operations.
     Publication(Box<PublicationDomain>),
 }
@@ -732,6 +743,25 @@ struct BoundaryAuditArgs {
 enum BoundaryScope {
     Dependency,
     RustOnly,
+}
+
+#[derive(Debug, Args)]
+struct RecoveryDomain {
+    #[command(subcommand)]
+    operation: RecoveryOperation,
+}
+
+#[derive(Debug, Subcommand)]
+enum RecoveryOperation {
+    /// Validate one strict fenced Phase 3 recovery receipt.
+    ValidateReceipt(RecoveryValidateReceiptArgs),
+}
+
+#[derive(Debug, Args)]
+struct RecoveryValidateReceiptArgs {
+    /// Phase 03-51 summary containing the unique receipt block.
+    #[arg(long)]
+    summary: PathBuf,
 }
 
 impl From<BoundaryScope> for boundary::Scope {
