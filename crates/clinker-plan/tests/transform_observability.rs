@@ -204,7 +204,10 @@ fn retired_surfaces_fail_at_plan_admission() {
         "",
         "        - { name: transform.seen, level: info, when: per_record, every: 1, message: seen, log_rule: external }\n",
     ));
-    assert!(retired_rule.contains("`log_rule` is retired"), "{retired_rule}");
+    assert!(
+        retired_rule.contains("`log_rule` is retired"),
+        "{retired_rule}"
+    );
     assert!(retired_rule.contains("line"), "{retired_rule}");
 
     let retired_routing = admission_error(&pipeline(
