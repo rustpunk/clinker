@@ -27,6 +27,7 @@
 
 pub mod builder;
 pub mod dataset;
+pub mod delivery;
 pub mod emit;
 pub mod logical_identity;
 pub mod openlineage;
@@ -36,6 +37,10 @@ pub use builder::{
     column_lineage_local_diagnostic_paths,
 };
 pub use dataset::{DatasetId, FALLBACK_NAMESPACE, FILE_NAMESPACE, dataset_identity};
+pub use delivery::{
+    LineageAdmission, LineageDelivery, LineageDeliveryConfig, LineageDeliveryConfigError,
+    LineageDeliveryOutcome, LineageDeliveryTerminal,
+};
 pub use emit::{
     RunLifecycleFacts, RunLifecycleStartFacts, RunLifecycleTerminalFacts, RunStats, Terminal,
     run_events, start_event, terminal_event,

@@ -126,6 +126,7 @@ pub struct RunStats {
 }
 
 /// The terminal state of a live run: how the `START` is closed out.
+/// API classification: supported integration API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Terminal {
     /// The run finished cleanly — the terminal event carries the column-lineage

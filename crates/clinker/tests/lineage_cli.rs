@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 fn clinker_bin() -> &'static str {
     env!("CARGO_BIN_EXE_clinker")
@@ -976,6 +977,36 @@ fn delivery_isolation() {
             .collect()
     }
 
+    fn attempt_evidence(workspace: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn visit(root: &Path, current: &Path, evidence: &mut Vec<(PathBuf, Vec<u8>)>) {
+            if !current.exists() {
+                return;
+            }
+            let mut entries = std::fs::read_dir(current)
+                .expect("read attempt evidence")
+                .map(|entry| entry.expect("attempt entry").path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    visit(root, &path, evidence);
+                } else {
+                    evidence.push((
+                        path.strip_prefix(root)
+                            .expect("attempt relative path")
+                            .to_owned(),
+                        std::fs::read(&path).expect("read attempt file"),
+                    ));
+                }
+            }
+        }
+
+        let root = workspace.join(".clinker-attempts");
+        let mut evidence = Vec::new();
+        visit(&root, &root, &mut evidence);
+        evidence
+    }
+
     fn terminal_truth(output: &std::process::Output) -> serde_json::Value {
         let terminal = machine_events(output)
             .into_iter()
@@ -984,10 +1015,19 @@ fn delivery_isolation() {
         serde_json::json!({
             "event": terminal["event"],
             "batch_id": terminal["batch_id"],
-            "counts": terminal["counts"],
+            "result": terminal["result"],
+            "exit_code": terminal["exit_code"],
             "failure": terminal["failure"],
             "publication": terminal["publication"],
         })
+    }
+
+    fn publication_inventory(output: &std::process::Output) -> Vec<serde_json::Value> {
+        machine_events(output)
+            .into_iter()
+            .filter(|event| event["event"] == "publication_artifacts")
+            .map(|event| event["publication"].clone())
+            .collect()
     }
 
     let oracle = tempfile::tempdir().expect("delivery oracle workspace");
@@ -1005,14 +1045,18 @@ fn delivery_isolation() {
     );
     assert_eq!(terminal_truth(&hung_output), terminal_truth(&oracle_output));
     assert_eq!(
+        publication_inventory(&hung_output),
+        publication_inventory(&oracle_output)
+    );
+    assert_eq!(
         authoritative_files(hung.path()),
         authoritative_files(oracle.path())
     );
     assert!(!hung.path().join("dlq.ndjson").exists());
     assert!(!oracle.path().join("dlq.ndjson").exists());
-    assert!(
-        !hung.path().join(".clinker-attempts").exists(),
-        "successful publication must leave no retained attempt ownership"
+    assert_eq!(
+        attempt_evidence(hung.path()),
+        attempt_evidence(oracle.path())
     );
     let stderr = String::from_utf8_lossy(&hung_output.stderr);
     assert!(stderr.contains("lineage sink received bytes"), "{stderr}");

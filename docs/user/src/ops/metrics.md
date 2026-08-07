@@ -288,6 +288,18 @@ blocking, unbounded, or disk-spool spelling. The telemetry arena contains two
 disjoint lanes. The lineage queue is a separate reservation and cannot be
 expressed as an alias of either telemetry lane or the arena.
 
+External `--lineage` and `--lineage-events` exports serialize each complete
+OpenLineage event within `lineage.max_event_bytes` before attempting immediate
+admission to the byte-bounded lineage queue. A full queue drops the newest
+event instead of delaying the finite job. One lineage-only synchronous worker
+owns the destination and receives no output, DLQ, publication, or machine-mode
+authority. At completion Clinker waits no longer than
+`lineage.flush_timeout_ms`; dropped events, write or flush failure, and a
+deadline-exceeded worker are reported separately on standard error and do not
+change the authoritative ETL/publication result. The explicit
+`local_diagnostic_paths` compatibility mode remains a local synchronous file
+or console export and cannot use this external delivery path.
+
 ### Authentication and privacy
 
 Authentication is always explicit. Credential-free delivery uses exactly:

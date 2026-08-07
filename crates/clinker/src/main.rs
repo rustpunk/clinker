@@ -1653,9 +1653,14 @@ enum CliLineageIdentity {
     LocalDiagnosticPaths,
 }
 
-fn resolve_cli_lineage_identity(
+struct CliLineageConfiguration {
+    identity: CliLineageIdentity,
+    delivery: Option<clinker_lineage::LineageDeliveryConfig>,
+}
+
+fn resolve_cli_lineage_configuration(
     config: &clinker_plan::config::ClinkerToml,
-) -> Result<CliLineageIdentity, PipelineError> {
+) -> Result<CliLineageConfiguration, PipelineError> {
     let observability = config
         .resolve_observability(None)
         .map_err(observability_configuration_error)?;
@@ -1666,15 +1671,23 @@ fn resolve_cli_lineage_identity(
     })?;
     match lineage.identity_mode() {
         clinker_plan::config::LineageIdentityMode::External => {
-            clinker_lineage::LineageIdentityContext::from_resolved(lineage)
-                .map(CliLineageIdentity::External)
-                .map_err(observability_configuration_error)
+            let identity = clinker_lineage::LineageIdentityContext::from_resolved(lineage)
+                .map_err(observability_configuration_error)?;
+            let delivery = clinker_lineage::LineageDeliveryConfig::from_resolved(lineage)
+                .map_err(observability_configuration_error)?;
+            Ok(CliLineageConfiguration {
+                identity: CliLineageIdentity::External(identity),
+                delivery: Some(delivery),
+            })
         }
         clinker_plan::config::LineageIdentityMode::LocalDiagnosticPaths => {
             eprintln!(
                 "clinker: lineage identity mode: local_diagnostic_paths (local diagnostic compatibility only)"
             );
-            Ok(CliLineageIdentity::LocalDiagnosticPaths)
+            Ok(CliLineageConfiguration {
+                identity: CliLineageIdentity::LocalDiagnosticPaths,
+                delivery: None,
+            })
         }
     }
 }
@@ -1695,8 +1708,13 @@ fn build_cli_lineage(
     }
 }
 
+enum LiveLineageSink {
+    External(clinker_lineage::LineageDelivery),
+    LocalDiagnostic(Box<dyn std::io::Write>),
+}
+
 struct LiveLineageOutput {
-    writer: Box<dyn std::io::Write>,
+    sink: LiveLineageSink,
     lineage: clinker_lineage::PlanColumnLineage,
     job: clinker_lineage::Job,
 }
@@ -1705,15 +1723,136 @@ impl LiveLineageOutput {
     fn emit_start(&mut self, start: &RunLifecycleStartFacts) -> std::io::Result<()> {
         let facts = lineage_start_facts(start);
         let event = clinker_lineage::start_event(&self.lineage, self.job.clone(), &facts);
-        clinker_lineage::write_ndjson(std::slice::from_ref(&event), &mut self.writer)
+        self.emit(event)
     }
 
     fn emit_terminal(&mut self, snapshot: &RunLifecycleSnapshot) -> Result<(), PipelineError> {
         let facts = lineage_lifecycle_facts(snapshot)?;
         let event = clinker_lineage::terminal_event(&self.lineage, self.job.clone(), &facts);
-        clinker_lineage::write_ndjson(std::slice::from_ref(&event), &mut self.writer)
-            .map_err(PipelineError::Io)
+        self.emit(event).map_err(PipelineError::Io)
     }
+
+    fn emit(&mut self, event: clinker_lineage::RunEvent) -> std::io::Result<()> {
+        match &mut self.sink {
+            LiveLineageSink::External(delivery) => {
+                let _ = delivery.try_emit(&event);
+                Ok(())
+            }
+            LiveLineageSink::LocalDiagnostic(writer) => {
+                clinker_lineage::write_ndjson(std::slice::from_ref(&event), writer)
+            }
+        }
+    }
+
+    fn finish(self) -> Option<clinker_lineage::LineageDeliveryOutcome> {
+        match self.sink {
+            LiveLineageSink::External(delivery) => Some(delivery.finish()),
+            LiveLineageSink::LocalDiagnostic(_) => None,
+        }
+    }
+}
+
+fn report_lineage_delivery(outcome: clinker_lineage::LineageDeliveryOutcome) {
+    if outcome.terminal() != clinker_lineage::LineageDeliveryTerminal::Shutdown
+        || outcome.dropped() > 0
+    {
+        eprintln!(
+            "clinker: lineage delivery outcome: status={} accepted={} dropped={} full={}",
+            outcome.terminal().as_str(),
+            outcome.accepted(),
+            outcome.dropped(),
+            outcome.full()
+        );
+    }
+}
+
+fn finish_live_lineage(output: &mut Option<LiveLineageOutput>) {
+    if let Some(outcome) = output.take().and_then(LiveLineageOutput::finish) {
+        report_lineage_delivery(outcome);
+    }
+}
+
+struct ExternalLineageFileSink {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl ExternalLineageFileSink {
+    fn file(&mut self) -> std::io::Result<&mut std::fs::File> {
+        if self.file.is_none() {
+            self.file = Some(std::fs::File::create(&self.path)?);
+        }
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("lineage file sink initialization failed"))
+    }
+}
+
+impl std::io::Write for ExternalLineageFileSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(self.file()?, bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(file) => std::io::Write::flush(file),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+struct QualificationHungLineageSink {
+    inner: Box<dyn std::io::Write + Send>,
+    blocked: bool,
+}
+
+#[cfg(debug_assertions)]
+impl std::io::Write for QualificationHungLineageSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.inner.write_all(bytes)?;
+        self.inner.flush()?;
+        if !self.blocked {
+            self.blocked = true;
+            eprintln!("clinker: lineage sink received bytes; blocking for qualification");
+            let released = std::sync::Mutex::new(false);
+            let release = std::sync::Condvar::new();
+            let mut released = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = release
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn external_lineage_sink(path: &std::path::Path) -> Box<dyn std::io::Write + Send> {
+    let sink: Box<dyn std::io::Write + Send> = if path.as_os_str() == std::ffi::OsStr::new("-") {
+        Box::new(std::io::stdout())
+    } else {
+        Box::new(ExternalLineageFileSink {
+            path: path.to_owned(),
+            file: None,
+        })
+    };
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CLINKER_TEST_LINEAGE_SINK").as_deref()
+        == Some(std::ffi::OsStr::new("hang-after-first-write"))
+    {
+        return Box::new(QualificationHungLineageSink {
+            inner: sink,
+            blocked: false,
+        });
+    }
+    sink
 }
 
 fn lineage_start_facts(start: &RunLifecycleStartFacts) -> clinker_lineage::RunLifecycleStartFacts {
@@ -1982,8 +2121,8 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     // same resolved root the validator re-derives.
     let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
         .map_err(storage_config_error)?;
-    let lineage_identity = if args.lineage.is_some() || args.lineage_events.is_some() {
-        Some(resolve_cli_lineage_identity(&clinker_toml)?)
+    let lineage_configuration = if args.lineage.is_some() || args.lineage_events.is_some() {
+        Some(resolve_cli_lineage_configuration(&clinker_toml)?)
     } else {
         None
     };
@@ -2431,9 +2570,10 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         };
         let lineage = build_cli_lineage(
             &compiled_plan,
-            lineage_identity
+            &lineage_configuration
                 .as_ref()
-                .expect("lineage identity is resolved whenever --lineage is set"),
+                .expect("lineage configuration is resolved whenever --lineage is set")
+                .identity,
             &lineage_base_dir,
         )?;
 
@@ -2470,17 +2610,31 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         let lifecycle_snapshot = lineage_lifecycle_facts(&lifecycle.snapshot())?;
         let events = clinker_lineage::run_events(&lineage, job, &lifecycle_snapshot);
 
-        let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
-            Box::new(std::io::stdout().lock())
+        let configuration = lineage_configuration
+            .as_ref()
+            .expect("lineage configuration is resolved whenever --lineage is set");
+        if let Some(delivery_config) = configuration.delivery {
+            let delivery = clinker_lineage::LineageDelivery::start(
+                delivery_config,
+                external_lineage_sink(path),
+            );
+            for event in &events {
+                let _ = delivery.try_emit(event);
+            }
+            report_lineage_delivery(delivery.finish());
         } else {
-            Box::new(std::fs::File::create(path).map_err(|e| {
-                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                    "cannot open --lineage output {}: {e}",
-                    path.display()
-                )))
-            })?)
-        };
-        clinker_lineage::write_ndjson(&events, writer).map_err(PipelineError::Io)?;
+            let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
+                Box::new(std::io::stdout().lock())
+            } else {
+                Box::new(std::fs::File::create(path).map_err(|e| {
+                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                        "cannot open --lineage output {}: {e}",
+                        path.display()
+                    )))
+                })?)
+            };
+            clinker_lineage::write_ndjson(&events, writer).map_err(PipelineError::Io)?;
+        }
         return Ok(0);
     }
 
@@ -2573,9 +2727,10 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     let live_lineage = if args.lineage_events.is_some() {
         Some(build_cli_lineage(
             &compiled_plan,
-            lineage_identity
+            &lineage_configuration
                 .as_ref()
-                .expect("lineage identity is resolved whenever --lineage-events is set"),
+                .expect("lineage configuration is resolved whenever --lineage-events is set")
+                .identity,
             &lineage_base_dir,
         )?)
     } else {
@@ -3094,23 +3249,30 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
         let job =
             clinker_lineage::Job::for_pipeline(pipeline_config.pipeline.name.clone(), source_hash);
-        let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
-            // Unlocked stdout handle: locking per write avoids deadlocking the run's
-            // own stdout prints (the spill-volume summary and completion line).
-            Box::new(std::io::stdout())
+        let configuration = lineage_configuration
+            .as_ref()
+            .expect("lineage configuration is resolved whenever --lineage-events is set");
+        let sink = if let Some(delivery_config) = configuration.delivery {
+            LiveLineageSink::External(clinker_lineage::LineageDelivery::start(
+                delivery_config,
+                external_lineage_sink(path),
+            ))
         } else {
-            Box::new(std::fs::File::create(path).map_err(|e| {
-                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                    "cannot open --lineage-events output {}: {e}",
-                    path.display()
-                )))
-            })?)
+            let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
+                // Unlocked stdout handle: locking per write avoids deadlocking the run's
+                // own stdout prints (the spill-volume summary and completion line).
+                Box::new(std::io::stdout())
+            } else {
+                Box::new(std::fs::File::create(path).map_err(|e| {
+                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                        "cannot open --lineage-events output {}: {e}",
+                        path.display()
+                    )))
+                })?)
+            };
+            LiveLineageSink::LocalDiagnostic(writer)
         };
-        lineage_output = Some(LiveLineageOutput {
-            writer,
-            lineage,
-            job,
-        });
+        lineage_output = Some(LiveLineageOutput { sink, lineage, job });
     }
 
     // One CLI-owned fact source starts immediately before the finite executor.
@@ -3179,6 +3341,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             {
                 tracing::warn!(error = %err, "failed to write FAIL lineage event");
             }
+            finish_live_lineage(&mut lineage_output);
             return Err(terminal_error);
         }
     };
@@ -3333,6 +3496,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         {
             tracing::warn!(error = %lineage_error, "failed to write FAIL lineage event");
         }
+        finish_live_lineage(&mut lineage_output);
         return Err(terminal_error);
     }
 
@@ -3360,6 +3524,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             {
                 tracing::warn!(error = %lineage_error, "failed to write FAIL lineage event");
             }
+            finish_live_lineage(&mut lineage_output);
             return Err(error);
         }
     } else {
@@ -3506,6 +3671,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     {
         tracing::warn!(error = %err, "failed to write terminal lineage event");
     }
+    finish_live_lineage(&mut lineage_output);
 
     // Staging cleanup, keyed on a clean exit. A zero exit code is the
     // "exited cleanly" signal `cleanup = on_success` removes after; an
