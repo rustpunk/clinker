@@ -72,12 +72,27 @@ impl<'a> SignalField<'a> {
     }
 }
 
+/// Engine-supplied identity of the run that produced a signal.
+///
+/// These are not record data and never derive from a source, so exact
+/// per-(event, field) privacy policy does not gate them: a deployment that
+/// declares an event without also declaring three correlation rules still gets
+/// telemetry it can join to the machine stream and the lineage events.
+/// `S` is `&str` on the producer side and `String` once received.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunCorrelation<S> {
+    pub execution_id: S,
+    pub batch_id: S,
+    pub pipeline_name: S,
+}
+
 /// Borrowed producer-side log event.
 #[derive(Clone, Copy, Debug)]
 pub struct LogEvent<'a> {
     pub event: &'a str,
     pub severity: Severity,
     pub message: &'a str,
+    pub correlation: RunCorrelation<&'a str>,
     pub fields: &'a [SignalField<'a>],
 }
 
@@ -117,14 +132,6 @@ pub enum SpanName {
     Transform,
 }
 
-/// Bounded span lifecycle fact.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SpanPhase {
-    Start,
-    End,
-}
-
 /// Bounded span result fact.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -135,12 +142,34 @@ pub enum SpanStatus {
 }
 
 /// Borrowed producer-side trace fact. No record or error payload is accepted.
+///
+/// One admitted fact is one complete span, closed at both ends. A span is
+/// emitted after its work finishes rather than as a start fact plus a later
+/// end fact, because a collector has no representation for half a span: both
+/// wall-clock boundaries are required, and independent admission of two halves
+/// lets sampling, lane routing, or a full arena deliver one without the other.
+/// The live "this transform has begun" signal is the `TransformStarted`
+/// metric, which is still recorded before the work runs.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct SpanFact<'a> {
     pub name: SpanName,
-    pub phase: SpanPhase,
     pub status: SpanStatus,
     pub logical_node: &'a str,
+    /// Span boundaries as Unix nanoseconds, `started_at <= ended_at`.
+    pub started_at_unix_nanos: u64,
+    pub ended_at_unix_nanos: u64,
+}
+
+/// Wall clock as Unix nanoseconds, saturating at the epoch.
+#[must_use]
+pub fn unix_nanos_now() -> u64 {
+    u64::try_from(
+        chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or(i64::MAX)
+            .max(0),
+    )
+    .unwrap_or(0)
 }
 
 /// Lane selected before serialization.
@@ -267,7 +296,7 @@ impl TelemetryArena {
             metrics: Arc::clone(&metrics),
             stats: Arc::clone(&stats),
             retained: Arc::clone(&retained),
-            sample_sequence: Arc::new(AtomicU64::new(0)),
+            sample_sequence: Arc::new(LaneSampling::default()),
         };
         let receiver = TelemetryReceiver {
             shared,
@@ -297,7 +326,23 @@ pub struct TelemetryProducer {
     metrics: Arc<MetricCounters>,
     stats: Arc<ProducerCounters>,
     retained: Arc<RetainedAccounting>,
-    sample_sequence: Arc<AtomicU64>,
+    sample_sequence: Arc<LaneSampling>,
+}
+
+/// One admission counter per disjoint lane.
+#[derive(Default)]
+struct LaneSampling {
+    ordinary: AtomicU64,
+    high: AtomicU64,
+}
+
+impl LaneSampling {
+    fn next(&self, lane: AdmissionLane) -> u64 {
+        match lane {
+            AdmissionLane::Ordinary => self.ordinary.fetch_add(1, Ordering::Relaxed),
+            AdmissionLane::HighSeverity => self.high.fetch_add(1, Ordering::Relaxed),
+        }
+    }
 }
 
 impl TelemetryProducer {
@@ -370,7 +415,11 @@ impl TelemetryProducer {
     }
 
     fn admit<T: Serialize>(&self, lane: AdmissionLane, signal: &T) -> AdmissionOutcome {
-        let sequence = self.sample_sequence.fetch_add(1, Ordering::Relaxed);
+        // Sampling counts within the destination lane, never across lanes. The
+        // two lanes exist so ordinary volume cannot starve high severity; one
+        // shared counter would have reintroduced exactly that coupling, letting
+        // nine Info events per Error discard the same nine tenths of Errors.
+        let sequence = self.sample_sequence.next(lane);
         if !sequence.is_multiple_of(u64::from(self.policy.sample_every())) {
             self.stats.sampled.fetch_add(1, Ordering::Relaxed);
             return AdmissionOutcome::Dropped(DropReason::Sampled);
@@ -463,6 +512,7 @@ pub struct LogRecord {
     pub event: String,
     pub severity: Severity,
     pub message: String,
+    pub correlation: RunCorrelation<String>,
     pub fields: BTreeMap<String, String>,
 }
 
@@ -473,13 +523,14 @@ pub struct MetricPoint {
     pub value: u64,
 }
 
-/// Receiver-owned bounded trace fact.
+/// Receiver-owned bounded trace fact. One value is one complete span.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TraceSpan {
     pub name: SpanName,
-    pub phase: SpanPhase,
     pub status: SpanStatus,
     pub logical_node: String,
+    pub started_at_unix_nanos: u64,
+    pub ended_at_unix_nanos: u64,
 }
 
 /// One transport-neutral bounded three-signal batch.
@@ -589,6 +640,7 @@ impl Serialize for FilteredLog<'_> {
             event: &'a str,
             severity: Severity,
             message: &'a str,
+            correlation: RunCorrelation<&'a str>,
             fields: F,
         }
 
@@ -596,6 +648,7 @@ impl Serialize for FilteredLog<'_> {
             event: self.event.event,
             severity: self.event.severity,
             message: self.event.message,
+            correlation: self.event.correlation,
             fields: FilteredFields {
                 policy: self.policy,
                 event: self.event.event,

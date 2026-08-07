@@ -17,8 +17,9 @@ use std::time::Duration;
 
 use clinker_exec::pipeline::shutdown::ShutdownToken;
 use clinker_exec::telemetry::{
-    LogRecord, MetricKey, MetricPoint, Severity, SpanName, SpanPhase, SpanStatus, TelemetryArena,
+    LogRecord, MetricKey, MetricPoint, Severity, SpanName, SpanStatus, TelemetryArena,
     TelemetryArenaError, TelemetryBatch, TelemetryProducer, TelemetryReceiver, TraceSpan,
+    unix_nanos_now,
 };
 use clinker_net::{
     AdmittedOtlpEndpoint, OtlpAuthentication, OtlpDeliveryBudget, OtlpDeliveryBudgetError,
@@ -55,6 +56,47 @@ struct ArenaBounds {
     ordinary_lane_bytes: u64,
     high_severity_lane_bytes: u64,
     max_batch_bytes: u64,
+    max_attributes_per_event: u32,
+}
+
+/// Re-encoding a stored record as OTLP rewraps each retained attribute as
+/// `{"key":…,"value":{"stringValue":…}}`. That costs a constant per attribute,
+/// not a multiple of the record, so the request bound is the slot bound plus an
+/// exact allowance rather than the slot bound itself.
+const OTLP_ATTRIBUTE_WRAPPING_BYTES: u64 = 64;
+
+/// Run correlation and the event name become attributes on top of the policy's
+/// per-event allowance.
+const OTLP_ENGINE_ATTRIBUTES: u64 = 8;
+
+/// Envelope nesting, severity text, body wrapper, and the fixed-shape lifecycle
+/// span, whose attributes are bounded independently of the arena.
+const OTLP_ENVELOPE_OVERHEAD_BYTES: u64 = 4 * 1024;
+
+impl ArenaBounds {
+    fn from_policy(policy: &ResolvedObservabilityPolicy) -> Self {
+        Self {
+            arena_bytes: policy.arena_bytes(),
+            ordinary_lane_bytes: policy.ordinary_lane_bytes(),
+            high_severity_lane_bytes: policy.high_severity_lane_bytes(),
+            max_batch_bytes: policy.max_batch_bytes(),
+            max_attributes_per_event: policy.max_attributes_per_event(),
+        }
+    }
+
+    /// Bound one HTTP request. `max_batch_bytes` bounds one *stored record*;
+    /// a delivery re-encodes a whole drained batch, so binding the two to the
+    /// same number made a realistic per-record log config overflow the buffer
+    /// and discard the entire batch before any request. This bound covers one
+    /// maximal record's OTLP expansion; a batch needing more is split across
+    /// requests.
+    const fn request_capacity_bytes(self) -> u64 {
+        let attributes =
+            (self.max_attributes_per_event as u64).saturating_add(OTLP_ENGINE_ATTRIBUTES);
+        self.max_batch_bytes
+            .saturating_add(attributes.saturating_mul(OTLP_ATTRIBUTE_WRAPPING_BYTES))
+            .saturating_add(OTLP_ENVELOPE_OVERHEAD_BYTES)
+    }
 }
 
 /// Immutable proof that endpoint, transport, and arena bounds were composed.
@@ -118,7 +160,10 @@ impl OtlpRuntimeBundle {
         // interprets, normalizes, or reconstructs the authored endpoint.
         let endpoint = admit_otlp_endpoint(otlp.raw_endpoint())
             .map_err(ObservabilityRuntimeError::Endpoint)?;
-        let max_request_bytes = usize::try_from(policy.max_batch_bytes())
+        // The transport rejects anything over this cap outright, so it has to
+        // be the per-request bound and not the per-stored-record bound.
+        let arena = ArenaBounds::from_policy(policy);
+        let max_request_bytes = usize::try_from(arena.request_capacity_bytes())
             .map_err(|_| ObservabilityRuntimeError::Worker)?;
         let delivery_budget = OtlpDeliveryBudget::new(
             max_request_bytes,
@@ -134,12 +179,7 @@ impl OtlpRuntimeBundle {
             endpoint,
             delivery_budget,
             flush_timeout: policy.flush_timeout(),
-            arena: ArenaBounds {
-                arena_bytes: policy.arena_bytes(),
-                ordinary_lane_bytes: policy.ordinary_lane_bytes(),
-                high_severity_lane_bytes: policy.high_severity_lane_bytes(),
-                max_batch_bytes: policy.max_batch_bytes(),
-            },
+            arena,
         };
 
         // AUTH-01 owns referenced credential capabilities. The check follows
@@ -157,12 +197,7 @@ impl OtlpRuntimeBundle {
         &self,
         policy: &ResolvedObservabilityPolicy,
     ) -> Result<(TelemetryProducer, TelemetryReceiver), ObservabilityRuntimeError> {
-        let supplied = ArenaBounds {
-            arena_bytes: policy.arena_bytes(),
-            ordinary_lane_bytes: policy.ordinary_lane_bytes(),
-            high_severity_lane_bytes: policy.high_severity_lane_bytes(),
-            max_batch_bytes: policy.max_batch_bytes(),
-        };
+        let supplied = ArenaBounds::from_policy(policy);
         if supplied != self.arena {
             return Err(ObservabilityRuntimeError::Worker);
         }
@@ -332,8 +367,7 @@ impl OtlpWorker {
             return Err(ObservabilityRuntimeError::Worker);
         }
         let backend = DeliveryBackend::new()?;
-        let max_payload_bytes = bundle.arena.max_batch_bytes;
-        let mut payload = BoundedPayload::new(max_payload_bytes)?;
+        let mut payload = BoundedPayload::new(bundle.arena.request_capacity_bytes())?;
         let (command, commands) = mpsc::sync_channel(1);
         let (done_sender, done) = mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
@@ -350,6 +384,9 @@ impl OtlpWorker {
                     shutdown,
                     stop: worker_stop,
                     report: OtlpDeliveryReport::default(),
+                    trace_id: new_trace_id(),
+                    next_span_id: RUN_SPAN_ID.saturating_add(1),
+                    metrics_window_start_unix_nanos: unix_nanos_now(),
                 };
                 loop {
                     state.drain_available();
@@ -423,6 +460,11 @@ struct WorkerState<'a> {
     shutdown: ShutdownToken,
     stop: Arc<AtomicBool>,
     report: OtlpDeliveryReport,
+    /// One run is one trace; every exported span carries this id.
+    trace_id: String,
+    next_span_id: u64,
+    /// Start of the delta window the next drained counters describe.
+    metrics_window_start_unix_nanos: u64,
 }
 
 impl WorkerState<'_> {
@@ -433,35 +475,106 @@ impl WorkerState<'_> {
     }
 
     fn deliver_batch(&mut self, batch: &TelemetryBatch) {
-        if !batch.logs().is_empty() {
-            let envelope = logs_envelope(batch.logs());
-            self.deliver(OtlpSignal::Logs, &envelope, batch.logs().len() as u64);
-        }
+        self.deliver_chunks(OtlpSignal::Logs, batch.logs(), |payload, _offset, chunk| {
+            payload.encode(&logs_envelope(chunk))
+        });
         if !batch.metrics().is_empty() {
-            let envelope = metrics_envelope(batch.metrics());
-            self.deliver(OtlpSignal::Metrics, &envelope, batch.metrics().len() as u64);
+            let window = self.take_metrics_window();
+            self.deliver_chunks(
+                OtlpSignal::Metrics,
+                batch.metrics(),
+                |payload, _offset, chunk| payload.encode(&metrics_envelope(chunk, window)),
+            );
         }
         if !batch.traces().is_empty() {
-            let envelope = traces_envelope(batch.traces());
-            self.deliver(OtlpSignal::Traces, &envelope, batch.traces().len() as u64);
+            let trace_id = self.trace_id.clone();
+            let first_span_id = self.reserve_span_ids(batch.traces().len());
+            self.deliver_chunks(
+                OtlpSignal::Traces,
+                batch.traces(),
+                |payload, offset, chunk| {
+                    let first =
+                        first_span_id.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX));
+                    payload.encode(&traces_envelope(chunk, &trace_id, first))
+                },
+            );
         }
     }
 
     fn deliver_lifecycle(&mut self, snapshot: &RunLifecycleSnapshot) {
-        let envelope = lifecycle_envelope(snapshot);
-        self.deliver(OtlpSignal::Traces, &envelope, 1);
+        let envelope = lifecycle_envelope(snapshot, &self.trace_id);
+        let encoded = self.payload.encode(&envelope);
+        self.deliver_encoded(OtlpSignal::Traces, encoded, 1);
     }
 
-    fn deliver<T: Serialize>(&mut self, signal: OtlpSignal, value: &T, item_count: u64) {
-        let result = match self.payload.encode(value) {
-            Ok(payload) => self
-                .backend
-                .deliver(&self.bundle, signal, payload, item_count, &|| {
-                    self.shutdown.is_requested() || self.stop.load(Ordering::Acquire)
-                }),
+    /// Split one drained batch across as many requests as its bounded buffer
+    /// needs. Halving on overflow keeps the memory fixed while guaranteeing
+    /// forward progress; only an item that cannot be represented alone is
+    /// reported as a failure, and it is reported as exactly one item rather
+    /// than taking its whole batch down with it.
+    fn deliver_chunks<T>(
+        &mut self,
+        signal: OtlpSignal,
+        items: &[T],
+        encode: impl Fn(&mut BoundedPayload, usize, &[T]) -> io::Result<()>,
+    ) {
+        let mut start = 0;
+        while start < items.len() {
+            let (len, encoded) = encode_largest_prefix(self.payload, start, items, &encode);
+            self.deliver_encoded(signal, encoded, len as u64);
+            start += len;
+        }
+    }
+
+    fn deliver_encoded(&mut self, signal: OtlpSignal, encoded: io::Result<()>, item_count: u64) {
+        let result = match encoded {
+            Ok(()) => self.backend.deliver(
+                &self.bundle,
+                signal,
+                self.payload.bytes(),
+                item_count,
+                &|| self.shutdown.is_requested() || self.stop.load(Ordering::Acquire),
+            ),
             Err(_) => DeliveryResult::EncodingFailure,
         };
         self.report.record(signal, result);
+    }
+
+    /// Close the current delta window and open the next one.
+    fn take_metrics_window(&mut self) -> MetricsWindow {
+        let start = self.metrics_window_start_unix_nanos;
+        let end = unix_nanos_now().max(start);
+        self.metrics_window_start_unix_nanos = end;
+        MetricsWindow { start, end }
+    }
+
+    fn reserve_span_ids(&mut self, count: usize) -> u64 {
+        let first = self.next_span_id;
+        self.next_span_id = self
+            .next_span_id
+            .checked_add(u64::try_from(count).unwrap_or(u64::MAX))
+            .unwrap_or(RUN_SPAN_ID.saturating_add(1));
+        first
+    }
+}
+
+/// Encode the longest prefix of `items[offset..]` that fits the fixed payload,
+/// halving on overflow. Returns the item count encoded and the encoding result;
+/// a returned count of one with an error means that single item cannot be
+/// represented at all, which is the only case a caller reports as a loss.
+fn encode_largest_prefix<T>(
+    payload: &mut BoundedPayload,
+    offset: usize,
+    items: &[T],
+    encode: &impl Fn(&mut BoundedPayload, usize, &[T]) -> io::Result<()>,
+) -> (usize, io::Result<()>) {
+    let mut len = items.len() - offset;
+    loop {
+        let encoded = encode(payload, offset, &items[offset..offset + len]);
+        if encoded.is_ok() || len == 1 {
+            return (len, encoded);
+        }
+        len = len.div_ceil(2);
     }
 }
 
@@ -634,14 +747,17 @@ impl BoundedPayload {
         Ok(Self { bytes, max_bytes })
     }
 
-    fn encode<T: Serialize>(&mut self, value: &T) -> io::Result<&[u8]> {
+    fn encode<T: Serialize>(&mut self, value: &T) -> io::Result<()> {
         self.bytes.clear();
         let mut writer = BoundedWriter {
             bytes: &mut self.bytes,
             max_bytes: self.max_bytes,
         };
-        serde_json::to_writer(&mut writer, value).map_err(io::Error::other)?;
-        Ok(&self.bytes)
+        serde_json::to_writer(&mut writer, value).map_err(io::Error::other)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -698,8 +814,23 @@ fn logs_envelope(logs: &[LogRecord]) -> LogsEnvelope<'_> {
     let log_records = logs
         .iter()
         .map(|record| {
-            let mut attributes = Vec::with_capacity(record.fields.len().saturating_add(1));
+            let mut attributes = Vec::with_capacity(record.fields.len().saturating_add(4));
             attributes.push(KeyValue::string("clinker.event", &record.event));
+            // Engine-supplied run identity, not record data. Without it an
+            // exported record cannot be joined to the machine stream or the
+            // lineage events for the same run.
+            attributes.push(KeyValue::string(
+                "clinker.execution_id",
+                &record.correlation.execution_id,
+            ));
+            attributes.push(KeyValue::string(
+                "clinker.batch_id",
+                &record.correlation.batch_id,
+            ));
+            attributes.push(KeyValue::string(
+                "clinker.pipeline_name",
+                &record.correlation.pipeline_name,
+            ));
             attributes.extend(
                 record
                     .fields
@@ -740,22 +871,46 @@ struct ScopeMetrics {
 #[derive(Serialize)]
 struct OtlpMetric {
     name: &'static str,
-    gauge: Gauge,
+    unit: &'static str,
+    sum: Sum,
 }
 
 #[derive(Serialize)]
-struct Gauge {
+struct Sum {
     #[serde(rename = "dataPoints")]
     data_points: [NumberDataPoint; 1],
+    #[serde(rename = "aggregationTemporality")]
+    aggregation_temporality: u8,
+    #[serde(rename = "isMonotonic")]
+    is_monotonic: bool,
 }
 
 #[derive(Serialize)]
 struct NumberDataPoint {
+    #[serde(rename = "startTimeUnixNano")]
+    start_time_unix_nano: String,
+    #[serde(rename = "timeUnixNano")]
+    time_unix_nano: String,
     #[serde(rename = "asInt")]
     as_int: String,
 }
 
-fn metrics_envelope(metrics: &[MetricPoint]) -> MetricsEnvelope {
+/// `AGGREGATION_TEMPORALITY_DELTA`.
+const DELTA_TEMPORALITY: u8 = 1;
+
+/// The half-open interval one drain's counters describe.
+#[derive(Clone, Copy)]
+struct MetricsWindow {
+    start: u64,
+    end: u64,
+}
+
+/// The producer's counters are drained with `swap(0)`, so each point is the
+/// count accumulated since the previous drain. Exporting that as a gauge made a
+/// backend read the last delta as the absolute total; a monotonic sum with
+/// explicit delta temporality and both required timestamps is what lets a
+/// backend re-derive the run total and any rate over it.
+fn metrics_envelope(metrics: &[MetricPoint], window: MetricsWindow) -> MetricsEnvelope {
     MetricsEnvelope {
         resource_metrics: [ResourceMetrics {
             scope_metrics: [ScopeMetrics {
@@ -763,10 +918,15 @@ fn metrics_envelope(metrics: &[MetricPoint]) -> MetricsEnvelope {
                     .iter()
                     .map(|point| OtlpMetric {
                         name: metric_name(point.key),
-                        gauge: Gauge {
+                        unit: "1",
+                        sum: Sum {
                             data_points: [NumberDataPoint {
+                                start_time_unix_nano: window.start.to_string(),
+                                time_unix_nano: window.end.to_string(),
                                 as_int: point.value.to_string(),
                             }],
+                            aggregation_temporality: DELTA_TEMPORALITY,
+                            is_monotonic: true,
                         },
                     })
                     .collect(),
@@ -794,13 +954,19 @@ struct ScopeSpans<'a> {
 
 #[derive(Serialize)]
 struct OtlpSpan<'a> {
+    #[serde(rename = "traceId")]
+    trace_id: &'a str,
+    #[serde(rename = "spanId")]
+    span_id: String,
+    #[serde(rename = "parentSpanId", skip_serializing_if = "Option::is_none")]
+    parent_span_id: Option<String>,
     name: &'static str,
     attributes: Vec<KeyValue<'a>>,
     status: OtlpStatus,
-    #[serde(rename = "startTimeUnixNano", skip_serializing_if = "Option::is_none")]
-    start_time_unix_nano: Option<String>,
-    #[serde(rename = "endTimeUnixNano", skip_serializing_if = "Option::is_none")]
-    end_time_unix_nano: Option<String>,
+    #[serde(rename = "startTimeUnixNano")]
+    start_time_unix_nano: String,
+    #[serde(rename = "endTimeUnixNano")]
+    end_time_unix_nano: String,
 }
 
 #[derive(Serialize)]
@@ -808,23 +974,57 @@ struct OtlpStatus {
     code: u8,
 }
 
-fn traces_envelope(traces: &[TraceSpan]) -> TracesEnvelope<'_> {
+/// The lifecycle span is the trace root and every transform span is one of its
+/// children. A span id only has to be unique within its trace and must not be
+/// zero, so a per-run counter is sufficient: the trace id carries the global
+/// uniqueness.
+const RUN_SPAN_ID: u64 = 1;
+
+/// Derive one run's trace id. OTLP requires 16 bytes; a v7 UUID always sets its
+/// version and variant bits, so the result is never the invalid all-zero id.
+fn new_trace_id() -> String {
+    format!(
+        "{:032x}",
+        u128::from_be_bytes(uuid::Uuid::now_v7().into_bytes())
+    )
+}
+
+/// OTLP/JSON encodes `trace_id` and `span_id` as hex, not as the base64 the
+/// standard Protobuf JSON mapping would use for a bytes field.
+fn span_id_hex(span_id: u64) -> String {
+    format!("{span_id:016x}")
+}
+
+fn traces_envelope<'a>(
+    traces: &'a [TraceSpan],
+    trace_id: &'a str,
+    first_span_id: u64,
+) -> TracesEnvelope<'a> {
     TracesEnvelope {
         resource_spans: [ResourceSpans {
             scope_spans: [ScopeSpans {
                 spans: traces
                     .iter()
-                    .map(|span| OtlpSpan {
+                    .enumerate()
+                    .map(|(index, span)| OtlpSpan {
+                        trace_id,
+                        span_id: span_id_hex(
+                            first_span_id.saturating_add(u64::try_from(index).unwrap_or(u64::MAX)),
+                        ),
+                        parent_span_id: Some(span_id_hex(RUN_SPAN_ID)),
                         name: span_name(span.name),
-                        attributes: vec![
-                            KeyValue::string("clinker.logical_node", &span.logical_node),
-                            KeyValue::static_string("clinker.span.phase", span_phase(span.phase)),
-                        ],
+                        attributes: vec![KeyValue::string(
+                            "clinker.logical_node",
+                            &span.logical_node,
+                        )],
                         status: OtlpStatus {
                             code: span_status(span.status),
                         },
-                        start_time_unix_nano: None,
-                        end_time_unix_nano: None,
+                        start_time_unix_nano: span.started_at_unix_nanos.to_string(),
+                        end_time_unix_nano: span
+                            .ended_at_unix_nanos
+                            .max(span.started_at_unix_nanos)
+                            .to_string(),
                     })
                     .collect(),
             }],
@@ -832,7 +1032,10 @@ fn traces_envelope(traces: &[TraceSpan]) -> TracesEnvelope<'_> {
     }
 }
 
-fn lifecycle_envelope(snapshot: &RunLifecycleSnapshot) -> TracesEnvelope<'_> {
+fn lifecycle_envelope<'a>(
+    snapshot: &'a RunLifecycleSnapshot,
+    trace_id: &'a str,
+) -> TracesEnvelope<'a> {
     let start = snapshot.start();
     let terminal = snapshot.terminal();
     let fingerprint = start.fingerprint();
@@ -865,15 +1068,24 @@ fn lifecycle_envelope(snapshot: &RunLifecycleSnapshot) -> TracesEnvelope<'_> {
             KeyValue::integer("clinker.records.dlq", counts.records_dlq),
         ]);
     }
+    // A run whose terminal facts are unavailable still has to produce a closed
+    // span: an unset end time is not a span a collector can accept.
+    let started_at = unix_nanos(start.started_at());
+    let ended_at = terminal
+        .map_or_else(unix_nanos_now, |facts| unix_nanos(facts.finished_at()))
+        .max(started_at);
     TracesEnvelope {
         resource_spans: [ResourceSpans {
             scope_spans: [ScopeSpans {
                 spans: vec![OtlpSpan {
+                    trace_id,
+                    span_id: span_id_hex(RUN_SPAN_ID),
+                    parent_span_id: None,
                     name: "clinker.run",
                     attributes,
                     status: OtlpStatus { code: status },
-                    start_time_unix_nano: Some(unix_nanos(start.started_at())),
-                    end_time_unix_nano: terminal.map(|facts| unix_nanos(facts.finished_at())),
+                    start_time_unix_nano: started_at.to_string(),
+                    end_time_unix_nano: ended_at.to_string(),
                 }],
             }],
         }],
@@ -996,13 +1208,6 @@ fn span_name(name: SpanName) -> &'static str {
     }
 }
 
-fn span_phase(phase: SpanPhase) -> &'static str {
-    match phase {
-        SpanPhase::Start => "start",
-        SpanPhase::End => "end",
-    }
-}
-
 fn span_status(status: SpanStatus) -> u8 {
     match status {
         SpanStatus::Unset => 0,
@@ -1011,10 +1216,264 @@ fn span_status(status: SpanStatus) -> u8 {
     }
 }
 
-fn unix_nanos(timestamp: chrono::DateTime<chrono::Utc>) -> String {
-    timestamp
-        .timestamp_nanos_opt()
-        .unwrap_or(i64::MAX)
-        .max(0)
-        .to_string()
+fn unix_nanos(timestamp: chrono::DateTime<chrono::Utc>) -> u64 {
+    u64::try_from(timestamp.timestamp_nanos_opt().unwrap_or(i64::MAX).max(0)).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use clinker_exec::telemetry::RunCorrelation;
+    use serde_json::Value;
+
+    use super::*;
+
+    const SHIPPED_BOUNDS: ArenaBounds = ArenaBounds {
+        arena_bytes: 4 * 1024 * 1024,
+        ordinary_lane_bytes: 3 * 1024 * 1024,
+        high_severity_lane_bytes: 1024 * 1024,
+        max_batch_bytes: 256 * 1024,
+        max_attributes_per_event: 32,
+    };
+
+    fn correlation() -> RunCorrelation<String> {
+        RunCorrelation {
+            execution_id: "0198c0de-0000-7000-8000-00000000cafe".to_owned(),
+            batch_id: "batch-987654321".to_owned(),
+            pipeline_name: "payments".to_owned(),
+        }
+    }
+
+    /// A log record that fills its arena slot: the largest one the producer
+    /// admits, and therefore the largest one a delivery has to be able to
+    /// carry. Every attribute sits at the shipped per-attribute cap.
+    fn slot_filling_log_record(bounds: ArenaBounds) -> LogRecord {
+        let attribute_bytes = 4 * 1024;
+        let fields = (0..bounds.max_attributes_per_event)
+            .map(|index| (format!("field_{index:03}"), "v".repeat(attribute_bytes)))
+            .collect::<BTreeMap<_, _>>();
+        let mut record = LogRecord {
+            event: "transform.customer_seen".to_owned(),
+            severity: Severity::Info,
+            message: String::new(),
+            correlation: correlation(),
+            fields,
+        };
+        let slot = usize::try_from(bounds.max_batch_bytes).expect("slot bound fits this platform");
+        let occupied = stored_bytes(&record);
+        record.message = "m".repeat(slot.saturating_sub(occupied));
+        assert!(
+            stored_bytes(&record) <= slot,
+            "the fixture must be admissible into one arena slot"
+        );
+        record
+    }
+
+    /// The producer stores a record as JSON in one fixed slot; this is that
+    /// stored size, before any OTLP rewrapping.
+    fn stored_bytes(record: &LogRecord) -> usize {
+        serde_json::to_vec(record).expect("record serializes").len()
+    }
+
+    fn span(logical_node: &str, started: u64, ended: u64) -> TraceSpan {
+        TraceSpan {
+            name: SpanName::Transform,
+            status: SpanStatus::Ok,
+            logical_node: logical_node.to_owned(),
+            started_at_unix_nanos: started,
+            ended_at_unix_nanos: ended,
+        }
+    }
+
+    fn to_value<T: Serialize>(value: &T) -> Value {
+        serde_json::to_value(value).expect("envelope serializes")
+    }
+
+    fn spans_of(envelope: &Value) -> &Vec<Value> {
+        envelope["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .expect("spans")
+    }
+
+    fn is_hex(value: &str, width: usize) -> bool {
+        value.len() == width && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+
+    #[test]
+    fn every_exported_span_carries_a_valid_trace_and_span_identifier() {
+        let trace_id = new_trace_id();
+        assert!(is_hex(&trace_id, 32), "16-byte hex trace id: {trace_id}");
+        assert_ne!(trace_id, "0".repeat(32), "the all-zero trace id is invalid");
+
+        let traces = [span("alpha", 10, 20), span("beta", 30, 40)];
+        let envelope = to_value(&traces_envelope(&traces, &trace_id, 2));
+        let spans = spans_of(&envelope);
+        assert_eq!(spans.len(), 2);
+
+        let mut span_ids = Vec::new();
+        for exported in spans {
+            let id = exported["spanId"].as_str().expect("spanId");
+            assert!(is_hex(id, 16), "8-byte hex span id: {id}");
+            assert_ne!(id, &"0".repeat(16), "the all-zero span id is invalid");
+            assert_eq!(exported["traceId"], trace_id.as_str());
+            assert_eq!(
+                exported["parentSpanId"].as_str().expect("parentSpanId"),
+                span_id_hex(RUN_SPAN_ID),
+                "transform spans hang off the lifecycle root"
+            );
+            span_ids.push(id.to_owned());
+        }
+        span_ids.dedup();
+        assert_eq!(span_ids.len(), 2, "span ids are unique within one trace");
+
+        assert_eq!(spans[0]["startTimeUnixNano"], "10");
+        assert_eq!(spans[0]["endTimeUnixNano"], "20");
+        assert_eq!(spans[1]["startTimeUnixNano"], "30");
+        assert_eq!(spans[1]["endTimeUnixNano"], "40");
+    }
+
+    #[test]
+    fn an_exported_span_is_never_open_at_either_end() {
+        // A backwards wall-clock step must not produce a span that ends before
+        // it starts, and neither boundary is ever omitted.
+        let traces = [span("alpha", 500, 100)];
+        let envelope = to_value(&traces_envelope(&traces, &new_trace_id(), 2));
+        let exported = &spans_of(&envelope)[0];
+        assert_eq!(exported["startTimeUnixNano"], "500");
+        assert_eq!(exported["endTimeUnixNano"], "500");
+        for required in ["traceId", "spanId", "startTimeUnixNano", "endTimeUnixNano"] {
+            assert!(
+                exported.get(required).is_some_and(|value| !value.is_null()),
+                "{required} is required on every span: {exported}"
+            );
+        }
+    }
+
+    #[test]
+    fn drained_counters_export_as_delta_sums_with_required_timestamps() {
+        let metrics = [MetricPoint {
+            key: MetricKey::TransformRecords,
+            value: 20_000,
+        }];
+        let window = MetricsWindow {
+            start: 1_000,
+            end: 2_000,
+        };
+        let envelope = to_value(&metrics_envelope(&metrics, window));
+        let metric = &envelope["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0];
+        assert_eq!(metric["name"], "clinker.transform.records");
+        assert!(
+            metric.get("gauge").is_none(),
+            "a per-flush delta read as a gauge is read as the absolute total"
+        );
+        let sum = &metric["sum"];
+        assert_eq!(
+            sum["aggregationTemporality"], 1,
+            "AGGREGATION_TEMPORALITY_DELTA"
+        );
+        assert_eq!(sum["isMonotonic"], true);
+        let point = &sum["dataPoints"][0];
+        assert_eq!(point["asInt"], "20000");
+        assert_eq!(point["startTimeUnixNano"], "1000");
+        assert_eq!(point["timeUnixNano"], "2000");
+    }
+
+    #[test]
+    fn one_slot_filling_log_record_fits_one_request_but_not_one_arena_slot() {
+        let record = slot_filling_log_record(SHIPPED_BOUNDS);
+        let batch = std::slice::from_ref(&record);
+
+        let mut request = BoundedPayload::new(SHIPPED_BOUNDS.request_capacity_bytes())
+            .expect("request buffer reserves");
+        request
+            .encode(&logs_envelope(batch))
+            .expect("the per-delivery bound admits one slot-filling record");
+        assert!(
+            request.bytes().len() > stored_bytes(&record),
+            "rewrapping every attribute as an OTLP key/value pair expands the record"
+        );
+
+        // The per-record slot bound was reused as the request bound. Re-encoding
+        // one stored record as OTLP already overflows it, and the whole drained
+        // batch was then discarded before any HTTP call.
+        let mut coupled = BoundedPayload::new(SHIPPED_BOUNDS.max_batch_bytes)
+            .expect("slot-sized buffer reserves");
+        assert!(
+            coupled.encode(&logs_envelope(batch)).is_err(),
+            "the per-record slot bound is not a per-request bound"
+        );
+    }
+
+    #[test]
+    fn a_batch_too_large_for_one_request_is_split_rather_than_dropped() {
+        let records = (0..4)
+            .map(|_| slot_filling_log_record(SHIPPED_BOUNDS))
+            .collect::<Vec<_>>();
+        let mut whole_batch =
+            BoundedPayload::new(SHIPPED_BOUNDS.request_capacity_bytes()).expect("buffer reserves");
+        assert!(
+            whole_batch.encode(&logs_envelope(&records)).is_err(),
+            "the fixture must be a batch that cannot travel as one request"
+        );
+
+        let mut payload = BoundedPayload::new(SHIPPED_BOUNDS.request_capacity_bytes())
+            .expect("request buffer reserves");
+        let encode = |payload: &mut BoundedPayload, _offset: usize, chunk: &[LogRecord]| {
+            payload.encode(&logs_envelope(chunk))
+        };
+
+        let mut delivered = 0;
+        let mut requests = 0;
+        while delivered < records.len() {
+            let (len, encoded) = encode_largest_prefix(&mut payload, delivered, &records, &encode);
+            encoded.expect("every chunk encodes once split");
+            assert!(payload.bytes().len() as u64 <= SHIPPED_BOUNDS.request_capacity_bytes());
+            delivered += len;
+            requests += 1;
+        }
+        assert_eq!(delivered, records.len(), "no record is discarded");
+        assert!(
+            requests > 1,
+            "a batch that cannot fit one request is split across requests"
+        );
+    }
+
+    #[test]
+    fn exported_log_records_carry_run_correlation() {
+        let record = LogRecord {
+            event: "transform.customer_seen".to_owned(),
+            severity: Severity::Info,
+            message: "customer observed".to_owned(),
+            correlation: correlation(),
+            fields: BTreeMap::new(),
+        };
+        let envelope = to_value(&logs_envelope(std::slice::from_ref(&record)));
+        let attributes = envelope["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"]
+            .as_array()
+            .expect("attributes")
+            .iter()
+            .map(|entry| {
+                (
+                    entry["key"].as_str().expect("key").to_owned(),
+                    entry["value"]["stringValue"]
+                        .as_str()
+                        .expect("stringValue")
+                        .to_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            attributes.get("clinker.execution_id").map(String::as_str),
+            Some("0198c0de-0000-7000-8000-00000000cafe")
+        );
+        assert_eq!(
+            attributes.get("clinker.batch_id").map(String::as_str),
+            Some("batch-987654321")
+        );
+        assert_eq!(
+            attributes.get("clinker.pipeline_name").map(String::as_str),
+            Some("payments")
+        );
+    }
 }

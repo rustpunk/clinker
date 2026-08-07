@@ -226,13 +226,24 @@ fn logs_payload() -> Vec<u8> {
     .expect("serialize fixture logs")
 }
 
+/// Shaped like what the exporter actually sends: the executor's counters are
+/// drained as per-flush deltas, so they travel as monotonic sums with explicit
+/// delta temporality and both required timestamps, never as gauges.
 fn metrics_payload() -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "resourceMetrics": [{
             "scopeMetrics": [{
                 "metrics": [{
                     "name": "items.processed",
-                    "gauge": {"dataPoints": [{"asInt": "1"}, {"asInt": "2"}]}
+                    "unit": "1",
+                    "sum": {
+                        "aggregationTemporality": 1,
+                        "isMonotonic": true,
+                        "dataPoints": [
+                            {"startTimeUnixNano": "1", "timeUnixNano": "2", "asInt": "1"},
+                            {"startTimeUnixNano": "2", "timeUnixNano": "3", "asInt": "2"}
+                        ]
+                    }
                 }]
             }]
         }]

@@ -9,8 +9,8 @@ use clinker_plan::config::{LogDirective, LogLevel, LogTiming};
 use clinker_record::Record;
 
 use crate::telemetry::{
-    LogEvent, MetricKey, Severity, SignalField, SpanFact, SpanName, SpanPhase, SpanStatus,
-    TelemetryProducer,
+    LogEvent, MetricKey, RunCorrelation, Severity, SignalField, SpanFact, SpanName, SpanStatus,
+    TelemetryProducer, unix_nanos_now,
 };
 
 const MAX_CORRELATION_BYTES: usize = 128;
@@ -40,6 +40,7 @@ struct EnabledDispatcher<'a> {
     batch_id: Box<str>,
     pipeline_name: Box<str>,
     logical_node: Box<str>,
+    started_at_unix_nanos: u64,
     saw_error: bool,
     closed: bool,
 }
@@ -58,6 +59,7 @@ impl<'a> LogDispatcher<'a> {
             batch_id: bounded_correlation(context.batch_id),
             pipeline_name: bounded_correlation(context.pipeline_name),
             logical_node: bounded_correlation(context.logical_node),
+            started_at_unix_nanos: unix_nanos_now(),
             saw_error: false,
             closed: false,
         });
@@ -71,12 +73,9 @@ impl<'a> LogDispatcher<'a> {
         enabled
             .producer
             .record_metric(MetricKey::TransformStarted, 1);
-        let _ = enabled.producer.emit_span(SpanFact {
-            name: SpanName::Transform,
-            phase: SpanPhase::Start,
-            status: SpanStatus::Unset,
-            logical_node: &enabled.logical_node,
-        });
+        // The span itself is admitted once, at close. This metric is what
+        // reaches a collector while the transform is still running.
+        enabled.started_at_unix_nanos = unix_nanos_now();
         enabled.emit_timing(LogTiming::BeforeTransform, None);
     }
 
@@ -141,10 +140,7 @@ impl EnabledDispatcher<'_> {
 
     fn emit(&self, directive: &LogDirective, record: Option<&Record>) {
         let requested = directive.fields.as_deref().unwrap_or_default();
-        let mut fields = Vec::with_capacity(requested.len().saturating_add(3));
-        fields.push(SignalField::new("execution_id", &self.execution_id));
-        fields.push(SignalField::new("batch_id", &self.batch_id));
-        fields.push(SignalField::new("pipeline_name", &self.pipeline_name));
+        let mut fields = Vec::with_capacity(requested.len());
         if let Some(record) = record {
             for field in requested {
                 if let Some(value) = record.get(field) {
@@ -156,6 +152,11 @@ impl EnabledDispatcher<'_> {
             event: &directive.name,
             severity: severity(directive.level),
             message: &directive.message,
+            correlation: RunCorrelation {
+                execution_id: &self.execution_id,
+                batch_id: &self.batch_id,
+                pipeline_name: &self.pipeline_name,
+            },
             fields: &fields,
         });
     }
@@ -164,11 +165,15 @@ impl EnabledDispatcher<'_> {
         if self.closed {
             return;
         }
+        // A wall clock that stepped backwards mid-transform would otherwise
+        // produce a span that ends before it starts.
+        let ended_at_unix_nanos = unix_nanos_now().max(self.started_at_unix_nanos);
         let _ = self.producer.emit_span(SpanFact {
             name: SpanName::Transform,
-            phase: SpanPhase::End,
             status,
             logical_node: &self.logical_node,
+            started_at_unix_nanos: self.started_at_unix_nanos,
+            ended_at_unix_nanos,
         });
         self.closed = true;
     }
