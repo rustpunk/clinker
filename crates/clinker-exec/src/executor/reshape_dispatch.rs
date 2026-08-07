@@ -155,6 +155,38 @@ impl MemoryConsumer for ReshapeConsumer {
     }
 }
 
+/// Context carrier kept lazy until the node-kind guard has succeeded. Normal
+/// dispatch passes the live executor context directly; the feature-gated
+/// mismatch matrix uses the inert carrier to prove rejection precedes input
+/// drain, rule evaluation, partition mutation, consumer registration, or spill.
+pub(crate) enum ReshapeDispatchContext<'borrow, 'plan> {
+    Live(&'borrow mut ExecutorContext<'plan>),
+    #[cfg(feature = "test-utils")]
+    Inert,
+}
+
+impl<'borrow, 'plan> From<&'borrow mut ExecutorContext<'plan>>
+    for ReshapeDispatchContext<'borrow, 'plan>
+{
+    fn from(ctx: &'borrow mut ExecutorContext<'plan>) -> Self {
+        Self::Live(ctx)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl crate::executor::dispatch::DispatchFaultGuard {
+    /// Execute the real reshape boundary with an inert context so tests can
+    /// prove a wrong node returns before partition, rule, or spill state.
+    #[doc(hidden)]
+    pub fn dispatch_reshape_mismatch_for_testing(
+        current_dag: &ExecutionPlanDag,
+        node_idx: NodeIndex,
+        node: &PlanNode,
+    ) -> Result<(), PipelineError> {
+        dispatch_reshape(ReshapeDispatchContext::Inert, current_dag, node_idx, node)
+    }
+}
+
 /// A detected runtime mutation conflict: two rules wrote the same field on
 /// the same group row. Captured as owned data so the DLQ push (which needs
 /// `&mut ExecutorContext`) runs after the eval context's immutable borrow
@@ -173,12 +205,15 @@ struct MutationConflict {
 /// group), and emits originals (mutated, audit-stamped) followed by
 /// synthesized rows. Blocking: the full input materializes before the
 /// first output row leaves.
-pub(crate) fn dispatch_reshape(
-    ctx: &mut ExecutorContext<'_>,
+pub(crate) fn dispatch_reshape<'borrow, 'plan>(
+    ctx: impl Into<ReshapeDispatchContext<'borrow, 'plan>>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     node: &PlanNode,
-) -> Result<(), PipelineError> {
+) -> Result<(), PipelineError>
+where
+    'plan: 'borrow,
+{
     let PlanNode::Reshape {
         ref name,
         ref config,
@@ -187,7 +222,19 @@ pub(crate) fn dispatch_reshape(
         ..
     } = *node
     else {
-        unreachable!("dispatch_reshape called with non-Reshape node");
+        return Err(crate::executor::invariant::dispatch_mismatch(
+            "dispatch_reshape",
+            "reshape",
+            node.kind_name(),
+            node.name(),
+        ));
+    };
+    let ctx = match ctx.into() {
+        ReshapeDispatchContext::Live(ctx) => ctx,
+        #[cfg(feature = "test-utils")]
+        ReshapeDispatchContext::Inert => {
+            panic!("reshape dispatcher accessed inert context after accepting a reshape node")
+        }
     };
 
     let pred = single_predecessor(current_dag, node_idx, "reshape", name)?;

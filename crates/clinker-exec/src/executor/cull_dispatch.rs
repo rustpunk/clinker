@@ -145,17 +145,52 @@ impl MemoryConsumer for CullConsumer {
     }
 }
 
+/// Context carrier kept lazy until the node-kind guard has succeeded. Normal
+/// dispatch passes the live executor context directly; the feature-gated
+/// mismatch matrix uses the inert carrier to prove rejection precedes input
+/// drain, selection state, consumer registration, spill, and port emission.
+pub(crate) enum CullDispatchContext<'borrow, 'plan> {
+    Live(&'borrow mut ExecutorContext<'plan>),
+    #[cfg(feature = "test-utils")]
+    Inert,
+}
+
+impl<'borrow, 'plan> From<&'borrow mut ExecutorContext<'plan>>
+    for CullDispatchContext<'borrow, 'plan>
+{
+    fn from(ctx: &'borrow mut ExecutorContext<'plan>) -> Self {
+        Self::Live(ctx)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl crate::executor::dispatch::DispatchFaultGuard {
+    /// Execute the real cull boundary with an inert context so tests can prove
+    /// a wrong node returns before selection or grouped state is touched.
+    #[doc(hidden)]
+    pub fn dispatch_cull_mismatch_for_testing(
+        current_dag: &ExecutionPlanDag,
+        node_idx: NodeIndex,
+        node: &PlanNode,
+    ) -> Result<(), PipelineError> {
+        dispatch_cull(CullDispatchContext::Inert, current_dag, node_idx, node)
+    }
+}
+
 /// Execute the `Cull` arm for `node_idx`. Drains the predecessor, groups by
 /// `partition_by`, evaluates each group's `drop_group_when` predicate over
 /// the whole group, and splits kept vs. removed records onto the main and
 /// `removed_to` output ports. Blocking: the full input materializes before
 /// the first output row leaves.
-pub(crate) fn dispatch_cull(
-    ctx: &mut ExecutorContext<'_>,
+pub(crate) fn dispatch_cull<'borrow, 'plan>(
+    ctx: impl Into<CullDispatchContext<'borrow, 'plan>>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     node: &PlanNode,
-) -> Result<(), PipelineError> {
+) -> Result<(), PipelineError>
+where
+    'plan: 'borrow,
+{
     let PlanNode::Cull {
         ref name,
         ref config,
@@ -165,7 +200,19 @@ pub(crate) fn dispatch_cull(
         ..
     } = *node
     else {
-        unreachable!("dispatch_cull called with non-Cull node");
+        return Err(crate::executor::invariant::dispatch_mismatch(
+            "dispatch_cull",
+            "cull",
+            node.kind_name(),
+            node.name(),
+        ));
+    };
+    let ctx = match ctx.into() {
+        CullDispatchContext::Live(ctx) => ctx,
+        #[cfg(feature = "test-utils")]
+        CullDispatchContext::Inert => {
+            panic!("cull dispatcher accessed inert context after accepting a cull node")
+        }
     };
 
     let pred = single_predecessor(current_dag, node_idx, "cull", name)?;

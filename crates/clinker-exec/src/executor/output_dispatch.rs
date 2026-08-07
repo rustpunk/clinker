@@ -252,6 +252,38 @@ struct OutputInputs {
     cxl_emit_names: Vec<String>,
 }
 
+/// Context carrier kept lazy until the node-kind guard has succeeded. Normal
+/// dispatch passes the live executor context directly; the feature-gated
+/// mismatch matrix uses the inert carrier to prove rejection precedes writer
+/// lookup, publication, correlation buffering, and input-buffer access.
+pub(crate) enum OutputDispatchContext<'borrow, 'plan> {
+    Live(&'borrow mut ExecutorContext<'plan>),
+    #[cfg(feature = "test-utils")]
+    Inert,
+}
+
+impl<'borrow, 'plan> From<&'borrow mut ExecutorContext<'plan>>
+    for OutputDispatchContext<'borrow, 'plan>
+{
+    fn from(ctx: &'borrow mut ExecutorContext<'plan>) -> Self {
+        Self::Live(ctx)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl crate::executor::dispatch::DispatchFaultGuard {
+    /// Execute the real output boundary with an inert context so tests can
+    /// prove a wrong node returns before writer or publication state is read.
+    #[doc(hidden)]
+    pub fn dispatch_output_mismatch_for_testing(
+        current_dag: &ExecutionPlanDag,
+        node_idx: NodeIndex,
+        node: &PlanNode,
+    ) -> Result<(), PipelineError> {
+        dispatch_output(OutputDispatchContext::Inert, current_dag, node_idx, node)
+    }
+}
+
 /// Derive the [`OutputInputs`] for `node_idx` from the plan. Shared by the
 /// records-only, document-DLQ, and envelope Output arms so the input-binding
 /// preamble lives in one place.
@@ -277,19 +309,34 @@ fn resolve_output_inputs(current_dag: &ExecutionPlanDag, node_idx: NodeIndex) ->
 /// correlation-key pipeline, and the streaming-fused short-circuit when a
 /// streaming sender was installed. Deferred physical boundaries block only at
 /// their compiled population grain and spill through the shared sorter.
-pub(crate) fn dispatch_output(
-    ctx: &mut ExecutorContext<'_>,
+pub(crate) fn dispatch_output<'borrow, 'plan>(
+    ctx: impl Into<OutputDispatchContext<'borrow, 'plan>>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     node: &PlanNode,
-) -> Result<(), PipelineError> {
+) -> Result<(), PipelineError>
+where
+    'plan: 'borrow,
+{
     let PlanNode::Output {
         ref name,
         ref resolved,
         ..
     } = *node
     else {
-        unreachable!("dispatch_output called with non-Output node");
+        return Err(crate::executor::invariant::dispatch_mismatch(
+            "dispatch_output",
+            "output",
+            node.kind_name(),
+            node.name(),
+        ));
+    };
+    let ctx = match ctx.into() {
+        OutputDispatchContext::Live(ctx) => ctx,
+        #[cfg(feature = "test-utils")]
+        OutputDispatchContext::Inert => {
+            panic!("output dispatcher accessed inert context after accepting an output node")
+        }
     };
     let output_id = node.id();
     // Streaming-Output short-circuit (issue #72). The executor

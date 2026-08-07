@@ -31,7 +31,7 @@ use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 /// the inert carrier to prove a mismatch returns before any context access.
 pub(crate) enum RouteDispatchContext<'borrow, 'plan> {
     Live(&'borrow mut ExecutorContext<'plan>),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     Inert,
 }
 
@@ -50,6 +50,20 @@ pub(crate) struct InertRouteDispatchContext;
 impl<'borrow, 'plan> From<InertRouteDispatchContext> for RouteDispatchContext<'borrow, 'plan> {
     fn from(_: InertRouteDispatchContext) -> Self {
         Self::Inert
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl crate::executor::dispatch::DispatchFaultGuard {
+    /// Execute the real route boundary with an inert context so tests can
+    /// prove a wrong node returns before branch or buffer state is touched.
+    #[doc(hidden)]
+    pub fn dispatch_route_mismatch_for_testing(
+        current_dag: &ExecutionPlanDag,
+        node_idx: NodeIndex,
+        node: &PlanNode,
+    ) -> Result<(), PipelineError> {
+        dispatch_route(RouteDispatchContext::Inert, current_dag, node_idx, node)
     }
 }
 
@@ -85,7 +99,7 @@ where
     };
     let ctx = match ctx.into() {
         RouteDispatchContext::Live(ctx) => ctx,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-utils"))]
         RouteDispatchContext::Inert => {
             panic!("route dispatcher accessed inert context after accepting a route node")
         }

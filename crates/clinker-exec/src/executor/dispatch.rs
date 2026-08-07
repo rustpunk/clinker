@@ -51,7 +51,46 @@ struct DispatchFaultState {
 #[cfg(feature = "test-utils")]
 struct ArmedDispatchFault {
     id: u64,
+    dispatcher: DispatchFaultKind,
     target_node: String,
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Clone, Copy)]
+enum DispatchFaultKind {
+    Route,
+    Aggregation,
+    Source,
+    Transform,
+    Composition,
+    Combine,
+    Merge,
+    Sort,
+    Envelope,
+    Output,
+    Cull,
+    Reshape,
+}
+
+#[cfg(feature = "test-utils")]
+impl DispatchFaultKind {
+    fn from_dispatcher(dispatcher: &str) -> Option<Self> {
+        match dispatcher {
+            "dispatch_route" => Some(Self::Route),
+            "dispatch_aggregation" => Some(Self::Aggregation),
+            "dispatch_source" => Some(Self::Source),
+            "dispatch_transform" => Some(Self::Transform),
+            "dispatch_composition" => Some(Self::Composition),
+            "dispatch_combine" => Some(Self::Combine),
+            "dispatch_merge" => Some(Self::Merge),
+            "dispatch_sort" => Some(Self::Sort),
+            "dispatch_envelope" => Some(Self::Envelope),
+            "dispatch_output" => Some(Self::Output),
+            "dispatch_cull" => Some(Self::Cull),
+            "dispatch_reshape" => Some(Self::Reshape),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(feature = "test-utils")]
@@ -70,8 +109,13 @@ pub struct DispatchFaultGuard {
 
 #[cfg(feature = "test-utils")]
 impl DispatchFaultGuard {
-    /// Route one matching non-Route node through the Route dispatcher guard.
-    pub fn route_mismatch_once(target_node: impl Into<String>) -> Result<Self, &'static str> {
+    /// Route one matching node through a selected dispatcher guard.
+    pub fn dispatch_mismatch_once(
+        dispatcher: &str,
+        target_node: impl Into<String>,
+    ) -> Result<Self, &'static str> {
+        let dispatcher = DispatchFaultKind::from_dispatcher(dispatcher)
+            .ok_or("dispatch fault names an unsupported dispatcher")?;
         let target_node = target_node.into();
         if target_node.is_empty() || target_node.len() > DISPATCH_FAULT_TARGET_MAX_BYTES {
             return Err("dispatch fault target is outside its byte bound");
@@ -85,8 +129,17 @@ impl DispatchFaultGuard {
             .checked_add(1)
             .ok_or("dispatch fault generation is exhausted")?;
         let id = state.next_id;
-        state.armed = Some(ArmedDispatchFault { id, target_node });
+        state.armed = Some(ArmedDispatchFault {
+            id,
+            dispatcher,
+            target_node,
+        });
         Ok(Self { id })
+    }
+
+    /// Route one matching non-Route node through the Route dispatcher guard.
+    pub fn route_mismatch_once(target_node: impl Into<String>) -> Result<Self, &'static str> {
+        Self::dispatch_mismatch_once("dispatch_route", target_node)
     }
 }
 
@@ -113,17 +166,17 @@ fn dispatch_fault_state() -> std::sync::MutexGuard<'static, DispatchFaultState> 
 }
 
 #[cfg(feature = "test-utils")]
-fn take_route_mismatch_fault(node: &PlanNode) -> bool {
+fn take_dispatch_mismatch_fault(node: &PlanNode) -> Option<DispatchFaultKind> {
     let mut state = dispatch_fault_state();
-    if state
+    let dispatcher = state
         .armed
         .as_ref()
-        .is_some_and(|fault| fault.target_node == node.name())
-    {
+        .filter(|fault| fault.target_node == node.name())
+        .map(|fault| fault.dispatcher);
+    if dispatcher.is_some() {
         state.armed = None;
-        return true;
     }
-    false
+    dispatcher
 }
 
 /// Stand-in `$source.file` value for dispatch sites that have no
@@ -4251,8 +4304,69 @@ pub(crate) fn dispatch_plan_node(
     }
     let node = current_dag.graph[node_idx].clone();
     #[cfg(feature = "test-utils")]
-    if take_route_mismatch_fault(&node) {
-        return crate::executor::route_dispatch::dispatch_route(ctx, current_dag, node_idx, &node);
+    if let Some(dispatcher) = take_dispatch_mismatch_fault(&node) {
+        return match dispatcher {
+            DispatchFaultKind::Route => {
+                crate::executor::route_dispatch::dispatch_route(ctx, current_dag, node_idx, &node)
+            }
+            DispatchFaultKind::Aggregation => {
+                crate::executor::aggregate_dispatch::dispatch_aggregation(
+                    ctx,
+                    current_dag,
+                    node_idx,
+                    &node,
+                )
+            }
+            DispatchFaultKind::Source => {
+                crate::executor::source_dispatch::dispatch_source(ctx, current_dag, node_idx, &node)
+            }
+            DispatchFaultKind::Transform => {
+                crate::executor::transform_dispatch::dispatch_transform(
+                    ctx,
+                    current_dag,
+                    node_idx,
+                    &node,
+                )
+            }
+            DispatchFaultKind::Composition => {
+                crate::executor::composition_dispatch::dispatch_composition(
+                    ctx,
+                    current_dag,
+                    node_idx,
+                    &node,
+                )
+            }
+            DispatchFaultKind::Combine => crate::executor::combine_dispatch::dispatch_combine(
+                ctx,
+                current_dag,
+                node_idx,
+                &node,
+            ),
+            DispatchFaultKind::Merge => {
+                crate::executor::merge_dispatch::dispatch_merge(ctx, current_dag, node_idx, &node)
+            }
+            DispatchFaultKind::Sort => {
+                crate::executor::sort_dispatch::dispatch_sort(ctx, current_dag, node_idx, &node)
+            }
+            DispatchFaultKind::Envelope => crate::executor::envelope_dispatch::dispatch_envelope(
+                ctx,
+                current_dag,
+                node_idx,
+                &node,
+            ),
+            DispatchFaultKind::Output => {
+                crate::executor::output_dispatch::dispatch_output(ctx, current_dag, node_idx, &node)
+            }
+            DispatchFaultKind::Cull => {
+                crate::executor::cull_dispatch::dispatch_cull(ctx, current_dag, node_idx, &node)
+            }
+            DispatchFaultKind::Reshape => crate::executor::reshape_dispatch::dispatch_reshape(
+                ctx,
+                current_dag,
+                node_idx,
+                &node,
+            ),
+        };
     }
     match node {
         PlanNode::Source { .. } => {
