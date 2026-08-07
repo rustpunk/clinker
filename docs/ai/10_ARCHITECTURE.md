@@ -1,6 +1,6 @@
 # AI Onboarding: Architecture
 
-Verified against the current working tree (2026-07-30).
+Verified against the current working tree (2026-08-07).
 
 Purpose: Give a senior Rust engineer or AI coding agent a practical, source-backed architecture overview before changing Clinker.
 
@@ -10,10 +10,10 @@ Primary evidence used for this pass:
 
 - Workspace and crate boundaries: `Cargo.toml`, `crates/*/Cargo.toml`, `docs/ai/20_CRATE_MAP.md`.
 - Planning and config: `crates/clinker-plan/src/lib.rs`, `crates/clinker-plan/src/config/pipeline.rs`, `crates/clinker-plan/src/config/pipeline_node.rs`, `crates/clinker-plan/src/resources/mod.rs`, `crates/clinker-plan/src/yaml.rs`, `crates/clinker-plan/src/plan/compiled.rs`, `crates/clinker-plan/src/plan/execution/consumer_registry.rs`, `crates/clinker-plan/src/plan/execution/scheduling.rs`.
-- Runtime and IO: `crates/clinker-exec/src/executor/mod.rs`, `crates/clinker-exec/src/executor/params.rs`, `crates/clinker-exec/src/executor/source_stream.rs`, `crates/clinker-exec/src/executor/output_dispatch.rs`, `crates/clinker-exec/src/executor/stream_event.rs`, `crates/clinker-exec/src/source/mod.rs`, `crates/clinker-exec/src/source/order_barrier.rs`, `crates/clinker-exec/src/pipeline/memory.rs`, `crates/clinker-exec/src/pipeline/shutdown.rs`, `crates/clinker-format/src/traits.rs`, `crates/clinker-net/src/lib.rs`.
+- Runtime and IO: `crates/clinker-exec/src/executor/mod.rs`, `crates/clinker-exec/src/executor/params.rs`, `crates/clinker-exec/src/executor/source_stream.rs`, `crates/clinker-exec/src/executor/output_dispatch.rs`, `crates/clinker-exec/src/executor/stream_event.rs`, `crates/clinker-exec/src/source/mod.rs`, `crates/clinker-exec/src/source/order_barrier.rs`, `crates/clinker-exec/src/pipeline/memory.rs`, `crates/clinker-exec/src/pipeline/shutdown.rs`, `crates/clinker-exec/src/telemetry.rs`, `crates/clinker-format/src/traits.rs`, `crates/clinker-net/src/otlp.rs`.
 - Data model and language: `crates/clinker-record/src/lib.rs`, `crates/clinker-record/src/record/mod.rs`, `crates/clinker-record/src/storage.rs`, `crates/clinker-record/src/value.rs`, `crates/cxl/src/lib.rs`.
-- Edge surfaces: `crates/clinker/src/main.rs`, `crates/clinker-channel/src/lib.rs`, `crates/clinker-channel/src/discovery.rs`, `crates/clinker-channel/src/group.rs`, `crates/clinker-channel/src/resolve.rs`, `crates/clinker-schema/src/lib.rs`, `examples/pipelines/customer_etl.yaml`.
-- Tests and CI: `crates/clinker-exec/tests/*`, `crates/clinker-plan/src/plan/tests/*`, `crates/clinker-format/tests/*`, `crates/clinker-net/tests/*`, `crates/clinker-channel/tests/*`, `.github/workflows/ci.yml`.
+- Edge surfaces: `crates/clinker/src/main.rs`, `crates/clinker/src/lifecycle.rs`, `crates/clinker/src/observability.rs`, `crates/clinker-lineage/src/logical_identity.rs`, `crates/clinker-lineage/src/delivery.rs`, `crates/clinker-channel/src/lib.rs`, `crates/clinker-channel/src/discovery.rs`, `crates/clinker-channel/src/group.rs`, `crates/clinker-channel/src/resolve.rs`, `crates/clinker-schema/src/lib.rs`, `examples/pipelines/customer_etl.yaml`.
+- Tests and CI: `crates/clinker-exec/tests/*`, `crates/clinker-plan/src/plan/tests/*`, `crates/clinker-format/tests/*`, `crates/clinker-net/tests/*`, `crates/clinker-channel/tests/*`, `crates/clinker/tests/machine_supervision.rs`, `crates/clinker/tests/observability_isolation.rs`, `.github/workflows/ci.yml`.
 
 Locked production targets, their current implementation status, compatibility
 posture, and downstream owners are indexed in the
@@ -42,13 +42,13 @@ Verified facts:
 - **Record model:** `clinker-record` owns `Value`, `Record`, `Schema`, `RecordStorage`, `RecordView`, provenance, document context, grouping keys, counters, and accumulator state. `Record` stores positional `Vec<Value>` data behind an `Arc<Schema>`.
 - **Expression engine:** `cxl` owns AST, lexing/parsing, module evaluation, resolution, typechecking, static analysis, aggregate planning, and runtime evaluation. Public symbols used downstream include `Parser`, `resolve_program`, `type_check`, `ProgramEvaluator`, and aggregate extraction/planning APIs.
 - **Format layer:** `clinker-format` owns streaming `FormatReader` / `FormatWriter` traits plus CSV, JSON/NDJSON, XML, fixed-width, HL7, X12, EDIFACT, SWIFT, multi-record, envelope, document index, source reopening, writer counting, and splitting modules.
-- **Planning layer:** `clinker-plan` parses YAML, validates topology and paths, resolves schemas and the workspace catalog, enumerates every CXL-bearing field through `PipelineNode::visit_cxl_fields`, admits and typechecks the bounded transitive module/declaration closure, lowers unified nodes into `ExecutionPlanDag`, and returns `CompiledPlan`. After all structural rewrites, the finalized DAG retains a `CompiledConsumerRegistry` keyed by `ProducerPortKey` and an immutable `ExecutionOrderContract` containing typed source orders, edge/consumer requirements, terminal promises, and physical-writer boundaries. `CompiledPlan::cxl_modules()` retains the parsed registry needed by execution.
-- **Runtime layer:** `clinker-exec` owns `PipelineExecutor`, executor dispatch arms, the unified `SourceAttemptEvent` stream and `AttemptPopulationDelta` accounting, `SourceRowId`, per-physical-file source-order verification/repair, shared-port replay, node buffers, streaming handoff, DLQ, metrics, memory arbitration, spill handling, joins/combines, aggregation, merge, reshape, cull, envelope, ordered physical-writer boundaries, output, and shutdown.
-- **Network source layer:** `clinker-net` currently exposes `build_rest_source`, adapting REST pages into `Box<dyn clinker_exec::source::RecordSource>`.
+- **Planning layer:** `clinker-plan` parses YAML, validates topology and paths, resolves schemas and the workspace catalog, enumerates every CXL-bearing field through `PipelineNode::visit_cxl_fields`, admits and typechecks the bounded transitive module/declaration closure, lowers unified nodes into `ExecutionPlanDag`, and returns `CompiledPlan`. After all structural rewrites, the finalized DAG retains a `CompiledConsumerRegistry` keyed by `ProducerPortKey` and an immutable `ExecutionOrderContract` containing typed source orders, edge/consumer requirements, terminal promises, and physical-writer boundaries. `CompiledPlan::cxl_modules()` retains the parsed registry needed by execution. Its workspace observability config owns only strict secret-free raw endpoint/auth intent and numeric telemetry/lineage bounds; it does not parse a URI or hold network-auth state.
+- **Runtime layer:** `clinker-exec` owns `PipelineExecutor`, executor dispatch arms, the unified `SourceAttemptEvent` stream and `AttemptPopulationDelta` accounting, `SourceRowId`, per-physical-file source-order verification/repair, shared-port replay, node buffers, streaming handoff, DLQ, metrics, memory arbitration, spill handling, joins/combines, aggregation, merge, reshape, cull, envelope, ordered physical-writer boundaries, output, and shutdown. It also owns the fixed-memory producers for real logs, metrics, and traces; it does not own OTLP transport.
+- **Network source and OTLP layer:** `clinker-net` exposes finite REST sources plus the sole structured `ureq::http::Uri` admission/normalization boundary for one OTLP origin. Its admitted proof has private fields, derives only `/v1/logs`, `/v1/metrics`, and `/v1/traces`, and feeds finite synchronous transport with a post-admission borrowed authentication applicator.
 - **Channel/deployment layer:** `clinker-channel` owns catalog-backed channel target discovery, explicit group target sets, selector/forced-group admission, typed overlay resolution, dotted paths, and source staging copies. Every applied layer is canonicalized and contained beneath its admitted root; parsing and identity hashing consume one bounded buffer from the same open file. `CompiledPlan::channel_identity()` records the complete ordered pipeline/group/channel/per-target layer stack, not merely a channel name or one overlay hash.
 - **Schema workspace layer:** `clinker-schema` parses `.schema.yaml`, discovers schema files, builds `SchemaIndex`, and validates pipeline schema references.
-- **Lineage layer:** `clinker-lineage` walks a `CompiledPlan` to compute OpenLineage column-level lineage (DIRECT value derivation plus dataset-level INDIRECT influence, traced through composition bodies) and emits run events as NDJSON. Wired to the CLI as `run --lineage` (plan-derived, no data processing) and `run --lineage-events` (live run lifecycle).
-- **CLI layer:** `crates/clinker/src/main.rs` exposes `run`, `metrics`, `explain`, `channels`, `refactor`, and `config` commands through Clap and calls into plan/exec/channel/net/format/lineage code.
+- **Lineage layer:** `clinker-lineage` walks a `CompiledPlan` to compute OpenLineage column-level lineage (DIRECT value derivation plus dataset-level INDIRECT influence, traced through composition bodies), owns canonical/catalog collection identity with standard subset and symlinks facets, and emits run events as NDJSON. External delivery has its own capped nonblocking queue, sink-owned worker, deadline, counters, and typed outcome; explicit `local_diagnostic_paths` remains a synchronous local-only compatibility mode.
+- **CLI layer:** `crates/clinker/src/main.rs` exposes `run`, `metrics`, `explain`, `channels`, `refactor`, and `config` commands through Clap and calls into plan/exec/channel/net/format/lineage code. At the observability edge it composes the admitted endpoint with plan-owned bounds before effects, owns one immutable `RunLifecycleFacts` source, and keeps OTLP and lineage workers and outcomes separate.
 - **Benchmark/test layer:** `clinker-bench-support` and `clinker-benchmarks` own generators, cached data, benchmark runners, and optional allocation instrumentation.
 
 ## Data Flow
@@ -135,7 +135,12 @@ Verified boundaries:
 - `clinker-plan` sits below execution. Its crate docs say it turns YAML and CXL into a typed, validated `ExecutionPlanDag` "without depending on any runtime operator." Its public `resources` module owns workspace catalog identity, rules-root selection, bounded module loading, and `CompiledModuleRegistry`.
 - `clinker-exec` consumes plan/config artifacts and owns runtime operator behavior. Executor public docs include a `compile_fail` doctest showing `&PipelineConfig` is not accepted by `run_plan_with_readers_writers`.
 - `clinker-format` is the streaming IO layer. Its current dependency on `cxl` is the reviewed D-20 exception for logical types and document path/index behavior, not general permission to move expression evaluation into formats.
-- `clinker-net` is not a low-level HTTP-only crate; it depends on `clinker-exec` because REST readers implement executor `RecordSource`.
+- `clinker-net` is not a low-level HTTP-only crate; it depends on `clinker-exec` because REST readers implement executor `RecordSource`, and it separately owns the opaque OTLP endpoint-admission proof and synchronous transport.
+- The shared failure edge is deliberately exact: only `clinker-net` and
+  `clinker-lineage` add normal dependencies on `clinker-core-types`, and they
+  consume only `FailureClassification`, `FailureCategory`, and `RetryAdvice`.
+  They do not re-export the taxonomy or move identity and serialization policy
+  into the shared crate.
 - `clinker-channel`, `clinker-net`, `clinker-schema`, `clinker`, and `cxl-cli` are edge/integration crates.
 - Benchmark helpers must remain outside default runtime paths. The `clinker-exec -> clinker-bench-support` edge is optional and feature-gated for `bench-alloc`.
 
@@ -155,14 +160,43 @@ serializer in `crates/clinker/src/machine.rs`, not a worker runtime. One owner
 assigns sequence, bounds advisory progress, and emits terminal truth only after
 the existing cancellation/publication decision is known.
 
-An external parent owns concurrent stdout/stderr drains, overall and graceful
-cancellation deadlines, independent heartbeat, platform process-tree policy,
-fresh-process retry, and direct-child reaping. It accepts success only when the
-supported terminal, actual process status, and current-attempt artifact truth
-reconcile. Progress is not a heartbeat or resume cursor, and individually
-atomic artifacts do not imply set-wide atomic publication. The executable
-contract is covered by `crates/clinker/tests/machine_protocol_cli.rs` and
+An external parent owns concurrent bounded stdout/stderr drains, the overall
+deadline, independent heartbeat, platform process-tree policy, fresh-process
+retry, and direct-child reaping. Cancellation delivers the real platform
+graceful signal while both drains remain active, waits a distinct bounded grace
+interval, forces once only after expiry, reaps the direct child, and only then
+joins the drains. It accepts success only when the supported terminal, actual
+process status, and current-attempt artifact truth reconcile. Progress is not a
+heartbeat or resume cursor, and individually atomic artifacts do not imply
+set-wide atomic publication. The Linux direct-child proof covers cooperative
+SIGTERM and uncooperative forced fallback; process groups and descendants
+remain adapter-owned and outside that proof. The executable contract is
+covered by `crates/clinker/tests/machine_protocol_cli.rs` and
 `crates/clinker/tests/machine_supervision.rs`.
+
+### Optional observability and lineage boundary
+
+Deployment observability is disabled when the workspace policy is absent. The
+enabled capability crosses a single chain: `clinker-plan` retains exact raw
+secret-free endpoint/auth intent and finite bounds; `clinker-net` alone admits
+and normalizes the endpoint into its opaque proof; the CLI composes that proof
+with the bounds before source, output, worker, or network effects; and
+`clinker-exec` supplies the real log, metric, and trace producers. There is no
+second URI parser or admitted-endpoint type.
+
+Credential-free HTTPS with no headers is production-reachable. A
+provider-neutral referenced mode is accepted as secret-free intent but fails
+before exporter effects until Phase 4 D-13/D-15 and AUTH-01 supply the run-local
+credential handle and applicator. That later applicator cannot change the
+admitted origin or fixed signal routes.
+
+Machine, OTLP, and OpenLineage correlation copies batch ID, execution ID,
+semantic plan fingerprint, and terminal facts from one CLI-owned immutable
+lifecycle source. OTLP and OpenLineage retain independent capacities,
+deadlines, workers, counters, and typed outcomes. Privacy policy is applied
+before telemetry queue admission; optional delivery outcomes never redefine
+output/DLQ bytes, process status, machine truth, publication inventory, visible
+finals, or retained failed-attempt evidence.
 
 ## Public API Surfaces
 
@@ -252,6 +286,13 @@ Verified facts:
 - Compile-time structured diagnostics live in `clinker-core-types` (`Diagnostic`, `Severity`, spans, payloads). `PipelineConfig::compile` returns `Result<CompiledPlan, Vec<Diagnostic>>`.
 - Runtime and subsystem failures aggregate through `clinker_plan::error::PipelineError`, which has variants for config, schema, format, eval, compilation, I/O, spill, thread pool, multiple writer errors, internal invariant violations, accumulator failures, schema mismatch, composition, memory, combine, envelope, and other runtime cases.
 - `PipelineError::Internal` is explicitly for plan-time invariant violations found at runtime and should abort regardless of `ErrorStrategy::Continue`.
+- The twelve production-reachable specialized dispatcher entry boundaries
+  return a bounded `DispatchMismatch` instead of unwinding. It classifies
+  directly as `runtime.invariant.dispatch_mismatch`,
+  `FailureCategory::InternalInvariant`, and `RetryAdvice::PolicyRequired`
+  before mutable operator or publication effects. This SECU-03 boundary is a
+  Phase 3 runtime-invariant decision, not a numbered production-contract row;
+  locally proven internal algorithm and Output assertions remain assertions.
 - `FormatError` is `#[non_exhaustive]`, returned per record or setup operation, and wraps format-specific errors plus structural count, invalid record, schema inference, undeclared field, and unserializable map cases.
 - Some runtime data failures can route to DLQ depending on error strategy; other classes always abort. Examples called out in source comments include memory budget errors, unsatisfiable memory budgets, sort-order violations, internal invariant failures, and specific envelope conflicts.
 - CLI exit codes distinguish success, config/schema/CXL errors, partial DLQ completion, fatal data/eval errors, I/O/format errors, and interrupted runs.
