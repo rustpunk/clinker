@@ -50,3 +50,8 @@ crates/clinker/out.csv
 .review-tmp/
 .review_scratch/
 .review_tmp/
+
+# Attempt-publication roots. Normally these live under a run's configured
+# destination, but a test that resolves the root relative to its working
+# directory leaves one in the crate tree; it is runtime state, never source.
+.clinker-attempts/
