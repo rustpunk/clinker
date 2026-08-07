@@ -197,8 +197,8 @@ pub struct OtlpDeliveryBudget {
     max_request_bytes: usize,
     max_response_bytes: u64,
     max_attempts: u32,
+    connect_timeout: Duration,
     request_timeout: Duration,
-    response_timeout: Duration,
     retry_backoff: Duration,
     total_timeout: Duration,
 }
@@ -210,8 +210,8 @@ impl OtlpDeliveryBudget {
         max_request_bytes: usize,
         max_response_bytes: u64,
         max_attempts: u32,
+        connect_timeout: Duration,
         request_timeout: Duration,
-        response_timeout: Duration,
         retry_backoff: Duration,
         total_timeout: Duration,
     ) -> Result<Self, OtlpDeliveryBudgetError> {
@@ -219,8 +219,8 @@ impl OtlpDeliveryBudget {
             || max_response_bytes == 0
             || max_response_bytes > usize::MAX as u64
             || max_attempts == 0
+            || connect_timeout.is_zero()
             || request_timeout.is_zero()
-            || response_timeout.is_zero()
             || total_timeout.is_zero()
             || retry_backoff > total_timeout
             || Instant::now().checked_add(total_timeout).is_none()
@@ -231,8 +231,8 @@ impl OtlpDeliveryBudget {
             max_request_bytes,
             max_response_bytes,
             max_attempts,
+            connect_timeout,
             request_timeout,
-            response_timeout,
             retry_backoff,
             total_timeout,
         })
@@ -684,19 +684,19 @@ fn send_attempt(
 ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
     let attempt_timeout = remaining.min(
         budget
-            .request_timeout
-            .saturating_add(budget.response_timeout),
+            .connect_timeout
+            .saturating_add(budget.request_timeout),
     );
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .https_only(endpoint.https_only)
         .max_redirects(0)
         .http_status_as_error(false)
         .timeout_global(Some(attempt_timeout))
-        .timeout_connect(Some(budget.request_timeout.min(remaining)))
+        .timeout_connect(Some(budget.connect_timeout.min(remaining)))
         .timeout_send_request(Some(budget.request_timeout.min(remaining)))
         .timeout_send_body(Some(budget.request_timeout.min(remaining)))
-        .timeout_recv_response(Some(budget.response_timeout.min(remaining)))
-        .timeout_recv_body(Some(budget.response_timeout.min(remaining)))
+        .timeout_recv_response(Some(budget.request_timeout.min(remaining)))
+        .timeout_recv_body(Some(budget.request_timeout.min(remaining)))
         .build()
         .into();
 
