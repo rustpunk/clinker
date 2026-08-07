@@ -2974,6 +2974,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         static_vars: effective_runtime_variables.static_vars,
         source_vars: effective_runtime_variables.source_vars,
         record_vars: effective_runtime_variables.record_vars,
+        telemetry_producer: None,
         shutdown_token: Some(shutdown_token.clone()),
         spill_root_dir: spill_root_dir.clone(),
         spill_disk_cap_bytes,
