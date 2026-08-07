@@ -1,8 +1,15 @@
+use std::collections::HashMap;
+use std::io::{Cursor, Write};
+use std::path::PathBuf;
+
+use clinker_bench_support::io::SharedBuffer;
+use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders};
+use clinker_exec::source::multi_file::FileSlot;
 use clinker_exec::telemetry::{
-    LogEvent, MetricKey, Severity, SignalField, SpanFact, SpanName, SpanPhase, SpanStatus,
-    TelemetryArena,
+    ArenaSnapshot, LogEvent, LogRecord, MetricKey, Severity, SignalField, SpanFact, SpanName,
+    SpanPhase, SpanStatus, TelemetryArena, TelemetryBatch, TraceSpan,
 };
-use clinker_plan::config::ClinkerToml;
+use clinker_plan::config::{ClinkerToml, CompileContext, parse_config};
 
 fn policy_with_lanes(
     ordinary: &str,
@@ -63,6 +70,281 @@ replacement = "[region]"
         .expect("telemetry policy parses")
         .resolve_observability(None)
         .expect("telemetry policy resolves")
+}
+
+fn transform_policy(
+    ordinary: &str,
+    high: &str,
+    arena: &str,
+    max_attribute: &str,
+    sample_every: u32,
+    rate_limit_per_second: u32,
+    rate_limit_burst: u32,
+) -> clinker_plan::config::ResolvedObservabilityPolicy {
+    let mut field_policy = String::new();
+    for event in [
+        "transform.starting",
+        "transform.completed",
+        "transform.customer_seen",
+        "transform.customer_failed",
+    ] {
+        for field in ["execution_id", "batch_id", "pipeline_name"] {
+            field_policy.push_str(&format!(
+                r#"
+[[observability.field_policy]]
+event = "{event}"
+field = "{field}"
+action = "allow"
+"#,
+            ));
+        }
+    }
+    field_policy.push_str(
+        r#"
+[[observability.field_policy]]
+event = "transform.customer_seen"
+field = "customer_id"
+action = "allow"
+
+[[observability.field_policy]]
+event = "transform.customer_seen"
+field = "email"
+action = "hash"
+
+[[observability.field_policy]]
+event = "transform.customer_seen"
+field = "region"
+action = "replace"
+replacement = "[region]"
+
+[[observability.field_policy]]
+event = "transform.customer_failed"
+field = "customer_id"
+action = "allow"
+"#,
+    );
+
+    let text = format!(
+        r#"
+[observability]
+arena_bytes = "{arena}"
+ordinary_lane_bytes = "{ordinary}"
+high_severity_lane_bytes = "{high}"
+max_batch_bytes = "512B"
+max_attributes_per_event = 8
+max_attribute_bytes = "{max_attribute}"
+drop_policy = "drop-newest"
+sample_every = {sample_every}
+rate_limit_per_second = {rate_limit_per_second}
+rate_limit_burst = {rate_limit_burst}
+flush_timeout_ms = 1000
+
+[observability.otlp]
+endpoint = "https://collector.invalid"
+connect_timeout_ms = 100
+request_timeout_ms = 200
+retry_max_attempts = 1
+retry_total_timeout_ms = 500
+max_response_bytes = "1KB"
+
+[observability.otlp.auth]
+mode = "none"
+
+[observability.lineage]
+queue_bytes = "1KB"
+max_event_bytes = "512B"
+drop_policy = "drop-newest"
+flush_timeout_ms = 500
+identity_mode = "local_diagnostic_paths"
+{field_policy}
+"#,
+    );
+    ClinkerToml::parse(&text)
+        .expect("transform telemetry policy parses")
+        .resolve_observability(None)
+        .expect("transform telemetry policy resolves")
+}
+
+const TRANSFORM_PIPELINE: &str = r#"
+pipeline:
+  name: transform_observability_runtime
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+  - type: source
+    name: customers
+    config:
+      name: customers
+      type: csv
+      path: customers.csv
+      schema:
+        - { name: customer_id, type: string }
+        - { name: amount, type: string }
+        - { name: email, type: string }
+        - { name: region, type: string }
+        - { name: secret, type: string }
+  - type: transform
+    name: observe_customers
+    input: customers
+    config:
+      cxl: |
+        emit customer_id = customer_id
+        emit amount = amount.to_int()
+        emit email = email
+        emit region = region
+      log:
+        - name: transform.starting
+          level: debug
+          when: before_transform
+          message: "Starting customer transform"
+        - name: transform.completed
+          level: info
+          when: after_transform
+          message: "Customer transform completed"
+        - name: transform.customer_seen
+          level: info
+          when: per_record
+          every: 1
+          message: "Customer observed"
+          fields: [customer_id, email, region, secret]
+        - name: transform.customer_failed
+          level: error
+          when: on_error
+          message: "Customer transform failed"
+          fields: [customer_id, secret]
+  - type: output
+    name: output
+    input: observe_customers
+    config:
+      name: output
+      type: csv
+      path: output.csv
+      include_unmapped: false
+"#;
+
+#[derive(Debug, Eq, PartialEq)]
+struct EtlSignature {
+    output: Vec<u8>,
+    counters: (u64, u64, u64, u64, u64, u64, String),
+    dlq: Vec<(u64, String, Option<String>, String)>,
+}
+
+struct TransformRun {
+    etl: EtlSignature,
+    batch: Option<TelemetryBatch>,
+    snapshot: Option<ArenaSnapshot>,
+}
+
+fn transform_csv(rows: usize) -> String {
+    let mut csv = String::from("customer_id,amount,email,region,secret\n");
+    for row in 1..=rows {
+        let amount = if row == 2 {
+            "not-an-integer".to_string()
+        } else {
+            row.to_string()
+        };
+        csv.push_str(&format!(
+            "customer-{row},{amount},customer-{row}@example.invalid,very-long-region-{row},secret-{row}\n"
+        ));
+    }
+    csv
+}
+
+fn run_transform_dispatch(
+    rows: usize,
+    policy: Option<&clinker_plan::config::ResolvedObservabilityPolicy>,
+) -> TransformRun {
+    let config = parse_config(TRANSFORM_PIPELINE).expect("transform telemetry fixture parses");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("transform telemetry fixture compiles");
+    let telemetry = policy.map(|policy| {
+        TelemetryArena::new(policy).expect("enabled transform telemetry policy creates arena")
+    });
+    let producer = telemetry.as_ref().map(|(producer, _)| producer.clone());
+
+    let readers: SourceReaders = HashMap::from([(
+        "customers".to_string(),
+        SourceInput::Files(vec![FileSlot::new(
+            PathBuf::from("customers.csv"),
+            Box::new(Cursor::new(transform_csv(rows))),
+        )]),
+    )]);
+    let output = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "output".to_string(),
+        Box::new(output.clone()) as Box<dyn Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "execution-123456789".to_string(),
+        batch_id: "batch-987654321".to_string(),
+        telemetry_producer: producer.clone(),
+        ..Default::default()
+    };
+    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect("recoverable transform error completes the run");
+
+    let etl = EtlSignature {
+        output: output.contents(),
+        counters: (
+            report.counters.total_count,
+            report.counters.ok_count,
+            report.counters.records_written,
+            report.counters.dlq_count,
+            report.counters.filtered_count,
+            report.counters.distinct_count,
+            format!("{:?}", report.counters.retraction),
+        ),
+        dlq: report
+            .dlq_entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.source_row.ordinal(),
+                    format!("{:?}", entry.category),
+                    entry.stage.clone(),
+                    entry.source_name.to_string(),
+                )
+            })
+            .collect(),
+    };
+    let batch = telemetry
+        .as_ref()
+        .and_then(|(_, receiver)| receiver.try_recv_batch());
+    let snapshot = producer.as_ref().map(|producer| producer.snapshot());
+    TransformRun {
+        etl,
+        batch,
+        snapshot,
+    }
+}
+
+fn log<'a>(logs: &'a [LogRecord], event: &str) -> &'a LogRecord {
+    logs.iter()
+        .find(|record| record.event == event)
+        .unwrap_or_else(|| panic!("missing structured event {event}: {logs:?}"))
+}
+
+fn assert_transform_span_pair(traces: &[TraceSpan]) {
+    let matching = traces
+        .iter()
+        .filter(|span| span.name == SpanName::Transform && span.logical_node == "observe_customers")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        2,
+        "one bounded start/end pair: {matching:?}"
+    );
+    assert_eq!(matching[0].phase, SpanPhase::Start);
+    assert_eq!(matching[0].status, SpanStatus::Unset);
+    assert_eq!(matching[1].phase, SpanPhase::End);
+    assert_eq!(
+        matching[1].status,
+        SpanStatus::Error,
+        "the recoverable record error is reflected without leaking its text"
+    );
 }
 
 #[test]
@@ -172,4 +454,145 @@ fn telemetry_arena_drop_newest_preserves_high_lane_and_exact_accounting() {
         "the high-severity fact crosses its reserved lane"
     );
     assert!(producer.snapshot().retained_bytes <= producer.snapshot().owned_bytes);
+}
+
+#[test]
+fn transform_dispatch_emits_typed_lifecycle_record_error_metrics_and_spans() {
+    let disabled = run_transform_dispatch(3, None);
+    let policy = transform_policy("4KB", "2KB", "6KB", "64B", 1, 10_000, 10_000);
+    let enabled = run_transform_dispatch(3, Some(&policy));
+
+    assert_eq!(
+        enabled.etl, disabled.etl,
+        "telemetry acceptance cannot alter output, counters, or DLQ decisions"
+    );
+    assert_eq!(enabled.etl.counters.0, 3);
+    assert_eq!(enabled.etl.counters.1, 2);
+    assert_eq!(enabled.etl.counters.2, 2);
+    assert_eq!(enabled.etl.counters.3, 1);
+    assert_eq!(enabled.etl.dlq.len(), 1);
+
+    let batch = enabled
+        .batch
+        .expect("typed transform telemetry is drainable");
+    let starting = log(batch.logs(), "transform.starting");
+    assert_eq!(starting.severity, Severity::Debug);
+    assert_eq!(starting.message, "Starting customer transform");
+    assert_eq!(
+        starting.fields.get("execution_id").map(String::as_str),
+        Some("execution-123456789")
+    );
+    assert_eq!(
+        starting.fields.get("batch_id").map(String::as_str),
+        Some("batch-987654321")
+    );
+    assert_eq!(
+        starting.fields.get("pipeline_name").map(String::as_str),
+        Some("transform_observability_runtime")
+    );
+
+    let completed = log(batch.logs(), "transform.completed");
+    assert_eq!(completed.severity, Severity::Info);
+    assert_eq!(completed.message, "Customer transform completed");
+
+    let seen = batch
+        .logs()
+        .iter()
+        .filter(|record| record.event == "transform.customer_seen")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        seen.len(),
+        3,
+        "per-record cadence every=1 fires once per row"
+    );
+    assert_eq!(
+        seen[0].fields.get("customer_id").map(String::as_str),
+        Some("customer-1")
+    );
+    assert!(
+        seen[0]
+            .fields
+            .get("email")
+            .is_some_and(|value| value.starts_with("blake3:"))
+    );
+    assert_eq!(
+        seen[0].fields.get("region").map(String::as_str),
+        Some("[region]")
+    );
+    assert!(!seen[0].fields.contains_key("secret"));
+
+    let failed = log(batch.logs(), "transform.customer_failed");
+    assert_eq!(failed.severity, Severity::Error);
+    assert_eq!(failed.message, "Customer transform failed");
+    assert_eq!(
+        failed.fields.get("customer_id").map(String::as_str),
+        Some("customer-2")
+    );
+    assert!(!failed.fields.contains_key("secret"));
+
+    let json = serde_json::to_string(&batch).expect("typed batch serializes");
+    assert!(
+        !json.contains("secret-"),
+        "denied record fields never cross the arena"
+    );
+    assert!(
+        !json.contains("not-an-integer"),
+        "raw evaluator errors never cross the arena"
+    );
+    assert!(
+        !json.contains("customers.csv"),
+        "source paths are not implicit attributes"
+    );
+
+    assert_eq!(batch.metric(MetricKey::TransformStarted), 1);
+    assert_eq!(batch.metric(MetricKey::TransformCompleted), 1);
+    assert_eq!(batch.metric(MetricKey::TransformRecords), 3);
+    assert_eq!(batch.metric(MetricKey::TransformErrors), 1);
+    assert_transform_span_pair(batch.traces());
+}
+
+#[test]
+fn transform_dispatch_loss_and_truncation_paths_preserve_etl_outcomes() {
+    let disabled = run_transform_dispatch(48, None);
+    let cases = [
+        (
+            "truncated",
+            transform_policy("8KB", "4KB", "12KB", "8B", 1, 100_000, 100_000),
+        ),
+        (
+            "sampled",
+            transform_policy("8KB", "4KB", "12KB", "64B", 7, 100_000, 100_000),
+        ),
+        (
+            "rate_limited",
+            transform_policy("8KB", "4KB", "12KB", "64B", 1, 1, 1),
+        ),
+        (
+            "full",
+            transform_policy("1KB", "1KB", "2KB", "64B", 1, 100_000, 100_000),
+        ),
+    ];
+
+    for (name, policy) in cases {
+        let enabled = run_transform_dispatch(48, Some(&policy));
+        assert_eq!(
+            enabled.etl, disabled.etl,
+            "{name} telemetry outcome cannot alter output, counters, or DLQ decisions"
+        );
+        let snapshot = enabled
+            .snapshot
+            .expect("enabled run has exact producer accounting");
+        assert!(snapshot.retained_bytes <= snapshot.owned_bytes, "{name}");
+        assert!(
+            snapshot.peak_retained_bytes <= snapshot.owned_bytes,
+            "{name}"
+        );
+        match name {
+            "truncated" => assert!(snapshot.truncated_fields > 0),
+            "sampled" => assert!(snapshot.sampled_drops > 0),
+            "rate_limited" => assert!(snapshot.rate_limited_drops > 0),
+            "full" => assert!(snapshot.full_drops > 0),
+            _ => unreachable!(),
+        }
+    }
 }
