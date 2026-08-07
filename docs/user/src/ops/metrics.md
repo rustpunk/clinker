@@ -290,6 +290,16 @@ expressed as an alias of either telemetry lane or the arena.
 
 ### Runtime ownership and failure isolation
 
+The deployment path keeps capability ownership narrow:
+
+| Boundary | Owned capability |
+|---|---|
+| Workspace plan/config | Secret-free raw endpoint text plus numeric, capacity, retry, and deadline bounds. |
+| Network | The sole endpoint admission, a private admitted-endpoint proof, fixed OTLP signal routes, and transport. |
+| Executor | The real log, metric, and trace producers plus the fixed-memory telemetry arena. |
+| Lineage | Canonical/catalog dataset identity, authorized subset and symlink facts, and independently bounded event delivery. |
+| CLI | Pre-effect composition, one immutable lifecycle-fact source, worker lifecycle, and separate typed delivery outcomes. |
+
 The workspace policy loader owns only the secret-free raw endpoint string.
 For an enabled run, the CLI's first capability transition calls the network
 crate's sole endpoint-admission API. That API accepts one HTTPS origin and
@@ -309,7 +319,9 @@ Phase 4 AUTH-01 credential applicator supplies that capability; the
 applicator will not be allowed to change the admitted origin or fixed routes.
 
 Logs, metrics, and traces share one finite telemetry arena and exporter worker,
-but retain distinct typed delivery outcomes and fixed aggregate counters. The
+but retain distinct typed per-signal delivery outcomes and fixed aggregate
+counters. Those producers are the executor's actual lifecycle, runtime, and
+terminal producers; the transport does not invent equivalent events. The
 OpenLineage worker has its own queue, byte cap, sink, deadline, counters, and
 typed outcome. Both paths copy the same batch ID, execution ID, semantic-plan
 algorithm/version/digest, and terminal facts from one immutable lifecycle
@@ -375,6 +387,14 @@ the complete `catalog_namespace`/`catalog_name` pair. Missing, duplicate,
 partial, and mixed bindings fail validation; Clinker does not synthesize an
 external identity from a working directory, worker path, temporary root, URL,
 attempt identifier, or path hash.
+
+The stable collection identity remains the dataset namespace/name. When the
+runtime has explicitly authorized a concrete logical partition or location,
+lineage represents it with the standard input/output subset facet rather than
+changing that collection name. Explicitly authorized aliases use the standard
+symlinks facet. The current resolved workspace config has no author-facing
+subset or symlink fields, so Clinker does not infer either fact from local
+paths, attempt directories, hashes, or process context.
 
 The only path-derived compatibility mode is the exact, explicit value below.
 It accepts no external dataset bindings and is for labeled local diagnostics,

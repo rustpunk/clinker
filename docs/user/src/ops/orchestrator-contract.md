@@ -107,12 +107,12 @@ partial terminal stream as set-wide success.
 4. Enforce a total Start-to-Close-style deadline for the whole process. A
    no-progress timeout is an additional explicit deployment policy, not a
    substitute for the overall deadline.
-5. On cancellation or deadline, request graceful termination, keep both pipes
-   draining, and wait a separately bounded cancellation grace period. If grace
-   expires, force termination. A forced stop is incomplete, not cancelled or
-   successful.
-6. Always wait for and reap the direct child, then join both drain tasks. Accept
-   an outcome only through the terminal, process-status, and artifact
+5. On cancellation or deadline, deliver the platform's real graceful signal to
+   the direct child, keep both pipes draining, and start a separately bounded
+   cancellation grace period. If grace expires, force termination exactly once.
+   A forced stop is incomplete, not cancelled or successful.
+6. Always wait for and reap the direct child before joining both drain tasks.
+   Accept an outcome only through the terminal, process-status, and artifact
    reconciliation table above.
 7. On retry, launch a completely fresh process from the beginning of the input
    with the same `batch_id`. Require a new `execution_id`; retain no Clinker
@@ -131,6 +131,16 @@ If publication wins first, later signals do not relabel or erase already
 complete visible artifacts; the bounded promotion finishes with `completed` or
 `failed` truth.
 
+The direct-child contract is exercised on Linux with a real SIGTERM rather
+than a closed control pipe or an in-process cancellation shortcut. The
+cooperative case verifies exit `130`, a matching `cancelled` terminal,
+unchanged final paths, and child reaping while both bounded drains remain live.
+The uncooperative case verifies that the grace interval is independent of the
+overall attempt deadline, force happens once only after that interval, the
+direct child is reaped before drain joining, and the attempt remains
+incomplete. Process groups and descendant ownership are deliberately outside
+that direct-child proof.
+
 The adapter owns the platform termination domain. On POSIX, an adapter that
 creates descendants may place them in a process group and signal that group. On
 Windows, such an adapter may use a Job Object, including kill-on-close policy.
@@ -145,6 +155,14 @@ child after graceful or forced termination.
 checkpoint, resume cursor, deduplication state, distributed transaction, or
 exactly-once guarantee. Safe application retry depends on stable input and the
 destination's chosen `if_exists` policy.
+
+Cancellation and forced termination preserve failed-attempt evidence under
+the configured [storage retention policy](storage.md#output-publication-and-retained-attempts).
+An incomplete attempt keeps its staging directory and manifest without changing
+pre-existing finals; the manifest's `eligible_after` timestamp, 24 hours by
+default, controls when ordinary cleanup may reclaim it. An immediate retry does
+not resume or mutate that directory: it starts a new attempt with a fresh
+`execution_id` and its own staging state.
 
 Progress is advisory liveness evidence, not a durable checkpoint or external
 heartbeat. Machine events are control evidence, not a secret-bearing event bus

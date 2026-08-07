@@ -15,7 +15,12 @@ There are two emission modes:
 - **`--lineage`** -- a *static, plan-derived* export. It compiles the plan and exits without reading data, so it runs instantly and describes the pipeline's lineage rather than a specific execution.
 - **`--lineage-events`** -- *live run-lifecycle* emission. It runs the pipeline and emits a `START` when the run begins and a terminal `COMPLETE` / `FAIL` / `ABORT` when it ends, carrying real timing and row counts. See [Live run events](#live-run-events) below.
 
-Both modes share the same column-lineage facet and the same on-the-wire OpenLineage shape; the live mode wraps it in real run-lifecycle events. Pushing those events to a live OpenLineage HTTP endpoint (a catalog such as Marquez) is a separate, planned transport and is not yet available.
+Both modes share the same column-lineage facet and the same on-the-wire
+OpenLineage shape; the live mode wraps it in real run-lifecycle events. In
+external identity mode, complete events can also cross the independently
+bounded delivery worker described below. That worker owns only the selected
+file or stdout sink; it does not share the OTLP Collector worker or its memory
+arena.
 
 ## Dataset identity preflight
 
@@ -68,6 +73,13 @@ The output is [NDJSON](https://github.com/ndjson/ndjson-spec) (one JSON object p
 - Correlation is copied from one immutable CLI lifecycle snapshot: `runId` is the generated execution ID, the clinker-defined **`clinker_batch`** run facet carries the caller/generated `batchId`, and the **`clinker_semanticPlan`** job facet carries the effective fingerprint algorithm, schema version, and digest. Static and live events do not independently mint or parse these identities.
 - **`job.namespace`** is `clinker`; **`job.name`** is the pipeline name. The pipeline's content hash rides in the `clinker_pipeline` job facet (`sourceHash`), not the job name -- so the name stays stable across edits while runs of the same definition remain correlatable.
 - **`inputs`** are the source datasets; **`outputs`** are the sink datasets. External mode uses the exact configured canonical or catalog identities, so relocating a pipeline does not change its lineage graph. Explicit `local_diagnostic_paths` compatibility mode instead uses the `file` namespace with resolved paths (and falls back to the `clinker` namespace plus the node name for a network source).
+- The dataset namespace/name identifies the stable collection. A concrete
+  logical partition or location is emitted as the standard role-specific
+  input/output subset facet, and an explicitly authorized alias is emitted as
+  the standard symlinks facet. Neither fact is inferred from worker paths,
+  attempt paths, hashes, or process context. The current workspace config has
+  no author-facing subset or symlink fields; only typed runtime context can
+  authorize them.
 - The `columnLineage` facet is attached to each **output** dataset on the `COMPLETE` event.
 
 ## Reading the `columnLineage` facet
@@ -150,6 +162,11 @@ waits no longer than `lineage.flush_timeout_ms`. Its typed outcome distinguishes
 normal shutdown, write failure (including permission errors), flush failure,
 and deadline expiry, with accepted, dropped, and full counters reported
 separately. It has no access to the telemetry arena or Collector worker.
+
+This external worker is not a second identity mode and does not make local
+paths suitable as catalog identity. The explicit `local_diagnostic_paths`
+mode remains a synchronous compatibility path for local file or console
+inspection and cannot enter the external delivery worker.
 
 Lineage uses logical dataset bindings, not working-directory or attempt paths.
 It copies the batch ID, execution ID, semantic fingerprint, and terminal facts
