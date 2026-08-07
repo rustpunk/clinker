@@ -120,40 +120,60 @@ type DispatchMismatchProbe =
 struct DispatchMismatchCase {
     dispatcher: &'static str,
     expected_kind: &'static str,
+    actual_kind: &'static str,
+    node_name: &'static str,
     invoke: DispatchMismatchProbe,
 }
 
 #[test]
-fn aggregate_and_source_dispatch_mismatches_are_typed() {
+fn transform_and_composition_complete_record_dispatcher_mismatch_matrix() {
     let plan = load_config_from_str(PIPELINE_YAML)
         .expect("parse pipeline")
         .compile(&CompileContext::default())
         .expect("compile pipeline");
     let dag = plan.dag();
-    let (node_idx, node) = dag
-        .graph
-        .node_indices()
-        .map(|idx| (idx, &dag.graph[idx]))
-        .find(|(_, node)| node.name() == "rename")
-        .expect("compiled transform exists");
     let cases = [
         DispatchMismatchCase {
             dispatcher: "dispatch_aggregation",
             expected_kind: "aggregation",
+            actual_kind: "transform",
+            node_name: "rename",
             invoke: DispatchFaultGuard::dispatch_aggregation_mismatch_for_testing,
         },
         DispatchMismatchCase {
             dispatcher: "dispatch_source",
             expected_kind: "source",
+            actual_kind: "transform",
+            node_name: "rename",
             invoke: DispatchFaultGuard::dispatch_source_mismatch_for_testing,
+        },
+        DispatchMismatchCase {
+            dispatcher: "dispatch_transform",
+            expected_kind: "transform",
+            actual_kind: "source",
+            node_name: "src",
+            invoke: DispatchFaultGuard::dispatch_transform_mismatch_for_testing,
+        },
+        DispatchMismatchCase {
+            dispatcher: "dispatch_composition",
+            expected_kind: "composition",
+            actual_kind: "source",
+            node_name: "src",
+            invoke: DispatchFaultGuard::dispatch_composition_mismatch_for_testing,
         },
     ];
 
     for case in cases {
+        let (node_idx, node) = dag
+            .graph
+            .node_indices()
+            .map(|idx| (idx, &dag.graph[idx]))
+            .find(|(_, node)| node.name() == case.node_name)
+            .unwrap_or_else(|| panic!("compiled {} exists", case.node_name));
         let returned = catch_unwind(AssertUnwindSafe(|| (case.invoke)(dag, node_idx, node)))
             .unwrap_or_else(|_| panic!("{} mismatch must return", case.dispatcher));
         let error = match returned {
-            Ok(()) => panic!("{} must reject a transform", case.dispatcher),
+            Ok(()) => panic!("{} must reject a {}", case.dispatcher, case.actual_kind),
             Err(error) => error,
         };
         let PipelineError::DispatchMismatch {
@@ -167,8 +187,8 @@ fn aggregate_and_source_dispatch_mismatches_are_typed() {
         };
         assert_eq!(*dispatcher, case.dispatcher);
         assert_eq!(*expected_kind, case.expected_kind);
-        assert_eq!(*actual_kind, "transform");
-        assert_eq!(node, "rename");
+        assert_eq!(*actual_kind, case.actual_kind);
+        assert_eq!(node, case.node_name);
 
         let classification = error
             .failure_classification()
