@@ -655,6 +655,12 @@ fn invoke_fault_matrix(
             )
         });
     terminal["execution_id"] = Value::String("<run-local-execution-id>".to_owned());
+    // The stream counter advances with however many observability events precede
+    // the terminal, and a delivery fault can emit one more than a clean run. That
+    // is stream position, not ETL truth, so it is normalized out of the authority
+    // oracle exactly like the run-local execution id. Sequence numbering itself is
+    // covered by the machine-protocol contract test, which asserts seq == index.
+    terminal["seq"] = Value::String("<stream-local-seq>".to_owned());
     let publication_inventory = events
         .iter()
         .filter(|event| event["event"] == "publication_artifacts")
