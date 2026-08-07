@@ -130,13 +130,12 @@ where
             node.name(),
         ));
     };
-    let ctx = match ctx.into() {
-        AggregateDispatchContext::Live(ctx) => ctx,
-        #[cfg(feature = "test-utils")]
-        AggregateDispatchContext::Inert => {
-            panic!("aggregate dispatcher accessed inert context after accepting an aggregate node")
-        }
+    #[cfg(feature = "test-utils")]
+    let AggregateDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("aggregate dispatcher accessed inert context after accepting an aggregate node")
     };
+    #[cfg(not(feature = "test-utils"))]
+    let AggregateDispatchContext::Live(ctx) = ctx.into();
     let spec = AggregateSpec {
         name: name.as_str(),
         typed,

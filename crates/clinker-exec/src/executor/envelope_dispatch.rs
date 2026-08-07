@@ -155,13 +155,12 @@ where
             node.name(),
         ));
     };
-    let ctx = match ctx.into() {
-        EnvelopeDispatchContext::Live(ctx) => ctx,
-        #[cfg(feature = "test-utils")]
-        EnvelopeDispatchContext::Inert => {
-            panic!("envelope dispatcher accessed inert context after accepting an envelope node")
-        }
+    #[cfg(feature = "test-utils")]
+    let EnvelopeDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("envelope dispatcher accessed inert context after accepting an envelope node")
     };
+    #[cfg(not(feature = "test-utils"))]
+    let EnvelopeDispatchContext::Live(ctx) = ctx.into();
 
     // Resolve the body predecessor. With no wired header the Envelope has a
     // single incoming neighbor (the body). With a wired header it has two — the

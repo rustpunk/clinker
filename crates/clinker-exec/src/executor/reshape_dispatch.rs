@@ -229,13 +229,12 @@ where
             node.name(),
         ));
     };
-    let ctx = match ctx.into() {
-        ReshapeDispatchContext::Live(ctx) => ctx,
-        #[cfg(feature = "test-utils")]
-        ReshapeDispatchContext::Inert => {
-            panic!("reshape dispatcher accessed inert context after accepting a reshape node")
-        }
+    #[cfg(feature = "test-utils")]
+    let ReshapeDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("reshape dispatcher accessed inert context after accepting a reshape node")
     };
+    #[cfg(not(feature = "test-utils"))]
+    let ReshapeDispatchContext::Live(ctx) = ctx.into();
 
     let pred = single_predecessor(current_dag, node_idx, "reshape", name)?;
     let producer_port = current_dag

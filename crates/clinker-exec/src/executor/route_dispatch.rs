@@ -97,13 +97,12 @@ where
             node.name(),
         ));
     };
-    let ctx = match ctx.into() {
-        RouteDispatchContext::Live(ctx) => ctx,
-        #[cfg(any(test, feature = "test-utils"))]
-        RouteDispatchContext::Inert => {
-            panic!("route dispatcher accessed inert context after accepting a route node")
-        }
+    #[cfg(any(test, feature = "test-utils"))]
+    let RouteDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("route dispatcher accessed inert context after accepting a route node")
     };
+    #[cfg(not(any(test, feature = "test-utils")))]
+    let RouteDispatchContext::Live(ctx) = ctx.into();
     // Body-context Routes that consume an input port have no
     // predecessor in the body's mini-DAG — the records are
     // seeded into this node's own buffer at composition entry.

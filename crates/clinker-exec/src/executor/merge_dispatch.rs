@@ -88,13 +88,12 @@ where
             node.name(),
         ));
     };
-    let ctx = match ctx.into() {
-        MergeDispatchContext::Live(ctx) => ctx,
-        #[cfg(feature = "test-utils")]
-        MergeDispatchContext::Inert => {
-            panic!("merge dispatcher accessed inert context after accepting a merge node")
-        }
+    #[cfg(feature = "test-utils")]
+    let MergeDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("merge dispatcher accessed inert context after accepting a merge node")
     };
+    #[cfg(not(feature = "test-utils"))]
+    let MergeDispatchContext::Live(ctx) = ctx.into();
     let advertised_promise = match (mode, interleave_seed) {
         (clinker_plan::config::MergeMode::Concat, _)
         | (clinker_plan::config::MergeMode::Interleave, Some(_)) => {

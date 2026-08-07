@@ -88,13 +88,12 @@ where
             node.name(),
         ));
     };
-    let ctx = match ctx.into() {
-        TransformDispatchContext::Live(ctx) => ctx,
-        #[cfg(feature = "test-utils")]
-        TransformDispatchContext::Inert => {
-            panic!("transform dispatcher accessed inert context after accepting a transform node")
-        }
+    #[cfg(feature = "test-utils")]
+    let TransformDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("transform dispatcher accessed inert context after accepting a transform node")
     };
+    #[cfg(not(feature = "test-utils"))]
+    let TransformDispatchContext::Live(ctx) = ctx.into();
     // Streaming-fused path: when the pre-pass has flagged this
     // Transform as eligible (sole upstream is a Source whose
     // receiver lives in `ctx.source_records`, non-windowed,

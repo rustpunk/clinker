@@ -396,11 +396,17 @@ fn valid_logical_subset(value: &str) -> bool {
         return false;
     }
     let lower = value.to_ascii_lowercase();
-    !lower.starts_with("worker-")
-        && !lower.starts_with("attempt-")
-        && !lower.starts_with(".clinker-attempts/")
-        && !(value.len() >= 3
-            && value.as_bytes()[0].is_ascii_alphabetic()
-            && value.as_bytes()[1] == b':'
-            && matches!(value.as_bytes()[2], b'/' | b'\\'))
+    if lower.starts_with("worker-")
+        || lower.starts_with("attempt-")
+        || lower.starts_with(".clinker-attempts/")
+    {
+        return false;
+    }
+    // A `C:/` or `C:\` prefix is a worker-local absolute path, never a logical
+    // subset identity.
+    let drive_prefixed = value.len() >= 3
+        && value.as_bytes()[0].is_ascii_alphabetic()
+        && value.as_bytes()[1] == b':'
+        && matches!(value.as_bytes()[2], b'/' | b'\\');
+    !drive_prefixed
 }

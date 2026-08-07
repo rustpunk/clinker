@@ -216,7 +216,7 @@ pub struct TelemetryArena;
 impl TelemetryArena {
     /// Reserve the complete arena and return its clonable producer plus sole
     /// bounded receiver.
-    pub fn new(
+    pub fn reserve(
         policy: &ResolvedObservabilityPolicy,
     ) -> Result<(TelemetryProducer, TelemetryReceiver), TelemetryArenaError> {
         if !policy.is_enabled() {
@@ -282,7 +282,7 @@ impl TelemetryArena {
         policy: &ResolvedObservabilityPolicy,
     ) -> Result<Option<(TelemetryProducer, TelemetryReceiver)>, TelemetryArenaError> {
         if policy.is_enabled() {
-            Self::new(policy).map(Some)
+            Self::reserve(policy).map(Some)
         } else {
             Ok(None)
         }

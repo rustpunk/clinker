@@ -89,15 +89,12 @@ where
             node.name(),
         ));
     };
-    let ctx = match ctx.into() {
-        CompositionDispatchContext::Live(ctx) => ctx,
-        #[cfg(feature = "test-utils")]
-        CompositionDispatchContext::Inert => {
-            panic!(
-                "composition dispatcher accessed inert context after accepting a composition node"
-            )
-        }
+    #[cfg(feature = "test-utils")]
+    let CompositionDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("composition dispatcher accessed inert context after accepting a composition node")
     };
+    #[cfg(not(feature = "test-utils"))]
+    let CompositionDispatchContext::Live(ctx) = ctx.into();
     // Recursive body execution: collect parent-scope records
     // per declared input port, swap `current_dag` to the body's
     // mini-DAG, walk the body's topo, then collect the body's

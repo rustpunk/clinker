@@ -262,7 +262,7 @@ fn run_transform_dispatch(
         .compile(&CompileContext::default())
         .expect("transform telemetry fixture compiles");
     let telemetry = policy.map(|policy| {
-        TelemetryArena::new(policy).expect("enabled transform telemetry policy creates arena")
+        TelemetryArena::reserve(policy).expect("enabled transform telemetry policy creates arena")
     });
     let producer = telemetry.as_ref().map(|(producer, _)| producer.clone());
 
@@ -351,7 +351,8 @@ fn assert_transform_span_pair(traces: &[TraceSpan]) {
 #[test]
 fn telemetry_arena_admits_private_three_signal_batch() {
     let policy = policy_with_lanes("3KB", "1KB", "4KB");
-    let (producer, receiver) = TelemetryArena::new(&policy).expect("enabled policy creates arena");
+    let (producer, receiver) =
+        TelemetryArena::reserve(&policy).expect("enabled policy creates arena");
 
     let log = LogEvent {
         event: "transform.customer_seen",
@@ -409,7 +410,8 @@ fn telemetry_arena_admits_private_three_signal_batch() {
 #[test]
 fn telemetry_arena_drop_newest_preserves_high_lane_and_exact_accounting() {
     let policy = policy_with_lanes("1KB", "1KB", "2KB");
-    let (producer, receiver) = TelemetryArena::new(&policy).expect("enabled policy creates arena");
+    let (producer, receiver) =
+        TelemetryArena::reserve(&policy).expect("enabled policy creates arena");
 
     let ordinary = LogEvent {
         event: "transform.customer_seen",
@@ -460,7 +462,8 @@ fn telemetry_arena_drop_newest_preserves_high_lane_and_exact_accounting() {
 #[test]
 fn telemetry_arena_bounds_typed_record_values_before_serialization() {
     let policy = policy_with_lanes("3KB", "1KB", "4KB");
-    let (producer, receiver) = TelemetryArena::new(&policy).expect("enabled policy creates arena");
+    let (producer, receiver) =
+        TelemetryArena::reserve(&policy).expect("enabled policy creates arena");
     let value = Value::Array((0..1_000).map(Value::Integer).collect());
 
     assert!(

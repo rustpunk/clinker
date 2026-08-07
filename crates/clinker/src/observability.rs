@@ -166,7 +166,7 @@ impl OtlpRuntimeBundle {
         if supplied != self.arena {
             return Err(ObservabilityRuntimeError::Worker);
         }
-        TelemetryArena::new(policy).map_err(ObservabilityRuntimeError::Arena)
+        TelemetryArena::reserve(policy).map_err(ObservabilityRuntimeError::Arena)
     }
 }
 

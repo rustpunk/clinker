@@ -680,7 +680,7 @@ impl ObservabilityConfigError {
         let offset = error.span().map_or(text.len(), |span| span.start);
         let (table, line) = authored_location(text, offset);
         let key = key_on_line(line);
-        let field = match (table.as_str(), key.as_deref()) {
+        let field = match (table.as_str(), key) {
             ("observability.otlp.auth", Some(key)) => {
                 format!("observability.otlp.auth.{key}")
             }
@@ -697,7 +697,7 @@ impl ObservabilityConfigError {
             _ => "observability".to_owned(),
         };
 
-        let correction = parse_correction(&field, key.as_deref());
+        let correction = parse_correction(&field, key);
         Self::invalid(
             field,
             "has an unknown, missing, or malformed value in the strict observability policy",

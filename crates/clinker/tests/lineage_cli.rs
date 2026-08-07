@@ -288,7 +288,7 @@ fn machine_terminal(output: &std::process::Output) -> serde_json::Value {
             .stdout
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
-            .last()
+            .next_back()
             .expect("machine terminal event"),
     )
     .expect("machine terminal is JSON")

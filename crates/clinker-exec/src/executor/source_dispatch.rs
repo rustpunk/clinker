@@ -79,13 +79,12 @@ where
             node.name(),
         ));
     };
-    let ctx = match ctx.into() {
-        SourceDispatchContext::Live(ctx) => ctx,
-        #[cfg(feature = "test-utils")]
-        SourceDispatchContext::Inert => {
-            panic!("source dispatcher accessed inert context after accepting a source node")
-        }
+    #[cfg(feature = "test-utils")]
+    let SourceDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("source dispatcher accessed inert context after accepting a source node")
     };
+    #[cfg(not(feature = "test-utils"))]
+    let SourceDispatchContext::Live(ctx) = ctx.into();
     // Three input paths feed a Source's emit:
     //
     // 1. Records already seeded into `ctx.node_buffers[node_idx]`

@@ -58,8 +58,8 @@ fn canonical_catalog_subset_and_symlinks() {
     let source = context
         .require("source_customers")
         .expect("source identity is present");
-    assert_eq!(source.subsets(), &[subset.clone()]);
-    assert_eq!(source.symlinks(), &[alias.clone()]);
+    assert_eq!(source.subsets(), std::slice::from_ref(&subset));
+    assert_eq!(source.symlinks(), std::slice::from_ref(&alias));
 
     let compiled = parse_config(
         r#"
@@ -95,8 +95,8 @@ nodes:
         .input_identity_facets
         .get(source.dataset_id())
         .expect("authorized input facts follow the stable dataset");
-    assert_eq!(input_facets.subsets(), &[subset.clone()]);
-    assert_eq!(input_facets.symlinks(), &[alias.clone()]);
+    assert_eq!(input_facets.subsets(), std::slice::from_ref(&subset));
+    assert_eq!(input_facets.symlinks(), std::slice::from_ref(&alias));
     assert!(lineage.outputs[0].identity_facets.symlinks().is_empty());
 
     let relocated = LineageIdentityContext::external([
@@ -266,7 +266,7 @@ nodes:
             "type": "LOCATION"
         }])
     );
-    assert!(complete.to_string().find("/worker-a/").is_none());
+    assert!(!complete.to_string().contains("/worker-a/"));
 
     let relocated = parse_config(
         r#"

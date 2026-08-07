@@ -207,13 +207,12 @@ where
             node.name(),
         ));
     };
-    let ctx = match ctx.into() {
-        CullDispatchContext::Live(ctx) => ctx,
-        #[cfg(feature = "test-utils")]
-        CullDispatchContext::Inert => {
-            panic!("cull dispatcher accessed inert context after accepting a cull node")
-        }
+    #[cfg(feature = "test-utils")]
+    let CullDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("cull dispatcher accessed inert context after accepting a cull node")
     };
+    #[cfg(not(feature = "test-utils"))]
+    let CullDispatchContext::Live(ctx) = ctx.into();
 
     let pred = single_predecessor(current_dag, node_idx, "cull", name)?;
     let producer_port = current_dag

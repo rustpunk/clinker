@@ -111,13 +111,12 @@ where
             node.name(),
         ));
     };
-    let ctx = match ctx.into() {
-        SortDispatchContext::Live(ctx) => ctx,
-        #[cfg(feature = "test-utils")]
-        SortDispatchContext::Inert => {
-            panic!("sort dispatcher accessed inert context after accepting a sort node")
-        }
+    #[cfg(feature = "test-utils")]
+    let SortDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("sort dispatcher accessed inert context after accepting a sort node")
     };
+    #[cfg(not(feature = "test-utils"))]
+    let SortDispatchContext::Live(ctx) = ctx.into();
     // Enforcer-sort dispatch. Carries `row_num` through
     // the sort permutation as the `SortBuffer<SourceRowId>`
     // payload — the Record itself carries every field

@@ -331,13 +331,12 @@ where
             node.name(),
         ));
     };
-    let ctx = match ctx.into() {
-        OutputDispatchContext::Live(ctx) => ctx,
-        #[cfg(feature = "test-utils")]
-        OutputDispatchContext::Inert => {
-            panic!("output dispatcher accessed inert context after accepting an output node")
-        }
+    #[cfg(feature = "test-utils")]
+    let OutputDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("output dispatcher accessed inert context after accepting an output node")
     };
+    #[cfg(not(feature = "test-utils"))]
+    let OutputDispatchContext::Live(ctx) = ctx.into();
     let output_id = node.id();
     // Streaming-Output short-circuit (issue #72). The executor
     // entry already moved this Output's writer into a

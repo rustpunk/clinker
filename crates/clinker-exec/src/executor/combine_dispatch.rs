@@ -118,13 +118,12 @@ where
             node.name(),
         ));
     };
-    let ctx = match ctx.into() {
-        CombineDispatchContext::Live(ctx) => ctx,
-        #[cfg(feature = "test-utils")]
-        CombineDispatchContext::Inert => {
-            panic!("combine dispatcher accessed inert context after accepting a combine node")
-        }
+    #[cfg(feature = "test-utils")]
+    let CombineDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("combine dispatcher accessed inert context after accepting a combine node")
     };
+    #[cfg(not(feature = "test-utils"))]
+    let CombineDispatchContext::Live(ctx) = ctx.into();
     assert_order_contract(
         current_dag.order_contract(),
         node,

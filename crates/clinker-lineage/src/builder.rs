@@ -230,6 +230,13 @@ fn build_column_lineage(
     })
 }
 
+/// Per-node DIRECT terminal and INDIRECT influence maps produced by one scope
+/// walk. A caller harvesting a composition body's output ports needs both.
+type ScopeWalkMaps = (
+    HashMap<PlanNodeId, ColumnTerminals>,
+    HashMap<PlanNodeId, InfluenceMap>,
+);
+
 /// Walk one DAG scope — the top-level pipeline or a composition body — in
 /// topological order, accumulating each node's DIRECT terminals and INDIRECT
 /// influence, and recording every Output sink into `output_acc`. Source datasets
@@ -252,13 +259,7 @@ fn walk_scope(
     seed: ScopeSeed,
     declared_sections: &HashMap<DatasetId, BTreeSet<String>>,
     sink: &mut ScopeSink,
-) -> Result<
-    (
-        HashMap<PlanNodeId, ColumnTerminals>,
-        HashMap<PlanNodeId, InfluenceMap>,
-    ),
-    LineageIdentityError,
-> {
+) -> Result<ScopeWalkMaps, LineageIdentityError> {
     // Pre-seeded nodes keep their injected terminals/influence/doc-sources and are
     // not recomputed by the walk. Derived before the seeds move into the working
     // maps.
