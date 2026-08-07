@@ -2,9 +2,30 @@ use clinker_lineage::logical_identity::{
     DatasetIdentifierType, DatasetSubset, ExternalDatasetIdentity, LineageIdentityContext,
     LineageIdentityError, LineageNodeBinding, SymlinkIdentifier,
 };
-use clinker_lineage::{Job, column_lineage_external, run_events};
+use clinker_lineage::{
+    Job, RunLifecycleFacts, RunLifecycleStartFacts, RunLifecycleTerminalFacts, RunStats, Terminal,
+    column_lineage_external, run_events,
+};
 use clinker_plan::CompileContext;
 use clinker_plan::config::parse_config;
+
+fn lifecycle_facts() -> RunLifecycleFacts {
+    RunLifecycleFacts {
+        start: RunLifecycleStartFacts {
+            batch_id: "catalog-export".to_owned(),
+            execution_id: "019c8e3e-7029-75a0-bc68-b60c36b7ef42".to_owned(),
+            plan_fingerprint_algorithm: "blake3".to_owned(),
+            plan_fingerprint_version: 1,
+            plan_fingerprint_digest: "00".repeat(32),
+            event_time: "2026-08-06T12:00:00Z".to_owned(),
+        },
+        terminal: RunLifecycleTerminalFacts {
+            event_time: "2026-08-06T12:00:00Z".to_owned(),
+            outcome: Terminal::Complete,
+            stats: RunStats::default(),
+        },
+    }
+}
 
 #[test]
 fn canonical_catalog_subset_and_symlinks() {
@@ -187,9 +208,8 @@ nodes:
     let lineage = column_lineage_external(&compiled, &identities).unwrap();
     let events = run_events(
         &lineage,
-        "019c8e3e-7029-75a0-bc68-b60c36b7ef42",
         Job::for_pipeline("serialized_identity", "00".repeat(32)),
-        "2026-08-06T12:00:00Z",
+        &lifecycle_facts(),
     );
     let complete = serde_json::to_value(&events[1]).expect("serialize COMPLETE event");
 
@@ -274,9 +294,8 @@ nodes:
     let relocated = column_lineage_external(&relocated, &identities).unwrap();
     let relocated_events = run_events(
         &relocated,
-        "019c8e3e-7029-75a0-bc68-b60c36b7ef42",
         Job::for_pipeline("serialized_identity", "00".repeat(32)),
-        "2026-08-06T12:00:00Z",
+        &lifecycle_facts(),
     );
     assert_eq!(
         serde_json::to_value(&events).unwrap(),

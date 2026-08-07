@@ -204,6 +204,52 @@ impl PipelineJobFacet {
     }
 }
 
+/// Versioned effective semantic fingerprint carried by the lineage job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticPlanJobFacet {
+    #[serde(rename = "_producer")]
+    pub producer: String,
+    #[serde(rename = "_schemaURL")]
+    pub schema_url: String,
+    pub algorithm: String,
+    #[serde(rename = "semanticSchemaVersion")]
+    pub semantic_schema_version: u32,
+    pub digest: String,
+}
+
+impl SemanticPlanJobFacet {
+    pub fn new(algorithm: impl Into<String>, version: u32, digest: impl Into<String>) -> Self {
+        Self {
+            producer: super::PRODUCER.to_string(),
+            schema_url: super::CLINKER_SEMANTIC_PLAN_FACET_SCHEMA_URL.to_string(),
+            algorithm: algorithm.into(),
+            semantic_schema_version: version,
+            digest: digest.into(),
+        }
+    }
+}
+
+/// Caller-owned batch correlation carried unchanged on every run event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchRunFacet {
+    #[serde(rename = "_producer")]
+    pub producer: String,
+    #[serde(rename = "_schemaURL")]
+    pub schema_url: String,
+    #[serde(rename = "batchId")]
+    pub batch_id: String,
+}
+
+impl BatchRunFacet {
+    pub fn new(batch_id: impl Into<String>) -> Self {
+        Self {
+            producer: super::PRODUCER.to_string(),
+            schema_url: super::CLINKER_BATCH_FACET_SCHEMA_URL.to_string(),
+            batch_id: batch_id.into(),
+        }
+    }
+}
+
 /// The standard OpenLineage error-message run facet.
 ///
 /// Attached to a `FAIL` [`RunEvent`](super::event::RunEvent)'s

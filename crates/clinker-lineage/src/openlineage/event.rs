@@ -3,8 +3,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::facet::{
-    ColumnLineageDatasetFacet, DatasetSubsetFacet, ErrorMessageRunFacet, PipelineJobFacet,
-    RunStatsFacet, SymlinksDatasetFacet,
+    BatchRunFacet, ClinkerFailureRunFacet, ColumnLineageDatasetFacet, DatasetSubsetFacet,
+    ErrorMessageRunFacet, PipelineJobFacet, RunStatsFacet, SemanticPlanJobFacet,
+    SymlinksDatasetFacet,
 };
 
 /// A single OpenLineage run-state event.
@@ -71,17 +72,23 @@ impl Run {
 
 /// The facet bundle attached to a [`Run`].
 ///
-/// `clinker_runStats` is a producer-defined facet carrying whole-run record
-/// counts and timing; `errorMessage` is the standard OpenLineage failure facet,
-/// present only on a `FAIL` event.
+/// `clinker_batch` carries shared immutable batch correlation,
+/// `clinker_runStats` carries whole-run counts and timing, and failures carry
+/// both the standard `errorMessage` and sanitized `clinker_failure` facets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RunFacets {
+    /// Shared immutable caller batch ID for this admitted run.
+    #[serde(rename = "clinker_batch", skip_serializing_if = "Option::is_none")]
+    pub clinker_batch: Option<BatchRunFacet>,
     /// Clinker run-statistics facet (producer-defined).
     #[serde(rename = "clinker_runStats", skip_serializing_if = "Option::is_none")]
     pub run_stats: Option<RunStatsFacet>,
     /// Standard OpenLineage error-message facet, on a `FAIL` event only.
     #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
     pub error_message: Option<ErrorMessageRunFacet>,
+    /// Sanitized stable failure classification, on a `FAIL` event only.
+    #[serde(rename = "clinker_failure", skip_serializing_if = "Option::is_none")]
+    pub clinker_failure: Option<ClinkerFailureRunFacet>,
 }
 
 /// The job (pipeline) a [`Run`] is an execution of.
@@ -106,17 +113,24 @@ impl Job {
             name: name.into(),
             facets: Some(JobFacets {
                 clinker_pipeline: Some(PipelineJobFacet::new(source_hash)),
+                clinker_semantic_plan: None,
             }),
         }
     }
 }
 
 /// The facet bundle attached to a [`Job`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobFacets {
     /// Clinker pipeline-source fingerprint facet (producer-defined).
     #[serde(rename = "clinker_pipeline", skip_serializing_if = "Option::is_none")]
     pub clinker_pipeline: Option<PipelineJobFacet>,
+    /// Effective semantic-plan fingerprint supplied by the shared lifecycle.
+    #[serde(
+        rename = "clinker_semanticPlan",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub clinker_semantic_plan: Option<SemanticPlanJobFacet>,
 }
 
 /// An input or output dataset referenced by a run event.
@@ -291,6 +305,7 @@ mod tests {
                 schema_url: CLINKER_PIPELINE_FACET_SCHEMA_URL.to_string(),
                 source_hash: "deadbeef".to_string(),
             }),
+            ..JobFacets::default()
         });
         let v = serde_json::to_value(&event).unwrap();
         let facet = &v["job"]["facets"]["clinker_pipeline"];
@@ -310,6 +325,7 @@ mod tests {
         event.run.facets = Some(RunFacets {
             run_stats: Some(RunStatsFacet::new(100, 97, 3, 1234)),
             error_message: Some(ErrorMessageRunFacet::new("source read failed")),
+            ..RunFacets::default()
         });
         let v = serde_json::to_value(&event).unwrap();
         // Run facets nest under `run.facets` with the spec-cased keys.

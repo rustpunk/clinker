@@ -9,9 +9,10 @@ mod ndjson;
 
 pub use event::{Dataset, DatasetFacets, EventType, Job, JobFacets, Run, RunEvent, RunFacets};
 pub use facet::{
-    ClinkerFailureRunFacet, ColumnLineageDatasetFacet, DatasetSubsetFacet, ErrorMessageRunFacet,
-    FieldLineage, InputField, LocationSubsetCondition, PipelineJobFacet, RunStatsFacet,
-    SymlinksDatasetFacet, Transformation, TransformationSubtype, TransformationType,
+    BatchRunFacet, ClinkerFailureRunFacet, ColumnLineageDatasetFacet, DatasetSubsetFacet,
+    ErrorMessageRunFacet, FieldLineage, InputField, LocationSubsetCondition, PipelineJobFacet,
+    RunStatsFacet, SemanticPlanJobFacet, SymlinksDatasetFacet, Transformation,
+    TransformationSubtype, TransformationType,
 };
 pub use ndjson::write_ndjson;
 
@@ -53,6 +54,14 @@ pub const ERROR_MESSAGE_FACET_SCHEMA_URL: &str =
 /// Schema URL for the clinker-owned sanitized failure-classification facet.
 pub const CLINKER_FAILURE_FACET_SCHEMA_URL: &str =
     "https://github.com/rustpunk/clinker/spec/facets/v1/ClinkerFailureRunFacet.json";
+
+/// Schema URL for caller-owned batch correlation.
+pub const CLINKER_BATCH_FACET_SCHEMA_URL: &str =
+    "https://github.com/rustpunk/clinker/spec/facets/v1/BatchRunFacet.json";
+
+/// Schema URL for the effective semantic-plan fingerprint.
+pub const CLINKER_SEMANTIC_PLAN_FACET_SCHEMA_URL: &str =
+    "https://github.com/rustpunk/clinker/spec/facets/v1/SemanticPlanJobFacet.json";
 
 /// Schema URL for the clinker-specific run-statistics run facet (the facet-level
 /// `_schemaURL`). OpenLineage has no standard run-level record-count facet, so —

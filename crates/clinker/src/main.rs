@@ -10,9 +10,14 @@ use clinker_exec::metrics::{self, ExecutionMetrics};
 use clinker_plan::config::utils::parse_memory_limit_bytes_strict;
 use clinker_plan::error::PipelineError;
 
+mod lifecycle;
 mod machine;
 mod refactor;
 
+use lifecycle::{
+    LifecycleFactsError, RunCountFacts, RunLifecycleFacts, RunLifecycleSnapshot,
+    RunLifecycleStartFacts, RunTerminalOutcome,
+};
 use machine::MachineEmitter;
 
 /// Bounded-memory batch ETL engine for CXL pipelines.
@@ -1690,6 +1695,93 @@ fn build_cli_lineage(
     }
 }
 
+struct LiveLineageOutput {
+    writer: Box<dyn std::io::Write>,
+    lineage: clinker_lineage::PlanColumnLineage,
+    job: clinker_lineage::Job,
+}
+
+impl LiveLineageOutput {
+    fn emit_start(&mut self, start: &RunLifecycleStartFacts) -> std::io::Result<()> {
+        let facts = lineage_start_facts(start);
+        let event = clinker_lineage::start_event(&self.lineage, self.job.clone(), &facts);
+        clinker_lineage::write_ndjson(std::slice::from_ref(&event), &mut self.writer)
+    }
+
+    fn emit_terminal(&mut self, snapshot: &RunLifecycleSnapshot) -> Result<(), PipelineError> {
+        let facts = lineage_lifecycle_facts(snapshot)?;
+        let event = clinker_lineage::terminal_event(&self.lineage, self.job.clone(), &facts);
+        clinker_lineage::write_ndjson(std::slice::from_ref(&event), &mut self.writer)
+            .map_err(PipelineError::Io)
+    }
+}
+
+fn lineage_start_facts(start: &RunLifecycleStartFacts) -> clinker_lineage::RunLifecycleStartFacts {
+    let fingerprint = start.fingerprint();
+    clinker_lineage::RunLifecycleStartFacts {
+        batch_id: start.batch_id().to_owned(),
+        execution_id: start.execution_id().to_owned(),
+        plan_fingerprint_algorithm: fingerprint.algorithm().to_owned(),
+        plan_fingerprint_version: fingerprint.version(),
+        plan_fingerprint_digest: clinker_exec::output::sidecar::hash_to_hex(&fingerprint.digest()),
+        event_time: start
+            .started_at()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    }
+}
+
+fn lineage_lifecycle_facts(
+    snapshot: &RunLifecycleSnapshot,
+) -> Result<clinker_lineage::RunLifecycleFacts, PipelineError> {
+    let terminal = snapshot.terminal().ok_or_else(|| PipelineError::Internal {
+        op: "lineage lifecycle snapshot",
+        node: "pipeline".to_owned(),
+        detail: "terminal facts are unavailable".to_owned(),
+    })?;
+    let outcome = match terminal.outcome() {
+        RunTerminalOutcome::Complete => clinker_lineage::Terminal::Complete,
+        RunTerminalOutcome::Abort => clinker_lineage::Terminal::Abort,
+        RunTerminalOutcome::Fail(failure) => clinker_lineage::Terminal::Fail {
+            failure: failure.clone(),
+        },
+    };
+    let counts = terminal.counts();
+    Ok(clinker_lineage::RunLifecycleFacts {
+        start: lineage_start_facts(snapshot.start()),
+        terminal: clinker_lineage::RunLifecycleTerminalFacts {
+            event_time: terminal
+                .finished_at()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            outcome,
+            stats: clinker_lineage::RunStats {
+                records_read: counts.records_read,
+                records_written: counts.records_written,
+                records_dlq: counts.records_dlq,
+                duration_ms: terminal.duration_ms(),
+            },
+        },
+    })
+}
+
+fn lifecycle_error(error: impl std::fmt::Display) -> PipelineError {
+    PipelineError::Internal {
+        op: "run lifecycle facts",
+        node: "pipeline".to_owned(),
+        detail: error.to_string(),
+    }
+}
+
+fn lifecycle_admission_error(error: LifecycleFactsError) -> PipelineError {
+    match error {
+        LifecycleFactsError::InvalidBatchId => PipelineError::Config(
+            clinker_plan::config::ConfigError::Validation(error.to_string()),
+        ),
+        LifecycleFactsError::InvalidExecutionId | LifecycleFactsError::TerminalAlreadyRecorded => {
+            lifecycle_error(error)
+        }
+    }
+}
+
 /// Map a comprehensive run-startup storage-validation failure onto the
 /// top-level `PipelineError::Config`, the same path the config-time storage
 /// errors take, so it renders through the shared miette diagnostic surface and
@@ -2345,14 +2437,14 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             &lineage_base_dir,
         )?;
 
+        let fingerprint = compiled_plan
+            .semantic_fingerprint_with_runtime_variables(&effective_runtime_variables)
+            .map_err(|error| PipelineError::Internal {
+                op: "run semantic fingerprint",
+                node: "pipeline".to_owned(),
+                detail: error.to_string(),
+            })?;
         if let Some(emitter) = machine {
-            let fingerprint = compiled_plan
-                .semantic_fingerprint_with_runtime_variables(&effective_runtime_variables)
-                .map_err(|error| PipelineError::Internal {
-                    op: "machine semantic fingerprint",
-                    node: "pipeline".to_owned(),
-                    detail: error.to_string(),
-                })?;
             emitter
                 .emit_plan_resolved(fingerprint)
                 .map_err(PipelineError::Io)?;
@@ -2360,8 +2452,23 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
 
         let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
         let job = clinker_lineage::Job::for_pipeline(cfg.pipeline.name.clone(), source_hash);
-        let event_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let events = clinker_lineage::run_events(&lineage, &execution_id, job, &event_time);
+        let started_at = chrono::Utc::now();
+        let lifecycle = RunLifecycleFacts::new(
+            batch_id.clone(),
+            execution_id.clone(),
+            fingerprint,
+            started_at,
+        )
+        .map_err(lifecycle_admission_error)?;
+        lifecycle
+            .record_terminal(
+                started_at,
+                RunTerminalOutcome::Complete,
+                RunCountFacts::default(),
+            )
+            .map_err(lifecycle_error)?;
+        let lifecycle_snapshot = lineage_lifecycle_facts(&lifecycle.snapshot())?;
+        let events = clinker_lineage::run_events(&lineage, job, &lifecycle_snapshot);
 
         let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
             Box::new(std::io::stdout().lock())
@@ -2482,16 +2589,16 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         record_vars: channel_record_vars,
     };
 
+    let semantic_fingerprint = compiled_plan
+        .semantic_fingerprint_with_runtime_variables(&effective_runtime_variables)
+        .map_err(|error| PipelineError::Internal {
+            op: "run semantic fingerprint",
+            node: "pipeline".to_owned(),
+            detail: error.to_string(),
+        })?;
     if let Some(emitter) = machine {
-        let fingerprint = compiled_plan
-            .semantic_fingerprint_with_runtime_variables(&effective_runtime_variables)
-            .map_err(|error| PipelineError::Internal {
-                op: "machine semantic fingerprint",
-                node: "pipeline".to_owned(),
-                detail: error.to_string(),
-            })?;
         emitter
-            .emit_plan_resolved(fingerprint)
+            .emit_plan_resolved(semantic_fingerprint)
             .map_err(PipelineError::Io)?;
         emitter
             .emit_progress_transition("executing")
@@ -2980,25 +3087,13 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         spill_disk_cap_bytes,
         spill_compress: storage_config.spill.compress,
     };
-    // Live run-lifecycle lineage (--lineage-events). Unlike --lineage (a static,
-    // plan-only export that exits before reading data), this rides the actual run:
-    // build the plan-derived column lineage once from the overlaid `compiled_plan`,
-    // open the NDJSON sink, and emit a START now — before the executor runs — so a
-    // mid-run crash still leaves an observable open run. The terminal
-    // COMPLETE/FAIL/ABORT is emitted at the run boundaries below; the emitter's
-    // Drop closes any started-but-unterminated run out as FAIL, covering the
-    // early-return output-commit paths between here and the success terminal.
-    let mut lineage_emitter: Option<clinker_lineage::LiveRunEmitter<Box<dyn std::io::Write>>> =
-        None;
-    let mut lineage_started_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut lineage_output: Option<LiveLineageOutput> = None;
     if let Some(path) = &args.lineage_events {
         let lineage =
             live_lineage.expect("live lineage is preflighted whenever --lineage-events is set");
         let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
         let job =
             clinker_lineage::Job::for_pipeline(pipeline_config.pipeline.name.clone(), source_hash);
-        let started_at = chrono::Utc::now();
-        let start_time = started_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
             // Unlocked stdout handle: locking per write avoids deadlocking the run's
             // own stdout prints (the spill-volume summary and completion line).
@@ -3011,16 +3106,35 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 )))
             })?)
         };
-        let mut emitter = clinker_lineage::LiveRunEmitter::new(
+        lineage_output = Some(LiveLineageOutput {
             writer,
             lineage,
             job,
-            execution_id.clone(),
-            start_time,
-        );
-        emitter.emit_start().map_err(PipelineError::Io)?;
-        lineage_started_at = Some(started_at);
-        lineage_emitter = Some(emitter);
+        });
+    }
+
+    // One CLI-owned fact source starts immediately before the finite executor.
+    // Optional lineage receives only bounded owned snapshots from it; the sink
+    // has no terminal authority and cannot mint or reconstruct correlation IDs.
+    let run_lifecycle = RunLifecycleFacts::new(
+        batch_id.clone(),
+        execution_id.clone(),
+        semantic_fingerprint,
+        chrono::Utc::now(),
+    )
+    .map_err(lifecycle_admission_error)?;
+    if let Some(output) = lineage_output.as_mut()
+        && let Err(error) = output.emit_start(&run_lifecycle.start_snapshot())
+    {
+        let error = PipelineError::Io(error);
+        run_lifecycle
+            .record_terminal(
+                chrono::Utc::now(),
+                RunTerminalOutcome::Fail(classify_pipeline_error(&error)),
+                RunCountFacts::default(),
+            )
+            .map_err(lifecycle_error)?;
+        return Err(error);
     }
 
     // The executor recompiles `compiled_plan.config()` — already the effective,
@@ -3043,39 +3157,29 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     let mut report = match execution_result {
         Ok(report) => report,
         Err(e) => {
-            // Live lineage: the executor failed — close the run out as FAIL with the
-            // error message before propagating. Best-effort: a lineage-sink write
-            // failure must not mask the real pipeline error.
-            if let Some(emitter) = lineage_emitter.as_mut() {
-                let now = chrono::Utc::now();
-                let duration_ms = lineage_started_at
-                    .map(|s| (now - s).num_milliseconds().max(0))
-                    .unwrap_or(0);
-                let event_time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                let stats = clinker_lineage::RunStats {
-                    duration_ms,
-                    ..Default::default()
-                };
-                if let Err(err) = emitter.emit_terminal(
-                    &event_time,
-                    clinker_lineage::Terminal::Fail {
-                        error: e.to_string(),
-                    },
-                    stats,
-                ) {
-                    tracing::warn!(error = %err, "failed to write FAIL lineage event");
-                }
-            }
             // A failed run keeps its staged copies so the operator can inspect
             // the exact inputs the failure saw (cleanup = on_success); only
             // cleanup = always reaps them on failure.
             source_stager.cleanup(false);
-            run_attempt.abandon().map_err(|attempt_error| {
-                PipelineError::Io(std::io::Error::other(format!(
+            let terminal_error = match run_attempt.abandon() {
+                Ok(()) => e,
+                Err(attempt_error) => PipelineError::Io(std::io::Error::other(format!(
                     "pipeline failed and attempt state could not be persisted: {attempt_error}"
-                )))
-            })?;
-            return Err(e);
+                ))),
+            };
+            run_lifecycle
+                .record_terminal(
+                    chrono::Utc::now(),
+                    RunTerminalOutcome::Fail(classify_pipeline_error(&terminal_error)),
+                    RunCountFacts::default(),
+                )
+                .map_err(lifecycle_error)?;
+            if let Some(output) = lineage_output.as_mut()
+                && let Err(err) = output.emit_terminal(&run_lifecycle.snapshot())
+            {
+                tracing::warn!(error = %err, "failed to write FAIL lineage event");
+            }
+            return Err(terminal_error);
         }
     };
 
@@ -3207,23 +3311,57 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     })();
     if let Err(error) = publication_preparation {
         source_stager.cleanup(false);
-        run_attempt.abandon().map_err(|attempt_error| {
-            PipelineError::Io(std::io::Error::other(format!(
+        let terminal_error = match run_attempt.abandon() {
+            Ok(()) => error,
+            Err(attempt_error) => PipelineError::Io(std::io::Error::other(format!(
                 "publication preparation failed and attempt state could not be persisted: {attempt_error}"
-            )))
-        })?;
-        return Err(error);
+            ))),
+        };
+        run_lifecycle
+            .record_terminal(
+                chrono::Utc::now(),
+                RunTerminalOutcome::Fail(classify_pipeline_error(&terminal_error)),
+                RunCountFacts {
+                    records_read: counters.total_count,
+                    records_written: counters.records_written,
+                    records_dlq: counters.dlq_count,
+                },
+            )
+            .map_err(lifecycle_error)?;
+        if let Some(output) = lineage_output.as_mut()
+            && let Err(lineage_error) = output.emit_terminal(&run_lifecycle.snapshot())
+        {
+            tracing::warn!(error = %lineage_error, "failed to write FAIL lineage event");
+        }
+        return Err(terminal_error);
     }
 
     let mut publication_failure: Option<String> = None;
     let mut publication_failure_code: Option<&'static str> = None;
     let mut publication_outcome = None;
     if report.interrupted {
-        run_attempt.abandon().map_err(|error| {
-            PipelineError::Io(std::io::Error::other(format!(
+        if let Err(error) = run_attempt.abandon() {
+            let error = PipelineError::Io(std::io::Error::other(format!(
                 "interrupted attempt state could not be persisted: {error}"
-            )))
-        })?;
+            )));
+            run_lifecycle
+                .record_terminal(
+                    chrono::Utc::now(),
+                    RunTerminalOutcome::Fail(classify_pipeline_error(&error)),
+                    RunCountFacts {
+                        records_read: counters.total_count,
+                        records_written: counters.records_written,
+                        records_dlq: counters.dlq_count,
+                    },
+                )
+                .map_err(lifecycle_error)?;
+            if let Some(output) = lineage_output.as_mut()
+                && let Err(lineage_error) = output.emit_terminal(&run_lifecycle.snapshot())
+            {
+                tracing::warn!(error = %lineage_error, "failed to write FAIL lineage event");
+            }
+            return Err(error);
+        }
     } else {
         match run_attempt.mark_all_ready() {
             Err(_) => {
@@ -3341,36 +3479,32 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         0
     };
 
-    // Live lineage: the run finished — close it out at the true run boundary
-    // (outputs persisted, DLQ written). An interrupted drain is an ABORT; every
-    // other outcome — including a DLQ-partial success — is a COMPLETE, so the
-    // column-lineage facets and the run's final row counts ride the terminal
-    // event. Best-effort: a lineage-sink write failure must not fail a run whose
-    // data outputs are already committed.
-    if let Some(emitter) = lineage_emitter.as_mut() {
-        let stats = clinker_lineage::RunStats {
-            records_read: counters.total_count,
-            records_written: counters.records_written,
-            records_dlq: counters.dlq_count,
-            duration_ms: (report.finished_at - report.started_at)
-                .num_milliseconds()
-                .max(0),
-        };
-        let outcome = if report.interrupted {
-            clinker_lineage::Terminal::Abort
-        } else if let Some(error) = &publication_failure {
-            clinker_lineage::Terminal::Fail {
-                error: error.clone(),
-            }
-        } else {
-            clinker_lineage::Terminal::Complete
-        };
-        let event_time = report
-            .finished_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        if let Err(err) = emitter.emit_terminal(&event_time, outcome, stats) {
-            tracing::warn!(error = %err, "failed to write terminal lineage event");
-        }
+    // Record the one authoritative terminal snapshot at the publication boundary.
+    let lifecycle_outcome = if report.interrupted {
+        RunTerminalOutcome::Abort
+    } else if let Some(code) = publication_failure_code {
+        RunTerminalOutcome::Fail(
+            FailureClassification::for_code(code)
+                .expect("publication failures use registered codes"),
+        )
+    } else {
+        RunTerminalOutcome::Complete
+    };
+    run_lifecycle
+        .record_terminal(
+            chrono::Utc::now(),
+            lifecycle_outcome,
+            RunCountFacts {
+                records_read: counters.total_count,
+                records_written: counters.records_written,
+                records_dlq: counters.dlq_count,
+            },
+        )
+        .map_err(lifecycle_error)?;
+    if let Some(output) = lineage_output.as_mut()
+        && let Err(err) = output.emit_terminal(&run_lifecycle.snapshot())
+    {
+        tracing::warn!(error = %err, "failed to write terminal lineage event");
     }
 
     // Staging cleanup, keyed on a clean exit. A zero exit code is the

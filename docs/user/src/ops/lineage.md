@@ -60,11 +60,12 @@ identity_mode = "local_diagnostic_paths"
 The output is [NDJSON](https://github.com/ndjson/ndjson-spec) (one JSON object per line) conforming to the OpenLineage `2-0-2` core spec. A run is described by a **`START`** event followed by a **`COMPLETE`** event that share one `runId`:
 
 ```json
-{"eventType":"START","run":{"runId":"019f030d-0b3e-7ee1-86ec-1bb5b4a2776b"},"job":{"namespace":"clinker","name":"audit_join","facets":{"clinker_pipeline":{"sourceHash":"7fd096a9..."}}}, ...}
-{"eventType":"COMPLETE","run":{"runId":"019f030d-0b3e-7ee1-86ec-1bb5b4a2776b"}, "inputs":[...], "outputs":[{"namespace":"analytics","name":"audit_report","facets":{"columnLineage":{ ... }}}]}
+{"eventType":"START","run":{"runId":"019f030d-0b3e-7ee1-86ec-1bb5b4a2776b","facets":{"clinker_batch":{"batchId":"batch-42"}}},"job":{"namespace":"clinker","name":"audit_join","facets":{"clinker_pipeline":{"sourceHash":"7fd096a9..."},"clinker_semanticPlan":{"algorithm":"blake3","semanticSchemaVersion":1,"digest":"4e8c..."}}}, ...}
+{"eventType":"COMPLETE","run":{"runId":"019f030d-0b3e-7ee1-86ec-1bb5b4a2776b","facets":{"clinker_batch":{"batchId":"batch-42"}}},"job":{"namespace":"clinker","name":"audit_join","facets":{"clinker_pipeline":{"sourceHash":"7fd096a9..."},"clinker_semanticPlan":{"algorithm":"blake3","semanticSchemaVersion":1,"digest":"4e8c..."}}}, "inputs":[...], "outputs":[{"namespace":"analytics","name":"audit_report","facets":{"columnLineage":{ ... }}}]}
 ```
 
 - **`runId`** is a UUID v7 minted for this export and shared by both events. Because `--lineage` is a *static, plan-derived* export, the `START`/`COMPLETE` pair describes the pipeline's lineage, not an executed data run — no rows are processed and the two events share one timestamp. A separate `clinker run` mints its own `runId`. (For real timing and row counts tied to an actual execution, use [`--lineage-events`](#live-run-events).)
+- Correlation is copied from one immutable CLI lifecycle snapshot: `runId` is the generated execution ID, the clinker-defined **`clinker_batch`** run facet carries the caller/generated `batchId`, and the **`clinker_semanticPlan`** job facet carries the effective fingerprint algorithm, schema version, and digest. Static and live events do not independently mint or parse these identities.
 - **`job.namespace`** is `clinker`; **`job.name`** is the pipeline name. The pipeline's content hash rides in the `clinker_pipeline` job facet (`sourceHash`), not the job name -- so the name stays stable across edits while runs of the same definition remain correlatable.
 - **`inputs`** are the source datasets; **`outputs`** are the sink datasets. External mode uses the exact configured canonical or catalog identities, so relocating a pipeline does not change its lineage graph. Explicit `local_diagnostic_paths` compatibility mode instead uses the `file` namespace with resolved paths (and falls back to the `clinker` namespace plus the node name for a network source).
 - The `columnLineage` facet is attached to each **output** dataset on the `COMPLETE` event.
@@ -118,24 +119,25 @@ Unlike `--lineage` (which exits before reading data), this processes data, so it
 
 A run emits a `START` when it begins, then exactly one terminal event when it ends:
 
-- **`START`** -- written and flushed **before** the run body executes, so a crash mid-run still leaves an observable open run. It carries the input and output datasets by identity (no facets yet).
+- **`START`** -- written and flushed **before** the run body executes, so a crash mid-run still leaves an observable open run. It carries the input and output datasets by identity plus the shared batch and semantic-plan correlation facets; no completed dataset facets exist yet.
 - **`COMPLETE`** -- the run finished. It carries the input datasets and the output datasets with their `columnLineage` facets, exactly like the static export.
-- **`FAIL`** -- the run errored. It carries the standard OpenLineage `errorMessage` run facet with the failure message.
+- **`FAIL`** -- the run errored. It carries the standard OpenLineage `errorMessage` run facet and the clinker-defined `clinker_failure` facet. Both are derived from the same bounded, sanitized classification used by machine supervision; the latter adds stable `code`, `category`, and `retryAdvice` fields.
 - **`ABORT`** -- the run was interrupted (e.g. a `SIGINT`/`SIGTERM` shutdown) and drained what it could before unwinding.
 
 ```json
-{"eventType":"START","eventTime":"2026-07-03T17:00:00Z","run":{"runId":"019f..."}, "inputs":[...], "outputs":[...]}
-{"eventType":"COMPLETE","eventTime":"2026-07-03T17:00:04Z","run":{"runId":"019f...","facets":{"clinker_runStats":{"recordsRead":1000,"recordsWritten":970,"recordsDlq":30,"durationMs":4210}}}, "outputs":[{"...":"...","facets":{"columnLineage":{ ... }}}]}
+{"eventType":"START","eventTime":"2026-07-03T17:00:00Z","run":{"runId":"019f...","facets":{"clinker_batch":{"batchId":"batch-42"}}},"job":{"facets":{"clinker_semanticPlan":{"algorithm":"blake3","semanticSchemaVersion":1,"digest":"4e8c..."}}}, "inputs":[...], "outputs":[...]}
+{"eventType":"COMPLETE","eventTime":"2026-07-03T17:00:04Z","run":{"runId":"019f...","facets":{"clinker_batch":{"batchId":"batch-42"},"clinker_runStats":{"recordsRead":1000,"recordsWritten":970,"recordsDlq":30,"durationMs":4210}}},"job":{"facets":{"clinker_semanticPlan":{"algorithm":"blake3","semanticSchemaVersion":1,"digest":"4e8c..."}}}, "outputs":[{"...":"...","facets":{"columnLineage":{ ... }}}]}
 ```
 
 Key differences from the static export:
 
 - **`runId`** is the run's **`execution_id`** (a UUID v7) — the same identity used across clinker's provenance sidecars and metrics spool, so an orchestrator can correlate the lineage events with the run's other artifacts.
+- Both events carry the same **`clinker_batch`** run facet and **`clinker_semanticPlan`** job facet. Together with `runId`, their batch ID, execution ID, and semantic fingerprint tuple come from the run's single CLI-owned lifecycle source and exactly match the optional machine stream when both are enabled.
 - The `START` and terminal events carry **distinct** `eventTime`s (run begin and run end), not one shared timestamp.
 - The terminal event carries a **`clinker_runStats`** run facet — a clinker-defined facet with `recordsRead`, `recordsWritten`, `recordsDlq`, and `durationMs`. Counts are pipeline-wide run totals, not per-output.
-- On `FAIL`, the run also carries the standard **`errorMessage`** run facet (`ErrorMessageRunFacet` `1-0-0`) with the failure message.
+- On `FAIL`, the run also carries the standard **`errorMessage`** run facet (`ErrorMessageRunFacet` `1-0-0`) plus **`clinker_failure`**, with the shared sanitized message and stable failure code/category/retry advice.
 
-A terminal event is always emitted for a started run: if the process fails to reach a clean terminal (for example, an output-commit error after the executor finished), the run is still closed out as a `FAIL` so no `START` is left dangling. Emission is best-effort *after* the run's data outputs are committed — a lineage-sink write error is logged as a warning and does not fail a run whose outputs already landed.
+Every started run that reaches a handled executor or publication boundary records one terminal snapshot; output-commit errors close as `FAIL` from that same source. Emission is best-effort *after* the run's data outputs are committed — a lineage-sink write error is logged as a warning and does not fail a run whose outputs already landed. A process crash can still leave only the already-flushed `START` event.
 
 ## When to use
 

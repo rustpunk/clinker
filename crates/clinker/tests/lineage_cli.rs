@@ -716,17 +716,49 @@ fn assert_shared_correlation(
 
     for event in lineage {
         assert_eq!(event["run"]["runId"], execution_id);
-        let lifecycle = &event["run"]["facets"]["clinker_runLifecycle"];
-        assert_eq!(lifecycle["batchId"], batch_id);
-        assert_eq!(lifecycle["executionId"], execution_id);
-        assert_eq!(lifecycle["planFingerprint"]["algorithm"], plan["algorithm"]);
-        assert_eq!(lifecycle["planFingerprint"]["version"], plan["version"]);
-        assert_eq!(lifecycle["planFingerprint"]["digest"], plan["digest"]);
+        assert_eq!(event["run"]["facets"]["clinker_batch"]["batchId"], batch_id);
+        let semantic = &event["job"]["facets"]["clinker_semanticPlan"];
+        assert_eq!(semantic["algorithm"], plan["algorithm"]);
+        assert_eq!(semantic["semanticSchemaVersion"], plan["version"]);
+        assert_eq!(semantic["digest"], plan["digest"]);
     }
 }
 
 #[test]
 fn shared_lifecycle_correlation() {
+    let static_dir = tempfile::tempdir().expect("static lifecycle workspace");
+    write_runnable_pipeline(static_dir.path(), None);
+    let static_output = Command::new(clinker_bin())
+        .current_dir(static_dir.path())
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "correlation-static",
+            "--lineage",
+            "static.ndjson",
+        ])
+        .output()
+        .expect("run static correlated lineage");
+    assert!(
+        static_output.status.success(),
+        "static export stderr: {}",
+        String::from_utf8_lossy(&static_output.stderr)
+    );
+    let static_lineage = std::fs::read_to_string(static_dir.path().join("static.ndjson"))
+        .expect("read static lineage")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("static lineage event is JSON"))
+        .collect::<Vec<_>>();
+    assert_shared_correlation(
+        &machine_events(&static_output),
+        &static_lineage,
+        "correlation-static",
+        "COMPLETE",
+    );
+
     let success_dir = tempfile::tempdir().expect("successful lifecycle workspace");
     let success_pipeline = write_runnable_pipeline(success_dir.path(), None);
     let (success_output, success_lineage) =
