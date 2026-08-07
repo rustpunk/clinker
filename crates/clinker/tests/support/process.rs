@@ -1,7 +1,9 @@
 //! Bounded direct-child runner used only by CLI integration tests.
 
 use std::io::{self, BufReader};
-use std::process::{ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+#[cfg(target_os = "linux")]
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,19 +20,32 @@ pub(crate) enum StdoutMode {
     CloseAfterLines(usize),
 }
 
-#[derive(Debug, Clone, Copy)]
 pub(crate) struct ProcessConfig {
-    deadline: Duration,
+    hard_deadline: Duration,
+    #[cfg(target_os = "linux")]
+    graceful_trigger: Option<GracefulTrigger>,
+    #[cfg(target_os = "linux")]
+    grace_duration: Duration,
     stdout_tail_bytes: usize,
     stderr_tail_bytes: usize,
     event_limit: usize,
     stdout_mode: StdoutMode,
 }
 
+#[cfg(target_os = "linux")]
+struct GracefulTrigger {
+    ready: Receiver<()>,
+    requested: SyncSender<()>,
+}
+
 impl ProcessConfig {
     pub(crate) fn new(deadline: Duration) -> Self {
         Self {
-            deadline,
+            hard_deadline: deadline,
+            #[cfg(target_os = "linux")]
+            graceful_trigger: None,
+            #[cfg(target_os = "linux")]
+            grace_duration: Duration::ZERO,
             stdout_tail_bytes: DEFAULT_TAIL_BYTES,
             stderr_tail_bytes: DEFAULT_TAIL_BYTES,
             event_limit: DEFAULT_EVENT_LIMIT,
@@ -50,6 +65,18 @@ impl ProcessConfig {
 
     pub(crate) fn stdout_mode(mut self, mode: StdoutMode) -> Self {
         self.stdout_mode = mode;
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn graceful_trigger(
+        mut self,
+        ready: Receiver<()>,
+        requested: SyncSender<()>,
+        grace_duration: Duration,
+    ) -> Self {
+        self.graceful_trigger = Some(GracefulTrigger { ready, requested });
+        self.grace_duration = grace_duration;
         self
     }
 }
@@ -150,6 +177,9 @@ pub(crate) enum ControlledOutcome {
 pub(crate) struct ProcessResult {
     status: ExitStatus,
     timed_out: bool,
+    #[cfg(target_os = "linux")]
+    graceful_requested_at: Option<Instant>,
+    forced_at: Option<Instant>,
     pub(crate) stdout: ProtocolDrain,
     pub(crate) stderr: DiagnosticDrain,
 }
@@ -160,7 +190,7 @@ impl ProcessResult {
     }
 
     pub(crate) fn outcome_for(&self, stdout: &ProtocolDrain) -> ControlledOutcome {
-        reconcile(stdout, &self.status, self.timed_out)
+        reconcile(stdout, &self.status, self.timed_out || self.forced())
     }
 
     pub(crate) fn status_code(&self) -> Option<i32> {
@@ -169,6 +199,22 @@ impl ProcessResult {
 
     pub(crate) fn timed_out(&self) -> bool {
         self.timed_out
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn graceful_requested(&self) -> bool {
+        self.graceful_requested_at.is_some()
+    }
+
+    pub(crate) fn forced(&self) -> bool {
+        self.forced_at.is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn observed_grace(&self) -> Option<Duration> {
+        self.graceful_requested_at
+            .zip(self.forced_at)
+            .map(|(requested, forced)| forced.saturating_duration_since(requested))
     }
 
     pub(crate) fn reaped(&self) -> bool {
@@ -199,22 +245,83 @@ pub(crate) fn run_child(mut command: Command, config: ProcessConfig) -> io::Resu
     let stderr_handle = thread::spawn(move || drain_diagnostics(stderr, config.stderr_tail_bytes));
 
     let started = Instant::now();
+    let hard_deadline = started + config.hard_deadline;
+    #[cfg(target_os = "linux")]
+    let graceful_trigger = config.graceful_trigger;
+    #[cfg(target_os = "linux")]
+    let mut graceful_requested_at = None;
+    #[cfg(target_os = "linux")]
+    let mut grace_deadline = None;
+    let mut forced_at = None;
     let (status, timed_out) = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break (status, false),
-            Ok(None) if started.elapsed() >= config.deadline => {
-                let _ = child.kill();
-                break (child.wait()?, true);
-            }
-            Ok(None) => thread::sleep(WAIT_POLL_INTERVAL),
+            Ok(Some(_)) => break (child.wait()?, false),
+            Ok(None) => {}
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = join_drain(stdout_handle, "stdout");
-                let _ = join_drain(stderr_handle, "stderr");
+                abort_child_and_drains(&mut child, stdout_handle, stderr_handle);
                 return Err(error);
             }
         }
+
+        #[cfg(target_os = "linux")]
+        if graceful_requested_at.is_none()
+            && let Some(trigger) = graceful_trigger.as_ref()
+        {
+            match trigger.ready.try_recv() {
+                Ok(()) => {
+                    if let Err(error) =
+                        clinker_exec::pipeline::shutdown::request_direct_child_sigterm(&mut child)
+                    {
+                        abort_child_and_drains(&mut child, stdout_handle, stderr_handle);
+                        return Err(error);
+                    }
+                    let requested_at = Instant::now();
+                    graceful_requested_at = Some(requested_at);
+                    grace_deadline = Some(requested_at + config.grace_duration);
+                    if trigger.requested.send(()).is_err() {
+                        abort_child_and_drains(&mut child, stdout_handle, stderr_handle);
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "graceful trigger acknowledgement receiver disconnected",
+                        ));
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    abort_child_and_drains(&mut child, stdout_handle, stderr_handle);
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "graceful trigger disconnected before readiness",
+                    ));
+                }
+            }
+        }
+
+        let now = Instant::now();
+        if now >= hard_deadline {
+            let (status, forced) = match force_and_wait(&mut child) {
+                Ok(result) => result,
+                Err(error) => {
+                    abort_child_and_drains(&mut child, stdout_handle, stderr_handle);
+                    return Err(error);
+                }
+            };
+            forced_at = forced;
+            break (status, true);
+        }
+        #[cfg(target_os = "linux")]
+        if grace_deadline.is_some_and(|deadline| now >= deadline) {
+            let (status, forced) = match force_and_wait(&mut child) {
+                Ok(result) => result,
+                Err(error) => {
+                    abort_child_and_drains(&mut child, stdout_handle, stderr_handle);
+                    return Err(error);
+                }
+            };
+            forced_at = forced;
+            break (status, false);
+        }
+        thread::sleep(WAIT_POLL_INTERVAL);
     };
 
     let stdout = join_drain(stdout_handle, "stdout")??;
@@ -222,9 +329,32 @@ pub(crate) fn run_child(mut command: Command, config: ProcessConfig) -> io::Resu
     Ok(ProcessResult {
         status,
         timed_out,
+        #[cfg(target_os = "linux")]
+        graceful_requested_at,
+        forced_at,
         stdout,
         stderr,
     })
+}
+
+fn force_and_wait(child: &mut Child) -> io::Result<(ExitStatus, Option<Instant>)> {
+    if child.try_wait()?.is_some() {
+        return child.wait().map(|status| (status, None));
+    }
+    let forced_at = Instant::now();
+    child.kill()?;
+    child.wait().map(|status| (status, Some(forced_at)))
+}
+
+fn abort_child_and_drains(
+    child: &mut Child,
+    stdout_handle: thread::JoinHandle<io::Result<ProtocolDrain>>,
+    stderr_handle: thread::JoinHandle<io::Result<DiagnosticDrain>>,
+) {
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = join_drain(stdout_handle, "stdout");
+    let _ = join_drain(stderr_handle, "stderr");
 }
 
 fn join_drain<T>(

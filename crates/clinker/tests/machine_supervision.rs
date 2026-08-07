@@ -460,6 +460,7 @@ fn real_sigterm_cancels_during_grace() {
 
     assert!(result.graceful_requested());
     assert!(!result.forced());
+    assert_eq!(result.observed_grace(), None);
     assert!(result.reaped());
     assert_eq!(result.status_code(), Some(130));
     assert_eq!(result.outcome(), ControlledOutcome::Cancelled);

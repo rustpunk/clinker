@@ -145,6 +145,32 @@ pub fn install_signal_handler() -> Result<(), String> {
     Ok(())
 }
 
+/// Send SIGTERM to a live direct child owned by the caller.
+///
+/// This helper exists only for Linux test-support consumers. It deliberately
+/// accepts a [`std::process::Child`] rather than a raw PID so callers cannot
+/// use it for process groups, descendants, or unrelated processes.
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
+pub fn request_direct_child_sigterm(child: &mut std::process::Child) -> std::io::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "direct child exited before SIGTERM",
+        ));
+    }
+    let pid = i32::try_from(child.id()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "direct child PID does not fit the platform pid type",
+        )
+    })?;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .map_err(std::io::Error::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
