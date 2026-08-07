@@ -692,11 +692,18 @@ fn collect_files(
             if path.is_dir() {
                 visit(root, &path, include, files);
             } else if include(&path) {
+                // Render with a single canonical separator rather than the
+                // platform's. The oracle compares these paths across runs and
+                // strips the run-local execution id by splitting on '/', so a
+                // native separator would silently leave that identity in the
+                // comparison and report every run as authoritative drift.
                 files.push((
                     path.strip_prefix(root)
                         .expect("oracle relative path")
-                        .to_string_lossy()
-                        .into_owned(),
+                        .components()
+                        .map(|component| component.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/"),
                     std::fs::read(&path).expect("read oracle file"),
                 ));
             }

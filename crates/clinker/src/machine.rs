@@ -20,6 +20,22 @@ const PUBLICATION_ARTIFACTS_PER_EVENT: usize = 64;
 /// actually reaches the stream; this only bounds how late a due snapshot is.
 const PROGRESS_TICK: Duration = Duration::from_millis(20);
 
+/// Resolve the worker's wake cadence.
+///
+/// Overridable in debug builds because a run that finishes inside one tick
+/// emits no periodic observation at all, which leaves the fault-injection
+/// tests racing a real timer against how fast the host reads the fixture
+/// rather than asserting the behaviour they name.
+fn progress_tick() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(value) = std::env::var_os("CLINKER_TEST_MACHINE_PROGRESS_TICK_MS")
+        && let Ok(millis) = value.to_string_lossy().parse::<u64>()
+    {
+        return Duration::from_millis(millis.max(1));
+    }
+    PROGRESS_TICK
+}
+
 /// One ordered serializer and terminal arbiter for a controlled invocation.
 #[derive(Clone)]
 pub(crate) struct MachineEmitter {
@@ -175,12 +191,13 @@ impl MachineEmitter {
             ));
         }
         let emitter = self.clone();
+        let tick = progress_tick();
         let (stop, receiver) = mpsc::sync_channel(1);
         let handle = thread::Builder::new()
             .name("clinker-machine-progress".to_owned())
             .spawn(move || {
                 loop {
-                    match receiver.recv_timeout(PROGRESS_TICK) {
+                    match receiver.recv_timeout(tick) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }

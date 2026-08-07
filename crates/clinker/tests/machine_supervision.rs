@@ -760,15 +760,24 @@ fn a_lost_periodic_observation_does_not_cancel_a_completed_run() {
     let directory = fixture();
     write_pipeline(directory.path(), "out.csv", 4_096, true);
 
+    // Wake the liveness worker faster than the default cadence. At the default
+    // the first observation is not due until 20 ms into execution, so a host
+    // that reads the 512-file fixture faster than that emits no periodic at
+    // all: the injected failure never fires and the test asserts nothing about
+    // the behaviour it names.
     let output = machine_command(directory.path(), "lost-periodic")
         .env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "periodic")
+        .env("CLINKER_TEST_MACHINE_PROGRESS_TICK_MS", "1")
         .output()
         .expect("run with injected periodic write failure");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("machine progress channel failed"),
-        "the injected periodic failure must actually have fired"
+        "the injected periodic failure must actually have fired; \
+         status={:?}\nstderr:\n{stderr}\nstdout:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout)
     );
     assert_eq!(output.status.code(), Some(0));
     assert!(directory.path().join("out.csv").exists());
