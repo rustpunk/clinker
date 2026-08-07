@@ -199,6 +199,39 @@ fn strict_directives_reject_interpolation_and_retired_policy_with_guidance() {
 }
 
 #[test]
+fn retired_surfaces_fail_at_plan_admission() {
+    let retired_rule = admission_error(&pipeline(
+        "",
+        "        - { name: transform.seen, level: info, when: per_record, every: 1, message: seen, log_rule: external }\n",
+    ));
+    assert!(retired_rule.contains("`log_rule` is retired"), "{retired_rule}");
+    assert!(retired_rule.contains("line"), "{retired_rule}");
+
+    let retired_routing = admission_error(&pipeline(
+        "  log_rules: {}\n",
+        "        - { name: transform.done, level: info, when: after_transform, message: done }\n",
+    ));
+    assert!(
+        retired_routing.contains("pipeline.log_rules is unsupported"),
+        "{retired_routing}"
+    );
+    assert!(
+        retired_routing.contains("remove the entire `log_rules:` entry"),
+        "{retired_routing}"
+    );
+
+    let interpolation = admission_error(&pipeline(
+        "",
+        "        - { name: transform.seen, level: info, when: per_record, every: 1, message: \"customer {customer_id}\" }\n",
+    ));
+    assert!(interpolation.contains("static"), "{interpolation}");
+    assert!(
+        interpolation.contains("fields: [customer_id]"),
+        "{interpolation}"
+    );
+}
+
+#[test]
 fn strict_directives_enforce_name_message_and_field_bounds() {
     let too_long_name = format!("event.{}", "x".repeat(128));
     let message = admission_error(&pipeline(
