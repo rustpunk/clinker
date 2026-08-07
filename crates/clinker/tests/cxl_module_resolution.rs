@@ -607,9 +607,10 @@ nodes:
       validations:
         - { check: "use roots.validation", message: "ordinary message" }
       log:
-        - level: info
+        - name: transform.record_seen
+          level: info
           when: per_record
-          condition: "use roots.log"
+          every: 1
           message: "ordinary template"
   - type: aggregate
     name: aggregate
@@ -684,7 +685,6 @@ nodes:
         vec![
             "roots.transform",
             "roots.validation",
-            "roots.log",
             "roots.aggregate",
             "roots.route_first",
             "roots.route_second",
@@ -729,8 +729,10 @@ nodes:
         - check: "id > 0"
           message: "use ignored.message"
       log:
-        - level: info
+        - name: transform.ignored_template
+          level: info
           when: per_record
+          every: 1
           message: "use ignored.template"
   - type: composition
     name: nested
