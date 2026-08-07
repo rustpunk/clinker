@@ -359,6 +359,170 @@ cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --off
   --require-accepted
 ```
 
+## 7.3. Phase 3 Recovery Matrix
+
+Run the following commands separately, in order, and stop on the first nonzero
+result. The command tokens are the recovery evidence contract; do not replace a
+focused target with an alias, a broader suite, or a merged command. Before the
+executor-heavy targets, apply the raise-only file-descriptor setup from section
+4. The OTLP integration target binds local sockets and may require ordinary host
+permissions outside a restricted sandbox.
+
+1. Semantic plan identity is versioned separately from the byte-oriented
+   pipeline hash and changes with effective typed semantics and admitted
+   dependency content:
+
+   ```bash
+   cargo test --locked --offline -p clinker-plan semantic_fingerprint
+   ```
+
+2. Shared typed failures expose exact category and retry advice without parsing
+   rendered diagnostics or exit status:
+
+   ```bash
+   cargo test --locked --offline -p clinker-core-types --test failure_classification
+   ```
+
+3. One explicitly selected machine protocol owns stdout, preserves standalone
+   behavior, bounds its records, and reports typed lifecycle and publication
+   truth:
+
+   ```bash
+   cargo test --locked --offline -p clinker --test machine_protocol_cli
+   ```
+
+4. The approved Linux direct-child capability delivers actual SIGTERM, keeps
+   both pipes draining through a distinct grace interval, forces only after
+   expiry, reaps the child, and retries in a fresh process:
+
+   ```bash
+   cargo test --locked --offline -p clinker --test machine_supervision
+   ```
+
+5. Attempt publication remains coupled to cancellation arbitration and the
+   current attempt ledger, including retained failed-attempt and visible-final
+   truth:
+
+   ```bash
+   cargo test --locked --offline -p clinker --test attempt_publication
+   ```
+
+6. The ordinary standalone `run` command remains the default surface and does
+   not require machine supervision:
+
+   ```bash
+   cargo run --locked --offline -p clinker -- run --help
+   ```
+
+7. All twelve production-reachable dispatcher boundaries return the exact
+   typed status before effects and retain D-15 failed-attempt evidence without
+   changing intended finals:
+
+   ```bash
+   cargo test --locked -p clinker-exec --features test-utils --test invariant_errors -- --nocapture
+   ```
+
+8. Workspace observability accepts only strict secret-free raw configuration
+   and finite telemetry and independent-lineage bounds; structured endpoint
+   admission remains outside the planner:
+
+   ```bash
+   cargo test --locked -p clinker-plan --test observability_config
+   ```
+
+9. Transform-authored logs, metrics, and traces use bounded static event
+   declarations, explicit requested fields, and no retired routing or message
+   interpolation surface:
+
+   ```bash
+   cargo test --locked -p clinker-plan --test transform_observability
+   ```
+
+10. The sole structured endpoint boundary admits one HTTPS origin, derives only
+    the fixed logs, metrics, and traces routes, and enforces finite OTLP/HTTP
+    request, response, retry, and shutdown bounds:
+
+    ```bash
+    cargo test --locked -p clinker-net --test otlp_http
+    ```
+
+11. Phase 1 D-42 external lineage uses canonical or catalog collection identity
+    with standard input/output subset and authorized symlinks facets, never an
+    implicit worker path:
+
+    ```bash
+    cargo test --locked -p clinker-lineage --test logical_identity
+    ```
+
+12. Phase 1 D-41 lifecycle facts and external lineage delivery remain shared in
+    identity but independent in byte capacity, worker, deadline, counters, and
+    bounded or hung-sink outcome:
+
+    ```bash
+    cargo test --locked -p clinker-lineage --test lifecycle_delivery
+    ```
+
+13. Fixed executor telemetry produces real privacy-gated logs, metrics, and
+    traces without changing ETL, DLQ, or publication authority:
+
+    ```bash
+    cargo test --locked -p clinker-exec --test observability_isolation
+    ```
+
+14. The CLI preserves Phase 1 D-42 identity and facet policy through preflight,
+    correlation, static output, and bounded external lineage delivery:
+
+    ```bash
+    cargo test --locked -p clinker --test lineage_cli
+    ```
+
+15. The CLI cross-signal matrix keeps OTLP and OpenLineage failures independent
+    while authoritative outputs, DLQ, status, machine truth, publication, and
+    retained attempt evidence remain unchanged:
+
+    ```bash
+    cargo test --locked -p clinker --test observability_isolation
+    ```
+
+16. The final dependency policy permits only the approved shared-failure edges
+    and consumer use of `FailureClassification`, `FailureCategory`, and
+    `RetryAdvice`, with no product orchestrator runtime:
+
+    ```bash
+    cargo run --manifest-path tools/dependency-policy/Cargo.toml --locked --offline -- --scope final --root .
+    ```
+
+17. The repository-owned AI documentation structure, links, contract tables,
+    and ownership references remain valid:
+
+    ```bash
+    bash scripts/check-ai-docs.sh
+    ```
+
+18. The user-facing operator and pipeline contract renders successfully:
+
+    ```bash
+    mdbook build docs/user
+    ```
+
+19. The engine contract renders successfully:
+
+    ```bash
+    mdbook build docs/engine
+    ```
+
+20. All tracked Rust remains formatted:
+
+    ```bash
+    cargo fmt --all --check
+    ```
+
+21. The complete working-tree diff has no whitespace errors:
+
+    ```bash
+    git diff --check
+    ```
+
 ## 8. Docs Generation Command
 
 Rust API docs:
