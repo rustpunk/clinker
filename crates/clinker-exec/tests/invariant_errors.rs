@@ -1,3 +1,5 @@
+#![cfg(feature = "test-utils")]
+
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -126,7 +128,7 @@ struct DispatchMismatchCase {
 }
 
 #[test]
-fn transform_and_composition_complete_record_dispatcher_mismatch_matrix() {
+fn aggregate_and_source_transform_and_composition_dispatch_mismatch_matrix() {
     let plan = load_config_from_str(PIPELINE_YAML)
         .expect("parse pipeline")
         .compile(&CompileContext::default())

@@ -26,17 +26,52 @@ use crate::executor::{
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
+/// Context carrier kept lazy until the node-kind guard has succeeded. Normal
+/// dispatch passes the live executor context directly; the feature-gated
+/// mismatch matrix uses the inert carrier to prove rejection precedes
+/// evaluator and buffer access.
+pub(crate) enum TransformDispatchContext<'borrow, 'plan> {
+    Live(&'borrow mut ExecutorContext<'plan>),
+    #[cfg(feature = "test-utils")]
+    Inert,
+}
+
+impl<'borrow, 'plan> From<&'borrow mut ExecutorContext<'plan>>
+    for TransformDispatchContext<'borrow, 'plan>
+{
+    fn from(ctx: &'borrow mut ExecutorContext<'plan>) -> Self {
+        Self::Live(ctx)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl crate::executor::dispatch::DispatchFaultGuard {
+    /// Execute the real transform boundary with an inert context so tests can
+    /// prove a wrong node returns before evaluator or buffer state is touched.
+    #[doc(hidden)]
+    pub fn dispatch_transform_mismatch_for_testing(
+        current_dag: &ExecutionPlanDag,
+        node_idx: NodeIndex,
+        node: &PlanNode,
+    ) -> Result<(), PipelineError> {
+        dispatch_transform(TransformDispatchContext::Inert, current_dag, node_idx, node)
+    }
+}
+
 /// Execute the `Transform` arm for `node_idx`: drive per-record CXL
 /// evaluation (filter, projection, distinct, emit_each fan-out) over the
 /// predecessor's records, taking the streaming-fused path off a Source
 /// receiver when the pre-pass flagged this Transform eligible and the
 /// buffered `node_buffers` path otherwise. Stateless and streaming.
-pub(crate) fn dispatch_transform(
-    ctx: &mut ExecutorContext<'_>,
+pub(crate) fn dispatch_transform<'borrow, 'plan>(
+    ctx: impl Into<TransformDispatchContext<'borrow, 'plan>>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     node: &PlanNode,
-) -> Result<(), PipelineError> {
+) -> Result<(), PipelineError>
+where
+    'plan: 'borrow,
+{
     let PlanNode::Transform {
         ref name,
         window_index,
@@ -45,7 +80,19 @@ pub(crate) fn dispatch_transform(
         ..
     } = *node
     else {
-        unreachable!("dispatch_transform called with non-Transform node");
+        return Err(crate::executor::invariant::dispatch_mismatch(
+            "dispatch_transform",
+            "transform",
+            node.kind_name(),
+            node.name(),
+        ));
+    };
+    let ctx = match ctx.into() {
+        TransformDispatchContext::Live(ctx) => ctx,
+        #[cfg(feature = "test-utils")]
+        TransformDispatchContext::Inert => {
+            panic!("transform dispatcher accessed inert context after accepting a transform node")
+        }
     };
     // Streaming-fused path: when the pre-pass has flagged this
     // Transform as eligible (sole upstream is a Source whose
