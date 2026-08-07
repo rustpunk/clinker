@@ -613,3 +613,30 @@ fn strict_directives_reject_duplicate_or_lifecycle_field_requests() {
         "{lifecycle}"
     );
 }
+
+/// A gate is one predicate.
+///
+/// The condition is spliced into `filter <source>`, so a source carrying a
+/// statement separator compiles into statements the author never wrote into a
+/// gate. A `distinct` reached that way lands in an evaluator that was not
+/// allocated to run one and aborted the process at the first record, with no
+/// classified failure and no terminal event, rather than failing the plan.
+#[test]
+fn a_condition_carrying_extra_statements_is_refused_at_plan_time() {
+    let message = compile_error(&pipeline(
+        "",
+        "        - { name: transform.seen, level: info, when: per_record, every: 1, message: seen, condition: \"amount > 1\\ndistinct\" }\n",
+    ));
+    assert!(
+        message.contains("E373"),
+        "an injected statement must be refused: {message}"
+    );
+    assert!(
+        message.contains("must be one predicate"),
+        "the rejection must name the rule it broke: {message}"
+    );
+    assert!(
+        message.contains("amount > 1 and region == 'eu'"),
+        "the rejection must show a corrected form: {message}"
+    );
+}

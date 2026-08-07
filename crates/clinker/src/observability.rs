@@ -154,7 +154,12 @@ impl OtlpRuntimeBundle {
         if !policy.is_enabled() {
             return Ok(None);
         }
-        let otlp = policy.otlp().ok_or(ObservabilityRuntimeError::Worker)?;
+        // Observability can be enabled for lineage alone. No collector export
+        // was requested, so there is no OTLP runtime to admit — a configuration
+        // choice, not a capability that failed to start.
+        let Some(otlp) = policy.otlp() else {
+            return Ok(None);
+        };
 
         // This is deliberately the first capability transition. No CLI code
         // interprets, normalizes, or reconstructs the authored endpoint.

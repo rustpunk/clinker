@@ -150,8 +150,13 @@ pub struct ObservabilityConfig {
     rate_limit_burst: u32,
     #[serde(default = "default_flush_timeout_ms")]
     flush_timeout_ms: u64,
-    otlp: OtlpConfig,
-    lineage: LineageConfig,
+    // Two independent delivery paths, each optional. Requiring both tables
+    // would make a lineage export declare a collector endpoint it never
+    // contacts, and a collector export declare a lineage sink it never writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    otlp: Option<OtlpConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lineage: Option<LineageConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     field_policy: Vec<FieldPolicyConfig>,
 }
@@ -719,17 +724,12 @@ impl std::fmt::Display for ObservabilityConfigError {
 impl std::error::Error for ObservabilityConfigError {}
 
 pub(crate) fn is_observability_toml_error(text: &str, error: &toml::de::Error) -> bool {
+    // Where the error is, not what the document happens to contain. A
+    // whole-document test would claim an unrelated `[storage]` error for this
+    // subsystem and report the wrong correction for it.
     let offset = error.span().map_or(text.len(), |span| span.start);
     let (table, _) = authored_location(text, offset);
-    if table.starts_with("observability") {
-        return true;
-    }
-
-    let has_observability = text.lines().any(|line| line.trim() == "[observability]");
-    has_observability
-        && (!text.contains("[observability.otlp]")
-            || !text.contains("[observability.otlp.auth]")
-            || !text.contains("[observability.lineage]"))
+    table.starts_with("observability")
 }
 
 impl ObservabilityConfig {
@@ -820,8 +820,16 @@ impl ObservabilityConfig {
             "set `flush_timeout_ms = 15000`",
         )?;
 
-        let otlp = self.otlp.resolve(flush_timeout_ms)?;
-        let lineage = self.lineage.resolve()?;
+        let otlp = self
+            .otlp
+            .as_ref()
+            .map(|otlp| otlp.resolve(flush_timeout_ms))
+            .transpose()?;
+        let lineage = self
+            .lineage
+            .as_ref()
+            .map(LineageConfig::resolve)
+            .transpose()?;
         let field_policies = resolve_field_policies(&self.field_policy)?;
 
         Ok(ResolvedObservabilityPolicy {
@@ -837,8 +845,8 @@ impl ObservabilityConfig {
             rate_limit_per_second,
             rate_limit_burst,
             flush_timeout: Duration::from_millis(flush_timeout_ms),
-            otlp: Some(otlp),
-            lineage: Some(lineage),
+            otlp,
+            lineage,
             field_policies,
         })
     }

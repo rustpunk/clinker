@@ -227,11 +227,19 @@ Telemetry delivery is bounded and best effort and cannot change transform
 results or published output — including a condition that fails to evaluate,
 which drops its event rather than failing the run.
 
-Every transform event also offers the fixed logical correlation fields
-`execution_id`, `batch_id`, and `pipeline_name`. These fields are default-deny
-like record fields: each exact event-field pair must be allowed, hashed, or
-replaced by deployment policy before it is retained. Source paths, records,
-secrets, and raw error text are never implicit attributes.
+Every transform event also carries the fixed correlation fields
+`execution_id`, `batch_id`, and `pipeline_name`. Unlike requested record
+fields, these are **not** default-deny and are **not** gated by
+`field_policy`: they are engine-supplied identity that never derives from a
+source, and they are what makes an exported event joinable to the machine
+stream and to the lineage events. A deployment that allows an event without
+also writing three correlation rules still gets telemetry it can correlate.
+
+Because they are exported verbatim, choose a `--batch-id` that is safe to send
+to your collector — an identifier, not a tenant name or anything else you
+would not want retained there. A `field_policy` rule naming one of these three
+fields does not redact it. Source paths, records, secrets, and raw error text
+are never implicit attributes.
 
 The former `log_rule` directive key and pipeline-level `log_rules` block are
 rejected. Move event identity and safe field requests into the transform's

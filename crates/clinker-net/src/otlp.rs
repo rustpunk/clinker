@@ -733,24 +733,36 @@ fn retryable_status(status: u16) -> Option<OtlpRetryCause> {
 /// requires it.
 ///
 /// Shared by the retry decision and the terminal classification so the two
-/// cannot disagree about the same error. Which I/O error surfaces depends on
-/// whether the peer writes bytes before closing and on the host's socket
-/// behaviour: a plaintext HTTP reply reaches rustls as invalid data, while a
-/// peer that closes first arrives as end-of-stream, a reset, or an abort. All
-/// of them mean the remote is not a TLS endpoint, which no amount of retrying
-/// will change.
+/// cannot disagree about the same error. The peer answered, so this is not a
+/// reachability failure; what it is instead depends on how far the exchange
+/// got and on the host's socket behaviour, which is why the answer cannot be
+/// one error kind. A plaintext HTTP reply reaches rustls as invalid data or
+/// as a protocol parse failure; a peer that closes first arrives as
+/// end-of-stream, a reset, or an abort; and writing a handshake to a socket
+/// the peer has already closed is a broken pipe on the BSD-derived hosts and
+/// buffered until the read on Linux. All of them say the remote is not a TLS
+/// endpoint, which no amount of retrying will change.
+///
+/// Reachability failures — refused, unresolved, or a deadline that expired
+/// before a connection existed — are deliberately not here: those describe
+/// getting to the peer rather than what the peer turned out to be.
 fn is_tls_endpoint_mismatch(error: &ureq::Error, https_only: bool) -> bool {
-    https_only
-        && matches!(
-            error,
-            ureq::Error::Io(io) if matches!(
-                io.kind(),
-                std::io::ErrorKind::InvalidData
-                    | std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-            )
-        )
+    if !https_only {
+        return false;
+    }
+    match error {
+        ureq::Error::Protocol(_) => true,
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::InvalidData
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+        ),
+        _ => false,
+    }
 }
 
 fn retryable_transport(error: &ureq::Error, https_only: bool) -> Option<OtlpRetryCause> {

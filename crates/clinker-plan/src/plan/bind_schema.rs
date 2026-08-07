@@ -2550,7 +2550,26 @@ fn bind_schema_inner(
                             span,
                             &bind_ctx.scoped_vars,
                         ) {
-                            Ok(typed) => compiled.push(Some(Arc::new(typed))),
+                            // The condition is spliced into `filter <source>`, so a
+                            // source carrying a statement separator compiles into
+                            // statements the author never wrote into a gate — including
+                            // ones the gate's evaluator is not allocated to run. A gate
+                            // is one predicate; anything else is refused here rather
+                            // than reaching the first record.
+                            Ok(typed) if typed.program.statements.len() == 1 => {
+                                compiled.push(Some(Arc::new(typed)));
+                            }
+                            Ok(typed) => {
+                                diags.push(Diagnostic::error(
+                                    "E373",
+                                    format!(
+                                        "transform `{name}` log[{index}].condition must be one predicate, but it parses as {} statements; write the gate as a single expression, for example `condition: \"amount > 1 and region == 'eu'\"`",
+                                        typed.program.statements.len()
+                                    ),
+                                    LabeledSpan::primary(span, "log condition".to_string()),
+                                ));
+                                every_condition_bound = false;
+                            }
                             Err(d) => {
                                 diags.push(d);
                                 every_condition_bound = false;

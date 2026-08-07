@@ -230,6 +230,7 @@ diagnostic_registry! {
     "E370", Error, "A pipeline combines document-level DLQ with correlation-key rejection, whose distinct atomic populations cannot share one physical writer boundary";
     "E371", Error, "Unsafe or invalid retained attempt refused";
     "E372", Error, "Attempt cleanup incomplete or budget exhausted";
+    "E373", Error, "A transform log directive's `condition` is more than one predicate";
     // ── Path security ───────────────────────────────────────────────────
     "E-SEC-001", Error, "Path security violation (escape, symlink, etc.)";
     // ── Warnings ────────────────────────────────────────────────────────

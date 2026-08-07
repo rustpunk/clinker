@@ -18,7 +18,13 @@ use crate::telemetry::{
     TelemetryProducer, unix_nanos_now,
 };
 
-const MAX_CORRELATION_BYTES: usize = 128;
+/// Ceiling on one exported correlation identifier.
+///
+/// Matches the largest `--batch-id` the CLI admits. A correlation value exists
+/// to be joined against the machine stream and the lineage events, both of
+/// which carry it whole, so a lower ceiling here would export an identifier
+/// that silently matches neither.
+const MAX_CORRELATION_BYTES: usize = 256;
 
 /// Logical run correlation supplied by the executor's stable context.
 pub(crate) struct TransformSignalContext<'a> {
