@@ -5,6 +5,55 @@ use std::collections::BTreeMap;
 use clinker_core_types::FailureClassification;
 use serde::{Deserialize, Serialize};
 
+use crate::logical_identity::{DatasetSubset, DatasetSubsetDirection, SymlinkIdentifier};
+
+/// Standard OpenLineage input/output facet naming one concrete logical member
+/// of a stable collection dataset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatasetSubsetFacet {
+    #[serde(rename = "_producer")]
+    pub producer: String,
+    #[serde(rename = "_schemaURL")]
+    pub schema_url: String,
+    /// Stable partition or location identifier; never a worker path.
+    pub subset: String,
+}
+
+impl DatasetSubsetFacet {
+    pub fn new(subset: &DatasetSubset) -> Self {
+        let schema_url = match subset.direction() {
+            DatasetSubsetDirection::Input => super::INPUT_DATASET_SUBSET_FACET_SCHEMA_URL,
+            DatasetSubsetDirection::Output => super::OUTPUT_DATASET_SUBSET_FACET_SCHEMA_URL,
+        };
+        Self {
+            producer: super::PRODUCER.to_string(),
+            schema_url: schema_url.to_string(),
+            subset: subset.identifier().to_string(),
+        }
+    }
+}
+
+/// Standard OpenLineage dataset facet listing explicitly authorized alternate
+/// table or location identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymlinksDatasetFacet {
+    #[serde(rename = "_producer")]
+    pub producer: String,
+    #[serde(rename = "_schemaURL")]
+    pub schema_url: String,
+    pub identifiers: Vec<SymlinkIdentifier>,
+}
+
+impl SymlinksDatasetFacet {
+    pub fn new(identifiers: Vec<SymlinkIdentifier>) -> Self {
+        Self {
+            producer: super::PRODUCER.to_string(),
+            schema_url: super::SYMLINKS_DATASET_FACET_SCHEMA_URL.to_string(),
+            identifiers,
+        }
+    }
+}
+
 /// Column-level lineage for one dataset.
 ///
 /// DIRECT (value-derivation) lineage is keyed per output column in

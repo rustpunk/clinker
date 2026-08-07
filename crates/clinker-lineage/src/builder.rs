@@ -11,12 +11,13 @@
 //!   sorting (Sort), conditional reshaping (Reshape `when:`) — collected once in
 //!   [`ColumnLineageDatasetFacet::dataset`].
 //!
-//! Dataset identity comes from [`crate::dataset::dataset_identity`] (#660); value
-//! derivation and influence are read off each operator's retained typed/compiled
-//! program. A **multi-record** flat-file source splits per record type: each
-//! record type becomes its own logical dataset (`<file>#<id>`) carrying only its
-//! declared columns, so column lineage is attributed per record type rather than
-//! to the one flat superset dataset (see [`seed_multi_record_source`]).
+//! External dataset identity comes from an explicit
+//! [`LineageIdentityContext`](crate::logical_identity::LineageIdentityContext);
+//! the legacy path resolver is isolated to the local diagnostic entry point.
+//! Value derivation and influence are read off each operator's retained
+//! typed/compiled program. A **multi-record** flat-file source keeps one stable
+//! collection identity; concrete record types belong in standard subset facets
+//! rather than name fragments (see [`seed_multi_record_source`]).
 //!
 //! Because topo order processes every upstream node first, the working maps store
 //! terminals already resolved back to a Source dataset column — never an
@@ -86,7 +87,7 @@ use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 
 use clinker_plan::config::pipeline_node::MatchMode;
-use clinker_plan::config::{RECORD_TYPE_COLUMN, RecordType, SourceSchema};
+use clinker_plan::config::{RecordType, SourceSchema};
 use clinker_plan::plan::combine::encode_chain_column;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 use clinker_plan::plan::{
@@ -98,6 +99,9 @@ use cxl::ast::{EmitTarget, Expr, Program, Statement, for_each_field_emit, progra
 use cxl::plan::BindingArg;
 
 use crate::dataset::{DatasetId, dataset_identity};
+use crate::logical_identity::{
+    DatasetIdentityFacets, LineageIdentityContext, LineageIdentityError,
+};
 use crate::openlineage::{
     COLUMN_LINEAGE_FACET_SCHEMA_URL, ColumnLineageDatasetFacet, FieldLineage, InputField, PRODUCER,
     Transformation, TransformationSubtype, TransformationType,
@@ -108,6 +112,8 @@ use crate::openlineage::{
 pub struct PlanColumnLineage {
     /// Source (input) datasets, deduplicated, in first-seen order.
     pub inputs: Vec<DatasetId>,
+    /// Standard subset/symlink identity facets keyed by input identity.
+    pub input_identity_facets: BTreeMap<DatasetId, DatasetIdentityFacets>,
     /// Each Output (sink) dataset paired with its DIRECT column-lineage facet.
     pub outputs: Vec<OutputColumnLineage>,
 }
@@ -116,6 +122,8 @@ pub struct PlanColumnLineage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputColumnLineage {
     pub dataset: DatasetId,
+    /// Standard subset/symlink facts authorized for this output identity.
+    pub identity_facets: DatasetIdentityFacets,
     /// `facet.fields` carries per-column DIRECT (value-derivation) lineage;
     /// `facet.dataset` carries the whole-dataset INDIRECT influence lineage.
     pub facet: ColumnLineageDatasetFacet,
@@ -129,6 +137,7 @@ pub struct OutputColumnLineage {
 struct ScopeSink {
     inputs: Vec<DatasetId>,
     seen_inputs: HashSet<DatasetId>,
+    input_identity_facets: BTreeMap<DatasetId, DatasetIdentityFacets>,
     output_acc: Vec<OutputAcc>,
 }
 
@@ -149,30 +158,72 @@ struct ScopeSeed {
 /// threaded in by the caller exactly as [`dataset_identity`] requires — it is not
 /// retained on [`CompiledPlan`].
 pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLineage {
+    build_column_lineage(compiled, &|node| Ok(dataset_identity(node, base_dir)), None)
+        .expect("local diagnostic path identity cannot fail")
+}
+
+/// Build lineage with an explicit, prevalidated external identity context.
+///
+/// Unlike [`column_lineage`], this production path never receives a base
+/// directory and cannot derive or hash a source/output path. Every emitted
+/// source and output must have one exact context binding.
+pub fn column_lineage_external(
+    compiled: &CompiledPlan,
+    identities: &LineageIdentityContext,
+) -> Result<PlanColumnLineage, LineageIdentityError> {
+    let required = compiled
+        .dag()
+        .graph
+        .node_weights()
+        .filter(|node| matches!(node, PlanNode::Source { .. } | PlanNode::Output { .. }))
+        .map(PlanNode::name);
+    identities.validate_required(required)?;
+    build_column_lineage(
+        compiled,
+        &|node| match node {
+            PlanNode::Source { name, .. } | PlanNode::Output { name, .. } => {
+                Ok(Some(identities.require(name)?.dataset_id().clone()))
+            }
+            _ => Ok(None),
+        },
+        Some(identities),
+    )
+}
+
+type DatasetResolver<'a> =
+    dyn Fn(&PlanNode) -> Result<Option<DatasetId>, LineageIdentityError> + 'a;
+
+fn build_column_lineage(
+    compiled: &CompiledPlan,
+    resolve_dataset: &DatasetResolver<'_>,
+    identities: Option<&LineageIdentityContext>,
+) -> Result<PlanColumnLineage, LineageIdentityError> {
     let mut sink = ScopeSink::default();
     // Per-source declared envelope sections — the filter that keeps a `$doc`
     // read from attributing to a source whose document cannot carry the section.
-    let declared_sections = declared_doc_sections(compiled, base_dir);
+    let declared_sections = declared_doc_sections(compiled, resolve_dataset)?;
 
     // Top-level scope: nothing pre-seeded.
     walk_scope(
         compiled,
-        base_dir,
+        resolve_dataset,
+        identities,
         compiled.dag(),
         ScopeSeed::default(),
         &declared_sections,
         &mut sink,
-    );
+    )?;
 
     let outputs = sink
         .output_acc
         .into_iter()
         .map(OutputAcc::into_output)
         .collect();
-    PlanColumnLineage {
+    Ok(PlanColumnLineage {
         inputs: sink.inputs,
+        input_identity_facets: sink.input_identity_facets,
         outputs,
-    }
+    })
 }
 
 /// Walk one DAG scope — the top-level pipeline or a composition body — in
@@ -191,15 +242,19 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
 /// section index that gates `$doc` attribution.
 fn walk_scope(
     compiled: &CompiledPlan,
-    base_dir: &Path,
+    resolve_dataset: &DatasetResolver<'_>,
+    identities: Option<&LineageIdentityContext>,
     dag: &ExecutionPlanDag,
     seed: ScopeSeed,
     declared_sections: &HashMap<DatasetId, BTreeSet<String>>,
     sink: &mut ScopeSink,
-) -> (
-    HashMap<PlanNodeId, ColumnTerminals>,
-    HashMap<PlanNodeId, InfluenceMap>,
-) {
+) -> Result<
+    (
+        HashMap<PlanNodeId, ColumnTerminals>,
+        HashMap<PlanNodeId, InfluenceMap>,
+    ),
+    LineageIdentityError,
+> {
     // Pre-seeded nodes keep their injected terminals/influence/doc-sources and are
     // not recomputed by the walk. Derived before the seeds move into the working
     // maps.
@@ -229,7 +284,7 @@ fn walk_scope(
 
         // The Source datasets this node draws from, resolved before the per-node
         // match so the emit-walkers can attribute a `$doc` read to them.
-        let node_doc_srcs = node_doc_sources(node, dag, idx, base_dir, &doc_sources);
+        let node_doc_srcs = node_doc_sources(node, dag, idx, resolve_dataset, &doc_sources)?;
 
         // Set by the Composition arm to the body's output-port INDIRECT influence,
         // merged into this node's influence below.
@@ -242,24 +297,12 @@ fn walk_scope(
                 // recomputing the string-allocating `dataset_identity` a second
                 // time.
                 if let Some(base) = node_doc_srcs.iter().next() {
-                    // A multi-record flat file carries several record shapes in
-                    // one physical file; each record type is its own logical
-                    // dataset (`<file>#<id>`) declaring only its own columns.
-                    // Attribute each superset column to the record type(s) that
-                    // declare it, so column lineage is accurate per record type
-                    // rather than collapsed onto the one flat superset dataset.
-                    // Single-record / generated / file schemas keep the whole
-                    // schema on the base dataset (the `None` arm), unchanged.
+                    // A multi-record flat file carries several concrete record
+                    // shapes in one stable collection. Subset facts stay on the
+                    // identity context; field terminals remain on the collection.
                     match compiled.bound_schemas().get(node.name()) {
                         Some(SourceSchema::MultiRecord { record_types, .. }) => {
-                            seed_multi_record_source(
-                                node,
-                                dag,
-                                base,
-                                record_types,
-                                &mut cols,
-                                sink,
-                            );
+                            seed_multi_record_source(node, dag, base, record_types, &mut cols);
                         }
                         _ => {
                             for (col_idx, col) in
@@ -275,10 +318,16 @@ fn walk_scope(
                                 );
                                 cols.insert(col.to_string(), terms);
                             }
-                            if sink.seen_inputs.insert(base.clone()) {
-                                sink.inputs.push(base.clone());
-                            }
                         }
+                    }
+                    if sink.seen_inputs.insert(base.clone()) {
+                        sink.inputs.push(base.clone());
+                    }
+                    if let Some(binding) =
+                        identities.and_then(|context| context.require(node.name()).ok())
+                    {
+                        sink.input_identity_facets
+                            .insert(base.clone(), binding.facets());
                     }
                 }
                 cols
@@ -553,8 +602,15 @@ fn walk_scope(
                             seed.doc_sources.insert(body_src_id, ds.clone());
                         }
                     }
-                    let (body_lineage, mut body_influence) =
-                        walk_scope(compiled, base_dir, &body_dag, seed, declared_sections, sink);
+                    let (body_lineage, mut body_influence) = walk_scope(
+                        compiled,
+                        resolve_dataset,
+                        identities,
+                        &body_dag,
+                        seed,
+                        declared_sections,
+                        sink,
+                    )?;
                     // Harvest the first declared output port — the records the
                     // composition surfaces, against the single `output_schema` the
                     // node carries — matching the runtime harvest.
@@ -638,9 +694,18 @@ fn walk_scope(
         }
 
         if let PlanNode::Output { .. } = node
-            && let Some(ds) = dataset_identity(node, base_dir)
+            && let Some(ds) = resolve_dataset(node)?
         {
-            record_output(&mut sink.output_acc, ds, &cols, &node_influence);
+            let identity_facets = identities
+                .and_then(|context| context.require(node.name()).ok())
+                .map_or_else(DatasetIdentityFacets::default, |binding| binding.facets());
+            record_output(
+                &mut sink.output_acc,
+                ds,
+                identity_facets,
+                &cols,
+                &node_influence,
+            );
         }
 
         lineage.insert(node_id, cols);
@@ -648,99 +713,35 @@ fn walk_scope(
         doc_sources.insert(node_id, node_doc_srcs);
     }
 
-    (lineage, influence)
+    Ok((lineage, influence))
 }
 
-/// Seed a multi-record flat-file source's DIRECT terminals per record type.
+/// Seed a multi-record flat-file source's DIRECT terminals on its stable
+/// collection identity.
 ///
-/// A multi-record file carries several record shapes over one discriminator-led
-/// superset schema. Rather than fold every superset column onto the single flat
-/// file dataset, each record type is modeled as its own logical dataset
-/// (`<file>#<id>`, via [`DatasetId::record_type`]) carrying only its declared
-/// columns:
-///
-/// - A column exactly one record type declares → an IDENTITY terminal on that
-///   record type's dataset.
-/// - A column several record types declare (unified to one superset column) →
-///   one IDENTITY terminal per owning record-type dataset, so a downstream
-///   derivation traces to every record type it could have come from.
-/// - A superset column no record type declares — the engine-stamped
-///   `record_type` discriminator lead, chiefly — stays on the base file
-///   dataset, preserving its pre-split identity (a `Route` on `record_type`
-///   still names `{file, <path>, record_type}`).
-///
-/// The base file dataset (carrying the discriminator) and every record-type
-/// dataset are registered as run inputs, mirroring the single-dataset source's
-/// unconditional input registration. Engine-stamped columns carrying field
-/// metadata are skipped, exactly as the single-record path skips them.
-///
-/// A record type's `parent` / `join_key` express an intra-file hierarchy across
-/// record types; that relationship is carried in the per-record-type dataset
-/// identities rather than synthesized as lineage edges (no plan node performs
-/// such a join, so emitting one would be invented provenance).
+/// Record shapes are concrete members of one collection, not independent
+/// datasets. Their stable logical partition/location identifiers belong in the
+/// standard subset facet supplied by the identity context; appending `#<id>` to
+/// the dataset name would make identity depend on a concrete subset. Column
+/// lineage therefore keeps every declared superset column on `base` while
+/// preserving exact field-level derivation.
 fn seed_multi_record_source(
     node: &PlanNode,
     dag: &ExecutionPlanDag,
     base: &DatasetId,
-    record_types: &[RecordType],
+    _record_types: &[RecordType],
     cols: &mut ColumnTerminals,
-    sink: &mut ScopeSink,
 ) {
-    // Column name → the record-type datasets declaring it, in record-type
-    // declaration order. A name shared by several record types lists each owner.
-    // The reserved `record_type` discriminator lead is never owned by a record
-    // type: `multi_record_superset` unifies any same-named column into that one
-    // lead slot, so a (runtime-invalid) config declaring such a column must not
-    // pull the discriminator onto a record-type dataset — keep it on the base.
-    let mut owners: HashMap<&str, Vec<DatasetId>> = HashMap::new();
-    for rt in record_types {
-        let ds = DatasetId::record_type(base, &rt.id);
-        for col in &rt.columns {
-            if col.name == RECORD_TYPE_COLUMN {
-                continue;
-            }
-            owners
-                .entry(col.name.as_str())
-                .or_default()
-                .push(ds.clone());
-        }
-    }
-
     for (col_idx, col) in node.output_schema_in(dag).columns().iter().enumerate() {
         if node.output_schema_in(dag).field_metadata(col_idx).is_some() {
             continue;
         }
-        let name: &str = col;
         let mut terms = TermMap::new();
-        match owners.get(name) {
-            Some(datasets) => {
-                for ds in datasets {
-                    terms.insert(
-                        Terminal::new(&ds.namespace, &ds.name, name),
-                        Subtype::Identity,
-                    );
-                }
-            }
-            // The `record_type` discriminator lead (declared by no record type)
-            // and any other file-level column stay on the base dataset.
-            None => {
-                terms.insert(
-                    Terminal::new(&base.namespace, &base.name, name),
-                    Subtype::Identity,
-                );
-            }
-        }
-        cols.insert(name.to_string(), terms);
-    }
-
-    if sink.seen_inputs.insert(base.clone()) {
-        sink.inputs.push(base.clone());
-    }
-    for rt in record_types {
-        let ds = DatasetId::record_type(base, &rt.id);
-        if sink.seen_inputs.insert(ds.clone()) {
-            sink.inputs.push(ds.clone());
-        }
+        terms.insert(
+            Terminal::new(&base.namespace, &base.name, col),
+            Subtype::Identity,
+        );
+        cols.insert(col.to_string(), terms);
     }
 }
 
@@ -882,11 +883,11 @@ fn node_doc_sources(
     node: &PlanNode,
     dag: &ExecutionPlanDag,
     idx: NodeIndex,
-    base_dir: &Path,
+    resolve_dataset: &DatasetResolver<'_>,
     doc_sources: &HashMap<PlanNodeId, BTreeSet<DatasetId>>,
-) -> BTreeSet<DatasetId> {
-    match node {
-        PlanNode::Source { .. } => dataset_identity(node, base_dir).into_iter().collect(),
+) -> Result<BTreeSet<DatasetId>, LineageIdentityError> {
+    Ok(match node {
+        PlanNode::Source { .. } => resolve_dataset(node)?.into_iter().collect(),
         PlanNode::Combine {
             driving_upstream, ..
         } => {
@@ -907,7 +908,7 @@ fn node_doc_sources(
             }
         }
         _ => union_doc_sources(dag, idx, doc_sources),
-    }
+    })
 }
 
 /// Union of the Source datasets feeding every direct upstream of `idx`.
@@ -938,14 +939,14 @@ fn union_doc_sources(
 /// one (CSV / fixed-width / SWIFT), where this filter prevents the false edge.
 fn declared_doc_sections(
     compiled: &CompiledPlan,
-    base_dir: &Path,
-) -> HashMap<DatasetId, BTreeSet<String>> {
+    resolve_dataset: &DatasetResolver<'_>,
+) -> Result<HashMap<DatasetId, BTreeSet<String>>, LineageIdentityError> {
     let mut out: HashMap<DatasetId, BTreeSet<String>> = HashMap::new();
     let dag = compiled.dag();
     for &idx in &dag.topo_order {
         let node = &dag.graph[idx];
         if let PlanNode::Source { resolved, .. } = node
-            && let Some(ds) = dataset_identity(node, base_dir)
+            && let Some(ds) = resolve_dataset(node)?
         {
             let sections: BTreeSet<String> = resolved
                 .as_ref()
@@ -955,7 +956,7 @@ fn declared_doc_sections(
             out.entry(ds).or_default().extend(sections);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Visit each non-engine-stamped output column name of `node` in schema order.
@@ -1955,6 +1956,7 @@ fn add_doc_influence(
 /// resolves to the same dataset.
 struct OutputAcc {
     dataset: DatasetId,
+    identity_facets: DatasetIdentityFacets,
     fields: BTreeMap<String, TermMap>,
     influence: InfluenceMap,
 }
@@ -1976,6 +1978,7 @@ impl OutputAcc {
             .collect();
         OutputColumnLineage {
             dataset: self.dataset,
+            identity_facets: self.identity_facets,
             facet: ColumnLineageDatasetFacet {
                 producer: PRODUCER.to_string(),
                 schema_url: COLUMN_LINEAGE_FACET_SCHEMA_URL.to_string(),
@@ -1991,6 +1994,7 @@ impl OutputAcc {
 fn record_output(
     acc: &mut Vec<OutputAcc>,
     dataset: DatasetId,
+    identity_facets: DatasetIdentityFacets,
     cols: &ColumnTerminals,
     influence: &InfluenceMap,
 ) {
@@ -2019,6 +2023,7 @@ fn record_output(
         .collect();
     acc.push(OutputAcc {
         dataset,
+        identity_facets,
         fields,
         influence: influence.clone(),
     });
@@ -4091,12 +4096,10 @@ nodes:
         }
     }
 
-    /// A multi-record flat file splits into one dataset per record type: each
-    /// record type's columns are attributed to its own `<file>#<id>` dataset,
-    /// and the engine-stamped `record_type` discriminator lead stays on the base
-    /// file dataset.
+    /// A multi-record flat file remains one stable collection dataset. Concrete
+    /// record types are subset facts rather than dataset-name fragments.
     #[test]
-    fn multi_record_source_splits_columns_per_record_type() {
+    fn multi_record_source_keeps_one_stable_collection_identity() {
         let yaml = r#"
 pipeline: { name: mr }
 nodes:
@@ -4134,35 +4137,27 @@ nodes:
 "#;
         let lineage = lineage_of(yaml);
         let base = "/w/data/payments.txt";
-        let header = format!("{base}#header");
-        let detail = format!("{base}#detail");
         let out = only_output(&lineage);
         let fields = &out.facet.fields;
 
         use TransformationSubtype::Identity;
         // The discriminator lead stays on the base file dataset.
         assert_field(fields, "kind", &[direct(base, "record_type", Identity)]);
-        // Header column → the header record-type dataset.
-        assert_field(fields, "batch_id", &[direct(&header, "batch_id", Identity)]);
-        // Detail columns → the detail record-type dataset (never the header).
-        assert_field(fields, "id", &[direct(&detail, "id", Identity)]);
-        assert_field(fields, "amount", &[direct(&detail, "amount", Identity)]);
+        assert_field(fields, "batch_id", &[direct(base, "batch_id", Identity)]);
+        assert_field(fields, "id", &[direct(base, "id", Identity)]);
+        assert_field(fields, "amount", &[direct(base, "amount", Identity)]);
 
-        // Inputs are the base file dataset plus one dataset per record type, in
-        // record-type declaration order.
         assert_eq!(
             lineage.inputs,
-            vec![file_ds(base), file_ds(&header), file_ds(&detail)],
-            "base + per-record-type datasets, in declaration order",
+            vec![file_ds(base)],
+            "concrete record types cannot change collection identity",
         );
     }
 
-    /// A column several record types declare (unified to one superset column)
-    /// lists every owning record-type dataset, so a downstream derivation traces
-    /// to each record type it could have come from; a type-exclusive column
-    /// lands only on its own record type.
+    /// Shared and type-exclusive columns both retain the collection dataset;
+    /// record-type membership is represented by subset facets, not identity.
     #[test]
-    fn multi_record_shared_column_lists_every_owning_record_type() {
+    fn multi_record_shared_column_stays_on_collection_identity() {
         let yaml = r#"
 pipeline: { name: mr_shared }
 nodes:
@@ -4200,32 +4195,15 @@ nodes:
 "#;
         let lineage = lineage_of(yaml);
         let base = "/w/data/src.txt";
-        let alpha = format!("{base}#alpha");
-        let beta = format!("{base}#beta");
         let out = only_output(&lineage);
         let fields = &out.facet.fields;
 
         use TransformationSubtype::Identity;
-        // `seq` is declared by BOTH record types → one terminal per owning
-        // dataset, ordered by (namespace, name, field): `#alpha` < `#beta`.
-        assert_field(
-            fields,
-            "seq",
-            &[
-                direct(&alpha, "seq", Identity),
-                direct(&beta, "seq", Identity),
-            ],
-        );
-        // Type-exclusive columns land only on their owning record type.
-        assert_field(fields, "a_only", &[direct(&alpha, "a_only", Identity)]);
-        assert_field(fields, "b_only", &[direct(&beta, "b_only", Identity)]);
+        assert_field(fields, "seq", &[direct(base, "seq", Identity)]);
+        assert_field(fields, "a_only", &[direct(base, "a_only", Identity)]);
+        assert_field(fields, "b_only", &[direct(base, "b_only", Identity)]);
 
-        // Inputs: base + both record-type datasets, no duplicate for the shared
-        // `seq` column.
-        assert_eq!(
-            lineage.inputs,
-            vec![file_ds(base), file_ds(&alpha), file_ds(&beta)],
-        );
+        assert_eq!(lineage.inputs, vec![file_ds(base)]);
     }
 
     /// Regression: a single-record (`Columns`) source is unchanged — every
@@ -4343,7 +4321,6 @@ nodes:
 "#;
         let lineage = lineage_of(yaml);
         let base = "/w/data/src.txt";
-        let only = format!("{base}#only");
         let out = only_output(&lineage);
         let fields = &out.facet.fields;
 
@@ -4351,7 +4328,7 @@ nodes:
         // The reserved discriminator lead stays on the base dataset even though a
         // record type declared a same-named column.
         assert_field(fields, "rt", &[direct(base, "record_type", Identity)]);
-        // A normal column still lands on its own record-type dataset.
-        assert_field(fields, "payload", &[direct(&only, "payload", Identity)]);
+        // Normal columns keep the same stable collection identity too.
+        assert_field(fields, "payload", &[direct(base, "payload", Identity)]);
     }
 }

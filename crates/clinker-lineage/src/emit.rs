@@ -326,11 +326,13 @@ mod tests {
                 namespace: "file".to_string(),
                 name: "/w/data/in.csv".to_string(),
             }],
+            input_identity_facets: BTreeMap::new(),
             outputs: vec![OutputColumnLineage {
                 dataset: DatasetId {
                     namespace: "file".to_string(),
                     name: "/w/out/out.csv".to_string(),
                 },
+                identity_facets: Default::default(),
                 facet: ColumnLineageDatasetFacet {
                     producer: PRODUCER.to_string(),
                     schema_url: COLUMN_LINEAGE_FACET_SCHEMA_URL.to_string(),

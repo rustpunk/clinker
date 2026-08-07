@@ -9,9 +9,9 @@ mod ndjson;
 
 pub use event::{Dataset, DatasetFacets, EventType, Job, JobFacets, Run, RunEvent, RunFacets};
 pub use facet::{
-    ClinkerFailureRunFacet, ColumnLineageDatasetFacet, ErrorMessageRunFacet, FieldLineage,
-    InputField, PipelineJobFacet, RunStatsFacet, Transformation, TransformationSubtype,
-    TransformationType,
+    ClinkerFailureRunFacet, ColumnLineageDatasetFacet, DatasetSubsetFacet, ErrorMessageRunFacet,
+    FieldLineage, InputField, PipelineJobFacet, RunStatsFacet, SymlinksDatasetFacet,
+    Transformation, TransformationSubtype, TransformationType,
 };
 pub use ndjson::write_ndjson;
 
@@ -21,6 +21,18 @@ pub const OPENLINEAGE_SCHEMA_URL: &str = "https://openlineage.io/spec/2-0-2/Open
 /// Schema URL for the column-lineage dataset facet (the facet-level `_schemaURL`).
 pub const COLUMN_LINEAGE_FACET_SCHEMA_URL: &str =
     "https://openlineage.io/spec/facets/1-2-0/ColumnLineageDatasetFacet.json";
+
+/// Schema URL for the standard concrete input-subset facet.
+pub const INPUT_DATASET_SUBSET_FACET_SCHEMA_URL: &str =
+    "https://openlineage.io/spec/facets/1-0-0/DatasetSubsetInputDatasetFacet.json";
+
+/// Schema URL for the standard concrete output-subset facet.
+pub const OUTPUT_DATASET_SUBSET_FACET_SCHEMA_URL: &str =
+    "https://openlineage.io/spec/facets/1-0-0/DatasetSubsetOutputDatasetFacet.json";
+
+/// Schema URL for the standard dataset symlinks facet.
+pub const SYMLINKS_DATASET_FACET_SCHEMA_URL: &str =
+    "https://openlineage.io/spec/facets/1-0-0/SymlinksDatasetFacet.json";
 
 /// Producer URI stamped on emitted events and facets, identifying this emitter.
 pub const PRODUCER: &str = "https://github.com/rustpunk/clinker";

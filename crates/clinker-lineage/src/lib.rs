@@ -29,9 +29,12 @@
 pub mod builder;
 pub mod dataset;
 pub mod emit;
+pub mod logical_identity;
 pub mod openlineage;
 
-pub use builder::{OutputColumnLineage, PlanColumnLineage, column_lineage};
+pub use builder::{
+    OutputColumnLineage, PlanColumnLineage, column_lineage, column_lineage_external,
+};
 pub use dataset::{DatasetId, FALLBACK_NAMESPACE, FILE_NAMESPACE, dataset_identity};
 pub use emit::{LiveRunEmitter, RunStats, Terminal, run_events, start_event, terminal_event};
 pub use openlineage::{
