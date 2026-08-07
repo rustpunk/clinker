@@ -807,7 +807,7 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
             .unwrap_or_else(|| FailureClassification::unknown_internal("unregistered failure"))
     };
     match error {
-        PipelineError::Io(error) if is_observability_delivery_start_failure(error) => {
+        PipelineError::Io(error) if is_observability_delivery_failure(error) => {
             registered("observability.delivery.failed")
         }
         PipelineError::Config(clinker_plan::config::ConfigError::Validation(message))
@@ -880,7 +880,25 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
         PipelineError::UnsatisfiableMemoryBudget { .. } => {
             registered("admission.configuration.memory_budget_unsatisfiable")
         }
-        PipelineError::Interrupted => registered("runtime.invariant.unknown"),
+        // Cancellation is an operator action, not a defect: it is retryable and
+        // it is not an engine invariant violation. Callers that can distinguish
+        // a cancelled run should use `run_terminal_outcome` instead of asking
+        // for a failure classification at all.
+        PipelineError::Interrupted => registered("infrastructure.runtime.transient"),
+    }
+}
+
+/// The lifecycle terminal a finished run earned.
+///
+/// Cancellation is [`RunTerminalOutcome::Abort`] regardless of which source
+/// observed the shutdown token first. A file source drains and returns a report
+/// flagged `interrupted`; a REST source cancelled inside a page read returns
+/// [`PipelineError::Interrupted`] instead, and both are the same operator
+/// action on the lineage and OTLP terminals.
+fn run_terminal_outcome(error: &PipelineError) -> RunTerminalOutcome {
+    match error {
+        PipelineError::Interrupted => RunTerminalOutcome::Abort,
+        other => RunTerminalOutcome::Fail(classify_pipeline_error(other)),
     }
 }
 
@@ -1654,34 +1672,138 @@ fn observability_configuration_error(error: impl std::fmt::Display) -> PipelineE
 }
 
 #[derive(Debug)]
-struct ObservabilityDeliveryStartFailure {
+struct ObservabilityDeliveryFailure {
     message: String,
 }
 
-impl std::fmt::Display for ObservabilityDeliveryStartFailure {
+impl std::fmt::Display for ObservabilityDeliveryFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
     }
 }
 
-impl std::error::Error for ObservabilityDeliveryStartFailure {}
+impl std::error::Error for ObservabilityDeliveryFailure {}
 
-fn observability_delivery_start_error(error: impl std::fmt::Display) -> PipelineError {
-    PipelineError::Io(std::io::Error::other(ObservabilityDeliveryStartFailure {
+fn observability_delivery_error(error: impl std::fmt::Display) -> PipelineError {
+    PipelineError::Io(std::io::Error::other(ObservabilityDeliveryFailure {
         message: error.to_string(),
     }))
 }
 
-fn is_observability_delivery_start_failure(error: &std::io::Error) -> bool {
+fn is_observability_delivery_failure(error: &std::io::Error) -> bool {
     error
         .get_ref()
-        .is_some_and(|source| source.is::<ObservabilityDeliveryStartFailure>())
+        .is_some_and(|source| source.is::<ObservabilityDeliveryFailure>())
 }
 
 fn lineage_worker_start_error(_error: std::io::Error) -> PipelineError {
-    observability_delivery_start_error(
+    observability_delivery_error(
         "the bounded lineage exporter could not start before execution. Correction: reduce host resource pressure or disable external lineage delivery",
     )
+}
+
+/// How many dropped events a diagnostic names before it summarizes the rest.
+const LINEAGE_EXPORT_REPORTED_DROPS: usize = 4;
+
+fn lineage_destination(path: &std::path::Path) -> String {
+    if path.as_os_str() == std::ffi::OsStr::new("-") {
+        "standard output".to_owned()
+    } else {
+        path.display().to_string()
+    }
+}
+
+fn lineage_admission_reason(admission: clinker_lineage::LineageAdmission) -> &'static str {
+    match admission {
+        clinker_lineage::LineageAdmission::Accepted => "was admitted",
+        clinker_lineage::LineageAdmission::DroppedEventTooLarge => {
+            "serialized larger than `observability.lineage.max_event_bytes`"
+        }
+        clinker_lineage::LineageAdmission::DroppedEncodingFailed => "could not be serialized",
+        clinker_lineage::LineageAdmission::DroppedQueueFull => {
+            "did not fit the remaining `observability.lineage.queue_bytes` capacity"
+        }
+        clinker_lineage::LineageAdmission::DroppedProducerBusy => {
+            "found the export queue momentarily locked"
+        }
+        clinker_lineage::LineageAdmission::DroppedShutdown => {
+            "arrived after the export worker had already stopped"
+        }
+    }
+}
+
+/// Diagnose a plan-only `--lineage` export that did not deliver every event.
+///
+/// Returns `None` only when every event was admitted and the worker drained
+/// and flushed the destination. This export is the whole invocation, so a
+/// partial or unwritten one is a run failure — the opposite of the
+/// `--lineage-events` bulkhead alongside a live run, whose delivery outcome
+/// deliberately cannot redefine run truth.
+fn lineage_export_failure(
+    path: &std::path::Path,
+    expected: usize,
+    rejected: &[(usize, clinker_lineage::LineageAdmission)],
+    outcome: clinker_lineage::LineageDeliveryOutcome,
+) -> Option<PipelineError> {
+    let destination = lineage_destination(path);
+    match outcome.terminal() {
+        clinker_lineage::LineageDeliveryTerminal::WriteFailed(kind)
+        | clinker_lineage::LineageDeliveryTerminal::FlushFailed(kind) => {
+            return Some(observability_delivery_error(format!(
+                "cannot write --lineage output {destination}: the export sink reported {} ({}) after {} of {expected} events entered the export queue. Correction: point --lineage at a writable destination, for example `--lineage ./lineage.ndjson`",
+                outcome.terminal().as_str(),
+                lineage_error_kind(kind),
+                outcome.accepted(),
+            )));
+        }
+        clinker_lineage::LineageDeliveryTerminal::DeadlineExceeded => {
+            return Some(observability_delivery_error(format!(
+                "--lineage output {destination} did not finish writing within the configured lineage flush deadline. Correction: raise the deadline in clinker.toml:\n\n  [observability.lineage]\n  flush_timeout_ms = 30000"
+            )));
+        }
+        clinker_lineage::LineageDeliveryTerminal::Shutdown => {}
+    }
+    if rejected.is_empty() {
+        return None;
+    }
+
+    let mut listed = rejected
+        .iter()
+        .take(LINEAGE_EXPORT_REPORTED_DROPS)
+        .map(|(index, admission)| {
+            format!(
+                "event {} {}",
+                index + 1,
+                lineage_admission_reason(*admission)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if let Some(remaining) = rejected.len().checked_sub(LINEAGE_EXPORT_REPORTED_DROPS)
+        && remaining > 0
+    {
+        listed.push_str(&format!("; and {remaining} more"));
+    }
+
+    // Only the byte caps have a configuration correction. Do not offer one for
+    // a serializer failure or a stopped worker: raising a cap would not change
+    // the outcome and the author would stop looking for the real cause.
+    let capped = rejected.iter().any(|(_, admission)| {
+        matches!(
+            admission,
+            clinker_lineage::LineageAdmission::DroppedEventTooLarge
+                | clinker_lineage::LineageAdmission::DroppedQueueFull
+        )
+    });
+    let correction = if capped {
+        "raise the lineage caps in clinker.toml:\n\n  [observability.lineage]\n  queue_bytes = \"1MB\"\n  max_event_bytes = \"1MB\""
+    } else {
+        "re-run the export; if it recurs, remove --lineage and report the diagnostic above"
+    };
+    Some(observability_configuration_error(format!(
+        "--lineage output {destination} is incomplete: {} of {expected} events were dropped before delivery ({listed}). Correction: {correction}",
+        rejected.len(),
+    )))
 }
 
 enum CliLineageIdentity {
@@ -2727,10 +2849,22 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 external_lineage_sink(path),
             )
             .map_err(lineage_worker_start_error)?;
-            for event in &events {
-                let _ = delivery.try_emit(event);
+            let mut rejected = Vec::new();
+            for (index, event) in events.iter().enumerate() {
+                match delivery.emit_export(event) {
+                    clinker_lineage::LineageAdmission::Accepted => {}
+                    admission => rejected.push((index, admission)),
+                }
             }
-            report_lineage_delivery(delivery.finish());
+            let outcome = delivery.finish();
+            report_lineage_delivery(outcome);
+            // Unlike `--lineage-events`, which is a bulkhead alongside a real
+            // run, this export IS the invocation. An unwritten or partial
+            // export that still exits 0 leaves a CI step uploading a stale
+            // file from a previous run, or none at all.
+            if let Some(error) = lineage_export_failure(path, events.len(), &rejected, outcome) {
+                return Err(error);
+            }
         } else {
             let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
                 Box::new(std::io::stdout().lock())
@@ -2892,20 +3026,20 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         MachineEmitter::shutdown_token,
     );
     let machine_progress = machine
-        .map(|emitter| emitter.start_execution_progress(shutdown_token.clone()))
+        .map(MachineEmitter::start_execution_progress)
         .transpose()
         .map_err(PipelineError::Io)?;
     let telemetry_handles = otlp_runtime
         .as_ref()
         .map(|runtime| runtime.reserve_arena(&observability_policy))
         .transpose()
-        .map_err(observability_delivery_start_error)?;
+        .map_err(observability_delivery_error)?;
     let (telemetry_producer, mut otlp_worker) = match (otlp_runtime.take(), telemetry_handles) {
         (Some(runtime), Some((producer, receiver))) => (
             Some(producer),
             Some(
                 observability::OtlpWorker::start(runtime, receiver, shutdown_token.clone())
-                    .map_err(observability_delivery_start_error)?,
+                    .map_err(observability_delivery_error)?,
             ),
         ),
         (None, None) => (None, None),
@@ -3464,8 +3598,13 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         &run_params,
         compile_ctx.without_overlay_ops(),
     );
-    let mut machine_control_error = machine_progress.and_then(|worker| worker.finish().err());
-    if let Some(error) = &machine_control_error {
+    // The periodic worker only ever writes discardable observations. A lost
+    // snapshot is not run-controlling evidence: the protocol's required
+    // records are the lifecycle transitions and the terminal, and those still
+    // fail closed below. Treating an advisory write error as an interruption
+    // would abandon a run that finished, discard its staged output, and report
+    // 130 for a run nothing cancelled.
+    if let Some(error) = machine_progress.and_then(|worker| worker.finish().err()) {
         tracing::warn!(error = %error, "machine progress channel failed");
     }
     let mut report = match execution_result {
@@ -3484,7 +3623,13 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             run_lifecycle
                 .record_terminal(
                     chrono::Utc::now(),
-                    RunTerminalOutcome::Fail(classify_pipeline_error(&terminal_error)),
+                    // A source that surfaces the tripped shutdown token as an
+                    // error — a REST read cancelled mid-page — unwinds through
+                    // here rather than through `report.interrupted`. The same
+                    // operator SIGTERM against a file source records ABORT, and
+                    // one signal must not produce two different lineage
+                    // terminals depending on which source observed it.
+                    run_terminal_outcome(&terminal_error),
                     RunCountFacts::default(),
                 )
                 .map_err(lifecycle_error)?;
@@ -3503,9 +3648,9 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         && let Err(error) = emitter.emit_progress_transition("finalizing")
     {
         tracing::warn!(error = %error, "machine finalization transition failed");
-        machine_control_error.get_or_insert(error);
-    }
-    if machine_control_error.is_some() {
+        // A required lifecycle record the supervisor will never see. Fail
+        // closed at the last point before staged output becomes visible:
+        // never publish an attempt whose outcome cannot be reported.
         report.interrupted = true;
     }
 
@@ -3702,8 +3847,11 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 if let Some(emitter) = machine
                     && let Err(error) = emitter.emit_progress_transition("publishing")
                 {
+                    // The emitter trips the run's shutdown token on a failed
+                    // write, and `publish_run` polls that token before the
+                    // first final rename, so this failure still fails closed
+                    // through the cancellation gate below.
                     tracing::warn!(error = %error, "machine publication transition failed");
-                    machine_control_error.get_or_insert(error);
                 }
                 match run_attempt.publish_run(&output_staging, &shutdown_token) {
                 Ok(None) => report.interrupted = true,

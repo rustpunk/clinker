@@ -45,9 +45,12 @@ runtime-variable scopes. It excludes deployment-only file locations and layer
 source formatting, so relocating equivalent inputs does not invalidate a
 pinned plan while a value that can change execution does.
 
-Progress events add a bounded logical phase, kind, elapsed time, optional
-checkpoint count, and truncation flags. They never contain records, secrets,
-source URLs, or physical paths. Failed terminals add a stable failure code,
+Progress events add a bounded logical phase, kind, elapsed time, and
+truncation flags. They never contain records, secrets, source URLs, or
+physical paths. Periodic records follow Clinker's own clock rather than
+internal engine activity, so a run inside one long operation keeps producing
+them; they stay advisory and bounded and never replace the parent's own
+heartbeat. Failed terminals add a stable failure code,
 broad category, sanitized message, and `retry_with_backoff`, `do_not_retry`, or
 `policy_required` advice. Before a publication-aware terminal, bounded
 `publication_artifacts` records carry the path-free inventory in ordered
@@ -80,7 +83,7 @@ agree:
 |---|---:|---|---|
 | `completed`, result `success`, exit `0` | `0` | Publication is complete; every reported artifact is individually complete. | Success. |
 | `completed`, result `completed_with_dlq`, exit `2` | `2` | Publication is complete and includes the reported complete DLQ artifact. | Completed under the caller's data-quality policy. |
-| `failed`, embedded exit `1`, `3`, or `4` | The same exit | Use the exact reported publication state. A visible subset, if any, consists only of individually complete artifacts. | Failure; apply the typed retry advice and caller policy. |
+| `failed`, embedded exit `1`, `3`, or `4` | The same exit | Use the exact reported publication state. When `publication` is absent the state could not be reported; infer nothing about the visible set from its absence. A reported visible subset, if any, consists only of individually complete artifacts. | Failure; apply the typed retry advice and caller policy. |
 | `cancelled` | `130` | Graceful cancellation won before publication; final paths for this attempt remain unchanged. | Cancellation. |
 | No terminal, malformed stream, unsupported major, duplicate terminal, forced termination, or mismatched exit | Any | Do not infer current-attempt success from a pre-existing final or a visible complete subset. | Incomplete attempt. |
 
@@ -89,6 +92,14 @@ advice without requiring the parent to parse rendered diagnostics. EOF alone
 never proves success. A control-pipe failure can prevent terminal delivery, so
 even an otherwise plausible exit remains incomplete without matching terminal
 evidence.
+
+The terminal family follows the exit code, and the `completed` family covers
+only exit `0` and exit `2`. Any other non-cancellation exit is written as a
+`failed` terminal carrying the run's own failure classification, including
+after an earlier `failed` emission that could not be encoded and so left the
+single terminal slot free. A non-zero exit is never restated as result
+`success`; if no terminal can be encoded at all, the stream ends without one
+and the attempt is incomplete by the table above.
 
 Publication is atomic per artifact, not for the artifact set. A failure or
 uncontrolled stop during multi-artifact publication can leave an exact subset
@@ -136,6 +147,22 @@ the atomic gate before publication, it exits `130` and leaves finals unchanged.
 If publication wins first, later signals do not relabel or erase already
 complete visible artifacts; the bounded promotion finishes with `completed` or
 `failed` truth.
+
+A cancellation is reported as a cancellation on every surface that reports it,
+and which source noticed the signal does not change that. A file source drains
+to a chunk boundary and stops; a source that observes cancellation while a
+request is already in flight — a REST page read, for instance — unwinds from
+inside that read. Both produce exit `130`, a `cancelled` machine terminal, and
+an OpenLineage `ABORT`. Cancellation is never reported as an engine failure
+class, so alerting keyed on the lineage or OTLP terminal does not page for an
+operator-initiated stop.
+
+Exit `130` also covers one non-signal case: a **required** machine lifecycle
+record that could not be written before publication. Clinker refuses to
+publish an outcome it cannot report, so a broken control pipe stops the attempt
+with finals unchanged. Discardable records are excluded from that rule — a lost
+periodic `progress` observation is reported on stderr and the run continues to
+its real outcome, and never converts a completed run into a cancellation.
 
 Signal-handler installation is admission-critical. If installation fails,
 Clinker exits with infrastructure status `4` before opening the machine

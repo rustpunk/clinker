@@ -12,7 +12,7 @@
 //! production SIGINT handling intact while eliminating the global mutable
 //! state that previously caused tests to race against each other.
 
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// A handle to a per-execution shutdown flag. Cheap to clone — clones share
@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 #[derive(Clone, Debug)]
 pub struct ShutdownToken {
     state: Arc<AtomicU8>,
-    progress_checkpoints: Arc<AtomicU64>,
 }
 
 const ACTIVE: u8 = 0;
@@ -41,10 +40,7 @@ impl ShutdownToken {
     pub fn new() -> Self {
         let state = Arc::new(AtomicU8::new(ACTIVE));
         register(&state);
-        Self {
-            state,
-            progress_checkpoints: Arc::new(AtomicU64::new(0)),
-        }
+        Self { state }
     }
 
     /// Create a token that is NOT registered with the signal handler. Useful
@@ -52,7 +48,6 @@ impl ShutdownToken {
     pub fn detached() -> Self {
         Self {
             state: Arc::new(AtomicU8::new(ACTIVE)),
-            progress_checkpoints: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -64,18 +59,16 @@ impl ShutdownToken {
     }
 
     /// Check whether shutdown has been requested on this token.
-    pub fn is_requested(&self) -> bool {
-        self.progress_checkpoints.fetch_add(1, Ordering::Relaxed);
-        self.state.load(Ordering::SeqCst) == CANCELLED
-    }
-
-    /// Number of existing cancellation checkpoints observed by this run.
     ///
-    /// This monotonic value is advisory liveness evidence only. It is never a
-    /// resume cursor and does not participate in the cancellation/publication
-    /// state machine.
-    pub fn progress_checkpoints(&self) -> u64 {
-        self.progress_checkpoints.load(Ordering::Relaxed)
+    /// A single load and no write. Every operator chunk boundary on every
+    /// worker thread polls this, and all clones share one cache line, so a
+    /// read-modify-write here would turn a read-only predicate into
+    /// cross-core coherence traffic in the engine's hottest poll. Run
+    /// liveness is reported on the progress worker's own clock and is never
+    /// derived from how often this predicate is called — a run wedged inside
+    /// one long operation polls nothing and is still alive.
+    pub fn is_requested(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == CANCELLED
     }
 
     /// Atomically cross the point of no return immediately before publication.
@@ -225,19 +218,18 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_polling_advances_a_separate_advisory_checkpoint() {
+    fn polling_the_predicate_never_moves_the_state_machine() {
         let token = ShutdownToken::detached();
-        assert_eq!(token.progress_checkpoints(), 0);
-        assert!(!token.is_requested());
-        assert!(!token.is_requested());
-        assert_eq!(token.progress_checkpoints(), 2);
-
+        for _ in 0..64 {
+            assert!(!token.is_requested());
+        }
         assert!(token.try_begin_publication());
-        let before = token.progress_checkpoints();
+        for _ in 0..64 {
+            assert!(!token.is_requested());
+        }
         token.request();
-        assert_eq!(token.progress_checkpoints(), before);
         assert!(!token.is_requested());
-        assert_eq!(token.progress_checkpoints(), before + 1);
+        assert!(token.try_begin_publication());
     }
 
     #[cfg(not(target_arch = "wasm32"))]

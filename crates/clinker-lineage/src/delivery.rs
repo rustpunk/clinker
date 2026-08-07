@@ -11,6 +11,12 @@ use clinker_plan::config::{ObservabilityDropPolicy, ResolvedLineageDeliveryPolic
 
 use crate::RunEvent;
 
+/// How many times a finite export re-attempts the queue lock before it treats
+/// contention as a drop. Each attempt yields, and the lock is only ever held
+/// across a `VecDeque` push or pop, so exhausting this bound means something
+/// other than ordinary contention is wrong.
+const PRODUCER_LOCK_RETRIES: usize = 64;
+
 /// Fixed delivery limits copied from the admitted workspace policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LineageDeliveryConfig {
@@ -97,6 +103,9 @@ pub enum LineageAdmission {
     Accepted,
     /// Serialization exceeded the admitted per-event byte cap.
     DroppedEventTooLarge,
+    /// The event could not be serialized at all. Distinct from
+    /// [`Self::DroppedEventTooLarge`]: raising the byte cap does not fix it.
+    DroppedEncodingFailed,
     /// The byte-accounted queue was full, so the newest event was dropped.
     DroppedQueueFull,
     /// Another producer or the worker briefly owned the queue lock.
@@ -218,12 +227,27 @@ impl DeliveryQueue {
         }
     }
 
-    fn try_push(&self, event: Box<[u8]>) -> QueueAdmission {
+    /// Admit one event without waiting on capacity or the sink.
+    ///
+    /// `lock_retries` bounds how many times the producer re-attempts the
+    /// queue lock itself. The lock is held only for the length of one
+    /// `VecDeque` push or pop — plus the instant between the worker taking it
+    /// and `Condvar::wait` releasing it — so contention there says nothing
+    /// about capacity, the cap, or the sink. Capacity and shutdown outcomes
+    /// are never retried.
+    fn try_push(&self, event: Box<[u8]>, lock_retries: usize) -> QueueAdmission {
         let event_bytes = event.len();
-        let mut state = match self.state.try_lock() {
-            Ok(state) => state,
-            Err(TryLockError::WouldBlock) => return QueueAdmission::Busy,
-            Err(TryLockError::Poisoned(_)) => return QueueAdmission::Closed,
+        let mut remaining = lock_retries;
+        let mut state = loop {
+            match self.state.try_lock() {
+                Ok(state) => break state,
+                Err(TryLockError::WouldBlock) if remaining > 0 => {
+                    remaining -= 1;
+                    thread::yield_now();
+                }
+                Err(TryLockError::WouldBlock) => return QueueAdmission::Busy,
+                Err(TryLockError::Poisoned(_)) => return QueueAdmission::Closed,
+            }
         };
         if state.closed {
             return QueueAdmission::Closed;
@@ -301,11 +325,30 @@ impl Write for CappedEventBuffer {
     }
 }
 
-fn serialize_event(event: &RunEvent, limit: usize) -> Option<Box<[u8]>> {
+/// Outcome of bounding one event into an owned buffer.
+enum SerializedEvent {
+    Bounded(Box<[u8]>),
+    TooLarge,
+    EncodingFailed,
+}
+
+fn serialize_event(event: &RunEvent, limit: usize) -> SerializedEvent {
     let mut buffer = CappedEventBuffer::new(limit);
-    serde_json::to_writer(&mut buffer, event).ok()?;
-    buffer.write_all(b"\n").ok()?;
-    Some(buffer.finish())
+    if let Err(error) = serde_json::to_writer(&mut buffer, event) {
+        // `CappedEventBuffer` is the only writer here and its sole failure is
+        // refusing the write that would cross the cap, which serde reports as
+        // an I/O error. Anything else came from the serializer itself and
+        // raising the cap would not fix it, so the two must not be conflated.
+        return if error.is_io() {
+            SerializedEvent::TooLarge
+        } else {
+            SerializedEvent::EncodingFailed
+        };
+    }
+    match buffer.write_all(b"\n") {
+        Ok(()) => SerializedEvent::Bounded(buffer.finish()),
+        Err(_) => SerializedEvent::TooLarge,
+    }
 }
 
 fn run_worker<W: Write>(queue: &DeliveryQueue, sink: &mut W) -> LineageDeliveryTerminal {
@@ -371,12 +414,38 @@ impl LineageDelivery {
 
     /// Serialize a complete event into an owned capped buffer, then attempt
     /// immediate drop-newest admission without waiting on capacity or the sink.
+    ///
+    /// This is the bulkhead form: it runs beside a live pipeline, so it never
+    /// waits, not even on the queue lock. Callers whose entire job is the
+    /// export should use [`Self::emit_export`] instead.
     pub fn try_emit(&self, event: &RunEvent) -> LineageAdmission {
-        let Some(bytes) = serialize_event(event, self.config.max_event_bytes) else {
-            Counters::increment(&self.counters.dropped);
-            return LineageAdmission::DroppedEventTooLarge;
+        self.emit(event, 0)
+    }
+
+    /// Admit one event for a finite export that is the caller's whole job.
+    ///
+    /// Identical to [`Self::try_emit`] except that the transient queue-lock
+    /// window is retried rather than counted as a drop. A plan-only export
+    /// has no running pipeline to protect, so losing an event to the instant
+    /// the worker holds the lock would be a defect, not backpressure. Byte
+    /// caps, queue capacity, and worker shutdown are reported unchanged.
+    pub fn emit_export(&self, event: &RunEvent) -> LineageAdmission {
+        self.emit(event, PRODUCER_LOCK_RETRIES)
+    }
+
+    fn emit(&self, event: &RunEvent, lock_retries: usize) -> LineageAdmission {
+        let bytes = match serialize_event(event, self.config.max_event_bytes) {
+            SerializedEvent::Bounded(bytes) => bytes,
+            SerializedEvent::TooLarge => {
+                Counters::increment(&self.counters.dropped);
+                return LineageAdmission::DroppedEventTooLarge;
+            }
+            SerializedEvent::EncodingFailed => {
+                Counters::increment(&self.counters.dropped);
+                return LineageAdmission::DroppedEncodingFailed;
+            }
         };
-        match self.queue.try_push(bytes) {
+        match self.queue.try_push(bytes, lock_retries) {
             QueueAdmission::Accepted => {
                 Counters::increment(&self.counters.accepted);
                 LineageAdmission::Accepted

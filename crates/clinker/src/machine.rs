@@ -16,6 +16,9 @@ use crate::{MachineFormat, RunArgs};
 const MAX_EVENT_BYTES: usize = 16 * 1024;
 const MAX_BATCH_ID_BYTES: usize = 256;
 const PUBLICATION_ARTIFACTS_PER_EVENT: usize = 64;
+/// Wake cadence of the progress worker. `BoundedProgress` throttles what
+/// actually reaches the stream; this only bounds how late a due snapshot is.
+const PROGRESS_TICK: Duration = Duration::from_millis(20);
 
 /// One ordered serializer and terminal arbiter for a controlled invocation.
 #[derive(Clone)]
@@ -31,6 +34,10 @@ struct MachineState {
     sequence: u64,
     plan_identity: serde_json::Value,
     terminal_reserved: bool,
+    /// Classification of a `failed` terminal whose encoding did not fit the
+    /// event bound. The slot is still free after such a failure, so this is
+    /// what the next terminal attempt must report instead of inventing one.
+    attempted_failure: Option<FailureClassification>,
     observability: Option<ObservabilitySummary>,
     progress: BoundedProgress,
 }
@@ -86,6 +93,7 @@ impl MachineEmitter {
                 sequence: 0,
                 plan_identity: serde_json::json!({"status": "pending"}),
                 terminal_reserved: false,
+                attempted_failure: None,
                 observability: None,
                 progress: BoundedProgress::default(),
             })),
@@ -131,23 +139,33 @@ impl MachineEmitter {
     pub(crate) fn emit_progress_transition(&self, phase: &str) -> io::Result<()> {
         self.with_state(|state| {
             let snapshot = state.progress.transition(phase);
-            state.write_progress(snapshot, None)
+            state.write_progress(snapshot)
         })
     }
 
-    fn emit_periodic(&self, checkpoints: u64) -> io::Result<()> {
-        self.with_state(|state| {
-            let Some(snapshot) = state.progress.periodic("executing") else {
-                return Ok(());
-            };
-            state.write_progress(snapshot, Some(checkpoints))
-        })
+    /// Write one discardable periodic observation.
+    ///
+    /// Deliberately not routed through [`Self::with_state`]: losing an
+    /// advisory snapshot is not evidence that the run must stop. Cancelling
+    /// here would destroy a healthy run's computed output over a record the
+    /// protocol allows to be missing. A control channel that is genuinely
+    /// broken still fails closed at the next *required* record — the
+    /// finalizing transition or the terminal.
+    fn emit_periodic(&self) -> io::Result<()> {
+        let mut state = self.lock_state();
+        let Some(snapshot) = state.progress.periodic("executing") else {
+            return Ok(());
+        };
+        state.write_progress(snapshot)
     }
 
-    pub(crate) fn start_execution_progress(
-        &self,
-        token: ShutdownToken,
-    ) -> io::Result<MachineProgressWorker> {
+    /// Start the periodic liveness worker.
+    ///
+    /// The cadence is the worker's own clock, not the engine's cancellation
+    /// polling: a run blocked inside one long operation — a large spill
+    /// merge, a slow REST page — polls no token and must still look alive to
+    /// a supervisor reading the stream.
+    pub(crate) fn start_execution_progress(&self) -> io::Result<MachineProgressWorker> {
         #[cfg(debug_assertions)]
         if std::env::var_os("CLINKER_TEST_MACHINE_PROGRESS_WORKER_START_FAILURE").as_deref()
             == Some(std::ffi::OsStr::new("1"))
@@ -161,17 +179,12 @@ impl MachineEmitter {
         let handle = thread::Builder::new()
             .name("clinker-machine-progress".to_owned())
             .spawn(move || {
-                let mut observed = token.progress_checkpoints();
                 loop {
-                    match receiver.recv_timeout(Duration::from_millis(20)) {
+                    match receiver.recv_timeout(PROGRESS_TICK) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
-                    let checkpoints = token.progress_checkpoints();
-                    if checkpoints > observed {
-                        observed = checkpoints;
-                        emitter.emit_periodic(checkpoints)?;
-                    }
+                    emitter.emit_periodic()?;
                 }
             })?;
         Ok(MachineProgressWorker { stop, handle })
@@ -187,13 +200,20 @@ impl MachineEmitter {
         publication: Option<&AttemptPublicationOutcome>,
     ) -> io::Result<()> {
         self.with_state(|state| {
-            if exit_code == 130 {
-                return state.write_terminal_event("cancelled", serde_json::Map::new(), None);
-            }
-            let result = if exit_code == 2 {
-                "completed_with_dlq"
-            } else {
-                "success"
+            let result = match exit_code {
+                0 => "success",
+                2 => "completed_with_dlq",
+                130 => {
+                    return state.write_terminal_event("cancelled", serde_json::Map::new(), None);
+                }
+                // No other exit code has a `completed` meaning. Reaching here
+                // means an earlier `failed` terminal could not be encoded and
+                // left the one terminal slot free, so this call is the last
+                // chance to state the truth. Relabelling a failed run as
+                // success is the one terminal a supervisor cannot recover
+                // from: it reconciles a non-zero exit against a success
+                // result and reports the batch as done.
+                _ => return state.write_unrepresentable_exit_terminal(exit_code, publication),
             };
             let fields = serde_json::Map::from_iter([
                 ("result".to_owned(), serde_json::json!(result)),
@@ -222,19 +242,8 @@ impl MachineEmitter {
                 state.plan_identity =
                     serde_json::json!({"status": "unavailable", "reason": "admission_failed"});
             }
-            let fields = serde_json::Map::from_iter([
-                (
-                    "failure".to_owned(),
-                    serde_json::json!({
-                        "code": failure.code(),
-                        "category": failure.category().as_str(),
-                        "retry": failure.retry_advice().as_str(),
-                        "message": failure.message(),
-                    }),
-                ),
-                ("exit_code".to_owned(), serde_json::json!(exit_code)),
-            ]);
-            state.write_terminal_event("failed", fields, publication)
+            state.attempted_failure = Some(failure.clone());
+            state.write_terminal_event("failed", failure_fields(failure, exit_code), publication)
         })
     }
 
@@ -281,6 +290,24 @@ impl MachineState {
     ) -> io::Result<()> {
         let encoded = self.encode_event(event, fields, self.sequence)?;
         self.write_encoded_event(&encoded)
+    }
+
+    /// Terminal for an exit code the `completed` family cannot express.
+    ///
+    /// The classification is the one an earlier `failed` emission already
+    /// attempted, so the recovered terminal carries the run's real failure
+    /// rather than a substitute. Without that record the code alone is all
+    /// that is known, and an exit the protocol has no family for is a
+    /// violation of this emitter's own contract.
+    fn write_unrepresentable_exit_terminal(
+        &mut self,
+        exit_code: u8,
+        publication: Option<&AttemptPublicationOutcome>,
+    ) -> io::Result<()> {
+        let failure = self.attempted_failure.clone().unwrap_or_else(|| {
+            FailureClassification::unknown_internal("run exit code has no machine terminal family")
+        });
+        self.write_terminal_event("failed", failure_fields(&failure, exit_code), publication)
     }
 
     fn write_terminal_event(
@@ -368,19 +395,12 @@ impl MachineState {
         Ok(())
     }
 
-    fn write_progress(
-        &mut self,
-        snapshot: ProgressSnapshot,
-        checkpoints: Option<u64>,
-    ) -> io::Result<()> {
-        let mut progress = serde_json::json!({
+    fn write_progress(&mut self, snapshot: ProgressSnapshot) -> io::Result<()> {
+        let progress = serde_json::json!({
             "phase": snapshot.phase(),
             "kind": snapshot.kind().as_str(),
             "elapsed_ms": snapshot.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         });
-        if let Some(checkpoints) = checkpoints {
-            progress["checkpoints"] = serde_json::json!(checkpoints);
-        }
         let fields = serde_json::Map::from_iter([
             ("progress".to_owned(), progress),
             (
@@ -393,6 +413,24 @@ impl MachineState {
         ]);
         self.write_event("progress", fields)
     }
+}
+
+fn failure_fields(
+    failure: &FailureClassification,
+    exit_code: u8,
+) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([
+        (
+            "failure".to_owned(),
+            serde_json::json!({
+                "code": failure.code(),
+                "category": failure.category().as_str(),
+                "retry": failure.retry_advice().as_str(),
+                "message": failure.message(),
+            }),
+        ),
+        ("exit_code".to_owned(), serde_json::json!(exit_code)),
+    ])
 }
 
 fn publication_payloads(
@@ -500,11 +538,13 @@ fn injected_write_failure(
         return false;
     };
     match point.to_string_lossy().as_ref() {
+        "periodic" => event == "progress" && fields["progress"]["kind"] == "periodic",
         "finalizing" => {
             event == "progress"
                 && fields["progress"]["kind"] == "transition"
                 && fields["progress"]["phase"] == "finalizing"
         }
+        "failed_terminal" => event == "failed",
         "terminal" => matches!(event, "completed" | "failed" | "cancelled"),
         _ => false,
     }
@@ -540,17 +580,62 @@ fn stdout_conflict(args: &RunArgs) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// Writer that keeps every flushed byte readable by the test that owns it.
+    #[derive(Clone)]
+    struct SharedSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn events(sink: &SharedSink) -> Vec<serde_json::Value> {
+        let bytes = sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        std::str::from_utf8(&bytes)
+            .expect("machine stream is UTF-8")
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("every record is JSON"))
+            .collect()
+    }
+
+    fn capturing_emitter() -> (MachineEmitter, SharedSink) {
+        let sink = SharedSink(Arc::new(Mutex::new(Vec::new())));
+        let emitter = MachineEmitter::with_writer("batch".to_owned(), Box::new(sink.clone()));
+        (emitter, sink)
+    }
+
     fn state() -> MachineState {
-        MachineState {
-            writer: BufWriter::new(Box::new(Vec::<u8>::new())),
+        capturing_state().0
+    }
+
+    fn capturing_state() -> (MachineState, SharedSink) {
+        let sink = SharedSink(Arc::new(Mutex::new(Vec::new())));
+        let state = MachineState {
+            writer: BufWriter::new(Box::new(sink.clone())),
             batch_id: "batch".to_owned(),
             execution_id: "018f47a2-9a41-7a27-b4d6-4f7137e3c159".to_owned(),
             sequence: 0,
             plan_identity: serde_json::json!({"status": "resolved"}),
             terminal_reserved: false,
+            attempted_failure: None,
             observability: None,
             progress: BoundedProgress::default(),
-        }
+        };
+        (state, sink)
     }
 
     #[test]
@@ -610,5 +695,76 @@ mod tests {
             .expect("later bounded terminal remains available");
         assert!(state.terminal_reserved);
         assert_eq!(state.sequence, 1);
+    }
+
+    #[test]
+    fn an_exit_code_outside_the_completed_family_is_never_labelled_success() {
+        let (emitter, sink) = capturing_emitter();
+        emitter.emit_completed(4).expect("terminal");
+
+        let stream = events(&sink);
+        let terminal = stream.last().expect("terminal record");
+        assert_eq!(terminal["event"], "failed");
+        assert_eq!(terminal["exit_code"], 4);
+        assert_eq!(terminal["failure"]["code"], "runtime.invariant.unknown");
+        assert!(
+            stream.iter().all(|event| event["result"] != "success"),
+            "a non-zero exit must never reconcile against a success result: {stream:#?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_terminal_that_did_not_fit_is_recovered_with_its_own_classification() {
+        let (mut state, sink) = capturing_state();
+        let failure = FailureClassification::for_code("attempt.publication.promotion_failed")
+            .expect("registered code");
+        let mut oversized = failure_fields(&failure, 4);
+        oversized.insert(
+            "detail".to_owned(),
+            serde_json::json!("x".repeat(MAX_EVENT_BYTES)),
+        );
+        state.attempted_failure = Some(failure);
+        assert!(
+            state
+                .write_terminal_event("failed", oversized, None)
+                .is_err()
+        );
+        assert!(!state.terminal_reserved);
+
+        // This is the call `main()`'s `Ok(4)` arm makes against the still-free
+        // slot; it must restate the publication failure, not relabel it.
+        state
+            .write_unrepresentable_exit_terminal(4, None)
+            .expect("recovered terminal");
+
+        let terminal = events(&sink).pop().expect("terminal record");
+        assert_eq!(terminal["event"], "failed");
+        assert_eq!(terminal["exit_code"], 4);
+        assert_eq!(
+            terminal["failure"]["code"],
+            "attempt.publication.promotion_failed"
+        );
+    }
+
+    #[test]
+    fn periodic_liveness_does_not_depend_on_cancellation_polling() {
+        let (emitter, sink) = capturing_emitter();
+        let worker = emitter
+            .start_execution_progress()
+            .expect("progress worker starts");
+        // Nothing polls the run's shutdown token here, exactly like a run
+        // wedged inside one long spill merge or one slow REST page.
+        thread::sleep(PROGRESS_TICK * 10);
+        worker.finish().expect("progress worker drains");
+
+        let periodics = events(&sink)
+            .into_iter()
+            .filter(|event| event["event"] == "progress" && event["progress"]["kind"] == "periodic")
+            .collect::<Vec<_>>();
+        assert!(
+            !periodics.is_empty(),
+            "liveness must come from the worker's own clock"
+        );
+        assert_eq!(periodics[0]["progress"]["phase"], "executing");
     }
 }

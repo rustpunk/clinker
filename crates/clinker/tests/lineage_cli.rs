@@ -1128,3 +1128,101 @@ fn delivery_isolation() {
     assert!(stderr.contains("lineage sink received bytes"), "{stderr}");
     assert!(stderr.contains("deadline-exceeded"), "{stderr}");
 }
+
+/// Rewrite the workspace policy with explicit lineage caps, which are
+/// otherwise defaulted. Regenerates the base policy so repeated calls cannot
+/// stack duplicate keys into the same table.
+fn set_lineage_caps(dir: &Path, queue_bytes: &str, max_event_bytes: &str) {
+    external_lineage_policy(dir, true);
+    let policy = std::fs::read_to_string(dir.join("clinker.toml"))
+        .expect("read external lineage policy")
+        .replace(
+            "[observability.lineage]\n",
+            &format!(
+                "[observability.lineage]\nqueue_bytes = \"{queue_bytes}\"\nmax_event_bytes = \"{max_event_bytes}\"\n"
+            ),
+        );
+    std::fs::write(dir.join("clinker.toml"), policy).expect("write capped lineage policy");
+}
+
+/// The plan-only export is the entire invocation: an export that delivered
+/// nothing must not look like a successful one to the CI step that uploads it.
+#[test]
+fn lineage_export_dropped_by_the_event_cap_is_reported_not_silently_empty() {
+    let workspace = tempfile::tempdir().expect("capped export workspace");
+    write_pipeline(workspace.path(), "./out.csv");
+    external_lineage_policy(workspace.path(), true);
+    set_lineage_caps(workspace.path(), "512", "512");
+
+    let output = Command::new(clinker_bin())
+        .current_dir(workspace.path())
+        .args(["run", "pipeline.yaml", "--lineage", "lineage.ndjson"])
+        .output()
+        .expect("run capped lineage export");
+
+    // Exit 1 is the status documented for an export the configured caps
+    // rejected: the fix is a configuration change, not a retry.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an export that delivered nothing cannot exit 0"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("lineage.ndjson"),
+        "the diagnostic must name the destination: {stderr}"
+    );
+    assert!(
+        stderr.contains("observability.lineage.max_event_bytes"),
+        "the diagnostic must name the rule that dropped the events: {stderr}"
+    );
+    assert!(
+        !workspace.path().join("lineage.ndjson").exists(),
+        "no export was written, so no file may be left behind for a later step to upload"
+    );
+
+    // The correction the diagnostic prints has to be one the parser accepts and
+    // that actually restores the export.
+    assert!(
+        stderr.contains("queue_bytes = \"1MB\"") && stderr.contains("max_event_bytes = \"1MB\""),
+        "the diagnostic must carry a pasteable correction: {stderr}"
+    );
+    set_lineage_caps(workspace.path(), "1MB", "1MB");
+    let corrected = Command::new(clinker_bin())
+        .current_dir(workspace.path())
+        .args(["run", "pipeline.yaml", "--lineage", "lineage.ndjson"])
+        .output()
+        .expect("run corrected lineage export");
+    assert!(
+        corrected.status.success(),
+        "the printed correction must be accepted by the parser it targets:\n{}",
+        String::from_utf8_lossy(&corrected.stderr)
+    );
+    let complete = lineage_complete(&workspace.path().join("lineage.ndjson"));
+    assert_eq!(complete["eventType"], "COMPLETE");
+}
+
+#[test]
+fn lineage_export_sink_write_failure_is_reported() {
+    let workspace = tempfile::tempdir().expect("unwritable export workspace");
+    write_pipeline(workspace.path(), "./out.csv");
+    external_lineage_policy(workspace.path(), true);
+
+    let output = Command::new(clinker_bin())
+        .current_dir(workspace.path())
+        .env("CLINKER_TEST_LINEAGE_SINK", "write-failed")
+        .args(["run", "pipeline.yaml", "--lineage", "lineage.ndjson"])
+        .output()
+        .expect("run failing-sink lineage export");
+
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot write --lineage output") && stderr.contains("lineage.ndjson"),
+        "the diagnostic must name the destination it could not write: {stderr}"
+    );
+    assert!(
+        stderr.contains("broken-pipe"),
+        "the diagnostic must name what the sink reported: {stderr}"
+    );
+}

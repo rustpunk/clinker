@@ -751,6 +751,113 @@ fn grace_expiry_forces_reaps_and_retries_fresh() {
     );
 }
 
+/// A periodic snapshot is a discardable observation. Losing one must not
+/// relabel a run that executed to completion as interrupted, abandon its
+/// attempt, and report the conventional SIGINT status for a run no operator
+/// cancelled.
+#[test]
+fn a_lost_periodic_observation_does_not_cancel_a_completed_run() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "out.csv", 4_096, true);
+
+    let output = machine_command(directory.path(), "lost-periodic")
+        .env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "periodic")
+        .output()
+        .expect("run with injected periodic write failure");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("machine progress channel failed"),
+        "the injected periodic failure must actually have fired"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert!(directory.path().join("out.csv").exists());
+
+    let events = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).expect("machine event JSON"))
+        .collect::<Vec<_>>();
+    let terminal = events.last().expect("terminal");
+    assert_eq!(terminal["event"], "completed");
+    assert_eq!(terminal["result"], "success");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["progress"]["kind"] == "periodic"),
+        "the advisory records were the ones dropped, not the required ones"
+    );
+}
+
+/// A shutdown signal that trips while a REST request is already in flight
+/// unwinds the run as an error rather than through the drained-report flag.
+/// Both paths are the same operator action, so both must record the same
+/// lineage terminal; a `FAIL` here would page an on-call for a cancellation.
+#[cfg(target_os = "linux")]
+#[test]
+fn sigterm_inside_a_rest_read_records_an_abort_lineage_terminal() {
+    let directory = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    write_hanging_rest_pipeline(directory.path(), address);
+    write_local_lineage_policy(directory.path());
+
+    let (request_ready_tx, request_ready_rx) = mpsc::sync_channel(1);
+    let (sigterm_sent_tx, sigterm_sent_rx) = mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let bytes = stream.read(&mut buffer).expect("read request");
+            assert!(bytes > 0, "request closed before its headers completed");
+            request.extend_from_slice(&buffer[..bytes]);
+        }
+        request_ready_tx.send(()).expect("announce live request");
+        sigterm_sent_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("supervisor sent SIGTERM");
+        // Drop the connection without a response. The child is blocked inside
+        // the request when the signal trips, so the transport failure lands
+        // after cancellation and the reader reports the interruption rather
+        // than reaching a clean page boundary.
+        drop(stream);
+    });
+
+    let mut command = machine_command(directory.path(), "rest-abort");
+    command.args(["--lineage-events", "lineage.ndjson"]);
+    let result = run_child(
+        command,
+        ProcessConfig::new(Duration::from_secs(5)).graceful_trigger(
+            request_ready_rx,
+            sigterm_sent_tx,
+            Duration::from_secs(2),
+        ),
+    )
+    .expect("gracefully supervised run");
+    server.join().expect("server thread");
+
+    assert_eq!(result.status_code(), Some(130));
+    assert_eq!(result.outcome(), ControlledOutcome::Cancelled);
+
+    let lineage = std::fs::read_to_string(directory.path().join("lineage.ndjson"))
+        .expect("read lineage events");
+    let events = lineage
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("lineage event JSON"))
+        .collect::<Vec<_>>();
+    let terminal = events.last().expect("lineage terminal event");
+    assert_eq!(
+        terminal["eventType"], "ABORT",
+        "a cancelled REST read is an abort, not an engine invariant failure: {events:#?}"
+    );
+}
+
 // Keep the imported type part of the test contract: malformed and unsupported
 // streams are represented by the bounded protocol drain, not raw EOF success.
 const _: Option<ProtocolDrain> = None;
