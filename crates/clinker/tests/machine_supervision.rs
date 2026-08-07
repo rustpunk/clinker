@@ -480,6 +480,119 @@ fn real_sigterm_cancels_during_grace() {
     assert_eq!(terminals[0]["event"], "cancelled");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn grace_expiry_forces_reaps_and_retries_fresh() {
+    let directory = fixture();
+    let previous_final = "previous complete artifact\n";
+    std::fs::write(directory.path().join("out.csv"), previous_final).expect("existing final");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    write_hanging_rest_pipeline(directory.path(), address);
+
+    let (request_ready_tx, request_ready_rx) = mpsc::sync_channel(1);
+    let (sigterm_sent_tx, sigterm_sent_rx) = mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let bytes = stream.read(&mut buffer).expect("read request");
+            assert!(bytes > 0, "request closed before its headers completed");
+            request.extend_from_slice(&buffer[..bytes]);
+        }
+        request_ready_tx.send(()).expect("announce live request");
+        sigterm_sent_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("supervisor sent SIGTERM");
+
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("wait for forced socket closure: {error}"),
+            }
+        }
+    });
+
+    let grace = Duration::from_millis(500);
+    let hard_deadline = Duration::from_secs(5);
+    let result = run_child(
+        machine_command(directory.path(), "force-retry"),
+        ProcessConfig::new(hard_deadline).graceful_trigger(
+            request_ready_rx,
+            sigterm_sent_tx,
+            grace,
+        ),
+    )
+    .expect("forced supervised run");
+    server.join().expect("server thread");
+
+    assert!(result.graceful_requested());
+    assert_eq!(result.force_count(), 1, "force must be issued exactly once");
+    assert!(
+        result
+            .observed_grace()
+            .is_some_and(|observed| observed >= grace),
+        "the forced path must honor the configured grace: {:?}",
+        result.observed_grace()
+    );
+    assert!(
+        result
+            .elapsed_to_force()
+            .is_some_and(|elapsed| elapsed < hard_deadline),
+        "grace expiry must force before the total hard deadline: {:?}",
+        result.elapsed_to_force()
+    );
+    assert!(result.reaped());
+    assert!(result.drains_joined_after_reap());
+    assert_eq!(result.outcome(), ControlledOutcome::Incomplete);
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("out.csv")).expect("existing final"),
+        previous_final,
+        "an incomplete attempt cannot replace an older complete final"
+    );
+
+    let first_execution_id = execution_id(result.stdout.events()).to_owned();
+    write_pipeline(directory.path(), "{batch_id}-{execution_id}.csv", 1, false);
+    let retry = run_child(
+        machine_command(directory.path(), "force-retry"),
+        ProcessConfig::new(PROCESS_DEADLINE),
+    )
+    .expect("fresh retry");
+
+    assert_eq!(retry.outcome(), ControlledOutcome::Success);
+    let retry_execution_id = execution_id(retry.stdout.events());
+    assert_ne!(first_execution_id, retry_execution_id);
+    assert_eq!(
+        result.stdout.events()[0]["batch_id"],
+        retry.stdout.events()[0]["batch_id"]
+    );
+    assert!(
+        directory
+            .path()
+            .join(format!("force-retry-{retry_execution_id}.csv"))
+            .exists(),
+        "retry must publish from a new independent execution"
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("out.csv")).expect("existing final"),
+        previous_final,
+        "the retry cannot relabel or overwrite the older final"
+    );
+}
+
 // Keep the imported type part of the test contract: malformed and unsupported
 // streams are represented by the bounded protocol drain, not raw EOF success.
 const _: Option<ProtocolDrain> = None;

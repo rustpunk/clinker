@@ -177,9 +177,13 @@ pub(crate) enum ControlledOutcome {
 pub(crate) struct ProcessResult {
     status: ExitStatus,
     timed_out: bool,
+    started_at: Instant,
     #[cfg(target_os = "linux")]
     graceful_requested_at: Option<Instant>,
     forced_at: Option<Instant>,
+    force_count: usize,
+    reaped_at: Instant,
+    drains_joined_at: Instant,
     pub(crate) stdout: ProtocolDrain,
     pub(crate) stderr: DiagnosticDrain,
 }
@@ -210,6 +214,15 @@ impl ProcessResult {
         self.forced_at.is_some()
     }
 
+    pub(crate) fn force_count(&self) -> usize {
+        self.force_count
+    }
+
+    pub(crate) fn elapsed_to_force(&self) -> Option<Duration> {
+        self.forced_at
+            .map(|forced| forced.saturating_duration_since(self.started_at))
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn observed_grace(&self) -> Option<Duration> {
         self.graceful_requested_at
@@ -218,7 +231,11 @@ impl ProcessResult {
     }
 
     pub(crate) fn reaped(&self) -> bool {
-        true
+        self.reaped_at <= self.drains_joined_at
+    }
+
+    pub(crate) fn drains_joined_after_reap(&self) -> bool {
+        self.drains_joined_at >= self.reaped_at
     }
 }
 
@@ -253,6 +270,7 @@ pub(crate) fn run_child(mut command: Command, config: ProcessConfig) -> io::Resu
     #[cfg(target_os = "linux")]
     let mut grace_deadline = None;
     let mut forced_at = None;
+    let mut force_count = 0_usize;
     let (status, timed_out) = loop {
         match child.try_wait() {
             Ok(Some(_)) => break (child.wait()?, false),
@@ -299,7 +317,7 @@ pub(crate) fn run_child(mut command: Command, config: ProcessConfig) -> io::Resu
 
         let now = Instant::now();
         if now >= hard_deadline {
-            let (status, forced) = match force_and_wait(&mut child) {
+            let (status, forced, forces) = match force_and_wait(&mut child) {
                 Ok(result) => result,
                 Err(error) => {
                     abort_child_and_drains(&mut child, stdout_handle, stderr_handle);
@@ -307,11 +325,12 @@ pub(crate) fn run_child(mut command: Command, config: ProcessConfig) -> io::Resu
                 }
             };
             forced_at = forced;
+            force_count = force_count.saturating_add(forces);
             break (status, true);
         }
         #[cfg(target_os = "linux")]
         if grace_deadline.is_some_and(|deadline| now >= deadline) {
-            let (status, forced) = match force_and_wait(&mut child) {
+            let (status, forced, forces) = match force_and_wait(&mut child) {
                 Ok(result) => result,
                 Err(error) => {
                     abort_child_and_drains(&mut child, stdout_handle, stderr_handle);
@@ -319,31 +338,38 @@ pub(crate) fn run_child(mut command: Command, config: ProcessConfig) -> io::Resu
                 }
             };
             forced_at = forced;
+            force_count = force_count.saturating_add(forces);
             break (status, false);
         }
         thread::sleep(WAIT_POLL_INTERVAL);
     };
 
+    let reaped_at = Instant::now();
     let stdout = join_drain(stdout_handle, "stdout")??;
     let stderr = join_drain(stderr_handle, "stderr")??;
+    let drains_joined_at = Instant::now();
     Ok(ProcessResult {
         status,
         timed_out,
+        started_at: started,
         #[cfg(target_os = "linux")]
         graceful_requested_at,
         forced_at,
+        force_count,
+        reaped_at,
+        drains_joined_at,
         stdout,
         stderr,
     })
 }
 
-fn force_and_wait(child: &mut Child) -> io::Result<(ExitStatus, Option<Instant>)> {
+fn force_and_wait(child: &mut Child) -> io::Result<(ExitStatus, Option<Instant>, usize)> {
     if child.try_wait()?.is_some() {
-        return child.wait().map(|status| (status, None));
+        return child.wait().map(|status| (status, None, 0));
     }
     let forced_at = Instant::now();
     child.kill()?;
-    child.wait().map(|status| (status, Some(forced_at)))
+    child.wait().map(|status| (status, Some(forced_at), 1))
 }
 
 fn abort_child_and_drains(
