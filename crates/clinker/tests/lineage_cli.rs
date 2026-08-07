@@ -213,6 +213,187 @@ fn write_pipeline(dir: &Path, output_path: &str) -> PathBuf {
     path
 }
 
+fn write_lineage_policy(dir: &Path, identity_mode: &str, datasets: &str) {
+    let policy = format!(
+        r#"[observability]
+
+[observability.otlp]
+endpoint = "https://collector.example.com"
+
+[observability.otlp.auth]
+mode = "none"
+
+[observability.lineage]
+identity_mode = "{identity_mode}"
+
+{datasets}"#
+    );
+    std::fs::write(dir.join("clinker.toml"), policy).expect("write lineage identity policy");
+}
+
+fn external_lineage_policy(dir: &Path, include_output: bool) {
+    let output = if include_output {
+        r#"
+[[observability.lineage.dataset]]
+node = "out"
+catalog_namespace = "analytics"
+catalog_name = "lineage_fixture"
+"#
+    } else {
+        ""
+    };
+    write_lineage_policy(
+        dir,
+        "external",
+        &format!(
+            r#"[[observability.lineage.dataset]]
+node = "src"
+canonical_datasource = "s3://warehouse/lineage_fixture"
+{output}"#
+        ),
+    );
+}
+
+fn lineage_complete(path: &Path) -> serde_json::Value {
+    let contents = std::fs::read_to_string(path).expect("read lineage event file");
+    let events: Vec<serde_json::Value> = contents
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("lineage event is JSON"))
+        .collect();
+    assert_eq!(events.len(), 2, "expected START and COMPLETE: {events:#?}");
+    assert_eq!(events[1]["eventType"], "COMPLETE");
+    events[1].clone()
+}
+
+#[test]
+fn identity_preflight_and_local_compatibility() {
+    let external = tempfile::tempdir().expect("external workspace");
+    write_pipeline(external.path(), "./out.csv");
+    external_lineage_policy(external.path(), true);
+    let event_path = external.path().join("external.ndjson");
+    let output = Command::new(clinker_bin())
+        .current_dir(external.path())
+        .args(["run", "pipeline.yaml", "--lineage", "external.ndjson"])
+        .output()
+        .expect("run external lineage export");
+    assert!(
+        output.status.success(),
+        "external identity export failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let complete = lineage_complete(&event_path);
+    assert_eq!(complete["inputs"][0]["namespace"], "s3://warehouse");
+    assert_eq!(complete["inputs"][0]["name"], "lineage_fixture");
+    assert_eq!(complete["outputs"][0]["namespace"], "analytics");
+    assert_eq!(complete["outputs"][0]["name"], "lineage_fixture");
+    assert!(
+        !complete
+            .to_string()
+            .contains(external.path().to_string_lossy().as_ref()),
+        "external lineage must not disclose the physical workspace"
+    );
+
+    let relocated = tempfile::tempdir().expect("relocated workspace");
+    write_pipeline(relocated.path(), "./different/out.csv");
+    external_lineage_policy(relocated.path(), true);
+    let relocated_output = Command::new(clinker_bin())
+        .current_dir(relocated.path())
+        .args(["run", "pipeline.yaml", "--lineage", "relocated.ndjson"])
+        .output()
+        .expect("run relocated lineage export");
+    assert!(
+        relocated_output.status.success(),
+        "relocated export failed:\n{}",
+        String::from_utf8_lossy(&relocated_output.stderr)
+    );
+    let relocated_complete = lineage_complete(&relocated.path().join("relocated.ndjson"));
+    assert_eq!(
+        complete["inputs"], relocated_complete["inputs"],
+        "source identity is independent of physical placement"
+    );
+    assert_eq!(
+        complete["outputs"], relocated_complete["outputs"],
+        "output identity is independent of physical placement"
+    );
+
+    let incomplete = tempfile::tempdir().expect("incomplete external workspace");
+    write_pipeline(incomplete.path(), "./must-not-exist.csv");
+    external_lineage_policy(incomplete.path(), false);
+    let rejected = Command::new(clinker_bin())
+        .current_dir(incomplete.path())
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--lineage",
+            "must-not-exist.ndjson",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "identity-preflight",
+        ])
+        .output()
+        .expect("run incomplete identity preflight");
+    assert_eq!(rejected.status.code(), Some(1));
+    let terminal: serde_json::Value = serde_json::from_slice(
+        rejected
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .last()
+            .expect("machine terminal event"),
+    )
+    .expect("machine terminal is JSON");
+    assert_eq!(terminal["event"], "failed");
+    assert_eq!(
+        terminal["failure"]["code"],
+        "observability.configuration.invalid"
+    );
+    assert!(
+        !incomplete.path().join("must-not-exist.ndjson").exists(),
+        "identity preflight must run before opening the lineage sink"
+    );
+    assert!(
+        !incomplete.path().join("must-not-exist.csv").exists(),
+        "identity preflight must run before output effects"
+    );
+
+    let local = tempfile::tempdir().expect("local compatibility workspace");
+    write_pipeline(local.path(), "./local.csv");
+    write_lineage_policy(local.path(), "local_diagnostic_paths", "");
+    let local_output = Command::new(clinker_bin())
+        .current_dir(local.path())
+        .args(["run", "pipeline.yaml", "--lineage", "local.ndjson"])
+        .output()
+        .expect("run local compatibility export");
+    assert!(local_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&local_output.stderr)
+            .contains("local_diagnostic_paths (local diagnostic compatibility only)"),
+        "local compatibility output must be visibly labeled"
+    );
+    let local_complete = lineage_complete(&local.path().join("local.ndjson"));
+    assert!(
+        local_complete["outputs"][0]["name"]
+            .as_str()
+            .expect("local dataset name")
+            .ends_with("local.csv")
+    );
+
+    let absent = tempfile::tempdir().expect("absent policy workspace");
+    write_pipeline(absent.path(), "./absent.csv");
+    let absent_output = Command::new(clinker_bin())
+        .current_dir(absent.path())
+        .args(["run", "pipeline.yaml", "--lineage", "absent.ndjson"])
+        .output()
+        .expect("run absent identity policy");
+    assert_eq!(absent_output.status.code(), Some(1));
+    assert!(
+        !absent.path().join("absent.ndjson").exists(),
+        "path identity must require the exact explicit compatibility mode"
+    );
+}
+
 fn output_dataset_name(pipeline: &Path, base_dir: Option<&Path>) -> String {
     let mut cmd = Command::new(clinker_bin());
     cmd.arg("run").arg(pipeline).args(["--lineage", "-"]);
