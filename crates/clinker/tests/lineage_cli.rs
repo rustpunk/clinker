@@ -928,3 +928,93 @@ fn lineage_events_conflicts_with_lineage() {
         "expected a clap conflict error, got:\n{stderr}"
     );
 }
+
+#[test]
+fn delivery_isolation() {
+    fn run(workspace: &Path, inject_hang: bool) -> (std::process::Output, Duration) {
+        let started = std::time::Instant::now();
+        let mut command = Command::new(clinker_bin());
+        command.current_dir(workspace).args([
+            "run",
+            "pipeline.yaml",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "delivery-isolation",
+            "--lineage-events",
+            "events.ndjson",
+        ]);
+        if inject_hang {
+            command.env("CLINKER_TEST_LINEAGE_SINK", "hang-after-first-write");
+        }
+        let output = command.output().expect("run delivery isolation fixture");
+        (output, started.elapsed())
+    }
+
+    fn prepare(workspace: &Path) {
+        write_runnable_pipeline(workspace, None);
+        external_lineage_policy(workspace, true);
+        let policy = std::fs::read_to_string(workspace.join("clinker.toml"))
+            .expect("read external lineage policy")
+            .replace(
+                "[observability.lineage]\n",
+                "[observability.lineage]\nqueue_bytes = \"4KB\"\nmax_event_bytes = \"4KB\"\nflush_timeout_ms = 50\n",
+            );
+        std::fs::write(workspace.join("clinker.toml"), policy)
+            .expect("write bounded lineage policy");
+    }
+
+    fn authoritative_files(workspace: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        ["pipeline.yaml", "clinker.toml", "data/in.csv", "out.csv"]
+            .into_iter()
+            .map(|path| {
+                (
+                    PathBuf::from(path),
+                    std::fs::read(workspace.join(path)).expect("read authoritative fixture file"),
+                )
+            })
+            .collect()
+    }
+
+    fn terminal_truth(output: &std::process::Output) -> serde_json::Value {
+        let terminal = machine_events(output)
+            .into_iter()
+            .last()
+            .expect("machine terminal event");
+        serde_json::json!({
+            "event": terminal["event"],
+            "batch_id": terminal["batch_id"],
+            "counts": terminal["counts"],
+            "failure": terminal["failure"],
+            "publication": terminal["publication"],
+        })
+    }
+
+    let oracle = tempfile::tempdir().expect("delivery oracle workspace");
+    prepare(oracle.path());
+    let (oracle_output, _) = run(oracle.path(), false);
+    assert!(oracle_output.status.success());
+
+    let hung = tempfile::tempdir().expect("hung delivery workspace");
+    prepare(hung.path());
+    let (hung_output, elapsed) = run(hung.path(), true);
+    assert_eq!(hung_output.status.code(), oracle_output.status.code());
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "hung sink controlled CLI return"
+    );
+    assert_eq!(terminal_truth(&hung_output), terminal_truth(&oracle_output));
+    assert_eq!(
+        authoritative_files(hung.path()),
+        authoritative_files(oracle.path())
+    );
+    assert!(!hung.path().join("dlq.ndjson").exists());
+    assert!(!oracle.path().join("dlq.ndjson").exists());
+    assert!(
+        !hung.path().join(".clinker-attempts").exists(),
+        "successful publication must leave no retained attempt ownership"
+    );
+    let stderr = String::from_utf8_lossy(&hung_output.stderr);
+    assert!(stderr.contains("lineage sink received bytes"), "{stderr}");
+    assert!(stderr.contains("deadline-exceeded"), "{stderr}");
+}
