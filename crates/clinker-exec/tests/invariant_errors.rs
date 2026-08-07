@@ -127,6 +127,48 @@ struct DispatchMismatchCase {
     invoke: DispatchMismatchProbe,
 }
 
+fn assert_dispatch_mismatch_cases(dag: &ExecutionPlanDag, cases: &[DispatchMismatchCase]) {
+    for case in cases {
+        let (node_idx, node) = dag
+            .graph
+            .node_indices()
+            .map(|idx| (idx, &dag.graph[idx]))
+            .find(|(_, node)| node.name() == case.node_name)
+            .unwrap_or_else(|| panic!("compiled {} exists", case.node_name));
+        let returned = catch_unwind(AssertUnwindSafe(|| (case.invoke)(dag, node_idx, node)));
+        let Ok(returned) = returned else {
+            panic!("{} mismatch must return", case.dispatcher);
+        };
+        let error = match returned {
+            Ok(()) => panic!("{} must reject a {}", case.dispatcher, case.actual_kind),
+            Err(error) => error,
+        };
+        let PipelineError::DispatchMismatch {
+            dispatcher,
+            expected_kind,
+            actual_kind,
+            node,
+        } = &error
+        else {
+            panic!("{} returned unexpected error: {error}", case.dispatcher);
+        };
+        assert_eq!(*dispatcher, case.dispatcher);
+        assert_eq!(*expected_kind, case.expected_kind);
+        assert_eq!(*actual_kind, case.actual_kind);
+        assert_eq!(node, case.node_name);
+
+        let classification = error
+            .failure_classification()
+            .expect("dispatch mismatches have a shared classification");
+        assert_eq!(classification.code(), "runtime.invariant.dispatch_mismatch");
+        assert_eq!(
+            classification.category(),
+            FailureCategory::InternalInvariant
+        );
+        assert_eq!(classification.retry_advice(), RetryAdvice::PolicyRequired);
+    }
+}
+
 #[test]
 fn aggregate_and_source_transform_and_composition_dispatch_mismatch_matrix() {
     let plan = load_config_from_str(PIPELINE_YAML)
@@ -165,43 +207,48 @@ fn aggregate_and_source_transform_and_composition_dispatch_mismatch_matrix() {
         },
     ];
 
-    for case in cases {
-        let (node_idx, node) = dag
-            .graph
-            .node_indices()
-            .map(|idx| (idx, &dag.graph[idx]))
-            .find(|(_, node)| node.name() == case.node_name)
-            .unwrap_or_else(|| panic!("compiled {} exists", case.node_name));
-        let returned = catch_unwind(AssertUnwindSafe(|| (case.invoke)(dag, node_idx, node)))
-            .unwrap_or_else(|_| panic!("{} mismatch must return", case.dispatcher));
-        let error = match returned {
-            Ok(()) => panic!("{} must reject a {}", case.dispatcher, case.actual_kind),
-            Err(error) => error,
-        };
-        let PipelineError::DispatchMismatch {
-            dispatcher,
-            expected_kind,
-            actual_kind,
-            node,
-        } = &error
-        else {
-            panic!("{} returned unexpected error: {error}", case.dispatcher);
-        };
-        assert_eq!(*dispatcher, case.dispatcher);
-        assert_eq!(*expected_kind, case.expected_kind);
-        assert_eq!(*actual_kind, case.actual_kind);
-        assert_eq!(node, case.node_name);
+    assert_dispatch_mismatch_cases(dag, &cases);
+}
 
-        let classification = error
-            .failure_classification()
-            .expect("dispatch mismatches have a shared classification");
-        assert_eq!(classification.code(), "runtime.invariant.dispatch_mismatch");
-        assert_eq!(
-            classification.category(),
-            FailureCategory::InternalInvariant
-        );
-        assert_eq!(classification.retry_advice(), RetryAdvice::PolicyRequired);
-    }
+#[test]
+fn fan_in_order_and_envelope_dispatch_mismatch_matrix() {
+    let plan = load_config_from_str(PIPELINE_YAML)
+        .expect("parse pipeline")
+        .compile(&CompileContext::default())
+        .expect("compile pipeline");
+    let dag = plan.dag();
+    let cases = [
+        DispatchMismatchCase {
+            dispatcher: "dispatch_combine",
+            expected_kind: "combine",
+            actual_kind: "transform",
+            node_name: "rename",
+            invoke: DispatchFaultGuard::dispatch_combine_mismatch_for_testing,
+        },
+        DispatchMismatchCase {
+            dispatcher: "dispatch_merge",
+            expected_kind: "merge",
+            actual_kind: "transform",
+            node_name: "rename",
+            invoke: DispatchFaultGuard::dispatch_merge_mismatch_for_testing,
+        },
+        DispatchMismatchCase {
+            dispatcher: "dispatch_sort",
+            expected_kind: "sort",
+            actual_kind: "transform",
+            node_name: "rename",
+            invoke: DispatchFaultGuard::dispatch_sort_mismatch_for_testing,
+        },
+        DispatchMismatchCase {
+            dispatcher: "dispatch_envelope",
+            expected_kind: "envelope",
+            actual_kind: "transform",
+            node_name: "rename",
+            invoke: DispatchFaultGuard::dispatch_envelope_mismatch_for_testing,
+        },
+    ];
+
+    assert_dispatch_mismatch_cases(dag, &cases);
 }
 
 #[test]
