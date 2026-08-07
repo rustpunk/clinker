@@ -251,6 +251,9 @@ fn otlp_bulkhead_drains_three_signals_and_shares_lifecycle_facts() {
     assert_eq!(
         otlp["clinker.plan.version"]["intValue"],
         plan["plan_identity"]["version"]
+            .as_u64()
+            .expect("numeric semantic version")
+            .to_string()
     );
     assert_eq!(
         otlp["clinker.plan.digest"]["stringValue"],

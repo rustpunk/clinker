@@ -12,6 +12,7 @@ use clinker_plan::error::PipelineError;
 
 mod lifecycle;
 mod machine;
+mod observability;
 mod refactor;
 
 use lifecycle::{
@@ -1659,11 +1660,8 @@ struct CliLineageConfiguration {
 }
 
 fn resolve_cli_lineage_configuration(
-    config: &clinker_plan::config::ClinkerToml,
+    observability: &clinker_plan::config::ResolvedObservabilityPolicy,
 ) -> Result<CliLineageConfiguration, PipelineError> {
-    let observability = config
-        .resolve_observability(None)
-        .map_err(observability_configuration_error)?;
     let lineage = observability.lineage().ok_or_else(|| {
         observability_configuration_error(
             "lineage export requires an explicit [observability.lineage] identity policy",
@@ -1769,6 +1767,20 @@ fn report_lineage_delivery(outcome: clinker_lineage::LineageDeliveryOutcome) {
 fn finish_live_lineage(output: &mut Option<LiveLineageOutput>) {
     if let Some(outcome) = output.take().and_then(LiveLineageOutput::finish) {
         report_lineage_delivery(outcome);
+    }
+}
+
+fn finish_otlp_delivery(
+    worker: &mut Option<observability::OtlpWorker>,
+    lifecycle: &RunLifecycleFacts,
+    machine: Option<&MachineEmitter>,
+) {
+    let Some(worker) = worker.take() else {
+        return;
+    };
+    let summary = worker.finish(lifecycle.snapshot());
+    if let Some(emitter) = machine {
+        emitter.set_observability_summary(summary);
     }
 }
 
@@ -2121,8 +2133,13 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     // same resolved root the validator re-derives.
     let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
         .map_err(storage_config_error)?;
+    let observability_policy = clinker_toml
+        .resolve_observability(None)
+        .map_err(observability_configuration_error)?;
+    let mut otlp_runtime = observability::OtlpRuntimeBundle::admit(&observability_policy)
+        .map_err(observability_configuration_error)?;
     let lineage_configuration = if args.lineage.is_some() || args.lineage_events.is_some() {
-        Some(resolve_cli_lineage_configuration(&clinker_toml)?)
+        Some(resolve_cli_lineage_configuration(&observability_policy)?)
     } else {
         None
     };
@@ -2774,6 +2791,15 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         return Ok(0);
     }
 
+    // Reserve the complete fixed arena before discovery or any output attempt.
+    // The immutable runtime bundle already contains the sole admitted endpoint
+    // and exact policy bounds; disabled runs retain neither handle.
+    let mut telemetry_handles = otlp_runtime
+        .as_ref()
+        .map(|runtime| runtime.reserve_arena(&observability_policy))
+        .transpose()
+        .map_err(observability_configuration_error)?;
+
     // Discovery pre-pass: resolve every File source's matcher to its file set
     // and build a Rest reader for every network source, before any storage
     // validation or staging copy. Collecting the full discovered file set up
@@ -3236,7 +3262,9 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         static_vars: effective_runtime_variables.static_vars,
         source_vars: effective_runtime_variables.source_vars,
         record_vars: effective_runtime_variables.record_vars,
-        telemetry_producer: None,
+        telemetry_producer: telemetry_handles
+            .as_ref()
+            .map(|(producer, _)| producer.clone()),
         shutdown_token: Some(shutdown_token.clone()),
         spill_root_dir: spill_root_dir.clone(),
         spill_disk_cap_bytes,
@@ -3299,6 +3327,21 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         return Err(error);
     }
 
+    let mut otlp_worker = match (otlp_runtime.take(), telemetry_handles.take()) {
+        (Some(runtime), Some((_producer, receiver))) => Some(
+            observability::OtlpWorker::start(runtime, receiver, shutdown_token.clone())
+                .map_err(observability_configuration_error)?,
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(PipelineError::Internal {
+                op: "observability runtime composition",
+                node: "pipeline".to_owned(),
+                detail: "admitted runtime and reserved telemetry arena disagree".to_owned(),
+            });
+        }
+    };
+
     // The executor recompiles `compiled_plan.config()` — already the effective,
     // post-overlay config — so the context it recompiles under must NOT carry
     // the overlay ops again (they would double-apply and collide). For a plain
@@ -3341,6 +3384,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             {
                 tracing::warn!(error = %err, "failed to write FAIL lineage event");
             }
+            finish_otlp_delivery(&mut otlp_worker, &run_lifecycle, machine);
             finish_live_lineage(&mut lineage_output);
             return Err(terminal_error);
         }
@@ -3496,6 +3540,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         {
             tracing::warn!(error = %lineage_error, "failed to write FAIL lineage event");
         }
+        finish_otlp_delivery(&mut otlp_worker, &run_lifecycle, machine);
         finish_live_lineage(&mut lineage_output);
         return Err(terminal_error);
     }
@@ -3524,6 +3569,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             {
                 tracing::warn!(error = %lineage_error, "failed to write FAIL lineage event");
             }
+            finish_otlp_delivery(&mut otlp_worker, &run_lifecycle, machine);
             finish_live_lineage(&mut lineage_output);
             return Err(error);
         }
@@ -3666,6 +3712,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             },
         )
         .map_err(lifecycle_error)?;
+    finish_otlp_delivery(&mut otlp_worker, &run_lifecycle, machine);
     if let Some(output) = lineage_output.as_mut()
         && let Err(err) = output.emit_terminal(&run_lifecycle.snapshot())
     {

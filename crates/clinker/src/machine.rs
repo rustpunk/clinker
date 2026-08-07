@@ -10,6 +10,7 @@ use clinker_exec::output::attempt::{ArtifactKind, ArtifactState, AttemptPublicat
 use clinker_exec::pipeline::shutdown::ShutdownToken;
 use clinker_exec::progress::{BoundedProgress, ProgressSnapshot};
 
+use crate::observability::ObservabilitySummary;
 use crate::{MachineFormat, RunArgs};
 
 const MAX_EVENT_BYTES: usize = 16 * 1024;
@@ -30,6 +31,7 @@ struct MachineState {
     sequence: u64,
     plan_identity: serde_json::Value,
     terminal_reserved: bool,
+    observability: Option<ObservabilitySummary>,
     progress: BoundedProgress,
 }
 
@@ -84,6 +86,7 @@ impl MachineEmitter {
                 sequence: 0,
                 plan_identity: serde_json::json!({"status": "pending"}),
                 terminal_reserved: false,
+                observability: None,
                 progress: BoundedProgress::default(),
             })),
             shutdown: ShutdownToken::new(),
@@ -100,6 +103,10 @@ impl MachineEmitter {
 
     pub(crate) fn shutdown_token(&self) -> ShutdownToken {
         self.shutdown.clone()
+    }
+
+    pub(crate) fn set_observability_summary(&self, summary: ObservabilitySummary) {
+        self.lock_state().observability = Some(summary);
     }
 
     pub(crate) fn emit_started(&self) -> io::Result<()> {
@@ -281,6 +288,9 @@ impl MachineState {
                     .map(|fields| ("publication_artifacts", fields)),
             );
             fields.insert("publication".to_owned(), summary);
+        }
+        if let Some(observability) = self.observability {
+            fields.insert("observability".to_owned(), serde_json::json!(observability));
         }
         events.push((event, fields));
 
@@ -525,6 +535,7 @@ mod tests {
             sequence: 0,
             plan_identity: serde_json::json!({"status": "resolved"}),
             terminal_reserved: false,
+            observability: None,
             progress: BoundedProgress::default(),
         }
     }
