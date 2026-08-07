@@ -31,6 +31,8 @@ use clinker_plan::config::{ErrorStrategy, OutputConfig, PipelineConfig};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::EntityRef;
 
+use crate::log_dispatch::{LogDispatcher, TransformSignalContext};
+
 /// Re-export of the correlation-buffer commit entry point, relocated to
 /// [`crate::executor::correlation_dispatch`]. The commit subtree reaches it
 /// through this module path, so the re-export preserves that surface.
@@ -1030,6 +1032,9 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) output_configs: &'a [OutputConfig],
     pub(crate) primary_output: &'a OutputConfig,
     pub(crate) stable: &'a StableEvalContext,
+    /// Run-scoped non-blocking telemetry handle. Cloned only when enabled;
+    /// `None` keeps dispatch on the zero-work signal path.
+    pub(crate) telemetry_producer: Option<crate::telemetry::TelemetryProducer>,
     /// Backing storage for `$source.batch` — per-pipeline-run UUID v7
     /// (per-source attribution is sub-issue #54). Distinct from
     /// `pipeline.batch_id`.
@@ -3714,7 +3719,12 @@ pub(crate) fn transform_fused_consume(
             resolved: Some(p),
             has_distinct,
             ..
-        } => Some((Arc::clone(&p.typed), p.max_expansion, *has_distinct)),
+        } => Some((
+            Arc::clone(&p.typed),
+            p.max_expansion,
+            *has_distinct,
+            p.log.as_slice(),
+        )),
         _ => None,
     };
     let expected_input = current_dag.graph[node_idx]
@@ -3751,10 +3761,31 @@ pub(crate) fn transform_fused_consume(
         ctx.streaming_charge_handle(node_idx, name, spill_allowed)
     });
 
-    let mut evaluator_opt: Option<ProgramEvaluator> =
-        transform_payload.map(|(typed, max_expansion, has_distinct)| {
-            ProgramEvaluator::with_max_expansion(typed, has_distinct, max_expansion)
-        });
+    let (mut evaluator_opt, directives): (
+        Option<ProgramEvaluator>,
+        &[clinker_plan::config::LogDirective],
+    ) = match transform_payload {
+        Some((typed, max_expansion, has_distinct, directives)) => (
+            Some(ProgramEvaluator::with_max_expansion(
+                typed,
+                has_distinct,
+                max_expansion,
+            )),
+            directives,
+        ),
+        None => (None, &[]),
+    };
+    let mut signals = LogDispatcher::new(
+        ctx.telemetry_producer.clone(),
+        directives,
+        TransformSignalContext {
+            execution_id: &ctx.stable.pipeline_execution_id,
+            batch_id: &ctx.stable.pipeline_batch_id,
+            pipeline_name: &ctx.stable.pipeline_name,
+            logical_node: name,
+        },
+    );
+    signals.fire_before_transform();
 
     let rx = ctx
         .source_records
@@ -3918,6 +3949,7 @@ pub(crate) fn transform_fused_consume(
             if let Some(exp) = expected_input.as_ref() {
                 check_input_schema(exp, rec.schema(), name, "transform", &source_name_owned)?;
             }
+            signals.fire_per_record(&rec);
 
             if let Some(evaluator) = evaluator_opt.as_mut() {
                 let source_file_arc = Arc::clone(&last_file);
@@ -3971,6 +4003,7 @@ pub(crate) fn transform_fused_consume(
                         }
                     }
                     Err((transform_name, eval_err)) => {
+                        signals.fire_on_error(&rec);
                         dispatch_transform_eval_error(ctx, rec, rn, transform_name, eval_err)?;
                     }
                 }
@@ -4010,6 +4043,7 @@ pub(crate) fn transform_fused_consume(
     // to no deferred region (enforced by `certify_streaming_edge`), and
     // `output_records` is empty in this mode anyway.
     if streaming {
+        signals.finish();
         return Ok(());
     }
 
@@ -4024,6 +4058,7 @@ pub(crate) fn transform_fused_consume(
         forwarded_puncts,
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
+    signals.finish();
     Ok(())
 }
 

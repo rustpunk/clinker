@@ -1,342 +1,202 @@
-use crate::log_template::{self, LogTemplateContext};
-use clinker_plan::config::{LogDirective, LogLevel, LogTiming};
+//! Typed transform observability dispatch.
+//!
+//! Authored directives select stable events and explicit record fields. This
+//! module converts those directives into the closed telemetry vocabulary; it
+//! never writes directly, interpolates messages, or carries raw errors and
+//! records across the observability boundary.
 
-/// Runtime state for log directive execution.
-pub struct LogDispatcher {
-    directives: Vec<LogDirective>,
-    /// Per-directive record counter for `every` sampling.
-    counters: Vec<u64>,
+use clinker_plan::config::{LogDirective, LogLevel, LogTiming};
+use clinker_record::Record;
+
+use crate::telemetry::{
+    LogEvent, MetricKey, Severity, SignalField, SpanFact, SpanName, SpanPhase, SpanStatus,
+    TelemetryProducer,
+};
+
+const MAX_CORRELATION_BYTES: usize = 128;
+
+/// Logical run correlation supplied by the executor's stable context.
+pub(crate) struct TransformSignalContext<'a> {
+    pub(crate) execution_id: &'a str,
+    pub(crate) batch_id: &'a str,
+    pub(crate) pipeline_name: &'a str,
+    pub(crate) logical_node: &'a str,
 }
 
-impl LogDispatcher {
-    pub fn new(directives: Vec<LogDirective>) -> Self {
-        let counters = vec![0u64; directives.len()];
-        Self {
+/// Runtime state for one Transform's typed signal lifecycle.
+///
+/// `enabled == None` is the disabled fast path: it allocates no counters or
+/// correlation storage and every method returns before inspecting directives
+/// or records.
+pub(crate) struct LogDispatcher<'a> {
+    enabled: Option<EnabledDispatcher<'a>>,
+}
+
+struct EnabledDispatcher<'a> {
+    producer: TelemetryProducer,
+    directives: &'a [LogDirective],
+    cadence: Vec<u64>,
+    execution_id: Box<str>,
+    batch_id: Box<str>,
+    pipeline_name: Box<str>,
+    logical_node: Box<str>,
+    saw_error: bool,
+    closed: bool,
+}
+
+impl<'a> LogDispatcher<'a> {
+    pub(crate) fn new(
+        producer: Option<TelemetryProducer>,
+        directives: &'a [LogDirective],
+        context: TransformSignalContext<'_>,
+    ) -> Self {
+        let enabled = producer.map(|producer| EnabledDispatcher {
+            producer,
             directives,
-            counters,
-        }
+            cadence: vec![0; directives.len()],
+            execution_id: bounded_correlation(context.execution_id),
+            batch_id: bounded_correlation(context.batch_id),
+            pipeline_name: bounded_correlation(context.pipeline_name),
+            logical_node: bounded_correlation(context.logical_node),
+            saw_error: false,
+            closed: false,
+        });
+        Self { enabled }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.directives.is_empty()
+    pub(crate) fn fire_before_transform(&mut self) {
+        let Some(enabled) = self.enabled.as_mut() else {
+            return;
+        };
+        enabled
+            .producer
+            .record_metric(MetricKey::TransformStarted, 1);
+        let _ = enabled.producer.emit_span(SpanFact {
+            name: SpanName::Transform,
+            phase: SpanPhase::Start,
+            status: SpanStatus::Unset,
+            logical_node: &enabled.logical_node,
+        });
+        enabled.emit_timing(LogTiming::BeforeTransform, None);
     }
 
-    /// Fire all `before_transform` directives.
-    pub fn fire_before_transform(&self, ctx: &LogTemplateContext<'_>) {
-        for d in &self.directives {
-            if d.when == LogTiming::BeforeTransform {
-                emit_log(d, ctx, None);
-            }
-        }
-    }
-
-    /// Fire all `after_transform` directives.
-    pub fn fire_after_transform(&self, ctx: &LogTemplateContext<'_>) {
-        for d in &self.directives {
-            if d.when == LogTiming::AfterTransform {
-                emit_log(d, ctx, None);
-            }
-        }
-    }
-
-    /// Fire all `per_record` directives for a record.
-    /// `record_fields` are the fields available for template resolution.
-    /// `condition_eval` is a closure that evaluates CXL condition expressions.
-    pub fn fire_per_record(
-        &mut self,
-        ctx: &LogTemplateContext<'_>,
-        condition_eval: Option<&dyn Fn(&str) -> bool>,
-    ) {
-        for (i, d) in self.directives.iter().enumerate() {
-            if d.when != LogTiming::PerRecord {
+    pub(crate) fn fire_per_record(&mut self, record: &Record) {
+        let Some(enabled) = self.enabled.as_mut() else {
+            return;
+        };
+        enabled
+            .producer
+            .record_metric(MetricKey::TransformRecords, 1);
+        for (index, directive) in enabled.directives.iter().enumerate() {
+            if directive.when != LogTiming::PerRecord {
                 continue;
             }
+            enabled.cadence[index] = enabled.cadence[index].saturating_add(1);
+            let every = directive.every.unwrap_or(1);
+            if !(enabled.cadence[index] - 1).is_multiple_of(every) {
+                continue;
+            }
+            enabled.emit(directive, Some(record));
+        }
+    }
 
-            // Sampling: increment counter and check modulo
-            self.counters[i] += 1;
-            if let Some(every) = d.every
-                && self.counters[i] % every != 1
-                && every != 1
-            {
-                // Skip unless it's the Nth record (1-indexed: fire on 1, 1+every, 1+2*every, ...)
-                // For every=1, fire on every record
-                if self.counters[i] != 1 && !(self.counters[i] - 1).is_multiple_of(every) {
-                    continue;
+    pub(crate) fn fire_on_error(&mut self, record: &Record) {
+        let Some(enabled) = self.enabled.as_mut() else {
+            return;
+        };
+        enabled.saw_error = true;
+        enabled
+            .producer
+            .record_metric(MetricKey::TransformErrors, 1);
+        enabled.emit_timing(LogTiming::OnError, Some(record));
+    }
+
+    /// Close the successful dispatch lifecycle. A recoverable record error is
+    /// reflected in the terminal span status while the transform still emits
+    /// its authored after event and completion metric.
+    pub(crate) fn finish(&mut self) {
+        let Some(enabled) = self.enabled.as_mut() else {
+            return;
+        };
+        enabled.emit_timing(LogTiming::AfterTransform, None);
+        enabled
+            .producer
+            .record_metric(MetricKey::TransformCompleted, 1);
+        enabled.close(if enabled.saw_error {
+            SpanStatus::Error
+        } else {
+            SpanStatus::Ok
+        });
+    }
+}
+
+impl EnabledDispatcher<'_> {
+    fn emit_timing(&self, timing: LogTiming, record: Option<&Record>) {
+        for directive in self.directives {
+            if directive.when == timing {
+                self.emit(directive, record);
+            }
+        }
+    }
+
+    fn emit(&self, directive: &LogDirective, record: Option<&Record>) {
+        let requested = directive.fields.as_deref().unwrap_or_default();
+        let mut fields = Vec::with_capacity(requested.len().saturating_add(3));
+        fields.push(SignalField::new("execution_id", &self.execution_id));
+        fields.push(SignalField::new("batch_id", &self.batch_id));
+        fields.push(SignalField::new("pipeline_name", &self.pipeline_name));
+        if let Some(record) = record {
+            for field in requested {
+                if let Some(value) = record.get(field) {
+                    fields.push(SignalField::from_record(field, value));
                 }
             }
-
-            // Condition check
-            if let Some(ref cond_expr) = d.condition
-                && let Some(eval_fn) = condition_eval
-                && !eval_fn(cond_expr)
-            {
-                continue;
-            }
-
-            emit_log(d, ctx, None);
         }
+        let _ = self.producer.emit_log(LogEvent {
+            event: &directive.name,
+            severity: severity(directive.level),
+            message: &directive.message,
+            fields: &fields,
+        });
     }
 
-    /// Fire all `on_error` directives for a DLQ-routed record.
-    pub fn fire_on_error(&self, ctx: &LogTemplateContext<'_>, fields: Option<&[(String, String)]>) {
-        for d in &self.directives {
-            if d.when == LogTiming::OnError {
-                emit_log(d, ctx, fields);
-            }
+    fn close(&mut self, status: SpanStatus) {
+        if self.closed {
+            return;
         }
+        let _ = self.producer.emit_span(SpanFact {
+            name: SpanName::Transform,
+            phase: SpanPhase::End,
+            status,
+            logical_node: &self.logical_node,
+        });
+        self.closed = true;
     }
 }
 
-fn emit_log(
-    directive: &LogDirective,
-    ctx: &LogTemplateContext<'_>,
-    extra_fields: Option<&[(String, String)]>,
-) {
-    let message = log_template::resolve_template(&directive.message, ctx);
-
-    // Build structured fields string
-    let fields_str = if let Some(ref field_names) = directive.fields {
-        let kv = log_template::extract_fields(field_names, ctx.record_fields);
-        if kv.is_empty() {
-            String::new()
-        } else {
-            let pairs: Vec<String> = kv.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-            format!(" {}", pairs.join(" "))
-        }
-    } else {
-        String::new()
-    };
-
-    let extra = if let Some(ef) = extra_fields {
-        let pairs: Vec<String> = ef.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-        if pairs.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", pairs.join(" "))
-        }
-    } else {
-        String::new()
-    };
-
-    let full_msg = format!("{}{}{}", message, fields_str, extra);
-
-    match directive.level {
-        LogLevel::Trace => tracing::trace!("{}", full_msg),
-        LogLevel::Debug => tracing::debug!("{}", full_msg),
-        LogLevel::Info => tracing::info!("{}", full_msg),
-        LogLevel::Warn => tracing::warn!("{}", full_msg),
-        LogLevel::Error => tracing::error!("{}", full_msg),
+impl Drop for EnabledDispatcher<'_> {
+    fn drop(&mut self) {
+        self.close(SpanStatus::Error);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use clinker_record::Value;
-    use indexmap::IndexMap;
-
-    use super::*;
-    use clinker_plan::config::{LogLevel, LogTiming};
-
-    /// Run-stable logging context: everything available to a log template
-    /// except the current record's fields, which vary per record and are
-    /// supplied separately at context-build time.
-    ///
-    /// Test-only: production builds [`LogTemplateContext`] directly along the
-    /// `LogDispatcher::fire_*` path; this argument-grouping struct exists solely
-    /// to keep the test helper's constructor below the clippy argument-count
-    /// threshold without a suppression attribute.
-    struct LogContext<'a> {
-        transform_name: &'a str,
-        /// Only available in after_transform.
-        transform_duration_ms: Option<u64>,
-        source_file: &'a str,
-        source_row: u64,
-        pipeline_ok_count: u64,
-        pipeline_dlq_count: u64,
-        pipeline_total_count: u64,
-        pipeline_name: &'a str,
-        pipeline_execution_id: &'a str,
-        /// Only available in on_error.
-        dlq_error_category: Option<&'a str>,
-        /// Only available in on_error.
-        dlq_error_detail: Option<&'a str>,
+const fn severity(level: LogLevel) -> Severity {
+    match level {
+        LogLevel::Trace => Severity::Trace,
+        LogLevel::Debug => Severity::Debug,
+        LogLevel::Info => Severity::Info,
+        LogLevel::Warn => Severity::Warn,
+        LogLevel::Error => Severity::Error,
     }
+}
 
-    /// Merges the current record's fields with the run-stable [`LogContext`]
-    /// into a [`LogTemplateContext`] for the test helpers below.
-    fn make_template_context<'a>(
-        record_fields: &'a IndexMap<String, Value>,
-        ctx: &LogContext<'a>,
-    ) -> LogTemplateContext<'a> {
-        LogTemplateContext {
-            record_fields,
-            transform_name: ctx.transform_name,
-            transform_duration_ms: ctx.transform_duration_ms,
-            source_file: ctx.source_file,
-            source_row: ctx.source_row,
-            pipeline_ok_count: ctx.pipeline_ok_count,
-            pipeline_dlq_count: ctx.pipeline_dlq_count,
-            pipeline_total_count: ctx.pipeline_total_count,
-            pipeline_name: ctx.pipeline_name,
-            pipeline_execution_id: ctx.pipeline_execution_id,
-            dlq_error_category: ctx.dlq_error_category,
-            dlq_error_detail: ctx.dlq_error_detail,
-        }
+fn bounded_correlation(value: &str) -> Box<str> {
+    if value.len() <= MAX_CORRELATION_BYTES {
+        return value.into();
     }
-
-    fn make_directive(level: LogLevel, when: LogTiming, message: &str) -> LogDirective {
-        LogDirective {
-            level,
-            when,
-            condition: None,
-            message: message.to_string(),
-            fields: None,
-            every: None,
-            log_rule: None,
-        }
+    let mut end = MAX_CORRELATION_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
     }
-
-    fn empty_fields() -> IndexMap<String, Value> {
-        IndexMap::new()
-    }
-
-    fn test_ctx(fields: &IndexMap<String, Value>) -> LogTemplateContext<'_> {
-        make_template_context(
-            fields,
-            &LogContext {
-                transform_name: "test",
-                transform_duration_ms: None,
-                source_file: "input.csv",
-                source_row: 1,
-                pipeline_ok_count: 0,
-                pipeline_dlq_count: 0,
-                pipeline_total_count: 0,
-                pipeline_name: "pipeline",
-                pipeline_execution_id: "exec-id",
-                dlq_error_category: None,
-                dlq_error_detail: None,
-            },
-        )
-    }
-
-    #[test]
-    fn test_log_before_transform_fires_once() {
-        // Create dispatcher with a before_transform directive
-        let d = make_directive(LogLevel::Info, LogTiming::BeforeTransform, "starting");
-        let dispatcher = LogDispatcher::new(vec![d]);
-
-        let fields = empty_fields();
-        let ctx = test_ctx(&fields);
-        // This should fire without panicking (we can't capture tracing output in unit tests
-        // without tracing-test, but we verify it doesn't panic and the logic paths execute)
-        dispatcher.fire_before_transform(&ctx);
-    }
-
-    #[test]
-    fn test_log_after_transform_fires_once() {
-        let d = make_directive(
-            LogLevel::Info,
-            LogTiming::AfterTransform,
-            "done in {_transform_duration_ms}ms",
-        );
-        let dispatcher = LogDispatcher::new(vec![d]);
-
-        let fields = empty_fields();
-        let mut ctx = test_ctx(&fields);
-        ctx.transform_duration_ms = Some(150);
-        dispatcher.fire_after_transform(&ctx);
-    }
-
-    #[test]
-    fn test_log_on_error_fires_per_dlq() {
-        let d = make_directive(
-            LogLevel::Error,
-            LogTiming::OnError,
-            "error: {_cxl_dlq_error_category}",
-        );
-        let dispatcher = LogDispatcher::new(vec![d]);
-
-        let fields = empty_fields();
-        let mut ctx = test_ctx(&fields);
-        ctx.dlq_error_category = Some("eval_error");
-        dispatcher.fire_on_error(&ctx, None);
-    }
-
-    #[test]
-    fn test_log_level1_every_sampling() {
-        let mut d = make_directive(LogLevel::Info, LogTiming::PerRecord, "record");
-        d.every = Some(100);
-        let mut dispatcher = LogDispatcher::new(vec![d]);
-
-        let fields = empty_fields();
-        // Simulate 300 records — should fire on records 1, 101, 201 = 3 events
-        let mut fire_count = 0;
-        for i in 1..=300 {
-            let _ctx = make_template_context(
-                &fields,
-                &LogContext {
-                    transform_name: "t",
-                    transform_duration_ms: None,
-                    source_file: "f.csv",
-                    source_row: i,
-                    pipeline_ok_count: 0,
-                    pipeline_dlq_count: 0,
-                    pipeline_total_count: 0,
-                    pipeline_name: "p",
-                    pipeline_execution_id: "e",
-                    dlq_error_category: None,
-                    dlq_error_detail: None,
-                },
-            );
-            // We can't easily count tracing events, so we test the counter logic
-            let d = &dispatcher.directives[0];
-            dispatcher.counters[0] += 1;
-            let counter = dispatcher.counters[0];
-            let every = d.every.unwrap();
-            if counter == 1 || (counter - 1).is_multiple_of(every) {
-                fire_count += 1;
-            }
-        }
-        assert_eq!(fire_count, 3, "every=100, 300 records → 3 events");
-    }
-
-    #[test]
-    fn test_log_level1_every_one() {
-        // every: 1 should fire on every record
-        let mut fire_count = 0;
-        for i in 1..=5u64 {
-            let counter = i;
-            let every = 1u64;
-            if counter == 1 || (counter - 1) % every == 0 {
-                fire_count += 1;
-            }
-        }
-        assert_eq!(fire_count, 5, "every=1, 5 records → 5 events");
-    }
-
-    #[test]
-    fn test_log_level1_multiple_directives() {
-        let d1 = make_directive(LogLevel::Info, LogTiming::PerRecord, "first");
-        let d2 = make_directive(LogLevel::Debug, LogTiming::PerRecord, "second");
-        let mut dispatcher = LogDispatcher::new(vec![d1, d2]);
-        assert_eq!(dispatcher.directives.len(), 2);
-
-        let fields = empty_fields();
-        let ctx = test_ctx(&fields);
-        // Should not panic — both directives fire
-        dispatcher.fire_per_record(&ctx, None);
-    }
-
-    #[test]
-    fn test_log_level1_condition_null_is_false() {
-        let mut d = make_directive(LogLevel::Info, LogTiming::PerRecord, "msg");
-        d.condition = Some("Amount > 1000".to_string());
-        let mut dispatcher = LogDispatcher::new(vec![d]);
-
-        let fields = empty_fields();
-        let ctx = test_ctx(&fields);
-        // Condition evaluator returns false
-        dispatcher.fire_per_record(&ctx, Some(&|_: &str| false));
-        // No panic — condition prevented firing
-    }
+    value[..end].into()
 }

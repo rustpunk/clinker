@@ -23,6 +23,7 @@ use crate::executor::schema_check::check_input_schema;
 use crate::executor::{
     WindowedEvalCtx, evaluate_single_transform, evaluate_single_transform_windowed,
 };
+use crate::log_dispatch::{LogDispatcher, TransformSignalContext};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
@@ -196,6 +197,17 @@ where
         has_distinct,
         payload.max_expansion,
     );
+    let mut signals = LogDispatcher::new(
+        ctx.telemetry_producer.clone(),
+        &payload.log,
+        TransformSignalContext {
+            execution_id: &ctx.stable.pipeline_execution_id,
+            batch_id: &ctx.stable.pipeline_batch_id,
+            pipeline_name: &ctx.stable.pipeline_name,
+            logical_node: name,
+        },
+    );
+    signals.fire_before_transform();
 
     let expected_input = current_dag.graph[node_idx]
         .expected_input_schema_in(current_dag)
@@ -293,6 +305,7 @@ where
         if let Some(exp) = expected_input.as_ref() {
             check_input_schema(exp, record.schema(), name, "transform", &upstream_name)?;
         }
+        signals.fire_per_record(&record);
         let source_file_arc = source_file_arc_of(&record);
         let source_name_arc = source_name_arc_of(&record);
         let eval_ctx =
@@ -377,6 +390,7 @@ where
                 }
             }
             Err((transform_name, eval_err)) => {
+                signals.fire_on_error(&record);
                 dispatch_transform_eval_error(ctx, record, rn, transform_name, eval_err)?;
             }
         }
@@ -402,6 +416,7 @@ where
         input_puncts,
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
+    signals.finish();
 
     Ok(())
 }

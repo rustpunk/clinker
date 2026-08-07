@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 
 use clinker_plan::config::{FieldPolicyAction, ResolvedFieldPolicy, ResolvedObservabilityPolicy};
+use clinker_record::Value;
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 
@@ -40,13 +41,34 @@ impl Severity {
 #[derive(Clone, Copy, Debug)]
 pub struct SignalField<'a> {
     pub name: &'a str,
-    pub value: &'a str,
+    pub value: SignalValue<'a>,
+}
+
+/// Borrowed producer-side field value. Record values remain typed until exact
+/// event-field policy has authorized their serialization.
+#[derive(Clone, Copy, Debug)]
+pub enum SignalValue<'a> {
+    Text(&'a str),
+    Record(&'a Value),
 }
 
 impl<'a> SignalField<'a> {
     #[must_use]
     pub const fn new(name: &'a str, value: &'a str) -> Self {
-        Self { name, value }
+        Self {
+            name,
+            value: SignalValue::Text(value),
+        }
+    }
+
+    /// Keep an explicitly selected record value typed until deployment policy
+    /// has allowed, hashed, or replaced this exact event-field pair.
+    #[must_use]
+    pub const fn from_record(name: &'a str, value: &'a Value) -> Self {
+        Self {
+            name,
+            value: SignalValue::Record(value),
+        }
     }
 }
 
@@ -607,17 +629,25 @@ impl Serialize for FilteredFields<'_> {
             }
             retained += 1;
             match rule.action() {
-                FieldPolicyAction::Allow => {
-                    map.serialize_entry(
+                FieldPolicyAction::Allow => match field.value {
+                    SignalValue::Text(value) => map.serialize_entry(
                         field.name,
-                        truncate_utf8(field.value, self.policy.max_attribute_bytes() as usize),
-                    )?;
-                }
+                        truncate_utf8(value, self.policy.max_attribute_bytes() as usize),
+                    )?,
+                    SignalValue::Record(value) => {
+                        let value = render_record_value_bounded(
+                            value,
+                            self.policy.max_attribute_bytes() as usize,
+                        );
+                        map.serialize_entry(field.name, &value)?;
+                    }
+                },
                 FieldPolicyAction::Hash => {
-                    map.serialize_entry(
-                        field.name,
-                        &HashValue(blake3::hash(field.value.as_bytes())),
-                    )?;
+                    let hash = match field.value {
+                        SignalValue::Text(value) => blake3::hash(value.as_bytes()),
+                        SignalValue::Record(value) => hash_record_value(value),
+                    };
+                    map.serialize_entry(field.name, &HashValue(hash))?;
                 }
                 FieldPolicyAction::Replace => {
                     let replacement = rule.replacement().unwrap_or("[redacted]");
@@ -672,11 +702,21 @@ impl PrivacyScan {
             }
             retained += 1;
             let candidate = match rule.action() {
-                FieldPolicyAction::Allow => Some(field.value),
-                FieldPolicyAction::Replace => rule.replacement(),
+                FieldPolicyAction::Allow => match field.value {
+                    SignalValue::Text(value) => {
+                        Some(value.len() > policy.max_attribute_bytes() as usize)
+                    }
+                    SignalValue::Record(value) => Some(record_value_exceeds(
+                        value,
+                        policy.max_attribute_bytes() as usize,
+                    )),
+                },
+                FieldPolicyAction::Replace => rule
+                    .replacement()
+                    .map(|replacement| replacement.len() > policy.max_attribute_bytes() as usize),
                 FieldPolicyAction::Hash => None,
             };
-            if candidate.is_some_and(|value| value.len() > policy.max_attribute_bytes() as usize) {
+            if candidate == Some(true) {
                 truncated += 1;
             }
         }
@@ -686,6 +726,80 @@ impl PrivacyScan {
             limit_drops,
         }
     }
+}
+
+/// `fmt::Write` target that never retains more than one configured attribute.
+/// Returning `fmt::Error` at the boundary stops recursive `Value::Display`
+/// formatting immediately, so arrays and maps cannot force an unbounded
+/// intermediate allocation.
+struct BoundedString {
+    value: String,
+    max_bytes: usize,
+}
+
+impl BoundedString {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            value: String::with_capacity(max_bytes.min(256)),
+            max_bytes,
+        }
+    }
+}
+
+impl fmt::Write for BoundedString {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let remaining = self.max_bytes.saturating_sub(self.value.len());
+        if value.len() <= remaining {
+            self.value.push_str(value);
+            return Ok(());
+        }
+        self.value.push_str(truncate_utf8(value, remaining));
+        Err(fmt::Error)
+    }
+}
+
+fn render_record_value_bounded(value: &Value, max_bytes: usize) -> String {
+    let mut bounded = BoundedString::new(max_bytes);
+    let _ = fmt::write(&mut bounded, format_args!("{value}"));
+    bounded.value
+}
+
+struct LimitProbe {
+    remaining: usize,
+}
+
+impl fmt::Write for LimitProbe {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if value.len() <= self.remaining {
+            self.remaining -= value.len();
+            Ok(())
+        } else {
+            Err(fmt::Error)
+        }
+    }
+}
+
+fn record_value_exceeds(value: &Value, max_bytes: usize) -> bool {
+    let mut probe = LimitProbe {
+        remaining: max_bytes,
+    };
+    fmt::write(&mut probe, format_args!("{value}")).is_err()
+}
+
+struct HashWriter<'a>(&'a mut blake3::Hasher);
+
+impl fmt::Write for HashWriter<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.0.update(value.as_bytes());
+        Ok(())
+    }
+}
+
+fn hash_record_value(value: &Value) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    let mut writer = HashWriter(&mut hasher);
+    let _ = fmt::write(&mut writer, format_args!("{value}"));
+    hasher.finalize()
 }
 
 fn field_rule<'a>(

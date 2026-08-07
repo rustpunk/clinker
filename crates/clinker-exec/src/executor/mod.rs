@@ -1352,6 +1352,7 @@ impl PipelineExecutor {
             output_configs: &output_configs,
             primary_output: &output_configs[0],
             stable: &stable,
+            telemetry_producer: params.telemetry_producer.clone(),
             source_batch_arc: &source_batch_arc,
             source_count_per_source,
             source_ingestion_timestamp,

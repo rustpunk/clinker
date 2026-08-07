@@ -20,6 +20,7 @@ pub mod dlq;
 pub mod executor;
 pub mod exit_codes;
 mod integration_tests;
+mod log_dispatch;
 pub mod metrics;
 pub mod output;
 pub mod partial;

@@ -16,6 +16,10 @@ pub struct PipelineRunParams {
     pub execution_id: String,
     /// Batch ID from --batch-id CLI flag or auto UUID v7.
     pub batch_id: String,
+    /// Optional fixed-arena telemetry producer for this run. `None` keeps the
+    /// executor's signal path allocation-free and performs no worker or
+    /// signaling work.
+    pub telemetry_producer: Option<crate::telemetry::TelemetryProducer>,
     /// Channel-supplied overrides/adds for `$pipeline.*`. Layered atop
     /// `collect_pipeline_var_defaults` at executor init; channel wins.
     pub pipeline_vars: IndexMap<String, Value>,

@@ -10,6 +10,7 @@ use clinker_exec::telemetry::{
     SpanPhase, SpanStatus, TelemetryArena, TelemetryBatch, TraceSpan,
 };
 use clinker_plan::config::{ClinkerToml, CompileContext, parse_config};
+use clinker_record::Value;
 
 fn policy_with_lanes(
     ordinary: &str,
@@ -454,6 +455,34 @@ fn telemetry_arena_drop_newest_preserves_high_lane_and_exact_accounting() {
         "the high-severity fact crosses its reserved lane"
     );
     assert!(producer.snapshot().retained_bytes <= producer.snapshot().owned_bytes);
+}
+
+#[test]
+fn telemetry_arena_bounds_typed_record_values_before_serialization() {
+    let policy = policy_with_lanes("3KB", "1KB", "4KB");
+    let (producer, receiver) = TelemetryArena::new(&policy).expect("enabled policy creates arena");
+    let value = Value::Array((0..1_000).map(Value::Integer).collect());
+
+    assert!(
+        producer
+            .emit_log(LogEvent {
+                event: "transform.customer_seen",
+                severity: Severity::Info,
+                message: "bounded typed value",
+                fields: &[SignalField::from_record("customer_id", &value)],
+            })
+            .is_accepted()
+    );
+
+    let batch = receiver
+        .try_recv_batch()
+        .expect("bounded typed record value is drainable");
+    let rendered = batch.logs()[0]
+        .fields
+        .get("customer_id")
+        .expect("allowed typed field is retained");
+    assert!(rendered.len() <= 64);
+    assert_eq!(producer.snapshot().truncated_fields, 1);
 }
 
 #[test]
