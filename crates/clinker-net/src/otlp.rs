@@ -762,7 +762,24 @@ fn map_transport_error(
         ureq::Error::Tls(_) | ureq::Error::Rustls(_) | ureq::Error::TlsRequired => {
             OtlpDeliveryFailureKind::Tls
         }
-        ureq::Error::Io(error) if https_only && error.kind() == std::io::ErrorKind::InvalidData => {
+        // A peer that is not speaking TLS on an origin that requires it fails
+        // during the handshake, and which I/O error surfaces depends on whether
+        // the peer writes bytes before closing: a plaintext HTTP reply reaches
+        // rustls as InvalidData, while a peer that closes first reaches it as
+        // end-of-stream or a reset. All three mean the same thing — the remote
+        // is not a TLS endpoint — so they classify together. Errors that fail
+        // before a handshake can begin (refused, unreachable) stay Transport,
+        // because those describe reachability rather than protocol.
+        ureq::Error::Io(error)
+            if https_only
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidData
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                ) =>
+        {
             OtlpDeliveryFailureKind::Tls
         }
         ureq::Error::Timeout(_) => OtlpDeliveryFailureKind::Timeout,

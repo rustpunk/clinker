@@ -199,6 +199,7 @@ where
     let mut signals = LogDispatcher::new(
         ctx.telemetry_producer.clone(),
         &payload.log,
+        &payload.log_conditions,
         TransformSignalContext {
             execution_id: &ctx.stable.pipeline_execution_id,
             batch_id: &ctx.stable.pipeline_batch_id,
@@ -304,11 +305,14 @@ where
         if let Some(exp) = expected_input.as_ref() {
             check_input_schema(exp, record.schema(), name, "transform", &upstream_name)?;
         }
-        signals.fire_per_record(&record);
         let source_file_arc = source_file_arc_of(&record);
         let source_name_arc = source_name_arc_of(&record);
         let eval_ctx =
             ctx.eval_ctx_for_record(&source_file_arc, &source_name_arc, rn, record.doc_ctx());
+        // Dispatch runs before the transform's program, so an authored gate
+        // sees the record as it arrived — the input row the gate was
+        // typechecked against.
+        signals.fire_per_record(&record, &eval_ctx);
 
         let target_schema = output_schema
             .as_ref()

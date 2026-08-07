@@ -3959,13 +3959,30 @@ pub(crate) fn lower_node_to_plan_node(
                 };
             let write_set = extract_write_set(&typed);
             let has_distinct = extract_has_distinct(&typed);
+            let log = config.log.clone().unwrap_or_default();
+            // The gate predicates bind_schema typechecked, one slot per
+            // directive. An absent entry means bind rejected a condition (a
+            // diagnostic was already pushed); a short one would silently
+            // un-gate the tail directives, so both refuse to lower — the same
+            // guard the Route and Reshape arms apply to their per-item
+            // program sets.
+            let log_conditions = if log.is_empty() {
+                Vec::new()
+            } else {
+                let conditions = artifacts.transform_log_conditions.get(&id)?.clone();
+                if conditions.len() != log.len() {
+                    return None;
+                }
+                conditions
+            };
             Some(PlanNode::Transform {
                 name: name.to_string(),
                 id,
                 span,
                 resolved: Some(Box::new(PlanTransformPayload {
                     analytic_window: config.analytic_window.clone(),
-                    log: config.log.clone().unwrap_or_default(),
+                    log,
+                    log_conditions,
                     validations: config.validations.clone().unwrap_or_default(),
                     dlq_node: None,
                     typed,

@@ -3719,6 +3719,17 @@ pub(crate) fn merge_fused_interleave(
 /// enforced upstream by `compute_transform_fused_sources` in
 /// `executor/mod.rs`; this helper trusts the predicate and panics on
 /// shape violations.
+///
+/// The per-record pieces the fused loop reads off a lowered
+/// `PlanNode::Transform`: the record evaluator, the authored log directives,
+/// and one compiled gate slot per directive. All three are absent together —
+/// a node that did not lower carries no program, no directives, and no gates.
+type FusedTransformParts<'a> = (
+    Option<ProgramEvaluator>,
+    &'a [clinker_plan::config::LogDirective],
+    &'a [Option<Arc<cxl::typecheck::TypedProgram>>],
+);
+
 pub(crate) fn transform_fused_consume(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
@@ -3777,6 +3788,7 @@ pub(crate) fn transform_fused_consume(
             p.max_expansion,
             *has_distinct,
             p.log.as_slice(),
+            p.log_conditions.as_slice(),
         )),
         _ => None,
     };
@@ -3814,23 +3826,23 @@ pub(crate) fn transform_fused_consume(
         ctx.streaming_charge_handle(node_idx, name, spill_allowed)
     });
 
-    let (mut evaluator_opt, directives): (
-        Option<ProgramEvaluator>,
-        &[clinker_plan::config::LogDirective],
-    ) = match transform_payload {
-        Some((typed, max_expansion, has_distinct, directives)) => (
-            Some(ProgramEvaluator::with_max_expansion(
-                typed,
-                has_distinct,
-                max_expansion,
-            )),
-            directives,
-        ),
-        None => (None, &[]),
-    };
+    let (mut evaluator_opt, directives, log_conditions): FusedTransformParts<'_> =
+        match transform_payload {
+            Some((typed, max_expansion, has_distinct, directives, log_conditions)) => (
+                Some(ProgramEvaluator::with_max_expansion(
+                    typed,
+                    has_distinct,
+                    max_expansion,
+                )),
+                directives,
+                log_conditions,
+            ),
+            None => (None, &[], &[]),
+        };
     let mut signals = LogDispatcher::new(
         ctx.telemetry_producer.clone(),
         directives,
+        log_conditions,
         TransformSignalContext {
             execution_id: &ctx.stable.pipeline_execution_id,
             batch_id: &ctx.stable.pipeline_batch_id,
@@ -4002,22 +4014,31 @@ pub(crate) fn transform_fused_consume(
             if let Some(exp) = expected_input.as_ref() {
                 check_input_schema(exp, rec.schema(), name, "transform", &source_name_owned)?;
             }
-            signals.fire_per_record(&rec);
+            // One evaluation context per record, shared by the authored log
+            // gates and the transform program. It is built before dispatch
+            // because `fire_per_record` runs its gates against the input row,
+            // which is only in scope until the program below rewrites it.
+            //
+            // The document context is cloned rather than borrowed from `rec`
+            // so this context borrows locals only — the pass-through arm below
+            // moves `rec` into the batcher, which a borrow of it would forbid.
+            let source_file_arc = Arc::clone(&last_file);
+            let rec_source_name_arc = source_name_arc_of(&rec);
+            let rec_doc_ctx = Arc::clone(rec.doc_ctx());
+            let eval_ctx = EvalContext {
+                stable: ctx.stable,
+                source_file: &source_file_arc,
+                source_row: rn.ordinal(),
+                source_path: &source_file_arc,
+                source_count: ctx.source_count_by_name(&rec_source_name_arc),
+                source_batch: ctx.source_batch_arc,
+                ingestion_timestamp: ctx.source_ingestion_timestamp,
+                source_name: &rec_source_name_arc,
+                doc_ctx: &rec_doc_ctx,
+            };
+            signals.fire_per_record(&rec, &eval_ctx);
 
             if let Some(evaluator) = evaluator_opt.as_mut() {
-                let source_file_arc = Arc::clone(&last_file);
-                let rec_source_name_arc = source_name_arc_of(&rec);
-                let eval_ctx = EvalContext {
-                    stable: ctx.stable,
-                    source_file: &source_file_arc,
-                    source_row: rn.ordinal(),
-                    source_path: &source_file_arc,
-                    source_count: ctx.source_count_by_name(&rec_source_name_arc),
-                    source_batch: ctx.source_batch_arc,
-                    ingestion_timestamp: ctx.source_ingestion_timestamp,
-                    source_name: &rec_source_name_arc,
-                    doc_ctx: rec.doc_ctx(),
-                };
                 let target_schema = output_schema
                     .as_ref()
                     .cloned()

@@ -285,8 +285,18 @@ Byte-size strings use decimal units (`1KB = 1,000` bytes and
 
 Both delivery paths admit with `drop_policy = "drop-newest"`; there is no
 blocking, unbounded, or disk-spool spelling. The telemetry arena contains two
-disjoint lanes. The lineage queue is a separate reservation and cannot be
-expressed as an alias of either telemetry lane or the arena.
+disjoint lanes: `trace`, `debug`, and `info` signals occupy the ordinary lane,
+while `warn` and `error` occupy the high-severity lane. The lineage queue is a
+separate reservation and cannot be expressed as an alias of either telemetry
+lane or the arena.
+
+`sample_every = N` keeps one in every N signals, counted **within each lane
+separately**. The lanes are disjoint precisely so ordinary volume cannot crowd
+out problems, and sampling honours that: with `sample_every = 10`, a Transform
+emitting nine per-record `info` events for every `error` still keeps one in ten
+of its errors, and that fraction does not change when the `info` volume does.
+A run that raises its per-record logging therefore does not quietly thin out
+its error reporting.
 
 ### Runtime ownership and failure isolation
 
@@ -356,6 +366,47 @@ change the authoritative ETL/publication result. The explicit
 `local_diagnostic_paths` compatibility mode remains a local synchronous file
 or console export and cannot use this external delivery path.
 
+### Exported signal shapes
+
+Clinker speaks OTLP/JSON over the three fixed routes. What it puts on the wire:
+
+**Traces.** One run is one trace. The lifecycle span `clinker.run` is the trace
+root and every Transform span is a child of it, so a collector can reconstruct
+the whole run from any single span. Each span carries a trace id, a span id, and
+both `startTimeUnixNano` and `endTimeUnixNano`.
+
+A Transform is one span, emitted when the Transform finishes and covering the
+interval it ran for. It is not a `start` record followed by an `end` record.
+That shape was not exportable: a span requires both timestamps, so a
+`start`-only record is not a valid span, and two independently admitted halves
+can be sampled or dropped separately, leaving a collector holding one half of a
+pair it cannot use. If you want to observe that a Transform has begun while it
+is still running, that signal is the `clinker.transform.started` metric below,
+which is recorded before the work runs and exported on the normal metric
+cadence — the span's `startTimeUnixNano` then tells you exactly when it began.
+
+**Metrics.** The Transform counters — `clinker.transform.started`,
+`clinker.transform.completed`, `clinker.transform.records`, and
+`clinker.transform.errors` — are exported as monotonic sums with **delta**
+aggregation temporality. Each exported point is the count accumulated since the
+previous export, not a running total, and carries the `startTimeUnixNano` and
+`timeUnixNano` bounding that interval. Sum the deltas to get the run total;
+reading any single point as an absolute value will understate the run, often by
+a large factor on a long one.
+
+**Logs.** Each emission of an authored `log:` directive becomes one OTLP log
+record: `severityText` from the directive's `level`, the directive's `message`
+as the body, the event name as the `clinker.event` attribute, the three
+run-correlation attributes described under
+[Authentication and privacy](#authentication-and-privacy), and whichever
+requested record fields the field policy allowed, hashed, or replaced.
+
+**Request size.** Delivery is bounded per request, not per record. A drained
+batch that would exceed one request's byte budget is split across as many
+requests as it needs rather than discarded. `max_batch_bytes` bounds one stored
+record inside the arena; it is not the request size, and the two are not the
+same number.
+
 ### Authentication and privacy
 
 Authentication is always explicit. Credential-free delivery uses exactly:
@@ -384,6 +435,29 @@ Event fields are denied by default. Each `[[observability.field_policy]]`
 entry selects exactly one dotted event/field pair and one `allow`, `hash`, or
 `replace` action. `replacement` is required only for `replace`, and duplicate
 rules for the same pair are invalid.
+
+Field policy governs **record fields** — values a Transform selected out of the
+data being processed. It does not govern run correlation. Every exported log
+record carries `clinker.execution_id`, `clinker.batch_id`, and
+`clinker.pipeline_name` unconditionally, with no `[[observability.field_policy]]`
+entry required for them.
+
+The reason is worth stating plainly, because the opposite behaviour was a
+defect rather than a policy: those three values are identifiers Clinker
+generates for the run itself, not data read from a source. A record-field
+privacy policy has nothing to decide about them. Subjecting them to it meant a
+workspace that declared an event without also writing three correlation rules
+exported log records with no correlation at all — telemetry that could not be
+joined to the machine stream's `execution_id`, to the lineage events, or to
+another run of the same pipeline — and it counted all three as privacy denials
+on every event, inflating the arena's denied-field accounting by three per
+event. Correlation is now carried outside the policy entirely, so neither
+happens.
+
+A `[[observability.field_policy]]` rule whose `field` happens to be named
+`execution_id`, `batch_id`, or `pipeline_name` still parses. It governs a
+*record column* of that name, if a directive requests one; it has no effect on
+the correlation attributes above.
 
 ### Lineage identity
 

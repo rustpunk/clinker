@@ -87,6 +87,7 @@ pub enum ValidationSeverity {
 
 const MAX_LOG_SELECTOR_BYTES: usize = 128;
 const MAX_LOG_MESSAGE_BYTES: usize = 1_024;
+const MAX_LOG_CONDITION_BYTES: usize = 512;
 const MAX_LOG_FIELDS: usize = 256;
 const MAX_LOG_DIRECTIVES_PER_TRANSFORM: usize = 32;
 const MAX_LOG_SELECTED_FIELDS_PER_TRANSFORM: usize = 256;
@@ -105,51 +106,126 @@ pub struct LogDirective {
     pub message: String,
     pub fields: Option<Vec<String>>,
     pub every: Option<u64>,
+    /// CXL boolean expression gating a `per_record` event, evaluated against
+    /// the transform's *input* record — dispatch fires before the transform's
+    /// own program runs, so the input row is the only one in scope.
+    ///
+    /// This reads record values but never exports them: the only thing it can
+    /// change is whether the event fires. The values that actually cross the
+    /// observability boundary remain exactly the `fields` list, each still
+    /// default-denied until deployment policy authorizes that event-field pair.
+    /// Narrowing a condition therefore can never widen exposure.
+    pub condition: Option<crate::yaml::CxlSource>,
 }
 
+/// Every key a log directive accepts, in the order the reference table
+/// documents them.
+///
+/// Retired spellings are deliberately absent. This list is quoted verbatim by
+/// the unknown-key diagnostic, and a suggestion an author cannot act on is
+/// worse than no suggestion: naming a key that is itself unconditionally
+/// rejected sends them to a second dead end.
+const LOG_DIRECTIVE_KEYS: &[&str] = &[
+    "name",
+    "level",
+    "when",
+    "message",
+    "fields",
+    "every",
+    "condition",
+];
+
+/// A directive that exercises every accepted key, offered as the pasteable
+/// corrected form whenever admission rejects an authored key.
+const LOG_DIRECTIVE_EXAMPLE: &str = "- { name: transform.customer_seen, level: info, when: per_record, every: 1, message: customer processed, fields: [customer_id] }";
+
+/// Reject a key the directive grammar does not accept, naming the offending
+/// key, the accepted set, and a directive the author can paste.
+fn unknown_log_directive_key(key: &str) -> String {
+    let accepted = LOG_DIRECTIVE_KEYS
+        .iter()
+        .map(|accepted| format!("`{accepted}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "unknown log directive key `{key}`; a log directive accepts only {accepted} — for example `{LOG_DIRECTIVE_EXAMPLE}`"
+    )
+}
+
+/// Bind an authored key exactly once, so a repeated key is rejected rather
+/// than silently taking the last value.
+fn bind_once<T, E: de::Error>(slot: &mut Option<T>, key: &'static str, value: T) -> Result<(), E> {
+    if slot.is_some() {
+        return Err(de::Error::duplicate_field(key));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+/// Hand-written to control the rejection text, following the `visit_map`
+/// pattern [`PipelineNode`](super::PipelineNode) uses for the same reason. A
+/// derived `deny_unknown_fields` builds its "expected one of" list from the
+/// struct's declared fields, which forces every retired key the impl must
+/// still recognize to be advertised as if it were usable.
 impl<'de> Deserialize<'de> for LogDirective {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct AuthoredLogDirective {
-            name: String,
-            level: LogLevel,
-            when: LogTiming,
-            message: String,
-            fields: Option<Vec<String>>,
-            every: Option<u64>,
-            #[serde(default)]
-            log_rule: RetiredLogRule,
-        }
+        struct LogDirectiveVisitor;
 
-        #[derive(Default)]
-        struct RetiredLogRule(bool);
+        impl<'de> de::Visitor<'de> for LogDirectiveVisitor {
+            type Value = LogDirective;
 
-        impl<'de> Deserialize<'de> for RetiredLogRule {
-            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                let _ = de::IgnoredAny::deserialize(deserializer)?;
-                Ok(Self(true))
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter
+                    .write_str("a log directive mapping with `name`, `level`, `when`, `message`")
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut name = None;
+                let mut level = None;
+                let mut when = None;
+                let mut message = None;
+                let mut fields = None;
+                let mut every = None;
+                let mut condition = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "name" => bind_once(&mut name, "name", map.next_value()?)?,
+                        "level" => bind_once(&mut level, "level", map.next_value()?)?,
+                        "when" => bind_once(&mut when, "when", map.next_value()?)?,
+                        "message" => bind_once(&mut message, "message", map.next_value()?)?,
+                        "fields" => bind_once(&mut fields, "fields", map.next_value()?)?,
+                        "every" => bind_once(&mut every, "every", map.next_value()?)?,
+                        "condition" => bind_once(&mut condition, "condition", map.next_value()?)?,
+                        "log_rule" => {
+                            map.next_value::<de::IgnoredAny>()?;
+                            return Err(de::Error::custom(
+                                "`log_rule` is retired; declare the event directly, for example `name: transform.customer_seen`, `message: customer processed`, and `fields: [customer_id]`",
+                            ));
+                        }
+                        other => {
+                            return Err(de::Error::custom(unknown_log_directive_key(other)));
+                        }
+                    }
+                }
+
+                let directive = LogDirective {
+                    name: name.ok_or_else(|| de::Error::missing_field("name"))?,
+                    level: level.ok_or_else(|| de::Error::missing_field("level"))?,
+                    when: when.ok_or_else(|| de::Error::missing_field("when"))?,
+                    message: message.ok_or_else(|| de::Error::missing_field("message"))?,
+                    fields,
+                    every,
+                    condition,
+                };
+                if let Some(error) = directive.validation_errors().into_iter().next() {
+                    return Err(de::Error::custom(error));
+                }
+                Ok(directive)
             }
         }
 
-        let authored = AuthoredLogDirective::deserialize(deserializer)?;
-        if authored.log_rule.0 {
-            return Err(de::Error::custom(
-                "`log_rule` is retired; declare the event directly, for example `name: transform.customer_seen`, `message: customer processed`, and `fields: [customer_id]`",
-            ));
-        }
-        let directive = Self {
-            name: authored.name,
-            level: authored.level,
-            when: authored.when,
-            message: authored.message,
-            fields: authored.fields,
-            every: authored.every,
-        };
-        if let Some(error) = directive.validation_errors().into_iter().next() {
-            return Err(de::Error::custom(error));
-        }
-        Ok(directive)
+        deserializer.deserialize_map(LogDirectiveVisitor)
     }
 }
 
@@ -187,6 +263,28 @@ impl LogDirective {
                 "`every` is only valid with `when: per_record`; remove `every` for lifecycle events"
                     .to_string(),
             ),
+        }
+        if let Some(condition) = &self.condition {
+            // A gate needs a record to test. Lifecycle events carry none, and
+            // `on_error` reports a failure the author already selected by
+            // routing it — narrowing that further would silently hide errors.
+            if self.when != LogTiming::PerRecord {
+                errors.push(
+                    "`condition` is only valid with `when: per_record`; remove `condition`, or change this event to `when: per_record` with an explicit `every`"
+                        .to_string(),
+                );
+            }
+            if condition.source.trim().is_empty() {
+                errors.push(
+                    "`condition` must be a CXL boolean expression (for example `condition: \"amount > 1000\"`); omit it to log every record"
+                        .to_string(),
+                );
+            }
+            if condition.source.len() > MAX_LOG_CONDITION_BYTES {
+                errors.push(format!(
+                    "`condition` must be at most {MAX_LOG_CONDITION_BYTES} UTF-8 bytes so per-record gate evaluation stays bounded"
+                ));
+            }
         }
         if let Some(fields) = &self.fields {
             if matches!(

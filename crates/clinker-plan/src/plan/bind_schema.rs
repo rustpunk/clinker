@@ -117,6 +117,14 @@ pub struct CompileArtifacts {
     /// composition scopes from colliding.
     pub reshape_compiled:
         HashMap<PlanNodeId, Arc<Vec<crate::plan::execution::CompiledReshapeRule>>>,
+    /// Per-Transform typechecked log-directive gate predicates, keyed by the
+    /// Transform node's [`PlanNodeId`] — one entry per `config.log` directive,
+    /// in declaration order, `None` where the directive declared no
+    /// `condition`. Bind→lowering handoff: lowering zips these onto
+    /// `PlanTransformPayload.log_conditions`; the runtime reads only that
+    /// on-node copy. The entry is inserted only when every condition on the
+    /// node typechecked, so a short vec cannot reach lowering.
+    pub transform_log_conditions: HashMap<PlanNodeId, Vec<Option<Arc<TypedProgram>>>>,
     /// All bound composition bodies, keyed by `CompositionBodyId`. The
     /// top-level pipeline is NOT in this map — it lives on
     /// `CompiledPlan.dag()` directly. Only body scopes are here.
@@ -2517,6 +2525,43 @@ fn bind_schema_inner(
                         artifacts.typed_insert(node_id, Arc::new(typed));
                     }
                     Err(d) => diags.push(d),
+                }
+                // Log-directive gates typecheck against the INPUT row, not the
+                // projected output: dispatch fires before the transform's own
+                // program runs, so an authored condition sees the record as it
+                // arrived. Wrapping in `filter` reuses the row-predicate
+                // lowering Reshape's `when` uses, which is what makes a
+                // non-boolean gate a normal type error instead of a runtime
+                // surprise.
+                if let Some(directives) = &config.log {
+                    let mut compiled: Vec<Option<Arc<TypedProgram>>> =
+                        Vec::with_capacity(directives.len());
+                    let mut every_condition_bound = true;
+                    for (index, directive) in directives.iter().enumerate() {
+                        let Some(condition) = &directive.condition else {
+                            compiled.push(None);
+                            continue;
+                        };
+                        match typecheck_cxl(
+                            &format!("{name}:log[{index}]:condition"),
+                            &format!("filter {}", condition.source),
+                            &upstream,
+                            AggregateMode::Row,
+                            span,
+                            &bind_ctx.scoped_vars,
+                        ) {
+                            Ok(typed) => compiled.push(Some(Arc::new(typed))),
+                            Err(d) => {
+                                diags.push(d);
+                                every_condition_bound = false;
+                            }
+                        }
+                    }
+                    // Insert only on a complete set, so lowering's length guard
+                    // can treat a missing entry as "bind rejected this node".
+                    if every_condition_bound {
+                        artifacts.transform_log_conditions.insert(node_id, compiled);
+                    }
                 }
             }
             PipelineNode::Aggregate { header, config } => {

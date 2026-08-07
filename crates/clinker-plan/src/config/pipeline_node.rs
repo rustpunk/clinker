@@ -824,10 +824,9 @@ impl PipelineNode {
     /// CXL, in stable configuration order.
     ///
     /// This exhaustive match is the sole structural admission boundary for
-    /// module-root discovery. `fallback_span` is used for the two legacy CXL
-    /// surfaces that are still represented as plain strings (validation
-    /// checks and log conditions); all [`CxlSource`] fields retain their own
-    /// authored span.
+    /// module-root discovery. `fallback_span` is used for the one legacy CXL
+    /// surface still represented as a plain string (validation checks); all
+    /// [`CxlSource`] fields retain their own authored span.
     pub fn visit_cxl_fields(
         &self,
         scope: CxlFieldScope,
@@ -859,6 +858,17 @@ impl PipelineNode {
                             format!("config.validations[{index}].check"),
                             fallback_span,
                         );
+                    }
+                }
+                if let Some(directives) = &config.log {
+                    for (index, directive) in directives.iter().enumerate() {
+                        if let Some(condition) = &directive.condition {
+                            emit(
+                                &condition.source,
+                                format!("config.log[{index}].condition"),
+                                condition.span,
+                            );
+                        }
                     }
                 }
             }

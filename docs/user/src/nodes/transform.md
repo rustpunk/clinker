@@ -181,17 +181,51 @@ execution:
 | `message` | Yes | Static event message, at most 1024 UTF-8 bytes. Interpolation is rejected; request record values with `fields` instead |
 | `every` | For `per_record` | Positive record interval. It is required for every `per_record` event, including explicit `every: 1`, and rejected for other timings |
 | `fields` | No | Up to 256 unique record field names requested as structured attributes. Available only for `per_record` and `on_error` events |
+| `condition` | No | CXL boolean expression; the event fires only for records where it is true. Available only for `when: per_record`, and at most 512 UTF-8 bytes |
 
 A transform may declare at most 32 events and request at most 256 fields in
 aggregate across them. Event names and field selectors use the same grammar as
 deployment field policy: dot-separated segments beginning with an ASCII letter
 or underscore, followed by ASCII letters, digits, or underscores.
 
-Transform declarations name events and request fields; they do not choose a
-destination, credentials, routing, filtering, redaction, or sampling policy.
-Each requested event-field pair is denied unless deployment observability policy
-explicitly allows, hashes, or replaces it. Telemetry delivery is bounded and
-best effort and cannot change transform results or published output.
+### Logging only the records you care about
+
+`every` thins a per-record event by count. `condition` selects it by content —
+use it when the interesting records are rare and you want all of them rather
+than every thousandth record:
+
+```yaml
+    log:
+      - name: transform.large_order
+        level: info
+        when: per_record
+        every: 1
+        condition: "amount > 1000"
+        message: "large order"
+        fields: [order_id, amount]
+```
+
+The two compose: `every` is applied first, then `condition`, so `every: 100`
+with a condition logs every hundredth record *that also matches*.
+
+A condition is CXL, checked when the pipeline compiles. It must resolve to a
+boolean, and it is evaluated against the transform's **input** record — the one
+that arrived, before this transform's own `cxl:` block runs. A field the
+transform only produces is therefore not in scope; write the condition in terms
+of the fields the transform reads.
+
+A condition decides only *whether* an event fires. It cannot add anything to
+one: the values that leave the process are still exactly the `fields` you
+requested, each still subject to deployment policy. Narrowing a condition can
+never widen what is exported.
+
+Transform declarations name events, request fields, and may gate a per-record
+event on its own input; they do not choose a destination, credentials, routing,
+redaction, or sampling policy. Each requested event-field pair is denied unless
+deployment observability policy explicitly allows, hashes, or replaces it.
+Telemetry delivery is bounded and best effort and cannot change transform
+results or published output — including a condition that fails to evaluate,
+which drops its event rather than failing the run.
 
 Every transform event also offers the fixed logical correlation fields
 `execution_id`, `batch_id`, and `pipeline_name`. These fields are default-deny
