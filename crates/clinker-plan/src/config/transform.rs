@@ -85,17 +85,212 @@ pub enum ValidationSeverity {
     Warn,
 }
 
-/// A logging directive attached to a transform.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+const MAX_LOG_SELECTOR_BYTES: usize = 128;
+const MAX_LOG_MESSAGE_BYTES: usize = 1_024;
+const MAX_LOG_FIELDS: usize = 256;
+const MAX_LOG_DIRECTIVES_PER_TRANSFORM: usize = 32;
+const MAX_LOG_SELECTED_FIELDS_PER_TRANSFORM: usize = 256;
+
+/// A stable structured-event declaration attached to a transform.
+///
+/// The message is static author text. Record-derived values cross the
+/// observability boundary only through the explicitly requested `fields`, and
+/// deployment policy must separately authorize each exact event-field pair.
+#[derive(Debug, Clone, Serialize)]
 pub struct LogDirective {
+    /// Stable event name matched by deployment field policy.
+    pub name: String,
     pub level: LogLevel,
     pub when: LogTiming,
-    pub condition: Option<String>,
     pub message: String,
     pub fields: Option<Vec<String>>,
     pub every: Option<u64>,
-    pub log_rule: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for LogDirective {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AuthoredLogDirective {
+            name: String,
+            level: LogLevel,
+            when: LogTiming,
+            message: String,
+            fields: Option<Vec<String>>,
+            every: Option<u64>,
+            #[serde(default)]
+            log_rule: RetiredLogRule,
+        }
+
+        #[derive(Default)]
+        struct RetiredLogRule(bool);
+
+        impl<'de> Deserialize<'de> for RetiredLogRule {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let _ = de::IgnoredAny::deserialize(deserializer)?;
+                Ok(Self(true))
+            }
+        }
+
+        let authored = AuthoredLogDirective::deserialize(deserializer)?;
+        if authored.log_rule.0 {
+            return Err(de::Error::custom(
+                "`log_rule` is retired; declare the event directly, for example `name: transform.customer_seen`, `message: customer processed`, and `fields: [customer_id]`",
+            ));
+        }
+        let directive = Self {
+            name: authored.name,
+            level: authored.level,
+            when: authored.when,
+            message: authored.message,
+            fields: authored.fields,
+            every: authored.every,
+        };
+        if let Some(error) = directive.validation_errors().into_iter().next() {
+            return Err(de::Error::custom(error));
+        }
+        Ok(directive)
+    }
+}
+
+impl LogDirective {
+    /// Return every authoring violation without applying a permissive fallback.
+    pub(crate) fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !valid_log_selector(&self.name) {
+            errors.push(
+                "`name` must be a bounded dotted identifier using ASCII letters, digits, or underscores (for example `name: transform.customer_seen`)"
+                    .to_string(),
+            );
+        }
+        if self.message.contains(['{', '}']) {
+            errors.push(
+                "`message` must be static text without interpolation; request record values separately with `fields: [customer_id]`"
+                    .to_string(),
+            );
+        }
+        if self.message.len() > MAX_LOG_MESSAGE_BYTES {
+            errors.push(format!(
+                "`message` must be at most {MAX_LOG_MESSAGE_BYTES} UTF-8 bytes so every admitted event is bounded"
+            ));
+        }
+        match (self.when, self.every) {
+            (LogTiming::PerRecord, None) => errors.push(
+                "`when: per_record` requires explicit `every`, including `every: 1`".to_string(),
+            ),
+            (LogTiming::PerRecord, Some(0)) => errors.push(
+                "`every` must be at least 1 for `when: per_record` (for every record, write `every: 1`)"
+                    .to_string(),
+            ),
+            (LogTiming::PerRecord, Some(_)) | (_, None) => {}
+            (_, Some(_)) => errors.push(
+                "`every` is only valid with `when: per_record`; remove `every` for lifecycle events"
+                    .to_string(),
+            ),
+        }
+        if let Some(fields) = &self.fields {
+            if matches!(
+                self.when,
+                LogTiming::BeforeTransform | LogTiming::AfterTransform
+            ) {
+                errors.push(
+                    "`fields` is only valid with `when: per_record` or `when: on_error`; remove `fields` from lifecycle events"
+                        .to_string(),
+                );
+            }
+            if fields.is_empty() {
+                errors.push(
+                    "`fields` must not be empty; omit it when no record values are requested"
+                        .to_string(),
+                );
+            }
+            if fields.len() > MAX_LOG_FIELDS {
+                errors.push(format!(
+                    "`fields` may request at most {MAX_LOG_FIELDS} structured attributes"
+                ));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for field in fields {
+                if !valid_log_selector(field) {
+                    errors.push(format!(
+                        "requested field `{field}` must be a bounded dotted identifier"
+                    ));
+                } else if !seen.insert(field.as_str()) {
+                    errors.push(format!(
+                        "requested field `{field}` appears more than once; every event attribute key must be unique"
+                    ));
+                }
+            }
+        }
+        errors
+    }
+}
+
+/// Return every violation across one transform's complete directive set.
+///
+/// This is the single admission authority for both per-directive grammar and
+/// transform-wide work limits. Callers that hold typed config must use this
+/// validator too: [`LogDirective`] and [`TransformBody`](super::TransformBody)
+/// remain publicly constructible and mutable after deserialization.
+pub(crate) fn log_directive_set_validation_errors(directives: &[LogDirective]) -> Vec<String> {
+    let mut errors = Vec::new();
+    if directives.len() > MAX_LOG_DIRECTIVES_PER_TRANSFORM {
+        errors.push(format!(
+            "`log` may declare at most {MAX_LOG_DIRECTIVES_PER_TRANSFORM} events per transform so per-record dispatch work stays bounded"
+        ));
+    }
+    let selected_fields = directives
+        .iter()
+        .map(|directive| directive.fields.as_ref().map_or(0, Vec::len))
+        .try_fold(0usize, usize::checked_add)
+        .unwrap_or(usize::MAX);
+    if selected_fields > MAX_LOG_SELECTED_FIELDS_PER_TRANSFORM {
+        errors.push(format!(
+            "`log` may request at most {MAX_LOG_SELECTED_FIELDS_PER_TRANSFORM} fields in aggregate across one transform"
+        ));
+    }
+    for (index, directive) in directives.iter().enumerate() {
+        errors.extend(
+            directive
+                .validation_errors()
+                .into_iter()
+                .map(|error| format!("log directive #{}: {error}", index + 1)),
+        );
+    }
+    errors
+}
+
+/// Deserialize one transform's complete directive list through the same
+/// validator used by typed validation and compilation.
+pub(crate) fn deserialize_log_directives<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<LogDirective>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let directives = Option::<Vec<LogDirective>>::deserialize(deserializer)?;
+    let Some(directives) = directives else {
+        return Ok(None);
+    };
+    if let Some(error) = log_directive_set_validation_errors(&directives)
+        .into_iter()
+        .next()
+    {
+        return Err(de::Error::custom(error));
+    }
+    Ok(Some(directives))
+}
+
+/// Return whether an observability event or field selector uses the canonical
+/// bounded dotted-identifier grammar used by deployment field policy.
+fn valid_log_selector(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_LOG_SELECTOR_BYTES
+        && value.split('.').all(|segment| {
+            let mut bytes = segment.bytes();
+            matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic() || first == b'_')
+                && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
 }
 
 /// When a log directive fires.

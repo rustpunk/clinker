@@ -861,17 +861,6 @@ impl PipelineNode {
                         );
                     }
                 }
-                if let Some(directives) = &config.log {
-                    for (index, directive) in directives.iter().enumerate() {
-                        if let Some(condition) = &directive.condition {
-                            emit(
-                                condition,
-                                format!("config.log[{index}].condition"),
-                                fallback_span,
-                            );
-                        }
-                    }
-                }
             }
             PipelineNode::Aggregate { config, .. } => {
                 emit(
@@ -1321,7 +1310,10 @@ pub struct TransformBody {
     /// CXL `$window.*` runtime binding, which is orthogonal.
     #[serde(default)]
     pub analytic_window: Option<AnalyticWindowSpec>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::config::transform::deserialize_log_directives"
+    )]
     pub log: Option<Vec<crate::config::LogDirective>>,
     #[serde(default)]
     pub validations: Option<Vec<crate::config::ValidationEntry>>,

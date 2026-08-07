@@ -632,9 +632,11 @@ pub struct PlanSourcePayload {
     pub validated_path: Option<crate::security::ValidatedPath>,
 }
 
-/// Fully-resolved Transform payload. Holds the optional analytic-window
-/// spec, the log directives, the validations sidebar, the DLQ NodeId for
-/// downstream wiring, and the compile-time CXL `TypedProgram`.
+/// Fully-resolved Transform payload. Holds the optional analytic-window spec,
+/// admission-validated named structured-event directives, the validations
+/// sidebar, the DLQ NodeId for downstream wiring, and the compile-time CXL
+/// `TypedProgram`. Deployment routing and privacy policy are deliberately not
+/// retained here and therefore cannot enter semantic plan identity.
 #[derive(Debug, Clone)]
 pub struct PlanTransformPayload {
     pub analytic_window: Option<AnalyticWindowSpec>,
