@@ -57,6 +57,12 @@ artifact count, and counts by artifact state. Every NDJSON record, including a
 maximum-cardinality inventory chunk and its terminal summary, is at most 16
 KiB.
 
+After plan resolution, Clinker starts the required machine-progress worker
+before source discovery, staging, attempt creation, sink writes, or lifecycle
+START. If that worker cannot be created, the stream ends with exactly one
+`infrastructure.runtime.transient` failed terminal and exit `4`; no run effect
+has started, and a supervisor may retry with backoff.
+
 A consumer must reject an unsupported `schema` major. Within schema 1 it may
 ignore additive fields and unknown nonterminal event kinds, but those additions
 carry no completion or failure meaning. Missing required fields, malformed

@@ -147,6 +147,24 @@ nodes:
     .expect("hanging REST pipeline");
 }
 
+fn write_local_lineage_policy(directory: &std::path::Path) {
+    std::fs::write(
+        directory.join("clinker.toml"),
+        r#"[observability]
+
+[observability.otlp]
+endpoint = "https://collector.example.com"
+
+[observability.otlp.auth]
+mode = "none"
+
+[observability.lineage]
+identity_mode = "local_diagnostic_paths"
+"#,
+    )
+    .expect("local lineage policy");
+}
+
 fn execution_id(events: &[Value]) -> &str {
     events[0]["execution_id"].as_str().expect("execution id")
 }
@@ -214,6 +232,57 @@ fn signal_handler_installation_failure_is_preeffect() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(fixture_snapshot(directory.path()), before);
+    assert!(!directory.path().join(".clinker-attempts").exists());
+}
+
+#[test]
+fn machine_progress_worker_start_failure_is_preeffect_and_classified() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "out.csv", 1, false);
+    write_local_lineage_policy(directory.path());
+    std::fs::write(directory.path().join("out.csv"), "existing output\n").expect("existing output");
+    std::fs::write(
+        directory.path().join("lineage.ndjson"),
+        "existing lineage\n",
+    )
+    .expect("existing lineage");
+    let staging = directory.path().join("staging");
+    std::fs::create_dir(&staging).expect("staging directory");
+    std::fs::write(staging.join("sentinel"), "existing staging\n")
+        .expect("existing staging sentinel");
+    let before = fixture_snapshot(directory.path());
+
+    let output = machine_command(directory.path(), "machine-worker-start-failure")
+        .args(["--lineage-events", "lineage.ndjson"])
+        .env("CLINKER_TEST_MACHINE_PROGRESS_WORKER_START_FAILURE", "1")
+        .output()
+        .expect("run with injected machine progress worker failure");
+
+    assert_eq!(output.status.code(), Some(4));
+    let events = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).expect("machine event JSON"))
+        .collect::<Vec<_>>();
+    let terminals = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event["event"].as_str(),
+                Some("completed" | "failed" | "cancelled")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1, "events: {events:#?}");
+    assert_eq!(terminals[0]["event"], "failed");
+    assert_eq!(
+        terminals[0]["failure"]["code"],
+        "infrastructure.runtime.transient"
+    );
+    assert_eq!(terminals[0]["failure"]["category"], "infrastructure");
+    assert_eq!(terminals[0]["failure"]["retry"], "retry_with_backoff");
     assert_eq!(fixture_snapshot(directory.path()), before);
     assert!(!directory.path().join(".clinker-attempts").exists());
 }

@@ -144,24 +144,37 @@ impl MachineEmitter {
         })
     }
 
-    pub(crate) fn start_execution_progress(&self, token: ShutdownToken) -> MachineProgressWorker {
+    pub(crate) fn start_execution_progress(
+        &self,
+        token: ShutdownToken,
+    ) -> io::Result<MachineProgressWorker> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("CLINKER_TEST_MACHINE_PROGRESS_WORKER_START_FAILURE").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            return Err(io::Error::other(
+                "injected machine progress worker startup failure",
+            ));
+        }
         let emitter = self.clone();
         let (stop, receiver) = mpsc::sync_channel(1);
-        let handle = thread::spawn(move || {
-            let mut observed = token.progress_checkpoints();
-            loop {
-                match receiver.recv_timeout(Duration::from_millis(20)) {
-                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+        let handle = thread::Builder::new()
+            .name("clinker-machine-progress".to_owned())
+            .spawn(move || {
+                let mut observed = token.progress_checkpoints();
+                loop {
+                    match receiver.recv_timeout(Duration::from_millis(20)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let checkpoints = token.progress_checkpoints();
+                    if checkpoints > observed {
+                        observed = checkpoints;
+                        emitter.emit_periodic(checkpoints)?;
+                    }
                 }
-                let checkpoints = token.progress_checkpoints();
-                if checkpoints > observed {
-                    observed = checkpoints;
-                    emitter.emit_periodic(checkpoints)?;
-                }
-            }
-        });
-        MachineProgressWorker { stop, handle }
+            })?;
+        Ok(MachineProgressWorker { stop, handle })
     }
 
     pub(crate) fn emit_completed(&self, exit_code: u8) -> io::Result<()> {

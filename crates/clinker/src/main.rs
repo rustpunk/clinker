@@ -2863,6 +2863,10 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         clinker_exec::pipeline::shutdown::ShutdownToken::new,
         MachineEmitter::shutdown_token,
     );
+    let machine_progress = machine
+        .map(|emitter| emitter.start_execution_progress(shutdown_token.clone()))
+        .transpose()
+        .map_err(PipelineError::Io)?;
     let telemetry_handles = otlp_runtime
         .as_ref()
         .map(|runtime| runtime.reserve_arena(&observability_policy))
@@ -3425,8 +3429,6 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     // post-overlay config — so the context it recompiles under must NOT carry
     // the overlay ops again (they would double-apply and collide). For a plain
     // run this is identical to `compile_ctx.clone()` (the op stream is empty).
-    let machine_progress =
-        machine.map(|emitter| emitter.start_execution_progress(shutdown_token.clone()));
     let execution_result = PipelineExecutor::run_plan_with_readers_writers_in_context(
         &compiled_plan,
         readers,
