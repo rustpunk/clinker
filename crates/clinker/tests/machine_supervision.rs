@@ -2,9 +2,10 @@
 
 mod support;
 
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::process::Command;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -411,6 +412,71 @@ fn retry_launches_a_fresh_process_from_fresh_input() {
         std::fs::read_to_string(second_output).expect("second output"),
         "the retry starts from the beginning of the replacement input"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_sigterm_cancels_during_grace() {
+    let directory = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    write_hanging_rest_pipeline(directory.path(), address);
+
+    let (request_ready_tx, request_ready_rx) = mpsc::sync_channel(1);
+    let (sigterm_sent_tx, sigterm_sent_rx) = mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let bytes = stream.read(&mut buffer).expect("read request");
+            assert!(bytes > 0, "request closed before its headers completed");
+            request.extend_from_slice(&buffer[..bytes]);
+        }
+        request_ready_tx.send(()).expect("announce live request");
+        sigterm_sent_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("supervisor sent SIGTERM");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n[{\"id\":1}]",
+            )
+            .expect("write response after SIGTERM");
+    });
+
+    let result = run_child(
+        machine_command(directory.path(), "real-sigterm"),
+        ProcessConfig::new(Duration::from_secs(5)).graceful_trigger(
+            request_ready_rx,
+            sigterm_sent_tx,
+            Duration::from_secs(2),
+        ),
+    )
+    .expect("gracefully supervised run");
+    server.join().expect("server thread");
+
+    assert!(result.graceful_requested());
+    assert!(!result.forced());
+    assert!(result.reaped());
+    assert_eq!(result.status_code(), Some(130));
+    assert_eq!(result.outcome(), ControlledOutcome::Cancelled);
+    let terminals = result
+        .stdout
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event["event"].as_str(),
+                Some("completed" | "failed" | "cancelled")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0]["schema"], 1);
+    assert_eq!(terminals[0]["event"], "cancelled");
 }
 
 // Keep the imported type part of the test contract: malformed and unsupported
