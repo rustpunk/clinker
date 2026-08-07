@@ -74,12 +74,12 @@ The output is [NDJSON](https://github.com/ndjson/ndjson-spec) (one JSON object p
 - **`job.namespace`** is `clinker`; **`job.name`** is the pipeline name. The pipeline's content hash rides in the `clinker_pipeline` job facet (`sourceHash`), not the job name -- so the name stays stable across edits while runs of the same definition remain correlatable.
 - **`inputs`** are the source datasets; **`outputs`** are the sink datasets. External mode uses the exact configured canonical or catalog identities, so relocating a pipeline does not change its lineage graph. Explicit `local_diagnostic_paths` compatibility mode instead uses the `file` namespace with resolved paths (and falls back to the `clinker` namespace plus the node name for a network source).
 - The dataset namespace/name identifies the stable collection. A concrete
-  logical partition or location is emitted as the standard role-specific
-  input/output subset facet, and an explicitly authorized alias is emitted as
-  the standard symlinks facet. Neither fact is inferred from worker paths,
-  attempt paths, hashes, or process context. The current workspace config has
-  no author-facing subset or symlink fields; only typed runtime context can
-  authorize them.
+  logical partition or location would be emitted as the standard role-specific
+  input/output subset facet, and an explicitly authorized alias as the standard
+  symlinks facet; neither is ever inferred from worker paths, attempt paths,
+  hashes, or process context. **No pipeline emits either facet today** -- the
+  workspace config exposes no subset or symlink fields, so nothing can
+  authorize one.
 - The `columnLineage` facet is attached to each **output** dataset on the `COMPLETE` event.
 
 ## Reading the `columnLineage` facet
@@ -108,14 +108,14 @@ Each transformation carries a `type` (`DIRECT` / `INDIRECT`) and a `subtype` (`I
 
 ## Multi-record sources
 
-A **multi-record flat file** carries several record shapes in one physical file, discriminated by a lead `record_type` column. Lineage attributes each record type to **its own logical dataset**, rather than collapsing every shape onto one flat superset dataset:
+A **multi-record flat file** carries several record shapes in one physical file, discriminated by a lead `record_type` column. Record types differ in their *columns*, not in which rows they select, so each is treated as **its own logical dataset** rather than as a subset of one flat superset dataset:
 
-- Each record type is a dataset named `<file>#<id>` -- the physical file path with the record type's `id` as a `#` fragment (e.g. `.../payments.txt#detail`). Its columns are exactly that record type's declared columns, so an output column that derives from a detail-record field traces to `<file>#detail`, and one from a header field traces to `<file>#header`.
-- A column declared by **several** record types (unified into one superset column) lists **each** owning `<file>#<id>` dataset as an input field, so a derived output column traces to every record type it could have come from.
-- The engine-stamped `record_type` **discriminator** lead column belongs to no record type, so it stays on the **base** file dataset (`<file>`, no fragment) -- a `Route` that branches on `record_type` still references `{file, <path>, record_type}`.
-- The run's `inputs` list the base file dataset followed by each `<file>#<id>` record-type dataset, in record-type declaration order.
+- Each record type is a dataset named `<dataset>#<id>` -- the source's **bound dataset identity** with the record type's `id` as a `#` fragment. Under `identity_mode = "external"` that is the configured canonical or catalog identity (namespace `s3://payments-lake`, name `raw/payments#detail`), so no filesystem path enters the name; under `local_diagnostic_paths` it is the resolved file path (`.../payments.txt#detail`). Its columns are exactly that record type's declared columns, so an output column that derives from a detail-record field traces to `…#detail`, and one from a header field traces to `…#header`.
+- A column declared by **several** record types (unified into one superset column) lists **each** owning `#<id>` dataset as an input field, so a derived output column traces to every record type it could have come from.
+- The engine-stamped `record_type` **discriminator** lead column belongs to the container rather than to any one record type, so it stays on the **base** dataset (no fragment) -- a `Route` that branches on `record_type` still references `{<base>, record_type}`.
+- The run's `inputs` list the base dataset followed by each `#<id>` record-type dataset, in record-type declaration order. Declaring them is load-bearing, not cosmetic: a lineage consumer resolves a `columnLineage` input field only against datasets the run declared as inputs, so a record-type dataset left out of `inputs` would have its column edges silently dropped on ingest.
 
-A record type's `parent` / `join_key` -- the intra-file hierarchy linking a child record type to its parent -- is carried implicitly in the per-record-type dataset identities; it is not emitted as a synthetic lineage edge, since no plan operation performs that join.
+A record type's `parent` / `join_key` -- the intra-file hierarchy linking a child record type to its parent -- is not emitted as a lineage edge, since no plan operation performs that join.
 
 ## Live run events
 

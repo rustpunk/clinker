@@ -303,3 +303,116 @@ nodes:
         "physical relocation cannot alter external lineage bytes"
     );
 }
+
+/// A multi-record flat file splits into one logical dataset per record type,
+/// and those datasets inherit the source's *bound* identity — so an externally
+/// bound source names `{canonical-namespace}/{canonical-name}#<id>` and no
+/// worker path reaches the wire. Record types differ in their columns, so they
+/// are distinct datasets rather than subsets of the container; the standard
+/// subset facet selects rows from one fixed schema and cannot express this.
+#[test]
+fn multi_record_types_are_datasets_on_the_bound_canonical_identity() {
+    let identities = LineageIdentityContext::external([
+        LineageNodeBinding::new(
+            "payments",
+            ExternalDatasetIdentity::canonical("s3://payments-lake/raw/payments").unwrap(),
+        ),
+        LineageNodeBinding::new(
+            "out",
+            ExternalDatasetIdentity::catalog("analytics", "payments_flat").unwrap(),
+        ),
+    ])
+    .expect("complete context");
+
+    let compiled = parse_config(
+        r#"
+pipeline: { name: mr_external }
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: fixed_width
+      path: data/payments.txt
+      schema:
+        discriminator: { start: 0, width: 1 }
+        records:
+          - id: header
+            tag: H
+            columns:
+              - { name: batch_id, type: string, start: 1, width: 9 }
+          - id: detail
+            tag: D
+            columns:
+              - { name: amount, type: int, start: 1, width: 4 }
+  - type: transform
+    name: project
+    input: payments
+    config:
+      cxl: |
+        emit kind = record_type
+        emit batch_id = batch_id
+        emit amount = amount
+  - type: output
+    name: out
+    input: project
+    config: { name: out, type: csv, path: out/out.csv }
+"#,
+    )
+    .unwrap()
+    .compile(&CompileContext::default())
+    .unwrap();
+
+    let lineage = column_lineage_external(&compiled, &identities).unwrap();
+
+    let base = identities.require("payments").unwrap().dataset_id().clone();
+    let names: Vec<(&str, &str)> = lineage
+        .inputs
+        .iter()
+        .map(|id| (id.namespace.as_str(), id.name.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("s3://payments-lake", "raw/payments"),
+            ("s3://payments-lake", "raw/payments#header"),
+            ("s3://payments-lake", "raw/payments#detail"),
+        ],
+        "base collection then each record type, in declaration order"
+    );
+
+    // The source path `data/payments.txt` must not survive anywhere in the
+    // emitted identities: that leakage is what canonical binding exists to stop.
+    for id in &lineage.inputs {
+        assert!(
+            !id.name.contains("payments.txt") && !id.name.starts_with('/'),
+            "worker path leaked into identity: {}:{}",
+            id.namespace,
+            id.name
+        );
+    }
+
+    let fields = &lineage.outputs[0].facet.fields;
+    let input_of = |col: &str| -> Vec<(String, String)> {
+        fields
+            .get(col)
+            .unwrap_or_else(|| panic!("column {col:?} missing"))
+            .input_fields
+            .iter()
+            .map(|f| (f.name.clone(), f.field.clone()))
+            .collect()
+    };
+    assert_eq!(
+        input_of("batch_id"),
+        vec![("raw/payments#header".to_owned(), "batch_id".to_owned())]
+    );
+    assert_eq!(
+        input_of("amount"),
+        vec![("raw/payments#detail".to_owned(), "amount".to_owned())]
+    );
+    // The discriminator lead belongs to the container, not a record type.
+    assert_eq!(
+        input_of("kind"),
+        vec![(base.name.clone(), "record_type".to_owned())]
+    );
+}

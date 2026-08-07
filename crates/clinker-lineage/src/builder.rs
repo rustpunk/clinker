@@ -15,9 +15,11 @@
 //! [`LineageIdentityContext`](crate::logical_identity::LineageIdentityContext);
 //! the legacy path resolver is isolated to the local diagnostic entry point.
 //! Value derivation and influence are read off each operator's retained
-//! typed/compiled program. A **multi-record** flat-file source keeps one stable
-//! collection identity; concrete record types belong in standard subset facets
-//! rather than name fragments (see [`seed_multi_record_source`]).
+//! typed/compiled program. A **multi-record** flat-file source splits per record
+//! type: each record type declares its own columns, so each becomes its own
+//! logical dataset (`<base>#<id>`) inheriting the source's bound identity, and
+//! column lineage is attributed per record type rather than to the one flat
+//! superset dataset (see [`seed_multi_record_source`]).
 //!
 //! Because topo order processes every upstream node first, the working maps store
 //! terminals already resolved back to a Source dataset column — never an
@@ -87,7 +89,7 @@ use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 
 use clinker_plan::config::pipeline_node::MatchMode;
-use clinker_plan::config::{RecordType, SourceSchema};
+use clinker_plan::config::{RECORD_TYPE_COLUMN, RecordType, SourceSchema};
 use clinker_plan::plan::combine::encode_chain_column;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 use clinker_plan::plan::{
@@ -302,12 +304,32 @@ fn walk_scope(
                 // recomputing the string-allocating `dataset_identity` a second
                 // time.
                 if let Some(base) = node_doc_srcs.iter().next() {
-                    // A multi-record flat file carries several concrete record
-                    // shapes in one stable collection. Subset facts stay on the
-                    // identity context; field terminals remain on the collection.
+                    // Registered before the per-schema split so the base
+                    // collection leads `inputs`, ahead of any record-type
+                    // dataset seeded below.
+                    if sink.seen_inputs.insert(base.clone()) {
+                        sink.inputs.push(base.clone());
+                    }
+                    if let Some(binding) =
+                        identities.and_then(|context| context.require(node.name()).ok())
+                    {
+                        sink.input_identity_facets
+                            .insert(base.clone(), binding.facets());
+                    }
+                    // A multi-record flat file holds several record types, each
+                    // with its own columns, in one physical container. Differing
+                    // column sets make them distinct logical datasets rather
+                    // than subsets of `base`.
                     match compiled.bound_schemas().get(node.name()) {
                         Some(SourceSchema::MultiRecord { record_types, .. }) => {
-                            seed_multi_record_source(node, dag, base, record_types, &mut cols);
+                            seed_multi_record_source(
+                                node,
+                                dag,
+                                base,
+                                record_types,
+                                &mut cols,
+                                sink,
+                            );
                         }
                         _ => {
                             for (col_idx, col) in
@@ -324,15 +346,6 @@ fn walk_scope(
                                 cols.insert(col.to_string(), terms);
                             }
                         }
-                    }
-                    if sink.seen_inputs.insert(base.clone()) {
-                        sink.inputs.push(base.clone());
-                    }
-                    if let Some(binding) =
-                        identities.and_then(|context| context.require(node.name()).ok())
-                    {
-                        sink.input_identity_facets
-                            .insert(base.clone(), binding.facets());
                     }
                 }
                 cols
@@ -721,32 +734,96 @@ fn walk_scope(
     Ok((lineage, influence))
 }
 
-/// Seed a multi-record flat-file source's DIRECT terminals on its stable
-/// collection identity.
+/// Seed a multi-record flat-file source's DIRECT terminals, one logical dataset
+/// per record type.
 ///
-/// Record shapes are concrete members of one collection, not independent
-/// datasets. Their stable logical partition/location identifiers belong in the
-/// standard subset facet supplied by the identity context; appending `#<id>` to
-/// the dataset name would make identity depend on a concrete subset. Column
-/// lineage therefore keeps every declared superset column on `base` while
-/// preserving exact field-level derivation.
+/// Record types differ in their *columns*, so each is its own logical dataset
+/// (`<base>#<id>`, via [`DatasetId::record_type`]) declaring only its own
+/// columns. They are not subsets of `base`: a subset condition selects rows from
+/// one fixed schema and cannot express a differing column set, which is why the
+/// standard subset facet cannot carry this attribution. Each record-type dataset
+/// inherits `base`'s identity, so an externally bound source keeps its canonical
+/// namespace and name and no worker path enters the identity.
+///
+/// The superset columns map as:
+///
+/// - A column exactly one record type declares → an IDENTITY terminal on that
+///   record type's dataset.
+/// - A column several record types declare (unified to one superset column) →
+///   one IDENTITY terminal per owning record-type dataset, so a downstream
+///   derivation traces to every record type it could have come from.
+/// - A superset column no record type declares — the engine-stamped
+///   `record_type` discriminator lead, chiefly — belongs to the container rather
+///   than to any one record type and stays on `base`, so a `Route` on
+///   `record_type` still names `{<base>, record_type}`.
+///
+/// Every record-type dataset is registered as a run input. That is load-bearing
+/// rather than cosmetic: a conformant consumer resolves a `columnLineage`
+/// input field only against datasets the run declared as inputs, so a
+/// record-type dataset absent from `inputs` would have its column edges dropped
+/// on ingest. `base` is registered by the caller, ahead of these.
+///
+/// A record type's `parent` / `join_key` express an intra-file hierarchy across
+/// record types; no plan node performs that join, so emitting one would be
+/// invented provenance.
 fn seed_multi_record_source(
     node: &PlanNode,
     dag: &ExecutionPlanDag,
     base: &DatasetId,
-    _record_types: &[RecordType],
+    record_types: &[RecordType],
     cols: &mut ColumnTerminals,
+    sink: &mut ScopeSink,
 ) {
+    // Column name → the record-type datasets declaring it, in record-type
+    // declaration order. A name shared by several record types lists each owner.
+    // The reserved `record_type` discriminator lead is never owned by a record
+    // type: `multi_record_superset` unifies any same-named column into that one
+    // lead slot, so a (runtime-invalid) config declaring such a column must not
+    // pull the discriminator onto a record-type dataset — keep it on the base.
+    let mut owners: HashMap<&str, Vec<DatasetId>> = HashMap::new();
+    for rt in record_types {
+        let ds = DatasetId::record_type(base, &rt.id);
+        for col in &rt.columns {
+            if col.name == RECORD_TYPE_COLUMN {
+                continue;
+            }
+            owners
+                .entry(col.name.as_str())
+                .or_default()
+                .push(ds.clone());
+        }
+    }
+
     for (col_idx, col) in node.output_schema_in(dag).columns().iter().enumerate() {
         if node.output_schema_in(dag).field_metadata(col_idx).is_some() {
             continue;
         }
+        let name: &str = col;
         let mut terms = TermMap::new();
-        terms.insert(
-            Terminal::new(&base.namespace, &base.name, col),
-            Subtype::Identity,
-        );
-        cols.insert(col.to_string(), terms);
+        match owners.get(name) {
+            Some(datasets) => {
+                for ds in datasets {
+                    terms.insert(
+                        Terminal::new(&ds.namespace, &ds.name, name),
+                        Subtype::Identity,
+                    );
+                }
+            }
+            None => {
+                terms.insert(
+                    Terminal::new(&base.namespace, &base.name, name),
+                    Subtype::Identity,
+                );
+            }
+        }
+        cols.insert(name.to_string(), terms);
+    }
+
+    for rt in record_types {
+        let ds = DatasetId::record_type(base, &rt.id);
+        if sink.seen_inputs.insert(ds.clone()) {
+            sink.inputs.push(ds);
+        }
     }
 }
 
@@ -4101,10 +4178,12 @@ nodes:
         }
     }
 
-    /// A multi-record flat file remains one stable collection dataset. Concrete
-    /// record types are subset facts rather than dataset-name fragments.
+    /// A multi-record flat file splits into one dataset per record type: each
+    /// record type's columns are attributed to its own `<base>#<id>` dataset,
+    /// and the engine-stamped `record_type` discriminator lead — owned by the
+    /// container rather than by any record type — stays on the base dataset.
     #[test]
-    fn multi_record_source_keeps_one_stable_collection_identity() {
+    fn multi_record_source_splits_columns_per_record_type() {
         let yaml = r#"
 pipeline: { name: mr }
 nodes:
@@ -4142,27 +4221,36 @@ nodes:
 "#;
         let lineage = lineage_of(yaml);
         let base = "/w/data/payments.txt";
+        let header = format!("{base}#header");
+        let detail = format!("{base}#detail");
         let out = only_output(&lineage);
         let fields = &out.facet.fields;
 
         use TransformationSubtype::Identity;
-        // The discriminator lead stays on the base file dataset.
+        // The discriminator lead belongs to the container, not a record type.
         assert_field(fields, "kind", &[direct(base, "record_type", Identity)]);
-        assert_field(fields, "batch_id", &[direct(base, "batch_id", Identity)]);
-        assert_field(fields, "id", &[direct(base, "id", Identity)]);
-        assert_field(fields, "amount", &[direct(base, "amount", Identity)]);
+        // Header column → the header record-type dataset.
+        assert_field(fields, "batch_id", &[direct(&header, "batch_id", Identity)]);
+        // Detail columns → the detail record-type dataset (never the header).
+        assert_field(fields, "id", &[direct(&detail, "id", Identity)]);
+        assert_field(fields, "amount", &[direct(&detail, "amount", Identity)]);
 
+        // Every record-type dataset is a declared input: a conformant consumer
+        // resolves column-lineage input fields only against declared inputs, so
+        // an undeclared one would have its column edges dropped on ingest.
         assert_eq!(
             lineage.inputs,
-            vec![file_ds(base)],
-            "concrete record types cannot change collection identity",
+            vec![file_ds(base), file_ds(&header), file_ds(&detail)],
+            "base + per-record-type datasets, in declaration order",
         );
     }
 
-    /// Shared and type-exclusive columns both retain the collection dataset;
-    /// record-type membership is represented by subset facets, not identity.
+    /// A column several record types declare (unified to one superset column)
+    /// lists every owning record-type dataset, so a downstream derivation traces
+    /// to each record type it could have come from; a type-exclusive column
+    /// lands only on its own record type.
     #[test]
-    fn multi_record_shared_column_stays_on_collection_identity() {
+    fn multi_record_shared_column_lists_every_owning_record_type() {
         let yaml = r#"
 pipeline: { name: mr_shared }
 nodes:
@@ -4200,15 +4288,33 @@ nodes:
 "#;
         let lineage = lineage_of(yaml);
         let base = "/w/data/src.txt";
+        let alpha = format!("{base}#alpha");
+        let beta = format!("{base}#beta");
         let out = only_output(&lineage);
         let fields = &out.facet.fields;
 
         use TransformationSubtype::Identity;
-        assert_field(fields, "seq", &[direct(base, "seq", Identity)]);
-        assert_field(fields, "a_only", &[direct(base, "a_only", Identity)]);
-        assert_field(fields, "b_only", &[direct(base, "b_only", Identity)]);
+        // `seq` is declared by BOTH record types → one terminal per owning
+        // dataset, ordered by (namespace, name, field): `#alpha` < `#beta`.
+        assert_field(
+            fields,
+            "seq",
+            &[
+                direct(&alpha, "seq", Identity),
+                direct(&beta, "seq", Identity),
+            ],
+        );
+        // Type-exclusive columns land only on their owning record type. These
+        // were never ambiguous, so collapsing them onto the base would discard
+        // attribution they had no reason to lose.
+        assert_field(fields, "a_only", &[direct(&alpha, "a_only", Identity)]);
+        assert_field(fields, "b_only", &[direct(&beta, "b_only", Identity)]);
 
-        assert_eq!(lineage.inputs, vec![file_ds(base)]);
+        // No duplicate input for the shared `seq` column.
+        assert_eq!(
+            lineage.inputs,
+            vec![file_ds(base), file_ds(&alpha), file_ds(&beta)],
+        );
     }
 
     /// Regression: a single-record (`Columns`) source is unchanged — every
@@ -4326,6 +4432,7 @@ nodes:
 "#;
         let lineage = lineage_of(yaml);
         let base = "/w/data/src.txt";
+        let only = format!("{base}#only");
         let out = only_output(&lineage);
         let fields = &out.facet.fields;
 
@@ -4333,7 +4440,8 @@ nodes:
         // The reserved discriminator lead stays on the base dataset even though a
         // record type declared a same-named column.
         assert_field(fields, "rt", &[direct(base, "record_type", Identity)]);
-        // Normal columns keep the same stable collection identity too.
-        assert_field(fields, "payload", &[direct(base, "payload", Identity)]);
+        // A normal column still lands on its own record type.
+        assert_field(fields, "payload", &[direct(&only, "payload", Identity)]);
+        assert_eq!(lineage.inputs, vec![file_ds(base), file_ds(&only)]);
     }
 }

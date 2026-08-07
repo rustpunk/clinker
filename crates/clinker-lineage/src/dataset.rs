@@ -71,6 +71,24 @@ impl DatasetId {
             name: name.into(),
         }
     }
+
+    /// One record type of a multi-record flat-file source, as its own logical
+    /// dataset: `base`'s identity with the record type id appended as a `#<id>`
+    /// fragment, keeping `base`'s namespace.
+    ///
+    /// Record types differ in their *columns*, not in which rows they select, so
+    /// they are distinct datasets rather than subsets of a shared one — a subset
+    /// condition selects rows from one fixed schema and cannot express a
+    /// differing column set. Identity is inherited from `base` rather than
+    /// derived here, so an externally bound source yields
+    /// `{canonical-namespace}/{canonical-name}#<id>` and no worker path can
+    /// reach the name.
+    pub(crate) fn record_type(base: &DatasetId, record_type_id: &str) -> Self {
+        Self {
+            namespace: base.namespace.clone(),
+            name: format!("{}#{record_type_id}", base.name),
+        }
+    }
 }
 
 impl From<DatasetId> for Dataset {
@@ -541,5 +559,41 @@ mod tests {
         assert_eq!(dataset.namespace, "file");
         assert_eq!(dataset.name, "/work/in.csv");
         assert!(dataset.facets.is_none());
+    }
+
+    // --- per-record-type dataset ---
+
+    #[test]
+    fn record_type_dataset_appends_id_fragment_and_keeps_namespace() {
+        let base = DatasetId::file("/work/payments.txt".to_string());
+        let header = DatasetId::record_type(&base, "header");
+        assert_eq!(header.namespace, "file");
+        assert_eq!(header.name, "/work/payments.txt#header");
+
+        // A fallback-namespaced base (network source) keeps its namespace too.
+        let net = DatasetId::fallback("orders_api");
+        let sub = DatasetId::record_type(&net, "detail");
+        assert_eq!(sub.namespace, FALLBACK_NAMESPACE);
+        assert_eq!(sub.name, "orders_api#detail");
+    }
+
+    /// Identity is inherited from the base binding, never derived from a path.
+    /// An externally bound source therefore keeps its canonical namespace and
+    /// name, and no worker-local path can appear in a record-type dataset name
+    /// — the property that makes per-record-type identity relocation-stable.
+    #[test]
+    fn record_type_dataset_inherits_external_identity_without_any_path() {
+        let canonical = DatasetId {
+            namespace: "s3://payments-lake".to_string(),
+            name: "raw/payments".to_string(),
+        };
+        let detail = DatasetId::record_type(&canonical, "detail");
+        assert_eq!(detail.namespace, "s3://payments-lake");
+        assert_eq!(detail.name, "raw/payments#detail");
+        assert!(
+            !detail.name.starts_with('/') && !detail.name.contains("/w/"),
+            "record-type identity must not embed a worker path: {}",
+            detail.name
+        );
     }
 }
