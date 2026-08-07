@@ -28,5 +28,6 @@ pub mod progress;
 pub mod projection;
 pub mod sketch;
 pub mod source;
+pub mod telemetry;
 
 pub use executor::stage_metrics::{StageCollector, StageMetrics, StageName};
