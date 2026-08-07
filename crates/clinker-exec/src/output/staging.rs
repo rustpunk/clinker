@@ -136,10 +136,22 @@ impl PublicationOutcome {
     }
 }
 
+/// How durable a recorded promotion is for one final path.
+///
+/// A rename that landed without its parent-directory synchronization is
+/// observable now but is not guaranteed to survive host power loss, so the
+/// ledger keeps the two apart instead of calling both "committed".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CommittedVisibility {
+    Published,
+    VisibleUnsynchronized,
+}
+
 #[derive(Debug, Default)]
 struct RegistryState {
     pending: Vec<PendingOutput>,
-    committed: Vec<(String, PathBuf)>,
+    committed: Vec<(String, PathBuf, CommittedVisibility)>,
+    cleanup_debt: Vec<CleanupDebt>,
     claims: BTreeMap<String, (String, PathBuf)>,
 }
 
@@ -444,8 +456,8 @@ impl OutputStagingRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .committed
             .iter()
-            .filter(|(entry_name, _)| entry_name == name)
-            .map(|(_, path)| path.clone())
+            .filter(|(entry_name, _, _)| entry_name == name)
+            .map(|(_, path, _)| path.clone())
             .collect()
     }
 
@@ -462,17 +474,34 @@ impl OutputStagingRegistry {
             .collect()
     }
 
-    /// Whether the publication ledger recorded this exact final path as
-    /// visible. The attempt layer uses this only when publication itself
-    /// errors before it can return a normal [`PublicationOutcome`], so the
-    /// failure still carries truthful per-artifact visibility.
-    pub(crate) fn is_committed_path(&self, path: &Path) -> bool {
+    /// How the publication ledger recorded this exact final path, if at all.
+    /// The attempt layer uses this only when publication itself errors before
+    /// it can return a normal [`PublicationOutcome`], so the failure still
+    /// carries truthful per-artifact visibility — including the difference
+    /// between a durable promotion and one whose parent-directory
+    /// synchronization never completed.
+    pub(crate) fn committed_visibility(&self, path: &Path) -> Option<CommittedVisibility> {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .committed
             .iter()
-            .any(|(_, committed)| committed == path)
+            .find(|(_, committed, _)| committed == path)
+            .map(|(_, _, visibility)| *visibility)
+    }
+
+    /// Number of cleanup-debt entries this ledger observed during publication.
+    ///
+    /// A successful call returns its debt inside [`PublicationOutcome`]; this
+    /// accessor serves the attempt layer's error path, where the outcome never
+    /// reaches the caller and the debt would otherwise be reported as zero
+    /// while the orphaned staged files remain on disk.
+    pub(crate) fn recorded_cleanup_debt_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cleanup_debt
+            .len()
     }
 
     /// Publish every staged file after successful pipeline execution.
@@ -523,14 +552,24 @@ impl OutputStagingRegistry {
             {
                 remaining.push_front(entry);
                 self.restore_pending(remaining.into());
-                self.record_committed(&published, &visible_unsynchronized);
+                // This error path returns no outcome, so the ledger is the only
+                // surviving record of debt already owed by earlier promotions.
+                self.record_publication_progress(
+                    &published,
+                    &visible_unsynchronized,
+                    &cleanup_debt,
+                );
                 return Err(PipelineError::Io(error));
             }
             if fail_before_rename_at == Some(index) {
                 remaining.push_front(entry);
                 let unpublished = partials_from(remaining.iter());
                 self.restore_pending(remaining.into());
-                self.record_committed(&published, &visible_unsynchronized);
+                self.record_publication_progress(
+                    &published,
+                    &visible_unsynchronized,
+                    &cleanup_debt,
+                );
                 return Ok(PublicationOutcome::Incomplete {
                     published,
                     visible_unsynchronized,
@@ -568,7 +607,11 @@ impl OutputStagingRegistry {
                     visible_unsynchronized.push(identity);
                     let unpublished = partials_from(remaining.iter());
                     self.restore_pending(remaining.into());
-                    self.record_committed(&published, &visible_unsynchronized);
+                    self.record_publication_progress(
+                        &published,
+                        &visible_unsynchronized,
+                        &cleanup_debt,
+                    );
                     return Ok(PublicationOutcome::Incomplete {
                         published,
                         visible_unsynchronized,
@@ -581,7 +624,11 @@ impl OutputStagingRegistry {
                     remaining.push_front(entry);
                     let unpublished = partials_from(remaining.iter());
                     self.restore_pending(remaining.into());
-                    self.record_committed(&published, &visible_unsynchronized);
+                    self.record_publication_progress(
+                        &published,
+                        &visible_unsynchronized,
+                        &cleanup_debt,
+                    );
                     return Ok(PublicationOutcome::Incomplete {
                         published,
                         visible_unsynchronized,
@@ -593,7 +640,7 @@ impl OutputStagingRegistry {
             }
             index += 1;
         }
-        self.record_committed(&published, &[]);
+        self.record_publication_progress(&published, &[], &cleanup_debt);
         Ok(PublicationOutcome::Complete {
             published,
             cleanup_debt,
@@ -608,17 +655,31 @@ impl OutputStagingRegistry {
             .extend(pending);
     }
 
-    fn record_committed(
+    fn record_publication_progress(
         &self,
         published: &[(String, PathBuf)],
         visible_unsynchronized: &[(String, PathBuf)],
+        cleanup_debt: &[CleanupDebt],
     ) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.committed.extend_from_slice(published);
-        state.committed.extend_from_slice(visible_unsynchronized);
+        state.committed.extend(
+            published
+                .iter()
+                .map(|(name, path)| (name.clone(), path.clone(), CommittedVisibility::Published)),
+        );
+        state
+            .committed
+            .extend(visible_unsynchronized.iter().map(|(name, path)| {
+                (
+                    name.clone(),
+                    path.clone(),
+                    CommittedVisibility::VisibleUnsynchronized,
+                )
+            }));
+        state.cleanup_debt.extend_from_slice(cleanup_debt);
     }
 
     #[cfg(test)]

@@ -30,7 +30,9 @@ use super::containment::{
     AnchoredDirectory, ContainedEntryKind, ContainmentError, OutputContainment,
     PromotionDisposition,
 };
-use super::staging::{AttemptCommitStage, OutputStagingRegistry, PublicationOutcome};
+use super::staging::{
+    AttemptCommitStage, CommittedVisibility, OutputStagingRegistry, PublicationOutcome,
+};
 use crate::pipeline::shutdown::ShutdownToken;
 
 const MANIFEST_SCHEMA: &str = "clinker.attempt-manifest/v1";
@@ -929,6 +931,12 @@ pub enum AttemptFault {
     PromotionInterruptedAfterFirst,
     BeforeRename,
     DirectorySync,
+    /// First artifact becomes visible without its parent-directory
+    /// synchronization, then the terminal manifest write fails.
+    DirectorySyncThenManifestReplace,
+    /// First artifact publishes but leaks its staged file, then promotion of
+    /// the second artifact is interrupted.
+    CleanupThenPromotionInterrupted,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -4899,7 +4907,13 @@ impl AttemptPublication {
                 self.persist_replacement(intent, false)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
                 if fault == Some(AttemptFault::PromotionInterrupted)
-                    || (fault == Some(AttemptFault::PromotionInterruptedAfterFirst) && index == 1)
+                    || (matches!(
+                        fault,
+                        Some(
+                            AttemptFault::PromotionInterruptedAfterFirst
+                                | AttemptFault::CleanupThenPromotionInterrupted
+                        )
+                    ) && index == 1)
                 {
                     return Err(std::io::Error::other(
                         "injected interruption after durable promotion intent",
@@ -4919,8 +4933,11 @@ impl AttemptPublication {
             Some(AttemptFault::BeforeRename) => {
                 registry.commit_all_inner(Some(0), None, None, Some(&mut barrier))
             }
-            Some(AttemptFault::DirectorySync) => {
+            Some(AttemptFault::DirectorySync | AttemptFault::DirectorySyncThenManifestReplace) => {
                 registry.commit_all_inner(None, Some(0), None, Some(&mut barrier))
+            }
+            Some(AttemptFault::CleanupThenPromotionInterrupted) => {
+                registry.commit_all_inner(None, None, Some(0), Some(&mut barrier))
             }
             _ => registry.commit_all_with_stage_control(&mut barrier),
         };
@@ -4932,11 +4949,19 @@ impl AttemptPublication {
                 for (manifest, runtime) in
                     incomplete.artifacts.iter_mut().zip(self.artifacts.iter())
                 {
-                    // A committed ledger entry is definitive. Otherwise retain
-                    // durable promotion intent so a fresh handle-relative query
-                    // can reconcile whether the rename became visible.
-                    if registry.is_committed_path(&runtime.final_path) {
-                        manifest.state = ArtifactState::Published;
+                    // A committed ledger entry is definitive, and a rename that
+                    // outlived its parent-directory synchronization is visible
+                    // without being durable. Otherwise retain durable promotion
+                    // intent so a fresh handle-relative query can reconcile
+                    // whether the rename became visible.
+                    match registry.committed_visibility(&runtime.final_path) {
+                        Some(CommittedVisibility::Published) => {
+                            manifest.state = ArtifactState::Published;
+                        }
+                        Some(CommittedVisibility::VisibleUnsynchronized) => {
+                            manifest.state = ArtifactState::VisibleUnsynchronized;
+                        }
+                        None => {}
                     }
                 }
                 self.persist_replacement(incomplete, false)?;
@@ -4970,7 +4995,10 @@ impl AttemptPublication {
                 }
             }
         }
-        self.persist_replacement(finished, false)?;
+        self.persist_replacement(
+            finished,
+            fault == Some(AttemptFault::DirectorySyncThenManifestReplace),
+        )?;
         self.terminal = true;
         if outcome.is_complete() {
             for artifact_id in artifact_ids {
@@ -5022,10 +5050,12 @@ impl AttemptPublication {
                         artifact_id: runtime.artifact_id.clone(),
                         kind: runtime.kind,
                         logical_leaf: runtime.logical_leaf.clone(),
-                        state: if registry.is_committed_path(&runtime.final_path) {
-                            ArtifactState::Published
-                        } else {
-                            ArtifactState::Unpublished
+                        state: match registry.committed_visibility(&runtime.final_path) {
+                            Some(CommittedVisibility::Published) => ArtifactState::Published,
+                            Some(CommittedVisibility::VisibleUnsynchronized) => {
+                                ArtifactState::VisibleUnsynchronized
+                            }
+                            None => ArtifactState::Unpublished,
                         },
                     })
                     .collect();
@@ -5034,7 +5064,9 @@ impl AttemptPublication {
                     outcome: AttemptPublicationOutcome::Incomplete {
                         execution_id: self.execution_id.clone(),
                         artifacts,
-                        cleanup_debt_count: 0,
+                        // Promotions that already leaked a staged file owe
+                        // reclamation whether or not publication finished.
+                        cleanup_debt_count: registry.recorded_cleanup_debt_count(),
                     },
                 });
             }
