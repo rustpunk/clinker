@@ -728,6 +728,15 @@ fn retryable_status(status: u16) -> Option<OtlpRetryCause> {
 
 fn retryable_transport(error: &ureq::Error) -> Option<OtlpRetryCause> {
     match error {
+        // A deadline that expires before a connection exists is a failure to
+        // reach the collector, not a slow one; what separates the two is the
+        // phase the deadline expired in, not that it was a deadline. Hosts
+        // differ in whether an unreachable port is refused outright or simply
+        // never answers, so classifying by phase keeps one unreachable
+        // collector from being reported two different ways.
+        ureq::Error::Timeout(ureq::Timeout::Connect | ureq::Timeout::Resolve) => {
+            Some(OtlpRetryCause::Connect)
+        }
         ureq::Error::Timeout(_) => Some(OtlpRetryCause::Timeout),
         ureq::Error::HostNotFound
         | ureq::Error::ConnectionFailed

@@ -415,21 +415,15 @@ impl LineageDelivery {
     /// Serialize a complete event into an owned capped buffer, then attempt
     /// immediate drop-newest admission without waiting on capacity or the sink.
     ///
-    /// This is the bulkhead form: it runs beside a live pipeline, so it never
-    /// waits, not even on the queue lock. Callers whose entire job is the
-    /// export should use [`Self::emit_export`] instead.
+    /// This is the bulkhead form: it runs beside a live pipeline and never
+    /// waits on queue capacity or on the sink. It does yield for the queue
+    /// lock, which the worker holds only long enough to take an event off the
+    /// queue and never across a sink write, so the wait is bounded by a
+    /// pop rather than by however long the collector takes. Dropping there
+    /// would report an empty queue as backpressure; real backpressure is
+    /// reported by capacity, and byte caps and worker shutdown are reported
+    /// on their own terms.
     pub fn try_emit(&self, event: &RunEvent) -> LineageAdmission {
-        self.emit(event, 0)
-    }
-
-    /// Admit one event for a finite export that is the caller's whole job.
-    ///
-    /// Identical to [`Self::try_emit`] except that the transient queue-lock
-    /// window is retried rather than counted as a drop. A plan-only export
-    /// has no running pipeline to protect, so losing an event to the instant
-    /// the worker holds the lock would be a defect, not backpressure. Byte
-    /// caps, queue capacity, and worker shutdown are reported unchanged.
-    pub fn emit_export(&self, event: &RunEvent) -> LineageAdmission {
         self.emit(event, PRODUCER_LOCK_RETRIES)
     }
 

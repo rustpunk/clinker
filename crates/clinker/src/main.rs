@@ -2851,7 +2851,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             .map_err(lineage_worker_start_error)?;
             let mut rejected = Vec::new();
             for (index, event) in events.iter().enumerate() {
-                match delivery.emit_export(event) {
+                match delivery.try_emit(event) {
                     clinker_lineage::LineageAdmission::Accepted => {}
                     admission => rejected.push((index, admission)),
                 }
