@@ -26,18 +26,53 @@ use clinker_plan::plan::execution::{
     matches_upstream_name,
 };
 
+/// Context carrier kept lazy until the node-kind guard has succeeded. Normal
+/// dispatch passes the live executor context directly; the feature-gated
+/// mismatch matrix uses the inert carrier to prove rejection precedes source
+/// handoff, channel, and buffer access.
+pub(crate) enum MergeDispatchContext<'borrow, 'plan> {
+    Live(&'borrow mut ExecutorContext<'plan>),
+    #[cfg(feature = "test-utils")]
+    Inert,
+}
+
+impl<'borrow, 'plan> From<&'borrow mut ExecutorContext<'plan>>
+    for MergeDispatchContext<'borrow, 'plan>
+{
+    fn from(ctx: &'borrow mut ExecutorContext<'plan>) -> Self {
+        Self::Live(ctx)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl crate::executor::dispatch::DispatchFaultGuard {
+    /// Execute the real merge boundary with an inert context so tests can
+    /// prove a wrong node returns before source or buffer state is touched.
+    #[doc(hidden)]
+    pub fn dispatch_merge_mismatch_for_testing(
+        current_dag: &ExecutionPlanDag,
+        node_idx: NodeIndex,
+        node: &PlanNode,
+    ) -> Result<(), PipelineError> {
+        dispatch_merge(MergeDispatchContext::Inert, current_dag, node_idx, node)
+    }
+}
+
 /// Execute the `Merge` arm for `node_idx`: concatenate predecessor buffers
 /// in declaration order (Concat), round-robin across them (Interleave), or —
 /// when every predecessor is an exclusively owned Source under
 /// `mode: interleave` — drive the fused `crossbeam_channel::Select` path.
 /// Streaming concatenation; emits
 /// every record onto the canonical merge output schema for `Arc::ptr_eq`.
-pub(crate) fn dispatch_merge(
-    ctx: &mut ExecutorContext<'_>,
+pub(crate) fn dispatch_merge<'borrow, 'plan>(
+    ctx: impl Into<MergeDispatchContext<'borrow, 'plan>>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     node: &PlanNode,
-) -> Result<(), PipelineError> {
+) -> Result<(), PipelineError>
+where
+    'plan: 'borrow,
+{
     let PlanNode::Merge {
         ref name,
         mode,
@@ -46,7 +81,19 @@ pub(crate) fn dispatch_merge(
         ..
     } = *node
     else {
-        unreachable!("dispatch_merge called with non-Merge node");
+        return Err(crate::executor::invariant::dispatch_mismatch(
+            "dispatch_merge",
+            "merge",
+            node.kind_name(),
+            node.name(),
+        ));
+    };
+    let ctx = match ctx.into() {
+        MergeDispatchContext::Live(ctx) => ctx,
+        #[cfg(feature = "test-utils")]
+        MergeDispatchContext::Inert => {
+            panic!("merge dispatcher accessed inert context after accepting a merge node")
+        }
     };
     let advertised_promise = match (mode, interleave_seed) {
         (clinker_plan::config::MergeMode::Concat, _)

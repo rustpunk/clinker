@@ -38,18 +38,53 @@ use clinker_plan::plan::execution::{
 /// and aligns with DataFusion's collect-list bound.
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
 
+/// Context carrier kept lazy until the node-kind guard has succeeded. Normal
+/// dispatch passes the live executor context directly; the feature-gated
+/// mismatch matrix uses the inert carrier to prove rejection precedes join
+/// state, evaluator, and buffer access.
+pub(crate) enum CombineDispatchContext<'borrow, 'plan> {
+    Live(&'borrow mut ExecutorContext<'plan>),
+    #[cfg(feature = "test-utils")]
+    Inert,
+}
+
+impl<'borrow, 'plan> From<&'borrow mut ExecutorContext<'plan>>
+    for CombineDispatchContext<'borrow, 'plan>
+{
+    fn from(ctx: &'borrow mut ExecutorContext<'plan>) -> Self {
+        Self::Live(ctx)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl crate::executor::dispatch::DispatchFaultGuard {
+    /// Execute the real combine boundary with an inert context so tests can
+    /// prove a wrong node returns before join state is touched.
+    #[doc(hidden)]
+    pub fn dispatch_combine_mismatch_for_testing(
+        current_dag: &ExecutionPlanDag,
+        node_idx: NodeIndex,
+        node: &PlanNode,
+    ) -> Result<(), PipelineError> {
+        dispatch_combine(CombineDispatchContext::Inert, current_dag, node_idx, node)
+    }
+}
+
 /// Execute the `Combine` arm for `node_idx`: dispatch on the planner-
 /// selected [`clinker_plan::plan::combine::CombineStrategy`], drive the build and
 /// probe sides, emit combined rows onto the node's widened output schema,
 /// and route recoverable per-row failures through the DLQ. Blocking on the
 /// build side; the probe side streams. Charges build-side state against the
 /// memory arbitrator and unregisters its consumer on completion.
-pub(crate) fn dispatch_combine(
-    ctx: &mut ExecutorContext<'_>,
+pub(crate) fn dispatch_combine<'borrow, 'plan>(
+    ctx: impl Into<CombineDispatchContext<'borrow, 'plan>>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     node: &PlanNode,
-) -> Result<(), PipelineError> {
+) -> Result<(), PipelineError>
+where
+    'plan: 'borrow,
+{
     let PlanNode::Combine {
         ref name,
         ref strategy,
@@ -76,7 +111,19 @@ pub(crate) fn dispatch_combine(
         ..
     } = *node
     else {
-        unreachable!("dispatch_combine called with non-Combine node");
+        return Err(crate::executor::invariant::dispatch_mismatch(
+            "dispatch_combine",
+            "combine",
+            node.kind_name(),
+            node.name(),
+        ));
+    };
+    let ctx = match ctx.into() {
+        CombineDispatchContext::Live(ctx) => ctx,
+        #[cfg(feature = "test-utils")]
+        CombineDispatchContext::Inert => {
+            panic!("combine dispatcher accessed inert context after accepting a combine node")
+        }
     };
     assert_order_contract(
         current_dag.order_contract(),
