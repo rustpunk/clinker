@@ -33,6 +33,13 @@ fn config(queue_bytes: usize, max_event_bytes: usize, deadline_ms: u64) -> Linea
     .expect("valid test delivery bounds")
 }
 
+fn start<W>(config: LineageDeliveryConfig, sink: W) -> LineageDelivery
+where
+    W: Write + Send + 'static,
+{
+    LineageDelivery::start(config, sink).expect("start lineage worker")
+}
+
 #[derive(Default)]
 struct SinkState {
     bytes: Mutex<Vec<u8>>,
@@ -107,8 +114,7 @@ impl Write for GatedSink {
 #[test]
 fn bounded_delivery_and_hung_sink() {
     let state = Arc::new(SinkState::default());
-    let delivery =
-        LineageDelivery::start(config(4_096, 4_096, 200), RecordingSink(Arc::clone(&state)));
+    let delivery = start(config(4_096, 4_096, 200), RecordingSink(Arc::clone(&state)));
     assert_eq!(
         delivery.try_emit(&event("accepted")),
         LineageAdmission::Accepted
@@ -121,7 +127,7 @@ fn bounded_delivery_and_hung_sink() {
     assert!(state.bytes.lock().expect("bytes lock").ends_with(b"\n"));
     assert_eq!(*state.flushes.lock().expect("flush lock"), 1);
 
-    let oversized = LineageDelivery::start(
+    let oversized = start(
         config(64, 64, 200),
         RecordingSink(Arc::new(SinkState::default())),
     );
@@ -138,7 +144,7 @@ fn bounded_delivery_and_hung_sink() {
 
     let (receipt_tx, receipt_rx) = mpsc::channel();
     let gate = Arc::new(WriteGate::default());
-    let full = LineageDelivery::start(
+    let full = start(
         config(1_024, 1_024, 500),
         GatedSink {
             receipt: Some(receipt_tx),
@@ -174,7 +180,7 @@ fn bounded_delivery_and_hung_sink() {
     assert_eq!(outcome.full(), 1);
     assert_eq!(outcome.terminal(), LineageDeliveryTerminal::Shutdown);
 
-    let write_failed = LineageDelivery::start(
+    let write_failed = start(
         config(4_096, 4_096, 200),
         FailingSink {
             write_kind: Some(io::ErrorKind::BrokenPipe),
@@ -190,7 +196,7 @@ fn bounded_delivery_and_hung_sink() {
         LineageDeliveryTerminal::WriteFailed(io::ErrorKind::BrokenPipe)
     );
 
-    let flush_failed = LineageDelivery::start(
+    let flush_failed = start(
         config(4_096, 4_096, 200),
         FailingSink {
             write_kind: None,
@@ -208,7 +214,7 @@ fn bounded_delivery_and_hung_sink() {
 
     let (receipt_tx, receipt_rx) = mpsc::channel();
     let hung_gate = Arc::new(WriteGate::default());
-    let hung = LineageDelivery::start(
+    let hung = start(
         config(4_096, 4_096, 40),
         GatedSink {
             receipt: Some(receipt_tx),

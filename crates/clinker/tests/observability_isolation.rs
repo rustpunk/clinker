@@ -771,6 +771,70 @@ fn fault_matrix_endpoint_partitions_fail_before_every_effect() {
 }
 
 #[test]
+fn worker_startup_failures_are_preeffect_and_machine_terminal() {
+    fn snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
+        collect_files(root, root, |_| true)
+    }
+
+    for variable in [
+        "CLINKER_TEST_OTLP_WORKER_START_FAILURE",
+        "CLINKER_TEST_LINEAGE_WORKER_START_FAILURE",
+    ] {
+        let root = fixture();
+        write_fault_matrix_pipeline(root.path());
+        write_fault_matrix_policy(root.path(), "4KB");
+        std::fs::create_dir(root.path().join("staging")).expect("staging root");
+        std::fs::write(root.path().join("staging/sentinel"), b"staging-before\n")
+            .expect("staging sentinel");
+        std::fs::write(
+            root.path().join("private/output/customers.csv"),
+            b"output-before\n",
+        )
+        .expect("output sentinel");
+        std::fs::write(root.path().join("lineage.ndjson"), b"lineage-before\n")
+            .expect("lineage sentinel");
+        let before = snapshot(root.path());
+
+        let output = Command::new(clinker_bin())
+            .current_dir(root.path())
+            .env("CLINKER_TEST_OTLP_OUTCOME", "success")
+            .env(variable, "1")
+            .args([
+                "run",
+                "pipeline.yaml",
+                "--machine",
+                "ndjson-v1",
+                "--batch-id",
+                "worker-startup-failure",
+                "--lineage-events",
+                "lineage.ndjson",
+            ])
+            .output()
+            .expect("run worker startup failure");
+
+        assert_eq!(output.status.code(), Some(1), "{variable}");
+        let events = machine_events(&output);
+        let terminals = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event["event"].as_str(),
+                    Some("completed" | "failed" | "cancelled")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1, "{variable}: {events:#?}");
+        assert_eq!(terminals[0]["event"], "failed", "{variable}");
+        assert_eq!(
+            terminals[0]["failure"]["code"], "observability.configuration.invalid",
+            "{variable}"
+        );
+        assert_eq!(snapshot(root.path()), before, "{variable}");
+        assert!(!root.path().join(".clinker-attempts").exists());
+    }
+}
+
+#[test]
 fn fault_matrix_otlp_outcomes_change_only_the_selected_signal() {
     let baseline = invoke_fault_matrix(None, "success", None, false, "4KB");
     assert_eq!(baseline.oracle.status, Some(2));

@@ -331,10 +331,21 @@ pub struct LineageDelivery {
 
 impl LineageDelivery {
     /// Start a worker that exclusively owns `sink`.
-    pub fn start<W>(config: LineageDeliveryConfig, mut sink: W) -> Self
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the dedicated worker thread cannot be
+    /// created. No event is admitted and the sink is not written on failure.
+    pub fn start<W>(config: LineageDeliveryConfig, mut sink: W) -> io::Result<Self>
     where
         W: Write + Send + 'static,
     {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("CLINKER_TEST_LINEAGE_WORKER_START_FAILURE").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            return Err(io::Error::other("injected lineage worker startup failure"));
+        }
         let queue = Arc::new(DeliveryQueue::new(
             config.queue_bytes,
             config.max_event_bytes,
@@ -342,18 +353,20 @@ impl LineageDelivery {
         let counters = Arc::new(Counters::default());
         let worker_queue = Arc::clone(&queue);
         let (outcome_tx, outcome_rx) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            let terminal = run_worker(&worker_queue, &mut sink);
-            worker_queue.close();
-            let _ = outcome_tx.send(terminal);
-        });
-        Self {
+        let worker = thread::Builder::new()
+            .name("clinker-lineage-export".to_owned())
+            .spawn(move || {
+                let terminal = run_worker(&worker_queue, &mut sink);
+                worker_queue.close();
+                let _ = outcome_tx.send(terminal);
+            })?;
+        Ok(Self {
             config,
             queue,
             counters,
             outcome_rx,
             worker: Some(worker),
-        }
+        })
     }
 
     /// Serialize a complete event into an owned capped buffer, then attempt

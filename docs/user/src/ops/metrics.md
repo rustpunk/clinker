@@ -323,7 +323,10 @@ but retain distinct typed per-signal delivery outcomes and fixed aggregate
 counters. Those producers are the executor's actual lifecycle, runtime, and
 terminal producers; the transport does not invent equivalent events. The
 OpenLineage worker has its own queue, byte cap, sink, deadline, counters, and
-typed outcome. Both paths copy the same batch ID, execution ID, semantic-plan
+typed outcome. The arena allocation and both worker spawns complete before
+source discovery, staging, publication-attempt creation, sink writes, or a
+lineage `START`; inability to create either worker fails admission without
+those effects. Both paths copy the same batch ID, execution ID, semantic-plan
 algorithm/version/digest, and terminal facts from one immutable lifecycle
 snapshot; neither path reconstructs or owns those facts. Collector partial
 acceptance, rejection, transport failure, shutdown, or flush expiry, and

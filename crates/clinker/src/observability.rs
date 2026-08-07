@@ -325,6 +325,12 @@ impl OtlpWorker {
         receiver: TelemetryReceiver,
         shutdown: ShutdownToken,
     ) -> Result<Self, ObservabilityRuntimeError> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("CLINKER_TEST_OTLP_WORKER_START_FAILURE").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            return Err(ObservabilityRuntimeError::Worker);
+        }
         let backend = DeliveryBackend::new()?;
         let max_payload_bytes = bundle.arena.max_batch_bytes;
         let mut payload = BoundedPayload::new(max_payload_bytes)?;

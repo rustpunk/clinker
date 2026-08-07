@@ -1649,6 +1649,12 @@ fn observability_configuration_error(error: impl std::fmt::Display) -> PipelineE
     )))
 }
 
+fn lineage_worker_start_error(_error: std::io::Error) -> PipelineError {
+    observability_configuration_error(
+        "the bounded lineage exporter could not start before execution. Correction: reduce host resource pressure or disable external lineage delivery",
+    )
+}
+
 enum CliLineageIdentity {
     External(clinker_lineage::LineageIdentityContext),
     LocalDiagnosticPaths,
@@ -2690,7 +2696,8 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             let delivery = clinker_lineage::LineageDelivery::start(
                 delivery_config,
                 external_lineage_sink(path),
-            );
+            )
+            .map_err(lineage_worker_start_error)?;
             for event in &events {
                 let _ = delivery.try_emit(event);
             }
@@ -2797,7 +2804,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     // Resolve every emitted source/output identity before discovery, staging,
     // publication-attempt creation, or lineage-sink opening. A missing or
     // ambiguous external binding is an admission failure, not a mid-run event.
-    let live_lineage = if args.lineage_events.is_some() {
+    let mut live_lineage = if args.lineage_events.is_some() {
         Some(build_cli_lineage(
             &compiled_plan,
             &lineage_configuration
@@ -2847,14 +2854,60 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         return Ok(0);
     }
 
-    // Reserve the complete fixed arena before discovery or any output attempt.
-    // The immutable runtime bundle already contains the sole admitted endpoint
-    // and exact policy bounds; disabled runs retain neither handle.
-    let mut telemetry_handles = otlp_runtime
+    // Construct every optional worker before discovery, staging, publication
+    // attempts, sink writes, or lifecycle START. A capability failure is an
+    // admission error; a worker that starts successfully remains an optional
+    // bulkhead whose later delivery outcome cannot redefine run truth.
+    let shutdown_token = machine.map_or_else(
+        clinker_exec::pipeline::shutdown::ShutdownToken::new,
+        MachineEmitter::shutdown_token,
+    );
+    let telemetry_handles = otlp_runtime
         .as_ref()
         .map(|runtime| runtime.reserve_arena(&observability_policy))
         .transpose()
         .map_err(observability_configuration_error)?;
+    let (telemetry_producer, mut otlp_worker) = match (otlp_runtime.take(), telemetry_handles) {
+        (Some(runtime), Some((producer, receiver))) => (
+            Some(producer),
+            Some(
+                observability::OtlpWorker::start(runtime, receiver, shutdown_token.clone())
+                    .map_err(observability_configuration_error)?,
+            ),
+        ),
+        (None, None) => (None, None),
+        _ => {
+            return Err(PipelineError::Internal {
+                op: "observability runtime composition",
+                node: "pipeline".to_owned(),
+                detail: "admitted runtime and reserved telemetry arena disagree".to_owned(),
+            });
+        }
+    };
+    let mut lineage_output: Option<LiveLineageOutput> = None;
+    if let Some(path) = &args.lineage_events {
+        let configuration = lineage_configuration
+            .as_ref()
+            .expect("lineage configuration is resolved whenever --lineage-events is set");
+        if let Some(delivery_config) = configuration.delivery {
+            let lineage = live_lineage
+                .take()
+                .expect("live lineage is preflighted whenever --lineage-events is set");
+            let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
+            let job = clinker_lineage::Job::for_pipeline(
+                pipeline_config.pipeline.name.clone(),
+                source_hash,
+            );
+            let sink = LiveLineageSink::External(
+                clinker_lineage::LineageDelivery::start(
+                    delivery_config,
+                    external_lineage_sink(path),
+                )
+                .map_err(lineage_worker_start_error)?,
+            );
+            lineage_output = Some(LiveLineageOutput { sink, lineage, job });
+        }
+    }
 
     // Discovery pre-pass: resolve every File source's matcher to its file set
     // and build a Rest reader for every network source, before any storage
@@ -3303,14 +3356,6 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         output_staging: output_staging.clone(),
         auto_commit_staged: false,
     };
-    // Fresh per-run shutdown token. `ShutdownToken::new()` auto-registers
-    // with the process-wide signal-handler registry installed in `main`,
-    // so a SIGINT/SIGTERM during the run trips it; the executor polls it
-    // at operator chunk boundaries and unwinds gracefully.
-    let shutdown_token = machine.map_or_else(
-        clinker_exec::pipeline::shutdown::ShutdownToken::new,
-        MachineEmitter::shutdown_token,
-    );
     let run_params = clinker_exec::executor::PipelineRunParams {
         execution_id: execution_id.clone(),
         batch_id: batch_id.clone(),
@@ -3318,44 +3363,38 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         static_vars: effective_runtime_variables.static_vars,
         source_vars: effective_runtime_variables.source_vars,
         record_vars: effective_runtime_variables.record_vars,
-        telemetry_producer: telemetry_handles
-            .as_ref()
-            .map(|(producer, _)| producer.clone()),
+        telemetry_producer,
         shutdown_token: Some(shutdown_token.clone()),
         spill_root_dir: spill_root_dir.clone(),
         spill_disk_cap_bytes,
         spill_compress: storage_config.spill.compress,
     };
-    let mut lineage_output: Option<LiveLineageOutput> = None;
-    if let Some(path) = &args.lineage_events {
-        let lineage =
-            live_lineage.expect("live lineage is preflighted whenever --lineage-events is set");
+    if let Some(path) = &args.lineage_events
+        && lineage_output.is_none()
+    {
+        let lineage = live_lineage
+            .take()
+            .expect("live lineage is preflighted whenever --lineage-events is set");
         let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
         let job =
             clinker_lineage::Job::for_pipeline(pipeline_config.pipeline.name.clone(), source_hash);
         let configuration = lineage_configuration
             .as_ref()
             .expect("lineage configuration is resolved whenever --lineage-events is set");
-        let sink = if let Some(delivery_config) = configuration.delivery {
-            LiveLineageSink::External(clinker_lineage::LineageDelivery::start(
-                delivery_config,
-                external_lineage_sink(path),
-            ))
+        debug_assert!(configuration.delivery.is_none());
+        let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
+            // Unlocked stdout handle: locking per write avoids deadlocking the run's
+            // own stdout prints (the spill-volume summary and completion line).
+            Box::new(std::io::stdout())
         } else {
-            let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
-                // Unlocked stdout handle: locking per write avoids deadlocking the run's
-                // own stdout prints (the spill-volume summary and completion line).
-                Box::new(std::io::stdout())
-            } else {
-                Box::new(std::fs::File::create(path).map_err(|e| {
-                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                        "cannot open --lineage-events output {}: {e}",
-                        path.display()
-                    )))
-                })?)
-            };
-            LiveLineageSink::LocalDiagnostic(writer)
+            Box::new(std::fs::File::create(path).map_err(|e| {
+                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                    "cannot open --lineage-events output {}: {e}",
+                    path.display()
+                )))
+            })?)
         };
+        let sink = LiveLineageSink::LocalDiagnostic(writer);
         lineage_output = Some(LiveLineageOutput { sink, lineage, job });
     }
 
@@ -3380,21 +3419,6 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             .map_err(lifecycle_error)?;
         return Err(error);
     }
-
-    let mut otlp_worker = match (otlp_runtime.take(), telemetry_handles.take()) {
-        (Some(runtime), Some((_producer, receiver))) => Some(
-            observability::OtlpWorker::start(runtime, receiver, shutdown_token.clone())
-                .map_err(observability_configuration_error)?,
-        ),
-        (None, None) => None,
-        _ => {
-            return Err(PipelineError::Internal {
-                op: "observability runtime composition",
-                node: "pipeline".to_owned(),
-                detail: "admitted runtime and reserved telemetry arena disagree".to_owned(),
-            });
-        }
-    };
 
     // The executor recompiles `compiled_plan.config()` — already the effective,
     // post-overlay config — so the context it recompiles under must NOT carry
