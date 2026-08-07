@@ -565,7 +565,10 @@ pub fn send_otlp_json(
                         .read_to_vec()
                     {
                         Ok(body) => body,
-                        Err(error) => match retryable_transport(&error) {
+                        // Reading the body means the handshake already
+                        // succeeded, so a reset here is the wire failing, not
+                        // a peer that was never a TLS endpoint.
+                        Err(error) => match retryable_transport(&error, false) {
                             Some(_cause) if attempts < budget.max_attempts => {
                                 wait_for_retry(
                                     signal,
@@ -624,7 +627,7 @@ pub fn send_otlp_json(
                     attempts,
                 ));
             }
-            Err(error) => match retryable_transport(&error) {
+            Err(error) => match retryable_transport(&error, endpoint.https_only) {
                 Some(_cause) if attempts < budget.max_attempts => {
                     wait_for_retry(
                         signal,
@@ -726,7 +729,38 @@ fn retryable_status(status: u16) -> Option<OtlpRetryCause> {
     }
 }
 
-fn retryable_transport(error: &ureq::Error) -> Option<OtlpRetryCause> {
+/// Whether `error` is a peer that is not speaking TLS on an origin that
+/// requires it.
+///
+/// Shared by the retry decision and the terminal classification so the two
+/// cannot disagree about the same error. Which I/O error surfaces depends on
+/// whether the peer writes bytes before closing and on the host's socket
+/// behaviour: a plaintext HTTP reply reaches rustls as invalid data, while a
+/// peer that closes first arrives as end-of-stream, a reset, or an abort. All
+/// of them mean the remote is not a TLS endpoint, which no amount of retrying
+/// will change.
+fn is_tls_endpoint_mismatch(error: &ureq::Error, https_only: bool) -> bool {
+    https_only
+        && matches!(
+            error,
+            ureq::Error::Io(io) if matches!(
+                io.kind(),
+                std::io::ErrorKind::InvalidData
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            )
+        )
+}
+
+fn retryable_transport(error: &ureq::Error, https_only: bool) -> Option<OtlpRetryCause> {
+    // Decline before the reachability arms below. A reset or an abort during
+    // the handshake is indistinguishable from one on the wire by kind alone,
+    // so without this the retry decision claims a TLS mismatch as a connect
+    // failure and the terminal classification never runs.
+    if is_tls_endpoint_mismatch(error, https_only) {
+        return None;
+    }
     match error {
         // A deadline that expires before a connection exists is a failure to
         // reach the collector, not a slow one; what separates the two is the
@@ -771,26 +805,10 @@ fn map_transport_error(
         ureq::Error::Tls(_) | ureq::Error::Rustls(_) | ureq::Error::TlsRequired => {
             OtlpDeliveryFailureKind::Tls
         }
-        // A peer that is not speaking TLS on an origin that requires it fails
-        // during the handshake, and which I/O error surfaces depends on whether
-        // the peer writes bytes before closing: a plaintext HTTP reply reaches
-        // rustls as InvalidData, while a peer that closes first reaches it as
-        // end-of-stream or a reset. All three mean the same thing — the remote
-        // is not a TLS endpoint — so they classify together. Errors that fail
-        // before a handshake can begin (refused, unreachable) stay Transport,
-        // because those describe reachability rather than protocol.
-        ureq::Error::Io(error)
-            if https_only
-                && matches!(
-                    error.kind(),
-                    std::io::ErrorKind::InvalidData
-                        | std::io::ErrorKind::UnexpectedEof
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                ) =>
-        {
-            OtlpDeliveryFailureKind::Tls
-        }
+        // Errors that fail before a handshake can begin (refused, unreachable)
+        // stay Transport, because those describe reachability rather than
+        // protocol.
+        error if is_tls_endpoint_mismatch(error, https_only) => OtlpDeliveryFailureKind::Tls,
         ureq::Error::Timeout(_) => OtlpDeliveryFailureKind::Timeout,
         ureq::Error::Other(other) if other.is::<OtlpCredentialApplicationError>() => {
             OtlpDeliveryFailureKind::CredentialApplication
