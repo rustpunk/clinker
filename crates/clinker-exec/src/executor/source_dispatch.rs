@@ -24,20 +24,67 @@ use crate::executor::node_buffer::TransientNodeBufferReservation;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
+/// Context carrier kept lazy until the node-kind guard has succeeded. Normal
+/// dispatch passes the live executor context directly; the feature-gated
+/// mismatch matrix uses the inert carrier to prove rejection precedes source
+/// receiver, cursor, and buffer access.
+pub(crate) enum SourceDispatchContext<'borrow, 'plan> {
+    Live(&'borrow mut ExecutorContext<'plan>),
+    #[cfg(feature = "test-utils")]
+    Inert,
+}
+
+impl<'borrow, 'plan> From<&'borrow mut ExecutorContext<'plan>>
+    for SourceDispatchContext<'borrow, 'plan>
+{
+    fn from(ctx: &'borrow mut ExecutorContext<'plan>) -> Self {
+        Self::Live(ctx)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl crate::executor::dispatch::DispatchFaultGuard {
+    /// Execute the real source boundary with an inert context so tests can
+    /// prove a wrong node returns before source state is touched.
+    #[doc(hidden)]
+    pub fn dispatch_source_mismatch_for_testing(
+        current_dag: &ExecutionPlanDag,
+        node_idx: NodeIndex,
+        node: &PlanNode,
+    ) -> Result<(), PipelineError> {
+        dispatch_source(SourceDispatchContext::Inert, current_dag, node_idx, node)
+    }
+}
+
 /// Execute the `Source` arm for `node_idx`: drain the source's records from
 /// its live receiver, body-port seed buffer, or fail loudly when the ingest
 /// pass missed it; canonicalize onto the plan-time `Arc<Schema>`; seed
 /// `$record.*` / `$source.*` defaults; advance the per-source counter; and
 /// finalize every window arena rooted at this Source at EOF. Streaming:
 /// records are consumed one at a time so back-pressure engages.
-pub(crate) fn dispatch_source(
-    ctx: &mut ExecutorContext<'_>,
+pub(crate) fn dispatch_source<'borrow, 'plan>(
+    ctx: impl Into<SourceDispatchContext<'borrow, 'plan>>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     node: &PlanNode,
-) -> Result<(), PipelineError> {
+) -> Result<(), PipelineError>
+where
+    'plan: 'borrow,
+{
     let PlanNode::Source { ref name, .. } = *node else {
-        unreachable!("dispatch_source called with non-Source node");
+        return Err(crate::executor::invariant::dispatch_mismatch(
+            "dispatch_source",
+            "source",
+            node.kind_name(),
+            node.name(),
+        ));
+    };
+    let ctx = match ctx.into() {
+        SourceDispatchContext::Live(ctx) => ctx,
+        #[cfg(feature = "test-utils")]
+        SourceDispatchContext::Inert => {
+            panic!("source dispatcher accessed inert context after accepting a source node")
+        }
     };
     // Three input paths feed a Source's emit:
     //

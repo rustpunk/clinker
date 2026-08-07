@@ -65,18 +65,53 @@ struct AggregateSpec<'a> {
     has_distinct: bool,
 }
 
+/// Context carrier kept lazy until the node-kind guard has succeeded. Normal
+/// dispatch passes the live executor context directly; the feature-gated
+/// mismatch matrix uses the inert carrier to prove rejection precedes all
+/// aggregate state and buffer access.
+pub(crate) enum AggregateDispatchContext<'borrow, 'plan> {
+    Live(&'borrow mut ExecutorContext<'plan>),
+    #[cfg(feature = "test-utils")]
+    Inert,
+}
+
+impl<'borrow, 'plan> From<&'borrow mut ExecutorContext<'plan>>
+    for AggregateDispatchContext<'borrow, 'plan>
+{
+    fn from(ctx: &'borrow mut ExecutorContext<'plan>) -> Self {
+        Self::Live(ctx)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl crate::executor::dispatch::DispatchFaultGuard {
+    /// Execute the real aggregate boundary with an inert context so tests can
+    /// prove a wrong node returns before aggregate state is touched.
+    #[doc(hidden)]
+    pub fn dispatch_aggregation_mismatch_for_testing(
+        current_dag: &ExecutionPlanDag,
+        node_idx: NodeIndex,
+        node: &PlanNode,
+    ) -> Result<(), PipelineError> {
+        dispatch_aggregation(AggregateDispatchContext::Inert, current_dag, node_idx, node)
+    }
+}
+
 /// Execute the `Aggregation` arm for `node_idx`: select hash or streaming
 /// strategy, ingest the predecessor's records (per-record for hash, sorted
 /// for streaming), trip soft/hard spill thresholds inside the RSS budget,
 /// finalize, and hand relaxed-CK aggregates to the retraction-mode commit
 /// path. Blocking: accumulates group state before emitting any output row.
 /// Time-windowed configs route through [`run_time_windowed_aggregate`].
-pub(crate) fn dispatch_aggregation(
-    ctx: &mut ExecutorContext<'_>,
+pub(crate) fn dispatch_aggregation<'borrow, 'plan>(
+    ctx: impl Into<AggregateDispatchContext<'borrow, 'plan>>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     node: &PlanNode,
-) -> Result<(), PipelineError> {
+) -> Result<(), PipelineError>
+where
+    'plan: 'borrow,
+{
     let PlanNode::Aggregation {
         ref name,
         ref compiled,
@@ -88,7 +123,19 @@ pub(crate) fn dispatch_aggregation(
         ..
     } = *node
     else {
-        unreachable!("dispatch_aggregation called with non-Aggregation node");
+        return Err(crate::executor::invariant::dispatch_mismatch(
+            "dispatch_aggregation",
+            "aggregation",
+            node.kind_name(),
+            node.name(),
+        ));
+    };
+    let ctx = match ctx.into() {
+        AggregateDispatchContext::Live(ctx) => ctx,
+        #[cfg(feature = "test-utils")]
+        AggregateDispatchContext::Inert => {
+            panic!("aggregate dispatcher accessed inert context after accepting an aggregate node")
+        }
     };
     let spec = AggregateSpec {
         name: name.as_str(),
