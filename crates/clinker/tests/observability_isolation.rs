@@ -1,6 +1,6 @@
 //! End-to-end contracts for the CLI-owned optional-observability bulkhead.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -271,6 +271,164 @@ fn otlp_bulkhead_drains_three_signals_and_shares_lifecycle_facts() {
     assert_eq!(lineage_plan["digest"], plan["plan_identity"]["digest"]);
     assert_eq!(otlp["clinker.run.outcome"]["stringValue"], "complete");
     assert_eq!(lineage_terminal["eventType"], "COMPLETE");
+}
+
+/// Four customers with varying amounts, and a per-record event gated on a
+/// field the directive never requests. The gate reads `amount`; only
+/// `customer_id` is exported.
+fn write_gated_pipeline(root: &Path, output: &str) {
+    std::fs::create_dir_all(root.join("private/source")).expect("source directory");
+    std::fs::create_dir_all(root.join("private/output")).expect("output directory");
+    std::fs::write(
+        root.join("private/source/customers.csv"),
+        "customer_id,amount\ncustomer-1,500\ncustomer-2,5000\ncustomer-3,900\ncustomer-4,2000\n",
+    )
+    .expect("input fixture");
+    std::fs::write(
+        root.join("pipeline.yaml"),
+        format!(
+            r#"pipeline:
+  name: telemetry_bulkhead
+nodes:
+  - type: source
+    name: customers
+    config:
+      name: customers
+      type: csv
+      path: ./private/source/customers.csv
+      options: {{ has_header: true }}
+      schema:
+        - {{ name: customer_id, type: string }}
+        - {{ name: amount, type: int }}
+  - type: transform
+    name: normalize
+    input: customers
+    config:
+      cxl: |
+        emit customer_id = customer_id
+        emit amount = amount
+      log:
+        - name: transform.customer_seen
+          level: info
+          when: per_record
+          message: customer processed
+          fields: [customer_id]
+          every: 1
+          condition: "amount > 1000"
+  - type: output
+    name: published_customers
+    input: normalize
+    config:
+      name: published_customers
+      type: csv
+      path: {output}
+"#
+        ),
+    )
+    .expect("pipeline fixture");
+}
+
+/// Every exported log record's attributes, flattened to `key -> stringValue`.
+fn captured_log_attributes(capture: &Path) -> Vec<BTreeMap<String, String>> {
+    let mut records = Vec::new();
+    for entry in capture_events(capture) {
+        if entry["signal"] != "logs" {
+            continue;
+        }
+        let Some(resource_logs) = entry["payload"]["resourceLogs"].as_array() else {
+            continue;
+        };
+        for resource in resource_logs {
+            let Some(scope_logs) = resource["scopeLogs"].as_array() else {
+                continue;
+            };
+            for scope in scope_logs {
+                let Some(log_records) = scope["logRecords"].as_array() else {
+                    continue;
+                };
+                for record in log_records {
+                    let attributes = record["attributes"]
+                        .as_array()
+                        .map(|attributes| {
+                            attributes
+                                .iter()
+                                .filter_map(|attribute| {
+                                    Some((
+                                        attribute["key"].as_str()?.to_owned(),
+                                        attribute["value"]["stringValue"].as_str()?.to_owned(),
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    records.push(attributes);
+                }
+            }
+        }
+    }
+    records
+}
+
+/// End-to-end proof that an authored `condition` survives the whole path —
+/// YAML admission, planning, lowering, and executor dispatch — and reaches a
+/// real OTLP payload having actually suppressed the records it excludes.
+///
+/// The dispatcher-level unit tests in `clinker-exec` cover the gate itself;
+/// this covers everything between the author's file and the collector.
+#[test]
+fn authored_condition_gates_the_exported_payload() {
+    let root = fixture();
+    write_gated_pipeline(root.path(), "./private/output/customers.csv");
+    write_observability_policy(
+        root.path(),
+        "https://collector.example.com",
+        "mode = \"none\"",
+    );
+    let capture = root.path().join("otlp.ndjson");
+
+    let output = invoke(root.path(), &capture, false);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Every input record reached the transform, so a missing log event is the
+    // gate's doing and not a short input. Without this the assertion below
+    // would also pass on a pipeline that silently processed two rows.
+    let published = std::fs::read_to_string(root.path().join("private/output/customers.csv"))
+        .expect("published output");
+    assert_eq!(
+        published.lines().count(),
+        5,
+        "header plus four records must be published regardless of gating: {published}"
+    );
+
+    let events = captured_log_attributes(&capture)
+        .into_iter()
+        .filter(|attributes| {
+            attributes.get("clinker.event").map(String::as_str) == Some("transform.customer_seen")
+        })
+        .collect::<Vec<_>>();
+    let gated = events
+        .iter()
+        .filter_map(|attributes| attributes.get("customer_id").cloned())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        gated,
+        vec!["customer-2".to_owned(), "customer-4".to_owned()],
+        "only records satisfying `amount > 1000` may reach the collector"
+    );
+
+    // The gate reads `amount`, which the directive never requested. Reading a
+    // field to decide whether to fire must not export it.
+    assert!(
+        events
+            .iter()
+            .all(|attributes| !attributes.contains_key("amount")),
+        "a gated field must not become an exported attribute: {events:?}"
+    );
 }
 
 #[test]
