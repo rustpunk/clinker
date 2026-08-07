@@ -18,6 +18,13 @@ pub(crate) struct RunLifecycleFacts {
     terminal: OnceLock<RunLifecycleTerminalFacts>,
 }
 
+/// Immutable proof that both caller-visible run correlation IDs were admitted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RunCorrelationIdentity {
+    batch_id: String,
+    execution_id: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RunLifecycleStartFacts {
     batch_id: String,
@@ -70,18 +77,14 @@ pub(crate) enum LifecycleFactsError {
 
 impl RunLifecycleFacts {
     pub(crate) fn new(
-        batch_id: String,
-        execution_id: String,
+        identity: RunCorrelationIdentity,
         fingerprint: SemanticFingerprint,
         started_at: DateTime<Utc>,
-    ) -> Result<Self, LifecycleFactsError> {
-        validate_correlation_id(&batch_id).map_err(|()| LifecycleFactsError::InvalidBatchId)?;
-        validate_correlation_id(&execution_id)
-            .map_err(|()| LifecycleFactsError::InvalidExecutionId)?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             start: RunLifecycleStartFacts {
-                batch_id,
-                execution_id,
+                batch_id: identity.batch_id,
+                execution_id: identity.execution_id,
                 fingerprint: PlanFingerprintFacts {
                     algorithm: fingerprint.algorithm(),
                     version: fingerprint.version(),
@@ -90,7 +93,7 @@ impl RunLifecycleFacts {
                 started_at,
             },
             terminal: OnceLock::new(),
-        })
+        }
     }
 
     pub(crate) fn start_snapshot(&self) -> RunLifecycleStartFacts {
@@ -122,6 +125,18 @@ impl RunLifecycleFacts {
                 duration_ms,
             })
             .map_err(|_| LifecycleFactsError::TerminalAlreadyRecorded)
+    }
+}
+
+impl RunCorrelationIdentity {
+    pub(crate) fn new(batch_id: String, execution_id: String) -> Result<Self, LifecycleFactsError> {
+        validate_correlation_id(&batch_id).map_err(|()| LifecycleFactsError::InvalidBatchId)?;
+        validate_correlation_id(&execution_id)
+            .map_err(|()| LifecycleFactsError::InvalidExecutionId)?;
+        Ok(Self {
+            batch_id,
+            execution_id,
+        })
     }
 }
 
@@ -236,13 +251,12 @@ mod tests {
         .expect("plan")
         .semantic_fingerprint()
         .expect("fingerprint");
-        let facts = RunLifecycleFacts::new(
+        let identity = RunCorrelationIdentity::new(
             "batch".to_owned(),
             "0190b7e0-0000-7000-8000-000000000000".to_owned(),
-            fingerprint,
-            start,
         )
-        .expect("facts");
+        .expect("identity");
+        let facts = RunLifecycleFacts::new(identity, fingerprint, start);
         let start_snapshot = facts.start_snapshot();
         facts
             .record_terminal(
@@ -257,5 +271,18 @@ mod tests {
             facts.record_terminal(start, RunTerminalOutcome::Abort, RunCountFacts::default(),),
             Err(LifecycleFactsError::TerminalAlreadyRecorded)
         );
+    }
+
+    #[test]
+    fn correlation_identity_rejects_each_invalid_input_class() {
+        for batch_id in [String::new(), "x".repeat(257), "batch\ncontrol".to_owned()] {
+            assert_eq!(
+                RunCorrelationIdentity::new(
+                    batch_id,
+                    "0190b7e0-0000-7000-8000-000000000000".to_owned(),
+                ),
+                Err(LifecycleFactsError::InvalidBatchId)
+            );
+        }
     }
 }

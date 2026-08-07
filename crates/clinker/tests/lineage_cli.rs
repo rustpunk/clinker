@@ -684,6 +684,72 @@ fn run_correlated_lifecycle(
     (output, lineage)
 }
 
+#[test]
+fn invalid_standalone_batch_ids_leave_every_run_effect_unchanged() {
+    fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn visit(root: &Path, current: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let mut entries = std::fs::read_dir(current)
+                .expect("read fixture tree")
+                .map(|entry| entry.expect("fixture entry").path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.push((
+                        path.strip_prefix(root)
+                            .expect("relative fixture path")
+                            .to_owned(),
+                        std::fs::read(&path).expect("read fixture file"),
+                    ));
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    for invalid_batch_id in [String::new(), "x".repeat(257), "batch\ncontrol".to_owned()] {
+        let workspace = tempfile::tempdir().expect("invalid correlation workspace");
+        write_runnable_pipeline(workspace.path(), None);
+        std::fs::create_dir(workspace.path().join("staging")).expect("staging root");
+        std::fs::write(
+            workspace.path().join("staging/sentinel"),
+            b"staging-before\n",
+        )
+        .expect("staging sentinel");
+        std::fs::write(workspace.path().join("events.ndjson"), b"lineage-before\n")
+            .expect("lineage sentinel");
+        let before = snapshot(workspace.path());
+
+        let output = Command::new(clinker_bin())
+            .current_dir(workspace.path())
+            .args([
+                "run",
+                "pipeline.yaml",
+                "--batch-id",
+                invalid_batch_id.as_str(),
+                "--lineage-events",
+                "events.ndjson",
+            ])
+            .output()
+            .expect("run invalid standalone correlation");
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("batch ID must be non-empty"),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(snapshot(workspace.path()), before);
+        assert!(!workspace.path().join("out.csv").exists());
+        assert!(!workspace.path().join(".clinker-attempts").exists());
+    }
+}
+
 fn machine_events(output: &std::process::Output) -> Vec<serde_json::Value> {
     std::str::from_utf8(&output.stdout)
         .expect("machine stdout is UTF-8")

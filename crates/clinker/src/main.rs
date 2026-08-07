@@ -16,8 +16,8 @@ mod observability;
 mod refactor;
 
 use lifecycle::{
-    LifecycleFactsError, RunCountFacts, RunLifecycleFacts, RunLifecycleSnapshot,
-    RunLifecycleStartFacts, RunTerminalOutcome,
+    LifecycleFactsError, RunCorrelationIdentity, RunCountFacts, RunLifecycleFacts,
+    RunLifecycleSnapshot, RunLifecycleStartFacts, RunTerminalOutcome,
 };
 use machine::MachineEmitter;
 
@@ -2401,6 +2401,8 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         |emitter| emitter.execution_id(),
     );
     let batch_id = machine.map_or_else(|| args.resolved_batch_id(), |emitter| emitter.batch_id());
+    let correlation_identity = RunCorrelationIdentity::new(batch_id.clone(), execution_id.clone())
+        .map_err(lifecycle_admission_error)?;
     let pipeline_hash = pipeline_config.source_hash;
     let timestamp_str = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
     let mut source_name_by_node: std::collections::HashMap<String, String> =
@@ -2669,13 +2671,8 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
         let job = clinker_lineage::Job::for_pipeline(cfg.pipeline.name.clone(), source_hash);
         let started_at = chrono::Utc::now();
-        let lifecycle = RunLifecycleFacts::new(
-            batch_id.clone(),
-            execution_id.clone(),
-            fingerprint,
-            started_at,
-        )
-        .map_err(lifecycle_admission_error)?;
+        let lifecycle =
+            RunLifecycleFacts::new(correlation_identity.clone(), fingerprint, started_at);
         lifecycle
             .record_terminal(
                 started_at,
@@ -3366,12 +3363,10 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     // Optional lineage receives only bounded owned snapshots from it; the sink
     // has no terminal authority and cannot mint or reconstruct correlation IDs.
     let run_lifecycle = RunLifecycleFacts::new(
-        batch_id.clone(),
-        execution_id.clone(),
+        correlation_identity,
         semantic_fingerprint,
         chrono::Utc::now(),
-    )
-    .map_err(lifecycle_admission_error)?;
+    );
     if let Some(output) = lineage_output.as_mut()
         && let Err(error) = output.emit_start(&run_lifecycle.start_snapshot())
     {
