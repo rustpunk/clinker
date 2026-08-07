@@ -37,11 +37,13 @@ pub use builder::{
 };
 pub use dataset::{DatasetId, FALLBACK_NAMESPACE, FILE_NAMESPACE, dataset_identity};
 pub use emit::{LiveRunEmitter, RunStats, Terminal, run_events, start_event, terminal_event};
+pub use logical_identity::{LineageIdentityContext, LineageIdentityError};
 pub use openlineage::{
     CLINKER_PIPELINE_FACET_SCHEMA_URL, CLINKER_RUN_STATS_FACET_SCHEMA_URL,
     COLUMN_LINEAGE_FACET_SCHEMA_URL, ColumnLineageDatasetFacet, Dataset, DatasetFacets,
-    ERROR_MESSAGE_FACET_SCHEMA_URL, ErrorMessageRunFacet, EventType, FieldLineage, InputField,
-    JOB_NAMESPACE, Job, JobFacets, OPENLINEAGE_SCHEMA_URL, PRODUCER, PipelineJobFacet, Run,
-    RunEvent, RunFacets, RunStatsFacet, Transformation, TransformationSubtype, TransformationType,
-    write_ndjson,
+    DatasetSubsetFacet, ERROR_MESSAGE_FACET_SCHEMA_URL, ErrorMessageRunFacet, EventType,
+    FieldLineage, INPUT_DATASET_SUBSET_FACET_SCHEMA_URL, InputField, JOB_NAMESPACE, Job, JobFacets,
+    OPENLINEAGE_SCHEMA_URL, OUTPUT_DATASET_SUBSET_FACET_SCHEMA_URL, PRODUCER, PipelineJobFacet,
+    Run, RunEvent, RunFacets, RunStatsFacet, SYMLINKS_DATASET_FACET_SCHEMA_URL,
+    SymlinksDatasetFacet, Transformation, TransformationSubtype, TransformationType, write_ndjson,
 };

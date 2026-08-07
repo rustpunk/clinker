@@ -7,6 +7,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::logical_identity::{DatasetSubset, DatasetSubsetDirection, SymlinkIdentifier};
 
+/// Standard OpenLineage location condition used by the subset facet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationSubsetCondition {
+    #[serde(rename = "type")]
+    condition_type: String,
+    pub locations: Vec<String>,
+}
+
+impl LocationSubsetCondition {
+    fn new(locations: Vec<String>) -> Self {
+        Self {
+            condition_type: "location".to_string(),
+            locations,
+        }
+    }
+}
+
 /// Standard OpenLineage input/output facet naming one concrete logical member
 /// of a stable collection dataset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,21 +32,36 @@ pub struct DatasetSubsetFacet {
     pub producer: String,
     #[serde(rename = "_schemaURL")]
     pub schema_url: String,
-    /// Stable partition or location identifier; never a worker path.
-    pub subset: String,
+    #[serde(rename = "inputCondition", skip_serializing_if = "Option::is_none")]
+    pub input_condition: Option<LocationSubsetCondition>,
+    #[serde(rename = "outputCondition", skip_serializing_if = "Option::is_none")]
+    pub output_condition: Option<LocationSubsetCondition>,
 }
 
 impl DatasetSubsetFacet {
-    pub fn new(subset: &DatasetSubset) -> Self {
-        let schema_url = match subset.direction() {
+    /// Build one role-specific standard subset facet from authorized logical
+    /// locations. Subsets for the other dataset role are not serialized.
+    pub fn new(subsets: &[DatasetSubset], direction: DatasetSubsetDirection) -> Option<Self> {
+        let locations: Vec<String> = subsets
+            .iter()
+            .filter(|subset| subset.direction() == direction)
+            .map(|subset| subset.identifier().to_string())
+            .collect();
+        if locations.is_empty() {
+            return None;
+        }
+        let schema_url = match direction {
             DatasetSubsetDirection::Input => super::INPUT_DATASET_SUBSET_FACET_SCHEMA_URL,
             DatasetSubsetDirection::Output => super::OUTPUT_DATASET_SUBSET_FACET_SCHEMA_URL,
         };
-        Self {
+        let condition = LocationSubsetCondition::new(locations);
+        Some(Self {
             producer: super::PRODUCER.to_string(),
             schema_url: schema_url.to_string(),
-            subset: subset.identifier().to_string(),
-        }
+            input_condition: (direction == DatasetSubsetDirection::Input)
+                .then_some(condition.clone()),
+            output_condition: (direction == DatasetSubsetDirection::Output).then_some(condition),
+        })
     }
 }
 

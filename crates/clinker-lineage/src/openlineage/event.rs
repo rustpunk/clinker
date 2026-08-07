@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::facet::{
-    ColumnLineageDatasetFacet, ErrorMessageRunFacet, PipelineJobFacet, RunStatsFacet,
+    ColumnLineageDatasetFacet, DatasetSubsetFacet, ErrorMessageRunFacet, PipelineJobFacet,
+    RunStatsFacet, SymlinksDatasetFacet,
 };
 
 /// A single OpenLineage run-state event.
@@ -128,8 +129,12 @@ pub struct Dataset {
 }
 
 /// The facet bundle attached to a [`Dataset`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatasetFacets {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subset: Option<DatasetSubsetFacet>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symlinks: Option<SymlinksDatasetFacet>,
     #[serde(rename = "columnLineage", skip_serializing_if = "Option::is_none")]
     pub column_lineage: Option<ColumnLineageDatasetFacet>,
 }
@@ -198,6 +203,7 @@ mod tests {
                 name: "/out/summary.csv".to_string(),
                 facets: Some(DatasetFacets {
                     column_lineage: Some(facet),
+                    ..DatasetFacets::default()
                 }),
             }],
         }

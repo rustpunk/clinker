@@ -21,14 +21,52 @@
 use std::io::{self, Write};
 
 use crate::builder::PlanColumnLineage;
+use crate::logical_identity::{DatasetIdentityFacets, DatasetSubsetDirection};
 use crate::openlineage::{
-    Dataset, DatasetFacets, ErrorMessageRunFacet, EventType, Job, OPENLINEAGE_SCHEMA_URL, PRODUCER,
-    Run, RunEvent, RunFacets, RunStatsFacet, write_ndjson,
+    Dataset, DatasetFacets, DatasetSubsetFacet, ErrorMessageRunFacet, EventType, Job,
+    OPENLINEAGE_SCHEMA_URL, PRODUCER, Run, RunEvent, RunFacets, RunStatsFacet,
+    SymlinksDatasetFacet, write_ndjson,
 };
 
 /// The input datasets of a run, as bare identities (no facets).
-fn input_datasets(lineage: &PlanColumnLineage) -> Vec<Dataset> {
+fn input_identities(lineage: &PlanColumnLineage) -> Vec<Dataset> {
     lineage.inputs.iter().cloned().map(Dataset::from).collect()
+}
+
+fn standard_identity_facets(
+    identity: &DatasetIdentityFacets,
+    direction: DatasetSubsetDirection,
+) -> Option<DatasetFacets> {
+    let subset = DatasetSubsetFacet::new(identity.subsets(), direction);
+    let symlinks = (!identity.symlinks().is_empty())
+        .then(|| SymlinksDatasetFacet::new(identity.symlinks().to_vec()));
+    if subset.is_none() && symlinks.is_none() {
+        return None;
+    }
+    Some(DatasetFacets {
+        subset,
+        symlinks,
+        column_lineage: None,
+    })
+}
+
+/// The input datasets of a completed/terminal run with their authorized
+/// standard subset and symlink facets.
+fn inputs_with_identity_facets(lineage: &PlanColumnLineage) -> Vec<Dataset> {
+    lineage
+        .inputs
+        .iter()
+        .cloned()
+        .map(|identity| {
+            let facets = lineage
+                .input_identity_facets
+                .get(&identity)
+                .and_then(|facts| standard_identity_facets(facts, DatasetSubsetDirection::Input));
+            let mut dataset = Dataset::from(identity);
+            dataset.facets = facets;
+            dataset
+        })
+        .collect()
 }
 
 /// The output datasets of a run as bare identities (no facets) — the shape used
@@ -50,9 +88,11 @@ fn outputs_with_lineage(lineage: &PlanColumnLineage) -> Vec<Dataset> {
         .iter()
         .map(|out| {
             let mut dataset = Dataset::from(out.dataset.clone());
-            dataset.facets = Some(DatasetFacets {
-                column_lineage: Some(out.facet.clone()),
-            });
+            let mut facets =
+                standard_identity_facets(&out.identity_facets, DatasetSubsetDirection::Output)
+                    .unwrap_or_default();
+            facets.column_lineage = Some(out.facet.clone());
+            dataset.facets = Some(facets);
             dataset
         })
         .collect()
@@ -90,7 +130,7 @@ pub fn run_events(
         event_type: EventType::Complete,
         run: Run::new(run_id),
         job,
-        inputs: input_datasets(lineage),
+        inputs: inputs_with_identity_facets(lineage),
         outputs: outputs_with_lineage(lineage),
     };
 
@@ -144,7 +184,7 @@ pub fn start_event(
         event_type: EventType::Start,
         run: Run::new(run_id),
         job,
-        inputs: input_datasets(lineage),
+        inputs: input_identities(lineage),
         outputs: output_identities(lineage),
     }
 }
@@ -193,7 +233,7 @@ pub fn terminal_event(
         event_type,
         run,
         job,
-        inputs: input_datasets(lineage),
+        inputs: inputs_with_identity_facets(lineage),
         outputs,
     }
 }
