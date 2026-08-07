@@ -654,6 +654,128 @@ fn run_lineage_events(pipeline: &Path) -> (bool, Vec<serde_json::Value>) {
     (status.success(), events)
 }
 
+fn run_correlated_lifecycle(
+    pipeline: &Path,
+    batch_id: &str,
+) -> (std::process::Output, Vec<serde_json::Value>) {
+    let dir = pipeline.parent().expect("pipeline has a parent dir");
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg("pipeline.yaml")
+        .args([
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            batch_id,
+            "--lineage-events",
+            "events.ndjson",
+        ])
+        .current_dir(dir)
+        .output()
+        .expect("spawn clinker");
+    let contents =
+        std::fs::read_to_string(dir.join("events.ndjson")).expect("read lineage-events file");
+    let lineage = contents
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("lineage event is JSON"))
+        .collect();
+    (output, lineage)
+}
+
+fn machine_events(output: &std::process::Output) -> Vec<serde_json::Value> {
+    std::str::from_utf8(&output.stdout)
+        .expect("machine stdout is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("machine event is JSON"))
+        .collect()
+}
+
+fn assert_shared_correlation(
+    machine: &[serde_json::Value],
+    lineage: &[serde_json::Value],
+    batch_id: &str,
+    terminal_event_type: &str,
+) {
+    assert_eq!(
+        lineage.len(),
+        2,
+        "one shared lifecycle emits exactly START and one terminal event"
+    );
+    assert_eq!(lineage[0]["eventType"], "START");
+    assert_eq!(lineage[1]["eventType"], terminal_event_type);
+
+    let resolved = machine
+        .iter()
+        .find(|event| event["event"] == "plan_resolved")
+        .expect("machine plan_resolved event");
+    let execution_id = resolved["execution_id"]
+        .as_str()
+        .expect("machine execution ID");
+    let plan = &resolved["plan_identity"];
+
+    for event in lineage {
+        assert_eq!(event["run"]["runId"], execution_id);
+        let lifecycle = &event["run"]["facets"]["clinker_runLifecycle"];
+        assert_eq!(lifecycle["batchId"], batch_id);
+        assert_eq!(lifecycle["executionId"], execution_id);
+        assert_eq!(lifecycle["planFingerprint"]["algorithm"], plan["algorithm"]);
+        assert_eq!(lifecycle["planFingerprint"]["version"], plan["version"]);
+        assert_eq!(lifecycle["planFingerprint"]["digest"], plan["digest"]);
+    }
+}
+
+#[test]
+fn shared_lifecycle_correlation() {
+    let success_dir = tempfile::tempdir().expect("successful lifecycle workspace");
+    let success_pipeline = write_runnable_pipeline(success_dir.path(), None);
+    let (success_output, success_lineage) =
+        run_correlated_lifecycle(&success_pipeline, "correlation-success");
+    assert!(
+        success_output.status.success(),
+        "successful run stderr: {}",
+        String::from_utf8_lossy(&success_output.stderr)
+    );
+    let success_machine = machine_events(&success_output);
+    assert_shared_correlation(
+        &success_machine,
+        &success_lineage,
+        "correlation-success",
+        "COMPLETE",
+    );
+    assert_eq!(
+        success_machine.last().expect("machine terminal")["event"],
+        "completed"
+    );
+    let success_stats = &success_lineage[1]["run"]["facets"]["clinker_runStats"];
+    assert_eq!(success_stats["recordsRead"], 3);
+    assert_eq!(success_stats["recordsWritten"], 3);
+    assert_eq!(success_stats["recordsDlq"], 0);
+
+    let failure_dir = tempfile::tempdir().expect("failed lifecycle workspace");
+    let failure_pipeline = write_runnable_pipeline(failure_dir.path(), Some("17179869184G"));
+    let (failure_output, failure_lineage) =
+        run_correlated_lifecycle(&failure_pipeline, "correlation-failure");
+    assert_eq!(failure_output.status.code(), Some(1));
+    let failure_machine = machine_events(&failure_output);
+    assert_shared_correlation(
+        &failure_machine,
+        &failure_lineage,
+        "correlation-failure",
+        "FAIL",
+    );
+    let machine_failure = &failure_machine.last().expect("machine failure terminal")["failure"];
+    let lineage_failure = &failure_lineage[1]["run"]["facets"]["clinker_failure"];
+    assert_eq!(lineage_failure["code"], machine_failure["code"]);
+    assert_eq!(lineage_failure["category"], machine_failure["category"]);
+    assert_eq!(lineage_failure["retryAdvice"], machine_failure["retry"]);
+    assert_eq!(lineage_failure["message"], machine_failure["message"]);
+    assert_eq!(
+        failure_lineage[1]["run"]["facets"]["errorMessage"]["message"],
+        machine_failure["message"]
+    );
+}
+
 #[test]
 fn lineage_events_successful_run_emits_start_then_complete() {
     let dir = tempfile::tempdir().expect("tempdir");
