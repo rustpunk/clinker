@@ -807,6 +807,9 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
             .unwrap_or_else(|| FailureClassification::unknown_internal("unregistered failure"))
     };
     match error {
+        PipelineError::Io(error) if is_observability_delivery_start_failure(error) => {
+            registered("observability.delivery.failed")
+        }
         PipelineError::Config(clinker_plan::config::ConfigError::Validation(message))
             if split_leading_code(message)
                 .is_some_and(|(code, _)| code == "observability.configuration.invalid") =>
@@ -1650,8 +1653,33 @@ fn observability_configuration_error(error: impl std::fmt::Display) -> PipelineE
     )))
 }
 
+#[derive(Debug)]
+struct ObservabilityDeliveryStartFailure {
+    message: String,
+}
+
+impl std::fmt::Display for ObservabilityDeliveryStartFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ObservabilityDeliveryStartFailure {}
+
+fn observability_delivery_start_error(error: impl std::fmt::Display) -> PipelineError {
+    PipelineError::Io(std::io::Error::other(ObservabilityDeliveryStartFailure {
+        message: error.to_string(),
+    }))
+}
+
+fn is_observability_delivery_start_failure(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<ObservabilityDeliveryStartFailure>())
+}
+
 fn lineage_worker_start_error(_error: std::io::Error) -> PipelineError {
-    observability_configuration_error(
+    observability_delivery_start_error(
         "the bounded lineage exporter could not start before execution. Correction: reduce host resource pressure or disable external lineage delivery",
     )
 }
@@ -2871,13 +2899,13 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         .as_ref()
         .map(|runtime| runtime.reserve_arena(&observability_policy))
         .transpose()
-        .map_err(observability_configuration_error)?;
+        .map_err(observability_delivery_start_error)?;
     let (telemetry_producer, mut otlp_worker) = match (otlp_runtime.take(), telemetry_handles) {
         (Some(runtime), Some((producer, receiver))) => (
             Some(producer),
             Some(
                 observability::OtlpWorker::start(runtime, receiver, shutdown_token.clone())
-                    .map_err(observability_configuration_error)?,
+                    .map_err(observability_delivery_start_error)?,
             ),
         ),
         (None, None) => (None, None),

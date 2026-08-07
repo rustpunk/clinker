@@ -326,7 +326,10 @@ OpenLineage worker has its own queue, byte cap, sink, deadline, counters, and
 typed outcome. The arena allocation and both worker spawns complete before
 source discovery, staging, publication-attempt creation, sink writes, or a
 lineage `START`; inability to create either worker fails admission without
-those effects. Both paths copy the same batch ID, execution ID, semantic-plan
+those effects as `observability.delivery.failed`, with exit `4` and
+`retry_with_backoff`. Invalid endpoint, authentication, identity, and bounds
+policy remains `observability.configuration.invalid` with `do_not_retry`.
+Both paths copy the same batch ID, execution ID, semantic-plan
 algorithm/version/digest, and terminal facts from one immutable lifecycle
 snapshot; neither path reconstructs or owns those facts. Collector partial
 acceptance, rejection, transport failure, shutdown, or flush expiry, and

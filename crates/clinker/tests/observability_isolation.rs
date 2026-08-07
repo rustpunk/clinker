@@ -298,6 +298,16 @@ fn otlp_bulkhead_admission_and_reference_fail_before_runtime_effects() {
         let capture = root.path().join("must-not-capture.ndjson");
         let output = invoke(root.path(), &capture, false);
         assert_eq!(output.status.code(), Some(1));
+        let events = machine_events(&output);
+        let terminal = events.last().expect("machine terminal");
+        assert_eq!(terminal["event"], "failed");
+        assert_eq!(
+            terminal["failure"]["code"],
+            "observability.configuration.invalid"
+        );
+        assert_eq!(terminal["failure"]["category"], "observability");
+        assert_eq!(terminal["failure"]["retry"], "do_not_retry");
+        assert_eq!(terminal["exit_code"], 1);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("observability.configuration.invalid"),
@@ -812,7 +822,7 @@ fn worker_startup_failures_are_preeffect_and_machine_terminal() {
             .output()
             .expect("run worker startup failure");
 
-        assert_eq!(output.status.code(), Some(1), "{variable}");
+        assert_eq!(output.status.code(), Some(4), "{variable}");
         let events = machine_events(&output);
         let terminals = events
             .iter()
@@ -826,9 +836,18 @@ fn worker_startup_failures_are_preeffect_and_machine_terminal() {
         assert_eq!(terminals.len(), 1, "{variable}: {events:#?}");
         assert_eq!(terminals[0]["event"], "failed", "{variable}");
         assert_eq!(
-            terminals[0]["failure"]["code"], "observability.configuration.invalid",
+            terminals[0]["failure"]["code"], "observability.delivery.failed",
             "{variable}"
         );
+        assert_eq!(
+            terminals[0]["failure"]["category"], "observability",
+            "{variable}"
+        );
+        assert_eq!(
+            terminals[0]["failure"]["retry"], "retry_with_backoff",
+            "{variable}"
+        );
+        assert_eq!(terminals[0]["exit_code"], 4, "{variable}");
         assert_eq!(snapshot(root.path()), before, "{variable}");
         assert!(!root.path().join(".clinker-attempts").exists());
     }
