@@ -46,6 +46,24 @@ nodes:
     .expect("pipeline fixture");
 }
 
+fn write_local_lineage_policy(directory: &std::path::Path) {
+    std::fs::write(
+        directory.join("clinker.toml"),
+        r#"[observability]
+
+[observability.otlp]
+endpoint = "https://collector.example.com"
+
+[observability.otlp.auth]
+mode = "none"
+
+[observability.lineage]
+identity_mode = "local_diagnostic_paths"
+"#,
+    )
+    .expect("local lineage policy");
+}
+
 fn write_rest_pipeline(directory: &std::path::Path, url: &str, pagination: &str) {
     std::fs::write(
         directory.join("pipeline.yaml"),
@@ -264,6 +282,7 @@ fn protocol_plain_run_does_not_emit_machine_records() {
 fn protocol_allows_file_lineage_but_rejects_lineage_stdout() {
     let directory = fixture();
     write_pipeline(directory.path(), "lineage-only.csv");
+    write_local_lineage_policy(directory.path());
     let file_lineage = invoke(
         directory.path(),
         &[

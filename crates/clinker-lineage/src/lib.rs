@@ -7,9 +7,11 @@
 //! identity; and the [`builder`] module walks a compiled plan to compute
 //! column-level lineage from those identities.
 //!
-//! [`builder::column_lineage`] populates both DIRECT (value-derivation) per-column
-//! lineage and whole-dataset INDIRECT influence (filter / join / group-by / sort /
-//! conditional), tracing through composition bodies to true source columns.
+//! [`builder::column_lineage_external`] and the explicitly local-only
+//! [`builder::column_lineage_local_diagnostic_paths`] populate both DIRECT
+//! (value-derivation) per-column lineage and whole-dataset INDIRECT influence
+//! (filter / join / group-by / sort / conditional), tracing through composition
+//! bodies to true source columns.
 //! Envelope (`$doc`) reads are traced too — as DIRECT lineage on the originating
 //! source for value-carrying reads, and as INDIRECT influence for reads in a
 //! route / cull / combine predicate; see that module's documented limitations for
@@ -33,7 +35,8 @@ pub mod logical_identity;
 pub mod openlineage;
 
 pub use builder::{
-    OutputColumnLineage, PlanColumnLineage, column_lineage, column_lineage_external,
+    OutputColumnLineage, PlanColumnLineage, column_lineage_external,
+    column_lineage_local_diagnostic_paths,
 };
 pub use dataset::{DatasetId, FALLBACK_NAMESPACE, FILE_NAMESPACE, dataset_identity};
 pub use emit::{LiveRunEmitter, RunStats, Terminal, run_events, start_event, terminal_event};

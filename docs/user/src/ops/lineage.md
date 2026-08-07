@@ -17,18 +17,56 @@ There are two emission modes:
 
 Both modes share the same column-lineage facet and the same on-the-wire OpenLineage shape; the live mode wraps it in real run-lifecycle events. Pushing those events to a live OpenLineage HTTP endpoint (a catalog such as Marquez) is a separate, planned transport and is not yet available.
 
+## Dataset identity preflight
+
+Both flags require an explicit `[observability.lineage]` identity policy in the
+workspace `clinker.toml`. The default `identity_mode = "external"` requires one
+exact binding for every emitted source and output node. A binding uses either a
+canonical datasource or a complete catalog namespace/name pair:
+
+```toml
+[observability.lineage]
+identity_mode = "external"
+
+[[observability.lineage.dataset]]
+node = "source_customers"
+canonical_datasource = "s3://warehouse/customers"
+
+[[observability.lineage.dataset]]
+node = "output_customers"
+catalog_namespace = "analytics"
+catalog_name = "customers_clean"
+```
+
+Clinker validates all required bindings before opening the lineage sink or,
+for `--lineage-events`, discovering sources and creating output attempts.
+Missing, duplicate, partial, ambiguous, or invalid bindings fail as
+`observability.configuration.invalid`; rejected values and physical paths are
+not copied into the diagnostic. The complete observability policy, including
+the required OTLP and authentication tables, is documented under
+[lineage identity](metrics.md#lineage-identity).
+
+Path-derived dataset names remain available only through the exact local
+compatibility spelling below. This mode is visibly labeled on stderr and is
+for local diagnostics, not external delivery:
+
+```toml
+[observability.lineage]
+identity_mode = "local_diagnostic_paths"
+```
+
 ## Output format
 
 The output is [NDJSON](https://github.com/ndjson/ndjson-spec) (one JSON object per line) conforming to the OpenLineage `2-0-2` core spec. A run is described by a **`START`** event followed by a **`COMPLETE`** event that share one `runId`:
 
 ```json
 {"eventType":"START","run":{"runId":"019f030d-0b3e-7ee1-86ec-1bb5b4a2776b"},"job":{"namespace":"clinker","name":"audit_join","facets":{"clinker_pipeline":{"sourceHash":"7fd096a9..."}}}, ...}
-{"eventType":"COMPLETE","run":{"runId":"019f030d-0b3e-7ee1-86ec-1bb5b4a2776b"}, "inputs":[...], "outputs":[{"namespace":"file","name":".../audit_report.csv","facets":{"columnLineage":{ ... }}}]}
+{"eventType":"COMPLETE","run":{"runId":"019f030d-0b3e-7ee1-86ec-1bb5b4a2776b"}, "inputs":[...], "outputs":[{"namespace":"analytics","name":"audit_report","facets":{"columnLineage":{ ... }}}]}
 ```
 
 - **`runId`** is a UUID v7 minted for this export and shared by both events. Because `--lineage` is a *static, plan-derived* export, the `START`/`COMPLETE` pair describes the pipeline's lineage, not an executed data run — no rows are processed and the two events share one timestamp. A separate `clinker run` mints its own `runId`. (For real timing and row counts tied to an actual execution, use [`--lineage-events`](#live-run-events).)
 - **`job.namespace`** is `clinker`; **`job.name`** is the pipeline name. The pipeline's content hash rides in the `clinker_pipeline` job facet (`sourceHash`), not the job name -- so the name stays stable across edits while runs of the same definition remain correlatable.
-- **`inputs`** are the source datasets; **`outputs`** are the sink datasets. Filesystem datasets use the `file` namespace with the resolved path as the name; a network source falls back to the `clinker` namespace plus the node name.
+- **`inputs`** are the source datasets; **`outputs`** are the sink datasets. External mode uses the exact configured canonical or catalog identities, so relocating a pipeline does not change its lineage graph. Explicit `local_diagnostic_paths` compatibility mode instead uses the `file` namespace with resolved paths (and falls back to the `clinker` namespace plus the node name for a network source).
 - The `columnLineage` facet is attached to each **output** dataset on the `COMPLETE` event.
 
 ## Reading the `columnLineage` facet

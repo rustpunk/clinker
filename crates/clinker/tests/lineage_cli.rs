@@ -49,7 +49,7 @@ fn run_lineage(pipeline: &Path) -> (serde_json::Value, serde_json::Value) {
 
 #[test]
 fn lineage_emits_start_complete_pair_with_column_lineage() {
-    let pipeline = repo_root().join("examples/pipelines/audit_join.yaml");
+    let (_workspace, pipeline) = audit_join_workspace();
     let (start, complete) = run_lineage(&pipeline);
 
     // --- Event envelope: a START then a COMPLETE sharing one runId. ---
@@ -154,9 +154,8 @@ fn lineage_emits_start_complete_pair_with_column_lineage() {
 
 #[test]
 fn lineage_writes_to_a_file_path() {
-    let pipeline = repo_root().join("examples/pipelines/audit_join.yaml");
-    let dir = tempfile::tempdir().expect("tempdir");
-    let out = dir.path().join("lineage.ndjson");
+    let (workspace, pipeline) = audit_join_workspace();
+    let out = workspace.path().join("lineage.ndjson");
 
     let status = Command::new(clinker_bin())
         .arg("run")
@@ -231,6 +230,22 @@ identity_mode = "{identity_mode}"
     std::fs::write(dir.join("clinker.toml"), policy).expect("write lineage identity policy");
 }
 
+fn write_local_lineage_policy(dir: &Path) {
+    write_lineage_policy(dir, "local_diagnostic_paths", "");
+}
+
+fn audit_join_workspace() -> (tempfile::TempDir, PathBuf) {
+    let workspace = tempfile::tempdir().expect("audit lineage workspace");
+    let pipeline = workspace.path().join("audit_join.yaml");
+    std::fs::copy(
+        repo_root().join("examples/pipelines/audit_join.yaml"),
+        &pipeline,
+    )
+    .expect("copy audit lineage fixture");
+    write_local_lineage_policy(workspace.path());
+    (workspace, pipeline)
+}
+
 fn external_lineage_policy(dir: &Path, include_output: bool) {
     let output = if include_output {
         r#"
@@ -264,6 +279,58 @@ fn lineage_complete(path: &Path) -> serde_json::Value {
     assert_eq!(events.len(), 2, "expected START and COMPLETE: {events:#?}");
     assert_eq!(events[1]["eventType"], "COMPLETE");
     events[1].clone()
+}
+
+fn machine_terminal(output: &std::process::Output) -> serde_json::Value {
+    serde_json::from_slice(
+        output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .last()
+            .expect("machine terminal event"),
+    )
+    .expect("machine terminal is JSON")
+}
+
+fn assert_external_policy_rejected(datasets: &str, forbidden_diagnostic_text: Option<&str>) {
+    let workspace = tempfile::tempdir().expect("rejected policy workspace");
+    write_pipeline(workspace.path(), "./must-not-exist.csv");
+    write_lineage_policy(workspace.path(), "external", datasets);
+    let output = Command::new(clinker_bin())
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--lineage",
+            "must-not-exist.ndjson",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "rejected-identity-policy",
+        ])
+        .output()
+        .expect("run rejected external policy");
+    assert_eq!(output.status.code(), Some(1));
+    let terminal = machine_terminal(&output);
+    assert_eq!(terminal["event"], "failed");
+    assert_eq!(
+        terminal["failure"]["code"],
+        "observability.configuration.invalid"
+    );
+    assert!(!workspace.path().join("must-not-exist.ndjson").exists());
+    assert!(!workspace.path().join("must-not-exist.csv").exists());
+    if let Some(forbidden) = forbidden_diagnostic_text {
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !rendered.contains(forbidden),
+            "rejected identity value leaked into the diagnostic: {rendered}"
+        );
+    }
 }
 
 #[test]
@@ -335,15 +402,7 @@ fn identity_preflight_and_local_compatibility() {
         .output()
         .expect("run incomplete identity preflight");
     assert_eq!(rejected.status.code(), Some(1));
-    let terminal: serde_json::Value = serde_json::from_slice(
-        rejected
-            .stdout
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .last()
-            .expect("machine terminal event"),
-    )
-    .expect("machine terminal is JSON");
+    let terminal = machine_terminal(&rejected);
     assert_eq!(terminal["event"], "failed");
     assert_eq!(
         terminal["failure"]["code"],
@@ -357,6 +416,72 @@ fn identity_preflight_and_local_compatibility() {
         !incomplete.path().join("must-not-exist.csv").exists(),
         "identity preflight must run before output effects"
     );
+
+    assert_external_policy_rejected(
+        r#"[[observability.lineage.dataset]]
+node = "src"
+catalog_namespace = "analytics"
+"#,
+        None,
+    );
+    assert_external_policy_rejected(
+        r#"[[observability.lineage.dataset]]
+node = "src"
+canonical_datasource = "s3://warehouse/source-a"
+
+[[observability.lineage.dataset]]
+node = "src"
+canonical_datasource = "s3://warehouse/source-b"
+"#,
+        None,
+    );
+    assert_external_policy_rejected(
+        r#"[[observability.lineage.dataset]]
+node = "src"
+canonical_datasource = "s3://warehouse/source"
+catalog_namespace = "analytics"
+catalog_name = "source"
+"#,
+        None,
+    );
+    assert_external_policy_rejected(
+        r#"[[observability.lineage.dataset]]
+node = "src"
+canonical_datasource = "private-worker-path-without-a-scheme"
+
+[[observability.lineage.dataset]]
+node = "out"
+catalog_namespace = "analytics"
+catalog_name = "lineage_fixture"
+"#,
+        Some("private-worker-path-without-a-scheme"),
+    );
+
+    let live = tempfile::tempdir().expect("live preflight workspace");
+    write_runnable_pipeline(live.path(), None);
+    external_lineage_policy(live.path(), false);
+    let live_rejected = Command::new(clinker_bin())
+        .current_dir(live.path())
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--lineage-events",
+            "events.ndjson",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "live-identity-preflight",
+        ])
+        .output()
+        .expect("run live identity preflight");
+    assert_eq!(live_rejected.status.code(), Some(1));
+    assert_eq!(
+        machine_terminal(&live_rejected)["failure"]["code"],
+        "observability.configuration.invalid"
+    );
+    assert!(!live.path().join("events.ndjson").exists());
+    assert!(!live.path().join("out.csv").exists());
+    assert!(!live.path().join(".clinker-attempts").exists());
 
     let local = tempfile::tempdir().expect("local compatibility workspace");
     write_pipeline(local.path(), "./local.csv");
@@ -417,6 +542,7 @@ fn templated_output_dataset_name_is_the_declared_template() {
     // or two runs of the same pipeline name different (un-joinable) datasets.
     let dir = tempfile::tempdir().expect("tempdir");
     let pipeline = write_pipeline(dir.path(), "./output/report-{execution_id}.csv");
+    write_local_lineage_policy(dir.path());
     let name1 = output_dataset_name(&pipeline, None);
     let name2 = output_dataset_name(&pipeline, None);
     assert!(
@@ -434,6 +560,7 @@ fn base_dir_anchors_dataset_names_at_the_pipeline_directory() {
     let subdir = ws.path().join("subdir");
     std::fs::create_dir_all(&subdir).expect("mkdir subdir");
     let pipeline = write_pipeline(&subdir, "./out.csv");
+    write_local_lineage_policy(ws.path());
     let name = output_dataset_name(&pipeline, Some(ws.path()));
     assert!(
         name.contains("/subdir/"),
@@ -455,6 +582,7 @@ fn base_dir_anchors_dataset_names_at_the_pipeline_directory() {
 /// overflows `u64` makes the executor reject the run at its startup gate — a
 /// deterministic fatal error raised after the run has begun.
 fn write_runnable_pipeline(dir: &Path, memory_limit: Option<&str>) -> PathBuf {
+    write_local_lineage_policy(dir);
     let data_dir = dir.join("data");
     std::fs::create_dir_all(&data_dir).expect("mkdir data");
     std::fs::write(

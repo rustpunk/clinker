@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use clinker_lineage::{
     DatasetId, FieldLineage, InputField, OutputColumnLineage, PlanColumnLineage, Transformation,
-    TransformationSubtype, TransformationType, column_lineage,
+    TransformationSubtype, TransformationType, column_lineage_local_diagnostic_paths,
 };
 use clinker_plan::CompileContext;
 use clinker_plan::config::parse_config;
@@ -37,7 +37,7 @@ fn compile_fixture(yaml: &str) -> CompiledPlan {
 }
 
 fn lineage_of(yaml: &str) -> PlanColumnLineage {
-    column_lineage(&compile_fixture(yaml), &fixtures_root())
+    column_lineage_local_diagnostic_paths(&compile_fixture(yaml), &fixtures_root())
 }
 
 /// The deterministic `file:` terminal name a source `path: <rel>` resolves to

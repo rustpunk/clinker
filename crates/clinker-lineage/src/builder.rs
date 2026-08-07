@@ -152,12 +152,16 @@ struct ScopeSeed {
     doc_sources: HashMap<PlanNodeId, BTreeSet<DatasetId>>,
 }
 
-/// Build the DIRECT column lineage of `compiled`.
+/// Build local-only lineage whose dataset identities are derived from declared
+/// source and output paths.
 ///
-/// `base_dir` is the workspace root (the directory containing the pipeline YAML),
-/// threaded in by the caller exactly as [`dataset_identity`] requires — it is not
-/// retained on [`CompiledPlan`].
-pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLineage {
+/// This compatibility path is intentionally named at the API boundary so a
+/// caller cannot mistake path-derived identities for external delivery
+/// identities. External emission must use [`column_lineage_external`].
+pub fn column_lineage_local_diagnostic_paths(
+    compiled: &CompiledPlan,
+    base_dir: &Path,
+) -> PlanColumnLineage {
     build_column_lineage(compiled, &|node| Ok(dataset_identity(node, base_dir)), None)
         .expect("local diagnostic path identity cannot fail")
 }
@@ -2090,7 +2094,7 @@ mod tests {
     /// Build for a `/w` workspace root, so a source `path: data/x.csv` resolves
     /// to the deterministic terminal name `/w/data/x.csv`.
     fn lineage_of(yaml: &str) -> PlanColumnLineage {
-        column_lineage(&compile(yaml), Path::new("/w"))
+        column_lineage_local_diagnostic_paths(&compile(yaml), Path::new("/w"))
     }
 
     /// One DIRECT `file:`-namespaced input field.

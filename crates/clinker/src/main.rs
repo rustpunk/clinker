@@ -532,9 +532,10 @@ pub struct RunArgs {
     )]
     pub explain: Option<ExplainFormat>,
 
-    /// Build column lineage and write OpenLineage NDJSON, then exit (no data
-    /// read). Give a file path, or `-` for stdout. A plan-only export, so it
-    /// cannot be combined with --explain, --dry-run, or -n.
+    /// Preflight the workspace lineage identity policy, build column lineage,
+    /// and write OpenLineage NDJSON, then exit (no data read). Give a file path,
+    /// or `-` for stdout. A plan-only export, so it cannot be combined with
+    /// --explain, --dry-run, or -n.
     #[arg(
         long,
         value_name = "PATH",
@@ -543,14 +544,14 @@ pub struct RunArgs {
     )]
     pub lineage: Option<PathBuf>,
 
-    /// Run the pipeline and emit live OpenLineage run events (a START at run
-    /// begin, then a terminal COMPLETE / FAIL / ABORT with real timing and row
-    /// counts) as NDJSON to a file path, or `-` for stdout. Unlike --lineage
-    /// (a static plan-only export that exits without reading data), this
-    /// processes data, so it cannot be combined with --lineage, --explain,
-    /// --dry-run, or -n. Prefer a file path for a clean NDJSON stream: with `-`,
-    /// the run's own stdout output (e.g. the spill-volume summary) interleaves
-    /// with the events.
+    /// Preflight the workspace lineage identity policy, run the pipeline, and
+    /// emit live OpenLineage run events (a START at run begin, then a terminal
+    /// COMPLETE / FAIL / ABORT with real timing and row counts) as NDJSON to a
+    /// file path, or `-` for stdout. Unlike --lineage (a static plan-only export
+    /// that exits without reading data), this processes data, so it cannot be
+    /// combined with --lineage, --explain, --dry-run, or -n. Prefer a file path
+    /// for a clean NDJSON stream: with `-`, the run's own stdout output (e.g. the
+    /// spill-volume summary) interleaves with the events.
     #[arg(
         long = "lineage-events",
         value_name = "PATH",
@@ -800,6 +801,12 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
             .unwrap_or_else(|| FailureClassification::unknown_internal("unregistered failure"))
     };
     match error {
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(message))
+            if split_leading_code(message)
+                .is_some_and(|(code, _)| code == "observability.configuration.invalid") =>
+        {
+            registered("observability.configuration.invalid")
+        }
         PipelineError::Format(format_error) => {
             if let Some(code) = format_error.classification_code() {
                 return registered(code);
@@ -1291,11 +1298,14 @@ fn with_explain_pointer(code: &str, message: &str, help: Option<String>) -> Opti
 /// A large family of plan-time gates reports through
 /// `ConfigError::Validation(format!("[E346] ..."))` rather than as a structured
 /// `Diagnostic`, so the code the user needs is carried in the message text.
-/// `None` for a message that names no code, or names one the registry does not
-/// list — an unregistered `[...]` is ordinary prose, not a code.
+/// `None` for a message that names no code, or names one neither the diagnostic
+/// nor shared failure-classification registry lists — an unregistered `[...]`
+/// is ordinary prose, not a code.
 fn split_leading_code(message: &str) -> Option<(&str, &str)> {
     let (code, body) = message.strip_prefix('[')?.split_once(']')?;
-    clinker_core_types::diagnostic::is_registered(code).then(|| (code, body.trim_start()))
+    (clinker_core_types::diagnostic::is_registered(code)
+        || FailureClassification::for_code(code).is_some())
+    .then(|| (code, body.trim_start()))
 }
 
 /// Turn one of a diagnostic's spans into a miette label against `text`.
@@ -1615,7 +1625,69 @@ fn resolve_compile_anchor(
 /// attached — the failing setting lives in `clinker.toml`, not the pipeline
 /// YAML the diagnostic renderer carries as its `NamedSource`.
 fn storage_config_error(e: clinker_plan::config::StorageConfigError) -> PipelineError {
-    PipelineError::Config(clinker_plan::config::ConfigError::Validation(e.to_string()))
+    match e {
+        clinker_plan::config::StorageConfigError::Observability(error) => {
+            observability_configuration_error(error)
+        }
+        error => PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+            error.to_string(),
+        )),
+    }
+}
+
+const OBSERVABILITY_CONFIGURATION_INVALID: &str = "observability.configuration.invalid";
+
+fn observability_configuration_error(error: impl std::fmt::Display) -> PipelineError {
+    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+        "[{OBSERVABILITY_CONFIGURATION_INVALID}] {error}"
+    )))
+}
+
+enum CliLineageIdentity {
+    External(clinker_lineage::LineageIdentityContext),
+    LocalDiagnosticPaths,
+}
+
+fn resolve_cli_lineage_identity(
+    config: &clinker_plan::config::ClinkerToml,
+) -> Result<CliLineageIdentity, PipelineError> {
+    let observability = config
+        .resolve_observability(None)
+        .map_err(observability_configuration_error)?;
+    let lineage = observability.lineage().ok_or_else(|| {
+        observability_configuration_error(
+            "lineage export requires an explicit [observability.lineage] identity policy",
+        )
+    })?;
+    match lineage.identity_mode() {
+        clinker_plan::config::LineageIdentityMode::External => {
+            clinker_lineage::LineageIdentityContext::from_resolved(lineage)
+                .map(CliLineageIdentity::External)
+                .map_err(observability_configuration_error)
+        }
+        clinker_plan::config::LineageIdentityMode::LocalDiagnosticPaths => {
+            eprintln!(
+                "clinker: lineage identity mode: local_diagnostic_paths (local diagnostic compatibility only)"
+            );
+            Ok(CliLineageIdentity::LocalDiagnosticPaths)
+        }
+    }
+}
+
+fn build_cli_lineage(
+    compiled: &clinker_plan::plan::CompiledPlan,
+    identity: &CliLineageIdentity,
+    base_dir: &std::path::Path,
+) -> Result<clinker_lineage::PlanColumnLineage, PipelineError> {
+    match identity {
+        CliLineageIdentity::External(context) => {
+            clinker_lineage::column_lineage_external(compiled, context)
+                .map_err(observability_configuration_error)
+        }
+        CliLineageIdentity::LocalDiagnosticPaths => Ok(
+            clinker_lineage::column_lineage_local_diagnostic_paths(compiled, base_dir),
+        ),
+    }
 }
 
 /// Map a comprehensive run-startup storage-validation failure onto the
@@ -1818,6 +1890,11 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     // same resolved root the validator re-derives.
     let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
         .map_err(storage_config_error)?;
+    let lineage_identity = if args.lineage.is_some() || args.lineage_events.is_some() {
+        Some(resolve_cli_lineage_identity(&clinker_toml)?)
+    } else {
+        None
+    };
     let group_layout = clinker_toml.group.clone();
     let catalog_config = clinker_toml.catalog.clone();
     let storage_config = clinker_toml.storage;
@@ -2115,7 +2192,6 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         } else {
             clinker_plan::plan::EffectiveRuntimeVariables::default()
         };
-
         if let Some(emitter) = machine {
             let fingerprint = compiled_plan
                 .semantic_fingerprint_with_runtime_variables(&effective_runtime_variables)
@@ -2261,6 +2337,13 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         } else {
             clinker_plan::plan::EffectiveRuntimeVariables::default()
         };
+        let lineage = build_cli_lineage(
+            &compiled_plan,
+            lineage_identity
+                .as_ref()
+                .expect("lineage identity is resolved whenever --lineage is set"),
+            &lineage_base_dir,
+        )?;
 
         if let Some(emitter) = machine {
             let fingerprint = compiled_plan
@@ -2275,7 +2358,6 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 .map_err(PipelineError::Io)?;
         }
 
-        let lineage = clinker_lineage::column_lineage(&compiled_plan, &lineage_base_dir);
         let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
         let job = clinker_lineage::Job::for_pipeline(cfg.pipeline.name.clone(), source_hash);
         let event_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -2377,6 +2459,21 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         }
         channel_record_vars.extend(overlay.record_vars);
     }
+
+    // Resolve every emitted source/output identity before discovery, staging,
+    // publication-attempt creation, or lineage-sink opening. A missing or
+    // ambiguous external binding is an admission failure, not a mid-run event.
+    let live_lineage = if args.lineage_events.is_some() {
+        Some(build_cli_lineage(
+            &compiled_plan,
+            lineage_identity
+                .as_ref()
+                .expect("lineage identity is resolved whenever --lineage-events is set"),
+            &lineage_base_dir,
+        )?)
+    } else {
+        None
+    };
 
     let effective_runtime_variables = clinker_plan::plan::EffectiveRuntimeVariables {
         static_vars: channel_static_vars,
@@ -2894,7 +2991,8 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         None;
     let mut lineage_started_at: Option<chrono::DateTime<chrono::Utc>> = None;
     if let Some(path) = &args.lineage_events {
-        let lineage = clinker_lineage::column_lineage(&compiled_plan, &lineage_base_dir);
+        let lineage =
+            live_lineage.expect("live lineage is preflighted whenever --lineage-events is set");
         let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
         let job =
             clinker_lineage::Job::for_pipeline(pipeline_config.pipeline.name.clone(), source_hash);
