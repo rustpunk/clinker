@@ -485,14 +485,36 @@ fn deadline_expiry_forces_termination_and_reaps_the_child() {
                 Err(error) => panic!("accept request: {error}"),
             }
         };
+        // A socket accepted from a non-blocking listener inherits O_NONBLOCK on
+        // macOS/BSD and Windows, but not on Linux. Left implicit, the first read
+        // returns WouldBlock, this loop exits immediately, and dropping the
+        // stream closes the connection — so the child's REST read fails fast
+        // instead of hanging and the deadline under test never expires.
+        stream
+            .set_nonblocking(false)
+            .expect("blocking accepted stream");
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("read timeout");
         let mut request = [0_u8; 4096];
+        // The fixture must hold the connection open until the child is gone, so
+        // an idle read is not a reason to stop. Only end-of-stream (the child
+        // was terminated) or a real transport error ends the loop, bounded so a
+        // wedged child cannot hang the suite.
+        let hold_until = Instant::now() + Duration::from_secs(30);
         loop {
             match stream.read(&mut request) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => break,
+            }
+            if Instant::now() >= hold_until {
+                break;
             }
         }
     });
