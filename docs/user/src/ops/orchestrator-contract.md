@@ -131,6 +131,10 @@ If publication wins first, later signals do not relabel or erase already
 complete visible artifacts; the bounded promotion finishes with `completed` or
 `failed` truth.
 
+Signal-handler installation is admission-critical. If installation fails,
+Clinker exits with infrastructure status `4` before opening the machine
+protocol stream or touching sources, staging, attempts, outputs, or lineage.
+
 The direct-child contract is exercised on Linux with a real SIGTERM rather
 than a closed control pipe or an in-process cancellation shortcut. The
 cooperative case verifies exit `130`, a matching `cancelled` terminal,

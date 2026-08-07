@@ -108,33 +108,43 @@ fn register(state: &Arc<AtomicU8>) {
     guard.push(Arc::downgrade(state));
 }
 
-/// Install the SIGINT + SIGTERM handler. Safe to call multiple times — only
-/// the first call wins. The handler walks the live-token registry and trips
-/// every flag.
+#[cfg(not(target_arch = "wasm32"))]
+fn cached_signal_handler_installation(
+    cache: &OnceLock<Result<(), String>>,
+    install: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    cache.get_or_init(install).clone()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn install_process_signal_handler() -> Result<(), String> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CLINKER_TEST_SIGNAL_HANDLER_FAILURE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        return Err("injected signal-handler installation failure".to_owned());
+    }
+
+    // ctrlc with "termination" feature handles both SIGINT and SIGTERM.
+    ctrlc::set_handler(move || {
+        let guard = registry().lock().expect("shutdown registry poisoned");
+        for weak in guard.iter() {
+            if let Some(state) = weak.upgrade() {
+                let _ =
+                    state.compare_exchange(ACTIVE, CANCELLED, Ordering::SeqCst, Ordering::SeqCst);
+            }
+        }
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// Install the SIGINT + SIGTERM handler. Safe to call multiple times: every
+/// caller observes the complete result of the first installation attempt.
+/// The handler walks the live-token registry and trips every flag.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn install_signal_handler() -> Result<(), String> {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    let mut result = Ok(());
-    INIT.call_once(|| {
-        // ctrlc with "termination" feature handles both SIGINT and SIGTERM.
-        if let Err(e) = ctrlc::set_handler(move || {
-            let guard = registry().lock().expect("shutdown registry poisoned");
-            for weak in guard.iter() {
-                if let Some(state) = weak.upgrade() {
-                    let _ = state.compare_exchange(
-                        ACTIVE,
-                        CANCELLED,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    );
-                }
-            }
-        }) {
-            result = Err(e.to_string());
-        }
-    });
-    result
+    static INSTALLATION: OnceLock<Result<(), String>> = OnceLock::new();
+    cached_signal_handler_installation(&INSTALLATION, install_process_signal_handler)
 }
 
 /// No-op on wasm32: the web build has no process to signal, so there is no
@@ -228,6 +238,27 @@ mod tests {
         assert_eq!(token.progress_checkpoints(), before);
         assert!(!token.is_requested());
         assert_eq!(token.progress_checkpoints(), before + 1);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn failed_signal_installation_is_cached_for_every_caller() {
+        use std::sync::atomic::AtomicUsize;
+
+        let cache = OnceLock::new();
+        let attempts = AtomicUsize::new(0);
+        let first = cached_signal_handler_installation(&cache, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err("original installation failure".to_owned())
+        });
+        let second = cached_signal_handler_installation(&cache, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        assert_eq!(first, Err("original installation failure".to_owned()));
+        assert_eq!(second, first);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]

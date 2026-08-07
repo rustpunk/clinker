@@ -151,6 +151,73 @@ fn execution_id(events: &[Value]) -> &str {
     events[0]["execution_id"].as_str().expect("execution id")
 }
 
+fn fixture_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    fn visit(
+        root: &std::path::Path,
+        current: &std::path::Path,
+        snapshot: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+    ) {
+        let mut entries = std::fs::read_dir(current)
+            .expect("read fixture directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read fixture entries");
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, snapshot);
+            } else {
+                snapshot.push((
+                    path.strip_prefix(root)
+                        .expect("fixture-relative path")
+                        .to_owned(),
+                    std::fs::read(&path).expect("read fixture file"),
+                ));
+            }
+        }
+    }
+
+    let mut snapshot = Vec::new();
+    visit(root, root, &mut snapshot);
+    snapshot
+}
+
+#[test]
+fn signal_handler_installation_failure_is_preeffect() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "out.csv", 1, false);
+    std::fs::write(directory.path().join("out.csv"), "existing output\n").expect("existing output");
+    std::fs::write(
+        directory.path().join("lineage.ndjson"),
+        "existing lineage\n",
+    )
+    .expect("existing lineage");
+    let staging = directory.path().join("staging");
+    std::fs::create_dir(&staging).expect("staging directory");
+    std::fs::write(staging.join("sentinel"), "existing staging\n")
+        .expect("existing staging sentinel");
+    let before = fixture_snapshot(directory.path());
+
+    let output = machine_command(directory.path(), "signal-handler-failure")
+        .args(["--lineage-events", "lineage.ndjson"])
+        .env("CLINKER_TEST_SIGNAL_HANDLER_FAILURE", "1")
+        .output()
+        .expect("run with injected signal-handler failure");
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(
+        output.stdout.is_empty(),
+        "the machine protocol must not open before signal admission succeeds"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to install signal handler"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture_snapshot(directory.path()), before);
+    assert!(!directory.path().join(".clinker-attempts").exists());
+}
+
 #[test]
 fn concurrent_bounded_drains_prevent_high_output_deadlock() {
     let directory = fixture();

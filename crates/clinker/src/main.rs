@@ -916,9 +916,10 @@ fn main() -> ExitCode {
 
             // Install the process-wide SIGINT/SIGTERM handler before the
             // run starts so an interrupt during a long pipeline trips the
-            // run's shutdown token. Idempotent — the first call wins.
+            // run's shutdown token. Every caller observes the first result.
             if let Err(e) = clinker_exec::pipeline::shutdown::install_signal_handler() {
                 eprintln!("clinker: failed to install signal handler: {e}");
+                return ExitCode::from(4);
             }
 
             let machine = match MachineEmitter::admit(args) {
