@@ -288,6 +288,44 @@ blocking, unbounded, or disk-spool spelling. The telemetry arena contains two
 disjoint lanes. The lineage queue is a separate reservation and cannot be
 expressed as an alias of either telemetry lane or the arena.
 
+### Runtime ownership and failure isolation
+
+The workspace policy loader owns only the secret-free raw endpoint string.
+For an enabled run, the CLI's first capability transition calls the network
+crate's sole endpoint-admission API. That API accepts one HTTPS origin and
+derives exactly three routes: `/v1/logs`, `/v1/metrics`, and `/v1/traces`.
+Relative, malformed, HTTP, credential-bearing, path-bearing, query-bearing,
+fragment-bearing, and already signal-specific endpoint text is rejected as
+`observability.otlp.endpoint` with a pasteable HTTPS-origin correction before
+source discovery, output attempts, arena reservation, worker construction, or
+network effects. Rejected text is not echoed.
+
+After admission, the CLI combines the admitted origin with the configured
+request, retry, response, arena, and flush bounds in one immutable run-local
+bundle. `auth.mode = "none"` is the supported production capability today and
+sends no credential headers. `auth.mode = "reference"` remains a logical,
+secret-free policy name, but the run fails before exporter effects until the
+Phase 4 AUTH-01 credential applicator supplies that capability; the
+applicator will not be allowed to change the admitted origin or fixed routes.
+
+Logs, metrics, and traces share one finite telemetry arena and exporter worker,
+but retain distinct typed delivery outcomes and fixed aggregate counters. The
+OpenLineage worker has its own queue, byte cap, sink, deadline, counters, and
+typed outcome. Both paths copy the same batch ID, execution ID, semantic-plan
+algorithm/version/digest, and terminal facts from one immutable lifecycle
+snapshot; neither path reconstructs or owns those facts. Collector partial
+acceptance, rejection, transport failure, shutdown, or flush expiry, and
+lineage drop, sink failure, or deadline expiry remain optional observations:
+they do not change final or DLQ bytes, process status, the machine terminal
+result, publication inventory, visible finals, or retained failed-attempt
+evidence. The machine terminal exposes aggregate per-signal counters only; it
+does not flatten or replace either typed delivery outcome.
+
+Field policy is applied before telemetry enters the arena. Denied values never
+reach Collector request bodies, OpenLineage events, counters, diagnostics, or
+machine records. With no `[observability]` table, Clinker performs no endpoint
+admission, arena reservation, worker creation, or exporter I/O.
+
 External `--lineage` and `--lineage-events` exports serialize each complete
 OpenLineage event within `lineage.max_event_bytes` before attempting immediate
 admission to the byte-bounded lineage queue. A full queue drops the newest

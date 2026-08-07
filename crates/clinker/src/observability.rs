@@ -174,6 +174,8 @@ impl OtlpRuntimeBundle {
 struct SignalDeliveryReport {
     summary: SignalSummary,
     last_typed: Option<Result<OtlpDeliveryOutcome, OtlpDeliveryFailure>>,
+    #[cfg(debug_assertions)]
+    injected_outcome: Option<&'static str>,
 }
 
 #[derive(Default)]
@@ -203,6 +205,10 @@ impl OtlpDeliveryReport {
         if result.failed() {
             report.summary.failures = report.summary.failures.saturating_add(1);
         }
+        #[cfg(debug_assertions)]
+        if let Some(outcome) = result.injected_outcome() {
+            report.injected_outcome = Some(outcome);
+        }
         if let DeliveryResult::Typed(typed) = result {
             report.last_typed = Some(typed);
         }
@@ -229,6 +235,13 @@ impl OtlpDeliveryReport {
                     error.attempts()
                 );
             }
+            #[cfg(debug_assertions)]
+            if let Some(outcome) = signal.injected_outcome {
+                eprintln!(
+                    "clinker: optional OTLP {name} delivery outcome: kind={outcome} attempts={}",
+                    signal.summary.attempts
+                );
+            }
         }
     }
 }
@@ -236,8 +249,12 @@ impl OtlpDeliveryReport {
 enum DeliveryResult {
     Typed(Result<OtlpDeliveryOutcome, OtlpDeliveryFailure>),
     #[cfg(debug_assertions)]
-    InjectedSuccess {
+    Injected {
         accepted: u64,
+        rejected: u64,
+        attempts: u32,
+        failed: bool,
+        outcome: Option<&'static str>,
     },
     EncodingFailure,
 }
@@ -247,7 +264,7 @@ impl DeliveryResult {
         match self {
             Self::Typed(Ok(outcome)) => outcome.accepted(),
             #[cfg(debug_assertions)]
-            Self::InjectedSuccess { accepted } => *accepted,
+            Self::Injected { accepted, .. } => *accepted,
             Self::Typed(Err(_)) | Self::EncodingFailure => 0,
         }
     }
@@ -257,7 +274,7 @@ impl DeliveryResult {
             Self::Typed(Ok(outcome)) => outcome.rejected(),
             Self::Typed(Err(_)) | Self::EncodingFailure => 1,
             #[cfg(debug_assertions)]
-            Self::InjectedSuccess { .. } => 0,
+            Self::Injected { rejected, .. } => *rejected,
         }
     }
 
@@ -266,13 +283,26 @@ impl DeliveryResult {
             Self::Typed(Ok(outcome)) => outcome.attempts(),
             Self::Typed(Err(error)) => error.attempts(),
             #[cfg(debug_assertions)]
-            Self::InjectedSuccess { .. } => 1,
+            Self::Injected { attempts, .. } => *attempts,
             Self::EncodingFailure => 0,
         }
     }
 
     fn failed(&self) -> bool {
-        matches!(self, Self::Typed(Err(_)) | Self::EncodingFailure)
+        match self {
+            Self::Typed(Err(_)) | Self::EncodingFailure => true,
+            Self::Typed(Ok(_)) => false,
+            #[cfg(debug_assertions)]
+            Self::Injected { failed, .. } => *failed,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn injected_outcome(&self) -> Option<&'static str> {
+        match self {
+            Self::Injected { outcome, .. } => *outcome,
+            Self::Typed(_) | Self::EncodingFailure => None,
+        }
     }
 }
 
@@ -474,6 +504,7 @@ impl DeliveryBackend {
 #[cfg(debug_assertions)]
 struct InjectedDelivery {
     capture: Option<File>,
+    reported: [bool; 3],
 }
 
 #[cfg(debug_assertions)]
@@ -483,7 +514,10 @@ impl InjectedDelivery {
             .map(File::create)
             .transpose()
             .map_err(|_| ObservabilityRuntimeError::Worker)?;
-        Ok(Self { capture })
+        Ok(Self {
+            capture,
+            reported: [false; 3],
+        })
     }
 
     fn deliver(&mut self, signal: OtlpSignal, payload: &[u8], item_count: u64) -> DeliveryResult {
@@ -510,10 +544,63 @@ impl InjectedDelivery {
                 return DeliveryResult::EncodingFailure;
             }
         }
-        DeliveryResult::InjectedSuccess {
-            accepted: item_count,
+        let mode = injected_signal_outcome(signal);
+        let signal_index = match signal {
+            OtlpSignal::Logs => 0,
+            OtlpSignal::Metrics => 1,
+            OtlpSignal::Traces => 2,
+        };
+        if self.reported[signal_index] {
+            return DeliveryResult::Injected {
+                accepted: 0,
+                rejected: 0,
+                attempts: 0,
+                failed: false,
+                outcome: None,
+            };
+        }
+        self.reported[signal_index] = true;
+        let (accepted, rejected, attempts, failed, outcome) = match mode.as_deref() {
+            None | Some("success") => (1, 0, 1, false, None),
+            Some("partial") => (0, 1, 1, false, Some("partial")),
+            Some("transient-exhausted") => {
+                (0, item_count.max(1), 3, true, Some("transient-exhausted"))
+            }
+            Some("shutdown") => (0, item_count.max(1), 0, true, Some("shutdown")),
+            Some("flush-expiry") => (0, item_count.max(1), 0, true, Some("flush-expiry")),
+            Some("permanent-rejection") => {
+                (0, item_count.max(1), 1, true, Some("permanent-rejection"))
+            }
+            Some("auth") => (0, item_count.max(1), 1, true, Some("auth")),
+            Some("tls") => (0, item_count.max(1), 1, true, Some("tls")),
+            Some("connect") => (0, item_count.max(1), 1, true, Some("connect")),
+            Some("read-timeout") => (0, item_count.max(1), 1, true, Some("read-timeout")),
+            Some("oversized-response") => {
+                (0, item_count.max(1), 1, true, Some("oversized-response"))
+            }
+            Some("malformed-response") => {
+                (0, item_count.max(1), 1, true, Some("malformed-response"))
+            }
+            Some(_) => (0, item_count.max(1), 0, true, Some("invalid-test-outcome")),
+        };
+        DeliveryResult::Injected {
+            accepted,
+            rejected,
+            attempts,
+            failed,
+            outcome,
         }
     }
+}
+
+#[cfg(debug_assertions)]
+fn injected_signal_outcome(signal: OtlpSignal) -> Option<String> {
+    let variable = match signal {
+        OtlpSignal::Logs => "CLINKER_TEST_OTLP_LOGS_OUTCOME",
+        OtlpSignal::Metrics => "CLINKER_TEST_OTLP_METRICS_OUTCOME",
+        OtlpSignal::Traces => "CLINKER_TEST_OTLP_TRACES_OUTCOME",
+    };
+    std::env::var(variable).ok()
 }
 
 #[cfg(debug_assertions)]

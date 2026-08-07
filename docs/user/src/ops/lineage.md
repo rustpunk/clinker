@@ -119,7 +119,7 @@ Unlike `--lineage` (which exits before reading data), this processes data, so it
 
 A run emits a `START` when it begins, then exactly one terminal event when it ends:
 
-- **`START`** -- written and flushed **before** the run body executes, so a crash mid-run still leaves an observable open run. It carries the input and output datasets by identity plus the shared batch and semantic-plan correlation facets; no completed dataset facets exist yet.
+- **`START`** -- offered to the lineage path **before** the run body executes. In local diagnostic mode it is written synchronously; in external mode it is admitted non-blockingly to the bounded lineage queue and can be dropped under the configured policy. It carries the input and output datasets by identity plus the shared batch and semantic-plan correlation facets; no completed dataset facets exist yet.
 - **`COMPLETE`** -- the run finished. It carries the input datasets and the output datasets with their `columnLineage` facets, exactly like the static export.
 - **`FAIL`** -- the run errored. It carries the standard OpenLineage `errorMessage` run facet and the clinker-defined `clinker_failure` facet. Both are derived from the same bounded, sanitized classification used by machine supervision; the latter adds stable `code`, `category`, and `retryAdvice` fields.
 - **`ABORT`** -- the run was interrupted (e.g. a `SIGINT`/`SIGTERM` shutdown) and drained what it could before unwinding.
@@ -137,7 +137,29 @@ Key differences from the static export:
 - The terminal event carries a **`clinker_runStats`** run facet — a clinker-defined facet with `recordsRead`, `recordsWritten`, `recordsDlq`, and `durationMs`. Counts are pipeline-wide run totals, not per-output.
 - On `FAIL`, the run also carries the standard **`errorMessage`** run facet (`ErrorMessageRunFacet` `1-0-0`) plus **`clinker_failure`**, with the shared sanitized message and stable failure code/category/retry advice.
 
-Every started run that reaches a handled executor or publication boundary records one terminal snapshot; output-commit errors close as `FAIL` from that same source. Emission is best-effort *after* the run's data outputs are committed — a lineage-sink write error is logged as a warning and does not fail a run whose outputs already landed. A process crash can still leave only the already-flushed `START` event.
+Every started run that reaches a handled executor or publication boundary records one terminal snapshot; output-commit errors close as `FAIL` from that same source. Terminal emission is best-effort after the run's authoritative publication decision. A lineage admission drop or sink write, flush, or deadline failure is reported on standard error and does not fail a run whose outputs already landed. A process crash can still leave only a delivered `START` event.
+
+### External delivery boundary
+
+External identity mode is also the boundary for the independently bounded
+lineage worker. Each complete event is serialized under
+`lineage.max_event_bytes` and offered without blocking to a queue capped by
+`lineage.queue_bytes`; a full queue or oversized event drops the newest event.
+One synchronous worker owns the selected file or stdout sink, and shutdown
+waits no longer than `lineage.flush_timeout_ms`. Its typed outcome distinguishes
+normal shutdown, write failure (including permission errors), flush failure,
+and deadline expiry, with accepted, dropped, and full counters reported
+separately. It has no access to the telemetry arena or Collector worker.
+
+Lineage uses logical dataset bindings, not working-directory or attempt paths.
+It copies the batch ID, execution ID, semantic fingerprint, and terminal facts
+from the same immutable lifecycle snapshot used by machine supervision and
+OTLP, while keeping its delivery result independent. A lineage fault cannot
+change final or DLQ bytes, exit status, machine terminal payload, publication
+inventory, visible final set, or retained failed-attempt evidence. Event values
+also remain outside this identity-only payload; telemetry field policy is
+enforced before Collector queue admission. If `[observability]` is absent,
+neither the lineage worker nor the Collector worker exists.
 
 ## When to use
 

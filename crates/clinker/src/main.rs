@@ -1734,6 +1734,14 @@ impl LiveLineageOutput {
         match &mut self.sink {
             LiveLineageSink::External(delivery) => {
                 let _ = delivery.try_emit(&event);
+                #[cfg(debug_assertions)]
+                if std::env::var_os("CLINKER_TEST_LINEAGE_REPEAT").as_deref()
+                    == Some(std::ffi::OsStr::new("64"))
+                {
+                    for _ in 1..64 {
+                        let _ = delivery.try_emit(&event);
+                    }
+                }
                 Ok(())
             }
             LiveLineageSink::LocalDiagnostic(writer) => {
@@ -1754,13 +1762,32 @@ fn report_lineage_delivery(outcome: clinker_lineage::LineageDeliveryOutcome) {
     if outcome.terminal() != clinker_lineage::LineageDeliveryTerminal::Shutdown
         || outcome.dropped() > 0
     {
+        let error_kind = match outcome.terminal() {
+            clinker_lineage::LineageDeliveryTerminal::WriteFailed(kind)
+            | clinker_lineage::LineageDeliveryTerminal::FlushFailed(kind) => {
+                lineage_error_kind(kind)
+            }
+            clinker_lineage::LineageDeliveryTerminal::Shutdown
+            | clinker_lineage::LineageDeliveryTerminal::DeadlineExceeded => "none",
+        };
         eprintln!(
-            "clinker: lineage delivery outcome: status={} accepted={} dropped={} full={}",
+            "clinker: lineage delivery outcome: status={} error_kind={} accepted={} dropped={} full={}",
             outcome.terminal().as_str(),
+            error_kind,
             outcome.accepted(),
             outcome.dropped(),
             outcome.full()
         );
+    }
+}
+
+fn lineage_error_kind(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::PermissionDenied => "permission-denied",
+        std::io::ErrorKind::BrokenPipe => "broken-pipe",
+        std::io::ErrorKind::WriteZero => "write-zero",
+        std::io::ErrorKind::TimedOut => "timed-out",
+        _ => "other",
     }
 }
 
@@ -1814,17 +1841,37 @@ impl std::io::Write for ExternalLineageFileSink {
 }
 
 #[cfg(debug_assertions)]
-struct QualificationHungLineageSink {
+struct QualificationLineageSink {
     inner: Box<dyn std::io::Write + Send>,
+    mode: QualificationLineageSinkMode,
     blocked: bool,
 }
 
 #[cfg(debug_assertions)]
-impl std::io::Write for QualificationHungLineageSink {
+#[derive(Clone, Copy)]
+enum QualificationLineageSinkMode {
+    PermissionDenied,
+    WriteFailed,
+    FlushFailed,
+    HangAfterFirstWrite,
+}
+
+#[cfg(debug_assertions)]
+impl std::io::Write for QualificationLineageSink {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self.mode {
+            QualificationLineageSinkMode::PermissionDenied => {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            QualificationLineageSinkMode::WriteFailed => {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            QualificationLineageSinkMode::FlushFailed
+            | QualificationLineageSinkMode::HangAfterFirstWrite => {}
+        }
         self.inner.write_all(bytes)?;
         self.inner.flush()?;
-        if !self.blocked {
+        if matches!(self.mode, QualificationLineageSinkMode::HangAfterFirstWrite) && !self.blocked {
             self.blocked = true;
             eprintln!("clinker: lineage sink received bytes; blocking for qualification");
             let released = std::sync::Mutex::new(false);
@@ -1842,7 +1889,12 @@ impl std::io::Write for QualificationHungLineageSink {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+        self.inner.flush()?;
+        if matches!(self.mode, QualificationLineageSinkMode::FlushFailed) {
+            Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1856,11 +1908,18 @@ fn external_lineage_sink(path: &std::path::Path) -> Box<dyn std::io::Write + Sen
         })
     };
     #[cfg(debug_assertions)]
-    if std::env::var_os("CLINKER_TEST_LINEAGE_SINK").as_deref()
-        == Some(std::ffi::OsStr::new("hang-after-first-write"))
-    {
-        return Box::new(QualificationHungLineageSink {
+    if let Some(mode) = std::env::var_os("CLINKER_TEST_LINEAGE_SINK").and_then(|mode| {
+        match mode.to_string_lossy().as_ref() {
+            "permission-denied" => Some(QualificationLineageSinkMode::PermissionDenied),
+            "write-failed" => Some(QualificationLineageSinkMode::WriteFailed),
+            "flush-failed" => Some(QualificationLineageSinkMode::FlushFailed),
+            "hang-after-first-write" => Some(QualificationLineageSinkMode::HangAfterFirstWrite),
+            _ => None,
+        }
+    }) {
+        return Box::new(QualificationLineageSink {
             inner: sink,
+            mode,
             blocked: false,
         });
     }

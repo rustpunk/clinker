@@ -828,9 +828,14 @@ fn fault_matrix_otlp_outcomes_change_only_the_selected_signal() {
 fn fault_matrix_lineage_outcomes_leave_otlp_and_authoritative_truth_unchanged() {
     let baseline = invoke_fault_matrix(None, "success", None, false, "4KB");
     for (mode, repeat, max_event, expected) in [
-        ("permission-denied", false, "4KB", "write-failed"),
-        ("write-failed", false, "4KB", "write-failed"),
-        ("flush-failed", false, "4KB", "flush-failed"),
+        (
+            "permission-denied",
+            false,
+            "4KB",
+            "error_kind=permission-denied",
+        ),
+        ("write-failed", false, "4KB", "error_kind=broken-pipe"),
+        ("flush-failed", false, "4KB", "error_kind=write-zero"),
         ("hang-after-first-write", false, "4KB", "deadline-exceeded"),
         ("hang-after-first-write", true, "4KB", "full="),
         ("success", false, "1KB", "dropped="),
