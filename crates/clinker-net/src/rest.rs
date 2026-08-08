@@ -578,6 +578,14 @@ impl RequestFailure {
         match self {
             Self::HttpStatus(400..=499) => "rest.http.client_error",
             Self::BodyLimit => "rest.protocol.page_body_limit_reached",
+            // A certificate the client will not trust, and a hostname that
+            // does not resolve, are settled facts about the endpoint as it is
+            // configured. Reporting them as a temporarily unavailable source
+            // told a supervisor to keep re-queuing a batch that cannot succeed
+            // until a human changes something, which is the same advice the
+            // cancellation rule was corrected to stop giving.
+            Self::Tls => "source.endpoint.untrusted_tls",
+            Self::HostNotFound => "source.endpoint.unresolvable",
             _ => "infrastructure.runtime.source_unavailable",
         }
     }

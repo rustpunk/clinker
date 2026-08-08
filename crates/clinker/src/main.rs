@@ -982,7 +982,18 @@ fn main() -> ExitCode {
                 .log_level
                 .parse::<tracing_subscriber::filter::LevelFilter>()
                 .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO);
-            if args.machine.is_some() {
+            // Diagnostics move to stderr exactly when standard output is
+            // carrying data a consumer parses: the machine stream, or a
+            // lineage export addressed to `-`. Human-formatted log lines
+            // written into either corrupt the feed. Everywhere else they stay
+            // on stdout, where the run's own completion summary is reported
+            // and where callers already expect to read it.
+            let stdout_carries_data = args.machine.is_some()
+                || [args.lineage.as_deref(), args.lineage_events.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|path| path.as_os_str() == std::ffi::OsStr::new("-"));
+            if stdout_carries_data {
                 tracing_subscriber::fmt()
                     .with_max_level(filter)
                     .with_writer(std::io::stderr)
@@ -2015,6 +2026,35 @@ fn build_cli_lineage(
     }
 }
 
+/// A destination opened on first write rather than at admission.
+///
+/// Used for anything that is not a regular file. Opening a FIFO for writing
+/// blocks until a reader attaches, so doing it during admission — on the run's
+/// own thread, before discovery — hangs a run whose collector connects a moment
+/// later. A regular file is still opened eagerly, because proving it writable
+/// before the run stages anything is the point of doing it there.
+struct LazyLineageFile {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl std::io::Write for LazyLineageFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let file = match self.file {
+            Some(ref mut file) => file,
+            None => self.file.insert(std::fs::File::create(&self.path)?),
+        };
+        std::io::Write::write(file, bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(file) => std::io::Write::flush(file),
+            None => Ok(()),
+        }
+    }
+}
+
 enum LiveLineageSink {
     External(clinker_lineage::LineageDelivery),
     LocalDiagnostic(Box<dyn std::io::Write>),
@@ -2368,6 +2408,15 @@ fn truncate_lineage_destination(
     path: &std::path::Path,
 ) -> Result<(), PipelineError> {
     if path.as_os_str() == std::ffi::OsStr::new("-") {
+        return Ok(());
+    }
+    // Only a regular file is emptied here. Opening a FIFO for writing blocks
+    // until a reader attaches, and this runs on the run's own thread during
+    // admission — so a destination wired to a collector that connects a moment
+    // later would hang the run before it read a record, with no diagnostic and
+    // no timeout. A pipe or device has no previous contents to strip anyway,
+    // and the export worker opens it lazily on its own thread.
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
         return Ok(());
     }
     std::fs::File::create(path)
@@ -3551,10 +3600,19 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 // leaves a file whose COMPLETE terminal belongs to a different
                 // run — which a catalogue reads as this one having succeeded.
                 // An empty file cannot be misread that way.
-                Box::new(
-                    std::fs::File::create(path)
-                        .map_err(|e| lineage_open_error("--lineage-events", path, &e))?,
-                )
+                // A pipe or device is opened by the first write instead, on
+                // the thread that does the writing. Opening one here would
+                // block admission until a reader attached.
+                match std::fs::symlink_metadata(path) {
+                    Ok(metadata) if !metadata.is_file() => Box::new(LazyLineageFile {
+                        path: path.clone(),
+                        file: None,
+                    }),
+                    _ => Box::new(
+                        std::fs::File::create(path)
+                            .map_err(|e| lineage_open_error("--lineage-events", path, &e))?,
+                    ),
+                }
             };
             lineage_output = Some(LiveLineageOutput {
                 sink: LiveLineageSink::LocalDiagnostic(writer),

@@ -209,6 +209,8 @@ failure_registry! {
     "observability.delivery.rejected", Observability, PolicyRequired, "observability delivery was rejected";
     "source.data.invalid", SourceProtocol, DoNotRetry, "source data does not satisfy the admitted plan";
     "rest.http.client_error", SourceProtocol, DoNotRetry, "REST source request was rejected";
+    "source.endpoint.untrusted_tls", SourceProtocol, PolicyRequired, "source endpoint did not present a trusted TLS identity";
+    "source.endpoint.unresolvable", SourceProtocol, PolicyRequired, "source endpoint host could not be resolved";
     "runtime.resource.memory_budget_exceeded", Infrastructure, PolicyRequired, "runtime memory budget was exceeded";
     "admission.configuration.memory_budget_unsatisfiable", Configuration, DoNotRetry, "configured memory budget is below the runtime baseline";
     "runtime.resource.spill_failed", Infrastructure, RetryWithBackoff, "runtime spill storage failed";
