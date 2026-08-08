@@ -1,6 +1,7 @@
 //! Sole ownership of the optional machine-run stream.
 
 use std::io::{self, BufWriter, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -60,6 +61,9 @@ struct MachineState {
 
 pub(crate) struct MachineProgressWorker {
     stop: mpsc::SyncSender<()>,
+    /// Observed by the worker before it emits, so a stop request is honoured
+    /// even when the wake-up that carried it lost a race with the tick.
+    stopping: Arc<AtomicBool>,
     /// `None` once the thread has been joined, by `finish` or by `Drop`.
     handle: Option<thread::JoinHandle<io::Result<()>>>,
 }
@@ -71,6 +75,9 @@ impl MachineProgressWorker {
 
     fn stop_and_join(&mut self) -> Option<io::Result<()>> {
         let handle = self.handle.take()?;
+        // Raised before the wake-up so a worker already past its `recv_timeout`
+        // sees the request rather than emitting one more snapshot first.
+        self.stopping.store(true, Ordering::Release);
         let _ = self.stop.try_send(());
         Some(
             handle
@@ -89,6 +96,11 @@ impl Drop for MachineProgressWorker {
         // the thread outlives the value and can still be holding the emitter
         // when the terminal is written. Joining here bounds it to this scope on
         // every path, not just the one that reaches `finish`.
+        //
+        // The join waits for a worker that is mid-write, which on a stream
+        // nobody is reading is a wait on the reader. That is the same wait the
+        // terminal write itself makes, so a stalled supervisor stalls the run
+        // either way; the stop flag keeps the window to a write already issued.
         let _ = self.stop_and_join();
     }
 }
@@ -214,6 +226,8 @@ impl MachineEmitter {
         let emitter = self.clone();
         let tick = progress_tick();
         let (stop, receiver) = mpsc::sync_channel(1);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
         let handle = thread::Builder::new()
             .name("clinker-machine-progress".to_owned())
             .spawn(move || {
@@ -222,11 +236,15 @@ impl MachineEmitter {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
+                    if worker_stopping.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
                     emitter.emit_periodic()?;
                 }
             })?;
         Ok(MachineProgressWorker {
             stop,
+            stopping,
             handle: Some(handle),
         })
     }

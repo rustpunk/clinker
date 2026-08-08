@@ -802,33 +802,47 @@ fn pipeline_error_exit_code(error: &PipelineError) -> u8 {
 fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::FailureClassification {
     use clinker_core_types::{FailureClassification, RetryAdvice};
 
-    // Carry the run's own error text, not the registry's fixed default. A
-    // registered code names the class of failure; a DLQ-rate breach and a sort
-    // order violation share one, and only the detail separates them for the
-    // engineer reading the catalogue or the machine terminal. Detail that is
-    // path-bearing, record-bearing, raw-debug, or empty is replaced by the safe
-    // message inside `new`, so this widens what is reported without widening
-    // what can leak.
-    let registered = |code| {
+    // Two builders, because these classifications leave the host. The machine
+    // terminal and the OpenLineage error facet both carry the message, and
+    // `--lineage` ships the facet to an external collector.
+    //
+    // `detailed` is for failures the engine itself describes — a configuration
+    // rule, a resource ceiling, a broken invariant. Their text names engine
+    // vocabulary and cannot quote a record, so carrying it tells an operator
+    // which of several failures sharing one code actually happened.
+    //
+    // `registered` is for the data-defect classes, whose text is built *from*
+    // the offending record: an out-of-range combine key renders the key, an
+    // evaluation failure renders the value it could not evaluate. The
+    // sanitizer inside `new` rejects shapes — paths, debug braces, credential
+    // labels — and a bare field value has none of them, so it would pass
+    // through and export customer data. These keep the registry's fixed text;
+    // the detail an engineer needs is already on stderr, which does not leave
+    // the host.
+    let detailed = |code| {
         FailureClassification::new(code, error.to_string())
+            .unwrap_or_else(|| FailureClassification::unknown_internal("unregistered failure"))
+    };
+    let registered = |code| {
+        FailureClassification::for_code(code)
             .unwrap_or_else(|| FailureClassification::unknown_internal("unregistered failure"))
     };
     match error {
         PipelineError::Io(error) if is_observability_delivery_failure(error) => {
-            registered("observability.delivery.failed")
+            detailed("observability.delivery.failed")
         }
         PipelineError::Config(clinker_plan::config::ConfigError::Validation(message))
             if split_leading_code(message)
                 .is_some_and(|(code, _)| code == "observability.configuration.invalid") =>
         {
-            registered("observability.configuration.invalid")
+            detailed("observability.configuration.invalid")
         }
         PipelineError::Format(format_error) => {
             if let Some(code) = format_error.classification_code() {
                 return registered(code);
             }
             if matches!(format_error, clinker_format::FormatError::Io(_)) {
-                registered("infrastructure.runtime.transient")
+                detailed("infrastructure.runtime.transient")
             } else {
                 registered("source.data.invalid")
             }
@@ -837,13 +851,13 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
         | PipelineError::Schema(_)
         | PipelineError::PlanDiagnostics { .. }
         | PipelineError::OverlayDiagnostics(_)
-        | PipelineError::Compilation { .. } => registered("admission.configuration.invalid"),
+        | PipelineError::Compilation { .. } => detailed("admission.configuration.invalid"),
         PipelineError::Internal { .. }
         | PipelineError::MergeSortOrderViolation { .. }
         | PipelineError::CompositionDepthExceeded { .. }
         | PipelineError::CompositionBodyMissing { .. }
         | PipelineError::CompositionUnknownPort { .. }
-        | PipelineError::SchemaMismatch { .. } => registered("runtime.invariant.plan_mismatch"),
+        | PipelineError::SchemaMismatch { .. } => detailed("runtime.invariant.plan_mismatch"),
         PipelineError::DispatchMismatch { .. } => {
             error.failure_classification().unwrap_or_else(|| {
                 FailureClassification::unknown_internal(
@@ -853,10 +867,10 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
         }
         PipelineError::CompositionBodyError { inner, .. } => classify_pipeline_error(inner),
         PipelineError::Io(_) | PipelineError::ThreadPool(_) => {
-            registered("infrastructure.runtime.transient")
+            detailed("infrastructure.runtime.transient")
         }
-        PipelineError::Spill(_) => registered("runtime.resource.spill_failed"),
-        PipelineError::SpillCapExceeded { .. } => registered("runtime.resource.spill_cap_exceeded"),
+        PipelineError::Spill(_) => detailed("runtime.resource.spill_failed"),
+        PipelineError::SpillCapExceeded { .. } => detailed("runtime.resource.spill_cap_exceeded"),
         PipelineError::Multiple(errors) => errors
             .iter()
             .map(classify_pipeline_error)
@@ -868,7 +882,7 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
                 };
                 (retry_rank, classification.code())
             })
-            .unwrap_or_else(|| registered("runtime.invariant.unknown")),
+            .unwrap_or_else(|| detailed("runtime.invariant.unknown")),
         PipelineError::Eval(_)
         | PipelineError::Accumulator { .. }
         | PipelineError::SortOrderViolation { .. }
@@ -882,16 +896,16 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
         | PipelineError::TypeErrorThresholdExceeded { .. }
         | PipelineError::CorrelationGroupOverflow { .. } => registered("source.data.invalid"),
         PipelineError::MemoryBudgetExceeded { .. } => {
-            registered("runtime.resource.memory_budget_exceeded")
+            detailed("runtime.resource.memory_budget_exceeded")
         }
         PipelineError::UnsatisfiableMemoryBudget { .. } => {
-            registered("admission.configuration.memory_budget_unsatisfiable")
+            detailed("admission.configuration.memory_budget_unsatisfiable")
         }
         // Cancellation is an operator action, not a defect: it is retryable and
         // it is not an engine invariant violation. Callers that can distinguish
         // a cancelled run should use `run_terminal_outcome` instead of asking
         // for a failure classification at all.
-        PipelineError::Interrupted => registered("infrastructure.runtime.transient"),
+        PipelineError::Interrupted => detailed("infrastructure.runtime.transient"),
     }
 }
 
@@ -907,9 +921,26 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
 /// delivery failure is excluded for the same reason: it carries its own
 /// classification and did not come from a source read.
 fn is_cancelled_transport_error(error: &PipelineError) -> bool {
+    /// The kinds tearing down a read in progress produces.
+    ///
+    /// A full disk, a refused permission, or a missing file is a real defect
+    /// that happened to coincide with a signal, and it keeps its identity —
+    /// being an `Io` error is not evidence of cancellation.
+    fn is_interrupted_read(io: &std::io::Error) -> bool {
+        matches!(
+            io.kind(),
+            std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::UnexpectedEof
+        )
+    }
+
     match error {
-        PipelineError::Io(io) => !is_observability_delivery_failure(io),
-        PipelineError::Format(clinker_format::FormatError::Io(_)) => true,
+        PipelineError::Io(io) => !is_observability_delivery_failure(io) && is_interrupted_read(io),
+        PipelineError::Format(clinker_format::FormatError::Io(io)) => is_interrupted_read(io),
         PipelineError::CompositionBodyError { inner, .. } => is_cancelled_transport_error(inner),
         PipelineError::Multiple(errors) => {
             !errors.is_empty() && errors.iter().all(is_cancelled_transport_error)
@@ -1812,9 +1843,14 @@ fn lineage_export_failure(
                 ))
             });
         }
+        // A collector that was merely slow this time is the same phenomenon
+        // `FlushFailed(TimedOut)` reports one layer down, and one slow
+        // collector must not produce two opposite instructions depending on
+        // which layer noticed it. Retryable, with a correction that offers the
+        // deadline as the fix if it keeps happening.
         clinker_lineage::LineageDeliveryTerminal::DeadlineExceeded => {
-            return Some(observability_configuration_error(format!(
-                "--lineage output {destination} did not finish writing within the configured lineage flush deadline. Correction: raise the deadline in clinker.toml:\n\n  [observability.lineage]\n  flush_timeout_ms = 30000"
+            return Some(observability_delivery_error(format!(
+                "--lineage output {destination} did not finish writing within the configured lineage flush deadline. Correction: re-run the export; if it recurs, raise the deadline in clinker.toml:\n\n  [observability.lineage]\n  flush_timeout_ms = 30000"
             )));
         }
         clinker_lineage::LineageDeliveryTerminal::Shutdown => {}
@@ -1926,6 +1962,35 @@ fn build_cli_lineage(
         CliLineageIdentity::LocalDiagnosticPaths => Ok(
             clinker_lineage::column_lineage_local_diagnostic_paths(compiled, base_dir),
         ),
+    }
+}
+
+/// A destination whose previous contents survive until this run writes to it.
+///
+/// The `--lineage-events` file is opened during admission so an unwritable one
+/// refuses the run before it stages a source or creates a publication attempt.
+/// Truncating at that moment would mean a run refused a few steps later had
+/// already destroyed the record its predecessor left behind, so the file is
+/// emptied by the first byte this run actually produces instead.
+struct TruncateOnFirstWrite {
+    file: std::fs::File,
+    truncated: bool,
+}
+
+impl std::io::Write for TruncateOnFirstWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::io::Seek as _;
+
+        if !self.truncated {
+            self.file.set_len(0)?;
+            self.file.rewind()?;
+            self.truncated = true;
+        }
+        std::io::Write::write(&mut self.file, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.file)
     }
 }
 
@@ -2054,9 +2119,19 @@ fn is_permanent_sink_refusal(kind: std::io::ErrorKind) -> bool {
     )
 }
 
+/// Name the observed failure for the operator.
+///
+/// Every kind [`is_permanent_sink_refusal`] treats as permanent appears here:
+/// those are the ones whose diagnostic tells the author to choose a different
+/// destination, and a correction is only actionable next to the reason for it.
 fn lineage_error_kind(kind: std::io::ErrorKind) -> &'static str {
     match kind {
         std::io::ErrorKind::PermissionDenied => "permission-denied",
+        std::io::ErrorKind::NotFound => "not-found",
+        std::io::ErrorKind::ReadOnlyFilesystem => "read-only-filesystem",
+        std::io::ErrorKind::StorageFull => "storage-full",
+        std::io::ErrorKind::IsADirectory => "is-a-directory",
+        std::io::ErrorKind::InvalidInput => "invalid-input",
         std::io::ErrorKind::BrokenPipe => "broken-pipe",
         std::io::ErrorKind::WriteZero => "write-zero",
         std::io::ErrorKind::TimedOut => "timed-out",
@@ -3234,12 +3309,27 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 // own stdout prints (the spill-volume summary and completion line).
                 Box::new(std::io::stdout())
             } else {
-                Box::new(std::fs::File::create(path).map_err(|e| {
-                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                        "cannot open --lineage-events output {}: {e}",
-                        path.display()
-                    )))
-                })?)
+                // Opened, but deliberately not truncated: proving the
+                // destination writable is the point of doing this during
+                // admission, and a run that is refused a few lines later must
+                // not have destroyed the record the previous run left here.
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(path)
+                    .map_err(|e| {
+                        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                            format!(
+                                "cannot open --lineage-events output {}: {e}",
+                                path.display()
+                            ),
+                        ))
+                    })?;
+                Box::new(TruncateOnFirstWrite {
+                    file,
+                    truncated: false,
+                })
             };
             lineage_output = Some(LiveLineageOutput {
                 sink: LiveLineageSink::LocalDiagnostic(writer),

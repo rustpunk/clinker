@@ -7,10 +7,10 @@ Clinker uses structured exit codes to communicate the outcome of a pipeline run.
 | Code | Meaning | Description |
 |------|---------|-------------|
 | 0 | Success | Pipeline completed successfully, or an attempt operation completed without cleanup debt. A purge preview that safely selects nothing is also successful. |
-| 1 | Configuration or argument error | Invalid YAML, CXL syntax error, type mismatch, DAG wiring problem, invalid attempt selector, invalid continuation, or a `--lineage` export rejected by the configured observability caps. Fix the pipeline configuration or command arguments. |
+| 1 | Configuration or argument error | Invalid YAML, CXL syntax error, type mismatch, DAG wiring problem, invalid attempt selector, invalid continuation, a `--lineage` export rejected by the configured observability caps, or a `--lineage` destination that will refuse every identical retry — one the process may not write, that does not exist, that is read-only, or that is out of space. Fix the pipeline configuration or command arguments. |
 | 2 | Partial success | Pipeline ran to completion, but some records were routed to the dead-letter queue. Check the DLQ file. |
 | 3 | Evaluation error | CXL runtime error during record processing (e.g., division by zero, type coercion failure). |
-| 4 | Infrastructure or retained cleanup debt | File/format failure, disk full, a `--lineage` destination the exporter could not write, or an attempt operation stopped with bounded, ambiguous, live, or otherwise retryable cleanup debt. This status never means completed-with-DLQ. |
+| 4 | Infrastructure or retained cleanup debt | File/format failure, disk full, a `--lineage` export that failed in a way a retry may resolve — a reader that went away, a write that timed out, or a flush that exceeded its deadline — or an attempt operation stopped with bounded, ambiguous, live, or otherwise retryable cleanup debt. This status never means completed-with-DLQ. |
 | 130 | Cancelled | Graceful SIGINT or SIGTERM cancellation won before publication, or a required `--machine` lifecycle record could not be written before publication. Final paths for the current attempt remain unchanged. |
 
 For an ordinary standalone run, these statuses are the complete process

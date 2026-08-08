@@ -665,12 +665,20 @@ pub fn send_otlp_json(
                     )?;
                 }
                 Some(cause) => {
-                    // Reaching the budget means the peer answered every
-                    // attempt and every attempt failed the same transient way,
-                    // which is what a load balancer dropping healthy
-                    // connections looks like. Report that cause rather than
-                    // guessing at TLS: the kinds that really do say "not a TLS
-                    // endpoint" are never retried at all.
+                    // The budget is spent, so whatever this is did not
+                    // recover. A collector that is not speaking TLS never
+                    // would; a dropped connection usually would have. Both
+                    // carry the same classification and retry advice, so
+                    // naming the mismatch here costs a supervisor nothing and
+                    // points a human at the misconfiguration that produces
+                    // this far more often than a failing load balancer does.
+                    if is_tls_endpoint_mismatch(&error, endpoint.https_only) {
+                        return Err(OtlpDeliveryFailure::new(
+                            signal,
+                            OtlpDeliveryFailureKind::Tls,
+                            attempts,
+                        ));
+                    }
                     return Err(OtlpDeliveryFailure::new(
                         signal,
                         OtlpDeliveryFailureKind::RetryExhausted(cause),
@@ -762,24 +770,27 @@ fn retryable_status(status: u16) -> Option<OtlpRetryCause> {
     }
 }
 
-/// Whether `error` is a peer that is not speaking TLS on an origin that
-/// requires it.
+/// Whether `error` is the signature of a peer that answered an origin
+/// requiring TLS without speaking it.
 ///
-/// Deliberately disjoint from [`retryable_transport`]: an error kind belongs to
-/// exactly one of the two, so no error can be both worth retrying and already
-/// decided. Only kinds a healthy collector does not produce are here. A
-/// plaintext reply to a handshake reaches rustls as invalid data or as a
-/// protocol parse failure, and writing a handshake to a socket the peer never
-/// intended to speak TLS on ends as end-of-stream or a broken pipe.
+/// Which kind that produces is a property of the host, not of the cause: the
+/// same plaintext reply to the same handshake arrives as invalid data or
+/// end-of-stream on the Unix hosts and as a reset on Windows. Naming only the
+/// Unix spellings would report the most common real misconfiguration —
+/// an `https://` endpoint pointed at a plaintext collector — as an ordinary
+/// transient on one platform and as TLS on another, for one deployment error.
 ///
-/// A reset, an abort, and a half-open socket are excluded even though a peer
-/// that is not speaking TLS can produce them, because a load balancer dropping
-/// a healthy connection produces them far more often. Claiming those would send
-/// an operator to inspect a certificate that was never involved; they are
-/// retried instead and reported by the cause that survives the budget.
+/// A connection dropped repeatedly in front of a healthy collector produces
+/// the same set, and no predicate over error kinds can separate the two. What
+/// narrows it is the retry budget rather than the kind, so this is consulted
+/// only once a failure has survived every attempt; a drop that recovers never
+/// reaches it. Both causes carry the same registered classification and the
+/// same retry advice, so the choice names the more likely one for a human
+/// without changing what a supervisor does.
+///
 /// Reachability failures — refused, unresolved, or a deadline that expired
-/// before a connection existed — are likewise absent: those describe getting to
-/// the peer rather than what the peer turned out to be.
+/// before a connection existed — are deliberately absent: those describe
+/// getting to the peer rather than what the peer turned out to be.
 fn is_tls_endpoint_mismatch(error: &ureq::Error, https_only: bool) -> bool {
     if !https_only {
         return false;
@@ -791,6 +802,9 @@ fn is_tls_endpoint_mismatch(error: &ureq::Error, https_only: bool) -> bool {
             std::io::ErrorKind::InvalidData
                 | std::io::ErrorKind::UnexpectedEof
                 | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
         ),
         _ => false,
     }
@@ -811,6 +825,11 @@ fn retryable_transport(error: &ureq::Error) -> Option<OtlpRetryCause> {
         ureq::Error::HostNotFound
         | ureq::Error::ConnectionFailed
         | ureq::Error::ConnectProxyFailed(_) => Some(OtlpRetryCause::Connect),
+        // End-of-stream and a broken pipe are how a pooled connection reports
+        // that the collector or a proxy closed it while idle, which the next
+        // request recovers from immediately. They are also one spelling of a
+        // peer that never spoke TLS, so they are retried like any other
+        // ambiguous close and judged only by what survives the budget.
         ureq::Error::Io(error)
             if matches!(
                 error.kind(),
@@ -818,6 +837,8 @@ fn retryable_transport(error: &ureq::Error) -> Option<OtlpRetryCause> {
                     | std::io::ErrorKind::ConnectionReset
                     | std::io::ErrorKind::ConnectionAborted
                     | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::BrokenPipe
                     | std::io::ErrorKind::TimedOut
             ) =>
         {
@@ -1029,13 +1050,12 @@ mod classification {
         ureq::Error::Io(IoError::from(kind))
     }
 
-    /// A reset, an abort, and a half-open socket are produced by a peer that is
-    /// not speaking TLS *and* by a load balancer dropping a healthy
-    /// connection — and the second is far more common. Naming them TLS sends an
-    /// operator to inspect a certificate that was never involved, so they are
-    /// retried and reported by whichever cause survives the budget.
+    /// A reset, an abort, and a half-open socket are produced by a peer that
+    /// is not speaking TLS *and* by a connection dropped in front of a healthy
+    /// collector. They are retried first, so a drop that recovers never
+    /// reaches a verdict at all — only what survives the whole budget does.
     #[test]
-    fn a_connection_a_healthy_collector_can_drop_is_retried_not_blamed_on_tls() {
+    fn an_ambiguous_close_is_retried_before_any_verdict_is_reached() {
         for kind in [
             ErrorKind::ConnectionReset,
             ErrorKind::ConnectionAborted,
@@ -1044,57 +1064,74 @@ mod classification {
             let error = io(kind);
             assert!(
                 retryable_transport(&error).is_some(),
-                "{kind:?} must spend the retry budget"
-            );
-            assert!(
-                !is_tls_endpoint_mismatch(&error, true),
-                "{kind:?} is what a reachable, correctly terminated collector does under load"
-            );
-        }
-    }
-
-    /// A peer that answers a TLS handshake with plaintext fails the same way on
-    /// every attempt. Retrying it spends a configured budget on a verdict that
-    /// cannot change, so these kinds are classified where they are raised.
-    #[test]
-    fn an_unambiguous_handshake_rejection_is_not_retried() {
-        for kind in [
-            ErrorKind::InvalidData,
-            ErrorKind::UnexpectedEof,
-            ErrorKind::BrokenPipe,
-        ] {
-            let error = io(kind);
-            assert!(
-                retryable_transport(&error).is_none(),
-                "{kind:?} is deterministic; a retry cannot change it"
+                "{kind:?} must spend the retry budget before it is judged"
             );
             assert!(
                 is_tls_endpoint_mismatch(&error, true),
-                "{kind:?} on an HTTPS origin is a mismatch"
+                "{kind:?} is how Windows reports a plaintext reply to a handshake"
             );
         }
     }
 
-    /// The two predicates partition the error kinds they cover. An overlap is
-    /// what forced the previous design to re-decide a failure after the retry
-    /// budget had already been spent, and re-deciding is what let an ordinary
-    /// dropped connection be reported as a certificate problem.
+    /// Invalid data is the one kind a working collector cannot produce: a
+    /// healthy peer never answers a handshake with something that is not a TLS
+    /// record. Retrying it spends a configured budget on a verdict that cannot
+    /// change, so it is classified where it is raised.
     #[test]
-    fn no_error_kind_is_both_retryable_and_a_mismatch() {
+    fn an_unambiguous_handshake_rejection_is_not_retried() {
+        let error = io(ErrorKind::InvalidData);
+        assert!(
+            retryable_transport(&error).is_none(),
+            "a non-TLS record is deterministic; a retry cannot change it"
+        );
+        assert!(
+            is_tls_endpoint_mismatch(&error, true),
+            "a non-TLS record on an HTTPS origin is a mismatch"
+        );
+    }
+
+    /// A collector or proxy closing an idle pooled connection is the ordinary
+    /// cost of keep-alive, and the next request recovers from it. Deciding on
+    /// the first one would discard a batch a single retry would have delivered.
+    #[test]
+    fn an_idle_connection_close_is_retried_before_it_is_judged() {
+        for kind in [ErrorKind::UnexpectedEof, ErrorKind::BrokenPipe] {
+            assert!(
+                retryable_transport(&io(kind)).is_some(),
+                "{kind:?} is how a pooled connection reports being closed while idle"
+            );
+        }
+    }
+
+    /// One deployment error must not be reported two ways depending on the host
+    /// it ran on. A plaintext collector behind an `https://` endpoint reaches
+    /// the client as invalid data or end-of-stream on the Unix hosts and as a
+    /// reset on Windows, so every spelling has to reach the same verdict.
+    #[test]
+    fn every_host_spelling_of_a_plaintext_peer_reaches_the_same_verdict() {
         for kind in [
-            ErrorKind::ConnectionRefused,
-            ErrorKind::ConnectionReset,
-            ErrorKind::ConnectionAborted,
-            ErrorKind::NotConnected,
-            ErrorKind::TimedOut,
             ErrorKind::InvalidData,
             ErrorKind::UnexpectedEof,
             ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::NotConnected,
         ] {
-            let error = io(kind);
             assert!(
-                !(retryable_transport(&error).is_some() && is_tls_endpoint_mismatch(&error, true)),
-                "{kind:?} must belong to exactly one of retry and mismatch"
+                is_tls_endpoint_mismatch(&io(kind), true),
+                "{kind:?} is one host's spelling of a peer that never spoke TLS"
+            );
+        }
+    }
+
+    /// Getting to the peer is not the same as what the peer turned out to be,
+    /// and a collector that was never reached says nothing about its TLS.
+    #[test]
+    fn a_collector_that_was_never_reached_is_not_a_mismatch() {
+        for kind in [ErrorKind::ConnectionRefused, ErrorKind::TimedOut] {
+            assert!(
+                !is_tls_endpoint_mismatch(&io(kind), true),
+                "{kind:?} describes reaching the peer, not what it is"
             );
         }
     }
