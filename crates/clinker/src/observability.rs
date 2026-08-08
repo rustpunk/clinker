@@ -560,7 +560,19 @@ impl OtlpWorker {
             .send(WorkerCommand::Finish(Box::new(snapshot)))
             .is_err()
         {
-            return ObservabilitySummary::default();
+            // The worker is gone, so it will report nothing further — but what
+            // it delivered before it went is in the mirror, and the default
+            // summary would claim a run whose collector holds thousands of
+            // records delivered none. Same rule as the timeout branch below:
+            // report what was observed, and say the flush did not complete.
+            let progress = *self
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            return ObservabilitySummary {
+                flush_complete: false,
+                ..progress
+            };
         }
         match self.done.recv_timeout(self.flush_timeout) {
             Ok(report) => {

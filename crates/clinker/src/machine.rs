@@ -812,13 +812,26 @@ mod tests {
             .expect("progress worker starts");
         // Nothing polls the run's shutdown token here, exactly like a run
         // wedged inside one long spill merge or one slow REST page.
-        thread::sleep(PROGRESS_TICK * 10);
+        //
+        // Waited for rather than slept past. The claim is that the worker's
+        // own clock produces liveness, not that it produces it within any
+        // particular span: sleeping a fixed multiple of the tick asserts that
+        // a thread starts and completes one wait inside it, which a loaded
+        // host with coarse timer granularity does not owe us.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let periodics = loop {
+            let seen = events(&sink)
+                .into_iter()
+                .filter(|event| {
+                    event["event"] == "progress" && event["progress"]["kind"] == "periodic"
+                })
+                .collect::<Vec<_>>();
+            if !seen.is_empty() || std::time::Instant::now() >= deadline {
+                break seen;
+            }
+            thread::sleep(PROGRESS_TICK);
+        };
         worker.finish().expect("progress worker drains");
-
-        let periodics = events(&sink)
-            .into_iter()
-            .filter(|event| event["event"] == "progress" && event["progress"]["kind"] == "periodic")
-            .collect::<Vec<_>>();
         assert!(
             !periodics.is_empty(),
             "liveness must come from the worker's own clock"

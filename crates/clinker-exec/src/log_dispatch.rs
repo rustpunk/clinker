@@ -46,6 +46,9 @@ struct EnabledDispatcher<'a> {
     /// Compiled `condition` gate per directive, parallel to `directives` and
     /// `cadence`. `None` where the directive declared no condition.
     gates: Vec<Option<ProgramEvaluator>>,
+    /// Whether any `per_record` directive carries a gate, decided once here
+    /// because it cannot change afterwards and the answer is read per record.
+    wants_per_record_context: bool,
     execution_id: Box<str>,
     batch_id: Box<str>,
     pipeline_name: Box<str>,
@@ -81,6 +84,11 @@ impl<'a> LogDispatcher<'a> {
                         .map(|program| ProgramEvaluator::new(Arc::clone(program), false))
                 })
                 .collect(),
+            wants_per_record_context: directives.iter().zip(conditions.iter()).any(
+                |(directive, condition)| {
+                    directive.when == LogTiming::PerRecord && condition.is_some()
+                },
+            ),
             execution_id: bounded_correlation(context.execution_id),
             batch_id: bounded_correlation(context.batch_id),
             pipeline_name: bounded_correlation(context.pipeline_name),
@@ -114,13 +122,9 @@ impl<'a> LogDispatcher<'a> {
     /// emits from the record alone. Answering "is observability configured at
     /// all" would rebuild it for every row of those transforms too.
     pub(crate) fn wants_per_record_context(&self) -> bool {
-        self.enabled.as_ref().is_some_and(|enabled| {
-            enabled
-                .directives
-                .iter()
-                .zip(enabled.gates.iter())
-                .any(|(directive, gate)| directive.when == LogTiming::PerRecord && gate.is_some())
-        })
+        self.enabled
+            .as_ref()
+            .is_some_and(|enabled| enabled.wants_per_record_context)
     }
 
     /// `eval_ctx` is the record's own evaluation context, used only to run

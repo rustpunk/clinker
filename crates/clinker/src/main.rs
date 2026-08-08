@@ -996,7 +996,14 @@ fn main() -> ExitCode {
             // run starts so an interrupt during a long pipeline trips the
             // run's shutdown token. Every caller observes the first result.
             if let Err(e) = clinker_exec::pipeline::shutdown::install_signal_handler() {
-                eprintln!("clinker: failed to install signal handler: {e}");
+                // Nothing has been read, written, or staged at this point, and
+                // the run refuses to start one it could not later cancel. The
+                // status is 4 and the environment is what has to change:
+                // another handler already owns these signals, or a sandbox
+                // policy refuses them.
+                eprintln!(
+                    "clinker: failed to install signal handler: {e}. Correction: run clinker as the process that owns SIGINT and SIGTERM, or relax the sandbox policy that refuses them"
+                );
                 return ExitCode::from(4);
             }
 
@@ -1783,7 +1790,18 @@ const LINEAGE_EXPORT_REPORTED_DROPS: usize = 4;
 /// running: a detached worker re-creates the destination on its next write,
 /// which would put a truncated event stream back after the removal.
 fn remove_empty_lineage_export(path: &std::path::Path) -> Option<PipelineError> {
-    let metadata = std::fs::metadata(path).ok()?;
+    // Standard output is not a path. Resolving it as one makes an ordinary
+    // file named `-` in the working directory this run's destination, and a
+    // stdout export would unlink a file the operator never named.
+    if path.as_os_str() == std::ffi::OsStr::new("-") {
+        return None;
+    }
+    // `symlink_metadata`, so a symlink is not a regular file here. Following
+    // it would report the target's size and then unlink the link instead of
+    // the target, destroying the operator's configured path while leaving the
+    // empty artifact exactly where it was. A symlinked destination is left
+    // alone: an ambiguous empty file is a smaller harm than a broken link.
+    let metadata = std::fs::symlink_metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() != 0 {
         return None;
     }
