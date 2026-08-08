@@ -1373,6 +1373,21 @@ fn parse_correction(field: &str, key: Option<&str>) -> Box<str> {
 /// header — so a document whose actual defect was a misspelled key elsewhere
 /// was reported as missing a key from a table the author had deliberately
 /// commented out, with a correction naming something they never wrote.
+/// The table header a line declares, ignoring a trailing comment.
+///
+/// TOML allows `[table]   # note` and a comment can also make a line *look*
+/// like a header without being one. Requiring the whole trimmed line to equal
+/// the header missed the first, and matching the header anywhere in the text
+/// matched the second — so this returns the header a line actually declares,
+/// which is neither.
+fn header_on_line(trimmed: &str) -> Option<&str> {
+    if !trimmed.starts_with('[') {
+        return None;
+    }
+    let end = trimmed.find(']')?;
+    Some(&trimmed[..=end])
+}
+
 fn table_body<'a>(text: &'a str, requested: &str) -> Option<&'a str> {
     let header = format!("[{requested}]");
     let mut offset = 0_usize;
@@ -1380,10 +1395,10 @@ fn table_body<'a>(text: &'a str, requested: &str) -> Option<&'a str> {
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim();
         if body_start.is_none() {
-            if trimmed == header {
+            if header_on_line(trimmed) == Some(header.as_str()) {
                 body_start = Some(offset + line.len());
             }
-        } else if trimmed.starts_with('[') {
+        } else if header_on_line(trimmed).is_some() {
             return Some(&text[body_start?..offset]);
         }
         offset += line.len();

@@ -424,7 +424,17 @@ impl RestRecordSource {
                     Ok(response) => response,
                     Err(error) => {
                         let failure = RequestFailure::from_transport(&error);
-                        if matches!(failure, RequestFailure::HttpStatus(400..=499)) {
+                        // A 4xx is the server refusing, and retrying it cannot
+                        // help — except for the two that are not refusals.
+                        // Throttling and a request timeout ask for later, so
+                        // they break into the retry loop like a 5xx rather
+                        // than returning here. Labelling them retryable
+                        // without this changed only what the run said about
+                        // itself: it still abandoned the batch on the first
+                        // 429, while now claiming it had backed off.
+                        if matches!(failure, RequestFailure::HttpStatus(400..=499))
+                            && !matches!(failure, RequestFailure::HttpStatus(408 | 429))
+                        {
                             return Err(self.sanitized_request_failure(
                                 &url,
                                 attempt.saturating_add(1),
@@ -456,7 +466,9 @@ impl RestRecordSource {
                     url = target;
                     continue;
                 }
-                if (500..600).contains(&status) {
+                // Retried for the same reason a 5xx is: the server asked for
+                // later rather than refusing.
+                if (500..600).contains(&status) || matches!(status, 408 | 429) {
                     break RequestFailure::HttpStatus(status);
                 }
                 if !(200..300).contains(&status) {
@@ -563,12 +575,15 @@ impl RequestFailure {
             // permanently and identically on every attempt, and a shutdown
             // that happens to be pending does not explain it — the same harm
             // the named verdicts exist to prevent.
+            // The same set the verdict calls unreadable local material, and
+            // no more. `InvalidData` and `InvalidInput` were left here after
+            // being removed there, so a cancelled run whose last error was a
+            // plaintext TLS handshake reported a retryable failure instead of
+            // an abort — the two rules disagreeing about one error kind.
             return !matches!(
                 kind,
                 std::io::ErrorKind::PermissionDenied
                     | std::io::ErrorKind::NotFound
-                    | std::io::ErrorKind::InvalidInput
-                    | std::io::ErrorKind::InvalidData
                     | std::io::ErrorKind::IsADirectory
                     | std::io::ErrorKind::ReadOnlyFilesystem
             );
