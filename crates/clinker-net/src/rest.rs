@@ -615,7 +615,27 @@ impl RequestFailure {
             // Every TLS-layer failure, not just the one variant. An expired or
             // untrusted certificate arrives as `Rustls`, which fell through to
             // the catch-all and was then treated as a peer that never answered.
-            ureq::Error::Tls(_) | ureq::Error::Rustls(_) | ureq::Error::TlsRequired => Self::Tls,
+            // Every TLS-layer failure this build can produce, including the
+            // one that is really the certificate material failing to parse.
+            // All of them mean this endpoint's identity cannot be established,
+            // which is a person's problem rather than a moment's. The
+            // remaining TLS variants belong to backends this build does not
+            // enable, so naming them would not compile.
+            ureq::Error::Tls(_)
+            | ureq::Error::Rustls(_)
+            | ureq::Error::TlsRequired
+            | ureq::Error::Pem(_) => Self::Tls,
+            // Settled facts about how the request was configured: a URL that
+            // will not parse, a proxy address that will not parse, a redirect
+            // that cannot be followed or never ends. These reached the
+            // catch-all, where a pending shutdown made them look like a
+            // cancellation and an orchestrator re-queued a batch that cannot
+            // succeed until the configuration changes.
+            ureq::Error::BadUri(_)
+            | ureq::Error::Http(_)
+            | ureq::Error::InvalidProxyUrl
+            | ureq::Error::RedirectFailed
+            | ureq::Error::TooManyRedirects => Self::Protocol,
             ureq::Error::ConnectProxyFailed(_) => Self::ProxyConnection,
             ureq::Error::ConnectionFailed => Self::Connection,
             ureq::Error::Protocol(_) => Self::Protocol,
