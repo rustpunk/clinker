@@ -79,9 +79,31 @@ where
             }
         }
         IfExistsPolicy::UniqueSuffix => {
+            // A sharing violation clears as soon as the thread that was
+            // creating that name finishes; a directory this process may not
+            // write into never does, and the two arrive as the same error.
+            // Advancing on either is what makes the policy work under
+            // contention, so what separates them is how many the search sees:
+            // a race resolves within a few names, while a denial repeats on
+            // every one. Past this bound the denial is reported rather than
+            // walked past, because the alternative is a run that never
+            // terminates and never says why.
+            const MAX_DENIED_CANDIDATES: u32 = 64;
+            let mut denied = 0_u32;
+            let mut advance = |error: &PipelineError| -> bool {
+                if is_already_exists(error) {
+                    return true;
+                }
+                if !is_candidate_unavailable(error) {
+                    return false;
+                }
+                denied = denied.saturating_add(1);
+                denied <= MAX_DENIED_CANDIDATES
+            };
+
             match stage_candidate(bare.clone(), PromotionDisposition::NoReplace, publication) {
                 Ok(output) => return Ok(output),
-                Err(error) if is_candidate_unavailable(&error) => {}
+                Err(error) if advance(&error) => {}
                 Err(error) => return Err(error),
             }
 
@@ -89,7 +111,7 @@ where
                 let candidate = path_for_n(Some(n)).map_err(PipelineError::Config)?;
                 match stage_candidate(candidate, PromotionDisposition::NoReplace, publication) {
                     Ok(output) => return Ok(output),
-                    Err(error) if is_candidate_unavailable(&error) => continue,
+                    Err(error) if advance(&error) => continue,
                     Err(error) => return Err(error),
                 }
             }

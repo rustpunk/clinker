@@ -2420,7 +2420,7 @@ fn truncate_lineage_destination(
     // regular destination — a "current run" indirection is exactly that — and
     // treating the link itself as non-regular would leave the previous run's
     // COMPLETE terminal in the target for a catalogue to attribute to this run.
-    if std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
+    if std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file() && !metadata.is_dir()) {
         return Ok(());
     }
     std::fs::File::create(path)
@@ -3613,10 +3613,19 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 // path down the lazy path instead would produce a green run
                 // that exported nothing.
                 match std::fs::metadata(path) {
-                    Ok(metadata) if !metadata.is_file() => Box::new(LazyLineageFile {
-                        path: path.clone(),
-                        file: None,
-                    }),
+                    // Neither a file nor a directory: a pipe, socket, or
+                    // device, whose open is what can block. A directory is
+                    // excluded deliberately — it is also "not a file", and
+                    // letting it defer produced a run that exited 0 having
+                    // exported nothing, because every later write failed with
+                    // EISDIR and lineage write failures are only reported.
+                    // Opening it here is what refuses it.
+                    Ok(metadata) if !metadata.is_file() && !metadata.is_dir() => {
+                        Box::new(LazyLineageFile {
+                            path: path.clone(),
+                            file: None,
+                        })
+                    }
                     _ => Box::new(
                         std::fs::File::create(path)
                             .map_err(|e| lineage_open_error("--lineage-events", path, &e))?,
