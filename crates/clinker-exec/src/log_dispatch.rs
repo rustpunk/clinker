@@ -23,6 +23,10 @@ pub(crate) struct TransformSignalContext<'a> {
     pub(crate) execution_id: &'a str,
     pub(crate) batch_id: &'a str,
     pub(crate) pipeline_name: &'a str,
+    /// The transform's exported identity: its authored name at the top level,
+    /// and `<call site>.<name>` inside a composition body. Callers build this
+    /// through `ExecutorContext::qualified_node_name` rather than reading the
+    /// node's name directly, which inside a body is scope-local.
     pub(crate) logical_node: &'a str,
 }
 

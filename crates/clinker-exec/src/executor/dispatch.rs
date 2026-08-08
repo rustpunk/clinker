@@ -16,6 +16,7 @@
 //! where `recursive_term.execute(partition, Arc::clone(&task_context))`
 //! re-enters the same execution loop with a different plan.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::sync::{Arc, LazyLock};
@@ -1263,6 +1264,16 @@ pub(crate) struct ExecutorContext<'a> {
     /// `None` at the top level — the existing config-walk path
     /// covers every top-level node.
     pub(crate) current_body_node_input_refs: Option<HashMap<String, Vec<String>>>,
+    /// Call-site node names of the composition bodies the walk is currently
+    /// inside, outermost first. Empty at the top level. Pushed and popped in
+    /// lockstep with `window_runtime.active_stack` by both body-entry paths —
+    /// the forward-pass body executor and the commit pass's re-entry.
+    ///
+    /// A body node's name is body-local and may legally repeat a name used at
+    /// the top level or in a sibling body, so it does not identify a node on
+    /// its own. This is the prefix that makes it identify one; see
+    /// [`ExecutorContext::qualified_node_name`].
+    pub(crate) composition_call_sites: Vec<String>,
     pub(crate) counters: PipelineCounters,
     pub(crate) dlq_entries: Vec<DlqEntry>,
     /// Per-source DLQ counters keyed by Source-node name. Incremented
@@ -1724,6 +1735,31 @@ impl<'a> ExecutorContext<'a> {
     /// the pipeline-wide total once every per-source slot is `Some`.
     pub(crate) fn source_count_by_name(&self, name: &Arc<str>) -> Option<u64> {
         self.source_count_per_source.get(name).copied().flatten()
+    }
+
+    /// Name `name` the way an operator reading telemetry has to see it: bare at
+    /// the top level, and prefixed with the composition call sites it sits
+    /// under — `enrich_eu.normalize` — inside a body.
+    ///
+    /// One pipeline can invoke the same composition at several call sites, and
+    /// every one of them runs the same body node names through the same
+    /// producer. Exported bare, the span closed for `normalize` under
+    /// `enrich_eu` and the one closed under `enrich_us` are one indistinguishable
+    /// name, and a body name may also collide with an unrelated top-level node's.
+    /// `<call site>.<node>` is the spelling the lineage events already use for
+    /// the same reason, so the two subsystems name a body node alike.
+    pub(crate) fn qualified_node_name<'name>(&self, name: &'name str) -> Cow<'name, str> {
+        if self.composition_call_sites.is_empty() {
+            Cow::Borrowed(name)
+        } else {
+            let mut qualified = String::new();
+            for call_site in &self.composition_call_sites {
+                qualified.push_str(call_site);
+                qualified.push('.');
+            }
+            qualified.push_str(name);
+            Cow::Owned(qualified)
+        }
     }
 
     /// True when the Transform at `node_idx` should run via the
@@ -3839,6 +3875,10 @@ pub(crate) fn transform_fused_consume(
             ),
             None => (None, &[], &[]),
         };
+    // Fusion is gated to the top level, so this resolves to the bare name
+    // today; it goes through the same helper as the buffered arm so both name a
+    // node the one way if that gate ever moves.
+    let logical_node = ctx.qualified_node_name(name);
     let mut signals = LogDispatcher::new(
         ctx.telemetry_producer.clone(),
         directives,
@@ -3847,7 +3887,7 @@ pub(crate) fn transform_fused_consume(
             execution_id: &ctx.stable.pipeline_execution_id,
             batch_id: &ctx.stable.pipeline_batch_id,
             pipeline_name: &ctx.stable.pipeline_name,
-            logical_node: name,
+            logical_node: &logical_node,
         },
     );
     signals.fire_before_transform();

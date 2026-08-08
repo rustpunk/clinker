@@ -426,6 +426,102 @@ nodes:
     );
 }
 
+/// A pipeline node name carries no grammar: configuration checks node names
+/// only for duplication, so a source named with a space and a transform named
+/// with non-ASCII letters both compile and run. Binding is what makes those
+/// pipelines emit lineage at all, so the binding key space has to admit every
+/// name the engine does — otherwise a pipeline that runs cannot be exported,
+/// and the author has nothing to correct.
+#[test]
+fn a_node_name_the_engine_accepts_can_be_bound() {
+    let identities = LineageIdentityContext::external([
+        LineageNodeBinding::new(
+            "normalize orders",
+            ExternalDatasetIdentity::canonical("s3://warehouse/orders").unwrap(),
+        ),
+        LineageNodeBinding::new(
+            "récapitulatif",
+            ExternalDatasetIdentity::catalog("analytics", "orders_summary").unwrap(),
+        ),
+    ])
+    .expect("a space and a non-ASCII letter are both legal in a pipeline node name");
+
+    let compiled = parse_config(
+        r#"
+pipeline: { name: odd_node_names }
+nodes:
+  - type: source
+    name: normalize orders
+    config:
+      name: normalize orders
+      type: csv
+      path: data/orders.csv
+      schema: [{ name: id, type: int }]
+  - type: transform
+    name: shape
+    input: normalize orders
+    config:
+      cxl: |
+        emit id = id
+  - type: output
+    name: récapitulatif
+    input: shape
+    config: { name: récapitulatif, type: csv, path: out/summary.csv }
+"#,
+    )
+    .unwrap()
+    .compile(&CompileContext::default())
+    .unwrap();
+
+    let lineage = column_lineage_external(&compiled, &identities).unwrap();
+    assert_eq!(
+        lineage
+            .inputs
+            .iter()
+            .map(|id| (id.namespace.as_str(), id.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("s3://warehouse", "orders")]
+    );
+    assert_eq!(lineage.outputs[0].dataset.name, "orders_summary");
+    assert_eq!(
+        lineage.outputs[0]
+            .facet
+            .fields
+            .get("id")
+            .expect("the projected column reaches the sink")
+            .input_fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.field.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("orders", "id")]
+    );
+
+    // The bound that stays is the one the configuration boundary applies, so a
+    // key configuration would reject is still refused here — and the diagnostic
+    // names the offending key rather than describing a grammar.
+    for rejected in ["", " padded ", "line\nbreak", &"n".repeat(129)] {
+        let err = LineageIdentityContext::external([LineageNodeBinding::new(
+            rejected,
+            ExternalDatasetIdentity::catalog("analytics", "orders").unwrap(),
+        )])
+        .expect_err("a key outside the retained bound must be refused");
+        assert_eq!(
+            err,
+            LineageIdentityError::InvalidNode {
+                node: rejected.to_owned()
+            }
+        );
+    }
+    assert!(
+        LineageIdentityError::InvalidNode {
+            node: " padded ".to_owned()
+        }
+        .to_string()
+        .contains("\" padded \""),
+        "the diagnostic must name the offending key"
+    );
+}
+
 /// A per-record-type dataset name is its base name with the record type id
 /// concatenated on, so an authored name carrying the separator can produce the
 /// exact `{namespace, name}` pair one of those record types already occupies.

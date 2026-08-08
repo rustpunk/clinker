@@ -255,7 +255,9 @@ impl LineageIdentityContext {
         let mut by_node = BTreeMap::new();
         for mut binding in bindings {
             if !valid_node(&binding.node) {
-                return Err(LineageIdentityError::InvalidNode);
+                return Err(LineageIdentityError::InvalidNode {
+                    node: binding.node.clone(),
+                });
             }
             binding.subsets.sort();
             binding.subsets.dedup();
@@ -341,7 +343,12 @@ impl LineageNodeBinding {
 pub enum LineageIdentityError {
     InvalidCanonicalDatasource,
     InvalidCatalogIdentity,
-    InvalidNode,
+    /// A binding key that cannot address any node. `node` is the offending
+    /// value, rendered escaped so a control character in it prints as an escape
+    /// rather than deforming the diagnostic.
+    InvalidNode {
+        node: String,
+    },
     InvalidSubset,
     InvalidSymlink,
     ExternalModeRequired,
@@ -368,7 +375,14 @@ impl fmt::Display for LineageIdentityError {
             Self::InvalidCatalogIdentity => {
                 f.write_str("catalog namespace and name must both be non-empty logical text")
             }
-            Self::InvalidNode => f.write_str("lineage node must be a non-empty logical node name"),
+            Self::InvalidNode { node } => write!(
+                f,
+                "lineage node key {node:?} cannot address a pipeline node: a key must be \
+                 non-empty, carry no control characters, have no leading or trailing whitespace, \
+                 and stay within {MAX_NODE_BYTES} bytes. Use the name the pipeline declares, \
+                 with nothing added around it — `orders`, or \
+                 `<composition node>.<body source>` for a node declared inside a composition body"
+            ),
             Self::InvalidSubset => f.write_str(
                 "dataset subset must be a logical partition/location identifier, not a worker or attempt path",
             ),
@@ -431,12 +445,32 @@ fn name_error(
     }
 }
 
+/// Ceiling on one binding key, matching the cap
+/// `observability.lineage.dataset.node` is validated against.
+const MAX_NODE_BYTES: usize = 128;
+
+/// Whether `value` can key one logical-node binding.
+///
+/// Configuration applies no grammar to a pipeline node name — it checks only
+/// for duplicates — so a source named `normalize orders` or `récapitulatif`
+/// compiles and runs. A character grammar here would refuse to bind a pipeline
+/// the engine accepts, leaving it with no way to use external identity mode at
+/// all: the configuration boundary would take the binding and this one would
+/// reject it. That is the split the telemetry exporter resolved in favour of
+/// the authored name, and it resolves the same way here.
+///
+/// What remains is exactly the bound the configuration boundary already
+/// applies: non-empty, trimmed, free of control characters, and within
+/// [`MAX_NODE_BYTES`]. Every value configuration admits therefore reaches a
+/// [`LineageIdentityError::MissingNode`] or
+/// [`LineageIdentityError::DuplicateNode`] naming the key, rather than a blanket
+/// refusal the author cannot act on. `.` stays admissible because it joins a
+/// composition call site to a body node name.
 fn valid_node(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/'))
+        && value.len() <= MAX_NODE_BYTES
+        && value == value.trim()
+        && !value.chars().any(char::is_control)
 }
 
 fn valid_logical_subset(value: &str) -> bool {

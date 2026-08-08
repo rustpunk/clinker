@@ -595,7 +595,7 @@ pub fn send_otlp_json(
                         // Reading the body means the handshake already
                         // succeeded, so a reset here is the wire failing, not
                         // a peer that was never a TLS endpoint.
-                        Err(error) => match retryable_transport(&error, false) {
+                        Err(error) => match retryable_transport(&error) {
                             Some(_cause) if attempts < budget.max_attempts => {
                                 wait_for_retry(
                                     signal,
@@ -654,7 +654,7 @@ pub fn send_otlp_json(
                     attempts,
                 ));
             }
-            Err(error) => match retryable_transport(&error, endpoint.https_only) {
+            Err(error) => match retryable_transport(&error) {
                 Some(_cause) if attempts < budget.max_attempts => {
                     wait_for_retry(
                         signal,
@@ -665,6 +665,19 @@ pub fn send_otlp_json(
                     )?;
                 }
                 Some(cause) => {
+                    // A peer that is not speaking TLS fails identically on
+                    // every attempt, while a reset mid-request may not — and
+                    // the error kind alone cannot tell them apart. The retry
+                    // budget can: whatever survives it was not transient, so
+                    // report the mismatch here rather than refusing to retry a
+                    // reset that would have succeeded.
+                    if is_tls_endpoint_mismatch(&error, endpoint.https_only) {
+                        return Err(OtlpDeliveryFailure::new(
+                            signal,
+                            OtlpDeliveryFailureKind::Tls,
+                            attempts,
+                        ));
+                    }
                     return Err(OtlpDeliveryFailure::new(
                         signal,
                         OtlpDeliveryFailureKind::RetryExhausted(cause),
@@ -792,14 +805,7 @@ fn is_tls_endpoint_mismatch(error: &ureq::Error, https_only: bool) -> bool {
     }
 }
 
-fn retryable_transport(error: &ureq::Error, https_only: bool) -> Option<OtlpRetryCause> {
-    // Decline before the reachability arms below. A reset or an abort during
-    // the handshake is indistinguishable from one on the wire by kind alone,
-    // so without this the retry decision claims a TLS mismatch as a connect
-    // failure and the terminal classification never runs.
-    if is_tls_endpoint_mismatch(error, https_only) {
-        return None;
-    }
+fn retryable_transport(error: &ureq::Error) -> Option<OtlpRetryCause> {
     match error {
         // A deadline that expires before a connection exists is a failure to
         // reach the collector, not a slow one; what separates the two is the
@@ -1020,5 +1026,80 @@ pub(crate) fn admitted_loopback_endpoint(address: SocketAddr) -> AdmittedOtlpEnd
     AdmittedOtlpEndpoint {
         origin,
         https_only: false,
+    }
+}
+
+#[cfg(test)]
+mod classification {
+    use super::{is_tls_endpoint_mismatch, retryable_transport};
+    use std::io::{Error as IoError, ErrorKind};
+
+    fn io(kind: ErrorKind) -> ureq::Error {
+        ureq::Error::Io(IoError::from(kind))
+    }
+
+    /// A reset, an abort, and a half-open socket are the errors a collector
+    /// that is not speaking TLS produces *and* the errors a load balancer
+    /// produces when it drops a healthy connection. Because one predicate
+    /// cannot separate them, both must claim the whole overlap and the retry
+    /// budget must run first — classifying on the first attempt would refuse a
+    /// retry that would have succeeded.
+    #[test]
+    fn the_ambiguous_kinds_are_retryable_and_mismatch_shaped_at_once() {
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::NotConnected,
+        ] {
+            let error = io(kind);
+            assert!(
+                retryable_transport(&error).is_some(),
+                "{kind:?} must spend the retry budget before it is judged"
+            );
+            assert!(
+                is_tls_endpoint_mismatch(&error, true),
+                "{kind:?} must still be classifiable as a mismatch once the budget is spent"
+            );
+        }
+    }
+
+    /// A peer that answers a TLS handshake with plaintext fails the same way on
+    /// every attempt. Retrying it spends a configured budget on a verdict that
+    /// cannot change, so these kinds are classified where they are raised.
+    #[test]
+    fn an_unambiguous_handshake_rejection_is_not_retried() {
+        for kind in [
+            ErrorKind::InvalidData,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::BrokenPipe,
+        ] {
+            let error = io(kind);
+            assert!(
+                retryable_transport(&error).is_none(),
+                "{kind:?} is deterministic; a retry cannot change it"
+            );
+            assert!(
+                is_tls_endpoint_mismatch(&error, true),
+                "{kind:?} on an HTTPS origin is a mismatch"
+            );
+        }
+    }
+
+    /// Mismatch classification is a claim about an HTTPS origin. On a plain
+    /// HTTP origin the same errors are ordinary transport failures, and calling
+    /// them TLS problems would send an operator to inspect a certificate that
+    /// was never involved.
+    #[test]
+    fn a_plain_http_origin_has_no_mismatch_to_report() {
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::InvalidData,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                !is_tls_endpoint_mismatch(&io(kind), false),
+                "{kind:?} against an http:// collector is not a TLS failure"
+            );
+        }
     }
 }

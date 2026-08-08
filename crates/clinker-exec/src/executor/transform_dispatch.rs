@@ -196,6 +196,10 @@ where
         has_distinct,
         payload.max_expansion,
     );
+    // Inside a composition body `name` is body-local: two call sites of one
+    // composition run the same names through the same telemetry producer, so
+    // the exported identity is the call-site path, not the bare name.
+    let logical_node = ctx.qualified_node_name(name);
     let mut signals = LogDispatcher::new(
         ctx.telemetry_producer.clone(),
         &payload.log,
@@ -204,7 +208,7 @@ where
             execution_id: &ctx.stable.pipeline_execution_id,
             batch_id: &ctx.stable.pipeline_batch_id,
             pipeline_name: &ctx.stable.pipeline_name,
-            logical_node: name,
+            logical_node: &logical_node,
         },
     );
     signals.fire_before_transform();

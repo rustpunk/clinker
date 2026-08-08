@@ -183,6 +183,11 @@ pub(crate) struct ProcessResult {
     forced_at: Option<Instant>,
     force_count: usize,
     reaped_at: Instant,
+    /// When both drains had begun reading, as reported by the drain threads.
+    ///
+    /// `None` means at least one never reported, which is itself a failure of
+    /// the property `reaped` asserts.
+    drains_started_at: Option<Instant>,
     drains_joined_at: Instant,
     pub(crate) stdout: ProtocolDrain,
     pub(crate) stderr: DiagnosticDrain,
@@ -230,12 +235,22 @@ impl ProcessResult {
             .map(|(requested, forced)| forced.saturating_duration_since(requested))
     }
 
+    /// Whether both drains were already reading when the child was reaped.
+    ///
+    /// This is the property that keeps `wait` from deadlocking against a full
+    /// pipe, and it is the one worth asserting: comparing the reap instant
+    /// against the join instant would only restate the order those two lines
+    /// appear in, so it could never fail. The drain instants are recorded by
+    /// the drain threads themselves, so a harness that spawned them after the
+    /// wait — or not at all — reports false here.
     pub(crate) fn reaped(&self) -> bool {
-        self.reaped_at <= self.drains_joined_at
+        self.drains_started_at
+            .is_some_and(|started| started <= self.reaped_at)
     }
 
+    /// Whether the drains outlived the reap rather than being waited on first.
     pub(crate) fn drains_joined_after_reap(&self) -> bool {
-        self.drains_joined_at >= self.reaped_at
+        self.reaped() && self.drains_joined_at >= self.reaped_at
     }
 }
 
@@ -251,7 +266,13 @@ pub(crate) fn run_child(mut command: Command, config: ProcessConfig) -> io::Resu
         .take()
         .ok_or_else(|| io::Error::other("child stderr pipe was not created"))?;
 
+    // Each drain reports when it began reading. Both instants are taken on the
+    // drain's own thread, so "the drains were running before the reap" is a
+    // fact about what happened rather than about statement order here.
+    let (drain_started_tx, drain_started_rx) = std::sync::mpsc::channel::<Instant>();
+    let stdout_started = drain_started_tx.clone();
     let stdout_handle = thread::spawn(move || {
+        let _ = stdout_started.send(Instant::now());
         drain_protocol(
             stdout,
             config.stdout_tail_bytes,
@@ -259,7 +280,19 @@ pub(crate) fn run_child(mut command: Command, config: ProcessConfig) -> io::Resu
             config.stdout_mode,
         )
     });
-    let stderr_handle = thread::spawn(move || drain_diagnostics(stderr, config.stderr_tail_bytes));
+    let stderr_handle = thread::spawn(move || {
+        let _ = drain_started_tx.send(Instant::now());
+        drain_diagnostics(stderr, config.stderr_tail_bytes)
+    });
+    let drains_started_at = drain_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .ok()
+        .and_then(|first| {
+            drain_started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .ok()
+                .map(|second| first.max(second))
+        });
 
     let started = Instant::now();
     let hard_deadline = started + config.hard_deadline;
@@ -351,6 +384,7 @@ pub(crate) fn run_child(mut command: Command, config: ProcessConfig) -> io::Resu
     Ok(ProcessResult {
         status,
         timed_out,
+        drains_started_at,
         started_at: started,
         #[cfg(target_os = "linux")]
         graceful_requested_at,

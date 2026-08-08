@@ -569,3 +569,149 @@ nodes:
         );
     }
 }
+
+/// Whether a source splits per record type is decided from the resolved
+/// schemas the plan retains, and that table is built from the top-level
+/// `nodes:` list alone. A body source shares the identity key space with every
+/// other lookup in the walk, so it never reads a top-level entry — and a body
+/// source of its own has no entry to read.
+mod multi_record_schemas_are_a_top_level_table {
+    use super::*;
+
+    /// The declaration a top-level `ref` carries: two record types, one of
+    /// which declares `code` — the column the body's own `ref` declares too.
+    const TOP_LEVEL_MULTI_RECORD: &str = r#"
+pipeline: { name: shadowed_multi_record }
+nodes:
+  - type: source
+    name: ref
+    config:
+      name: ref
+      type: fixed_width
+      path: data/payments.txt
+      schema:
+        discriminator: { start: 0, width: 1 }
+        records:
+          - id: header
+            tag: H
+            columns:
+              - { name: batch_id, type: string, start: 1, width: 9 }
+          - id: detail
+            tag: D
+            columns:
+              - { name: code, type: string, start: 1, width: 4 }
+  - type: transform
+    name: drive
+    input: ref
+    config:
+      cxl: |
+        emit x = 1
+  - type: composition
+    name: enrich
+    input: drive
+    use: ../compositions/own_source.comp.yaml
+    inputs:
+      driver: drive
+  - type: output
+    name: out
+    input: enrich
+    config: { name: out, type: csv, path: out/out.csv }
+"#;
+
+    /// A body source named the same as a top-level multi-record source is a
+    /// plain single-schema CSV. Reading the top-level declaration for it would
+    /// split the body's dataset by record types it does not have and attribute
+    /// its `code` column to `<body dataset>#detail` — a dataset no source in
+    /// the plan declares, and one that would be read as a record type of the
+    /// top-level file.
+    #[test]
+    fn a_body_source_does_not_inherit_a_top_level_declaration() {
+        let lineage = lineage_of(TOP_LEVEL_MULTI_RECORD);
+        let names: Vec<&str> = lineage.inputs.iter().map(|id| id.name.as_str()).collect();
+
+        let body = file_dataset("data/ref.csv");
+        assert!(
+            names.contains(&body.as_str()),
+            "the body source is an input under its own path: {names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with(&body) && *name != body),
+            "the body source declares one flat schema, so it has no record-type \
+             datasets: {names:?}"
+        );
+
+        // The top-level source keeps its own split, so the fix is a key
+        // correction rather than a disabling of the split.
+        let top = file_dataset("data/payments.txt");
+        assert!(
+            names.contains(&format!("{top}#header").as_str())
+                && names.contains(&format!("{top}#detail").as_str()),
+            "the top-level multi-record source still splits: {names:?}"
+        );
+
+        assert_field(
+            &only_output(&lineage).facet.fields,
+            "label",
+            &[direct(&body, "code", TransformationSubtype::Identity)],
+        );
+    }
+
+    /// A multi-record source declared inside a body keeps every column on its
+    /// container dataset. The plan retains no resolved schema for a body node,
+    /// so there is nothing to split by — the builder's documented limitation.
+    /// The columns still land on a dataset the run declares as an input, which
+    /// is what a consumer resolves a column edge against.
+    #[test]
+    fn a_body_multi_record_source_is_attributed_to_its_container() {
+        let lineage = lineage_of(
+            r#"
+pipeline: { name: body_multi_record }
+nodes:
+  - type: source
+    name: drv
+    config:
+      name: drv
+      type: csv
+      path: data/src.csv
+      schema: [{ name: x, type: int }]
+  - type: composition
+    name: enrich
+    input: drv
+    use: ../compositions/own_multi_record.comp.yaml
+    inputs:
+      driver: drv
+  - type: output
+    name: out
+    input: enrich
+    config: { name: out, type: csv, path: out/out.csv }
+"#,
+        );
+
+        let ledger = file_dataset("data/ledger.txt");
+        let names: Vec<&str> = lineage.inputs.iter().map(|id| id.name.as_str()).collect();
+        assert!(
+            names.contains(&ledger.as_str()),
+            "the body source is an input: {names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with(&ledger) && *name != ledger),
+            "no record-type dataset is derived for a body source: {names:?}"
+        );
+
+        let fields = &only_output(&lineage).facet.fields;
+        assert_field(
+            fields,
+            "batch",
+            &[direct(&ledger, "batch_id", TransformationSubtype::Identity)],
+        );
+        assert_field(
+            fields,
+            "total",
+            &[direct(&ledger, "amount", TransformationSubtype::Identity)],
+        );
+    }
+}

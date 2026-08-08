@@ -17,9 +17,9 @@ use std::time::Duration;
 
 use clinker_exec::pipeline::shutdown::ShutdownToken;
 use clinker_exec::telemetry::{
-    LogRecord, MetricKey, MetricPoint, Severity, SpanName, SpanStatus, TelemetryArena,
-    TelemetryArenaError, TelemetryBatch, TelemetryProducer, TelemetryReceiver, TraceSpan,
-    unix_nanos_now,
+    LogRecord, MetricKey, MetricPoint, RunCorrelation, Severity, SpanName, SpanStatus,
+    TelemetryArena, TelemetryArenaError, TelemetryBatch, TelemetryProducer, TelemetryReceiver,
+    TraceSpan, unix_nanos_now,
 };
 use clinker_net::{
     AdmittedOtlpEndpoint, OtlpAuthentication, OtlpDeliveryBudget, OtlpDeliveryBudgetError,
@@ -74,12 +74,13 @@ struct ArenaBounds {
 /// exact allowance rather than the slot bound itself.
 const OTLP_ATTRIBUTE_WRAPPING_BYTES: u64 = 64;
 
-/// Run correlation and the event name become attributes on top of the policy's
-/// per-event allowance.
+/// Run correlation, the event name, and the observation timestamp ride on top
+/// of the policy's per-event allowance.
 const OTLP_ENGINE_ATTRIBUTES: u64 = 8;
 
-/// Envelope nesting, severity text, body wrapper, and the fixed-shape lifecycle
-/// span, whose attributes are bounded independently of the arena.
+/// Envelope nesting, the resource block naming the producing run, severity
+/// text, body wrapper, and the fixed-shape lifecycle span, whose attributes are
+/// bounded independently of the arena.
 const OTLP_ENVELOPE_OVERHEAD_BYTES: u64 = 4 * 1024;
 
 impl ArenaBounds {
@@ -222,9 +223,25 @@ impl OtlpRuntimeBundle {
 #[derive(Default)]
 struct SignalDeliveryReport {
     summary: SignalSummary,
-    last_typed: Option<Result<OtlpDeliveryOutcome, OtlpDeliveryFailure>>,
+    /// The most recent failure, which no later success clears.
+    ///
+    /// Retaining the last *delivery* instead meant a run whose final chunk
+    /// happened to succeed reported nothing, however many chunks before it had
+    /// been rejected. Without `--machine ndjson-v1` the summary is discarded
+    /// entirely, so this line is the only place an operator ever learns that
+    /// telemetry was lost.
+    last_failure: Option<DeliveryFailureCause>,
     #[cfg(debug_assertions)]
     injected_outcome: Option<&'static str>,
+}
+
+/// Why one chunk of a signal was not delivered.
+enum DeliveryFailureCause {
+    /// The transport returned a sanitized typed failure.
+    Transport(OtlpDeliveryFailure),
+    /// The chunk could not be represented as an OTLP request at all, so there
+    /// is no transport outcome to name.
+    Unencodable,
 }
 
 #[derive(Default)]
@@ -243,10 +260,13 @@ impl OtlpDeliveryReport {
         }
     }
 
-    fn record(&mut self, signal: OtlpSignal, result: DeliveryResult) {
+    fn record(&mut self, signal: OtlpSignal, result: DeliveryResult, item_count: u64) {
         let report = self.signal_mut(signal);
         report.summary.accepted = report.summary.accepted.saturating_add(result.accepted());
-        report.summary.rejected = report.summary.rejected.saturating_add(result.rejected());
+        report.summary.rejected = report
+            .summary
+            .rejected
+            .saturating_add(result.rejected(item_count));
         report.summary.attempts = report
             .summary
             .attempts
@@ -258,8 +278,14 @@ impl OtlpDeliveryReport {
         if let Some(outcome) = result.injected_outcome() {
             report.injected_outcome = Some(outcome);
         }
-        if let DeliveryResult::Typed(typed) = result {
-            report.last_typed = Some(typed);
+        match result {
+            DeliveryResult::Typed(Err(error)) => {
+                report.last_failure = Some(DeliveryFailureCause::Transport(error));
+            }
+            DeliveryResult::EncodingFailure => {
+                report.last_failure = Some(DeliveryFailureCause::Unencodable);
+            }
+            _ => {}
         }
     }
 
@@ -278,12 +304,8 @@ impl OtlpDeliveryReport {
             ("metrics", &self.metrics),
             ("traces", &self.traces),
         ] {
-            if let Some(Err(error)) = signal.last_typed.as_ref() {
-                eprintln!(
-                    "clinker: optional OTLP {name} delivery outcome: kind={:?} attempts={}",
-                    error.kind(),
-                    error.attempts()
-                );
+            if let Some(line) = failure_line(name, signal) {
+                eprintln!("{line}");
             }
             #[cfg(debug_assertions)]
             if let Some(outcome) = signal.injected_outcome {
@@ -293,6 +315,25 @@ impl OtlpDeliveryReport {
                 );
             }
         }
+    }
+}
+
+/// The one stderr line an operator gets for a signal that lost chunks.
+///
+/// The count matters as much as the reason: nine rejected chunks out of ten is
+/// not a healthy export, and naming only the most recent failure would read
+/// like an isolated one.
+fn failure_line(name: &str, signal: &SignalDeliveryReport) -> Option<String> {
+    let failures = signal.summary.failures;
+    match signal.last_failure.as_ref()? {
+        DeliveryFailureCause::Transport(error) => Some(format!(
+            "clinker: optional OTLP {name} delivery outcome: kind={:?} attempts={} failures={failures}",
+            error.kind(),
+            error.attempts()
+        )),
+        DeliveryFailureCause::Unencodable => Some(format!(
+            "clinker: optional OTLP {name} delivery outcome: kind=Unencodable failures={failures}"
+        )),
     }
 }
 
@@ -307,6 +348,11 @@ enum DeliveryResult {
         outcome: Option<&'static str>,
     },
     EncodingFailure,
+    /// A test double took the payload; no transport produced an outcome.
+    #[cfg(test)]
+    Recorded {
+        item_count: u64,
+    },
 }
 
 impl DeliveryResult {
@@ -315,16 +361,25 @@ impl DeliveryResult {
             Self::Typed(Ok(outcome)) => outcome.accepted(),
             #[cfg(debug_assertions)]
             Self::Injected { accepted, .. } => *accepted,
+            #[cfg(test)]
+            Self::Recorded { item_count } => *item_count,
             Self::Typed(Err(_)) | Self::EncodingFailure => 0,
         }
     }
 
-    fn rejected(&self) -> u64 {
+    /// A chunk travels whole, so a failed or unencodable one loses every item
+    /// in it. Counting one loss per failed request instead left a supervisor
+    /// reconciling accepted plus rejected against the run's record counts with
+    /// thousands of records unaccounted for, and reading that shortfall as an
+    /// export that had nothing to report.
+    fn rejected(&self, item_count: u64) -> u64 {
         match self {
             Self::Typed(Ok(outcome)) => outcome.rejected(),
-            Self::Typed(Err(_)) | Self::EncodingFailure => 1,
+            Self::Typed(Err(_)) | Self::EncodingFailure => item_count,
             #[cfg(debug_assertions)]
             Self::Injected { rejected, .. } => *rejected,
+            #[cfg(test)]
+            Self::Recorded { .. } => 0,
         }
     }
 
@@ -334,6 +389,8 @@ impl DeliveryResult {
             Self::Typed(Err(error)) => error.attempts(),
             #[cfg(debug_assertions)]
             Self::Injected { attempts, .. } => *attempts,
+            #[cfg(test)]
+            Self::Recorded { .. } => 1,
             Self::EncodingFailure => 0,
         }
     }
@@ -344,6 +401,8 @@ impl DeliveryResult {
             Self::Typed(Ok(_)) => false,
             #[cfg(debug_assertions)]
             Self::Injected { failed, .. } => *failed,
+            #[cfg(test)]
+            Self::Recorded { .. } => false,
         }
     }
 
@@ -351,6 +410,8 @@ impl DeliveryResult {
     fn injected_outcome(&self) -> Option<&'static str> {
         match self {
             Self::Injected { outcome, .. } => *outcome,
+            #[cfg(test)]
+            Self::Recorded { .. } => None,
             Self::Typed(_) | Self::EncodingFailure => None,
         }
     }
@@ -393,6 +454,15 @@ impl OtlpWorker {
             return Err(ObservabilityRuntimeError::Worker);
         }
         let backend = DeliveryBackend::new()?;
+        Self::start_with_backend(bundle, receiver, shutdown, backend)
+    }
+
+    fn start_with_backend(
+        bundle: OtlpRuntimeBundle,
+        receiver: TelemetryReceiver,
+        shutdown: ShutdownToken,
+        backend: DeliveryBackend,
+    ) -> Result<Self, ObservabilityRuntimeError> {
         let mut payload = BoundedPayload::new(bundle.arena.request_capacity_bytes())?;
         let (command, commands) = mpsc::sync_channel(1);
         let (done_sender, done) = mpsc::sync_channel(1);
@@ -413,6 +483,7 @@ impl OtlpWorker {
                     stop: worker_stop,
                     report: OtlpDeliveryReport::default(),
                     progress: worker_progress,
+                    correlation: None,
                     trace_id: new_trace_id(),
                     next_span_id: RUN_SPAN_ID.saturating_add(1),
                     metrics_window_start_unix_nanos: unix_nanos_now(),
@@ -428,6 +499,7 @@ impl OtlpWorker {
                         }
                         Ok(WorkerCommand::Drain) => {
                             state.drain_available();
+                            let _ = done_sender.try_send(state.report);
                             return;
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -500,12 +572,33 @@ impl Drop for OtlpWorker {
         // `finish` takes the handle before returning on its own deadline, so a
         // flush that already timed out is not joined again here: the optional
         // path still cannot extend the authoritative run.
-        if let Some(handle) = self.handle.take() {
-            let _ = self.command.try_send(WorkerCommand::Drain);
+        let Some(handle) = self.handle.take() else {
+            self.stop.store(true, Ordering::Release);
+            return;
+        };
+        // `stop` is the signal every in-flight delivery checks before opening
+        // a connection, so raising it alongside the drain request made each of
+        // those deliveries short-circuit and the drain export nothing at all.
+        // The request is itself the instruction to stop; `stop` is held back
+        // until the worker has either finished or run past the deadline.
+        if self.command.try_send(WorkerCommand::Drain).is_err() {
             self.stop.store(true, Ordering::Release);
             let _ = handle.join();
-        } else {
-            self.stop.store(true, Ordering::Release);
+            return;
+        }
+        match self.done.recv_timeout(self.flush_timeout) {
+            Ok(report) => {
+                let _ = handle.join();
+                report.report_failures();
+            }
+            Err(_) => {
+                self.stop.store(true, Ordering::Release);
+                // Same bound as the flush that timed out: a still-active
+                // transport call remains capped by the admitted retry-total
+                // deadline, and abandoning the handle keeps the optional path
+                // from extending the authoritative run.
+                drop(handle);
+            }
         }
     }
 }
@@ -524,6 +617,15 @@ struct WorkerState<'a> {
     /// shutdown, so without this a parent whose flush deadline expired has no
     /// account of what was delivered and can only invent one.
     progress: Arc<Mutex<ObservabilitySummary>>,
+    /// The run identity every exported envelope names as its producer.
+    ///
+    /// The exporter is handed a receiver, not the run — so the identity
+    /// reaches it on the records themselves. Every record of one run carries
+    /// the same engine-supplied correlation, so the first drained log record
+    /// fixes it for the rest of the run. A run that emits metrics before it
+    /// emits any authored log event exports those metrics under the service
+    /// identity alone.
+    correlation: Option<RunCorrelation<String>>,
     /// One run is one trace; every exported span carries this id.
     trace_id: String,
     next_span_id: u64,
@@ -539,15 +641,27 @@ impl WorkerState<'_> {
     }
 
     fn deliver_batch(&mut self, batch: &TelemetryBatch) {
+        if self.correlation.is_none() {
+            self.correlation = batch
+                .logs()
+                .first()
+                .map(|record| record.correlation.clone());
+        }
+        let correlation = self.correlation.clone();
+        // One drain is one observation instant: these records left the arena
+        // together, whenever each of them was authored.
+        let observed_at = unix_nanos_now().to_string();
         self.deliver_chunks(OtlpSignal::Logs, batch.logs(), |payload, _offset, chunk| {
-            payload.encode(&logs_envelope(chunk))
+            payload.encode(&logs_envelope(chunk, &observed_at, correlation.as_ref()))
         });
         if !batch.metrics().is_empty() {
             let window = self.take_metrics_window();
             self.deliver_chunks(
                 OtlpSignal::Metrics,
                 batch.metrics(),
-                |payload, _offset, chunk| payload.encode(&metrics_envelope(chunk, window)),
+                |payload, _offset, chunk| {
+                    payload.encode(&metrics_envelope(chunk, window, correlation.as_ref()))
+                },
             );
         }
         if !batch.traces().is_empty() {
@@ -559,14 +673,19 @@ impl WorkerState<'_> {
                 |payload, offset, chunk| {
                     let first =
                         first_span_id.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX));
-                    payload.encode(&traces_envelope(chunk, &trace_id, first))
+                    payload.encode(&traces_envelope(
+                        chunk,
+                        &trace_id,
+                        first,
+                        correlation.as_ref(),
+                    ))
                 },
             );
         }
     }
 
     fn deliver_lifecycle(&mut self, snapshot: &RunLifecycleSnapshot) {
-        let envelope = lifecycle_envelope(snapshot, &self.trace_id);
+        let envelope = lifecycle_envelope(snapshot, &self.trace_id, self.correlation.as_ref());
         let encoded = self.payload.encode(&envelope);
         self.deliver_encoded(OtlpSignal::Traces, encoded, 1);
     }
@@ -601,7 +720,7 @@ impl WorkerState<'_> {
             ),
             Err(_) => DeliveryResult::EncodingFailure,
         };
-        self.report.record(signal, result);
+        self.report.record(signal, result, item_count);
         self.publish_progress();
     }
 
@@ -659,6 +778,8 @@ enum DeliveryBackend {
     Network,
     #[cfg(debug_assertions)]
     Injected(InjectedDelivery),
+    #[cfg(test)]
+    Recording(RecordingDelivery),
 }
 
 impl DeliveryBackend {
@@ -680,7 +801,7 @@ impl DeliveryBackend {
         item_count: u64,
         shutdown: &dyn Fn() -> bool,
     ) -> DeliveryResult {
-        #[cfg(not(debug_assertions))]
+        #[cfg(not(any(debug_assertions, test)))]
         let _ = item_count;
         match self {
             Self::Network => DeliveryResult::Typed(send_otlp_json(
@@ -693,7 +814,60 @@ impl DeliveryBackend {
             )),
             #[cfg(debug_assertions)]
             Self::Injected(injected) => injected.deliver(signal, payload, item_count),
+            #[cfg(test)]
+            Self::Recording(recording) => recording.deliver(signal, item_count, shutdown),
         }
+    }
+}
+
+/// Records what the worker handed the transport, and whether the worker would
+/// have abandoned it.
+///
+/// `send_otlp_json` returns before opening a connection when the abandon
+/// predicate holds, so a recorded `abandoned` is a delivery that reached no
+/// collector.
+#[cfg(test)]
+struct RecordingDelivery {
+    deliveries: Arc<Mutex<Vec<RecordedDelivery>>>,
+    started: mpsc::Sender<()>,
+    /// How long the first delivery occupies the worker. It gives a test a
+    /// window in which the worker is demonstrably busy, so telemetry produced
+    /// during it is still buffered when the worker is asked to stop.
+    hold: Duration,
+    held: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecordedDelivery {
+    signal: OtlpSignal,
+    item_count: u64,
+    abandoned: bool,
+}
+
+#[cfg(test)]
+impl RecordingDelivery {
+    fn deliver(
+        &mut self,
+        signal: OtlpSignal,
+        item_count: u64,
+        shutdown: &dyn Fn() -> bool,
+    ) -> DeliveryResult {
+        let recorded = RecordedDelivery {
+            signal,
+            item_count,
+            abandoned: shutdown(),
+        };
+        self.deliveries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(recorded);
+        let _ = self.started.send(());
+        if !self.held {
+            self.held = true;
+            thread::sleep(self.hold);
+        }
+        DeliveryResult::Recorded { item_count }
     }
 }
 
@@ -861,6 +1035,39 @@ impl Write for BoundedWriter<'_> {
     }
 }
 
+/// The producer identity every exported envelope carries.
+///
+/// OTLP identifies whatever produced a signal by its resource, and a collector
+/// given none files everything it receives under one anonymous producer — so
+/// two pipelines reporting to the same collector merged into a single series
+/// with no way to tell which run a point came from.
+#[derive(Serialize)]
+struct Resource<'a> {
+    attributes: Vec<KeyValue<'a>>,
+}
+
+/// The exporting service as a collector sees it. One run is one process of one
+/// engine, so the run correlation rather than the service name is what
+/// separates two pipelines reporting to the same collector.
+const SERVICE_NAME: &str = "clinker";
+
+fn resource(correlation: Option<&RunCorrelation<String>>) -> Resource<'_> {
+    let mut attributes = vec![KeyValue::static_string("service.name", SERVICE_NAME)];
+    if let Some(correlation) = correlation {
+        attributes.extend(correlation_attributes(correlation));
+    }
+    Resource { attributes }
+}
+
+/// Engine-supplied run identity, in the spelling the log records already use.
+fn correlation_attributes(correlation: &RunCorrelation<String>) -> [KeyValue<'_>; 3] {
+    [
+        KeyValue::string("clinker.execution_id", &correlation.execution_id),
+        KeyValue::string("clinker.batch_id", &correlation.batch_id),
+        KeyValue::string("clinker.pipeline_name", &correlation.pipeline_name),
+    ]
+}
+
 #[derive(Serialize)]
 struct LogsEnvelope<'a> {
     #[serde(rename = "resourceLogs")]
@@ -869,6 +1076,7 @@ struct LogsEnvelope<'a> {
 
 #[derive(Serialize)]
 struct ResourceLogs<'a> {
+    resource: Resource<'a>,
     #[serde(rename = "scopeLogs")]
     scope_logs: [ScopeLogs<'a>; 1],
 }
@@ -881,13 +1089,27 @@ struct ScopeLogs<'a> {
 
 #[derive(Serialize)]
 struct OtlpLogRecord<'a> {
+    /// When the exporter drained this record from the arena.
+    ///
+    /// A record carrying no time at all is one a collector stamps with its own
+    /// receive time, which places an authored event after every span it
+    /// actually sits between — the spans alongside it do carry their
+    /// boundaries. `timeUnixNano`, the time the event itself occurred, stays
+    /// absent because the producer does not retain it; a collector reads this
+    /// field in its place.
+    #[serde(rename = "observedTimeUnixNano")]
+    observed_time_unix_nano: &'a str,
     #[serde(rename = "severityText")]
     severity_text: &'static str,
     body: StringValue<'a>,
     attributes: Vec<KeyValue<'a>>,
 }
 
-fn logs_envelope(logs: &[LogRecord]) -> LogsEnvelope<'_> {
+fn logs_envelope<'a>(
+    logs: &'a [LogRecord],
+    observed_at_unix_nanos: &'a str,
+    correlation: Option<&'a RunCorrelation<String>>,
+) -> LogsEnvelope<'a> {
     let log_records = logs
         .iter()
         .map(|record| {
@@ -915,6 +1137,7 @@ fn logs_envelope(logs: &[LogRecord]) -> LogsEnvelope<'_> {
                     .map(|(key, value)| KeyValue::string(key, value)),
             );
             OtlpLogRecord {
+                observed_time_unix_nano: observed_at_unix_nanos,
                 severity_text: severity_name(record.severity),
                 body: StringValue::new(&record.message),
                 attributes,
@@ -923,39 +1146,41 @@ fn logs_envelope(logs: &[LogRecord]) -> LogsEnvelope<'_> {
         .collect();
     LogsEnvelope {
         resource_logs: [ResourceLogs {
+            resource: resource(correlation),
             scope_logs: [ScopeLogs { log_records }],
         }],
     }
 }
 
 #[derive(Serialize)]
-struct MetricsEnvelope {
+struct MetricsEnvelope<'a> {
     #[serde(rename = "resourceMetrics")]
-    resource_metrics: [ResourceMetrics; 1],
+    resource_metrics: [ResourceMetrics<'a>; 1],
 }
 
 #[derive(Serialize)]
-struct ResourceMetrics {
+struct ResourceMetrics<'a> {
+    resource: Resource<'a>,
     #[serde(rename = "scopeMetrics")]
-    scope_metrics: [ScopeMetrics; 1],
+    scope_metrics: [ScopeMetrics<'a>; 1],
 }
 
 #[derive(Serialize)]
-struct ScopeMetrics {
-    metrics: Vec<OtlpMetric>,
+struct ScopeMetrics<'a> {
+    metrics: Vec<OtlpMetric<'a>>,
 }
 
 #[derive(Serialize)]
-struct OtlpMetric {
+struct OtlpMetric<'a> {
     name: &'static str,
     unit: &'static str,
-    sum: Sum,
+    sum: Sum<'a>,
 }
 
 #[derive(Serialize)]
-struct Sum {
+struct Sum<'a> {
     #[serde(rename = "dataPoints")]
-    data_points: [NumberDataPoint; 1],
+    data_points: [NumberDataPoint<'a>; 1],
     #[serde(rename = "aggregationTemporality")]
     aggregation_temporality: u8,
     #[serde(rename = "isMonotonic")]
@@ -963,7 +1188,13 @@ struct Sum {
 }
 
 #[derive(Serialize)]
-struct NumberDataPoint {
+struct NumberDataPoint<'a> {
+    /// The run this point counts, in the same spelling a log record uses.
+    ///
+    /// A backend that keys a series on point attributes alone — resource
+    /// attributes are routinely flattened away in transit — otherwise sums two
+    /// pipelines' counters into one anonymous series.
+    attributes: Vec<KeyValue<'a>>,
     #[serde(rename = "startTimeUnixNano")]
     start_time_unix_nano: String,
     #[serde(rename = "timeUnixNano")]
@@ -987,9 +1218,14 @@ struct MetricsWindow {
 /// backend read the last delta as the absolute total; a monotonic sum with
 /// explicit delta temporality and both required timestamps is what lets a
 /// backend re-derive the run total and any rate over it.
-fn metrics_envelope(metrics: &[MetricPoint], window: MetricsWindow) -> MetricsEnvelope {
+fn metrics_envelope<'a>(
+    metrics: &[MetricPoint],
+    window: MetricsWindow,
+    correlation: Option<&'a RunCorrelation<String>>,
+) -> MetricsEnvelope<'a> {
     MetricsEnvelope {
         resource_metrics: [ResourceMetrics {
+            resource: resource(correlation),
             scope_metrics: [ScopeMetrics {
                 metrics: metrics
                     .iter()
@@ -998,6 +1234,9 @@ fn metrics_envelope(metrics: &[MetricPoint], window: MetricsWindow) -> MetricsEn
                         unit: "1",
                         sum: Sum {
                             data_points: [NumberDataPoint {
+                                attributes: correlation.map_or_else(Vec::new, |correlation| {
+                                    Vec::from(correlation_attributes(correlation))
+                                }),
                                 start_time_unix_nano: window.start.to_string(),
                                 time_unix_nano: window.end.to_string(),
                                 as_int: point.value.to_string(),
@@ -1020,6 +1259,7 @@ struct TracesEnvelope<'a> {
 
 #[derive(Serialize)]
 struct ResourceSpans<'a> {
+    resource: Resource<'a>,
     #[serde(rename = "scopeSpans")]
     scope_spans: [ScopeSpans<'a>; 1],
 }
@@ -1076,9 +1316,11 @@ fn traces_envelope<'a>(
     traces: &'a [TraceSpan],
     trace_id: &'a str,
     first_span_id: u64,
+    correlation: Option<&'a RunCorrelation<String>>,
 ) -> TracesEnvelope<'a> {
     TracesEnvelope {
         resource_spans: [ResourceSpans {
+            resource: resource(correlation),
             scope_spans: [ScopeSpans {
                 spans: traces
                     .iter()
@@ -1112,6 +1354,7 @@ fn traces_envelope<'a>(
 fn lifecycle_envelope<'a>(
     snapshot: &'a RunLifecycleSnapshot,
     trace_id: &'a str,
+    correlation: Option<&'a RunCorrelation<String>>,
 ) -> TracesEnvelope<'a> {
     let start = snapshot.start();
     let terminal = snapshot.terminal();
@@ -1153,6 +1396,7 @@ fn lifecycle_envelope<'a>(
         .max(started_at);
     TracesEnvelope {
         resource_spans: [ResourceSpans {
+            resource: resource(correlation),
             scope_spans: [ScopeSpans {
                 spans: vec![OtlpSpan {
                     trace_id,
@@ -1301,7 +1545,8 @@ fn unix_nanos(timestamp: chrono::DateTime<chrono::Utc>) -> u64 {
 mod tests {
     use std::collections::BTreeMap;
 
-    use clinker_exec::telemetry::RunCorrelation;
+    use clinker_exec::telemetry::LogEvent;
+    use clinker_plan::config::ClinkerToml;
     use serde_json::Value;
 
     use super::*;
@@ -1373,6 +1618,87 @@ mod tests {
             .expect("spans")
     }
 
+    /// Flatten one OTLP `KeyValue` list into the string attributes it carries.
+    fn attributes_of(attributes: &Value) -> BTreeMap<String, String> {
+        attributes
+            .as_array()
+            .expect("attributes")
+            .iter()
+            .map(|entry| {
+                (
+                    entry["key"].as_str().expect("key").to_owned(),
+                    entry["value"]["stringValue"]
+                        .as_str()
+                        .expect("stringValue")
+                        .to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn log_record(message: &str) -> LogRecord {
+        LogRecord {
+            event: "transform.customer_seen".to_owned(),
+            severity: Severity::Info,
+            message: message.to_owned(),
+            correlation: correlation(),
+            fields: BTreeMap::new(),
+        }
+    }
+
+    /// A policy that both reserves an arena and admits a collector endpoint.
+    /// The endpoint never resolves; every test using it substitutes a backend.
+    fn exporting_policy() -> ResolvedObservabilityPolicy {
+        let text = r#"
+[observability]
+arena_bytes = "1024KB"
+ordinary_lane_bytes = "768KB"
+high_severity_lane_bytes = "256KB"
+max_batch_bytes = "8KB"
+max_attributes_per_event = 4
+max_attribute_bytes = "64B"
+drop_policy = "drop-newest"
+sample_every = 1
+rate_limit_per_second = 1000
+rate_limit_burst = 1000
+flush_timeout_ms = 5000
+
+[observability.otlp]
+endpoint = "https://collector.invalid"
+connect_timeout_ms = 100
+request_timeout_ms = 200
+retry_max_attempts = 1
+retry_total_timeout_ms = 500
+max_response_bytes = "1KB"
+
+[observability.otlp.auth]
+mode = "none"
+"#;
+        ClinkerToml::parse(text)
+            .expect("the observability policy parses")
+            .resolve_observability(None)
+            .expect("the observability policy resolves")
+    }
+
+    fn emit_one_log(producer: &TelemetryProducer) {
+        let correlation = correlation();
+        let outcome = producer.emit_log(LogEvent {
+            event: "transform.customer_seen",
+            severity: Severity::Info,
+            message: "customer observed",
+            correlation: RunCorrelation {
+                execution_id: &correlation.execution_id,
+                batch_id: &correlation.batch_id,
+                pipeline_name: &correlation.pipeline_name,
+            },
+            fields: &[],
+        });
+        assert!(
+            outcome.is_accepted(),
+            "the arena admits the fixture: {outcome:?}"
+        );
+    }
+
     fn is_hex(value: &str, width: usize) -> bool {
         value.len() == width && value.bytes().all(|byte| byte.is_ascii_hexdigit())
     }
@@ -1384,7 +1710,7 @@ mod tests {
         assert_ne!(trace_id, "0".repeat(32), "the all-zero trace id is invalid");
 
         let traces = [span("alpha", 10, 20), span("beta", 30, 40)];
-        let envelope = to_value(&traces_envelope(&traces, &trace_id, 2));
+        let envelope = to_value(&traces_envelope(&traces, &trace_id, 2, None));
         let spans = spans_of(&envelope);
         assert_eq!(spans.len(), 2);
 
@@ -1415,7 +1741,7 @@ mod tests {
         // A backwards wall-clock step must not produce a span that ends before
         // it starts, and neither boundary is ever omitted.
         let traces = [span("alpha", 500, 100)];
-        let envelope = to_value(&traces_envelope(&traces, &new_trace_id(), 2));
+        let envelope = to_value(&traces_envelope(&traces, &new_trace_id(), 2, None));
         let exported = &spans_of(&envelope)[0];
         assert_eq!(exported["startTimeUnixNano"], "500");
         assert_eq!(exported["endTimeUnixNano"], "500");
@@ -1437,7 +1763,7 @@ mod tests {
             start: 1_000,
             end: 2_000,
         };
-        let envelope = to_value(&metrics_envelope(&metrics, window));
+        let envelope = to_value(&metrics_envelope(&metrics, window, None));
         let metric = &envelope["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0];
         assert_eq!(metric["name"], "clinker.transform.records");
         assert!(
@@ -1460,11 +1786,15 @@ mod tests {
     fn one_slot_filling_log_record_fits_one_request_but_not_one_arena_slot() {
         let record = slot_filling_log_record(SHIPPED_BOUNDS);
         let batch = std::slice::from_ref(&record);
+        // The largest request this record can produce: the resource block and
+        // the observation timestamp travel with it.
+        let correlation = correlation();
+        let observed_at = "1723065600000000000";
 
         let mut request = BoundedPayload::new(SHIPPED_BOUNDS.request_capacity_bytes())
             .expect("request buffer reserves");
         request
-            .encode(&logs_envelope(batch))
+            .encode(&logs_envelope(batch, observed_at, Some(&correlation)))
             .expect("the per-delivery bound admits one slot-filling record");
         assert!(
             request.bytes().len() > stored_bytes(&record),
@@ -1477,7 +1807,9 @@ mod tests {
         let mut coupled = BoundedPayload::new(SHIPPED_BOUNDS.max_batch_bytes)
             .expect("slot-sized buffer reserves");
         assert!(
-            coupled.encode(&logs_envelope(batch)).is_err(),
+            coupled
+                .encode(&logs_envelope(batch, observed_at, Some(&correlation)))
+                .is_err(),
             "the per-record slot bound is not a per-request bound"
         );
     }
@@ -1487,17 +1819,21 @@ mod tests {
         let records = (0..4)
             .map(|_| slot_filling_log_record(SHIPPED_BOUNDS))
             .collect::<Vec<_>>();
+        let correlation = correlation();
+        let observed_at = "1723065600000000000";
         let mut whole_batch =
             BoundedPayload::new(SHIPPED_BOUNDS.request_capacity_bytes()).expect("buffer reserves");
         assert!(
-            whole_batch.encode(&logs_envelope(&records)).is_err(),
+            whole_batch
+                .encode(&logs_envelope(&records, observed_at, Some(&correlation)))
+                .is_err(),
             "the fixture must be a batch that cannot travel as one request"
         );
 
         let mut payload = BoundedPayload::new(SHIPPED_BOUNDS.request_capacity_bytes())
             .expect("request buffer reserves");
         let encode = |payload: &mut BoundedPayload, _offset: usize, chunk: &[LogRecord]| {
-            payload.encode(&logs_envelope(chunk))
+            payload.encode(&logs_envelope(chunk, observed_at, Some(&correlation)))
         };
 
         let mut delivered = 0;
@@ -1518,28 +1854,11 @@ mod tests {
 
     #[test]
     fn exported_log_records_carry_run_correlation() {
-        let record = LogRecord {
-            event: "transform.customer_seen".to_owned(),
-            severity: Severity::Info,
-            message: "customer observed".to_owned(),
-            correlation: correlation(),
-            fields: BTreeMap::new(),
-        };
-        let envelope = to_value(&logs_envelope(std::slice::from_ref(&record)));
-        let attributes = envelope["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"]
-            .as_array()
-            .expect("attributes")
-            .iter()
-            .map(|entry| {
-                (
-                    entry["key"].as_str().expect("key").to_owned(),
-                    entry["value"]["stringValue"]
-                        .as_str()
-                        .expect("stringValue")
-                        .to_owned(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+        let record = log_record("customer observed");
+        let envelope = to_value(&logs_envelope(std::slice::from_ref(&record), "1", None));
+        let attributes = attributes_of(
+            &envelope["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"],
+        );
         assert_eq!(
             attributes.get("clinker.execution_id").map(String::as_str),
             Some("0198c0de-0000-7000-8000-00000000cafe")
@@ -1551,6 +1870,192 @@ mod tests {
         assert_eq!(
             attributes.get("clinker.pipeline_name").map(String::as_str),
             Some("payments")
+        );
+    }
+
+    #[test]
+    fn exported_log_records_carry_the_time_they_left_the_arena() {
+        let record = log_record("customer observed");
+        let envelope = to_value(&logs_envelope(
+            std::slice::from_ref(&record),
+            "1723065600000000000",
+            None,
+        ));
+        let exported = &envelope["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0];
+        assert_eq!(
+            exported["observedTimeUnixNano"], "1723065600000000000",
+            "a record carrying no time at all is stamped with the collector's \
+             receive time and cannot be ordered against the run's spans"
+        );
+    }
+
+    #[test]
+    fn every_exported_envelope_names_its_producing_run() {
+        let correlation = correlation();
+        let record = log_record("customer observed");
+        let logs = to_value(&logs_envelope(
+            std::slice::from_ref(&record),
+            "1",
+            Some(&correlation),
+        ));
+        let points = [MetricPoint {
+            key: MetricKey::TransformRecords,
+            value: 7,
+        }];
+        let metrics = to_value(&metrics_envelope(
+            &points,
+            MetricsWindow { start: 1, end: 2 },
+            Some(&correlation),
+        ));
+        let traces = [span("alpha", 10, 20)];
+        let traces = to_value(&traces_envelope(
+            &traces,
+            &new_trace_id(),
+            2,
+            Some(&correlation),
+        ));
+
+        for (signal, envelope) in [
+            ("logs", &logs["resourceLogs"][0]["resource"]),
+            ("metrics", &metrics["resourceMetrics"][0]["resource"]),
+            ("traces", &traces["resourceSpans"][0]["resource"]),
+        ] {
+            let attributes = attributes_of(&envelope["attributes"]);
+            assert_eq!(
+                attributes.get("service.name").map(String::as_str),
+                Some("clinker"),
+                "{signal} reaches the collector with no producer identity"
+            );
+            assert_eq!(
+                attributes.get("clinker.pipeline_name").map(String::as_str),
+                Some("payments"),
+                "{signal} cannot be told apart from another pipeline's"
+            );
+        }
+    }
+
+    #[test]
+    fn exported_metric_points_name_the_run_that_produced_them() {
+        let points = [MetricPoint {
+            key: MetricKey::TransformRecords,
+            value: 20_000,
+        }];
+        let correlation = correlation();
+        let envelope = to_value(&metrics_envelope(
+            &points,
+            MetricsWindow {
+                start: 1_000,
+                end: 2_000,
+            },
+            Some(&correlation),
+        ));
+        let point = &envelope["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"]
+            [0];
+        let attributes = attributes_of(&point["attributes"]);
+        assert_eq!(
+            attributes.get("clinker.execution_id").map(String::as_str),
+            Some("0198c0de-0000-7000-8000-00000000cafe")
+        );
+        assert_eq!(
+            attributes.get("clinker.batch_id").map(String::as_str),
+            Some("batch-987654321")
+        );
+        assert_eq!(
+            attributes.get("clinker.pipeline_name").map(String::as_str),
+            Some("payments"),
+            "two pipelines reporting to one collector otherwise share a series"
+        );
+    }
+
+    #[test]
+    fn a_failed_chunk_counts_every_record_it_carried_as_rejected() {
+        let mut report = OtlpDeliveryReport::default();
+        for _ in 0..3 {
+            report.record(OtlpSignal::Logs, DeliveryResult::EncodingFailure, 1_000);
+        }
+
+        assert_eq!(
+            report.logs.summary.rejected, 3_000,
+            "a supervisor reconciles accepted plus rejected against the run's \
+             record counts, so a lost chunk owes every record in it"
+        );
+        assert_eq!(report.logs.summary.accepted, 0);
+        assert_eq!(report.logs.summary.failures, 3, "three requests failed");
+    }
+
+    #[test]
+    fn a_signal_reports_its_losses_even_when_its_last_chunk_succeeded() {
+        let mut report = OtlpDeliveryReport::default();
+        for _ in 0..9 {
+            report.record(OtlpSignal::Logs, DeliveryResult::EncodingFailure, 100);
+        }
+        report.record(
+            OtlpSignal::Logs,
+            DeliveryResult::Recorded { item_count: 100 },
+            100,
+        );
+
+        let line = failure_line("logs", &report.logs)
+            .expect("a chunk that never reached the collector is still reported");
+        assert!(
+            line.contains("failures=9"),
+            "the count separates one unlucky request from a failed export: {line}"
+        );
+        assert!(
+            failure_line("metrics", &report.metrics).is_none(),
+            "a signal that lost nothing reports nothing"
+        );
+    }
+
+    #[test]
+    fn a_dropped_worker_delivers_the_telemetry_it_still_holds() {
+        let policy = exporting_policy();
+        let bundle = OtlpRuntimeBundle::admit(&policy)
+            .expect("the collector endpoint is admissible")
+            .expect("the policy configures a collector");
+        let (producer, receiver) = bundle.reserve_arena(&policy).expect("the arena reserves");
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let (started, delivery_started) = mpsc::channel();
+        let worker = OtlpWorker::start_with_backend(
+            bundle,
+            receiver,
+            ShutdownToken::new(),
+            DeliveryBackend::Recording(RecordingDelivery {
+                deliveries: Arc::clone(&deliveries),
+                started,
+                hold: Duration::from_millis(250),
+                held: false,
+            }),
+        )
+        .expect("the exporter starts");
+
+        emit_one_log(&producer);
+        delivery_started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the exporter delivers the first drained batch");
+
+        // Produced while the exporter is occupied, so it is still buffered when
+        // the run gives up and drops the exporter — which is the telemetry
+        // describing why the run gave up.
+        emit_one_log(&producer);
+        drop(worker);
+
+        let deliveries = deliveries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let delivered = deliveries
+            .iter()
+            .filter(|delivery| delivery.signal == OtlpSignal::Logs)
+            .map(|delivery| delivery.item_count)
+            .sum::<u64>();
+        assert_eq!(
+            delivered, 2,
+            "the drop-time drain exports what the run had buffered: {deliveries:?}"
+        );
+        assert!(
+            deliveries.iter().all(|delivery| !delivery.abandoned),
+            "raising the abandon flag alongside the drain request makes every \
+             delivery return before it opens a connection: {deliveries:?}"
         );
     }
 }

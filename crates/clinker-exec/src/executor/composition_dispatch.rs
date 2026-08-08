@@ -456,6 +456,11 @@ fn execute_composition_body(
         .replace(bound_body.node_input_refs.clone());
 
     ctx.window_runtime.active_stack.push(body_id);
+    // Body node names are body-local; telemetry names them by this call site so
+    // two invocations of one composition stay tellable apart. Pushed with the
+    // window-runtime scope and popped with it below.
+    ctx.composition_call_sites
+        .push(composition_name.to_string());
 
     // Increment depth before recursing. The walk and output harvest execute
     // inside one captured Result; parent-scope restoration below runs before
@@ -555,6 +560,7 @@ fn execute_composition_body(
     }
     ctx.window_arena_consumer_ids = saved_arena_ids;
     ctx.window_runtime.active_stack.pop();
+    ctx.composition_call_sites.pop();
     ctx.window_runtime.remove_body_scope(bound_body.body_scope);
 
     walk_and_harvest

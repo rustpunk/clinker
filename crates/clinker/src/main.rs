@@ -1882,25 +1882,53 @@ struct LiveLineageOutput {
     sink: LiveLineageSink,
     lineage: clinker_lineage::PlanColumnLineage,
     job: clinker_lineage::Job,
+    /// Whether the consumer was told this run began.
+    ///
+    /// The bounded sink can refuse an event, so a START is not guaranteed to
+    /// arrive. A terminal for a run the consumer never saw start describes
+    /// nothing it can attach to, so the pairing is tracked rather than assumed.
+    started: bool,
 }
 
 impl LiveLineageOutput {
     fn emit_start(&mut self, start: &RunLifecycleStartFacts) -> std::io::Result<()> {
         let facts = lineage_start_facts(start);
         let event = clinker_lineage::start_event(&self.lineage, self.job.clone(), &facts);
-        self.emit(event)
+        self.started = self.emit(event)?;
+        Ok(())
     }
 
     fn emit_terminal(&mut self, snapshot: &RunLifecycleSnapshot) -> Result<(), PipelineError> {
+        // Nothing told the consumer this run began, so a terminal would arrive
+        // against a run it has no record of. Refusing to send it keeps the
+        // stream consistent; the refused START is already on stderr.
+        if !self.started {
+            tracing::warn!("lineage terminal withheld: this run's START was never admitted");
+            return Ok(());
+        }
         let facts = lineage_lifecycle_facts(snapshot)?;
         let event = clinker_lineage::terminal_event(&self.lineage, self.job.clone(), &facts);
-        self.emit(event).map_err(PipelineError::Io)
+        self.emit(event).map(|_| ()).map_err(PipelineError::Io)
     }
 
-    fn emit(&mut self, event: clinker_lineage::RunEvent) -> std::io::Result<()> {
+    /// Offer one event to the sink. `Ok(false)` means it was refused.
+    fn emit(&mut self, event: clinker_lineage::RunEvent) -> std::io::Result<bool> {
         match &mut self.sink {
             LiveLineageSink::External(delivery) => {
-                let _ = delivery.try_emit(&event);
+                // Whether the consumer ever sees this event is the admission's
+                // answer, and it was being discarded — so a refused event was
+                // indistinguishable from a delivered one, and the pairing below
+                // could not be maintained. Delivery stays optional: a refusal
+                // is reported, never propagated, because an observation of the
+                // run must not decide the run.
+                let admission = delivery.try_emit(&event);
+                if admission != clinker_lineage::LineageAdmission::Accepted {
+                    tracing::warn!(
+                        admission = ?admission,
+                        "lineage event was refused by the bounded sink"
+                    );
+                    return Ok(false);
+                }
                 #[cfg(debug_assertions)]
                 if std::env::var_os("CLINKER_TEST_LINEAGE_REPEAT").as_deref()
                     == Some(std::ffi::OsStr::new("64"))
@@ -1909,10 +1937,10 @@ impl LiveLineageOutput {
                         let _ = delivery.try_emit(&event);
                     }
                 }
-                Ok(())
+                Ok(true)
             }
             LiveLineageSink::LocalDiagnostic(writer) => {
-                clinker_lineage::write_ndjson(std::slice::from_ref(&event), writer)
+                clinker_lineage::write_ndjson(std::slice::from_ref(&event), writer).map(|()| true)
             }
         }
     }
@@ -2122,7 +2150,7 @@ fn lineage_lifecycle_facts(
             failure: failure.clone(),
         },
     };
-    let counts = terminal.counts();
+    let counts = terminal.measured_counts();
     Ok(clinker_lineage::RunLifecycleFacts {
         start: lineage_start_facts(snapshot.start()),
         terminal: clinker_lineage::RunLifecycleTerminalFacts {
@@ -2130,7 +2158,7 @@ fn lineage_lifecycle_facts(
                 .finished_at()
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             outcome,
-            stats: Some(clinker_lineage::RunStats {
+            stats: counts.map(|counts| clinker_lineage::RunStats {
                 records_read: counts.records_read,
                 records_written: counts.records_written,
                 records_dlq: counts.records_dlq,
@@ -2844,14 +2872,12 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             .record_terminal(
                 started_at,
                 RunTerminalOutcome::Complete,
-                RunCountFacts::default(),
+                // A plan-only export runs nothing, so there are no counts to
+                // report and zeros would claim it ran and read nothing.
+                None,
             )
             .map_err(lifecycle_error)?;
-        let mut lifecycle_snapshot = lineage_lifecycle_facts(&lifecycle.snapshot())?;
-        // A plan-only export executes nothing, so it has no counts to report.
-        // Reporting zeros would tell a catalogue this pipeline ran and read
-        // nothing, which no consumer can tell apart from a real empty run.
-        lifecycle_snapshot.terminal.stats = None;
+        let lifecycle_snapshot = lineage_lifecycle_facts(&lifecycle.snapshot())?;
         let events = clinker_lineage::run_events(&lineage, job, &lifecycle_snapshot);
 
         let configuration = lineage_configuration
@@ -3091,7 +3117,12 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 )
                 .map_err(lineage_worker_start_error)?,
             );
-            lineage_output = Some(LiveLineageOutput { sink, lineage, job });
+            lineage_output = Some(LiveLineageOutput {
+                sink,
+                lineage,
+                job,
+                started: false,
+            });
         }
     }
 
@@ -3581,7 +3612,12 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             })?)
         };
         let sink = LiveLineageSink::LocalDiagnostic(writer);
-        lineage_output = Some(LiveLineageOutput { sink, lineage, job });
+        lineage_output = Some(LiveLineageOutput {
+            sink,
+            lineage,
+            job,
+            started: false,
+        });
     }
 
     // One CLI-owned fact source starts immediately before the finite executor.
@@ -3600,9 +3636,16 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             .record_terminal(
                 chrono::Utc::now(),
                 RunTerminalOutcome::Fail(classify_pipeline_error(&error)),
-                RunCountFacts::default(),
+                // The run never began, so nothing observed a record.
+                None,
             )
             .map_err(lifecycle_error)?;
+        // The terminal exists now, so close the exporter out through it rather
+        // than dropping the worker. This is the only path that emits the run's
+        // root span and attaches the delivery summary to the machine terminal,
+        // and a run that failed here has telemetry describing why.
+        finish_otlp_delivery(&mut otlp_worker, &run_lifecycle, machine);
+        finish_live_lineage(&mut lineage_output);
         return Err(error);
     }
 
@@ -3662,7 +3705,11 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                     // one signal must not produce two different lineage
                     // terminals depending on which source observed it.
                     run_terminal_outcome(&terminal_error),
-                    RunCountFacts::default(),
+                    // Execution returned an error rather than a report, so no
+                    // counts were observed. Reporting zeros here told a
+                    // catalogue that a run which failed at four million records
+                    // had read none of them.
+                    None,
                 )
                 .map_err(lifecycle_error)?;
             if let Some(output) = lineage_output.as_mut()
@@ -3814,11 +3861,11 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             .record_terminal(
                 chrono::Utc::now(),
                 RunTerminalOutcome::Fail(classify_pipeline_error(&terminal_error)),
-                RunCountFacts {
+                Some(RunCountFacts {
                     records_read: counters.total_count,
                     records_written: counters.records_written,
                     records_dlq: counters.dlq_count,
-                },
+                }),
             )
             .map_err(lifecycle_error)?;
         if let Some(output) = lineage_output.as_mut()
@@ -3843,11 +3890,11 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 .record_terminal(
                     chrono::Utc::now(),
                     RunTerminalOutcome::Fail(classify_pipeline_error(&error)),
-                    RunCountFacts {
+                    Some(RunCountFacts {
                         records_read: counters.total_count,
                         records_written: counters.records_written,
                         records_dlq: counters.dlq_count,
-                    },
+                    }),
                 )
                 .map_err(lifecycle_error)?;
             if let Some(output) = lineage_output.as_mut()
@@ -3994,11 +4041,11 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         .record_terminal(
             chrono::Utc::now(),
             lifecycle_outcome,
-            RunCountFacts {
+            Some(RunCountFacts {
                 records_read: counters.total_count,
                 records_written: counters.records_written,
                 records_dlq: counters.dlq_count,
-            },
+            }),
         )
         .map_err(lifecycle_error)?;
     finish_otlp_delivery(&mut otlp_worker, &run_lifecycle, machine);

@@ -58,7 +58,12 @@ pub(crate) enum RunTerminalOutcome {
 pub(crate) struct RunLifecycleTerminalFacts {
     finished_at: DateTime<Utc>,
     outcome: RunTerminalOutcome,
-    counts: RunCountFacts,
+    /// Counts an execution observed, or `None` when it produced none.
+    ///
+    /// A run that failed before returning a report has no counts, and zeros
+    /// are not a stand-in for that: a consumer cannot tell them from a run
+    /// that genuinely read nothing.
+    counts: Option<RunCountFacts>,
     duration_ms: i64,
 }
 
@@ -112,7 +117,7 @@ impl RunLifecycleFacts {
         &self,
         finished_at: DateTime<Utc>,
         outcome: RunTerminalOutcome,
-        counts: RunCountFacts,
+        counts: Option<RunCountFacts>,
     ) -> Result<(), LifecycleFactsError> {
         let duration_ms = (finished_at - self.start.started_at)
             .num_milliseconds()
@@ -181,7 +186,16 @@ impl RunLifecycleTerminalFacts {
         &self.outcome
     }
 
-    pub(crate) const fn counts(&self) -> RunCountFacts {
+    /// The counts an execution observed, or zeros when it produced none.
+    ///
+    /// Prefer [`Self::measured_counts`] anywhere the difference matters; this
+    /// exists for callers that need a number and treat absent as empty.
+    pub(crate) fn counts(&self) -> RunCountFacts {
+        self.counts.unwrap_or_default()
+    }
+
+    /// The counts an execution observed, or `None` when it produced none.
+    pub(crate) const fn measured_counts(&self) -> Option<RunCountFacts> {
         self.counts
     }
 
@@ -262,13 +276,17 @@ mod tests {
             .record_terminal(
                 start,
                 RunTerminalOutcome::Complete,
-                RunCountFacts::default(),
+                Some(RunCountFacts::default()),
             )
             .expect("first terminal");
         assert_eq!(start_snapshot.batch_id(), "batch");
         assert!(facts.snapshot().terminal().is_some());
         assert_eq!(
-            facts.record_terminal(start, RunTerminalOutcome::Abort, RunCountFacts::default(),),
+            facts.record_terminal(
+                start,
+                RunTerminalOutcome::Abort,
+                Some(RunCountFacts::default()),
+            ),
             Err(LifecycleFactsError::TerminalAlreadyRecorded)
         );
     }

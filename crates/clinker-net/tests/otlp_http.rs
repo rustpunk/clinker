@@ -704,4 +704,5 @@ fn logs_metrics_traces_and_fault_matrix() {
     .expect_err("plaintext collector on HTTPS origin must be a TLS failure");
     handle.join().expect("join TLS fixture");
     assert_eq!(failure.kind(), OtlpDeliveryFailureKind::Tls);
+    assert_eq!(failure.attempts(), 1);
 }

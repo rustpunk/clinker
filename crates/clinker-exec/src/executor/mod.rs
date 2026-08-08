@@ -1396,6 +1396,7 @@ impl PipelineExecutor {
             collector,
             recursion_depth: 0,
             current_body_node_input_refs: None,
+            composition_call_sites: Vec::new(),
             spill_root,
             spill_root_path,
             window_runtime,

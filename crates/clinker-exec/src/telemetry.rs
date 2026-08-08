@@ -155,7 +155,9 @@ pub enum SpanStatus {
 pub struct SpanFact<'a> {
     pub name: SpanName,
     pub status: SpanStatus,
-    /// The authored pipeline node this span covers, verbatim. Configuration
+    /// The authored pipeline node this span covers, verbatim — prefixed with
+    /// the composition call sites it sits under when it is a body node, since a
+    /// body name identifies a node only within its own scope. Configuration
     /// applies no grammar to a node name, so neither does this: the name is
     /// carried whole under a fixed identity ceiling and nothing else.
     pub logical_node: &'a str,
@@ -930,11 +932,13 @@ const TRUNCATION_MARKER: &str = "…";
 
 /// Return `value` under `max_bytes`, marked when the cap forced it short.
 ///
-/// The marker is charged against the same cap, so the result never exceeds
-/// `max_bytes` and the fixed arena budget is unchanged. `max_attribute_bytes`
-/// admits values below the marker's own width; at those settings the result is
-/// whatever fits of the marker alone, never a bare data prefix that would read
-/// as complete.
+/// The marker is charged against the same cap, so a value that fits is returned
+/// whole and a marked result stays within `max_bytes` at every cap wide enough
+/// to hold the marker. `max_attribute_bytes` also admits caps below the marker's
+/// own width; there the marker alone is the result and it is the one case that
+/// exceeds the cap, by at most two bytes. Nothing sizes the arena from this cap
+/// — the lanes are reserved from `arena_bytes` and each event is bounded by
+/// `max_batch_bytes` — so the fixed budget is unchanged either way.
 pub(crate) fn bounded_utf8(value: &str, max_bytes: usize) -> Cow<'_, str> {
     if value.len() <= max_bytes {
         return Cow::Borrowed(value);
@@ -951,12 +955,18 @@ pub(crate) fn bounded_identity(value: &str) -> Cow<'_, str> {
 ///
 /// `value` may already sit at the cap, so the head is re-cut rather than
 /// assumed short enough.
+///
+/// The marker is emitted whole even at a cap too narrow to hold it. Cutting it
+/// to fit produces nothing at all — the marker is one three-byte character, and
+/// its first two bytes are not a character — so the alternative is an exported
+/// empty string, which a consumer cannot tell from a field that genuinely holds
+/// one. A whole marker at a one- or two-byte cap overshoots by at most two
+/// bytes and stays legible as what it is.
 fn mark_truncated(value: &str, max_bytes: usize) -> String {
     let head = truncate_utf8(value, max_bytes.saturating_sub(TRUNCATION_MARKER.len()));
-    let marker = truncate_utf8(TRUNCATION_MARKER, max_bytes);
-    let mut marked = String::with_capacity(head.len() + marker.len());
+    let mut marked = String::with_capacity(head.len() + TRUNCATION_MARKER.len());
     marked.push_str(head);
-    marked.push_str(marker);
+    marked.push_str(TRUNCATION_MARKER);
     marked
 }
 
@@ -1532,21 +1542,53 @@ replacement = "{replacement}"
     }
 
     /// `max_attribute_bytes` accepts any nonzero size, including caps narrower
-    /// than the marker. Those export only what fits of the marker, never a data
-    /// prefix a consumer would read as the whole value.
+    /// than the marker. Those export the marker alone: no data prefix a consumer
+    /// would read as the whole value, and nothing empty either — an empty export
+    /// is exactly what a field holding the empty string produces.
     #[test]
-    fn cap_narrower_than_the_marker_exports_no_data_prefix() {
+    fn cap_narrower_than_the_marker_exports_the_marker_alone() {
         for cap in 0..TRUNCATION_MARKER.len() {
             let bounded = bounded_utf8("123456789", cap);
-            assert!(
-                bounded.len() <= cap,
-                "cap {cap} produced {} bytes: {bounded:?}",
-                bounded.len()
+            assert_eq!(
+                bounded, TRUNCATION_MARKER,
+                "cap {cap} must export the whole marker and nothing else"
             );
-            assert!(
-                !bounded.chars().any(char::is_numeric),
-                "cap {cap} leaked a data prefix: {bounded:?}"
-            );
+        }
+    }
+
+    /// The end-to-end reading of the case above, across the caps either side of
+    /// the marker's own width. Every one of these is a policy a deployment can
+    /// write, and at every one of them a cut value has to stay legible as cut.
+    #[test]
+    fn attribute_at_every_cap_around_the_marker_width_is_marked() {
+        for (cap, expected) in [("1B", "…"), ("2B", "…"), ("3B", "…"), ("4B", "1…")] {
+            let exported =
+                exported_attribute(cap, "amount", SignalField::new("amount", "123456789"));
+            assert_eq!(exported, expected, "cap {cap}");
+        }
+    }
+
+    /// The typed record path renders incrementally into its own bounded writer,
+    /// so it reaches the same narrow caps by a different route.
+    #[test]
+    fn typed_record_value_at_every_cap_around_the_marker_width_is_marked() {
+        let value = Value::Integer(123_456_789);
+        for (cap, expected) in [("1B", "…"), ("2B", "…"), ("3B", "…"), ("4B", "1…")] {
+            let exported =
+                exported_attribute(cap, "amount", SignalField::from_record("amount", &value));
+            assert_eq!(exported, expected, "cap {cap}");
+        }
+    }
+
+    /// The other half of the distinction: a field that genuinely holds the empty
+    /// string is already under every cap, so it exports whole and unmarked.
+    /// Without this the marking tests would pass on an exporter that emitted the
+    /// marker for everything.
+    #[test]
+    fn genuinely_empty_attribute_is_exported_unmarked_at_every_narrow_cap() {
+        for cap in ["1B", "2B", "3B", "4B"] {
+            let exported = exported_attribute(cap, "amount", SignalField::new("amount", ""));
+            assert_eq!(exported, "", "cap {cap}");
         }
     }
 

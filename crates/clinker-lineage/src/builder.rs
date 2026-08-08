@@ -71,6 +71,12 @@
 //!   in a Reshape rule — the planner rejects those outright (`bind_reshape`'s E200
 //!   guard, because Reshape re-runs its rules after a spill that drops envelope
 //!   context), so no Reshape envelope read ever reaches this builder.
+//! - A multi-record source **declared inside a composition body** is attributed
+//!   to its container dataset rather than split per record type. The split reads
+//!   the record types off [`CompiledPlan::bound_schemas`], which is built from
+//!   the top-level `nodes:` list; a body node's resolved `SourceSchema` is not
+//!   retained on the compiled plan, so there is nothing to split by. Top-level
+//!   multi-record sources are unaffected.
 //! - A `match: collect` combine (no projection body) is resolved coarsely.
 //! - INDIRECT influence covers the predicate / grouping / sort surfaces above (for
 //!   record columns, plus `$doc` terms in the Route / Cull / Combine predicates);
@@ -364,7 +370,17 @@ fn walk_scope(
                     // with its own columns, in one physical container. Differing
                     // column sets make them distinct logical datasets rather
                     // than subsets of `base`.
-                    match ctx.compiled.bound_schemas().get(node.name()) {
+                    //
+                    // Keyed by the qualified name, like every identity lookup in
+                    // this walk. `bound_schemas` is built from the top-level
+                    // `nodes:` list alone, so a bare name would hand a body
+                    // source the schema of a same-named top-level one and split
+                    // it by record types that are not its own — naming datasets
+                    // no source in the plan declares. A body-declared source
+                    // misses instead and takes the flat arm, which is also why
+                    // its own record types are not split (see the module's
+                    // documented limitations).
+                    match ctx.compiled.bound_schemas().get(node_key.as_ref()) {
                         Some(SourceSchema::MultiRecord { record_types, .. }) => {
                             seed_multi_record_source(
                                 node,

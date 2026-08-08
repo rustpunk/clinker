@@ -1,0 +1,39 @@
+# A body that declares its own multi-record source. The record types live in
+# the body file, which the compiled plan does not retain a resolved schema for,
+# so lineage has nothing to split the container by — see the builder's
+# documented limitations.
+_compose:
+  name: own_multi_record
+  inputs:
+    driver:
+      schema:
+        - { name: x, type: int }
+  outputs:
+    out: shape
+  config_schema: {}
+
+nodes:
+  - type: source
+    name: ledger
+    config:
+      name: ledger
+      type: fixed_width
+      path: data/ledger.txt
+      schema:
+        discriminator: { start: 0, width: 1 }
+        records:
+          - id: header
+            tag: H
+            columns:
+              - { name: batch_id, type: string, start: 1, width: 9 }
+          - id: detail
+            tag: D
+            columns:
+              - { name: amount, type: int, start: 1, width: 4 }
+  - type: transform
+    name: shape
+    input: ledger
+    config:
+      cxl: |
+        emit batch = batch_id
+        emit total = amount
