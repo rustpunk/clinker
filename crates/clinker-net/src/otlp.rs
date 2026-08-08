@@ -779,41 +779,47 @@ fn retryable_status(status: u16) -> Option<OtlpRetryCause> {
     }
 }
 
-/// Whether `error` is the signature of a peer that answered an origin
-/// requiring TLS without speaking it.
+/// Whether `error` says the peer on an origin requiring TLS did not speak it.
 ///
-/// Which kind that produces is a property of the host, not of the cause: the
-/// same plaintext reply to the same handshake arrives as invalid data or
-/// end-of-stream on the Unix hosts and as a reset on Windows. Naming only the
-/// Unix spellings would report the most common real misconfiguration —
-/// an `https://` endpoint pointed at a plaintext collector — as an ordinary
-/// transient on one platform and as TLS on another, for one deployment error.
+/// Decided by how far the exchange got, not by which error kind the host chose
+/// to describe it. The same plaintext reply to the same handshake arrives as
+/// invalid data on Linux, a reset on Windows, and something else again on
+/// macOS; enumerating those spellings reported one deployment error three
+/// different ways and needed a new arm for every host. What every spelling has
+/// in common is that the peer was reached and the exchange then failed, which
+/// on an `https://` origin is the mismatch signature.
 ///
-/// A connection dropped repeatedly in front of a healthy collector produces
-/// the same set, and no predicate over error kinds can separate the two. What
+/// So this excludes only the failures that describe never getting to the peer
+/// — refused, unresolved, or a deadline that expired before a connection
+/// existed — and treats the rest as the mismatch.
+///
+/// A connection dropped repeatedly in front of a healthy collector looks
+/// identical, and no predicate over error kinds separates the two. What
 /// narrows it is the retry budget rather than the kind, so this is consulted
 /// only once a failure has survived every attempt; a drop that recovers never
 /// reaches it. Both causes carry the same registered classification and the
 /// same retry advice, so the choice names the more likely one for a human
 /// without changing what a supervisor does.
-///
-/// Reachability failures — refused, unresolved, or a deadline that expired
-/// before a connection existed — are deliberately absent: those describe
-/// getting to the peer rather than what the peer turned out to be.
 fn is_tls_endpoint_mismatch(error: &ureq::Error, https_only: bool) -> bool {
     if !https_only {
         return false;
     }
+    !is_reachability_failure(error)
+}
+
+/// Whether `error` describes never having reached the peer.
+///
+/// Refused, unresolved, and a deadline that expired before a connection
+/// existed say nothing about what the peer turned out to be.
+fn is_reachability_failure(error: &ureq::Error) -> bool {
     match error {
-        ureq::Error::Protocol(_) => true,
+        ureq::Error::HostNotFound
+        | ureq::Error::ConnectionFailed
+        | ureq::Error::ConnectProxyFailed(_) => true,
+        ureq::Error::Timeout(ureq::Timeout::Connect | ureq::Timeout::Resolve) => true,
         ureq::Error::Io(io) => matches!(
             io.kind(),
-            std::io::ErrorKind::InvalidData
-                | std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::NotConnected
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
         ),
         _ => false,
     }

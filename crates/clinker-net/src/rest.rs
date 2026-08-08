@@ -493,7 +493,18 @@ impl RestRecordSource {
                 };
                 return Ok(PageResponse { body, next_link });
             };
-            if self.shutdown.as_ref().is_some_and(|t| t.is_requested()) {
+            // A cancellation tears down the request we are inside, and the
+            // transport reports that teardown as the failure. Reporting it as
+            // an outage would page an on-call for an operator action.
+            //
+            // A status, though, means the peer answered: that verdict was
+            // reached before any signal arrived and stands on its own. Keying
+            // this on the retry budget instead reported a collector that had
+            // failed every attempt as a clean cancellation whenever a signal
+            // happened to be pending, and left the outage in no terminal.
+            if retry_failure.is_cancellable_transport()
+                && self.shutdown.as_ref().is_some_and(|t| t.is_requested())
+            {
                 return Err(FormatError::Interrupted);
             }
             if attempt < self.cfg.retries {
@@ -524,6 +535,23 @@ enum RequestFailure {
 }
 
 impl RequestFailure {
+    /// Whether a pending shutdown explains this failure.
+    ///
+    /// True only where the peer never answered, which is what tearing down a
+    /// request in flight produces. A status means the exchange completed and
+    /// the peer rejected it, and that verdict is independent of any signal
+    /// that arrives afterwards.
+    const fn is_cancellable_transport(self) -> bool {
+        matches!(
+            self,
+            Self::Timeout
+                | Self::Connection
+                | Self::ProxyConnection
+                | Self::Transport
+                | Self::Io(_)
+        )
+    }
+
     const fn classification_code(self) -> &'static str {
         match self {
             Self::HttpStatus(400..=499) => "rest.http.client_error",
