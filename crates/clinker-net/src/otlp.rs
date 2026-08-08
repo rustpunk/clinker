@@ -617,18 +617,20 @@ pub fn send_otlp_json(
                         // merely unknown. Report the unreadable reply and stop.
                         Err(error) => return Err(map_body_error(signal, attempts, &error)),
                     };
-                    // A reply this transport cannot parse is the same situation
-                    // as one it cannot read: the 200 already said the collector
-                    // holds the batch. Only the confirmation is missing, so the
-                    // records are still accounted as delivered.
+                    // Deliberately not marked as having reached the collector,
+                    // unlike a reply that could not be read at all. There the
+                    // 200 is all the information there is; here the collector
+                    // sent more and this parser could not read it — and what it
+                    // sends is where a partial success reports the records it
+                    // rejected. Claiming full delivery would hide a loss the
+                    // collector had just declared, and understating delivery is
+                    // the safe direction for this number to be wrong in.
                     let rejected = parse_response(signal, &body, item_count).ok_or_else(|| {
-                        let mut failure = OtlpDeliveryFailure::new(
+                        OtlpDeliveryFailure::new(
                             signal,
                             OtlpDeliveryFailureKind::MalformedResponse,
                             attempts,
-                        );
-                        failure.reached_collector = true;
-                        failure
+                        )
                     })?;
                     return Ok(OtlpDeliveryOutcome {
                         signal,

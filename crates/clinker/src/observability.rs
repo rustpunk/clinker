@@ -132,7 +132,7 @@ impl fmt::Display for ObservabilityRuntimeError {
         match self {
             Self::Endpoint(error) => error.fmt(formatter),
             Self::CredentialUnresolved => formatter.write_str(
-                "observability.otlp.auth.reference is unresolved for this run. Correction: provision the logical reference through the Phase 4 credential provider before starting the run",
+                "observability.otlp.auth.reference is unresolved for this run. Correction: provision the referenced credential before starting the run, or set observability.otlp.auth.mode = \"none\" to export without authentication",
             ),
             Self::Budget(error) => error.fmt(formatter),
             Self::Arena(_) => formatter.write_str(

@@ -1772,6 +1772,32 @@ fn lineage_worker_start_error(_error: std::io::Error) -> PipelineError {
 /// How many dropped events a diagnostic names before it summarizes the rest.
 const LINEAGE_EXPORT_REPORTED_DROPS: usize = 4;
 
+/// Remove a lineage destination this run left empty.
+///
+/// The file is emptied once the exporter starts, so an export that then wrote
+/// nothing leaves a zero-byte file behind — and a publish step that runs on
+/// failure, or one that globs the artifact directory, uploads it as though it
+/// were the export. Absent is unambiguous where empty is not.
+///
+/// A removal that fails is reported rather than swallowed: the artifact this
+/// exists to prevent is still on disk, and saying so is the only thing that
+/// stops it being published as a result.
+fn remove_empty_lineage_export(path: &std::path::Path) -> Option<PipelineError> {
+    if path.as_os_str() == std::ffi::OsStr::new("-") {
+        return None;
+    }
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() == 0 => match std::fs::remove_file(path) {
+            Ok(()) => None,
+            Err(error) => Some(observability_delivery_error(format!(
+                "--lineage output {} is empty and could not be removed: {error}. Correction: delete it before publishing this run's artifacts, so an empty file is not read as its lineage export",
+                path.display()
+            ))),
+        },
+        Ok(_) | Err(_) => None,
+    }
+}
+
 fn lineage_destination(path: &std::path::Path) -> String {
     if path.as_os_str() == std::ffi::OsStr::new("-") {
         "standard output".to_owned()
@@ -1813,15 +1839,13 @@ fn lineage_export_failure(
     outcome: clinker_lineage::LineageDeliveryOutcome,
 ) -> Option<PipelineError> {
     let destination = lineage_destination(path);
-    // Before any verdict below returns. The destination was emptied once the
-    // exporter was running, so an export that then delivered nothing leaves a
-    // zero-byte file, and a step that runs on failure or globs the artifact
-    // directory uploads it as though it were the export. Absent is
-    // unambiguous where empty is not — and a failed export is exactly where an
-    // empty file is most likely.
-    if outcome.accepted() == 0 && path.as_os_str() != std::ffi::OsStr::new("-") {
-        let _ = std::fs::remove_file(path);
-    }
+    // Before any verdict below returns, and decided by the file rather than by
+    // the queue. `accepted` counts events admitted for export, which a write
+    // that then failed still counts — so keying on it left the zero-byte file
+    // on exactly the write, flush, and deadline verdicts this exists to cover.
+    // What matters is whether anything reached the destination, and only the
+    // destination knows that.
+    let removal = remove_empty_lineage_export(path);
     match outcome.terminal() {
         // Whether the same invocation could ever succeed is what separates
         // these, and the diagnostic has to say the same thing its retry advice
@@ -1859,6 +1883,9 @@ fn lineage_export_failure(
             )));
         }
         clinker_lineage::LineageDeliveryTerminal::Shutdown => {}
+    }
+    if let Some(error) = removal {
+        return Some(error);
     }
     if rejected.is_empty() {
         return None;
@@ -2254,23 +2281,42 @@ fn truncate_lineage_destination(
     if path.as_os_str() == std::ffi::OsStr::new("-") {
         return Ok(());
     }
-    std::fs::File::create(path).map(|_| ()).map_err(|e| {
-        let detail = format!("cannot open {flag} output {}: {e}", path.display());
+    std::fs::File::create(path)
+        .map(|_| ())
+        .map_err(|e| lineage_open_error(flag, path, &e))
+}
+
+/// Classify a destination this run could not open.
+///
+/// Every site that opens a lineage destination reports through here, so one
+/// operator-visible condition cannot produce two exit classes depending on
+/// which identity mode or which flag reached it first.
+fn lineage_open_error(
+    flag: &'static str,
+    path: &std::path::Path,
+    error: &std::io::Error,
+) -> PipelineError {
+    let detail = format!("cannot open {flag} output {}: {error}", path.display());
+    {
         // The same split the write path uses: a destination the process may
         // never write refuses every identical retry and is a configuration
         // failure, while a full volume or a momentarily unavailable mount is
         // one a supervisor should try again. Classifying every open failure as
         // configuration would tell it to give up on both.
-        if is_permanent_sink_refusal(e.kind()) {
-            PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+        if is_permanent_sink_refusal(error.kind()) {
+            // Through the helper, not a bare validation error: the leading code
+            // is what `classify_pipeline_error` matches to report this as an
+            // observability problem rather than an invalid pipeline, which is
+            // what decides whose queue the alert lands in.
+            observability_configuration_error(format!(
                 "{detail}. Correction: point {flag} at a writable destination"
-            )))
+            ))
         } else {
             observability_delivery_error(format!(
                 "{detail}. Correction: re-run the export; if it recurs, point {flag} at a different destination"
             ))
         }
-    })
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -3153,12 +3199,10 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
                 Box::new(std::io::stdout().lock())
             } else {
-                Box::new(std::fs::File::create(path).map_err(|e| {
-                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                        "cannot open --lineage output {}: {e}",
-                        path.display()
-                    )))
-                })?)
+                Box::new(
+                    std::fs::File::create(path)
+                        .map_err(|e| lineage_open_error("--lineage", path, &e))?,
+                )
             };
             clinker_lineage::write_ndjson(&events, writer).map_err(PipelineError::Io)?;
         }
@@ -3410,12 +3454,10 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 // leaves a file whose COMPLETE terminal belongs to a different
                 // run — which a catalogue reads as this one having succeeded.
                 // An empty file cannot be misread that way.
-                Box::new(std::fs::File::create(path).map_err(|e| {
-                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                        "cannot open --lineage-events output {}: {e}",
-                        path.display()
-                    )))
-                })?)
+                Box::new(
+                    std::fs::File::create(path)
+                        .map_err(|e| lineage_open_error("--lineage-events", path, &e))?,
+                )
             };
             lineage_output = Some(LiveLineageOutput {
                 sink: LiveLineageSink::LocalDiagnostic(writer),

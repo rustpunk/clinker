@@ -64,8 +64,12 @@ Current normal dependencies are intentional: `clinker-plan`, `clinker-record`,
   the CLI edge. Route any proposal to invert this through architecture review.
 - No HTTP/network transport dependencies: live emission over HTTP is a
   separate, deferred layer. The current transport is the NDJSON file writer.
-- No clock or randomness: the crate holds no clock by design — the CLI
-  supplies every timestamp. Do not add `chrono::Utc::now()`-style calls.
+- No randomness, and no clock in event assembly: the CLI supplies every
+  timestamp that appears in an event. Do not add `chrono::Utc::now()`-style
+  calls to the emit path.
+- The bounded delivery worker is the one exception, and only for its own
+  deadlines: it reads `Instant::now()` to enforce the configured flush timeout.
+  That clock never reaches an event field.
 
 ## Important invariants
 
