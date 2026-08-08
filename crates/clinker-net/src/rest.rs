@@ -587,10 +587,13 @@ impl RequestFailure {
             // Split by phase. Collapsing every deadline into one made a body
             // read that expired after the peer answered look like a peer that
             // never did, so a signal arriving later erased the outage.
-            ureq::Error::Timeout(
-                ureq::Timeout::Connect | ureq::Timeout::Resolve | ureq::Timeout::Global,
-            ) => Self::Timeout,
-            ureq::Error::Timeout(_) => Self::ResponseTimeout,
+            // Only the body read happens after the peer answered. Waiting for
+            // a response, sending the request, and waiting on a continue are
+            // all deadlines that expire with nothing received — a peer that
+            // accepted the connection and then said nothing has not answered,
+            // so a cancellation still explains them.
+            ureq::Error::Timeout(ureq::Timeout::RecvBody) => Self::ResponseTimeout,
+            ureq::Error::Timeout(_) => Self::Timeout,
             ureq::Error::HostNotFound => Self::HostNotFound,
             ureq::Error::Tls(_) => Self::Tls,
             ureq::Error::ConnectProxyFailed(_) => Self::ProxyConnection,
@@ -630,6 +633,9 @@ impl RequestFailure {
                         | std::io::ErrorKind::ConnectionAborted
                         | std::io::ErrorKind::BrokenPipe
                         | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::WouldBlock
                 )
                 | Self::Io(
                     std::io::ErrorKind::ConnectionReset

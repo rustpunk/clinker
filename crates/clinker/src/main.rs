@@ -2070,12 +2070,27 @@ impl LiveLineageOutput {
         // The refused event is kept rather than discarded: it carries this
         // run's real outcome, and closing a completed run with the synthetic
         // failure would trade an open run for a wrong one.
-        let admitted = self.emit(event.clone()).map_err(PipelineError::Io)?;
-        self.terminal_emitted = admitted;
-        if !admitted {
-            self.refused_terminal = Some(event);
+        match self.emit(event.clone()) {
+            // Refused, not failed: the sink is alive and said no. Keep the
+            // event so a drained queue can still take this run's real outcome.
+            Ok(false) => {
+                self.refused_terminal = Some(event);
+                Ok(())
+            }
+            Ok(true) => {
+                self.terminal_emitted = true;
+                Ok(())
+            }
+            // The write itself failed. This run produced a terminal and the
+            // sink could not take it, so the fallback must not append a
+            // synthetic failure describing a different outcome — a completed
+            // run would be published as failed. Record the attempt and report
+            // the error.
+            Err(error) => {
+                self.terminal_emitted = true;
+                Err(PipelineError::Io(error))
+            }
         }
-        Ok(())
     }
 
     /// Offer one event to the sink. `Ok(false)` means it was refused.
@@ -2134,18 +2149,27 @@ impl LiveLineageOutput {
     /// none were observed. Doing nothing instead leaves a lone START, and a
     /// catalogue shows the run as still executing forever.
     fn close_open_run(&mut self) {
-        if !self.started || self.terminal_emitted {
+        if self.terminal_emitted {
             return;
         }
-        // The run's own terminal, if the sink refused it earlier. Offering it
-        // again is the only way a completed run gets reported as completed;
-        // the synthetic failure below is for a run that never produced one.
+        // The run's own terminal, if the sink refused it earlier. Offered
+        // again before anything else, and regardless of whether the START was
+        // admitted: `emit_terminal` sends it either way because it carries the
+        // column lineage and the run statistics, and a consumer attaches it by
+        // run identity. Gating this on the START meant a run whose START and
+        // terminal were both refused by a momentarily full queue delivered
+        // nothing at all, even once the queue had drained.
         if let Some(event) = self.refused_terminal.take() {
             if self.emit(event).unwrap_or(false) {
                 self.terminal_emitted = true;
                 return;
             }
             tracing::warn!("lineage run left open: its own terminal was refused twice");
+            return;
+        }
+        // Nothing of this run's own to send. A synthetic close is only
+        // meaningful to a consumer that saw the run begin.
+        if !self.started {
             return;
         }
         let Some(start) = self.start_facts.clone() else {
