@@ -446,6 +446,7 @@ impl OtlpWorker {
         bundle: OtlpRuntimeBundle,
         receiver: TelemetryReceiver,
         shutdown: ShutdownToken,
+        correlation: RunCorrelation<String>,
     ) -> Result<Self, ObservabilityRuntimeError> {
         #[cfg(debug_assertions)]
         if std::env::var_os("CLINKER_TEST_OTLP_WORKER_START_FAILURE").as_deref()
@@ -454,13 +455,14 @@ impl OtlpWorker {
             return Err(ObservabilityRuntimeError::Worker);
         }
         let backend = DeliveryBackend::new()?;
-        Self::start_with_backend(bundle, receiver, shutdown, backend)
+        Self::start_with_backend(bundle, receiver, shutdown, correlation, backend)
     }
 
     fn start_with_backend(
         bundle: OtlpRuntimeBundle,
         receiver: TelemetryReceiver,
         shutdown: ShutdownToken,
+        correlation: RunCorrelation<String>,
         backend: DeliveryBackend,
     ) -> Result<Self, ObservabilityRuntimeError> {
         let mut payload = BoundedPayload::new(bundle.arena.request_capacity_bytes())?;
@@ -483,7 +485,7 @@ impl OtlpWorker {
                     stop: worker_stop,
                     report: OtlpDeliveryReport::default(),
                     progress: worker_progress,
-                    correlation: None,
+                    correlation,
                     trace_id: new_trace_id(),
                     next_span_id: RUN_SPAN_ID.saturating_add(1),
                     metrics_window_start_unix_nanos: unix_nanos_now(),
@@ -619,13 +621,13 @@ struct WorkerState<'a> {
     progress: Arc<Mutex<ObservabilitySummary>>,
     /// The run identity every exported envelope names as its producer.
     ///
-    /// The exporter is handed a receiver, not the run — so the identity
-    /// reaches it on the records themselves. Every record of one run carries
-    /// the same engine-supplied correlation, so the first drained log record
-    /// fixes it for the rest of the run. A run that emits metrics before it
-    /// emits any authored log event exports those metrics under the service
-    /// identity alone.
-    correlation: Option<RunCorrelation<String>>,
+    /// Supplied when the worker starts rather than read off the records it
+    /// drains. Metrics and spans are produced for every transform, while log
+    /// records exist only where the author wrote a `log:` directive — taking
+    /// the identity from the records would leave a pipeline that declares no
+    /// log directives exporting all of its telemetry under the service name
+    /// alone, joinable to nothing.
+    correlation: RunCorrelation<String>,
     /// One run is one trace; every exported span carries this id.
     trace_id: String,
     next_span_id: u64,
@@ -641,18 +643,12 @@ impl WorkerState<'_> {
     }
 
     fn deliver_batch(&mut self, batch: &TelemetryBatch) {
-        if self.correlation.is_none() {
-            self.correlation = batch
-                .logs()
-                .first()
-                .map(|record| record.correlation.clone());
-        }
         let correlation = self.correlation.clone();
         // One drain is one observation instant: these records left the arena
         // together, whenever each of them was authored.
         let observed_at = unix_nanos_now().to_string();
         self.deliver_chunks(OtlpSignal::Logs, batch.logs(), |payload, _offset, chunk| {
-            payload.encode(&logs_envelope(chunk, &observed_at, correlation.as_ref()))
+            payload.encode(&logs_envelope(chunk, &observed_at, &correlation))
         });
         if !batch.metrics().is_empty() {
             let window = self.take_metrics_window();
@@ -660,7 +656,7 @@ impl WorkerState<'_> {
                 OtlpSignal::Metrics,
                 batch.metrics(),
                 |payload, _offset, chunk| {
-                    payload.encode(&metrics_envelope(chunk, window, correlation.as_ref()))
+                    payload.encode(&metrics_envelope(chunk, window, &correlation))
                 },
             );
         }
@@ -673,19 +669,14 @@ impl WorkerState<'_> {
                 |payload, offset, chunk| {
                     let first =
                         first_span_id.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX));
-                    payload.encode(&traces_envelope(
-                        chunk,
-                        &trace_id,
-                        first,
-                        correlation.as_ref(),
-                    ))
+                    payload.encode(&traces_envelope(chunk, &trace_id, first, &correlation))
                 },
             );
         }
     }
 
     fn deliver_lifecycle(&mut self, snapshot: &RunLifecycleSnapshot) {
-        let envelope = lifecycle_envelope(snapshot, &self.trace_id, self.correlation.as_ref());
+        let envelope = lifecycle_envelope(snapshot, &self.trace_id, &self.correlation);
         let encoded = self.payload.encode(&envelope);
         self.deliver_encoded(OtlpSignal::Traces, encoded, 1);
     }
@@ -1051,11 +1042,9 @@ struct Resource<'a> {
 /// separates two pipelines reporting to the same collector.
 const SERVICE_NAME: &str = "clinker";
 
-fn resource(correlation: Option<&RunCorrelation<String>>) -> Resource<'_> {
+fn resource(correlation: &RunCorrelation<String>) -> Resource<'_> {
     let mut attributes = vec![KeyValue::static_string("service.name", SERVICE_NAME)];
-    if let Some(correlation) = correlation {
-        attributes.extend(correlation_attributes(correlation));
-    }
+    attributes.extend(correlation_attributes(correlation));
     Resource { attributes }
 }
 
@@ -1108,7 +1097,7 @@ struct OtlpLogRecord<'a> {
 fn logs_envelope<'a>(
     logs: &'a [LogRecord],
     observed_at_unix_nanos: &'a str,
-    correlation: Option<&'a RunCorrelation<String>>,
+    correlation: &'a RunCorrelation<String>,
 ) -> LogsEnvelope<'a> {
     let log_records = logs
         .iter()
@@ -1221,7 +1210,7 @@ struct MetricsWindow {
 fn metrics_envelope<'a>(
     metrics: &[MetricPoint],
     window: MetricsWindow,
-    correlation: Option<&'a RunCorrelation<String>>,
+    correlation: &'a RunCorrelation<String>,
 ) -> MetricsEnvelope<'a> {
     MetricsEnvelope {
         resource_metrics: [ResourceMetrics {
@@ -1234,9 +1223,7 @@ fn metrics_envelope<'a>(
                         unit: "1",
                         sum: Sum {
                             data_points: [NumberDataPoint {
-                                attributes: correlation.map_or_else(Vec::new, |correlation| {
-                                    Vec::from(correlation_attributes(correlation))
-                                }),
+                                attributes: Vec::from(correlation_attributes(correlation)),
                                 start_time_unix_nano: window.start.to_string(),
                                 time_unix_nano: window.end.to_string(),
                                 as_int: point.value.to_string(),
@@ -1316,7 +1303,7 @@ fn traces_envelope<'a>(
     traces: &'a [TraceSpan],
     trace_id: &'a str,
     first_span_id: u64,
-    correlation: Option<&'a RunCorrelation<String>>,
+    correlation: &'a RunCorrelation<String>,
 ) -> TracesEnvelope<'a> {
     TracesEnvelope {
         resource_spans: [ResourceSpans {
@@ -1354,7 +1341,7 @@ fn traces_envelope<'a>(
 fn lifecycle_envelope<'a>(
     snapshot: &'a RunLifecycleSnapshot,
     trace_id: &'a str,
-    correlation: Option<&'a RunCorrelation<String>>,
+    correlation: &'a RunCorrelation<String>,
 ) -> TracesEnvelope<'a> {
     let start = snapshot.start();
     let terminal = snapshot.terminal();
@@ -1380,8 +1367,12 @@ fn lifecycle_envelope<'a>(
             failure_code,
         ));
     }
-    if let Some(terminal) = terminal {
-        let counts = terminal.counts();
+    // Only counts that were actually observed. A run that failed before any
+    // were taken has no throughput to report, and exporting zeros would tell a
+    // volume alert that the batch processed nothing rather than that nothing
+    // was measured — the same misreport the lineage terminal omits its
+    // run-statistics facet to avoid.
+    if let Some(counts) = terminal.and_then(|facts| facts.measured_counts()) {
         attributes.extend([
             KeyValue::integer("clinker.records.read", counts.records_read),
             KeyValue::integer("clinker.records.written", counts.records_written),
@@ -1710,7 +1701,7 @@ mode = "none"
         assert_ne!(trace_id, "0".repeat(32), "the all-zero trace id is invalid");
 
         let traces = [span("alpha", 10, 20), span("beta", 30, 40)];
-        let envelope = to_value(&traces_envelope(&traces, &trace_id, 2, None));
+        let envelope = to_value(&traces_envelope(&traces, &trace_id, 2, &correlation()));
         let spans = spans_of(&envelope);
         assert_eq!(spans.len(), 2);
 
@@ -1741,7 +1732,12 @@ mode = "none"
         // A backwards wall-clock step must not produce a span that ends before
         // it starts, and neither boundary is ever omitted.
         let traces = [span("alpha", 500, 100)];
-        let envelope = to_value(&traces_envelope(&traces, &new_trace_id(), 2, None));
+        let envelope = to_value(&traces_envelope(
+            &traces,
+            &new_trace_id(),
+            2,
+            &correlation(),
+        ));
         let exported = &spans_of(&envelope)[0];
         assert_eq!(exported["startTimeUnixNano"], "500");
         assert_eq!(exported["endTimeUnixNano"], "500");
@@ -1763,7 +1759,7 @@ mode = "none"
             start: 1_000,
             end: 2_000,
         };
-        let envelope = to_value(&metrics_envelope(&metrics, window, None));
+        let envelope = to_value(&metrics_envelope(&metrics, window, &correlation()));
         let metric = &envelope["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0];
         assert_eq!(metric["name"], "clinker.transform.records");
         assert!(
@@ -1794,7 +1790,7 @@ mode = "none"
         let mut request = BoundedPayload::new(SHIPPED_BOUNDS.request_capacity_bytes())
             .expect("request buffer reserves");
         request
-            .encode(&logs_envelope(batch, observed_at, Some(&correlation)))
+            .encode(&logs_envelope(batch, observed_at, &correlation))
             .expect("the per-delivery bound admits one slot-filling record");
         assert!(
             request.bytes().len() > stored_bytes(&record),
@@ -1808,7 +1804,7 @@ mode = "none"
             .expect("slot-sized buffer reserves");
         assert!(
             coupled
-                .encode(&logs_envelope(batch, observed_at, Some(&correlation)))
+                .encode(&logs_envelope(batch, observed_at, &correlation))
                 .is_err(),
             "the per-record slot bound is not a per-request bound"
         );
@@ -1825,7 +1821,7 @@ mode = "none"
             BoundedPayload::new(SHIPPED_BOUNDS.request_capacity_bytes()).expect("buffer reserves");
         assert!(
             whole_batch
-                .encode(&logs_envelope(&records, observed_at, Some(&correlation)))
+                .encode(&logs_envelope(&records, observed_at, &correlation))
                 .is_err(),
             "the fixture must be a batch that cannot travel as one request"
         );
@@ -1833,7 +1829,7 @@ mode = "none"
         let mut payload = BoundedPayload::new(SHIPPED_BOUNDS.request_capacity_bytes())
             .expect("request buffer reserves");
         let encode = |payload: &mut BoundedPayload, _offset: usize, chunk: &[LogRecord]| {
-            payload.encode(&logs_envelope(chunk, observed_at, Some(&correlation)))
+            payload.encode(&logs_envelope(chunk, observed_at, &correlation))
         };
 
         let mut delivered = 0;
@@ -1855,7 +1851,11 @@ mode = "none"
     #[test]
     fn exported_log_records_carry_run_correlation() {
         let record = log_record("customer observed");
-        let envelope = to_value(&logs_envelope(std::slice::from_ref(&record), "1", None));
+        let envelope = to_value(&logs_envelope(
+            std::slice::from_ref(&record),
+            "1",
+            &correlation(),
+        ));
         let attributes = attributes_of(
             &envelope["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"],
         );
@@ -1879,7 +1879,7 @@ mode = "none"
         let envelope = to_value(&logs_envelope(
             std::slice::from_ref(&record),
             "1723065600000000000",
-            None,
+            &correlation(),
         ));
         let exported = &envelope["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0];
         assert_eq!(
@@ -1896,7 +1896,7 @@ mode = "none"
         let logs = to_value(&logs_envelope(
             std::slice::from_ref(&record),
             "1",
-            Some(&correlation),
+            &correlation,
         ));
         let points = [MetricPoint {
             key: MetricKey::TransformRecords,
@@ -1905,15 +1905,10 @@ mode = "none"
         let metrics = to_value(&metrics_envelope(
             &points,
             MetricsWindow { start: 1, end: 2 },
-            Some(&correlation),
+            &correlation,
         ));
         let traces = [span("alpha", 10, 20)];
-        let traces = to_value(&traces_envelope(
-            &traces,
-            &new_trace_id(),
-            2,
-            Some(&correlation),
-        ));
+        let traces = to_value(&traces_envelope(&traces, &new_trace_id(), 2, &correlation));
 
         for (signal, envelope) in [
             ("logs", &logs["resourceLogs"][0]["resource"]),
@@ -1947,7 +1942,7 @@ mode = "none"
                 start: 1_000,
                 end: 2_000,
             },
-            Some(&correlation),
+            &correlation,
         ));
         let point = &envelope["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"]
             [0];
@@ -2020,6 +2015,7 @@ mode = "none"
             bundle,
             receiver,
             ShutdownToken::new(),
+            correlation(),
             DeliveryBackend::Recording(RecordingDelivery {
                 deliveries: Arc::clone(&deliveries),
                 started,

@@ -186,15 +186,11 @@ impl RunLifecycleTerminalFacts {
         &self.outcome
     }
 
-    /// The counts an execution observed, or zeros when it produced none.
-    ///
-    /// Prefer [`Self::measured_counts`] anywhere the difference matters; this
-    /// exists for callers that need a number and treat absent as empty.
-    pub(crate) fn counts(&self) -> RunCountFacts {
-        self.counts.unwrap_or_default()
-    }
-
     /// The counts an execution observed, or `None` when it produced none.
+    ///
+    /// Absent is not zero: a run that failed before any counts were taken has
+    /// nothing to report, and every export says so by omission rather than by
+    /// claiming the run processed no records.
     pub(crate) const fn measured_counts(&self) -> Option<RunCountFacts> {
         self.counts
     }

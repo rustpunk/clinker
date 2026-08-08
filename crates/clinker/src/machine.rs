@@ -60,15 +60,36 @@ struct MachineState {
 
 pub(crate) struct MachineProgressWorker {
     stop: mpsc::SyncSender<()>,
-    handle: thread::JoinHandle<io::Result<()>>,
+    /// `None` once the thread has been joined, by `finish` or by `Drop`.
+    handle: Option<thread::JoinHandle<io::Result<()>>>,
 }
 
 impl MachineProgressWorker {
-    pub(crate) fn finish(self) -> io::Result<()> {
+    pub(crate) fn finish(mut self) -> io::Result<()> {
+        self.stop_and_join().unwrap_or(Ok(()))
+    }
+
+    fn stop_and_join(&mut self) -> Option<io::Result<()>> {
+        let handle = self.handle.take()?;
         let _ = self.stop.try_send(());
-        self.handle
-            .join()
-            .map_err(|_| io::Error::other("machine progress worker panicked"))?
+        Some(
+            handle
+                .join()
+                .map_err(|_| io::Error::other("machine progress worker panicked"))
+                .and_then(|result| result),
+        )
+    }
+}
+
+impl Drop for MachineProgressWorker {
+    fn drop(&mut self) {
+        // The worker is started before discovery so a failure to start one is
+        // refused up front, which puts many early returns between its start and
+        // `finish`. Dropping it only disconnects the channel, so without this
+        // the thread outlives the value and can still be holding the emitter
+        // when the terminal is written. Joining here bounds it to this scope on
+        // every path, not just the one that reaches `finish`.
+        let _ = self.stop_and_join();
     }
 }
 
@@ -204,7 +225,10 @@ impl MachineEmitter {
                     emitter.emit_periodic()?;
                 }
             })?;
-        Ok(MachineProgressWorker { stop, handle })
+        Ok(MachineProgressWorker {
+            stop,
+            handle: Some(handle),
+        })
     }
 
     pub(crate) fn emit_completed(&self, exit_code: u8) -> io::Result<()> {
@@ -413,6 +437,14 @@ impl MachineState {
     }
 
     fn write_progress(&mut self, snapshot: ProgressSnapshot) -> io::Result<()> {
+        // The terminal record is the last record of a run. A progress writer
+        // runs on its own thread and can still be mid-tick when the run ends,
+        // so the reservation is what orders them rather than the shutdown
+        // handshake — a supervisor that stops reading at the terminal would
+        // otherwise be handed one more line it can never attribute.
+        if self.terminal_reserved {
+            return Ok(());
+        }
         let progress = serde_json::json!({
             "phase": snapshot.phase(),
             "kind": snapshot.kind().as_str(),

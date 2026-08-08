@@ -87,6 +87,21 @@ pub struct RunCorrelation<S> {
     pub pipeline_name: S,
 }
 
+impl RunCorrelation<String> {
+    /// Bound each identity the way the producer side already bounds it.
+    ///
+    /// A consumer outside this crate has the same three strings but not the
+    /// cap, and an identity that is bounded on the log records and unbounded on
+    /// the run's own envelopes would name one run two ways.
+    pub fn bounded(execution_id: &str, batch_id: &str, pipeline_name: &str) -> Self {
+        Self {
+            execution_id: bounded_identity(execution_id).into_owned(),
+            batch_id: bounded_identity(batch_id).into_owned(),
+            pipeline_name: bounded_identity(pipeline_name).into_owned(),
+        }
+    }
+}
+
 /// Borrowed producer-side log event.
 #[derive(Clone, Copy, Debug)]
 pub struct LogEvent<'a> {
