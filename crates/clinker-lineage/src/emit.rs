@@ -154,7 +154,13 @@ pub struct RunLifecycleStartFacts {
 pub struct RunLifecycleTerminalFacts {
     pub event_time: String,
     pub outcome: Terminal,
-    pub stats: RunStats,
+    /// Counts an execution observed, or `None` when nothing executed.
+    ///
+    /// Zeros are not a stand-in for "did not run": to a catalogue they assert
+    /// that this pipeline executed and processed nothing, which is
+    /// indistinguishable from a real empty run and is exactly what freshness
+    /// and volume alerts key on.
+    pub stats: Option<RunStats>,
 }
 
 /// Read-only owned lifecycle input for lineage event assembly.
@@ -224,12 +230,14 @@ pub fn terminal_event(
         run_id: lifecycle.start.execution_id.clone(),
         facets: Some(RunFacets {
             clinker_batch: Some(BatchRunFacet::new(lifecycle.start.batch_id.clone())),
-            run_stats: Some(RunStatsFacet::new(
-                stats.records_read,
-                stats.records_written,
-                stats.records_dlq,
-                stats.duration_ms,
-            )),
+            run_stats: stats.map(|stats| {
+                RunStatsFacet::new(
+                    stats.records_read,
+                    stats.records_written,
+                    stats.records_dlq,
+                    stats.duration_ms,
+                )
+            }),
             error_message: failure.map(|failure| ErrorMessageRunFacet::new(failure.message())),
             clinker_failure: failure.map(ClinkerFailureRunFacet::from_classification),
         }),
@@ -326,9 +334,50 @@ mod tests {
             terminal: RunLifecycleTerminalFacts {
                 event_time: "2020-02-22T22:43:00Z".to_string(),
                 outcome,
-                stats: stats(),
+                stats: Some(stats()),
             },
         }
+    }
+
+    /// A run that executed nothing has no counts to report, and zeros are not
+    /// a stand-in for that: a catalogue cannot tell `recordsRead = 0` from a
+    /// real run that read nothing, and freshness and volume alerts key on
+    /// exactly that number.
+    #[test]
+    fn a_terminal_without_observed_counts_carries_no_run_stats_facet() {
+        let mut facts = lifecycle(Terminal::Complete);
+        facts.terminal.stats = None;
+        let events = run_events(&sample_lineage(), sample_job(), &facts);
+        let terminal = events.last().expect("terminal event");
+        assert_eq!(terminal.event_type, EventType::Complete);
+        assert!(
+            terminal
+                .run
+                .facets
+                .as_ref()
+                .expect("run facets")
+                .run_stats
+                .is_none(),
+            "a run that did not execute must not report record counts"
+        );
+
+        let executed = run_events(
+            &sample_lineage(),
+            sample_job(),
+            &lifecycle(Terminal::Complete),
+        );
+        assert!(
+            executed
+                .last()
+                .expect("terminal event")
+                .run
+                .facets
+                .as_ref()
+                .expect("run facets")
+                .run_stats
+                .is_some(),
+            "an executed run must still report its counts"
+        );
     }
 
     #[test]

@@ -2120,12 +2120,12 @@ fn lineage_lifecycle_facts(
                 .finished_at()
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             outcome,
-            stats: clinker_lineage::RunStats {
+            stats: Some(clinker_lineage::RunStats {
                 records_read: counts.records_read,
                 records_written: counts.records_written,
                 records_dlq: counts.records_dlq,
                 duration_ms: terminal.duration_ms(),
-            },
+            }),
         },
     })
 }
@@ -2837,7 +2837,11 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 RunCountFacts::default(),
             )
             .map_err(lifecycle_error)?;
-        let lifecycle_snapshot = lineage_lifecycle_facts(&lifecycle.snapshot())?;
+        let mut lifecycle_snapshot = lineage_lifecycle_facts(&lifecycle.snapshot())?;
+        // A plan-only export executes nothing, so it has no counts to report.
+        // Reporting zeros would tell a catalogue this pipeline ran and read
+        // nothing, which no consumer can tell apart from a real empty run.
+        lifecycle_snapshot.terminal.stats = None;
         let events = clinker_lineage::run_events(&lineage, job, &lifecycle_snapshot);
 
         let configuration = lineage_configuration

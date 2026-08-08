@@ -22,7 +22,7 @@ fn lifecycle_facts() -> RunLifecycleFacts {
         terminal: RunLifecycleTerminalFacts {
             event_time: "2026-08-06T12:00:00Z".to_owned(),
             outcome: Terminal::Complete,
-            stats: RunStats::default(),
+            stats: Some(RunStats::default()),
         },
     }
 }
