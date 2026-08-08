@@ -2033,8 +2033,11 @@ struct LiveLineageOutput {
     /// The admitted START, kept so a run that never reaches its terminal can
     /// still be closed against the identity the consumer already has.
     start_facts: Option<clinker_lineage::RunLifecycleStartFacts>,
-    /// Whether a terminal has been offered for this run.
+    /// Whether a terminal has been accepted by the sink for this run.
     terminal_emitted: bool,
+    /// This run's real terminal, when the sink refused it. Re-offered before
+    /// any synthetic close, so a completed run is never reported as failed.
+    refused_terminal: Option<clinker_lineage::RunEvent>,
 }
 
 impl LiveLineageOutput {
@@ -2059,8 +2062,20 @@ impl LiveLineageOutput {
         }
         let facts = lineage_lifecycle_facts(snapshot)?;
         let event = clinker_lineage::terminal_event(&self.lineage, self.job.clone(), &facts);
-        self.terminal_emitted = true;
-        self.emit(event).map(|_| ()).map_err(PipelineError::Io)
+        // Marked emitted only if the sink took it. Setting the flag first
+        // meant a terminal the bounded queue refused still disabled the
+        // fallback that exists to close the run, so the consumer kept a START
+        // with no terminal — the state that fallback was written to prevent.
+        //
+        // The refused event is kept rather than discarded: it carries this
+        // run's real outcome, and closing a completed run with the synthetic
+        // failure would trade an open run for a wrong one.
+        let admitted = self.emit(event.clone()).map_err(PipelineError::Io)?;
+        self.terminal_emitted = admitted;
+        if !admitted {
+            self.refused_terminal = Some(event);
+        }
+        Ok(())
     }
 
     /// Offer one event to the sink. `Ok(false)` means it was refused.
@@ -2120,6 +2135,17 @@ impl LiveLineageOutput {
     /// catalogue shows the run as still executing forever.
     fn close_open_run(&mut self) {
         if !self.started || self.terminal_emitted {
+            return;
+        }
+        // The run's own terminal, if the sink refused it earlier. Offering it
+        // again is the only way a completed run gets reported as completed;
+        // the synthetic failure below is for a run that never produced one.
+        if let Some(event) = self.refused_terminal.take() {
+            if self.emit(event).unwrap_or(false) {
+                self.terminal_emitted = true;
+                return;
+            }
+            tracing::warn!("lineage run left open: its own terminal was refused twice");
             return;
         }
         let Some(start) = self.start_facts.clone() else {
@@ -3416,6 +3442,13 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             });
         }
     };
+    // Handed over as soon as the worker exists, so a terminal written on any
+    // path between here and the flush still reports what had been delivered.
+    // Pushing the summary only at the flush left exactly the early failures —
+    // the ones an operator most needs to interpret — with no field at all.
+    if let (Some(emitter), Some(worker)) = (machine, otlp_worker.as_ref()) {
+        emitter.attach_observability_progress(worker.progress_handle());
+    }
     let mut lineage_output: Option<LiveLineageOutput> = None;
     if let Some(path) = &args.lineage_events {
         let configuration = lineage_configuration
@@ -3445,6 +3478,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 started: false,
                 start_facts: None,
                 terminal_emitted: false,
+                refused_terminal: None,
             });
         } else {
             // The local-diagnostic sink is a file the run opens, so refusing it
@@ -3484,6 +3518,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 started: false,
                 start_facts: None,
                 terminal_emitted: false,
+                refused_terminal: None,
             });
         }
     }

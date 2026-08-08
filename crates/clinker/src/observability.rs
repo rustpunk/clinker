@@ -554,6 +554,15 @@ impl OtlpWorker {
         })
     }
 
+    /// A handle to the counters this worker keeps as it delivers.
+    ///
+    /// Handed to the machine emitter so a terminal written on a path that
+    /// never reaches the explicit flush still reports what was delivered,
+    /// rather than omitting the field entirely on exactly the early failures.
+    pub(crate) fn progress_handle(&self) -> Arc<Mutex<ObservabilitySummary>> {
+        Arc::clone(&self.progress)
+    }
+
     pub(crate) fn finish(mut self, snapshot: RunLifecycleSnapshot) -> ObservabilitySummary {
         if self
             .command

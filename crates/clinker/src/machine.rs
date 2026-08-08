@@ -55,6 +55,11 @@ struct MachineState {
     /// what the next terminal attempt must report instead of inventing one.
     attempted_failure: Option<FailureClassification>,
     observability: Option<ObservabilitySummary>,
+    /// The export worker's live counters, read when a terminal is written on a
+    /// path that never reached the explicit flush. Without it those terminals
+    /// carried no `observability` field at all, so one condition was reported
+    /// two ways depending on how early the run failed.
+    observability_progress: Option<Arc<Mutex<ObservabilitySummary>>>,
     progress: BoundedProgress,
 }
 
@@ -141,6 +146,7 @@ impl MachineEmitter {
                 terminal_reserved: false,
                 attempted_failure: None,
                 observability: None,
+                observability_progress: None,
                 progress: BoundedProgress::default(),
             })),
             shutdown: ShutdownToken::new(),
@@ -161,6 +167,12 @@ impl MachineEmitter {
 
     pub(crate) fn set_observability_summary(&self, summary: ObservabilitySummary) {
         self.lock_state().observability = Some(summary);
+    }
+
+    /// Attach the export worker's live counters as a fallback for terminals
+    /// written before the flush that would have pushed a final summary.
+    pub(crate) fn attach_observability_progress(&self, progress: Arc<Mutex<ObservabilitySummary>>) {
+        self.lock_state().observability_progress = Some(progress);
     }
 
     pub(crate) fn emit_started(&self) -> io::Result<()> {
@@ -379,7 +391,22 @@ impl MachineState {
             );
             fields.insert("publication".to_owned(), summary);
         }
-        if let Some(observability) = self.observability {
+        // The pushed summary when the flush completed, and otherwise whatever
+        // the worker had delivered by now. A terminal that omits the field
+        // entirely tells a supervisor nothing about whether this run's
+        // telemetry can be trusted.
+        let observability = self.observability.or_else(|| {
+            self.observability_progress.as_ref().map(|progress| {
+                let delivered = *progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                ObservabilitySummary {
+                    flush_complete: false,
+                    ..delivered
+                }
+            })
+        });
+        if let Some(observability) = observability {
             fields.insert("observability".to_owned(), serde_json::json!(observability));
         }
         events.push((event, fields));
@@ -691,6 +718,7 @@ mod tests {
             terminal_reserved: false,
             attempted_failure: None,
             observability: None,
+            observability_progress: None,
             progress: BoundedProgress::default(),
         };
         (state, sink)

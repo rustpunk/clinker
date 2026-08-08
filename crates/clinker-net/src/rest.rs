@@ -480,7 +480,7 @@ impl RestRecordSource {
                 {
                     Ok(body) => body,
                     Err(error) => {
-                        let failure = RequestFailure::from_transport(&error);
+                        let failure = RequestFailure::from_transport(&error).in_response_phase();
                         if failure.retryable_body_read() {
                             break failure;
                         }
@@ -522,7 +522,14 @@ impl RestRecordSource {
 #[derive(Debug, Clone, Copy)]
 enum RequestFailure {
     HttpStatus(u16),
+    /// A deadline that expired before the peer answered.
     Timeout,
+    /// A deadline that expired after the peer answered — while its headers or
+    /// body were being read. The exchange had already begun, so a signal
+    /// arriving afterwards does not explain it.
+    ResponseTimeout,
+    /// An I/O failure while reading a reply the peer had begun sending.
+    ResponseIo(std::io::ErrorKind),
     HostNotFound,
     Tls,
     ProxyConnection,
@@ -551,6 +558,21 @@ impl RequestFailure {
         )
     }
 
+    /// Re-label a failure observed while reading a reply the peer had already
+    /// begun sending.
+    ///
+    /// The request-phase spellings and the response-phase ones are the same
+    /// error kinds, so only the call site knows which happened. A response-
+    /// phase failure means the peer answered, and a signal arriving afterwards
+    /// does not explain it.
+    const fn in_response_phase(self) -> Self {
+        match self {
+            Self::Timeout => Self::ResponseTimeout,
+            Self::Io(kind) => Self::ResponseIo(kind),
+            other => other,
+        }
+    }
+
     const fn classification_code(self) -> &'static str {
         match self {
             Self::HttpStatus(400..=499) => "rest.http.client_error",
@@ -562,7 +584,13 @@ impl RequestFailure {
     fn from_transport(error: &ureq::Error) -> Self {
         match error {
             ureq::Error::StatusCode(status) => Self::HttpStatus(*status),
-            ureq::Error::Timeout(_) => Self::Timeout,
+            // Split by phase. Collapsing every deadline into one made a body
+            // read that expired after the peer answered look like a peer that
+            // never did, so a signal arriving later erased the outage.
+            ureq::Error::Timeout(
+                ureq::Timeout::Connect | ureq::Timeout::Resolve | ureq::Timeout::Global,
+            ) => Self::Timeout,
+            ureq::Error::Timeout(_) => Self::ResponseTimeout,
             ureq::Error::HostNotFound => Self::HostNotFound,
             ureq::Error::Tls(_) => Self::Tls,
             ureq::Error::ConnectProxyFailed(_) => Self::ProxyConnection,
@@ -578,6 +606,8 @@ impl RequestFailure {
         match self {
             Self::HttpStatus(status) => format!("http_status_{status}"),
             Self::Timeout => "timeout".to_owned(),
+            Self::ResponseTimeout => "response_timeout".to_owned(),
+            Self::ResponseIo(kind) => format!("response_io_{kind:?}").to_lowercase(),
             Self::HostNotFound => "host_not_found".to_owned(),
             Self::Tls => "tls".to_owned(),
             Self::ProxyConnection => "proxy_connection".to_owned(),
@@ -593,7 +623,14 @@ impl RequestFailure {
         matches!(
             self,
             Self::Timeout
+                | Self::ResponseTimeout
                 | Self::Connection
+                | Self::ResponseIo(
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                )
                 | Self::Io(
                     std::io::ErrorKind::ConnectionReset
                         | std::io::ErrorKind::ConnectionAborted
