@@ -2041,12 +2041,23 @@ struct LiveLineageOutput {
 }
 
 impl LiveLineageOutput {
-    fn emit_start(&mut self, start: &RunLifecycleStartFacts) -> std::io::Result<()> {
+    fn emit_start(&mut self, start: &RunLifecycleStartFacts) {
         let facts = lineage_start_facts(start);
         let event = clinker_lineage::start_event(&self.lineage, self.job.clone(), &facts);
-        self.started = self.emit(event)?;
+        // A failed write is reported, never propagated. Lineage is an optional
+        // observation of the run, and the external sink already treats a
+        // refusal this way — propagating the local sink's error instead made a
+        // healthy pipeline exit 4 because something downstream closed the pipe
+        // it was writing events to, and made success depend on which identity
+        // mode was configured rather than on the data.
+        self.started = match self.emit(event) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                tracing::warn!(error = %error, "this run's lineage START could not be written");
+                false
+            }
+        };
         self.start_facts = Some(facts);
-        Ok(())
     }
 
     fn emit_terminal(&mut self, snapshot: &RunLifecycleSnapshot) -> Result<(), PipelineError> {
@@ -2188,9 +2199,19 @@ impl LiveLineageOutput {
             },
         };
         let event = clinker_lineage::terminal_event(&self.lineage, self.job.clone(), &facts);
-        self.terminal_emitted = true;
-        if self.emit(event).is_err() {
-            tracing::warn!("lineage run left open: its closing event could not be written");
+        // Same rule as the real terminal: the flag records what the sink took,
+        // not what was offered. Setting it first and then checking only for an
+        // error let a refusal — the sink alive and saying no — be dropped while
+        // the run was recorded as closed.
+        match self.emit(event) {
+            Ok(true) => self.terminal_emitted = true,
+            Ok(false) => tracing::warn!(
+                "lineage run left open: its closing event was refused by the export queue"
+            ),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "lineage run left open: its closing event could not be written"
+            ),
         }
     }
 }
@@ -4015,25 +4036,11 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         semantic_fingerprint,
         chrono::Utc::now(),
     );
-    if let Some(output) = lineage_output.as_mut()
-        && let Err(error) = output.emit_start(&run_lifecycle.start_snapshot())
-    {
-        let error = PipelineError::Io(error);
-        run_lifecycle
-            .record_terminal(
-                chrono::Utc::now(),
-                RunTerminalOutcome::Fail(classify_pipeline_error(&error)),
-                // The run never began, so nothing observed a record.
-                None,
-            )
-            .map_err(lifecycle_error)?;
-        // The terminal exists now, so close the exporter out through it rather
-        // than dropping the worker. This is the only path that emits the run's
-        // root span and attaches the delivery summary to the machine terminal,
-        // and a run that failed here has telemetry describing why.
-        finish_otlp_delivery(&mut otlp_worker, &run_lifecycle, machine);
-        finish_live_lineage(&mut lineage_output);
-        return Err(error);
+    // The START is offered, and whether it lands is the sink's business. A
+    // lineage event that could not be written is reported on stderr and in the
+    // delivery summary; it does not decide whether this run executes.
+    if let Some(output) = lineage_output.as_mut() {
+        output.emit_start(&run_lifecycle.start_snapshot());
     }
 
     // The executor recompiles `compiled_plan.config()` — already the effective,

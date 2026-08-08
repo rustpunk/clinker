@@ -548,13 +548,14 @@ impl RequestFailure {
     /// the peer rejected it, and that verdict is independent of any signal
     /// that arrives afterwards.
     const fn is_cancellable_transport(self) -> bool {
+        // `Transport` is deliberately absent. It is the catch-all for failures
+        // this mapping does not name, so it is an absence of information, not
+        // evidence that the peer never answered — and treating it as the
+        // latter turned a permanent failure into a clean cancellation whenever
+        // a signal happened to be pending.
         matches!(
             self,
-            Self::Timeout
-                | Self::Connection
-                | Self::ProxyConnection
-                | Self::Transport
-                | Self::Io(_)
+            Self::Timeout | Self::Connection | Self::ProxyConnection | Self::Io(_)
         )
     }
 
@@ -595,7 +596,10 @@ impl RequestFailure {
             ureq::Error::Timeout(ureq::Timeout::RecvBody) => Self::ResponseTimeout,
             ureq::Error::Timeout(_) => Self::Timeout,
             ureq::Error::HostNotFound => Self::HostNotFound,
-            ureq::Error::Tls(_) => Self::Tls,
+            // Every TLS-layer failure, not just the one variant. An expired or
+            // untrusted certificate arrives as `Rustls`, which fell through to
+            // the catch-all and was then treated as a peer that never answered.
+            ureq::Error::Tls(_) | ureq::Error::Rustls(_) | ureq::Error::TlsRequired => Self::Tls,
             ureq::Error::ConnectProxyFailed(_) => Self::ProxyConnection,
             ureq::Error::ConnectionFailed => Self::Connection,
             ureq::Error::Protocol(_) => Self::Protocol,
@@ -919,6 +923,23 @@ mod tests {
             !body.is_cancellable_transport(),
             "a body read follows an answer, so the peer's verdict stands"
         );
+
+        // Not only deadlines. Covering just the timeout variants is what let a
+        // permanent TLS failure reach the catch-all and be read as a peer that
+        // never answered.
+        for permanent in [
+            RequestFailure::Tls,
+            RequestFailure::HttpStatus(503),
+            RequestFailure::Protocol,
+            RequestFailure::BodyLimit,
+            RequestFailure::HostNotFound,
+            RequestFailure::Transport,
+        ] {
+            assert!(
+                !permanent.is_cancellable_transport(),
+                "{permanent:?} is a verdict or an unknown, and a signal explains neither"
+            );
+        }
     }
 
     /// Relabelling a failure by phase must not change whether it can be
