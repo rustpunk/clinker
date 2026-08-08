@@ -211,6 +211,7 @@ failure_registry! {
     "rest.http.client_error", SourceProtocol, DoNotRetry, "REST source request was rejected";
     "source.endpoint.untrusted_tls", SourceProtocol, PolicyRequired, "source endpoint did not present a trusted TLS identity";
     "source.endpoint.unresolvable", SourceProtocol, PolicyRequired, "source endpoint host could not be resolved";
+    "source.endpoint.unreadable_material", SourceProtocol, PolicyRequired, "source endpoint material could not be read from local storage";
     "runtime.resource.memory_budget_exceeded", Infrastructure, PolicyRequired, "runtime memory budget was exceeded";
     "admission.configuration.memory_budget_unsatisfiable", Configuration, DoNotRetry, "configured memory budget is below the runtime baseline";
     "runtime.resource.spill_failed", Infrastructure, RetryWithBackoff, "runtime spill storage failed";

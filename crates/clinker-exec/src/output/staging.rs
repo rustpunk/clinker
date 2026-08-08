@@ -270,16 +270,26 @@ impl OutputStagingRegistry {
                 // exercising only the other copy reported the policy fixed
                 // while the live path still failed the run.
                 let mut search = super::open::SuffixSearch::default();
+                // A name another output in this same run has already claimed
+                // is a taken candidate too, and it arrives as a validation
+                // error rather than an I/O one. Without this the attempt path
+                // aborted on the first collision while the non-attempt path
+                // wrote `out-1.json` and succeeded — the same authored YAML
+                // with opposite outcomes depending on whether a run attempt
+                // happened to be active.
+                let mut advance = |error: &PipelineError| {
+                    is_intra_run_claim_collision(error) || search.advance(error)
+                };
                 match stage(bare.clone()) {
                     Ok(output) => return Ok(output),
-                    Err(error) if search.advance(&error) => {}
+                    Err(error) if advance(&error) => {}
                     Err(error) => return Err(error),
                 }
                 for n in 1_u64..=u64::MAX {
                     let candidate = path_for_n(Some(n)).map_err(PipelineError::Config)?;
                     match stage(candidate) {
                         Ok(output) => return Ok(output),
-                        Err(error) if search.advance(&error) => continue,
+                        Err(error) if advance(&error) => continue,
                         Err(error) => return Err(error),
                     }
                 }
@@ -730,6 +740,17 @@ impl OutputStagingRegistry {
         }
         self.commit_all().map(Some)
     }
+}
+
+/// Whether this candidate name is already claimed by another output of the
+/// same run, which the registry reports as a validation error rather than an
+/// I/O one because no file was involved.
+fn is_intra_run_claim_collision(error: &PipelineError) -> bool {
+    matches!(
+        error,
+        PipelineError::Config(ConfigError::Validation(message))
+            if message.starts_with("output destination collision:")
+    )
 }
 
 fn collision_error(

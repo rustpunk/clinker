@@ -35,6 +35,7 @@ source.data.invalid	source_protocol	do_not_retry
 rest.http.client_error	source_protocol	do_not_retry
 source.endpoint.untrusted_tls	source_protocol	policy_required
 source.endpoint.unresolvable	source_protocol	policy_required
+source.endpoint.unreadable_material	source_protocol	policy_required
 runtime.resource.memory_budget_exceeded	infrastructure	policy_required
 admission.configuration.memory_budget_unsatisfiable	configuration	do_not_retry
 runtime.resource.spill_failed	infrastructure	retry_with_backoff

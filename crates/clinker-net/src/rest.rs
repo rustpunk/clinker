@@ -606,6 +606,20 @@ impl RequestFailure {
             // cancellation rule was corrected to stop giving.
             Self::Tls => "source.endpoint.untrusted_tls",
             Self::HostNotFound => "source.endpoint.unresolvable",
+            // The same permanent local failures the cancellation rule now
+            // declines to explain away. Excluding them there without changing
+            // this left them reported as a temporarily unavailable source, so
+            // a certificate the process cannot read was still re-queued
+            // forever — the caller was corrected and the callee that produces
+            // the operator-visible verdict was not.
+            Self::Io(
+                std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::InvalidInput
+                | std::io::ErrorKind::InvalidData
+                | std::io::ErrorKind::IsADirectory
+                | std::io::ErrorKind::ReadOnlyFilesystem,
+            ) => "source.endpoint.unreadable_material",
             _ => "infrastructure.runtime.source_unavailable",
         }
     }

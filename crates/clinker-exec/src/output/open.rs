@@ -193,11 +193,17 @@ pub(crate) fn containment_error(error: ContainmentError) -> PipelineError {
 #[derive(Default)]
 pub(crate) struct SuffixSearch {
     consecutive_denials: u32,
+    total_denials: u32,
 }
 
 impl SuffixSearch {
-    /// How many consecutive denials still look like contention.
+    /// How many denials in a row still look like contention.
     const MAX_CONSECUTIVE_DENIALS: u32 = 64;
+    /// How many a whole search may meet before the answer is a denial
+    /// regardless of spacing. A destination that is both permanently denied
+    /// and concurrently written alternates the two errors, so the consecutive
+    /// count alone never reaches its bound and the search never terminates.
+    const MAX_TOTAL_DENIALS: u32 = 4096;
 
     pub(crate) fn advance(&mut self, error: &PipelineError) -> bool {
         if is_already_exists(error) {
@@ -208,7 +214,9 @@ impl SuffixSearch {
             return false;
         }
         self.consecutive_denials = self.consecutive_denials.saturating_add(1);
+        self.total_denials = self.total_denials.saturating_add(1);
         self.consecutive_denials <= Self::MAX_CONSECUTIVE_DENIALS
+            && self.total_denials <= Self::MAX_TOTAL_DENIALS
     }
 }
 
