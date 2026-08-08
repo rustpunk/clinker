@@ -617,12 +617,18 @@ pub fn send_otlp_json(
                         // merely unknown. Report the unreadable reply and stop.
                         Err(error) => return Err(map_body_error(signal, attempts, &error)),
                     };
+                    // A reply this transport cannot parse is the same situation
+                    // as one it cannot read: the 200 already said the collector
+                    // holds the batch. Only the confirmation is missing, so the
+                    // records are still accounted as delivered.
                     let rejected = parse_response(signal, &body, item_count).ok_or_else(|| {
-                        OtlpDeliveryFailure::new(
+                        let mut failure = OtlpDeliveryFailure::new(
                             signal,
                             OtlpDeliveryFailureKind::MalformedResponse,
                             attempts,
-                        )
+                        );
+                        failure.reached_collector = true;
+                        failure
                     })?;
                     return Ok(OtlpDeliveryOutcome {
                         signal,

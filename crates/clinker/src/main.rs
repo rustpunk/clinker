@@ -1813,6 +1813,15 @@ fn lineage_export_failure(
     outcome: clinker_lineage::LineageDeliveryOutcome,
 ) -> Option<PipelineError> {
     let destination = lineage_destination(path);
+    // Before any verdict below returns. The destination was emptied once the
+    // exporter was running, so an export that then delivered nothing leaves a
+    // zero-byte file, and a step that runs on failure or globs the artifact
+    // directory uploads it as though it were the export. Absent is
+    // unambiguous where empty is not — and a failed export is exactly where an
+    // empty file is most likely.
+    if outcome.accepted() == 0 && path.as_os_str() != std::ffi::OsStr::new("-") {
+        let _ = std::fs::remove_file(path);
+    }
     match outcome.terminal() {
         // Whether the same invocation could ever succeed is what separates
         // these, and the diagnostic has to say the same thing its retry advice
@@ -1883,14 +1892,6 @@ fn lineage_export_failure(
                 | clinker_lineage::LineageAdmission::DroppedQueueFull
         )
     });
-    // An export that delivered nothing leaves nothing. The destination was
-    // emptied when the run was admitted, which is what stops a later step from
-    // reading the previous run's events as this run's; but an empty file is
-    // still a file a downstream step can upload as though it were the export.
-    // Absent is unambiguous where empty is not.
-    if outcome.accepted() == 0 && path.as_os_str() != std::ffi::OsStr::new("-") {
-        let _ = std::fs::remove_file(path);
-    }
     let detail = format!(
         "--lineage output {destination} is incomplete: {} of {expected} events were dropped before delivery ({listed}). Correction: ",
         rejected.len(),
@@ -2168,11 +2169,23 @@ fn lineage_error_kind(kind: std::io::ErrorKind) -> &'static str {
 impl Drop for LiveLineageOutput {
     /// Close a run the consumer was told had begun.
     ///
-    /// Every ordinary path emits its own terminal. What this covers is the one
-    /// that does not reach one: an early return between START and the
-    /// executor, or an unwind.
+    /// Every ordinary path emits its own terminal and finishes the exporter.
+    /// What this covers is the one that reaches neither: an early return
+    /// between START and the point where the run reports how it ended, which
+    /// otherwise leaves a lone START and a catalogue showing the run as
+    /// executing forever.
+    ///
+    /// It runs the whole finish rather than only emitting, because the
+    /// external exporter delivers on its own thread: enqueuing a terminal and
+    /// returning would drop the queue and detach that thread, and the process
+    /// would exit before the event this exists to guarantee had been written.
+    ///
+    /// Unwinding is not covered. The release profile aborts on panic, so there
+    /// is no unwind for a destructor to run during.
     fn drop(&mut self) {
-        self.close_open_run();
+        if let Some(outcome) = self.finish() {
+            report_lineage_delivery(outcome);
+        }
     }
 }
 
@@ -2234,15 +2247,29 @@ impl std::io::Write for ExternalLineageFileSink {
 /// here, and emptying the file at that point is what stops a run that then
 /// fails before its first event from leaving the previous run's events — whose
 /// COMPLETE terminal a catalogue would attribute to this run.
-fn truncate_lineage_destination(path: &std::path::Path) -> Result<(), PipelineError> {
+fn truncate_lineage_destination(
+    flag: &'static str,
+    path: &std::path::Path,
+) -> Result<(), PipelineError> {
     if path.as_os_str() == std::ffi::OsStr::new("-") {
         return Ok(());
     }
     std::fs::File::create(path).map(|_| ()).map_err(|e| {
-        PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-            "cannot open --lineage output {}: {e}",
-            path.display()
-        )))
+        let detail = format!("cannot open {flag} output {}: {e}", path.display());
+        // The same split the write path uses: a destination the process may
+        // never write refuses every identical retry and is a configuration
+        // failure, while a full volume or a momentarily unavailable mount is
+        // one a supervisor should try again. Classifying every open failure as
+        // configuration would tell it to give up on both.
+        if is_permanent_sink_refusal(e.kind()) {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                "{detail}. Correction: point {flag} at a writable destination"
+            )))
+        } else {
+            observability_delivery_error(format!(
+                "{detail}. Correction: re-run the export; if it recurs, point {flag} at a different destination"
+            ))
+        }
     })
 }
 
@@ -3105,7 +3132,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 external_lineage_sink(path),
             )
             .map_err(lineage_worker_start_error)?;
-            truncate_lineage_destination(path)?;
+            truncate_lineage_destination("--lineage", path)?;
             let mut rejected = Vec::new();
             for (index, event) in events.iter().enumerate() {
                 match delivery.try_emit(event) {
@@ -3348,7 +3375,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 )
                 .map_err(lineage_worker_start_error)?,
             );
-            truncate_lineage_destination(path)?;
+            truncate_lineage_destination("--lineage-events", path)?;
             lineage_output = Some(LiveLineageOutput {
                 sink,
                 lineage,

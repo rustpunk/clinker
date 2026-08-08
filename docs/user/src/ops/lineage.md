@@ -72,13 +72,25 @@ not copied into the diagnostic. The complete observability policy, including
 the required OTLP and authentication tables, is documented under
 [lineage identity](metrics.md#lineage-identity).
 
-The destination file is emptied when the run is admitted, before any event is
-written — so a run that is refused, or that fails before emitting anything,
-leaves an empty file rather than the previous run's events. Point each run at
-a path you are willing to overwrite, and copy a record you want to keep before
-re-running against it. This applies to both `--lineage` and `--lineage-events`.
-An empty file means this run wrote nothing; it never means the previous run's
-result still stands.
+The destination file is emptied once the exporter has started, before any
+event is written. Point each run at a path you are willing to overwrite, and
+copy a record you want to keep before re-running against it. This applies to
+both `--lineage` and `--lineage-events`.
+
+What that means for a run that produces no events:
+
+- Refused **before** the exporter starts — an invalid pipeline, a rejected
+  configuration, a lineage binding that does not resolve — the file is
+  untouched and still holds the previous run's events.
+- Refused **after** the exporter starts, or fails before its first event, the
+  file is empty. An empty file means this run wrote nothing; it never means
+  the previous run's result still stands.
+- A plan-only `--lineage` export that delivered nothing removes the file, so
+  no zero-byte artifact is left for a later step to publish.
+
+If a consumer must distinguish "this run produced no lineage" from "an older
+run's lineage is still here", give each run its own destination path rather
+than relying on the state of a shared one.
 
 Path-derived dataset names remain available only through the exact local
 compatibility spelling below. This mode is visibly labeled on stderr and is
