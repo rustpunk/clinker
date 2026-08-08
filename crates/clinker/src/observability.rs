@@ -321,11 +321,6 @@ impl OtlpDeliveryReport {
     }
 }
 
-/// The one stderr line an operator gets for a signal that lost chunks.
-///
-/// The count matters as much as the reason: nine rejected chunks out of ten is
-/// not a healthy export, and naming only the most recent failure would read
-/// like an isolated one.
 /// What an operator should look at, for the kinds that do not name it.
 ///
 /// `Tls` is reported when a peer on an `https://` origin never completed a
@@ -343,8 +338,13 @@ fn failure_hint(kind: OtlpDeliveryFailureKind) -> &'static str {
     }
 }
 
-/// One line describing how a signal's delivery ended, or `None` when it did
-/// not fail. Delivery outcomes are observations: this never gates the run.
+/// The one stderr line an operator gets for a signal that lost chunks, or
+/// `None` when it lost none.
+///
+/// The count matters as much as the reason: nine rejected chunks out of ten is
+/// not a healthy export, and naming only the most recent failure would read
+/// like an isolated one. Delivery outcomes are observations; this never gates
+/// the run.
 fn failure_line(name: &str, signal: &SignalDeliveryReport) -> Option<String> {
     let failures = signal.summary.failures;
     match signal.last_failure.as_ref()? {

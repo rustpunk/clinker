@@ -105,14 +105,22 @@ impl<'a> LogDispatcher<'a> {
         enabled.emit_timing(LogTiming::BeforeTransform, None);
     }
 
-    /// Whether any signal is being produced for this transform.
+    /// Whether a per-record evaluation context will actually be read.
     ///
-    /// Callers assemble the per-record evaluation context, which costs a
-    /// handful of reference-count bumps and a source lookup per row. A
-    /// deployment that configures no observability reads none of it, so this
-    /// lets the hot loop skip building what nothing will look at.
-    pub(crate) const fn is_enabled(&self) -> bool {
-        self.enabled.is_some()
+    /// Callers assemble that context per row, which costs a handful of
+    /// reference-count bumps and a source lookup. Only an authored `condition`
+    /// on a `per_record` directive reads it: a transform whose directives are
+    /// all `before`/`after`, or whose per-record directives carry no gate,
+    /// emits from the record alone. Answering "is observability configured at
+    /// all" would rebuild it for every row of those transforms too.
+    pub(crate) fn wants_per_record_context(&self) -> bool {
+        self.enabled.as_ref().is_some_and(|enabled| {
+            enabled
+                .directives
+                .iter()
+                .zip(enabled.gates.iter())
+                .any(|(directive, gate)| directive.when == LogTiming::PerRecord && gate.is_some())
+        })
     }
 
     /// `eval_ctx` is the record's own evaluation context, used only to run

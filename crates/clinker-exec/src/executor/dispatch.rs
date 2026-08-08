@@ -4066,18 +4066,19 @@ pub(crate) fn transform_fused_consume(
             // in a deployment that configures no observability runs neither a
             // gate nor a program, and the reference-count bumps and source
             // lookup below would be per-record work with no reader.
-            let eval_inputs = (signals.is_enabled() || evaluator_opt.is_some()).then(|| {
-                let source_file_arc = Arc::clone(&last_file);
-                let rec_source_name_arc = source_name_arc_of(&rec);
-                let source_count = ctx.source_count_by_name(&rec_source_name_arc);
-                let rec_doc_ctx = Arc::clone(rec.doc_ctx());
-                (
-                    source_file_arc,
-                    rec_source_name_arc,
-                    rec_doc_ctx,
-                    source_count,
-                )
-            });
+            let eval_inputs =
+                (signals.wants_per_record_context() || evaluator_opt.is_some()).then(|| {
+                    let source_file_arc = Arc::clone(&last_file);
+                    let rec_source_name_arc = source_name_arc_of(&rec);
+                    let source_count = ctx.source_count_by_name(&rec_source_name_arc);
+                    let rec_doc_ctx = Arc::clone(rec.doc_ctx());
+                    (
+                        source_file_arc,
+                        rec_source_name_arc,
+                        rec_doc_ctx,
+                        source_count,
+                    )
+                });
             if let Some((source_file_arc, rec_source_name_arc, rec_doc_ctx, source_count)) =
                 eval_inputs.as_ref()
             {

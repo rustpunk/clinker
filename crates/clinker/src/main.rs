@@ -1772,30 +1772,27 @@ fn lineage_worker_start_error(_error: std::io::Error) -> PipelineError {
 /// How many dropped events a diagnostic names before it summarizes the rest.
 const LINEAGE_EXPORT_REPORTED_DROPS: usize = 4;
 
-/// Remove a lineage destination this run left empty.
+/// Remove a lineage destination this run truncated and never wrote to.
 ///
-/// The file is emptied once the exporter starts, so an export that then wrote
-/// nothing leaves a zero-byte file behind — and a publish step that runs on
-/// failure, or one that globs the artifact directory, uploads it as though it
-/// were the export. Absent is unambiguous where empty is not.
+/// Only a regular file. A destination that always reports zero length —
+/// `/dev/null`, a FIFO, any character device — is a successful export, not an
+/// empty one, and unlinking it would take the device node with it on a
+/// container running as root.
 ///
-/// A removal that fails is reported rather than swallowed: the artifact this
-/// exists to prevent is still on disk, and saying so is the only thing that
-/// stops it being published as a result.
+/// The caller must not use this on a verdict that leaves the export worker
+/// running: a detached worker re-creates the destination on its next write,
+/// which would put a truncated event stream back after the removal.
 fn remove_empty_lineage_export(path: &std::path::Path) -> Option<PipelineError> {
-    if path.as_os_str() == std::ffi::OsStr::new("-") {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() != 0 {
         return None;
     }
-    match std::fs::metadata(path) {
-        Ok(metadata) if metadata.len() == 0 => match std::fs::remove_file(path) {
-            Ok(()) => None,
-            Err(error) => Some(observability_delivery_error(format!(
-                "--lineage output {} is empty and could not be removed: {error}. Correction: delete it before publishing this run's artifacts, so an empty file is not read as its lineage export",
-                path.display()
-            ))),
-        },
-        Ok(_) | Err(_) => None,
-    }
+    std::fs::remove_file(path).err().map(|error| {
+        observability_delivery_error(format!(
+            "--lineage output {} is empty and could not be removed: {error}. Correction: delete it before publishing this run's artifacts, so an empty file is not read as its lineage export",
+            path.display()
+        ))
+    })
 }
 
 fn lineage_destination(path: &std::path::Path) -> String {
@@ -1839,13 +1836,19 @@ fn lineage_export_failure(
     outcome: clinker_lineage::LineageDeliveryOutcome,
 ) -> Option<PipelineError> {
     let destination = lineage_destination(path);
-    // Before any verdict below returns, and decided by the file rather than by
-    // the queue. `accepted` counts events admitted for export, which a write
-    // that then failed still counts — so keying on it left the zero-byte file
-    // on exactly the write, flush, and deadline verdicts this exists to cover.
-    // What matters is whether anything reached the destination, and only the
-    // destination knows that.
-    let removal = remove_empty_lineage_export(path);
+    // The destination was emptied once the exporter started, so an export that
+    // then wrote nothing leaves a zero-byte file for a publish step to upload
+    // as though it were the export. Skipped on `DeadlineExceeded`, the one
+    // verdict that returns while the worker is still running: removing the file
+    // there would race a writer that re-creates it.
+    //
+    // A failure to remove is reported only when nothing else is — every verdict
+    // below already tells the operator the export did not complete, and that is
+    // the more useful of the two diagnostics.
+    let removal = match outcome.terminal() {
+        clinker_lineage::LineageDeliveryTerminal::DeadlineExceeded => None,
+        _ => remove_empty_lineage_export(path),
+    };
     match outcome.terminal() {
         // Whether the same invocation could ever succeed is what separates
         // these, and the diagnostic has to say the same thing its retry advice
@@ -1884,11 +1887,8 @@ fn lineage_export_failure(
         }
         clinker_lineage::LineageDeliveryTerminal::Shutdown => {}
     }
-    if let Some(error) = removal {
-        return Some(error);
-    }
     if rejected.is_empty() {
-        return None;
+        return removal;
     }
 
     let mut listed = rejected

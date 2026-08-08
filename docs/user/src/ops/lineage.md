@@ -85,8 +85,12 @@ What that means for a run that produces no events:
 - Refused **after** the exporter starts, or fails before its first event, the
   file is empty. An empty file means this run wrote nothing; it never means
   the previous run's result still stands.
-- A plan-only `--lineage` export that delivered nothing removes the file, so
-  no zero-byte artifact is left for a later step to publish.
+- A plan-only `--lineage` export that wrote nothing removes the destination,
+  so no zero-byte artifact is left for a later step to publish. This applies
+  only to a regular file: a destination that always reports zero length, such
+  as `/dev/null` or a FIFO, is a successful export and is never removed. It is
+  also skipped when the export ran out of flush time, because the exporter may
+  still be writing.
 
 If a consumer must distinguish "this run produced no lineage" from "an older
 run's lineage is still here", give each run its own destination path rather

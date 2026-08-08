@@ -1011,6 +1011,13 @@ fn count_metrics(resources: &[serde_json::Value]) -> Option<u64> {
 }
 
 fn parse_response(signal: OtlpSignal, body: &[u8], sent: u64) -> Option<u64> {
+    // A 200 with no body at all. Collectors and the proxies in front of them
+    // answer this way rather than sending `{}`, and it says the same thing:
+    // accepted, with nothing to report. Treating it as unparseable charged
+    // every such export as wholly rejected.
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Some(0);
+    }
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let response = value.as_object()?;
     if response.is_empty() {
