@@ -2534,6 +2534,12 @@ fn bind_schema_inner(
                 // non-boolean gate a normal type error instead of a runtime
                 // surprise.
                 if let Some(directives) = &config.log {
+                    // A gate is compiled as its own program, so a module alias
+                    // the transform declared is not in scope for it. Module-root
+                    // discovery already walks conditions, so the closure is
+                    // compiled and the alias is available — only the gate's own
+                    // program was missing the declaration that binds it.
+                    let use_prelude = module_use_prelude(&config.cxl.source);
                     let mut compiled: Vec<Option<Arc<TypedProgram>>> =
                         Vec::with_capacity(directives.len());
                     let mut every_condition_bound = true;
@@ -2544,7 +2550,7 @@ fn bind_schema_inner(
                         };
                         match typecheck_cxl(
                             &format!("{name}:log[{index}]:condition"),
-                            &format!("filter {}", condition.source),
+                            &format!("{use_prelude}filter {}", condition.source),
                             &upstream,
                             AggregateMode::Row,
                             span,
@@ -2556,7 +2562,7 @@ fn bind_schema_inner(
                             // ones the gate's evaluator is not allocated to run. A gate
                             // is one predicate; anything else is refused here rather
                             // than reaching the first record.
-                            Ok(typed) if typed.program.statements.len() == 1 => {
+                            Ok(typed) if authored_gate_statements(&typed) == 1 => {
                                 compiled.push(Some(Arc::new(typed)));
                             }
                             Ok(typed) => {
@@ -2564,7 +2570,7 @@ fn bind_schema_inner(
                                     "E373",
                                     format!(
                                         "transform `{name}` log[{index}].condition must be one predicate, but it parses as {} statements; write the gate as a single expression, for example `condition: \"amount > 1 and region == 'eu'\"`",
-                                        typed.program.statements.len()
+                                        authored_gate_statements(&typed)
                                     ),
                                     LabeledSpan::primary(span, "log condition".to_string()),
                                 ));
@@ -4682,6 +4688,43 @@ struct CxlTypecheckCtx<'a> {
     mode: &'a AggregateMode,
     span: Span,
     scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
+}
+
+/// The `use` declarations of a program, rendered back as CXL source.
+///
+/// Reconstructed from the parsed statements rather than sliced out of the
+/// authored text, so an alias reaches a gate in the one canonical spelling
+/// regardless of how it was written.
+fn module_use_prelude(source: &str) -> String {
+    let parsed = cxl::parser::Parser::parse(source);
+    let mut prelude = String::new();
+    for statement in &parsed.ast.statements {
+        if let Statement::UseStmt { path, alias, .. } = statement {
+            prelude.push_str("use ");
+            let segments: Vec<&str> = path.iter().map(AsRef::as_ref).collect();
+            prelude.push_str(&segments.join("."));
+            if let Some(alias) = alias {
+                prelude.push_str(" as ");
+                prelude.push_str(alias);
+            }
+            prelude.push('\n');
+        }
+    }
+    prelude
+}
+
+/// The statements a gate's author actually wrote.
+///
+/// The compiled program carries the transform's `use` declarations ahead of
+/// the predicate, and those are the engine's doing, not the author's — counting
+/// them would reject every gate in a transform that imports a module.
+fn authored_gate_statements(typed: &TypedProgram) -> usize {
+    typed
+        .program
+        .statements
+        .iter()
+        .filter(|statement| !matches!(statement, Statement::UseStmt { .. }))
+        .count()
 }
 
 #[allow(clippy::result_large_err)]

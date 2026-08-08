@@ -15,16 +15,8 @@ use cxl::typecheck::TypedProgram;
 use crate::executor::NullStorage;
 use crate::telemetry::{
     LogEvent, MetricKey, RunCorrelation, Severity, SignalField, SpanFact, SpanName, SpanStatus,
-    TelemetryProducer, unix_nanos_now,
+    TelemetryProducer, bounded_identity, unix_nanos_now,
 };
-
-/// Ceiling on one exported correlation identifier.
-///
-/// Matches the largest `--batch-id` the CLI admits. A correlation value exists
-/// to be joined against the machine stream and the lineage events, both of
-/// which carry it whole, so a lower ceiling here would export an identifier
-/// that silently matches neither.
-const MAX_CORRELATION_BYTES: usize = 256;
 
 /// Logical run correlation supplied by the executor's stable context.
 pub(crate) struct TransformSignalContext<'a> {
@@ -253,15 +245,11 @@ const fn severity(level: LogLevel) -> Severity {
     }
 }
 
+/// Retain one identity string for the dispatcher's lifetime under the same
+/// ceiling the exporter applies, so a name too long to export whole is already
+/// marked here rather than exported as a plausible shorter identity.
 fn bounded_correlation(value: &str) -> Box<str> {
-    if value.len() <= MAX_CORRELATION_BYTES {
-        return value.into();
-    }
-    let mut end = MAX_CORRELATION_BYTES;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].into()
+    bounded_identity(value).into_owned().into_boxed_str()
 }
 
 #[cfg(test)]
@@ -339,6 +327,94 @@ nodes:
             })
             .expect("transform payload");
         (payload.log.clone(), payload.log_conditions.clone())
+    }
+
+    /// Compile a one-transform pipeline whose transform is named `node_name`,
+    /// returning the name the plan kept. Establishes what configuration
+    /// actually admits before the dispatcher is asked to export a span for it.
+    fn compiled_transform_node_name(node_name: &str) -> String {
+        let yaml = format!(
+            r#"
+pipeline:
+  name: node_naming
+nodes:
+  - type: source
+    name: input
+    config:
+      name: input
+      type: csv
+      path: input.csv
+      schema:
+        - {{ name: amount, type: int }}
+  - type: transform
+    name: "{node_name}"
+    input: input
+    config:
+      cxl: |
+        emit amount = amount
+  - type: output
+    name: output
+    input: "{node_name}"
+    config:
+      name: output
+      type: csv
+      path: output.csv
+"#
+        );
+        let plan = parse_config(&yaml)
+            .expect("fixture parses")
+            .compile(&CompileContext::default())
+            .expect("fixture compiles");
+        plan.dag()
+            .graph
+            .node_weights()
+            .find_map(|node| match node {
+                PlanNode::Transform { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .expect("transform node")
+    }
+
+    /// A node name is validated only for duplication, so `normalize orders`
+    /// compiles and runs. Its span has to reach the collector like any other:
+    /// dropping it left the operator with that transform's metrics and authored
+    /// log events present, the span absent, and nothing to explain the gap.
+    #[test]
+    fn a_node_name_the_planner_accepts_still_closes_a_span() {
+        let node_name = compiled_transform_node_name("normalize orders");
+        assert_eq!(
+            node_name, "normalize orders",
+            "configuration applies no grammar to a node name"
+        );
+
+        let (directives, conditions) = compiled_directives(None);
+        let policy = telemetry_policy();
+        let (producer, receiver) = TelemetryArena::reserve(&policy).expect("arena reserves");
+        {
+            let mut dispatcher = LogDispatcher::new(
+                Some(producer),
+                &directives,
+                &conditions,
+                TransformSignalContext {
+                    execution_id: "exec",
+                    batch_id: "batch",
+                    pipeline_name: "node_naming",
+                    logical_node: &node_name,
+                },
+            );
+            dispatcher.fire_before_transform();
+            dispatcher.finish();
+        }
+
+        let mut spans = Vec::new();
+        while let Some(batch) = receiver.try_recv_batch() {
+            spans.extend(batch.traces().iter().map(|span| span.logical_node.clone()));
+        }
+        assert_eq!(
+            spans,
+            vec!["normalize orders".to_string()],
+            "the closed span must carry the authored node name"
+        );
     }
 
     fn telemetry_policy() -> clinker_plan::config::ResolvedObservabilityPolicy {

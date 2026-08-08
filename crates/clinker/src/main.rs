@@ -950,17 +950,23 @@ fn main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
+            // A required lifecycle record the supervisor will never see, at a
+            // point where nothing has been published. That is the documented
+            // 130: the run refuses to publish an outcome it cannot report, and
+            // the attempt's final paths are unchanged. Reporting infrastructure
+            // here instead would make a supervisor classify one condition two
+            // ways depending only on which record happened to fail first.
             if let Some(emitter) = machine.as_ref()
                 && let Err(error) = emitter.emit_started()
             {
                 eprintln!("clinker: cannot write machine protocol: {error}");
-                return ExitCode::from(4);
+                return ExitCode::from(130);
             }
             if let Some(emitter) = machine.as_ref()
                 && let Err(error) = emitter.emit_progress_transition("planning")
             {
                 eprintln!("clinker: cannot write machine protocol: {error}");
-                return ExitCode::from(4);
+                return ExitCode::from(130);
             }
 
             // The executor is fully synchronous — call it directly.
@@ -970,7 +976,11 @@ fn main() -> ExitCode {
                         && let Err(error) = emitter.emit_completed(code)
                     {
                         eprintln!("clinker: cannot write machine terminal event: {error}");
-                        return ExitCode::from(4);
+                        // A run that concluded 130 published nothing, and an
+                        // unwritable terminal does not change that. A run that
+                        // did publish cannot be relabelled a cancellation, so
+                        // there the unreportable terminal is infrastructure.
+                        return ExitCode::from(if code == 130 { 130 } else { 4 });
                     }
                     ExitCode::from(code)
                 }
@@ -2999,12 +3009,17 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             detail: error.to_string(),
         })?;
     if let Some(emitter) = machine {
-        emitter
+        // Required records, and nothing has been staged or published yet. An
+        // I/O failure here is not infrastructure to report as such: it is a
+        // supervisor that will never see this run's outcome, so the run stops
+        // before it can publish one, which is what 130 says.
+        if let Err(error) = emitter
             .emit_plan_resolved(semantic_fingerprint)
-            .map_err(PipelineError::Io)?;
-        emitter
-            .emit_progress_transition("executing")
-            .map_err(PipelineError::Io)?;
+            .and_then(|()| emitter.emit_progress_transition("executing"))
+        {
+            tracing::warn!(error = %error, "machine lifecycle record failed before execution");
+            return Err(PipelineError::Interrupted);
+        }
     }
 
     if args.dry_run && args.dry_run_n.is_none() {
@@ -3618,6 +3633,19 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             // the exact inputs the failure saw (cleanup = on_success); only
             // cleanup = always reaps them on failure.
             source_stager.cleanup(false);
+            // A source cancelled mid-read reports whatever its transport
+            // produced: a file source drains and returns a report flagged
+            // interrupted, while a socket read unwinds with the transport's own
+            // I/O error. Both are one operator action, so normalize before the
+            // outcome is derived — otherwise the same cancellation is an
+            // infrastructure failure or a cancellation depending on which
+            // source noticed first, and under load that varies run to run.
+            let e = if shutdown_token.is_requested() && !matches!(e, PipelineError::Interrupted) {
+                tracing::warn!(error = %e, "cancelled run unwound through a transport error");
+                PipelineError::Interrupted
+            } else {
+                e
+            };
             let terminal_error = match run_attempt.abandon() {
                 Ok(()) => e,
                 Err(attempt_error) => PipelineError::Io(std::io::Error::other(format!(
@@ -4058,10 +4086,16 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             emitter.emit_completed_with_publication(exit_code, publication_outcome.as_ref())
         };
         if let Err(error) = terminal_result {
-            if publication_failure.is_none() {
+            if report.interrupted {
+                // Nothing was published, so the unwritable terminal does not
+                // change what happened to the data: the run is still the
+                // cancellation it already concluded it was.
+                tracing::warn!(error = %error, "machine terminal write failed for an unpublished run");
+            } else if publication_failure.is_none() {
                 return Err(PipelineError::Io(error));
+            } else {
+                tracing::warn!(error = %error, "machine terminal write failed after publication failure");
             }
-            tracing::warn!(error = %error, "machine terminal write failed after publication failure");
         }
     }
 

@@ -134,23 +134,56 @@ pub struct JobFacets {
 }
 
 /// An input or output dataset referenced by a run event.
+///
+/// The spec splits a dataset's facets by where the dataset sits in the event.
+/// `facets` carries facets that describe the dataset itself and are true of it
+/// wherever it appears; `inputFacets` and `outputFacets` carry facets that are
+/// statements about *this run's* read or write of it. The core spec models the
+/// split as two types (`InputDataset` / `OutputDataset`) that each extend one
+/// `Dataset`; one struct with a position-specific bucket per role is the same
+/// shape on the wire, and a dataset only ever occupies one position, so at most
+/// one of the two is ever set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dataset {
     pub namespace: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facets: Option<DatasetFacets>,
+    #[serde(rename = "inputFacets", skip_serializing_if = "Option::is_none")]
+    pub input_facets: Option<InputDatasetFacets>,
+    #[serde(rename = "outputFacets", skip_serializing_if = "Option::is_none")]
+    pub output_facets: Option<OutputDatasetFacets>,
 }
 
-/// The facet bundle attached to a [`Dataset`].
+/// The facet bundle attached to a [`Dataset`] itself, in either position.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatasetFacets {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subset: Option<DatasetSubsetFacet>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symlinks: Option<SymlinksDatasetFacet>,
     #[serde(rename = "columnLineage", skip_serializing_if = "Option::is_none")]
     pub column_lineage: Option<ColumnLineageDatasetFacet>,
+}
+
+/// The facet bundle describing this run's read of an input [`Dataset`].
+///
+/// The subset facet names the concrete members the run actually consumed, which
+/// is a fact about the read and not about the collection, so its schema type is
+/// `InputSubsetInputDatasetFacet` — an `InputDatasetFacet`, admissible here and
+/// nowhere else.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputDatasetFacets {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subset: Option<DatasetSubsetFacet>,
+}
+
+/// The facet bundle describing this run's write of an output [`Dataset`].
+///
+/// Mirrors [`InputDatasetFacets`] for the output position: the subset facet here
+/// is an `OutputSubsetOutputDatasetFacet`, i.e. an `OutputDatasetFacet`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputDatasetFacets {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subset: Option<DatasetSubsetFacet>,
 }
 
 #[cfg(test)]
@@ -211,6 +244,8 @@ mod tests {
                 namespace: "file".to_string(),
                 name: "/data/orders.csv".to_string(),
                 facets: None,
+                input_facets: None,
+                output_facets: None,
             }],
             outputs: vec![Dataset {
                 namespace: "file".to_string(),
@@ -219,6 +254,8 @@ mod tests {
                     column_lineage: Some(facet),
                     ..DatasetFacets::default()
                 }),
+                input_facets: None,
+                output_facets: None,
             }],
         }
     }

@@ -190,8 +190,12 @@ fn otlp_bulkhead_drains_three_signals_and_shares_lifecycle_facts() {
         .expect("fixed observability summary");
     assert_eq!(
         summary.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-        BTreeSet::from(["logs", "metrics", "traces"])
+        BTreeSet::from(["flush_complete", "logs", "metrics", "traces"])
     );
+    // This run's exporter finished, so the counters beside it are a final
+    // accounting rather than whatever had been recorded when a deadline cut
+    // them short. A reader cannot tell those apart without this.
+    assert_eq!(summary["flush_complete"], serde_json::json!(true));
     for signal in ["logs", "metrics", "traces"] {
         let counters = summary[signal].as_object().expect("signal counters");
         assert_eq!(

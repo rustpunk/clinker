@@ -36,7 +36,9 @@ pub use builder::{
     OutputColumnLineage, PlanColumnLineage, column_lineage_external,
     column_lineage_local_diagnostic_paths,
 };
-pub use dataset::{DatasetId, FALLBACK_NAMESPACE, FILE_NAMESPACE, dataset_identity};
+pub use dataset::{
+    DatasetId, FALLBACK_NAMESPACE, FILE_NAMESPACE, RECORD_TYPE_SEPARATOR, dataset_identity,
+};
 pub use delivery::{
     LineageAdmission, LineageDelivery, LineageDeliveryConfig, LineageDeliveryConfigError,
     LineageDeliveryOutcome, LineageDeliveryTerminal,
@@ -52,9 +54,9 @@ pub use openlineage::{
     CLINKER_SEMANTIC_PLAN_FACET_SCHEMA_URL, COLUMN_LINEAGE_FACET_SCHEMA_URL,
     ClinkerFailureRunFacet, ColumnLineageDatasetFacet, Dataset, DatasetFacets, DatasetSubsetFacet,
     ERROR_MESSAGE_FACET_SCHEMA_URL, ErrorMessageRunFacet, EventType, FieldLineage,
-    INPUT_DATASET_SUBSET_FACET_SCHEMA_URL, InputField, JOB_NAMESPACE, Job, JobFacets,
-    OPENLINEAGE_SCHEMA_URL, OUTPUT_DATASET_SUBSET_FACET_SCHEMA_URL, PRODUCER, PipelineJobFacet,
-    Run, RunEvent, RunFacets, RunStatsFacet, SYMLINKS_DATASET_FACET_SCHEMA_URL,
-    SemanticPlanJobFacet, SymlinksDatasetFacet, Transformation, TransformationSubtype,
-    TransformationType, write_ndjson,
+    INPUT_DATASET_SUBSET_FACET_SCHEMA_URL, InputDatasetFacets, InputField, JOB_NAMESPACE, Job,
+    JobFacets, OPENLINEAGE_SCHEMA_URL, OUTPUT_DATASET_SUBSET_FACET_SCHEMA_URL, OutputDatasetFacets,
+    PRODUCER, PipelineJobFacet, Run, RunEvent, RunFacets, RunStatsFacet,
+    SYMLINKS_DATASET_FACET_SCHEMA_URL, SemanticPlanJobFacet, SymlinksDatasetFacet, Transformation,
+    TransformationSubtype, TransformationType, write_ndjson,
 };

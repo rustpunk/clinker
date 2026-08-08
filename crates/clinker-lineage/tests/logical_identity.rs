@@ -213,12 +213,15 @@ nodes:
     );
     let complete = serde_json::to_value(&events[1]).expect("serialize COMPLETE event");
 
+    // The subset facet's schema type is an `InputDatasetFacet`, which the core
+    // spec admits only under `inputFacets`; symlinks is a plain dataset facet
+    // and belongs to the dataset itself, in either position.
     assert_eq!(
         complete["inputs"][0],
         serde_json::json!({
             "namespace": "s3://warehouse",
             "name": "customers",
-            "facets": {
+            "inputFacets": {
                 "subset": {
                     "_producer": "https://github.com/rustpunk/clinker",
                     "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/BaseSubsetDatasetFacet.json#/$defs/InputSubsetInputDatasetFacet",
@@ -226,7 +229,9 @@ nodes:
                         "type": "location",
                         "locations": ["partition=2026-08-05", "partition=2026-08-06"]
                     }
-                },
+                }
+            },
+            "facets": {
                 "symlinks": {
                     "_producer": "https://github.com/rustpunk/clinker",
                     "_schemaURL": "https://openlineage.io/spec/facets/1-0-1/SymlinksDatasetFacet.json",
@@ -248,7 +253,7 @@ nodes:
         serde_json::json!("customers_clean")
     );
     assert_eq!(
-        complete["outputs"][0]["facets"]["subset"],
+        complete["outputs"][0]["outputFacets"]["subset"],
         serde_json::json!({
             "_producer": "https://github.com/rustpunk/clinker",
             "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/BaseSubsetDatasetFacet.json#/$defs/OutputSubsetOutputDatasetFacet",
@@ -257,6 +262,10 @@ nodes:
                 "locations": ["release=current"]
             }
         })
+    );
+    assert!(
+        complete["outputs"][0]["facets"].get("subset").is_none(),
+        "an output-position facet must not ride in the dataset's own facets"
     );
     assert_eq!(
         complete["outputs"][0]["facets"]["symlinks"]["identifiers"],
@@ -414,5 +423,105 @@ nodes:
     assert_eq!(
         input_of("kind"),
         vec![(base.name.clone(), "record_type".to_owned())]
+    );
+}
+
+/// A per-record-type dataset name is its base name with the record type id
+/// concatenated on, so an authored name carrying the separator can produce the
+/// exact `{namespace, name}` pair one of those record types already occupies.
+/// The two logical datasets would then merge in the catalogue and the column
+/// edges of one would be read as the other's — a wrong attribution, which is
+/// worse than a missing one because nothing in the event signals it.
+///
+/// The separator is therefore reserved in an authored *name*. Only the name:
+/// a record type keeps its base's namespace and appends to the name alone, so a
+/// separator in a namespace cannot compose into the ambiguous form.
+#[test]
+fn a_reserved_separator_in_an_authored_name_is_refused() {
+    // The pair the rejected name would have produced is a real record-type
+    // dataset of the pipeline below, bound canonically to `payments`.
+    let identities = LineageIdentityContext::external([
+        LineageNodeBinding::new(
+            "payments",
+            ExternalDatasetIdentity::catalog("analytics", "payments").unwrap(),
+        ),
+        LineageNodeBinding::new(
+            "out",
+            ExternalDatasetIdentity::catalog("analytics", "payments_flat").unwrap(),
+        ),
+    ])
+    .expect("complete context");
+
+    let compiled = parse_config(
+        r#"
+pipeline: { name: separator_collision }
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: fixed_width
+      path: data/payments.txt
+      schema:
+        discriminator: { start: 0, width: 1 }
+        records:
+          - id: detail
+            tag: D
+            columns:
+              - { name: amount, type: int, start: 1, width: 4 }
+  - type: transform
+    name: project
+    input: payments
+    config:
+      cxl: |
+        emit amount = amount
+  - type: output
+    name: out
+    input: project
+    config: { name: out, type: csv, path: out/out.csv }
+"#,
+    )
+    .unwrap()
+    .compile(&CompileContext::default())
+    .unwrap();
+    let lineage = column_lineage_external(&compiled, &identities).unwrap();
+    let record_type = lineage
+        .inputs
+        .iter()
+        .find(|id| id.name.ends_with("detail"))
+        .expect("the detail record type is its own dataset");
+    assert_eq!(record_type.namespace, "analytics");
+    assert_eq!(record_type.name, "payments#detail");
+
+    // Authoring that same pair as a catalog identity is refused, so no second
+    // node can be bound onto the record type's dataset.
+    let collision = ExternalDatasetIdentity::catalog("analytics", "payments#detail")
+        .expect_err("an authored name may not carry the reserved separator");
+    assert_eq!(
+        collision,
+        LineageIdentityError::ReservedRecordTypeSeparator {
+            field: "catalog_name"
+        }
+    );
+    assert!(
+        collision.to_string().contains("payments_detail"),
+        "the diagnostic must offer a corrected form: {collision}"
+    );
+
+    // The same reservation applies to the name half of a canonical datasource.
+    assert_eq!(
+        ExternalDatasetIdentity::canonical("s3://payments-lake/raw/payments#detail")
+            .expect_err("a canonical dataset name may not carry it either"),
+        LineageIdentityError::ReservedRecordTypeSeparator {
+            field: "canonical_datasource"
+        }
+    );
+
+    // A namespace is not composed onto, so it is left alone — refusing it would
+    // be a restriction with no collision behind it.
+    assert!(ExternalDatasetIdentity::catalog("analytics#eu", "payments").is_ok());
+    assert!(
+        ExternalDatasetIdentity::canonical("s3://payments-lake/raw/payments").is_ok(),
+        "a name without the separator is unaffected"
     );
 }

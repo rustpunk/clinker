@@ -450,7 +450,12 @@ fn closed_protocol_stdout_cancels_before_publication() {
     )
     .expect("closed-control run");
 
-    assert_eq!(result.status_code(), Some(4));
+    // 130, and the same 130 wherever the write happens to fail. A supervisor
+    // that closed the stream loses a different record depending on how far the
+    // run got, so deriving the status from which write failed reported one
+    // condition as two, and the assertion below is what makes 130 the right
+    // one: nothing reached a final path.
+    assert_eq!(result.status_code(), Some(130));
     assert_eq!(result.outcome(), ControlledOutcome::Incomplete);
     assert!(result.reaped());
     assert!(!directory.path().join("must-not-publish.csv").exists());

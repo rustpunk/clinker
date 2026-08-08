@@ -80,6 +80,7 @@
 //! - Engine-stamped columns (`$ck.*` / `$meta.*` / `$source.*` / `$widened`) are
 //!   skipped, mirroring the default-writer strip.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -91,7 +92,8 @@ use petgraph::visit::EdgeRef;
 use clinker_plan::config::pipeline_node::MatchMode;
 use clinker_plan::config::{RECORD_TYPE_COLUMN, RecordType, SourceSchema};
 use clinker_plan::plan::combine::encode_chain_column;
-use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::plan::composition_body::BoundBody;
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanEdge, PlanNode};
 use clinker_plan::plan::{
     CompiledPlan, JoinSide, PlanNodeId, PredicateSupport, QualifiedField, predicate_support,
 };
@@ -164,31 +166,36 @@ pub fn column_lineage_local_diagnostic_paths(
     compiled: &CompiledPlan,
     base_dir: &Path,
 ) -> PlanColumnLineage {
-    build_column_lineage(compiled, &|node| Ok(dataset_identity(node, base_dir)), None)
-        .expect("local diagnostic path identity cannot fail")
+    build_column_lineage(
+        compiled,
+        &|node, _| Ok(dataset_identity(node, base_dir)),
+        None,
+    )
+    .expect("local diagnostic path identity cannot fail")
 }
 
 /// Build lineage with an explicit, prevalidated external identity context.
 ///
 /// Unlike [`column_lineage`], this production path never receives a base
 /// directory and cannot derive or hash a source/output path. Every emitted
-/// source and output must have one exact context binding.
+/// source and output must have one exact context binding, keyed by the node's
+/// [qualified name](qualified_node).
 pub fn column_lineage_external(
     compiled: &CompiledPlan,
     identities: &LineageIdentityContext,
 ) -> Result<PlanColumnLineage, LineageIdentityError> {
-    let required = compiled
-        .dag()
-        .graph
-        .node_weights()
-        .filter(|node| matches!(node, PlanNode::Source { .. } | PlanNode::Output { .. }))
-        .map(PlanNode::name);
-    identities.validate_required(required)?;
+    // Enumerated over the same scopes the walk descends into, so a pipeline
+    // whose composition body declares its own source is refused here — naming a
+    // node the author can bind — rather than part-way through the walk, naming
+    // one they cannot.
+    let mut required = Vec::new();
+    for_each_dataset_node(compiled, &mut |key, _| required.push(key.to_string()));
+    identities.validate_required(required.iter().map(String::as_str))?;
     build_column_lineage(
         compiled,
-        &|node| match node {
-            PlanNode::Source { name, .. } | PlanNode::Output { name, .. } => {
-                Ok(Some(identities.require(name)?.dataset_id().clone()))
+        &|node, key| match node {
+            PlanNode::Source { .. } | PlanNode::Output { .. } => {
+                Ok(Some(identities.require(key)?.dataset_id().clone()))
             }
             _ => Ok(None),
         },
@@ -196,8 +203,30 @@ pub fn column_lineage_external(
     )
 }
 
+/// Resolve one dataset node's identity. `key` is the node's
+/// [qualified name](qualified_node); the local diagnostic path ignores it and
+/// reads the declared path off the node instead.
 type DatasetResolver<'a> =
-    dyn Fn(&PlanNode) -> Result<Option<DatasetId>, LineageIdentityError> + 'a;
+    dyn Fn(&PlanNode, &str) -> Result<Option<DatasetId>, LineageIdentityError> + 'a;
+
+/// The identity key of one dataset node: its declared name, prefixed by the
+/// composition call sites it sits under and joined with `.` — `enrich.ref` for
+/// a source declared inside the body bound at node `enrich`.
+///
+/// A bare name cannot key a plan-wide identity table. Body node names live in
+/// their own scope by design (a body node may legally share a name with a
+/// top-level one), so two different datasets would answer to one binding and the
+/// column edges of one would be attributed to the other. `<call site>.<name>` is
+/// also the spelling a channel `sources:` patch already uses to reach a
+/// body-declared source, and it is per call site — which matters, because two
+/// call sites of one body can be patched to read different files.
+fn qualified_node<'a>(scope: &str, name: &'a str) -> Cow<'a, str> {
+    if scope.is_empty() {
+        Cow::Borrowed(name)
+    } else {
+        Cow::Owned(format!("{scope}.{name}"))
+    }
+}
 
 fn build_column_lineage(
     compiled: &CompiledPlan,
@@ -209,16 +238,15 @@ fn build_column_lineage(
     // read from attributing to a source whose document cannot carry the section.
     let declared_sections = declared_doc_sections(compiled, resolve_dataset)?;
 
-    // Top-level scope: nothing pre-seeded.
-    walk_scope(
+    let ctx = WalkContext {
         compiled,
         resolve_dataset,
         identities,
-        compiled.dag(),
-        ScopeSeed::default(),
-        &declared_sections,
-        &mut sink,
-    )?;
+        declared_sections: &declared_sections,
+    };
+
+    // Top-level scope: unqualified, and nothing pre-seeded.
+    walk_scope(&ctx, compiled.dag(), "", ScopeSeed::default(), &mut sink)?;
 
     let outputs = sink
         .output_acc
@@ -230,6 +258,17 @@ fn build_column_lineage(
         input_identity_facets: sink.input_identity_facets,
         outputs,
     })
+}
+
+/// The read-only inputs one whole build shares, constant across every scope the
+/// walk descends into: the plan, how a dataset node's identity is resolved, the
+/// identity context those bindings came from (`None` on the local diagnostic
+/// path), and the per-run envelope-section index that gates `$doc` attribution.
+struct WalkContext<'a> {
+    compiled: &'a CompiledPlan,
+    resolve_dataset: &'a DatasetResolver<'a>,
+    identities: Option<&'a LineageIdentityContext>,
+    declared_sections: &'a HashMap<DatasetId, BTreeSet<String>>,
 }
 
 /// Per-node DIRECT terminal and INDIRECT influence maps produced by one scope
@@ -251,15 +290,16 @@ type ScopeWalkMaps = (
 /// feeding the call site. Those nodes are skipped so their placeholder Source
 /// identity is never resolved (which would inject a phantom input). At the top
 /// level the seed is empty, so this is a behavior-preserving extraction of the
-/// original single-scope walk. `declared_sections` is the per-run envelope
-/// section index that gates `$doc` attribution.
+/// original single-scope walk.
+///
+/// `scope` is the call-site path this DAG sits under — empty at the top level,
+/// and the enclosing composition's [qualified name](qualified_node) inside a
+/// body. Every identity lookup in this scope is keyed by it.
 fn walk_scope(
-    compiled: &CompiledPlan,
-    resolve_dataset: &DatasetResolver<'_>,
-    identities: Option<&LineageIdentityContext>,
+    ctx: &WalkContext<'_>,
     dag: &ExecutionPlanDag,
+    scope: &str,
     seed: ScopeSeed,
-    declared_sections: &HashMap<DatasetId, BTreeSet<String>>,
     sink: &mut ScopeSink,
 ) -> Result<ScopeWalkMaps, LineageIdentityError> {
     // Pre-seeded nodes keep their injected terminals/influence/doc-sources and are
@@ -289,9 +329,12 @@ fn walk_scope(
             continue;
         }
 
+        let node_key = qualified_node(scope, node.name());
+
         // The Source datasets this node draws from, resolved before the per-node
         // match so the emit-walkers can attribute a `$doc` read to them.
-        let node_doc_srcs = node_doc_sources(node, dag, idx, resolve_dataset, &doc_sources)?;
+        let node_doc_srcs =
+            node_doc_sources(node, dag, idx, &node_key, ctx.resolve_dataset, &doc_sources)?;
 
         // Set by the Composition arm to the body's output-port INDIRECT influence,
         // merged into this node's influence below.
@@ -310,8 +353,9 @@ fn walk_scope(
                     if sink.seen_inputs.insert(base.clone()) {
                         sink.inputs.push(base.clone());
                     }
-                    if let Some(binding) =
-                        identities.and_then(|context| context.require(node.name()).ok())
+                    if let Some(binding) = ctx
+                        .identities
+                        .and_then(|context| context.require(&node_key).ok())
                     {
                         sink.input_identity_facets
                             .insert(base.clone(), binding.facets());
@@ -320,7 +364,7 @@ fn walk_scope(
                     // with its own columns, in one physical container. Differing
                     // column sets make them distinct logical datasets rather
                     // than subsets of `base`.
-                    match compiled.bound_schemas().get(node.name()) {
+                    match ctx.compiled.bound_schemas().get(node.name()) {
                         Some(SourceSchema::MultiRecord { record_types, .. }) => {
                             seed_multi_record_source(
                                 node,
@@ -371,7 +415,7 @@ fn walk_scope(
                         &mut emitted,
                         &resolve_unbound,
                         &node_doc_srcs,
-                        declared_sections,
+                        ctx.declared_sections,
                     );
                 }
                 // Output schema = explicit emits + open-row passthrough of the rest.
@@ -416,7 +460,7 @@ fn walk_scope(
                             &residual_docs,
                             field_ref_subtype(&emit.residual),
                             &node_doc_srcs,
-                            declared_sections,
+                            ctx.declared_sections,
                         );
                         let mut agg_docs = Vec::new();
                         aggregate_binding_doc_paths(&emit.residual, compiled, &mut agg_docs);
@@ -425,7 +469,7 @@ fn walk_scope(
                             &agg_docs,
                             Subtype::Aggregation,
                             &node_doc_srcs,
-                            declared_sections,
+                            ctx.declared_sections,
                         );
                     }
                     cols.insert_nonempty(&emit.output_name, terms);
@@ -506,7 +550,7 @@ fn walk_scope(
                             &mut emitted,
                             &resolve_unbound,
                             &node_doc_srcs,
-                            declared_sections,
+                            ctx.declared_sections,
                         );
                         for (name, terms) in emitted {
                             cols.insert_nonempty(&name, terms);
@@ -590,7 +634,7 @@ fn walk_scope(
                 // negligible vs. record volume); nested compositions recurse
                 // through this same arm.
                 let mut cols = ColumnTerminals::new();
-                if let Some(b) = compiled.body_of(*body) {
+                if let Some(b) = ctx.compiled.body_of(*body) {
                     let body_dag = ExecutionPlanDag::from_body(b);
                     // Seed each bound input port's body Source from the parent
                     // producer feeding it (the composition's incoming port-tagged
@@ -598,15 +642,9 @@ fn walk_scope(
                     // body walk skips it rather than resolving its placeholder
                     // identity into a phantom `clinker:<port>` input.
                     let mut seed = ScopeSeed::default();
-                    for edge in dag.graph.edges_directed(idx, Direction::Incoming) {
-                        let Some(port) = edge.weight().port.as_deref() else {
-                            continue;
-                        };
-                        let Some(&body_src_idx) = b.port_name_to_node_idx.get(port) else {
-                            continue;
-                        };
+                    for (body_src_idx, parent_idx) in bound_port_sources(&dag.graph, idx, b) {
                         let body_src_id = b.graph[body_src_idx].id();
-                        let parent_id = dag.graph[edge.source()].id();
+                        let parent_id = dag.graph[parent_idx].id();
                         if let Some(terms) = lineage.get(&parent_id) {
                             seed.lineage.insert(body_src_id, terms.clone());
                         }
@@ -620,15 +658,8 @@ fn walk_scope(
                             seed.doc_sources.insert(body_src_id, ds.clone());
                         }
                     }
-                    let (body_lineage, mut body_influence) = walk_scope(
-                        compiled,
-                        resolve_dataset,
-                        identities,
-                        &body_dag,
-                        seed,
-                        declared_sections,
-                        sink,
-                    )?;
+                    let (body_lineage, mut body_influence) =
+                        walk_scope(ctx, &body_dag, &node_key, seed, sink)?;
                     // Harvest the first declared output port — the records the
                     // composition surfaces, against the single `output_schema` the
                     // node carries — matching the runtime harvest.
@@ -699,7 +730,7 @@ fn walk_scope(
             &lineage,
             &influence,
             &node_doc_srcs,
-            declared_sections,
+            ctx.declared_sections,
         );
         // A composition's in-body INDIRECT influence (filters / joins / group-bys
         // inside the body), harvested at its output port, joins the inherited
@@ -712,10 +743,11 @@ fn walk_scope(
         }
 
         if let PlanNode::Output { .. } = node
-            && let Some(ds) = resolve_dataset(node)?
+            && let Some(ds) = (ctx.resolve_dataset)(node, &node_key)?
         {
-            let identity_facets = identities
-                .and_then(|context| context.require(node.name()).ok())
+            let identity_facets = ctx
+                .identities
+                .and_then(|context| context.require(&node_key).ok())
                 .map_or_else(DatasetIdentityFacets::default, |binding| binding.facets());
             record_output(
                 &mut sink.output_acc,
@@ -965,11 +997,12 @@ fn node_doc_sources(
     node: &PlanNode,
     dag: &ExecutionPlanDag,
     idx: NodeIndex,
+    node_key: &str,
     resolve_dataset: &DatasetResolver<'_>,
     doc_sources: &HashMap<PlanNodeId, BTreeSet<DatasetId>>,
 ) -> Result<BTreeSet<DatasetId>, LineageIdentityError> {
     Ok(match node {
-        PlanNode::Source { .. } => resolve_dataset(node)?.into_iter().collect(),
+        PlanNode::Source { .. } => resolve_dataset(node, node_key)?.into_iter().collect(),
         PlanNode::Combine {
             driving_upstream, ..
         } => {
@@ -1008,12 +1041,87 @@ fn union_doc_sources(
     out
 }
 
+/// The body input-port Sources a Composition call site seeds, each paired with
+/// the parent-scope producer feeding it.
+///
+/// An input port is a real `Source` node in the body DAG, synthesized at bind
+/// time and reached from the call site's port-tagged incoming edges. Both the
+/// walk (which seeds those nodes from the parent rather than resolving their
+/// placeholder identity into a phantom input) and the identity enumeration
+/// (which must skip exactly what the walk skips) read the pairing from here, so
+/// the two cannot drift apart.
+fn bound_port_sources<'a>(
+    graph: &'a petgraph::graph::DiGraph<PlanNode, PlanEdge>,
+    idx: NodeIndex,
+    body: &'a BoundBody,
+) -> impl Iterator<Item = (NodeIndex, NodeIndex)> + 'a {
+    graph
+        .edges_directed(idx, Direction::Incoming)
+        .filter_map(move |edge| {
+            let port = edge.weight().port.as_deref()?;
+            Some((*body.port_name_to_node_idx.get(port)?, edge.source()))
+        })
+}
+
+/// Visit every Source and Output node the lineage walk resolves an identity for,
+/// paired with its [qualified name](qualified_node): the top-level dataset nodes
+/// plus those declared inside every composition body, minus each body's
+/// input-port placeholders.
+///
+/// A composition body may declare its own `type: source` (the shape a channel
+/// `sources:` patch addresses as `<call site>.<source>`), so the plan's dataset
+/// nodes are not the top-level DAG's alone.
+fn for_each_dataset_node<'a>(
+    compiled: &'a CompiledPlan,
+    visit: &mut impl FnMut(&str, &'a PlanNode),
+) {
+    let dag = compiled.dag();
+    visit_scope_dataset_nodes(
+        compiled,
+        &dag.graph,
+        &dag.topo_order,
+        "",
+        &HashSet::new(),
+        visit,
+    );
+}
+
+fn visit_scope_dataset_nodes<'a>(
+    compiled: &'a CompiledPlan,
+    graph: &'a petgraph::graph::DiGraph<PlanNode, PlanEdge>,
+    topo: &'a [NodeIndex],
+    scope: &str,
+    skip: &HashSet<NodeIndex>,
+    visit: &mut impl FnMut(&str, &'a PlanNode),
+) {
+    for &idx in topo {
+        if skip.contains(&idx) {
+            continue;
+        }
+        let node = &graph[idx];
+        let key = qualified_node(scope, node.name());
+        match node {
+            PlanNode::Source { .. } | PlanNode::Output { .. } => visit(&key, node),
+            PlanNode::Composition { body, .. } => {
+                let Some(b) = compiled.body_of(*body) else {
+                    continue;
+                };
+                let seeded: HashSet<NodeIndex> = bound_port_sources(graph, idx, b)
+                    .map(|(port_src, _)| port_src)
+                    .collect();
+                visit_scope_dataset_nodes(compiled, &b.graph, &b.topo_order, &key, &seeded, visit);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Each Source dataset mapped to the envelope section names it declares — the
 /// sections a `$doc.<section>.<field>` read may legitimately resolve against.
-/// Built once from the top-level Source nodes (composition bodies are fed by
-/// synthetic ports, never their own file sources, so they hold no real Source).
-/// A source with no `envelope:` block maps to the empty set, so a `$doc` read is
-/// never attributed to a source whose document cannot carry the section.
+/// Covers every scope, because a composition body's own declared source is a
+/// real envelope-bearing source even though its input ports are not. A source
+/// with no `envelope:` block maps to the empty set, so a `$doc` read is never
+/// attributed to a source whose document cannot carry the section.
 ///
 /// This is the lineage-side counterpart to the planner's per-source E341/E348
 /// section-declaration check: that check rejects an undeclared read against a
@@ -1023,13 +1131,18 @@ fn declared_doc_sections(
     compiled: &CompiledPlan,
     resolve_dataset: &DatasetResolver<'_>,
 ) -> Result<HashMap<DatasetId, BTreeSet<String>>, LineageIdentityError> {
+    let mut dataset_nodes: Vec<(String, &PlanNode)> = Vec::new();
+    for_each_dataset_node(compiled, &mut |key, node| {
+        dataset_nodes.push((key.to_string(), node));
+    });
+
     let mut out: HashMap<DatasetId, BTreeSet<String>> = HashMap::new();
-    let dag = compiled.dag();
-    for &idx in &dag.topo_order {
-        let node = &dag.graph[idx];
-        if let PlanNode::Source { resolved, .. } = node
-            && let Some(ds) = resolve_dataset(node)?
-        {
+    for (key, node) in dataset_nodes {
+        // Only a source carries an envelope; a sink declares no sections.
+        let PlanNode::Source { resolved, .. } = node else {
+            continue;
+        };
+        if let Some(ds) = resolve_dataset(node, &key)? {
             let sections: BTreeSet<String> = resolved
                 .as_ref()
                 .and_then(|payload| payload.source.envelope.as_ref())

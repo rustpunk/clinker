@@ -7,7 +7,10 @@ mod event;
 mod facet;
 mod ndjson;
 
-pub use event::{Dataset, DatasetFacets, EventType, Job, JobFacets, Run, RunEvent, RunFacets};
+pub use event::{
+    Dataset, DatasetFacets, EventType, InputDatasetFacets, Job, JobFacets, OutputDatasetFacets,
+    Run, RunEvent, RunFacets,
+};
 pub use facet::{
     BatchRunFacet, ClinkerFailureRunFacet, ColumnLineageDatasetFacet, DatasetSubsetFacet,
     ErrorMessageRunFacet, FieldLineage, InputField, LocationSubsetCondition, PipelineJobFacet,

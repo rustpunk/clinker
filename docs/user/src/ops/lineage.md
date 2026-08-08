@@ -43,6 +43,27 @@ catalog_namespace = "analytics"
 catalog_name = "customers_clean"
 ```
 
+A source or output declared **inside a composition body** needs its own
+binding, keyed by the call site it belongs to:
+
+```toml
+[[observability.lineage.dataset]]
+node = "enrich_orders.reference_prices"
+canonical_datasource = "s3://warehouse/prices"
+```
+
+Body node names live in their own scope and may legally repeat a top-level
+name, so the key is `<composition node>.<body source>` rather than the bare
+name — two call sites of one body can be pointed at different files, and each
+gets its own identity.
+
+`#` is reserved in an authored dataset **name** (`catalog_name`, or the name
+half of a canonical datasource) because it separates a multi-record source's
+record types from their base dataset. Without the restriction a name like
+`payments#detail` would collide with record type `detail` of a source bound to
+`payments`, and the two would merge in the catalogue — attributing one
+dataset's columns to the other. Namespaces are unaffected.
+
 Clinker validates all required bindings before opening the lineage sink or,
 for `--lineage-events`, discovering sources and creating output attempts.
 Missing, duplicate, partial, ambiguous, or invalid bindings fail as
@@ -75,8 +96,10 @@ The output is [NDJSON](https://github.com/ndjson/ndjson-spec) (one JSON object p
 - **`inputs`** are the source datasets; **`outputs`** are the sink datasets. External mode uses the exact configured canonical or catalog identities, so relocating a pipeline does not change its lineage graph. Explicit `local_diagnostic_paths` compatibility mode instead uses the `file` namespace with resolved paths (and falls back to the `clinker` namespace plus the node name for a network source).
 - The dataset namespace/name identifies the stable collection. A concrete
   logical partition or location would be emitted as the standard role-specific
-  input/output subset facet, and an explicitly authorized alias as the standard
-  symlinks facet; neither is ever inferred from worker paths, attempt paths,
+  input/output subset facet — which rides under `inputFacets` on an input and
+  `outputFacets` on an output, the positions its schema names, not under the
+  dataset-level `facets` — and an explicitly authorized alias as the standard
+  symlinks facet, which is a plain dataset facet and does ride under `facets`; neither is ever inferred from worker paths, attempt paths,
   hashes, or process context. **No pipeline emits either facet today** -- the
   workspace config exposes no subset or symlink fields, so nothing can
   authorize one.

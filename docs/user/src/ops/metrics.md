@@ -283,6 +283,20 @@ Byte-size strings use decimal units (`1KB = 1,000` bytes and
 | `lineage.max_event_bytes` | 64 KiB | 1 MiB and no larger than its lineage queue |
 | `lineage.flush_timeout_ms` | 5,000 | 60,000 |
 
+An exported attribute longer than `max_attribute_bytes` is cut to fit and
+marked with a trailing `…`, and the marker is charged against the same cap, so
+a marked value is never longer than an unmarked one would have been. The mark
+matters because a bare prefix is not obviously a prefix: an amount of
+`123456789` cut to four bytes reads as `1234`, and a timestamp cut short is
+still a well-formed timestamp. A dashboard reading `1…` fails visibly; one
+reading `1234` charts a wrong number. Note that the mark is a signal, not a
+guarantee — a free-text value that genuinely ends in `…` is indistinguishable
+from a truncated one.
+
+Node names are exported verbatim under the same treatment. A name is never
+dropped for the characters it contains, so a Transform named with a space or a
+non-ASCII character still produces a span.
+
 Both delivery paths admit with `drop_policy = "drop-newest"`; there is no
 blocking, unbounded, or disk-spool spelling. The telemetry arena contains two
 disjoint lanes: `trace`, `debug`, and `info` signals occupy the ordinary lane,
@@ -297,6 +311,24 @@ emitting nine per-record `info` events for every `error` still keeps one in ten
 of its errors, and that fraction does not change when the `info` volume does.
 A run that raises its per-record logging therefore does not quietly thin out
 its error reporting.
+
+### What the machine terminal reports about export
+
+Under `--machine ndjson-v1` the terminal event carries an `observability`
+object summarising what the exporter did. It holds one counter group per
+signal — `logs`, `metrics`, and `traces`, each with `accepted`, `rejected`,
+`attempts`, and `failures` — plus `flush_complete`.
+
+Read `flush_complete` before reading the counters. When it is `true` the
+counts are the run's final accounting. When it is `false` the exporter did not
+finish flushing within `flush_timeout_ms`: the counts are what had been
+recorded when that deadline expired, deliveries may still have been in flight,
+and a low `accepted` means "we stopped counting" rather than "the collector
+refused them". Those call for different responses, and only one of them is a
+collector problem.
+
+Delivery outcomes never change execution, publication, or the process exit
+status; the summary is an observation about the export, not about the run.
 
 ### Runtime ownership and failure isolation
 

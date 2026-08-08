@@ -11,7 +11,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -39,6 +39,15 @@ pub(crate) struct ObservabilitySummary {
     pub(crate) logs: SignalSummary,
     pub(crate) metrics: SignalSummary,
     pub(crate) traces: SignalSummary,
+    /// Whether the exporter finished flushing within its deadline.
+    ///
+    /// When false the counters are what had been recorded when the deadline
+    /// expired rather than a final accounting, and deliveries may still have
+    /// been in flight. A supervisor reading a low accepted count needs to know
+    /// which of those two it is looking at, because the answers are "the
+    /// collector rejected them" and "we stopped counting" — and only one of
+    /// those is a collector problem.
+    pub(crate) flush_complete: bool,
 }
 
 /// Aggregate-only visibility for one closed signal kind.
@@ -259,6 +268,7 @@ impl OtlpDeliveryReport {
             logs: self.logs.summary,
             metrics: self.metrics.summary,
             traces: self.traces.summary,
+            flush_complete: true,
         }
     }
 
@@ -347,7 +357,15 @@ impl DeliveryResult {
 }
 
 enum WorkerCommand {
-    Finish(RunLifecycleSnapshot),
+    /// Boxed so the two commands are the same size on the channel: a snapshot
+    /// is two orders of magnitude larger than a drain request, and every send
+    /// would otherwise pay for the larger one.
+    Finish(Box<RunLifecycleSnapshot>),
+    /// Deliver what is buffered and stop, with no lifecycle terminal.
+    ///
+    /// The run never reached its terminal, so there is no snapshot to describe
+    /// one — but the records already produced still describe why.
+    Drain,
 }
 
 /// One finite run's sole telemetry receiver and blocking exporter worker.
@@ -357,6 +375,9 @@ pub(crate) struct OtlpWorker {
     handle: Option<thread::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     flush_timeout: Duration,
+    /// The worker's counters as of its last delivery, readable without the
+    /// completion channel.
+    progress: Arc<Mutex<ObservabilitySummary>>,
 }
 
 impl OtlpWorker {
@@ -377,6 +398,8 @@ impl OtlpWorker {
         let (done_sender, done) = mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
+        let progress = Arc::new(Mutex::new(ObservabilitySummary::default()));
+        let worker_progress = Arc::clone(&progress);
         let flush_timeout = bundle.flush_timeout;
         let handle = thread::Builder::new()
             .name("clinker-otlp-export".to_owned())
@@ -389,6 +412,7 @@ impl OtlpWorker {
                     shutdown,
                     stop: worker_stop,
                     report: OtlpDeliveryReport::default(),
+                    progress: worker_progress,
                     trace_id: new_trace_id(),
                     next_span_id: RUN_SPAN_ID.saturating_add(1),
                     metrics_window_start_unix_nanos: unix_nanos_now(),
@@ -398,8 +422,12 @@ impl OtlpWorker {
                     match commands.recv_timeout(IDLE_POLL) {
                         Ok(WorkerCommand::Finish(snapshot)) => {
                             state.drain_available();
-                            state.deliver_lifecycle(&snapshot);
+                            state.deliver_lifecycle(snapshot.as_ref());
                             let _ = done_sender.try_send(state.report);
+                            return;
+                        }
+                        Ok(WorkerCommand::Drain) => {
+                            state.drain_available();
                             return;
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -417,11 +445,16 @@ impl OtlpWorker {
             handle: Some(handle),
             stop,
             flush_timeout,
+            progress,
         })
     }
 
     pub(crate) fn finish(mut self, snapshot: RunLifecycleSnapshot) -> ObservabilitySummary {
-        if self.command.send(WorkerCommand::Finish(snapshot)).is_err() {
+        if self
+            .command
+            .send(WorkerCommand::Finish(Box::new(snapshot)))
+            .is_err()
+        {
             return ObservabilitySummary::default();
         }
         match self.done.recv_timeout(self.flush_timeout) {
@@ -438,13 +471,18 @@ impl OtlpWorker {
                 // admitted retry-total deadline. Dropping the handle prevents
                 // the optional path from extending the authoritative run.
                 let _ = self.handle.take();
+                // Report what the worker actually recorded. Inventing a summary
+                // here told a supervisor that a run which delivered thousands of
+                // records delivered none, which is the one direction the number
+                // must not be wrong in: it turns a slow flush into an apparent
+                // collector outage.
+                let progress = *self
+                    .progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 ObservabilitySummary {
-                    traces: SignalSummary {
-                        rejected: 1,
-                        failures: 1,
-                        ..SignalSummary::default()
-                    },
-                    ..ObservabilitySummary::default()
+                    flush_complete: false,
+                    ..progress
                 }
             }
         }
@@ -453,7 +491,22 @@ impl OtlpWorker {
 
 impl Drop for OtlpWorker {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        // The worker is constructed before every startup step that can fail,
+        // and the flush is only reached after execution — so a run that fails
+        // during discovery, staging, or sink creation dropped everything it
+        // had already buffered, which is precisely the telemetry describing
+        // that failure. Deliver it instead.
+        //
+        // `finish` takes the handle before returning on its own deadline, so a
+        // flush that already timed out is not joined again here: the optional
+        // path still cannot extend the authoritative run.
+        if let Some(handle) = self.handle.take() {
+            let _ = self.command.try_send(WorkerCommand::Drain);
+            self.stop.store(true, Ordering::Release);
+            let _ = handle.join();
+        } else {
+            self.stop.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -465,6 +518,12 @@ struct WorkerState<'a> {
     shutdown: ShutdownToken,
     stop: Arc<AtomicBool>,
     report: OtlpDeliveryReport,
+    /// The counters so far, readable by the parent.
+    ///
+    /// The full report only crosses the completion channel on a clean
+    /// shutdown, so without this a parent whose flush deadline expired has no
+    /// account of what was delivered and can only invent one.
+    progress: Arc<Mutex<ObservabilitySummary>>,
     /// One run is one trace; every exported span carries this id.
     trace_id: String,
     next_span_id: u64,
@@ -543,6 +602,19 @@ impl WorkerState<'_> {
             Err(_) => DeliveryResult::EncodingFailure,
         };
         self.report.record(signal, result);
+        self.publish_progress();
+    }
+
+    /// Mirror the running counters where the parent can read them.
+    fn publish_progress(&self) {
+        let mut progress = self
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *progress = ObservabilitySummary {
+            flush_complete: false,
+            ..self.report.summary()
+        };
     }
 
     /// Close the current delta window and open the next one.

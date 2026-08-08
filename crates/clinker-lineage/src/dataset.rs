@@ -38,6 +38,18 @@ pub const FILE_NAMESPACE: &str = "file";
 /// naming is intentionally outside this module's scope.
 pub const FALLBACK_NAMESPACE: &str = "clinker";
 
+/// Separates a multi-record source's base dataset name from one record type id
+/// in the composed per-record-type name (`<base><sep><id>`).
+///
+/// Reserved in an authored dataset name, because the composition is plain
+/// concatenation: were it admissible, an authored name ending in
+/// `<sep><some id>` would be the same `{namespace, name}` pair as a record type
+/// of some other source, and the two logical datasets would merge in the
+/// catalogue with the column edges of one attributed to the other.
+/// [`ExternalDatasetIdentity`](crate::logical_identity::ExternalDatasetIdentity)
+/// enforces the reservation where an authored name enters.
+pub const RECORD_TYPE_SEPARATOR: char = '#';
+
 /// A plan-derived OpenLineage dataset identity: the `{namespace, name}` pair
 /// naming one logical input or output dataset.
 ///
@@ -73,8 +85,8 @@ impl DatasetId {
     }
 
     /// One record type of a multi-record flat-file source, as its own logical
-    /// dataset: `base`'s identity with the record type id appended as a `#<id>`
-    /// fragment, keeping `base`'s namespace.
+    /// dataset: `base`'s identity with the record type id appended as a
+    /// [`RECORD_TYPE_SEPARATOR`]-prefixed fragment, keeping `base`'s namespace.
     ///
     /// Record types differ in their *columns*, not in which rows they select, so
     /// they are distinct datasets rather than subsets of a shared one — a subset
@@ -86,7 +98,7 @@ impl DatasetId {
     pub(crate) fn record_type(base: &DatasetId, record_type_id: &str) -> Self {
         Self {
             namespace: base.namespace.clone(),
-            name: format!("{}#{record_type_id}", base.name),
+            name: format!("{}{RECORD_TYPE_SEPARATOR}{record_type_id}", base.name),
         }
     }
 }
@@ -97,6 +109,8 @@ impl From<DatasetId> for Dataset {
             namespace: id.namespace,
             name: id.name,
             facets: None,
+            input_facets: None,
+            output_facets: None,
         }
     }
 }

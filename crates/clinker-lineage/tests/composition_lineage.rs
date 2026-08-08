@@ -445,3 +445,127 @@ nodes:
         "only the real envelope source should be an input"
     );
 }
+
+/// A composition body may declare its own source. It reads a file nothing at
+/// the call site feeds, so it is a logical dataset in its own right — not one
+/// the call site's identity could stand in for — and under external identity
+/// mode the author has to bind it like any other.
+///
+/// It is bound by its call-site path, `<composition>.<source>`, because a body
+/// carries its own node-name space: the pipeline below has a top-level `ref`
+/// and a body `ref`, and a bare key would hand both the same identity and
+/// attribute one's columns to the other. That path is also what a channel
+/// `sources:` patch uses to reach the same source.
+mod body_declared_source {
+    use super::*;
+
+    use clinker_lineage::column_lineage_external;
+    use clinker_lineage::logical_identity::{
+        ExternalDatasetIdentity, LineageIdentityContext, LineageIdentityError, LineageNodeBinding,
+    };
+
+    const PIPELINE: &str = r#"
+pipeline: { name: body_source_identity }
+nodes:
+  - type: source
+    name: ref
+    config:
+      name: ref
+      type: csv
+      path: data/top.csv
+      schema: [{ name: x, type: int }]
+  - type: composition
+    name: enrich
+    input: ref
+    use: ../compositions/own_source.comp.yaml
+    inputs:
+      driver: ref
+  - type: output
+    name: out
+    input: enrich
+    config: { name: out, type: csv, path: out/out.csv }
+"#;
+
+    fn binding(node: &str, name: &str) -> LineageNodeBinding {
+        LineageNodeBinding::new(
+            node,
+            ExternalDatasetIdentity::catalog("analytics", name).expect("catalog identity"),
+        )
+    }
+
+    /// Preflight enumerates the body, so an unbound body source is refused
+    /// before the run starts and the diagnostic names the key that fixes it.
+    #[test]
+    fn an_unbound_body_source_is_named_at_plan_time() {
+        let identities = LineageIdentityContext::external([
+            binding("ref", "top_customers"),
+            binding("out", "enriched"),
+        ])
+        .expect("complete top-level context");
+
+        let err = column_lineage_external(&compile_fixture(PIPELINE), &identities)
+            .expect_err("a body-declared source needs its own identity");
+        assert_eq!(
+            err,
+            LineageIdentityError::MissingNode {
+                node: "enrich.ref".to_string()
+            },
+            "the diagnostic must name the call-site path, which the author can bind"
+        );
+    }
+
+    /// Binding that key resolves it, and the body source stays a distinct
+    /// dataset from the identically-named top-level node.
+    #[test]
+    fn a_bound_body_source_is_its_own_dataset() {
+        let identities = LineageIdentityContext::external([
+            binding("ref", "top_customers"),
+            binding("enrich.ref", "reference_codes"),
+            binding("out", "enriched"),
+        ])
+        .expect("complete context");
+
+        let lineage = column_lineage_external(&compile_fixture(PIPELINE), &identities)
+            .expect("every dataset node is bound");
+
+        let names: Vec<&str> = lineage.inputs.iter().map(|id| id.name.as_str()).collect();
+        assert!(
+            names.contains(&"top_customers") && names.contains(&"reference_codes"),
+            "both sources are declared inputs, under their own identities: {names:?}"
+        );
+        assert_eq!(
+            lineage.outputs[0].dataset.name, "enriched",
+            "the sink keeps its own binding"
+        );
+
+        // The output column the body produces derives from the body source's
+        // column, so the edge lands on the body source's identity.
+        let label = lineage.outputs[0]
+            .facet
+            .fields
+            .get("label")
+            .expect("the body's emitted column reaches the sink");
+        assert_eq!(
+            label
+                .input_fields
+                .iter()
+                .map(|f| (f.name.as_str(), f.field.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("reference_codes", "code")]
+        );
+    }
+
+    /// The same pipeline under local diagnostic paths — the mode that already
+    /// walked body sources — resolves both to distinct path-derived datasets.
+    /// External mode now reaches the same node set rather than aborting.
+    #[test]
+    fn local_diagnostic_paths_resolve_the_same_node_set() {
+        let lineage = lineage_of(PIPELINE);
+        let names: Vec<&str> = lineage.inputs.iter().map(|id| id.name.as_str()).collect();
+        assert!(
+            names.contains(&file_dataset("data/top.csv").as_str())
+                && names.contains(&file_dataset("data/ref.csv").as_str()),
+            "both sources are inputs under their declared paths: {names:?}"
+        );
+    }
+}

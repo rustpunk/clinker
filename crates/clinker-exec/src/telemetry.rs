@@ -5,6 +5,7 @@
 //! limiting, and severity routing all run before a byte becomes retained.
 //! Producers never block, grow the arena, spill, or write the metrics spool.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::{self, Write};
@@ -150,14 +151,43 @@ pub enum SpanStatus {
 /// lets sampling, lane routing, or a full arena deliver one without the other.
 /// The live "this transform has begun" signal is the `TransformStarted`
 /// metric, which is still recorded before the work runs.
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug)]
 pub struct SpanFact<'a> {
     pub name: SpanName,
     pub status: SpanStatus,
+    /// The authored pipeline node this span covers, verbatim. Configuration
+    /// applies no grammar to a node name, so neither does this: the name is
+    /// carried whole under a fixed identity ceiling and nothing else.
     pub logical_node: &'a str,
     /// Span boundaries as Unix nanoseconds, `started_at <= ended_at`.
     pub started_at_unix_nanos: u64,
     pub ended_at_unix_nanos: u64,
+}
+
+impl Serialize for SpanFact<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            name: SpanName,
+            status: SpanStatus,
+            logical_node: &'a str,
+            started_at_unix_nanos: u64,
+            ended_at_unix_nanos: u64,
+        }
+
+        let logical_node = bounded_identity(self.logical_node);
+        Wire {
+            name: self.name,
+            status: self.status,
+            logical_node: &logical_node,
+            started_at_unix_nanos: self.started_at_unix_nanos,
+            ended_at_unix_nanos: self.ended_at_unix_nanos,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// Wall clock as Unix nanoseconds, saturating at the epoch.
@@ -372,11 +402,16 @@ impl TelemetryProducer {
     }
 
     /// Admit one closed trace fact without accepting arbitrary attributes.
+    ///
+    /// A span carries no identity grammar. Its `logical_node` is an authored
+    /// pipeline node name, and configuration constrains those only for
+    /// duplication — so any rule imposed here would reject names the planner
+    /// accepts and compiles, leaving that transform's metrics and authored log
+    /// events in the collector with its span missing and nothing to explain the
+    /// hole. Serialization instead bounds the name to the same identity ceiling
+    /// the run correlation ids use, and marks it when that ceiling bites — which
+    /// keeps the fixed arena budget without discarding the fact.
     pub fn emit_span(&self, span: SpanFact<'_>) -> AdmissionOutcome {
-        if !valid_logical_identity(span.logical_node) {
-            self.stats.invalid.fetch_add(1, Ordering::Relaxed);
-            return AdmissionOutcome::Dropped(DropReason::InvalidLogicalIdentity);
-        }
         let lane = if span.status == SpanStatus::Error {
             AdmissionLane::HighSeverity
         } else {
@@ -685,7 +720,7 @@ impl Serialize for FilteredFields<'_> {
                 FieldPolicyAction::Allow => match field.value {
                     SignalValue::Text(value) => map.serialize_entry(
                         field.name,
-                        truncate_utf8(value, self.policy.max_attribute_bytes() as usize),
+                        &bounded_utf8(value, self.policy.max_attribute_bytes() as usize),
                     )?,
                     SignalValue::Record(value) => {
                         let value = render_record_value_bounded(
@@ -706,7 +741,7 @@ impl Serialize for FilteredFields<'_> {
                     let replacement = rule.replacement().unwrap_or("[redacted]");
                     map.serialize_entry(
                         field.name,
-                        truncate_utf8(replacement, self.policy.max_attribute_bytes() as usize),
+                        &bounded_utf8(replacement, self.policy.max_attribute_bytes() as usize),
                     )?;
                 }
             }
@@ -811,10 +846,17 @@ impl fmt::Write for BoundedString {
     }
 }
 
+/// Render one typed record value, marked when the byte cap cut it short.
+///
+/// [`BoundedString`] reports the cut by returning `fmt::Error`, which is the
+/// only signal available here: the rendering is produced incrementally and
+/// never materializes the full value to compare lengths against.
 fn render_record_value_bounded(value: &Value, max_bytes: usize) -> String {
     let mut bounded = BoundedString::new(max_bytes);
-    let _ = fmt::write(&mut bounded, format_args!("{value}"));
-    bounded.value
+    if fmt::write(&mut bounded, format_args!("{value}")).is_ok() {
+        return bounded.value;
+    }
+    mark_truncated(&bounded.value, max_bytes)
 }
 
 struct LimitProbe {
@@ -866,6 +908,58 @@ fn field_rule<'a>(
         .find(|rule| rule.event() == event && rule.field() == field)
 }
 
+/// Ceiling on one exported identity string: a run correlation id, or the
+/// logical node name on a span.
+///
+/// Matches the largest `--batch-id` the CLI admits. An identity exists to be
+/// joined against the machine stream and the lineage events, both of which
+/// carry it whole, so a lower ceiling here would export an identifier that
+/// silently matches neither.
+pub(crate) const MAX_IDENTITY_BYTES: usize = 256;
+
+/// Appended to any exported value a byte cap forced short.
+///
+/// A consumer reading an exported attribute has no other way to tell a whole
+/// value from its prefix. Capped at four bytes, an `amount` of `123456789`
+/// exports as `1234`, an ISO timestamp exports as a shorter but well-formed
+/// date, and an array exports as a plausible shorter array — each of which a
+/// dashboard or alert rule will happily compute against. The marker is a single
+/// character that appears in no number, timestamp, or bare identifier, so those
+/// consumers fail on the value instead of trusting it.
+const TRUNCATION_MARKER: &str = "…";
+
+/// Return `value` under `max_bytes`, marked when the cap forced it short.
+///
+/// The marker is charged against the same cap, so the result never exceeds
+/// `max_bytes` and the fixed arena budget is unchanged. `max_attribute_bytes`
+/// admits values below the marker's own width; at those settings the result is
+/// whatever fits of the marker alone, never a bare data prefix that would read
+/// as complete.
+pub(crate) fn bounded_utf8(value: &str, max_bytes: usize) -> Cow<'_, str> {
+    if value.len() <= max_bytes {
+        return Cow::Borrowed(value);
+    }
+    Cow::Owned(mark_truncated(value, max_bytes))
+}
+
+/// Bound one exported identity string against [`MAX_IDENTITY_BYTES`].
+pub(crate) fn bounded_identity(value: &str) -> Cow<'_, str> {
+    bounded_utf8(value, MAX_IDENTITY_BYTES)
+}
+
+/// Cut `value` to leave room for [`TRUNCATION_MARKER`] and append it.
+///
+/// `value` may already sit at the cap, so the head is re-cut rather than
+/// assumed short enough.
+fn mark_truncated(value: &str, max_bytes: usize) -> String {
+    let head = truncate_utf8(value, max_bytes.saturating_sub(TRUNCATION_MARKER.len()));
+    let marker = truncate_utf8(TRUNCATION_MARKER, max_bytes);
+    let mut marked = String::with_capacity(head.len() + marker.len());
+    marked.push_str(head);
+    marked.push_str(marker);
+    marked
+}
+
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
     if value.len() <= max_bytes {
         return value;
@@ -877,6 +971,15 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
     &value[..end]
 }
 
+/// Return whether an event name is one deployment field policy can address.
+///
+/// This mirrors the dotted-identifier grammar `clinker-plan` enforces on a log
+/// directive's `name`, where an author gets a diagnostic naming the offending
+/// input. The two rules agree by construction: the planner's grammar is the
+/// stricter of the pair, so a compiled directive always passes here and a
+/// rejection means the event reached the producer from somewhere other than an
+/// authored directive. Node names carry no such grammar and are not checked
+/// here — see [`TelemetryProducer::emit_span`].
 fn valid_logical_identity(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -1146,5 +1249,310 @@ impl RetainedAccounting {
                 self.high.fetch_sub(bytes, Ordering::AcqRel);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clinker_plan::config::{ClinkerToml, ResolvedObservabilityPolicy};
+    use clinker_record::Value;
+
+    use super::{
+        AdmissionOutcome, DropReason, LogEvent, MAX_IDENTITY_BYTES, RunCorrelation, Severity,
+        SignalField, SpanFact, SpanName, SpanStatus, TRUNCATION_MARKER, TelemetryArena,
+        TelemetryProducer, TelemetryReceiver, bounded_utf8,
+    };
+
+    /// A policy whose only variable is the attribute cap under test. Declares
+    /// one `allow` field and one `replace` field so both rendering paths are
+    /// reachable from the same event.
+    fn policy(max_attribute_bytes: &str, replacement: &str) -> ResolvedObservabilityPolicy {
+        let text = format!(
+            r#"
+[observability]
+arena_bytes = "768KB"
+ordinary_lane_bytes = "512KB"
+high_severity_lane_bytes = "256KB"
+max_batch_bytes = "8KB"
+max_attributes_per_event = 8
+max_attribute_bytes = "{max_attribute_bytes}"
+drop_policy = "drop-newest"
+sample_every = 1
+rate_limit_per_second = 100000
+rate_limit_burst = 100000
+flush_timeout_ms = 1000
+
+[observability.otlp]
+endpoint = "https://collector.invalid"
+connect_timeout_ms = 100
+request_timeout_ms = 200
+retry_max_attempts = 1
+retry_total_timeout_ms = 500
+max_response_bytes = "1KB"
+
+[observability.otlp.auth]
+mode = "none"
+
+[observability.lineage]
+queue_bytes = "1KB"
+max_event_bytes = "512B"
+drop_policy = "drop-newest"
+flush_timeout_ms = 500
+identity_mode = "local_diagnostic_paths"
+
+[[observability.field_policy]]
+event = "transform.seen"
+field = "amount"
+action = "allow"
+
+[[observability.field_policy]]
+event = "transform.seen"
+field = "region"
+action = "replace"
+replacement = "{replacement}"
+"#
+        );
+        ClinkerToml::parse(&text)
+            .expect("telemetry policy parses")
+            .resolve_observability(None)
+            .expect("telemetry policy resolves")
+    }
+
+    fn arena(max_attribute_bytes: &str) -> (TelemetryProducer, TelemetryReceiver) {
+        TelemetryArena::reserve(&policy(max_attribute_bytes, "[region]")).expect("arena reserves")
+    }
+
+    fn correlation() -> RunCorrelation<&'static str> {
+        RunCorrelation {
+            execution_id: "execution-1",
+            batch_id: "batch-1",
+            pipeline_name: "pipeline-1",
+        }
+    }
+
+    fn span(logical_node: &str) -> SpanFact<'_> {
+        SpanFact {
+            name: SpanName::Transform,
+            status: SpanStatus::Ok,
+            logical_node,
+            started_at_unix_nanos: 10,
+            ended_at_unix_nanos: 20,
+        }
+    }
+
+    /// Admit one span and return the logical node name that reached the
+    /// receiver, or `None` when the span never arrived.
+    fn exported_node_name(logical_node: &str) -> Option<String> {
+        let (producer, receiver) = arena("256B");
+        let outcome = producer.emit_span(span(logical_node));
+        assert!(
+            outcome.is_accepted(),
+            "span for {logical_node:?} was not admitted: {outcome:?}"
+        );
+        let batch = receiver.try_recv_batch()?;
+        batch
+            .traces()
+            .iter()
+            .map(|trace| trace.logical_node.clone())
+            .next()
+    }
+
+    /// Admit one log carrying `value` under `field` and return the attribute
+    /// the receiver saw.
+    fn exported_attribute(
+        max_attribute_bytes: &str,
+        field: &str,
+        value: SignalField<'_>,
+    ) -> String {
+        let (producer, receiver) = arena(max_attribute_bytes);
+        let outcome = producer.emit_log(LogEvent {
+            event: "transform.seen",
+            severity: Severity::Info,
+            message: "seen",
+            correlation: correlation(),
+            fields: &[value],
+        });
+        assert!(outcome.is_accepted(), "log was not admitted: {outcome:?}");
+        let batch = receiver
+            .try_recv_batch()
+            .expect("admitted log is drainable");
+        batch.logs()[0]
+            .fields
+            .get(field)
+            .unwrap_or_else(|| panic!("field {field} is missing: {:?}", batch.logs()[0]))
+            .clone()
+    }
+
+    /// Configuration validates node names only for duplication, so every one of
+    /// these compiles and runs. Each must reach a collector as its own span:
+    /// dropping one leaves that transform's metrics and authored log events in
+    /// place with the span missing, which reads as a collector fault.
+    #[test]
+    fn every_node_name_configuration_accepts_reaches_the_collector() {
+        for name in [
+            "normalize orders",
+            "orders+returns",
+            "stage:normalize",
+            "récapitulatif",
+            "订单",
+            "normalize/orders",
+            "(unnamed)",
+        ] {
+            assert_eq!(
+                exported_node_name(name).as_deref(),
+                Some(name),
+                "a node named {name:?} must export its span verbatim"
+            );
+        }
+    }
+
+    /// The conventional name shape keeps working; without this the test above
+    /// would pass on an exporter that mangles every name equally.
+    #[test]
+    fn conventional_node_name_is_unchanged() {
+        assert_eq!(
+            exported_node_name("normalize_orders").as_deref(),
+            Some("normalize_orders")
+        );
+    }
+
+    /// A name past the identity ceiling is exported marked rather than as a
+    /// shorter name that would read as a different, real node.
+    #[test]
+    fn node_name_over_the_identity_ceiling_is_marked() {
+        let name = "n".repeat(MAX_IDENTITY_BYTES + 40);
+        let exported = exported_node_name(&name).expect("an over-long name still exports a span");
+        assert!(
+            exported.len() <= MAX_IDENTITY_BYTES,
+            "the identity ceiling still binds: {} bytes",
+            exported.len()
+        );
+        assert!(
+            exported.ends_with(TRUNCATION_MARKER),
+            "a shortened node name must say so: {exported:?}"
+        );
+        assert!(
+            exported.starts_with("nnn"),
+            "the retained prefix is the authored name: {exported:?}"
+        );
+    }
+
+    /// The event name is a different vocabulary from the node name: it is
+    /// matched by deployment field policy and `clinker-plan` enforces a dotted
+    /// identifier grammar on it with a diagnostic. That gate stays.
+    #[test]
+    fn event_name_outside_the_authored_grammar_is_refused() {
+        let (producer, _receiver) = arena("256B");
+        let outcome = producer.emit_log(LogEvent {
+            event: "transform seen",
+            severity: Severity::Info,
+            message: "seen",
+            correlation: correlation(),
+            fields: &[],
+        });
+        assert_eq!(
+            outcome,
+            AdmissionOutcome::Dropped(DropReason::InvalidLogicalIdentity)
+        );
+        assert_eq!(producer.snapshot().invalid_drops, 1);
+    }
+
+    #[test]
+    fn attribute_under_the_cap_is_exported_whole_and_unmarked() {
+        let exported = exported_attribute("64B", "amount", SignalField::new("amount", "123456789"));
+        assert_eq!(exported, "123456789");
+        assert!(!exported.contains(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn attribute_over_the_cap_is_marked_and_stays_within_the_cap() {
+        let exported = exported_attribute("4B", "amount", SignalField::new("amount", "123456789"));
+        assert!(
+            exported.len() <= 4,
+            "the byte cap still binds: {exported:?} is {} bytes",
+            exported.len()
+        );
+        assert!(
+            exported.ends_with(TRUNCATION_MARKER),
+            "a shortened amount must not read as a complete one: {exported:?}"
+        );
+        assert_ne!(exported, "1234", "the bare prefix is a plausible amount");
+    }
+
+    /// The cap lands inside a two-byte character. The retained prefix must stop
+    /// at the preceding boundary, and the marker still has to fit.
+    #[test]
+    fn attribute_cut_inside_a_character_keeps_valid_utf8() {
+        let exported = exported_attribute("8B", "amount", SignalField::new("amount", "ααααα"));
+        assert_eq!(exported, "αα…");
+        assert!(exported.len() <= 8, "{} bytes", exported.len());
+    }
+
+    /// The typed record path renders incrementally and learns of the cut only
+    /// from its writer, so it needs its own coverage.
+    #[test]
+    fn typed_record_value_over_the_cap_is_marked() {
+        let value = Value::Integer(123_456_789);
+        let exported =
+            exported_attribute("4B", "amount", SignalField::from_record("amount", &value));
+        assert_eq!(exported, "1…");
+    }
+
+    #[test]
+    fn typed_record_value_under_the_cap_is_exported_whole() {
+        let value = Value::Integer(12);
+        let exported =
+            exported_attribute("4B", "amount", SignalField::from_record("amount", &value));
+        assert_eq!(exported, "12");
+    }
+
+    /// A replacement is author-supplied text and can exceed the cap like any
+    /// other value.
+    #[test]
+    fn replacement_over_the_cap_is_marked() {
+        let policy = policy("6B", "[redacted-by-policy]");
+        let (producer, receiver) = TelemetryArena::reserve(&policy).expect("arena reserves");
+        let outcome = producer.emit_log(LogEvent {
+            event: "transform.seen",
+            severity: Severity::Info,
+            message: "seen",
+            correlation: correlation(),
+            fields: &[SignalField::new("region", "north")],
+        });
+        assert!(outcome.is_accepted(), "log was not admitted: {outcome:?}");
+        let batch = receiver
+            .try_recv_batch()
+            .expect("admitted log is drainable");
+        let exported = batch.logs()[0]
+            .fields
+            .get("region")
+            .expect("replaced field is retained");
+        assert_eq!(exported, "[re…");
+        assert!(exported.len() <= 6, "{} bytes", exported.len());
+    }
+
+    /// `max_attribute_bytes` accepts any nonzero size, including caps narrower
+    /// than the marker. Those export only what fits of the marker, never a data
+    /// prefix a consumer would read as the whole value.
+    #[test]
+    fn cap_narrower_than_the_marker_exports_no_data_prefix() {
+        for cap in 0..TRUNCATION_MARKER.len() {
+            let bounded = bounded_utf8("123456789", cap);
+            assert!(
+                bounded.len() <= cap,
+                "cap {cap} produced {} bytes: {bounded:?}",
+                bounded.len()
+            );
+            assert!(
+                !bounded.chars().any(char::is_numeric),
+                "cap {cap} leaked a data prefix: {bounded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn value_exactly_at_the_cap_is_not_marked() {
+        let bounded = bounded_utf8("1234", 4);
+        assert_eq!(bounded, "1234");
     }
 }

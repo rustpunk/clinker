@@ -19,8 +19,9 @@ use crate::builder::PlanColumnLineage;
 use crate::logical_identity::{DatasetIdentityFacets, DatasetSubsetDirection};
 use crate::openlineage::{
     BatchRunFacet, ClinkerFailureRunFacet, Dataset, DatasetFacets, DatasetSubsetFacet,
-    ErrorMessageRunFacet, EventType, Job, OPENLINEAGE_SCHEMA_URL, PRODUCER, Run, RunEvent,
-    RunFacets, RunStatsFacet, SemanticPlanJobFacet, SymlinksDatasetFacet,
+    ErrorMessageRunFacet, EventType, InputDatasetFacets, Job, OPENLINEAGE_SCHEMA_URL,
+    OutputDatasetFacets, PRODUCER, Run, RunEvent, RunFacets, RunStatsFacet, SemanticPlanJobFacet,
+    SymlinksDatasetFacet,
 };
 
 /// The input datasets of a run, as bare identities (no facets).
@@ -28,21 +29,34 @@ fn input_identities(lineage: &PlanColumnLineage) -> Vec<Dataset> {
     lineage.inputs.iter().cloned().map(Dataset::from).collect()
 }
 
-fn standard_identity_facets(
-    identity: &DatasetIdentityFacets,
-    direction: DatasetSubsetDirection,
-) -> Option<DatasetFacets> {
-    let subset = DatasetSubsetFacet::new(identity.subsets(), direction);
-    let symlinks = (!identity.symlinks().is_empty())
-        .then(|| SymlinksDatasetFacet::new(identity.symlinks().to_vec()));
-    if subset.is_none() && symlinks.is_none() {
+/// The alternate identities authorized for a dataset, as the dataset-level
+/// facet bundle.
+///
+/// A symlink is true of the dataset wherever it appears, so it belongs to the
+/// dataset itself; the subset facet is a claim about this run's read or write
+/// and rides in the position bucket instead — see [`subset_facet`].
+fn symlink_facets(identity: &DatasetIdentityFacets) -> Option<DatasetFacets> {
+    if identity.symlinks().is_empty() {
         return None;
     }
     Some(DatasetFacets {
-        subset,
-        symlinks,
+        symlinks: Some(SymlinksDatasetFacet::new(identity.symlinks().to_vec())),
         column_lineage: None,
     })
+}
+
+/// The concrete members this run consumed or produced, as a role-specific
+/// subset facet.
+///
+/// Its schema type is `InputSubsetInputDatasetFacet` or
+/// `OutputSubsetOutputDatasetFacet` — an `InputDatasetFacet` / `OutputDatasetFacet`
+/// respectively — so a conformant consumer looks for it under `inputFacets` or
+/// `outputFacets`, never under the dataset's own `facets`.
+fn subset_facet(
+    identity: &DatasetIdentityFacets,
+    direction: DatasetSubsetDirection,
+) -> Option<DatasetSubsetFacet> {
+    DatasetSubsetFacet::new(identity.subsets(), direction)
 }
 
 /// The input datasets of a completed/terminal run with their authorized
@@ -53,12 +67,14 @@ fn inputs_with_identity_facets(lineage: &PlanColumnLineage) -> Vec<Dataset> {
         .iter()
         .cloned()
         .map(|identity| {
-            let facets = lineage
-                .input_identity_facets
-                .get(&identity)
-                .and_then(|facts| standard_identity_facets(facts, DatasetSubsetDirection::Input));
+            let facts = lineage.input_identity_facets.get(&identity);
             let mut dataset = Dataset::from(identity);
-            dataset.facets = facets;
+            dataset.facets = facts.and_then(symlink_facets);
+            dataset.input_facets = facts
+                .and_then(|facts| subset_facet(facts, DatasetSubsetDirection::Input))
+                .map(|subset| InputDatasetFacets {
+                    subset: Some(subset),
+                });
             dataset
         })
         .collect()
@@ -83,11 +99,15 @@ fn outputs_with_lineage(lineage: &PlanColumnLineage) -> Vec<Dataset> {
         .iter()
         .map(|out| {
             let mut dataset = Dataset::from(out.dataset.clone());
-            let mut facets =
-                standard_identity_facets(&out.identity_facets, DatasetSubsetDirection::Output)
-                    .unwrap_or_default();
+            let mut facets = symlink_facets(&out.identity_facets).unwrap_or_default();
             facets.column_lineage = Some(out.facet.clone());
             dataset.facets = Some(facets);
+            dataset.output_facets =
+                subset_facet(&out.identity_facets, DatasetSubsetDirection::Output).map(|subset| {
+                    OutputDatasetFacets {
+                        subset: Some(subset),
+                    }
+                });
             dataset
         })
         .collect()
@@ -264,6 +284,7 @@ mod tests {
     use super::*;
     use crate::builder::OutputColumnLineage;
     use crate::dataset::DatasetId;
+    use crate::logical_identity::LineageIdentityContext;
     use crate::openlineage::{
         CLINKER_PIPELINE_FACET_SCHEMA_URL, COLUMN_LINEAGE_FACET_SCHEMA_URL,
         ColumnLineageDatasetFacet, JobFacets, PipelineJobFacet,
@@ -378,6 +399,113 @@ mod tests {
                 .is_some(),
             "an executed run must still report its counts"
         );
+    }
+
+    /// The subset facet is a claim about this run's read or write, so its schema
+    /// type is `InputSubsetInputDatasetFacet` / `OutputSubsetOutputDatasetFacet`
+    /// — an `InputDatasetFacet` / `OutputDatasetFacet`. A consumer following
+    /// those schemas looks under `inputFacets` / `outputFacets` and would find
+    /// nothing if the facet rode in the dataset's own `facets`, so the emitted
+    /// position and the pinned schema URL have to agree. Symlinks and column
+    /// lineage are plain dataset facets and stay in `facets`.
+    #[test]
+    fn subset_rides_in_the_position_bucket_its_schema_names() {
+        use crate::logical_identity::{
+            DatasetIdentifierType, DatasetSubset, ExternalDatasetIdentity, LineageNodeBinding,
+            SymlinkIdentifier,
+        };
+        use crate::openlineage::{
+            INPUT_DATASET_SUBSET_FACET_SCHEMA_URL, OUTPUT_DATASET_SUBSET_FACET_SCHEMA_URL,
+        };
+
+        let read = LineageNodeBinding::new(
+            "in",
+            ExternalDatasetIdentity::catalog("analytics", "orders").unwrap(),
+        )
+        .with_subset(DatasetSubset::input("dt=2026-08-07").unwrap())
+        .with_symlink(
+            SymlinkIdentifier::new("hive://cluster", "db.orders", DatasetIdentifierType::Table)
+                .unwrap(),
+        );
+        let written = LineageNodeBinding::new(
+            "out",
+            ExternalDatasetIdentity::catalog("analytics", "summary").unwrap(),
+        )
+        .with_subset(DatasetSubset::output("dt=2026-08-07").unwrap());
+
+        let mut lineage = sample_lineage();
+        lineage.input_identity_facets = BTreeMap::from([(
+            lineage.inputs[0].clone(),
+            LineageIdentityContext::external([read])
+                .unwrap()
+                .require("in")
+                .unwrap()
+                .facets(),
+        )]);
+        lineage.outputs[0].identity_facets = LineageIdentityContext::external([written])
+            .unwrap()
+            .require("out")
+            .unwrap()
+            .facets();
+
+        let complete = terminal_event(&lineage, sample_job(), &lifecycle(Terminal::Complete));
+        let v = serde_json::to_value(&complete).unwrap();
+
+        let input = &v["inputs"][0];
+        assert_eq!(
+            input["inputFacets"]["subset"]["inputCondition"]["locations"][0],
+            "dt=2026-08-07"
+        );
+        assert_eq!(
+            input["inputFacets"]["subset"]["_schemaURL"],
+            INPUT_DATASET_SUBSET_FACET_SCHEMA_URL
+        );
+        assert!(
+            input["facets"].get("subset").is_none(),
+            "an input-position facet must not ride in the dataset's own facets"
+        );
+        // A symlink is true of the dataset in any position, so it stays put.
+        assert_eq!(
+            input["facets"]["symlinks"]["identifiers"][0]["name"],
+            "db.orders"
+        );
+
+        let output = &v["outputs"][0];
+        assert_eq!(
+            output["outputFacets"]["subset"]["outputCondition"]["locations"][0],
+            "dt=2026-08-07"
+        );
+        assert_eq!(
+            output["outputFacets"]["subset"]["_schemaURL"],
+            OUTPUT_DATASET_SUBSET_FACET_SCHEMA_URL
+        );
+        assert!(output["facets"].get("subset").is_none());
+        assert!(
+            output["facets"]["columnLineage"].is_object(),
+            "column lineage is a plain dataset facet and stays in `facets`"
+        );
+        assert!(
+            output.get("inputFacets").is_none(),
+            "a dataset occupies one position, so only that position's bucket is set"
+        );
+
+        let back: RunEvent =
+            serde_json::from_str(&serde_json::to_string(&complete).unwrap()).expect("round trip");
+        assert_eq!(complete, back);
+    }
+
+    /// A dataset with no authorized subset carries neither position bucket, so
+    /// the keys are absent rather than serialized as empty objects.
+    #[test]
+    fn position_buckets_are_omitted_without_a_subset() {
+        let complete = terminal_event(
+            &sample_lineage(),
+            sample_job(),
+            &lifecycle(Terminal::Complete),
+        );
+        let v = serde_json::to_value(&complete).unwrap();
+        assert!(v["inputs"][0].get("inputFacets").is_none());
+        assert!(v["outputs"][0].get("outputFacets").is_none());
     }
 
     #[test]

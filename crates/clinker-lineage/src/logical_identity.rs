@@ -15,7 +15,7 @@ use clinker_plan::config::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::dataset::DatasetId;
+use crate::dataset::{DatasetId, RECORD_TYPE_SEPARATOR};
 
 /// Whether a concrete logical subset was consumed or produced by the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -146,12 +146,15 @@ impl ExternalDatasetIdentity {
                 0 => byte.is_ascii_alphabetic(),
                 _ => byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'),
             });
-        if !valid_scheme
-            || !valid_identity_component(authority)
-            || !valid_identity_component(name)
-            || name.starts_with('/')
-        {
+        if !valid_scheme || !valid_identity_component(authority) || name.starts_with('/') {
             return Err(LineageIdentityError::InvalidCanonicalDatasource);
+        }
+        if !valid_identity_name(name) {
+            return Err(name_error(
+                name,
+                LineageIdentityError::InvalidCanonicalDatasource,
+                "canonical_datasource",
+            ));
         }
         Ok(Self::CanonicalDatasource {
             dataset: DatasetId {
@@ -168,8 +171,15 @@ impl ExternalDatasetIdentity {
     ) -> Result<Self, LineageIdentityError> {
         let namespace = namespace.into();
         let name = name.into();
-        if !valid_identity_component(&namespace) || !valid_identity_component(&name) {
+        if !valid_identity_component(&namespace) {
             return Err(LineageIdentityError::InvalidCatalogIdentity);
+        }
+        if !valid_identity_name(&name) {
+            return Err(name_error(
+                &name,
+                LineageIdentityError::InvalidCatalogIdentity,
+                "catalog_name",
+            ));
         }
         Ok(Self::Catalog {
             dataset: DatasetId { namespace, name },
@@ -335,8 +345,18 @@ pub enum LineageIdentityError {
     InvalidSubset,
     InvalidSymlink,
     ExternalModeRequired,
-    DuplicateNode { node: String },
-    MissingNode { node: String },
+    /// An authored dataset name carries the reserved record-type separator, so
+    /// it could name a per-record-type dataset of some other source. `field` is
+    /// the configuration key that supplied it.
+    ReservedRecordTypeSeparator {
+        field: &'static str,
+    },
+    DuplicateNode {
+        node: String,
+    },
+    MissingNode {
+        node: String,
+    },
 }
 
 impl fmt::Display for LineageIdentityError {
@@ -358,6 +378,14 @@ impl fmt::Display for LineageIdentityError {
             Self::ExternalModeRequired => {
                 f.write_str("external lineage identity requires `identity_mode = \"external\"`")
             }
+            Self::ReservedRecordTypeSeparator { field } => write!(
+                f,
+                "`{field}` must not contain `{RECORD_TYPE_SEPARATOR}`: it is reserved to compose \
+                 a multi-record source's per-record-type dataset name \
+                 (`<name>{RECORD_TYPE_SEPARATOR}<record type>`), so an authored name carrying one \
+                 would name the same dataset as a record type of some other source. Rewrite the \
+                 name without it — `payments_detail`, not `payments{RECORD_TYPE_SEPARATOR}detail`"
+            ),
             Self::DuplicateNode { node } => {
                 write!(f, "lineage node `{node}` has more than one identity binding")
             }
@@ -376,6 +404,31 @@ fn valid_identity_component(value: &str) -> bool {
         && value == value.trim()
         && !value.chars().any(char::is_control)
         && value.len() <= 1_024
+}
+
+/// A dataset's *name* half, which additionally may not carry the reserved
+/// [`RECORD_TYPE_SEPARATOR`].
+///
+/// Only the name is restricted. A per-record-type dataset keeps its base's
+/// namespace and appends the separator plus the record type id to the name
+/// alone, so a separator anywhere else cannot produce the composed form.
+fn valid_identity_name(value: &str) -> bool {
+    valid_identity_component(value) && !value.contains(RECORD_TYPE_SEPARATOR)
+}
+
+/// Pick the failure that explains why `name` was refused: the reserved
+/// separator when that is what it carries, and `generic` for every other way a
+/// name can be malformed.
+fn name_error(
+    name: &str,
+    generic: LineageIdentityError,
+    field: &'static str,
+) -> LineageIdentityError {
+    if name.contains(RECORD_TYPE_SEPARATOR) {
+        LineageIdentityError::ReservedRecordTypeSeparator { field }
+    } else {
+        generic
+    }
 }
 
 fn valid_node(value: &str) -> bool {

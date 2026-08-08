@@ -1,0 +1,30 @@
+# A body that declares its own source alongside its input port. The body source
+# reads a file nothing at the call site feeds, so it is a dataset in its own
+# right and needs its own identity; the port is wired but its records are not
+# what the output port surfaces. Named `ref` deliberately: the invoking pipeline
+# has a top-level node by the same name, and the two must stay distinct.
+_compose:
+  name: own_source
+  inputs:
+    driver:
+      schema:
+        - { name: x, type: int }
+  outputs:
+    out: shape
+  config_schema: {}
+
+nodes:
+  - type: source
+    name: ref
+    config:
+      name: ref
+      type: csv
+      path: data/ref.csv
+      schema:
+        - { name: code, type: string }
+  - type: transform
+    name: shape
+    input: ref
+    config:
+      cxl: |
+        emit label = code
