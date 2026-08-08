@@ -666,12 +666,15 @@ fn logs_metrics_traces_and_fault_matrix() {
     assert_eq!(outcome.attempts(), 2);
     assert_eq!(handle.join().expect("join header-timeout fixture").len(), 2);
 
-    let (address, handle) = spawn_sequence_server(vec![
-        FixtureResponse::delayed_body(Duration::from_millis(120)),
-        FixtureResponse::immediate(200, br#"{}"#.to_vec()),
-    ]);
+    // A body that never arrives comes after a 200, and a 200 means the
+    // collector already has the batch. Re-sending it would ingest the same
+    // records twice and count the same monotonic sums twice, so what is lost
+    // here is the confirmation, not the delivery, and the attempt ends.
+    let (address, handle) = spawn_sequence_server(vec![FixtureResponse::delayed_body(
+        Duration::from_millis(120),
+    )]);
     let endpoint = admitted_loopback_endpoint(address);
-    let outcome = send_otlp_json(
+    let failure = send_otlp_json(
         &endpoint,
         OtlpSignal::Metrics,
         &metrics_payload(),
@@ -679,9 +682,14 @@ fn logs_metrics_traces_and_fault_matrix() {
         &|| false,
         OtlpAuthentication::None,
     )
-    .expect("response-body timeout must consume one bounded retry");
-    assert_eq!(outcome.attempts(), 2);
-    assert_eq!(handle.join().expect("join body-timeout fixture").len(), 2);
+    .expect_err("an unreadable reply to an accepted batch is not a delivery to repeat");
+    assert_eq!(
+        failure.attempts(),
+        1,
+        "an accepted batch must never be sent a second time"
+    );
+    assert_eq!(failure.kind(), OtlpDeliveryFailureKind::Timeout);
+    assert_eq!(handle.join().expect("join body-timeout fixture").len(), 1);
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind TLS fixture");
     let address = listener.local_addr().expect("TLS fixture address");

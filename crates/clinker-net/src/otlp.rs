@@ -592,29 +592,14 @@ pub fn send_otlp_json(
                         .read_to_vec()
                     {
                         Ok(body) => body,
-                        // Reading the body means the handshake already
-                        // succeeded, so a reset here is the wire failing, not
-                        // a peer that was never a TLS endpoint.
-                        Err(error) => match retryable_transport(&error) {
-                            Some(_cause) if attempts < budget.max_attempts => {
-                                wait_for_retry(
-                                    signal,
-                                    attempts,
-                                    budget.retry_backoff,
-                                    deadline,
-                                    shutdown_requested,
-                                )?;
-                                continue;
-                            }
-                            Some(cause) => {
-                                return Err(OtlpDeliveryFailure::new(
-                                    signal,
-                                    OtlpDeliveryFailureKind::RetryExhausted(cause),
-                                    attempts,
-                                ));
-                            }
-                            None => return Err(map_body_error(signal, attempts, &error)),
-                        },
+                        // The collector answered 200, so it has this batch.
+                        // Failing to read its reply loses the confirmation,
+                        // not the delivery, and re-sending would put the same
+                        // records in a second time: duplicated log records and
+                        // monotonic sums counted twice, which is worse than an
+                        // unconfirmed delivery because it is wrong rather than
+                        // merely unknown. Report the unreadable reply and stop.
+                        Err(error) => return Err(map_body_error(signal, attempts, &error)),
                     };
                     let rejected = parse_response(signal, &body, item_count).ok_or_else(|| {
                         OtlpDeliveryFailure::new(

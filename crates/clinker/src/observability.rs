@@ -23,8 +23,8 @@ use clinker_exec::telemetry::{
 };
 use clinker_net::{
     AdmittedOtlpEndpoint, OtlpAuthentication, OtlpDeliveryBudget, OtlpDeliveryBudgetError,
-    OtlpDeliveryFailure, OtlpDeliveryOutcome, OtlpEndpointAdmissionError, OtlpSignal,
-    admit_otlp_endpoint, send_otlp_json,
+    OtlpDeliveryFailure, OtlpDeliveryFailureKind, OtlpDeliveryOutcome, OtlpEndpointAdmissionError,
+    OtlpSignal, admit_otlp_endpoint, send_otlp_json,
 };
 use clinker_plan::config::{ObservabilityAuth, ResolvedObservabilityPolicy};
 use serde::Serialize;
@@ -323,13 +323,31 @@ impl OtlpDeliveryReport {
 /// The count matters as much as the reason: nine rejected chunks out of ten is
 /// not a healthy export, and naming only the most recent failure would read
 /// like an isolated one.
+/// What an operator should look at, for the kinds that do not name it.
+///
+/// `Tls` is reported when a peer on an `https://` origin never completed a
+/// handshake. Which error kind that produces is a property of the host, and on
+/// some hosts it is the same kind a connection dropped in front of a healthy
+/// collector produces. Both survive the retry budget identically, so the line
+/// names both rather than sending someone to inspect a certificate that may
+/// never have been involved.
+fn failure_hint(kind: OtlpDeliveryFailureKind) -> &'static str {
+    match kind {
+        OtlpDeliveryFailureKind::Tls => {
+            " (no TLS handshake completed: either the collector is not an HTTPS endpoint, or connections to it are being dropped)"
+        }
+        _ => "",
+    }
+}
+
 fn failure_line(name: &str, signal: &SignalDeliveryReport) -> Option<String> {
     let failures = signal.summary.failures;
     match signal.last_failure.as_ref()? {
         DeliveryFailureCause::Transport(error) => Some(format!(
-            "clinker: optional OTLP {name} delivery outcome: kind={:?} attempts={} failures={failures}",
+            "clinker: optional OTLP {name} delivery outcome: kind={:?} attempts={} failures={failures}{}",
             error.kind(),
-            error.attempts()
+            error.attempts(),
+            failure_hint(error.kind())
         )),
         DeliveryFailureCause::Unencodable => Some(format!(
             "clinker: optional OTLP {name} delivery outcome: kind=Unencodable failures={failures}"

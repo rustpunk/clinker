@@ -802,47 +802,38 @@ fn pipeline_error_exit_code(error: &PipelineError) -> u8 {
 fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::FailureClassification {
     use clinker_core_types::{FailureClassification, RetryAdvice};
 
-    // Two builders, because these classifications leave the host. The machine
-    // terminal and the OpenLineage error facet both carry the message, and
-    // `--lineage` ships the facet to an external collector.
+    // Registry text only. These classifications leave the host — the machine
+    // terminal carries the message, and `--lineage` ships the OpenLineage
+    // error facet to an external collector — so what may appear in them is a
+    // question about disclosure, not about convenience.
     //
-    // `detailed` is for failures the engine itself describes — a configuration
-    // rule, a resource ceiling, a broken invariant. Their text names engine
-    // vocabulary and cannot quote a record, so carrying it tells an operator
-    // which of several failures sharing one code actually happened.
-    //
-    // `registered` is for the data-defect classes, whose text is built *from*
-    // the offending record: an out-of-range combine key renders the key, an
-    // evaluation failure renders the value it could not evaluate. The
-    // sanitizer inside `new` rejects shapes — paths, debug braces, credential
-    // labels — and a bare field value has none of them, so it would pass
-    // through and export customer data. These keep the registry's fixed text;
-    // the detail an engineer needs is already on stderr, which does not leave
-    // the host.
-    let detailed = |code| {
-        FailureClassification::new(code, error.to_string())
-            .unwrap_or_else(|| FailureClassification::unknown_internal("unregistered failure"))
-    };
+    // Carrying `error.to_string()` was tried and withdrawn twice. The
+    // sanitizer that guards it matches shapes: absolute paths, debug braces,
+    // credential labels. Engine error text is not a shape. A combine key
+    // rendered from a record is a bare number; a staging collision is a
+    // relative path; neither is recognisable to a shape rule, and each new
+    // variant is another chance to be wrong in the same direction. The detail
+    // an engineer needs is on stderr, which does not leave the host.
     let registered = |code| {
         FailureClassification::for_code(code)
             .unwrap_or_else(|| FailureClassification::unknown_internal("unregistered failure"))
     };
     match error {
         PipelineError::Io(error) if is_observability_delivery_failure(error) => {
-            detailed("observability.delivery.failed")
+            registered("observability.delivery.failed")
         }
         PipelineError::Config(clinker_plan::config::ConfigError::Validation(message))
             if split_leading_code(message)
                 .is_some_and(|(code, _)| code == "observability.configuration.invalid") =>
         {
-            detailed("observability.configuration.invalid")
+            registered("observability.configuration.invalid")
         }
         PipelineError::Format(format_error) => {
             if let Some(code) = format_error.classification_code() {
                 return registered(code);
             }
             if matches!(format_error, clinker_format::FormatError::Io(_)) {
-                detailed("infrastructure.runtime.transient")
+                registered("infrastructure.runtime.transient")
             } else {
                 registered("source.data.invalid")
             }
@@ -851,13 +842,13 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
         | PipelineError::Schema(_)
         | PipelineError::PlanDiagnostics { .. }
         | PipelineError::OverlayDiagnostics(_)
-        | PipelineError::Compilation { .. } => detailed("admission.configuration.invalid"),
+        | PipelineError::Compilation { .. } => registered("admission.configuration.invalid"),
         PipelineError::Internal { .. }
         | PipelineError::MergeSortOrderViolation { .. }
         | PipelineError::CompositionDepthExceeded { .. }
         | PipelineError::CompositionBodyMissing { .. }
         | PipelineError::CompositionUnknownPort { .. }
-        | PipelineError::SchemaMismatch { .. } => detailed("runtime.invariant.plan_mismatch"),
+        | PipelineError::SchemaMismatch { .. } => registered("runtime.invariant.plan_mismatch"),
         PipelineError::DispatchMismatch { .. } => {
             error.failure_classification().unwrap_or_else(|| {
                 FailureClassification::unknown_internal(
@@ -867,10 +858,10 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
         }
         PipelineError::CompositionBodyError { inner, .. } => classify_pipeline_error(inner),
         PipelineError::Io(_) | PipelineError::ThreadPool(_) => {
-            detailed("infrastructure.runtime.transient")
+            registered("infrastructure.runtime.transient")
         }
-        PipelineError::Spill(_) => detailed("runtime.resource.spill_failed"),
-        PipelineError::SpillCapExceeded { .. } => detailed("runtime.resource.spill_cap_exceeded"),
+        PipelineError::Spill(_) => registered("runtime.resource.spill_failed"),
+        PipelineError::SpillCapExceeded { .. } => registered("runtime.resource.spill_cap_exceeded"),
         PipelineError::Multiple(errors) => errors
             .iter()
             .map(classify_pipeline_error)
@@ -882,7 +873,7 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
                 };
                 (retry_rank, classification.code())
             })
-            .unwrap_or_else(|| detailed("runtime.invariant.unknown")),
+            .unwrap_or_else(|| registered("runtime.invariant.unknown")),
         PipelineError::Eval(_)
         | PipelineError::Accumulator { .. }
         | PipelineError::SortOrderViolation { .. }
@@ -896,16 +887,16 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
         | PipelineError::TypeErrorThresholdExceeded { .. }
         | PipelineError::CorrelationGroupOverflow { .. } => registered("source.data.invalid"),
         PipelineError::MemoryBudgetExceeded { .. } => {
-            detailed("runtime.resource.memory_budget_exceeded")
+            registered("runtime.resource.memory_budget_exceeded")
         }
         PipelineError::UnsatisfiableMemoryBudget { .. } => {
-            detailed("admission.configuration.memory_budget_unsatisfiable")
+            registered("admission.configuration.memory_budget_unsatisfiable")
         }
         // Cancellation is an operator action, not a defect: it is retryable and
         // it is not an engine invariant violation. Callers that can distinguish
         // a cancelled run should use `run_terminal_outcome` instead of asking
         // for a failure classification at all.
-        PipelineError::Interrupted => detailed("infrastructure.runtime.transient"),
+        PipelineError::Interrupted => registered("infrastructure.runtime.transient"),
     }
 }
 
@@ -926,15 +917,24 @@ fn is_cancelled_transport_error(error: &PipelineError) -> bool {
     /// A full disk, a refused permission, or a missing file is a real defect
     /// that happened to coincide with a signal, and it keeps its identity —
     /// being an `Io` error is not evidence of cancellation.
+    /// Named by what it cannot be, because a transport error carried up from a
+    /// source arrives with whatever kind that transport chose — frequently
+    /// `Other`, which no list of expected kinds would contain. What can be
+    /// enumerated is the opposite: the failures of the environment, which a
+    /// signal never causes and which a retry never fixes on its own.
     fn is_interrupted_read(io: &std::io::Error) -> bool {
-        matches!(
+        !matches!(
             io.kind(),
-            std::io::ErrorKind::Interrupted
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::NotConnected
-                | std::io::ErrorKind::UnexpectedEof
+            std::io::ErrorKind::StorageFull
+                | std::io::ErrorKind::QuotaExceeded
+                | std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::ReadOnlyFilesystem
+                | std::io::ErrorKind::AlreadyExists
+                | std::io::ErrorKind::IsADirectory
+                | std::io::ErrorKind::NotADirectory
+                | std::io::ErrorKind::InvalidInput
+                | std::io::ErrorKind::InvalidData
         )
     }
 
@@ -1965,35 +1965,6 @@ fn build_cli_lineage(
     }
 }
 
-/// A destination whose previous contents survive until this run writes to it.
-///
-/// The `--lineage-events` file is opened during admission so an unwritable one
-/// refuses the run before it stages a source or creates a publication attempt.
-/// Truncating at that moment would mean a run refused a few steps later had
-/// already destroyed the record its predecessor left behind, so the file is
-/// emptied by the first byte this run actually produces instead.
-struct TruncateOnFirstWrite {
-    file: std::fs::File,
-    truncated: bool,
-}
-
-impl std::io::Write for TruncateOnFirstWrite {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        use std::io::Seek as _;
-
-        if !self.truncated {
-            self.file.set_len(0)?;
-            self.file.rewind()?;
-            self.truncated = true;
-        }
-        std::io::Write::write(&mut self.file, buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        std::io::Write::flush(&mut self.file)
-    }
-}
-
 enum LiveLineageSink {
     External(clinker_lineage::LineageDelivery),
     LocalDiagnostic(Box<dyn std::io::Write>),
@@ -2103,17 +2074,21 @@ fn report_lineage_delivery(outcome: clinker_lineage::LineageDeliveryOutcome) {
 /// Whether a sink that refused a write will refuse the identical retry.
 ///
 /// The distinction decides the retry advice a supervisor acts on. Permission,
-/// a missing directory, a read-only filesystem, and a full disk are properties
-/// of the destination rather than of the moment, so re-running unchanged is
-/// wasted work. Everything else — a reader that closed, a write that timed
-/// out — may not recur.
+/// a missing directory, a read-only filesystem, and a path that is the wrong
+/// kind of thing are properties of the destination rather than of the moment,
+/// so re-running unchanged is wasted work.
+///
+/// A full disk is deliberately not here. It reads like a permanent property
+/// and is usually a temporary one: the run that filled the volume, or a
+/// neighbour on it, releases the space and the next attempt succeeds. Telling
+/// an operator to choose a different destination for it would be advice about
+/// the wrong thing.
 fn is_permanent_sink_refusal(kind: std::io::ErrorKind) -> bool {
     matches!(
         kind,
         std::io::ErrorKind::PermissionDenied
             | std::io::ErrorKind::NotFound
             | std::io::ErrorKind::ReadOnlyFilesystem
-            | std::io::ErrorKind::StorageFull
             | std::io::ErrorKind::IsADirectory
             | std::io::ErrorKind::InvalidInput
     )
@@ -3309,27 +3284,19 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 // own stdout prints (the spill-volume summary and completion line).
                 Box::new(std::io::stdout())
             } else {
-                // Opened, but deliberately not truncated: proving the
-                // destination writable is the point of doing this during
-                // admission, and a run that is refused a few lines later must
-                // not have destroyed the record the previous run left here.
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(path)
-                    .map_err(|e| {
-                        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
-                            format!(
-                                "cannot open --lineage-events output {}: {e}",
-                                path.display()
-                            ),
-                        ))
-                    })?;
-                Box::new(TruncateOnFirstWrite {
-                    file,
-                    truncated: false,
-                })
+                // Emptied here, when the run is admitted, rather than at its
+                // first event. A destination this run was handed is this run's
+                // to overwrite, and holding the previous run's events until the
+                // first write means a run that fails before emitting anything
+                // leaves a file whose COMPLETE terminal belongs to a different
+                // run — which a catalogue reads as this one having succeeded.
+                // An empty file cannot be misread that way.
+                Box::new(std::fs::File::create(path).map_err(|e| {
+                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                        "cannot open --lineage-events output {}: {e}",
+                        path.display()
+                    )))
+                })?)
             };
             lineage_output = Some(LiveLineageOutput {
                 sink: LiveLineageSink::LocalDiagnostic(writer),
@@ -7391,18 +7358,49 @@ mod tests {
             "a cancelled socket read unwinds as the transport's own error"
         );
 
+        assert!(
+            is_cancelled_transport_error(&PipelineError::Io(std::io::Error::other(
+                "wrapped transport failure"
+            ))),
+            "a source transport reports its own kind, often Other, and is still a cancelled read"
+        );
+
         for defect in [
             PipelineError::SortOrderViolation {
                 message: "sort order violation at node `by_date`: row 41 precedes row 40"
                     .to_owned(),
             },
             PipelineError::Interrupted,
+            PipelineError::Io(std::io::Error::from(std::io::ErrorKind::StorageFull)),
+            PipelineError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
         ] {
             assert!(
                 !is_cancelled_transport_error(&defect),
                 "{defect} must keep its own identity when a signal races it"
             );
         }
+    }
+
+    /// The registered message is what leaves the host, so it must never be the
+    /// error's own text: two rounds of shape-matching sanitizers let a record
+    /// value and then a relative path through.
+    #[test]
+    fn an_exported_classification_never_carries_the_run_error_text() {
+        let leaky = PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+            "output destination collision: producer \"a\" resolves to out/data.json".to_owned(),
+        ));
+        let classification = classify_pipeline_error(&leaky);
+        assert!(
+            !classification.message().contains("out/data.json"),
+            "an internal path must not reach the machine terminal or the lineage facet"
+        );
+        assert_eq!(
+            classification.message(),
+            clinker_core_types::FailureClassification::for_code(classification.code())
+                .expect("the arm selected a registered code")
+                .message(),
+            "the exported message is the registry's, not the run's"
+        );
     }
 
     /// The retry advice and the printed correction have to agree.
@@ -7412,6 +7410,7 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
             std::io::ErrorKind::ReadOnlyFilesystem,
             std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::IsADirectory,
         ] {
             assert!(
                 is_permanent_sink_refusal(permanent),
@@ -7422,6 +7421,10 @@ mod tests {
             std::io::ErrorKind::BrokenPipe,
             std::io::ErrorKind::TimedOut,
             std::io::ErrorKind::Interrupted,
+            // A volume that filled up is usually emptied again; sending the
+            // operator to pick another destination is advice about the wrong
+            // thing.
+            std::io::ErrorKind::StorageFull,
         ] {
             assert!(
                 !is_permanent_sink_refusal(transient),
