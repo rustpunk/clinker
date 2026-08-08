@@ -7,11 +7,15 @@ mod event;
 mod facet;
 mod ndjson;
 
-pub use event::{Dataset, DatasetFacets, EventType, Job, JobFacets, Run, RunEvent, RunFacets};
+pub use event::{
+    Dataset, DatasetFacets, EventType, InputDatasetFacets, Job, JobFacets, OutputDatasetFacets,
+    Run, RunEvent, RunFacets,
+};
 pub use facet::{
-    ClinkerFailureRunFacet, ColumnLineageDatasetFacet, ErrorMessageRunFacet, FieldLineage,
-    InputField, PipelineJobFacet, RunStatsFacet, Transformation, TransformationSubtype,
-    TransformationType,
+    BatchRunFacet, ClinkerFailureRunFacet, ColumnLineageDatasetFacet, DatasetSubsetFacet,
+    ErrorMessageRunFacet, FieldLineage, InputField, LocationSubsetCondition, PipelineJobFacet,
+    RunStatsFacet, SemanticPlanJobFacet, SymlinksDatasetFacet, Transformation,
+    TransformationSubtype, TransformationType,
 };
 pub use ndjson::write_ndjson;
 
@@ -21,6 +25,16 @@ pub const OPENLINEAGE_SCHEMA_URL: &str = "https://openlineage.io/spec/2-0-2/Open
 /// Schema URL for the column-lineage dataset facet (the facet-level `_schemaURL`).
 pub const COLUMN_LINEAGE_FACET_SCHEMA_URL: &str =
     "https://openlineage.io/spec/facets/1-2-0/ColumnLineageDatasetFacet.json";
+
+/// Schema URL for the standard concrete input-subset facet.
+pub const INPUT_DATASET_SUBSET_FACET_SCHEMA_URL: &str = "https://openlineage.io/spec/facets/1-0-0/BaseSubsetDatasetFacet.json#/$defs/InputSubsetInputDatasetFacet";
+
+/// Schema URL for the standard concrete output-subset facet.
+pub const OUTPUT_DATASET_SUBSET_FACET_SCHEMA_URL: &str = "https://openlineage.io/spec/facets/1-0-0/BaseSubsetDatasetFacet.json#/$defs/OutputSubsetOutputDatasetFacet";
+
+/// Schema URL for the standard dataset symlinks facet.
+pub const SYMLINKS_DATASET_FACET_SCHEMA_URL: &str =
+    "https://openlineage.io/spec/facets/1-0-1/SymlinksDatasetFacet.json";
 
 /// Producer URI stamped on emitted events and facets, identifying this emitter.
 pub const PRODUCER: &str = "https://github.com/rustpunk/clinker";
@@ -43,6 +57,14 @@ pub const ERROR_MESSAGE_FACET_SCHEMA_URL: &str =
 /// Schema URL for the clinker-owned sanitized failure-classification facet.
 pub const CLINKER_FAILURE_FACET_SCHEMA_URL: &str =
     "https://github.com/rustpunk/clinker/spec/facets/v1/ClinkerFailureRunFacet.json";
+
+/// Schema URL for caller-owned batch correlation.
+pub const CLINKER_BATCH_FACET_SCHEMA_URL: &str =
+    "https://github.com/rustpunk/clinker/spec/facets/v1/BatchRunFacet.json";
+
+/// Schema URL for the effective semantic-plan fingerprint.
+pub const CLINKER_SEMANTIC_PLAN_FACET_SCHEMA_URL: &str =
+    "https://github.com/rustpunk/clinker/spec/facets/v1/SemanticPlanJobFacet.json";
 
 /// Schema URL for the clinker-specific run-statistics run facet (the facet-level
 /// `_schemaURL`). OpenLineage has no standard run-level record-count facet, so —

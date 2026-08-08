@@ -19,11 +19,19 @@
 //! and admitted under exact normalized-origin policy before another request is
 //! constructed; an offered continuation beyond the page bound fails closed.
 
+mod otlp;
 mod rest;
 
 use clinker_format::FormatError;
 
 use rest::RestRecordSource;
+
+pub use otlp::{
+    AdmittedOtlpEndpoint, OtlpAuthentication, OtlpCredentialApplicationError,
+    OtlpCredentialApplicator, OtlpCredentialRequest, OtlpDeliveryBounds, OtlpDeliveryBudget,
+    OtlpDeliveryBudgetError, OtlpDeliveryFailure, OtlpDeliveryFailureKind, OtlpDeliveryOutcome,
+    OtlpEndpointAdmissionError, OtlpRetryCause, OtlpSignal, admit_otlp_endpoint, send_otlp_json,
+};
 
 /// Build the REST record source for a `rest` Source from its declared
 /// node config. The caller (the CLI reader-build) registers the returned
@@ -36,14 +44,6 @@ pub fn build_rest_source(
 ) -> Result<Box<dyn clinker_exec::source::RecordSource>, FormatError> {
     let reader = RestRecordSource::new(cfg, source, schema_decl, on_unmapped)?;
     Ok(Box::new(reader))
-}
-
-/// Construct a `FormatError::Io` wrapping a REST read failure, tagged with
-/// the `E221` diagnostic code. The ingest driver propagates a reader error
-/// as a hard pipeline failure (a connect/HTTP/body-read failure is not a
-/// per-row data error), so this is the right channel for those.
-fn io_err(msg: String) -> FormatError {
-    FormatError::Io(std::io::Error::other(format!("[E221] {msg}")))
 }
 
 /// Construct a `FormatError::SchemaInference` for a body-decode/setup

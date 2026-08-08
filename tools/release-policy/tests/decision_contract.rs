@@ -598,11 +598,15 @@ fn bounded_child_uses_explicit_argv_allowlisted_environment_and_truncation_flags
     assert!(result.stderr.is_empty());
     assert!(!result.stdout_truncated);
 
+    // The deadline has to outlast spawning the child, scheduling it, and its
+    // first write, or the capture is empty and the byte assertions below are
+    // measuring host load rather than truncation. `yes` never exits, so a
+    // deadline generous enough to remove that race still terminates by it.
     let flood = run(ChildSpec {
         program: PathBuf::from("/usr/bin/yes"),
         arguments: Vec::new(),
         environment: BTreeMap::new(),
-        timeout: Duration::from_millis(100),
+        timeout: Duration::from_secs(2),
         output_limit: 128,
     })
     .unwrap();

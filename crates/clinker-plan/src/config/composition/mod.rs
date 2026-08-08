@@ -272,6 +272,11 @@ pub enum ResourceKind {
 pub struct CompositionFile {
     pub signature: CompositionSignature,
     pub nodes: Vec<Spanned<PipelineNode>>,
+    /// BLAKE3 of the exact composition source bytes read during planning.
+    pub content_digest: [u8; 32],
+    /// BLAKE3 of the canonical parsed composition, excluding deployment
+    /// locators that do not change execution meaning.
+    pub semantic_digest: [u8; 32],
 }
 
 impl CompositionFile {
@@ -287,8 +292,119 @@ impl CompositionFile {
         source_path: PathBuf,
     ) -> Result<CompositionFile, YamlError> {
         let raw: raw::RawCompositionFile = crate::yaml::from_str(yaml)?;
-        Ok(raw.finalize(file_id, source_path))
+        let mut semantic_value: serde_json::Value = crate::yaml::from_str(yaml)?;
+        remove_composition_deployment_locators(&mut semantic_value);
+        Ok(raw.finalize(
+            file_id,
+            source_path,
+            *blake3::hash(yaml.as_bytes()).as_bytes(),
+            hash_semantic_json(&semantic_value),
+        ))
     }
+}
+
+fn remove_composition_deployment_locators(value: &mut serde_json::Value) {
+    let Some(nodes) = value
+        .as_object_mut()
+        .and_then(|object| object.get_mut("nodes"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for node in nodes {
+        remove_node_deployment_locators(node);
+    }
+}
+
+fn remove_node_deployment_locators(node: &mut serde_json::Value) {
+    let Some(object) = node.as_object_mut() else {
+        return;
+    };
+    match object.get("type").and_then(serde_json::Value::as_str) {
+        Some("source") => {
+            if let Some(config) = object
+                .get_mut("config")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                config.remove("path");
+                config.remove("paths");
+            }
+        }
+        Some("output") => {
+            if let Some(config) = object
+                .get_mut("config")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                config.remove("path");
+            }
+        }
+        Some("composition") => {
+            object.remove("use");
+            object.remove("resources");
+        }
+        _ => {}
+    }
+}
+
+fn hash_semantic_json(value: &serde_json::Value) -> [u8; 32] {
+    fn write_len(hasher: &mut blake3::Hasher, len: usize) {
+        hasher.update(&(len as u64).to_le_bytes());
+    }
+
+    fn write_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+        write_len(hasher, bytes.len());
+        hasher.update(bytes);
+    }
+
+    fn hash_value(hasher: &mut blake3::Hasher, value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Null => {
+                hasher.update(&[0]);
+            }
+            serde_json::Value::Bool(value) => {
+                hasher.update(&[1, u8::from(*value)]);
+            }
+            serde_json::Value::Number(value) => {
+                hasher.update(&[2]);
+                if let Some(value) = value.as_i64() {
+                    hasher.update(&[0]);
+                    hasher.update(&value.to_le_bytes());
+                } else if let Some(value) = value.as_u64() {
+                    hasher.update(&[1]);
+                    hasher.update(&value.to_le_bytes());
+                } else if let Some(value) = value.as_f64() {
+                    hasher.update(&[2]);
+                    hasher.update(&value.to_bits().to_le_bytes());
+                }
+            }
+            serde_json::Value::String(value) => {
+                hasher.update(&[3]);
+                write_bytes(hasher, value.as_bytes());
+            }
+            serde_json::Value::Array(values) => {
+                hasher.update(&[4]);
+                write_len(hasher, values.len());
+                for value in values {
+                    hash_value(hasher, value);
+                }
+            }
+            serde_json::Value::Object(object) => {
+                hasher.update(&[5]);
+                write_len(hasher, object.len());
+                let mut entries = object.iter().collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                for (key, value) in entries {
+                    write_bytes(hasher, key.as_bytes());
+                    hash_value(hasher, value);
+                }
+            }
+        }
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"clinker.composition.semantic-content.v1\0");
+    hash_value(&mut hasher, value);
+    *hasher.finalize().as_bytes()
 }
 
 // =========================================================================

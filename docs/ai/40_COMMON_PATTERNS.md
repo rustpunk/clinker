@@ -1,6 +1,6 @@
 # AI Onboarding: Common Patterns
 
-Verified against the working tree on 2026-07-29.
+Verified against the working tree on 2026-08-07.
 
 Purpose: Describe practices that recur in current Clinker code without turning
 repetition into architecture law. Reviewed invariants live in
@@ -55,22 +55,60 @@ permanent stability.
   alias, string erasure, `anyhow`, or panic-based runtime handling.
 - **Verified:** 2026-07-29.
 
+### Typed mismatch guard at dispatcher entry
+
+- **Classification:** Local implementation of the SECU-03 invariant decision.
+- **Where:** The twelve specialized executor dispatchers and their one-shot
+  finite-attempt qualification selector.
+- **Use:** Check the received `PlanNode` kind before touching mutable operator
+  or publication context. Return `PipelineError::DispatchMismatch` with fixed
+  dispatcher and expected/actual kind tags, bounded logical node identity, the
+  registered `runtime.invariant.dispatch_mismatch` code, internal-invariant
+  category, policy-required retry advice, and fixed safe guidance.
+- **Evidence:** Dispatcher entry modules under
+  `crates/clinker-exec/src/executor/`, `crates/clinker-exec/src/executor/dispatch.rs`,
+  and `crates/clinker-exec/tests/invariant_errors.rs`.
+- **Counterexamples / limits:** Do not include records, paths, runtime state, or
+  authored secret-bearing values. Locally proven internal algorithm and Output
+  assertions remain assertions; this pattern is not a blanket assertion-removal
+  rule and is not a numbered production-contract row.
+- **Verified:** 2026-08-07.
+
 ### Typed wrappers and proof-bearing values
 
 - **Classification:** Observed.
 - **Where:** `FileId`, `Span`, `DocumentId`, `NodeId`, `PlanNodeId`,
-  `DottedPath`, `CxlSource`, `ValidatedPath`, `SourceIdentity`, and
-  `ConsumerId` distinguish identities and validated state.
+  `DottedPath`, `CxlSource`, `ValidatedPath`, `SourceIdentity`, `ConsumerId`,
+  and `AdmittedOtlpEndpoint` distinguish identities and validated state.
 - **Use:** Keep construction private when the type proves validation or origin;
   expose borrowed accessors and only the traits callers actually need.
 - **Evidence:** `crates/clinker-core-types/src/span.rs`,
   `crates/clinker-record/src/document_context.rs`,
-  `crates/clinker-plan/src/security.rs`, and
-  `crates/clinker-channel/src/dotted.rs`.
+  `crates/clinker-plan/src/security.rs`,
+  `crates/clinker-channel/src/dotted.rs`, and
+  `crates/clinker-net/src/otlp.rs`.
 - **Counterexamples / limits:** A wrapper without a domain guarantee is not
   automatically clearer than its underlying value. TOML and JSON retain their
   own typed parsing paths rather than reusing YAML proof types.
 - **Verified:** 2026-07-29.
+
+### Raw-to-admitted-to-composed endpoint chain
+
+- **Classification:** Local implementation of a reviewed security boundary.
+- **Where:** Workspace policy resolution in `clinker-plan`, endpoint admission
+  and fixed routing in `clinker-net`, and run-local composition in the CLI.
+- **Use:** Preserve the chain `raw secret-free policy ->
+  AdmittedOtlpEndpoint -> OtlpRuntimeBundle`. Pass the admitted proof forward;
+  do not reparse, split, normalize, rebuild, or accept raw endpoint text in a
+  sibling production entry point.
+- **Evidence:** `crates/clinker-plan/src/config/observability.rs`,
+  `crates/clinker-net/src/otlp.rs`, and
+  `crates/clinker/src/observability.rs`.
+- **Counterexamples / limits:** Test-only loopback construction is not a
+  production constructor. The borrowed credential applicator runs after
+  admission and cannot replace the origin or fixed route; referenced credential
+  resolution remains Phase 4 AUTH-01 work.
+- **Verified:** 2026-08-07.
 
 ### Run-scoped handles and registries
 
@@ -90,6 +128,26 @@ permanent stability.
   registry is not justified when an existing run context already owns the
   resource.
 - **Verified:** 2026-07-29.
+
+### One lifecycle snapshot with independent optional bulkheads
+
+- **Classification:** Observed implementation of the Phase 1 D-41 rule.
+- **Where:** CLI `RunLifecycleFacts`, OTLP composition, OpenLineage
+  event/delivery adapters, and machine correlation checks.
+- **Use:** Record start and terminal facts once, then hand consumers bounded
+  immutable snapshots. Keep OTLP and lineage queues, byte accounting, workers,
+  deadlines, counters, and typed outcomes independent even though both copy the
+  same batch ID, execution ID, semantic fingerprint, and terminal facts and
+  must match the machine stream's correlation and terminal truth.
+- **Evidence:** `crates/clinker/src/lifecycle.rs`,
+  `crates/clinker/src/observability.rs`,
+  `crates/clinker-lineage/src/emit.rs`, and
+  `crates/clinker-lineage/src/delivery.rs`.
+- **Counterexamples / limits:** A consumer does not mint or parse a replacement
+  lifecycle identity. Machine control, human diagnostics, metrics spool, and
+  guaranteed outputs remain separate paths rather than extra consumers of one
+  observability queue.
+- **Verified:** 2026-08-07.
 
 ### Inline record and control events
 
@@ -173,6 +231,24 @@ permanent stability.
   supported integration API; D-18 and D-19 classify that separately.
 - **Verified:** 2026-07-29.
 
+### Narrow shared-failure vocabulary at consumer edges
+
+- **Classification:** Local implementation of the Phase 3 D-41 dependency
+  decision.
+- **Where:** `clinker-net` and `clinker-lineage` outcomes that expose the
+  serialization-neutral taxonomy from `clinker-core-types`.
+- **Use:** Keep exactly the normal edges `clinker-net -> clinker-core-types` and
+  `clinker-lineage -> clinker-core-types`. Consumers use only
+  `FailureClassification`, `FailureCategory`, and `RetryAdvice`, adapt them at
+  their own boundary, and do not re-export the taxonomy.
+- **Evidence:** The three crate manifests, `crates/clinker-net/src/otlp.rs`,
+  and `crates/clinker-lineage/src/emit.rs`.
+- **Counterexamples / limits:** This does not authorize a feature, serializer,
+  package, identity type, transport type, or any fourth shared type. Semantic
+  plan identity stays in `clinker-plan`; dataset identity stays in
+  `clinker-lineage`.
+- **Verified:** 2026-08-07.
+
 ### External derives and test macros
 
 - **Classification:** Observed.
@@ -219,6 +295,23 @@ permanent stability.
   intended behavior change; a golden is not proof of correctness by itself.
 - **Verified:** 2026-07-29.
 
+### Authoritative oracle for optional delivery
+
+- **Classification:** Preferred for optional observability and lineage fault
+  matrices.
+- **Where:** CLI observability isolation and bounded lineage delivery tests.
+- **Use:** Capture exact authoritative output/DLQ bytes, exit status, projected
+  machine terminal, publication inventory, visible finals, and retained
+  manifest/quarantine evidence from a no-fault run. For each optional-delivery
+  fault, compare that oracle independently from the path-specific typed outcome
+  and counters; canonicalize only unavoidable run-local IDs and timestamps.
+- **Evidence:** `crates/clinker/tests/observability_isolation.rs` and
+  `crates/clinker/tests/lineage_cli.rs`.
+- **Counterexamples / limits:** A green exporter assertion, matching counter,
+  or process exit alone is not authoritative artifact equivalence. The pattern
+  does not claim set-wide atomic publication or lossless observability.
+- **Verified:** 2026-08-07.
+
 ### Pipeline YAML as runnable documentation
 
 - **Classification:** Local.
@@ -248,6 +341,24 @@ permanent stability.
 - **Counterexamples / limits:** It is not a generic replacement for every
   internal `PathBuf`, and must not gain an unchecked `From<PathBuf>`.
 - **Verified:** 2026-07-29.
+
+### Stable collection identity plus standard facets
+
+- **Classification:** Local to external OpenLineage identity.
+- **Where:** `LineageIdentityContext`, dataset emission, and CLI lineage
+  preflight.
+- **Use:** Bind each source/output node to canonical datasource or exact catalog
+  namespace/name identity. Keep that collection identity stable while placing
+  authorized concrete input/output locations in standard subset facets and
+  authorized aliases in the standard symlinks facet.
+- **Evidence:** `crates/clinker-lineage/src/logical_identity.rs`,
+  `crates/clinker-lineage/src/emit.rs`, and
+  `crates/clinker-lineage/tests/logical_identity.rs`.
+- **Counterexamples / limits:** Do not infer subsets or aliases from worker,
+  attempt, or process paths. The current author config has no subset/symlink
+  fields; exact `local_diagnostic_paths` is a separately labeled synchronous
+  compatibility path and cannot enter external delivery.
+- **Verified:** 2026-08-07.
 
 ### `FieldStr` compact storage
 

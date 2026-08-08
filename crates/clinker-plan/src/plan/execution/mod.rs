@@ -632,13 +632,37 @@ pub struct PlanSourcePayload {
     pub validated_path: Option<crate::security::ValidatedPath>,
 }
 
-/// Fully-resolved Transform payload. Holds the optional analytic-window
-/// spec, the log directives, the validations sidebar, the DLQ NodeId for
-/// downstream wiring, and the compile-time CXL `TypedProgram`.
+/// Fully-resolved Transform payload. Holds the optional analytic-window spec,
+/// admission-validated named structured-event directives, the validations
+/// sidebar, the DLQ NodeId for downstream wiring, and the compile-time CXL
+/// `TypedProgram`.
+///
+/// The line for semantic plan identity runs between authored pipeline
+/// expressions and resolved deployment policy, not between "logic" and
+/// "observability":
+///
+/// - **Authored pipeline expressions are retained and DO enter identity.** A
+///   log directive's `condition` is CXL written in the transform node, in the
+///   same category as a Reshape rule's `when`. Two pipelines differing only in
+///   a log condition emit on different records, so they must not share a
+///   fingerprint — otherwise plan reuse could apply the wrong predicate. This
+///   direction is the conservative one: the cost of including it is a missed
+///   reuse opportunity, and the cost of omitting it is wrong behavior.
+/// - **Resolved deployment policy is deliberately NOT retained.** Endpoints,
+///   credentials, field policy, and sampling are resolved outside the pipeline
+///   YAML. The same pipeline shipped against different telemetry config is the
+///   same plan, so that configuration must stay out of identity.
 #[derive(Debug, Clone)]
 pub struct PlanTransformPayload {
     pub analytic_window: Option<AnalyticWindowSpec>,
     pub log: Vec<crate::config::LogDirective>,
+    /// Typechecked gate predicate per entry in `log`, in the same order and
+    /// always the same length — `None` where that directive declared no
+    /// `condition`. Parallel to `log` rather than folded into it because
+    /// `LogDirective` is a config type and a `TypedProgram` is a plan
+    /// artifact; the runtime dispatcher already keeps its per-directive
+    /// cadence counters in the same parallel shape.
+    pub log_conditions: Vec<Option<Arc<TypedProgram>>>,
     pub validations: Vec<crate::config::ValidationEntry>,
     pub dlq_node: Option<NodeIndex>,
     /// Compile-time-typechecked CXL program. Populated by
@@ -882,8 +906,8 @@ impl PlanNode {
         Some(dag.graph[first].output_schema_in(dag))
     }
 
-    /// Get the type tag string for id slug construction.
-    pub fn type_tag(&self) -> &'static str {
+    /// Return the closed runtime kind tag for this node.
+    pub fn kind_name(&self) -> &'static str {
         match self {
             PlanNode::Source { .. } => "source",
             PlanNode::Transform { .. } => "transform",
@@ -899,6 +923,11 @@ impl PlanNode {
             PlanNode::Cull { .. } => "cull",
             PlanNode::Envelope { .. } => "envelope",
         }
+    }
+
+    /// Get the type tag string for id slug construction.
+    pub fn type_tag(&self) -> &'static str {
+        self.kind_name()
     }
 
     /// Build the id slug: `"{type}.{name}"`.

@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 fn clinker_bin() -> &'static str {
     env!("CARGO_BIN_EXE_clinker")
@@ -49,7 +50,7 @@ fn run_lineage(pipeline: &Path) -> (serde_json::Value, serde_json::Value) {
 
 #[test]
 fn lineage_emits_start_complete_pair_with_column_lineage() {
-    let pipeline = repo_root().join("examples/pipelines/audit_join.yaml");
+    let (_workspace, pipeline) = audit_join_workspace();
     let (start, complete) = run_lineage(&pipeline);
 
     // --- Event envelope: a START then a COMPLETE sharing one runId. ---
@@ -154,9 +155,8 @@ fn lineage_emits_start_complete_pair_with_column_lineage() {
 
 #[test]
 fn lineage_writes_to_a_file_path() {
-    let pipeline = repo_root().join("examples/pipelines/audit_join.yaml");
-    let dir = tempfile::tempdir().expect("tempdir");
-    let out = dir.path().join("lineage.ndjson");
+    let (workspace, pipeline) = audit_join_workspace();
+    let out = workspace.path().join("lineage.ndjson");
 
     let status = Command::new(clinker_bin())
         .arg("run")
@@ -213,6 +213,313 @@ fn write_pipeline(dir: &Path, output_path: &str) -> PathBuf {
     path
 }
 
+fn write_lineage_policy(dir: &Path, identity_mode: &str, datasets: &str) {
+    let policy = format!(
+        r#"[observability]
+
+[observability.otlp]
+endpoint = "https://collector.example.com"
+
+[observability.otlp.auth]
+mode = "none"
+
+[observability.lineage]
+identity_mode = "{identity_mode}"
+
+{datasets}"#
+    );
+    std::fs::write(dir.join("clinker.toml"), policy).expect("write lineage identity policy");
+}
+
+fn write_local_lineage_policy(dir: &Path) {
+    write_lineage_policy(dir, "local_diagnostic_paths", "");
+}
+
+fn audit_join_workspace() -> (tempfile::TempDir, PathBuf) {
+    let workspace = tempfile::tempdir().expect("audit lineage workspace");
+    let pipeline = workspace.path().join("audit_join.yaml");
+    std::fs::copy(
+        repo_root().join("examples/pipelines/audit_join.yaml"),
+        &pipeline,
+    )
+    .expect("copy audit lineage fixture");
+    write_local_lineage_policy(workspace.path());
+    (workspace, pipeline)
+}
+
+fn external_lineage_policy(dir: &Path, include_output: bool) {
+    let output = if include_output {
+        r#"
+[[observability.lineage.dataset]]
+node = "out"
+catalog_namespace = "analytics"
+catalog_name = "lineage_fixture"
+"#
+    } else {
+        ""
+    };
+    write_lineage_policy(
+        dir,
+        "external",
+        &format!(
+            r#"[[observability.lineage.dataset]]
+node = "src"
+canonical_datasource = "s3://warehouse/lineage_fixture"
+{output}"#
+        ),
+    );
+}
+
+fn lineage_complete(path: &Path) -> serde_json::Value {
+    let contents = std::fs::read_to_string(path).expect("read lineage event file");
+    let events: Vec<serde_json::Value> = contents
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("lineage event is JSON"))
+        .collect();
+    assert_eq!(events.len(), 2, "expected START and COMPLETE: {events:#?}");
+    assert_eq!(events[1]["eventType"], "COMPLETE");
+    events[1].clone()
+}
+
+fn machine_terminal(output: &std::process::Output) -> serde_json::Value {
+    serde_json::from_slice(
+        output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .next_back()
+            .expect("machine terminal event"),
+    )
+    .expect("machine terminal is JSON")
+}
+
+fn assert_external_policy_rejected(datasets: &str, forbidden_diagnostic_text: Option<&str>) {
+    let workspace = tempfile::tempdir().expect("rejected policy workspace");
+    write_pipeline(workspace.path(), "./must-not-exist.csv");
+    write_lineage_policy(workspace.path(), "external", datasets);
+    let output = Command::new(clinker_bin())
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--lineage",
+            "must-not-exist.ndjson",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "rejected-identity-policy",
+        ])
+        .output()
+        .expect("run rejected external policy");
+    assert_eq!(output.status.code(), Some(1));
+    let terminal = machine_terminal(&output);
+    assert_eq!(terminal["event"], "failed");
+    assert_eq!(
+        terminal["failure"]["code"],
+        "observability.configuration.invalid"
+    );
+    assert!(!workspace.path().join("must-not-exist.ndjson").exists());
+    assert!(!workspace.path().join("must-not-exist.csv").exists());
+    if let Some(forbidden) = forbidden_diagnostic_text {
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !rendered.contains(forbidden),
+            "rejected identity value leaked into the diagnostic: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn identity_preflight_and_local_compatibility() {
+    let external = tempfile::tempdir().expect("external workspace");
+    write_pipeline(external.path(), "./out.csv");
+    external_lineage_policy(external.path(), true);
+    let event_path = external.path().join("external.ndjson");
+    let output = Command::new(clinker_bin())
+        .current_dir(external.path())
+        .args(["run", "pipeline.yaml", "--lineage", "external.ndjson"])
+        .output()
+        .expect("run external lineage export");
+    assert!(
+        output.status.success(),
+        "external identity export failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let complete = lineage_complete(&event_path);
+    assert_eq!(complete["inputs"][0]["namespace"], "s3://warehouse");
+    assert_eq!(complete["inputs"][0]["name"], "lineage_fixture");
+    assert_eq!(complete["outputs"][0]["namespace"], "analytics");
+    assert_eq!(complete["outputs"][0]["name"], "lineage_fixture");
+    assert!(
+        !complete
+            .to_string()
+            .contains(external.path().to_string_lossy().as_ref()),
+        "external lineage must not disclose the physical workspace"
+    );
+
+    let relocated = tempfile::tempdir().expect("relocated workspace");
+    write_pipeline(relocated.path(), "./different/out.csv");
+    external_lineage_policy(relocated.path(), true);
+    let relocated_output = Command::new(clinker_bin())
+        .current_dir(relocated.path())
+        .args(["run", "pipeline.yaml", "--lineage", "relocated.ndjson"])
+        .output()
+        .expect("run relocated lineage export");
+    assert!(
+        relocated_output.status.success(),
+        "relocated export failed:\n{}",
+        String::from_utf8_lossy(&relocated_output.stderr)
+    );
+    let relocated_complete = lineage_complete(&relocated.path().join("relocated.ndjson"));
+    assert_eq!(
+        complete["inputs"], relocated_complete["inputs"],
+        "source identity is independent of physical placement"
+    );
+    assert_eq!(
+        complete["outputs"], relocated_complete["outputs"],
+        "output identity is independent of physical placement"
+    );
+
+    let incomplete = tempfile::tempdir().expect("incomplete external workspace");
+    write_pipeline(incomplete.path(), "./must-not-exist.csv");
+    external_lineage_policy(incomplete.path(), false);
+    let rejected = Command::new(clinker_bin())
+        .current_dir(incomplete.path())
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--lineage",
+            "must-not-exist.ndjson",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "identity-preflight",
+        ])
+        .output()
+        .expect("run incomplete identity preflight");
+    assert_eq!(rejected.status.code(), Some(1));
+    let terminal = machine_terminal(&rejected);
+    assert_eq!(terminal["event"], "failed");
+    assert_eq!(
+        terminal["failure"]["code"],
+        "observability.configuration.invalid"
+    );
+    assert!(
+        !incomplete.path().join("must-not-exist.ndjson").exists(),
+        "identity preflight must run before opening the lineage sink"
+    );
+    assert!(
+        !incomplete.path().join("must-not-exist.csv").exists(),
+        "identity preflight must run before output effects"
+    );
+
+    assert_external_policy_rejected(
+        r#"[[observability.lineage.dataset]]
+node = "src"
+catalog_namespace = "analytics"
+"#,
+        None,
+    );
+    assert_external_policy_rejected(
+        r#"[[observability.lineage.dataset]]
+node = "src"
+canonical_datasource = "s3://warehouse/source-a"
+
+[[observability.lineage.dataset]]
+node = "src"
+canonical_datasource = "s3://warehouse/source-b"
+"#,
+        None,
+    );
+    assert_external_policy_rejected(
+        r#"[[observability.lineage.dataset]]
+node = "src"
+canonical_datasource = "s3://warehouse/source"
+catalog_namespace = "analytics"
+catalog_name = "source"
+"#,
+        None,
+    );
+    assert_external_policy_rejected(
+        r#"[[observability.lineage.dataset]]
+node = "src"
+canonical_datasource = "private-worker-path-without-a-scheme"
+
+[[observability.lineage.dataset]]
+node = "out"
+catalog_namespace = "analytics"
+catalog_name = "lineage_fixture"
+"#,
+        Some("private-worker-path-without-a-scheme"),
+    );
+
+    let live = tempfile::tempdir().expect("live preflight workspace");
+    write_runnable_pipeline(live.path(), None);
+    external_lineage_policy(live.path(), false);
+    let live_rejected = Command::new(clinker_bin())
+        .current_dir(live.path())
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--lineage-events",
+            "events.ndjson",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "live-identity-preflight",
+        ])
+        .output()
+        .expect("run live identity preflight");
+    assert_eq!(live_rejected.status.code(), Some(1));
+    assert_eq!(
+        machine_terminal(&live_rejected)["failure"]["code"],
+        "observability.configuration.invalid"
+    );
+    assert!(!live.path().join("events.ndjson").exists());
+    assert!(!live.path().join("out.csv").exists());
+    assert!(!live.path().join(".clinker-attempts").exists());
+
+    let local = tempfile::tempdir().expect("local compatibility workspace");
+    write_pipeline(local.path(), "./local.csv");
+    write_lineage_policy(local.path(), "local_diagnostic_paths", "");
+    let local_output = Command::new(clinker_bin())
+        .current_dir(local.path())
+        .args(["run", "pipeline.yaml", "--lineage", "local.ndjson"])
+        .output()
+        .expect("run local compatibility export");
+    assert!(local_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&local_output.stderr)
+            .contains("local_diagnostic_paths (local diagnostic compatibility only)"),
+        "local compatibility output must be visibly labeled"
+    );
+    let local_complete = lineage_complete(&local.path().join("local.ndjson"));
+    assert!(
+        local_complete["outputs"][0]["name"]
+            .as_str()
+            .expect("local dataset name")
+            .ends_with("local.csv")
+    );
+
+    let absent = tempfile::tempdir().expect("absent policy workspace");
+    write_pipeline(absent.path(), "./absent.csv");
+    let absent_output = Command::new(clinker_bin())
+        .current_dir(absent.path())
+        .args(["run", "pipeline.yaml", "--lineage", "absent.ndjson"])
+        .output()
+        .expect("run absent identity policy");
+    assert_eq!(absent_output.status.code(), Some(1));
+    assert!(
+        !absent.path().join("absent.ndjson").exists(),
+        "path identity must require the exact explicit compatibility mode"
+    );
+}
+
 fn output_dataset_name(pipeline: &Path, base_dir: Option<&Path>) -> String {
     let mut cmd = Command::new(clinker_bin());
     cmd.arg("run").arg(pipeline).args(["--lineage", "-"]);
@@ -236,6 +543,7 @@ fn templated_output_dataset_name_is_the_declared_template() {
     // or two runs of the same pipeline name different (un-joinable) datasets.
     let dir = tempfile::tempdir().expect("tempdir");
     let pipeline = write_pipeline(dir.path(), "./output/report-{execution_id}.csv");
+    write_local_lineage_policy(dir.path());
     let name1 = output_dataset_name(&pipeline, None);
     let name2 = output_dataset_name(&pipeline, None);
     assert!(
@@ -253,6 +561,7 @@ fn base_dir_anchors_dataset_names_at_the_pipeline_directory() {
     let subdir = ws.path().join("subdir");
     std::fs::create_dir_all(&subdir).expect("mkdir subdir");
     let pipeline = write_pipeline(&subdir, "./out.csv");
+    write_local_lineage_policy(ws.path());
     let name = output_dataset_name(&pipeline, Some(ws.path()));
     assert!(
         name.contains("/subdir/"),
@@ -274,6 +583,7 @@ fn base_dir_anchors_dataset_names_at_the_pipeline_directory() {
 /// overflows `u64` makes the executor reject the run at its startup gate — a
 /// deterministic fatal error raised after the run has begun.
 fn write_runnable_pipeline(dir: &Path, memory_limit: Option<&str>) -> PathBuf {
+    write_local_lineage_policy(dir);
     let data_dir = dir.join("data");
     std::fs::create_dir_all(&data_dir).expect("mkdir data");
     std::fs::write(
@@ -343,6 +653,226 @@ fn run_lineage_events(pipeline: &Path) -> (bool, Vec<serde_json::Value>) {
         .map(|l| serde_json::from_str(l).expect("event line is JSON"))
         .collect();
     (status.success(), events)
+}
+
+fn run_correlated_lifecycle(
+    pipeline: &Path,
+    batch_id: &str,
+) -> (std::process::Output, Vec<serde_json::Value>) {
+    let dir = pipeline.parent().expect("pipeline has a parent dir");
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg("pipeline.yaml")
+        .args([
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            batch_id,
+            "--lineage-events",
+            "events.ndjson",
+        ])
+        .current_dir(dir)
+        .output()
+        .expect("spawn clinker");
+    let contents =
+        std::fs::read_to_string(dir.join("events.ndjson")).expect("read lineage-events file");
+    let lineage = contents
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("lineage event is JSON"))
+        .collect();
+    (output, lineage)
+}
+
+#[test]
+fn invalid_standalone_batch_ids_leave_every_run_effect_unchanged() {
+    fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn visit(root: &Path, current: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let mut entries = std::fs::read_dir(current)
+                .expect("read fixture tree")
+                .map(|entry| entry.expect("fixture entry").path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.push((
+                        path.strip_prefix(root)
+                            .expect("relative fixture path")
+                            .to_owned(),
+                        std::fs::read(&path).expect("read fixture file"),
+                    ));
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    for invalid_batch_id in [String::new(), "x".repeat(257), "batch\ncontrol".to_owned()] {
+        let workspace = tempfile::tempdir().expect("invalid correlation workspace");
+        write_runnable_pipeline(workspace.path(), None);
+        std::fs::create_dir(workspace.path().join("staging")).expect("staging root");
+        std::fs::write(
+            workspace.path().join("staging/sentinel"),
+            b"staging-before\n",
+        )
+        .expect("staging sentinel");
+        std::fs::write(workspace.path().join("events.ndjson"), b"lineage-before\n")
+            .expect("lineage sentinel");
+        let before = snapshot(workspace.path());
+
+        let output = Command::new(clinker_bin())
+            .current_dir(workspace.path())
+            .args([
+                "run",
+                "pipeline.yaml",
+                "--batch-id",
+                invalid_batch_id.as_str(),
+                "--lineage-events",
+                "events.ndjson",
+            ])
+            .output()
+            .expect("run invalid standalone correlation");
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("batch ID must be non-empty"),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(snapshot(workspace.path()), before);
+        assert!(!workspace.path().join("out.csv").exists());
+        assert!(!workspace.path().join(".clinker-attempts").exists());
+    }
+}
+
+fn machine_events(output: &std::process::Output) -> Vec<serde_json::Value> {
+    std::str::from_utf8(&output.stdout)
+        .expect("machine stdout is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("machine event is JSON"))
+        .collect()
+}
+
+fn assert_shared_correlation(
+    machine: &[serde_json::Value],
+    lineage: &[serde_json::Value],
+    batch_id: &str,
+    terminal_event_type: &str,
+) {
+    assert_eq!(
+        lineage.len(),
+        2,
+        "one shared lifecycle emits exactly START and one terminal event"
+    );
+    assert_eq!(lineage[0]["eventType"], "START");
+    assert_eq!(lineage[1]["eventType"], terminal_event_type);
+
+    let resolved = machine
+        .iter()
+        .find(|event| event["event"] == "plan_resolved")
+        .expect("machine plan_resolved event");
+    let execution_id = resolved["execution_id"]
+        .as_str()
+        .expect("machine execution ID");
+    let plan = &resolved["plan_identity"];
+
+    for event in lineage {
+        assert_eq!(event["run"]["runId"], execution_id);
+        assert_eq!(event["run"]["facets"]["clinker_batch"]["batchId"], batch_id);
+        let semantic = &event["job"]["facets"]["clinker_semanticPlan"];
+        assert_eq!(semantic["algorithm"], plan["algorithm"]);
+        assert_eq!(semantic["semanticSchemaVersion"], plan["version"]);
+        assert_eq!(semantic["digest"], plan["digest"]);
+    }
+}
+
+#[test]
+fn shared_lifecycle_correlation() {
+    let static_dir = tempfile::tempdir().expect("static lifecycle workspace");
+    write_runnable_pipeline(static_dir.path(), None);
+    let static_output = Command::new(clinker_bin())
+        .current_dir(static_dir.path())
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "correlation-static",
+            "--lineage",
+            "static.ndjson",
+        ])
+        .output()
+        .expect("run static correlated lineage");
+    assert!(
+        static_output.status.success(),
+        "static export stderr: {}",
+        String::from_utf8_lossy(&static_output.stderr)
+    );
+    let static_lineage = std::fs::read_to_string(static_dir.path().join("static.ndjson"))
+        .expect("read static lineage")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("static lineage event is JSON"))
+        .collect::<Vec<_>>();
+    assert_shared_correlation(
+        &machine_events(&static_output),
+        &static_lineage,
+        "correlation-static",
+        "COMPLETE",
+    );
+
+    let success_dir = tempfile::tempdir().expect("successful lifecycle workspace");
+    let success_pipeline = write_runnable_pipeline(success_dir.path(), None);
+    let (success_output, success_lineage) =
+        run_correlated_lifecycle(&success_pipeline, "correlation-success");
+    assert!(
+        success_output.status.success(),
+        "successful run stderr: {}",
+        String::from_utf8_lossy(&success_output.stderr)
+    );
+    let success_machine = machine_events(&success_output);
+    assert_shared_correlation(
+        &success_machine,
+        &success_lineage,
+        "correlation-success",
+        "COMPLETE",
+    );
+    assert_eq!(
+        success_machine.last().expect("machine terminal")["event"],
+        "completed"
+    );
+    let success_stats = &success_lineage[1]["run"]["facets"]["clinker_runStats"];
+    assert_eq!(success_stats["recordsRead"], 3);
+    assert_eq!(success_stats["recordsWritten"], 3);
+    assert_eq!(success_stats["recordsDlq"], 0);
+
+    let failure_dir = tempfile::tempdir().expect("failed lifecycle workspace");
+    let failure_pipeline = write_runnable_pipeline(failure_dir.path(), Some("17179869184G"));
+    let (failure_output, failure_lineage) =
+        run_correlated_lifecycle(&failure_pipeline, "correlation-failure");
+    assert_eq!(failure_output.status.code(), Some(1));
+    let failure_machine = machine_events(&failure_output);
+    assert_shared_correlation(
+        &failure_machine,
+        &failure_lineage,
+        "correlation-failure",
+        "FAIL",
+    );
+    let machine_failure = &failure_machine.last().expect("machine failure terminal")["failure"];
+    let lineage_failure = &failure_lineage[1]["run"]["facets"]["clinker_failure"];
+    assert_eq!(lineage_failure["code"], machine_failure["code"]);
+    assert_eq!(lineage_failure["category"], machine_failure["category"]);
+    assert_eq!(lineage_failure["retryAdvice"], machine_failure["retry"]);
+    assert_eq!(lineage_failure["message"], machine_failure["message"]);
+    assert_eq!(
+        failure_lineage[1]["run"]["facets"]["errorMessage"]["message"],
+        machine_failure["message"]
+    );
 }
 
 #[test]
@@ -463,5 +993,236 @@ fn lineage_events_conflicts_with_lineage() {
     assert!(
         stderr.contains("cannot be used with"),
         "expected a clap conflict error, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn delivery_isolation() {
+    fn run(workspace: &Path, inject_hang: bool) -> (std::process::Output, Duration) {
+        let started = std::time::Instant::now();
+        let mut command = Command::new(clinker_bin());
+        command.current_dir(workspace).args([
+            "run",
+            "pipeline.yaml",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "delivery-isolation",
+            "--lineage-events",
+            "events.ndjson",
+        ]);
+        if inject_hang {
+            command.env("CLINKER_TEST_LINEAGE_SINK", "hang-after-first-write");
+        }
+        let output = command.output().expect("run delivery isolation fixture");
+        (output, started.elapsed())
+    }
+
+    fn prepare(workspace: &Path) {
+        write_runnable_pipeline(workspace, None);
+        external_lineage_policy(workspace, true);
+        let policy = std::fs::read_to_string(workspace.join("clinker.toml"))
+            .expect("read external lineage policy")
+            .replace(
+                "[observability.lineage]\n",
+                "[observability.lineage]\nqueue_bytes = \"4KB\"\nmax_event_bytes = \"4KB\"\nflush_timeout_ms = 50\n",
+            );
+        std::fs::write(workspace.join("clinker.toml"), policy)
+            .expect("write bounded lineage policy");
+    }
+
+    fn authoritative_files(workspace: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        ["pipeline.yaml", "clinker.toml", "data/in.csv", "out.csv"]
+            .into_iter()
+            .map(|path| {
+                (
+                    PathBuf::from(path),
+                    std::fs::read(workspace.join(path)).expect("read authoritative fixture file"),
+                )
+            })
+            .collect()
+    }
+
+    fn attempt_evidence(workspace: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn visit(root: &Path, current: &Path, evidence: &mut Vec<(PathBuf, Vec<u8>)>) {
+            if !current.exists() {
+                return;
+            }
+            let mut entries = std::fs::read_dir(current)
+                .expect("read attempt evidence")
+                .map(|entry| entry.expect("attempt entry").path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    visit(root, &path, evidence);
+                } else {
+                    evidence.push((
+                        path.strip_prefix(root)
+                            .expect("attempt relative path")
+                            .to_owned(),
+                        std::fs::read(&path).expect("read attempt file"),
+                    ));
+                }
+            }
+        }
+
+        let root = workspace.join(".clinker-attempts");
+        let mut evidence = Vec::new();
+        visit(&root, &root, &mut evidence);
+        evidence
+    }
+
+    fn terminal_truth(output: &std::process::Output) -> serde_json::Value {
+        let terminal = machine_events(output)
+            .into_iter()
+            .last()
+            .expect("machine terminal event");
+        serde_json::json!({
+            "event": terminal["event"],
+            "batch_id": terminal["batch_id"],
+            "result": terminal["result"],
+            "exit_code": terminal["exit_code"],
+            "failure": terminal["failure"],
+            "publication": terminal["publication"],
+        })
+    }
+
+    fn publication_inventory(output: &std::process::Output) -> Vec<serde_json::Value> {
+        machine_events(output)
+            .into_iter()
+            .filter(|event| event["event"] == "publication_artifacts")
+            .map(|event| event["publication"].clone())
+            .collect()
+    }
+
+    let oracle = tempfile::tempdir().expect("delivery oracle workspace");
+    prepare(oracle.path());
+    let (oracle_output, _) = run(oracle.path(), false);
+    assert!(oracle_output.status.success());
+
+    let hung = tempfile::tempdir().expect("hung delivery workspace");
+    prepare(hung.path());
+    let (hung_output, elapsed) = run(hung.path(), true);
+    assert_eq!(hung_output.status.code(), oracle_output.status.code());
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "hung sink controlled CLI return"
+    );
+    assert_eq!(terminal_truth(&hung_output), terminal_truth(&oracle_output));
+    assert_eq!(
+        publication_inventory(&hung_output),
+        publication_inventory(&oracle_output)
+    );
+    assert_eq!(
+        authoritative_files(hung.path()),
+        authoritative_files(oracle.path())
+    );
+    assert!(!hung.path().join("dlq.ndjson").exists());
+    assert!(!oracle.path().join("dlq.ndjson").exists());
+    assert_eq!(
+        attempt_evidence(hung.path()),
+        attempt_evidence(oracle.path())
+    );
+    let stderr = String::from_utf8_lossy(&hung_output.stderr);
+    assert!(stderr.contains("lineage sink received bytes"), "{stderr}");
+    assert!(stderr.contains("deadline-exceeded"), "{stderr}");
+}
+
+/// Rewrite the workspace policy with explicit lineage caps, which are
+/// otherwise defaulted. Regenerates the base policy so repeated calls cannot
+/// stack duplicate keys into the same table.
+fn set_lineage_caps(dir: &Path, queue_bytes: &str, max_event_bytes: &str) {
+    external_lineage_policy(dir, true);
+    let policy = std::fs::read_to_string(dir.join("clinker.toml"))
+        .expect("read external lineage policy")
+        .replace(
+            "[observability.lineage]\n",
+            &format!(
+                "[observability.lineage]\nqueue_bytes = \"{queue_bytes}\"\nmax_event_bytes = \"{max_event_bytes}\"\n"
+            ),
+        );
+    std::fs::write(dir.join("clinker.toml"), policy).expect("write capped lineage policy");
+}
+
+/// The plan-only export is the entire invocation: an export that delivered
+/// nothing must not look like a successful one to the CI step that uploads it.
+#[test]
+fn lineage_export_dropped_by_the_event_cap_is_reported_not_silently_empty() {
+    let workspace = tempfile::tempdir().expect("capped export workspace");
+    write_pipeline(workspace.path(), "./out.csv");
+    external_lineage_policy(workspace.path(), true);
+    set_lineage_caps(workspace.path(), "512", "512");
+
+    let output = Command::new(clinker_bin())
+        .current_dir(workspace.path())
+        .args(["run", "pipeline.yaml", "--lineage", "lineage.ndjson"])
+        .output()
+        .expect("run capped lineage export");
+
+    // Exit 1 is the status documented for an export the configured caps
+    // rejected: the fix is a configuration change, not a retry.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an export that delivered nothing cannot exit 0"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("lineage.ndjson"),
+        "the diagnostic must name the destination: {stderr}"
+    );
+    assert!(
+        stderr.contains("observability.lineage.max_event_bytes"),
+        "the diagnostic must name the rule that dropped the events: {stderr}"
+    );
+    assert!(
+        !workspace.path().join("lineage.ndjson").exists(),
+        "no export was written, so no file may be left behind for a later step to upload"
+    );
+
+    // The correction the diagnostic prints has to be one the parser accepts and
+    // that actually restores the export.
+    assert!(
+        stderr.contains("queue_bytes = \"1MB\"") && stderr.contains("max_event_bytes = \"1MB\""),
+        "the diagnostic must carry a pasteable correction: {stderr}"
+    );
+    set_lineage_caps(workspace.path(), "1MB", "1MB");
+    let corrected = Command::new(clinker_bin())
+        .current_dir(workspace.path())
+        .args(["run", "pipeline.yaml", "--lineage", "lineage.ndjson"])
+        .output()
+        .expect("run corrected lineage export");
+    assert!(
+        corrected.status.success(),
+        "the printed correction must be accepted by the parser it targets:\n{}",
+        String::from_utf8_lossy(&corrected.stderr)
+    );
+    let complete = lineage_complete(&workspace.path().join("lineage.ndjson"));
+    assert_eq!(complete["eventType"], "COMPLETE");
+}
+
+#[test]
+fn lineage_export_sink_write_failure_is_reported() {
+    let workspace = tempfile::tempdir().expect("unwritable export workspace");
+    write_pipeline(workspace.path(), "./out.csv");
+    external_lineage_policy(workspace.path(), true);
+
+    let output = Command::new(clinker_bin())
+        .current_dir(workspace.path())
+        .env("CLINKER_TEST_LINEAGE_SINK", "write-failed")
+        .args(["run", "pipeline.yaml", "--lineage", "lineage.ndjson"])
+        .output()
+        .expect("run failing-sink lineage export");
+
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot write --lineage output") && stderr.contains("lineage.ndjson"),
+        "the diagnostic must name the destination it could not write: {stderr}"
+    );
+    assert!(
+        stderr.contains("broken-pipe"),
+        "the diagnostic must name what the sink reported: {stderr}"
     );
 }

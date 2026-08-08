@@ -8,6 +8,7 @@ pub mod format;
 pub mod fs_type;
 pub mod multi_value;
 pub mod node_header;
+pub mod observability;
 pub mod output;
 pub mod output_mapping;
 pub mod patch;
@@ -44,6 +45,7 @@ pub use fs_type::{
     same_device,
 };
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
+pub use observability::*;
 pub use output::*;
 pub use output_mapping::{MappingEntry, OutputMapping};
 pub use patch::{

@@ -1,6 +1,6 @@
 # AI Onboarding: Crate Map
 
-Verified against the current working tree (2026-07-30).
+Verified against the current working tree (2026-08-07).
 
 Purpose: Give future AI agents a factual map of the current Cargo workspace, with dependency direction, crate roles, and evidence anchors for safe code changes.
 
@@ -28,12 +28,14 @@ clinker-record
   -> clinker-schema
   -> clinker / cxl-cli
 
+clinker-core-types -> clinker-net + clinker-lineage
+
 clinker-bench-support -> clinker-record
 clinker-benchmarks -> clinker-bench-support + clinker-exec + clinker-plan + cxl
 clinker-scenarios -> (no workspace dependencies; dev-dependency of clinker)
 ```
 
-Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clinker-record`; `clinker-format -> clinker-record, cxl`; `clinker-plan -> clinker-core-types, clinker-format, clinker-record, cxl`; `clinker-exec -> clinker-core-types, clinker-format, clinker-plan, clinker-record, cxl`; `clinker-channel -> clinker-core-types, clinker-plan, clinker-record`; `clinker-net -> clinker-exec, clinker-format, clinker-plan, clinker-record`; `clinker -> clinker-channel, clinker-core-types, clinker-exec, clinker-format, clinker-lineage, clinker-net, clinker-plan, clinker-record`; `cxl-cli -> cxl, clinker-record`; `clinker-schema -> clinker-plan`; `clinker-lineage -> clinker-plan, clinker-record, cxl`.
+Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clinker-record`; `clinker-format -> clinker-record, cxl`; `clinker-plan -> clinker-core-types, clinker-format, clinker-record, cxl`; `clinker-exec -> clinker-core-types, clinker-format, clinker-plan, clinker-record, cxl`; `clinker-channel -> clinker-core-types, clinker-plan, clinker-record`; `clinker-net -> clinker-core-types, clinker-exec, clinker-format, clinker-plan, clinker-record`; `clinker -> clinker-channel, clinker-core-types, clinker-exec, clinker-format, clinker-lineage, clinker-net, clinker-plan, clinker-record`; `cxl-cli -> cxl, clinker-record`; `clinker-schema -> clinker-plan`; `clinker-lineage -> clinker-core-types, clinker-plan, clinker-record, cxl`.
 
 ### Shared failure taxonomy boundary
 
@@ -42,7 +44,8 @@ The only approved root types for the network and lineage consumers are
 `FailureClassification`, `FailureCategory`, and `RetryAdvice`. The approved
 normal dependency edges are `clinker-net -> clinker-core-types` and
 `clinker-lineage -> clinker-core-types`. Consumer crates adapt these values at
-their edges and do not re-export the shared taxonomy.
+their edges and do not re-export the shared taxonomy. This decision adds no
+feature, serialization policy, package, or additional shared type.
 
 Semantic plan identity remains in `clinker-plan`; dataset identity remains in
 `clinker-lineage`. The shared vocabulary therefore owns neither identity nor
@@ -54,10 +57,10 @@ wire-format serialization policy.
 - `clinker-record` is the shared data model leaf for row values, schemas, storage traits, grouping keys, document context, and accumulators (`crates/clinker-record/src/lib.rs`).
 - `cxl` sits above records but below planning/execution: it parses, resolves, type-checks, plans aggregates, and evaluates expressions against `clinker-record` values (`crates/cxl/src/lib.rs`).
 - `clinker-format` owns streaming readers/writers and document/envelope framing. It depends on `cxl`, so it is not a pure serialization leaf (`crates/clinker-format/Cargo.toml`; `crates/clinker-format/src/lib.rs`).
-- `clinker-plan` is the sole execution-admission authority below the runtime executor. It discovers every typed CXL root, freezes the complete producer-port consumer registry and execution-order/writer contract after structural rewrites, and returns those proofs on `CompiledPlan` (`crates/clinker-plan/src/lib.rs`; `crates/clinker-plan/src/plan/execution/consumer_registry.rs`; `crates/clinker-plan/src/plan/execution/scheduling.rs`).
-- `clinker-exec` is runtime orchestration and operators. It consumes planning-owned proofs, owns the unified source-attempt and population-accounting stream, and enforces shared-port replay plus source/writer ordering under one run-scoped memory arbitrator. Binaries and network transports depend on it rather than the reverse (`crates/clinker-exec/src/lib.rs`; `crates/clinker-exec/src/executor/mod.rs`).
-- `clinker-channel`, `clinker-net`, `clinker-schema`, `clinker`, and `cxl-cli` appear to be edge/application or integration crates around the plan/exec/language core.
-- `clinker-lineage` is a plan-time, read-only consumer of `clinker-plan`: it maps Source/Output nodes to OpenLineage dataset identities and walks the compiled DAG to emit DIRECT (per-column) and INDIRECT (whole-dataset influence) column-level lineage facets (OpenLineage `2-0-2` / `ColumnLineageDatasetFacet` `1-2-0`). It reads typed/compiled programs off plan nodes via `cxl`; it does not run pipelines or hold any clock — the CLI supplies every timestamp (`crates/clinker-lineage/src/lib.rs`). The `clinker` CLI consumes it two ways: `run --lineage <path>` compiles the plan and writes a static START/COMPLETE OpenLineage NDJSON pair without reading data (mirroring `--explain`); `run --lineage-events <path>` runs the pipeline and, via `emit::LiveRunEmitter`, emits live run-lifecycle events tied to the execution — a START at run begin and a terminal COMPLETE / FAIL / ABORT at run end, carrying real timing, row counts (the clinker-defined `clinker_runStats` run facet), and, on FAIL, the standard `ErrorMessageRunFacet`. The engine core (`clinker-exec`) has no lineage dependency; the run lifecycle is orchestrated at the CLI edge. Live emission over an HTTP/network transport is a separate, deferred layer.
+- `clinker-plan` is the sole execution-admission authority below the runtime executor. It discovers every typed CXL root, freezes the complete producer-port consumer registry and execution-order/writer contract after structural rewrites, and returns those proofs on `CompiledPlan`. Its observability config retains only strict secret-free raw endpoint/auth intent and numeric telemetry/lineage bounds; endpoint parsing and network-auth state stay out (`crates/clinker-plan/src/lib.rs`; `crates/clinker-plan/src/config/observability.rs`; `crates/clinker-plan/src/plan/execution/consumer_registry.rs`; `crates/clinker-plan/src/plan/execution/scheduling.rs`).
+- `clinker-exec` is runtime orchestration and operators. It consumes planning-owned proofs, owns the unified source-attempt and population-accounting stream, enforces shared-port replay plus source/writer ordering under one run-scoped memory arbitrator, and produces real fixed-memory logs, metrics, and traces. Binaries and network transports depend on it rather than the reverse (`crates/clinker-exec/src/lib.rs`; `crates/clinker-exec/src/executor/mod.rs`; `crates/clinker-exec/src/telemetry.rs`).
+- `clinker-channel`, `clinker-net`, `clinker-schema`, `clinker`, and `cxl-cli` appear to be edge/application or integration crates around the plan/exec/language core. In addition to finite REST sources, `clinker-net` alone parses and normalizes an OTLP origin into an opaque admitted proof with private fields, derives the three fixed signal routes, and owns bounded synchronous transport plus the post-admission borrowed credential applicator.
+- `clinker-lineage` is a plan-time, read-only consumer of `clinker-plan`: it maps Source/Output nodes to canonical datasource or exact catalog identities and walks the compiled DAG to emit DIRECT (per-column) and INDIRECT (whole-dataset influence) column-level lineage facets (OpenLineage `2-0-2` / `ColumnLineageDatasetFacet` `1-2-0`). Stable collection identities carry explicitly authorized standard input/output subset and symlinks facets; path identity exists only in explicit `local_diagnostic_paths`. It reads typed/compiled programs off plan nodes via `cxl`; it does not run pipelines, mint identities, hold a clock, or own lifecycle state. The CLI supplies immutable bounded start/terminal snapshots from one `RunLifecycleFacts` source (`crates/clinker/src/lifecycle.rs`; `crates/clinker-lineage/src/emit.rs`). `run --lineage <path>` writes a static START/COMPLETE pair; `run --lineage-events <path>` emits live START and terminal events with shared `clinker_batch` run and `clinker_semanticPlan` job correlation, real `clinker_runStats`, and sanitized standard/clinker failure facets. External delivery owns an independent byte-capped nonblocking queue, sink worker, deadline, counters, and typed outcome. Both paths preflight the resolved workspace identity policy before opening lineage or execution outputs. The engine core (`clinker-exec`) has no lineage dependency; lifecycle truth remains at the CLI edge.
 - Benchmark crates appear intended to stay outside the runtime layer. `clinker-benchmarks/src/lib.rs` says it houses a runner needing both `clinker-exec` and `clinker-bench-support` to avoid a circular dependency.
 
 ## Cycles And Suspicious Coupling
@@ -127,13 +130,13 @@ results, and OpenLineage output datasets keep their existing vocabulary. See
 - Crate name: `clinker-core-types`
 - Path: `crates/clinker-core-types`
 - Role: Library crate.
-- Purpose: Provides leaf vocabulary shared by planning, execution, diagnostics, and channels: source spans, structured diagnostics, name-keyed graph utilities, and DLQ categories/stage helpers.
-- Important public modules: `diagnostic`, `dlq`, `graph`, `span`.
+- Purpose: Provides leaf vocabulary shared by planning, execution, diagnostics, channels, network delivery, and lineage: source spans, structured diagnostics, name-keyed graph utilities, DLQ categories/stage helpers, and the serialization-neutral failure taxonomy.
+- Important public modules: `diagnostic`, `dlq`, `failure`, `graph`, `span`. The failure module owns only `FailureClassification`, `FailureCategory`, and `RetryAdvice` for the approved network and lineage consumer boundary; it owns no identity or wire policy.
 - Internal dependencies: none.
 - Architecturally important external dependencies: `miette`, `petgraph`, `serde-saphyr`.
-- Known tests/examples/benches: unit tests in `diagnostic.rs`, `dlq.rs`, `graph.rs`, and `span.rs`; one integration test, `tests/registry_no_orphan_codes.rs`, which scans the workspace's Rust sources for diagnostic code literals and fails on any the registry does not list; no benches listed by Cargo metadata.
+- Known tests/examples/benches: unit tests in `diagnostic.rs`, `dlq.rs`, `failure.rs`, `graph.rs`, and `span.rs`; one integration test, `tests/registry_no_orphan_codes.rs`, which scans the workspace's Rust sources for diagnostic code literals and fails on any the registry does not list; no benches listed by Cargo metadata.
 - Confidence: High.
-- Evidence: `crates/clinker-core-types/src/lib.rs` explicitly describes the crate as leaf vocabulary and re-exports `Diagnostic`, `NameGraph`, `Span`, and `DlqErrorCategory`; `crates/clinker-core-types/Cargo.toml`.
+- Evidence: `crates/clinker-core-types/src/lib.rs` explicitly describes the crate as leaf vocabulary and re-exports `Diagnostic`, `NameGraph`, `Span`, `DlqErrorCategory`, `FailureClassification`, `FailureCategory`, and `RetryAdvice`; `crates/clinker-core-types/Cargo.toml`.
 
 ### cxl
 
@@ -179,7 +182,7 @@ results, and OpenLineage output datasets keep their existing vocabulary. See
 - Crate name: `clinker-plan`
 - Path: `crates/clinker-plan`
 - Role: Library crate with in-crate plan/config tests.
-- Purpose: Parses YAML pipeline/composition configuration, resolves schemas, discovers sources and workspace resources, validates configs, and produces typed execution DAGs consumed by `clinker-exec`. Planning uses the variant-exhaustive `PipelineNode::visit_cxl_fields` traversal to own direct CXL roots and the bounded transitive module/declaration closure; the parsed `CompiledModuleRegistry` remains on `CompiledPlan`. After every structural rewrite it also freezes `CompiledConsumerRegistry` and `ExecutionOrderContract`, including source-order proofs and physical-writer boundaries.
+- Purpose: Parses YAML pipeline/composition configuration, resolves schemas, discovers sources and workspace resources, validates configs, and produces typed execution DAGs consumed by `clinker-exec`. Planning uses the variant-exhaustive `PipelineNode::visit_cxl_fields` traversal to own direct CXL roots and the bounded transitive module/declaration closure; the parsed `CompiledModuleRegistry` remains on `CompiledPlan`. After every structural rewrite it also freezes `CompiledConsumerRegistry` and `ExecutionOrderContract`, including source-order proofs and physical-writer boundaries. Workspace observability resolution owns strict secret-free raw endpoint/auth intent and fixed numeric telemetry plus independent-lineage bounds, but no URI admission or network credential handle.
 - Important public modules: `config`, `error`, `overlay_ops`, `plan`, `resources`, `runtime_error`, `schema`, `security`, `span`, `validation`, `yaml`. `config` exposes aggregate/canonical/compile-context/composition/discovery/format/output/patch/pipeline/route/sort/source/storage/transform surfaces; `plan` exposes binding, combine, compiled plans, composition bodies, deferred regions, entities, envelope synthesis, execution, provenance, extraction/index, properties, row types, scheduling, statistics, streaming eligibility, and plan types. `plan::execution` owns `ProducerPortKey`, `CompiledConsumerRegistry`, `CompiledSourceOrder`, `PhysicalWriterBoundary`, and `ExecutionOrderContract`; `resources` owns `CompiledModuleRegistry`, parsed module entries, export metadata, and evaluator-registry construction.
 - Internal dependencies: `clinker-core-types`, `clinker-format`, `clinker-record`, `cxl`.
 - Architecturally important external dependencies: `serde`, `serde_json`, `serde-saphyr`, `toml`, `indexmap`, `miette`, `petgraph`, `regex`, `tracing`, `walkdir`, `glob`, `blake3`, `postcard`, `lz4_flex`, `tempfile`, platform `nix`/`windows-sys`.
@@ -192,8 +195,8 @@ results, and OpenLineage output datasets keep their existing vocabulary. See
 - Crate name: `clinker-exec`
 - Path: `crates/clinker-exec`
 - Role: Library crate with the largest integration-test and benchmark surface.
-- Purpose: Executes compiled pipeline DAGs: unified successful/type-error source attempts and population accounting, attempt-local row identity, per-physical-file source-order verification/repair, compiled shared-port replay, dispatch for node kinds, transforms, aggregations, combines/joins, route/merge/reshape/cull/output dispatch, physical-writer ordering and cleanup, DLQ, metrics, memory arbitration, spill handling, record sources, and progress. CXL and channel filesystem admission, the consumer graph, and ordering/writer proofs are planning-owned; execution consumes the retained artifacts.
-- Important public modules: `aggregation`, `dlq`, `executor`, `exit_codes`, `log_dispatch`, `log_rules`, `log_template`, `metrics`, `output`, `partial`, `pipeline`, `progress`, `projection`, `sketch`, `source`. The `executor` module exposes `PipelineExecutor`, `PipelineRunParams`, `ExecutionReport`, `WriterRegistry`, `RecordSource`, `SourceInput`, and validation types; internal `source_stream` owns `SourceAttemptEvent` and `AttemptPopulationDelta`, `stream_event` owns `SourceRowId`, and `output_dispatch` owns `OrderedWriterBoundary`. The `pipeline` module exposes sort, combine, grace hash, IEJoin, memory, spill, streaming merge, and window context helpers. Source repair and writer ordering both reuse `MemoryArbitrator`, `SortBuffer`, and `SortedRunMerger` rather than defining private budgets or another ordering engine.
+- Purpose: Executes compiled pipeline DAGs: unified successful/type-error source attempts and population accounting, attempt-local row identity, per-physical-file source-order verification/repair, compiled shared-port replay, dispatch for node kinds, transforms, aggregations, combines/joins, route/merge/reshape/cull/output dispatch, physical-writer ordering and cleanup, DLQ, metrics, memory arbitration, spill handling, record sources, and progress. CXL and channel filesystem admission, the consumer graph, and ordering/writer proofs are planning-owned; execution consumes the retained artifacts. The crate also owns the preallocated privacy-gated logs/metrics/traces arena and real execution producers; it does not admit endpoints or deliver OpenLineage.
+- Important public modules: `aggregation`, `dlq`, `executor`, `exit_codes`, `metrics`, `output`, `partial`, `pipeline`, `progress`, `projection`, `sketch`, `source`, `telemetry`; transform dispatch remains private. The `executor` module exposes `PipelineExecutor`, `PipelineRunParams`, `ExecutionReport`, `WriterRegistry`, `RecordSource`, `SourceInput`, and validation types; internal `source_stream` owns `SourceAttemptEvent` and `AttemptPopulationDelta`, `stream_event` owns `SourceRowId`, and `output_dispatch` owns `OrderedWriterBoundary`. The `pipeline` module exposes sort, combine, grace hash, IEJoin, memory, spill, streaming merge, and window context helpers. Source repair and writer ordering both reuse `MemoryArbitrator`, `SortBuffer`, and `SortedRunMerger` rather than defining private budgets or another ordering engine.
 - Internal dependencies: `clinker-core-types`, `clinker-format`, `clinker-plan`, `clinker-record`, `cxl`; optional normal dependency on `clinker-bench-support`; dev-depends on `clinker-bench-support` and `clinker-channel`.
 - Architecturally important external dependencies: `crossbeam-channel`, `rayon`, `arc-swap`, `hashbrown`, `lz4_flex`, `postcard`, `fs4`, `petgraph`, `miette`, `tracing`, `serde-saphyr`, `serde_json`, `csv`, `glob`, `uuid`, `ctrlc` on native targets, `windows-sys` on Windows, `criterion`, `insta`, `proptest`, `serial_test`.
 - Known tests/examples/benches: many integration tests in `crates/clinker-exec/tests/`, including `multi_output`, `source_order_verification`, `source_type_errors`, `ordering_contract`, `output_envelope_seam`, `streaming_output`, and `document_dlq`, plus aggregate, combine, composition, correlation/retraction, format, storage, memory, streaming, docs, and fixture coverage; white-box tests under `crates/clinker-exec/src/executor/tests/`; benches under `crates/clinker-exec/benches/` including `sort`, `arena`, `window`, `pipeline`, `parallel`, `provenance`, `composition`, `combine`, `combine_iejoin`, `combine_nary_3input`, `combine_grace_hash`, `deferred_buffer_pruning`, `arbitration_poll`, and `spill_compression`.
@@ -217,12 +220,12 @@ results, and OpenLineage output datasets keep their existing vocabulary. See
 
 - Crate name: `clinker-net`
 - Path: `crates/clinker-net`
-- Role: Library crate plus REST integration tests.
-- Purpose: Provides finite-pull network source readers, currently REST, that adapt paginated network data into executor `RecordSource` inputs.
-- Important public modules: no public submodules; `rest` is private. Public API is `build_rest_source`.
-- Internal dependencies: `clinker-exec`, `clinker-format`, `clinker-plan`, `clinker-record`; dev-depends on `clinker-bench-support` and `clinker-exec` with `test-utils`.
+- Role: Library crate plus REST and OTLP integration tests.
+- Purpose: Provides finite-pull REST sources and the sole OTLP endpoint-admission/normalization and finite synchronous delivery boundary. `admit_otlp_endpoint` accepts one HTTPS origin, returns an opaque `AdmittedOtlpEndpoint` whose fields are private, and fixes `/v1/logs`, `/v1/metrics`, and `/v1/traces`; authentication can only be applied through the borrowed post-admission request boundary.
+- Important public modules: no public submodules; `rest` and `otlp` are private. The root re-exports `build_rest_source`, `admit_otlp_endpoint`, the opaque admitted proof, signal/budget/outcome types, the borrowed credential applicator boundary, and `send_otlp_json`.
+- Internal dependencies: `clinker-core-types`, `clinker-exec`, `clinker-format`, `clinker-plan`, `clinker-record`; dev-depends on `clinker-bench-support` and `clinker-exec` with `test-utils`.
 - Architecturally important external dependencies: `ureq` with rustls, `serde_json`, `indexmap`, `tracing`.
-- Known tests/examples/benches: `crates/clinker-net/tests/rest_executor_e2e.rs`; `crates/clinker-net/tests/rest_pagination.rs`; executor transport coverage also appears in `crates/clinker-exec/tests/transport_validation.rs` and `record_source_transport.rs`.
+- Known tests/examples/benches: `crates/clinker-net/tests/rest_executor_e2e.rs`; `crates/clinker-net/tests/rest_pagination.rs`; `crates/clinker-net/tests/otlp_http.rs`; executor transport coverage also appears in `crates/clinker-exec/tests/transport_validation.rs` and `record_source_transport.rs`.
 - Confidence: High.
 - Evidence: `crates/clinker-net/src/lib.rs` documents the finite-pull model and returns `Box<dyn clinker_exec::source::RecordSource>` from `build_rest_source`.
 
@@ -231,7 +234,7 @@ results, and OpenLineage output datasets keep their existing vocabulary. See
 - Crate name: `clinker`
 - Path: `crates/clinker`
 - Role: Binary crate for the main CLI.
-- Purpose: Provides the user-facing ETL CLI that runs pipelines, performs dry-run/explain flows, applies channels, resolves memory/threads/output behavior, collects metrics, explains diagnostic codes, lists channels/groups, applies workspace-wide refactors (node rename), and prints resolved config (`config --resolved` expands multi-value shorthand to canonical form).
+- Purpose: Provides the user-facing ETL CLI that runs pipelines, performs dry-run/explain flows, applies channels, resolves memory/threads/output behavior, collects metrics, explains diagnostic codes, lists channels/groups, applies workspace-wide refactors (node rename), and prints resolved config (`config --resolved` expands multi-value shorthand to canonical form). It owns pre-effect observability composition, one immutable lifecycle-fact source, and separate finite OTLP and OpenLineage workers and outcomes.
 - Important public modules: `refactor` (workspace-wide rename support in `src/refactor.rs` + `src/refactor/`); the rest of the CLI lives in `src/main.rs`. Main symbols include `Cli`, `Commands`, `RunArgs`, `MetricsCommands`, `CollectArgs`, `ExplainArgs`, `ConfigArgs`, `RenameNodeArgs`, `ResolveArgs`, and `LintArgs`.
 - Internal dependencies: `clinker-channel`, `clinker-core-types`, `clinker-exec`, `clinker-format`, `clinker-lineage`, `clinker-net`, `clinker-plan`, `clinker-record`.
 - Architecturally important external dependencies: `clap`, `miette`, `tracing`, `tracing-subscriber`, `serde-saphyr`, `serde_json`, `indexmap`, `chrono`, `num_cpus`, `uuid`, `tempfile`.
@@ -257,13 +260,13 @@ results, and OpenLineage output datasets keep their existing vocabulary. See
 - Crate name: `clinker-lineage`
 - Path: `crates/clinker-lineage`
 - Role: Library crate plus composition-lineage integration test.
-- Purpose: Serializes pipeline lineage as OpenLineage events: maps Source/Output nodes to dataset identities, walks a `CompiledPlan` DAG to compute DIRECT per-column lineage and dataset-level INDIRECT influence (traced through composition bodies and `$doc` reads), and assembles run events for NDJSON output — a static START/COMPLETE pair for plan-derived export or live run-lifecycle events via `LiveRunEmitter`.
-- Important public modules: `builder`, `dataset`, `emit`, `openlineage` (`event`, `facet`, `ndjson`).
-- Internal dependencies: `clinker-plan`, `clinker-record`, `cxl`; dev-depends on `clinker-core-types`.
+- Purpose: Serializes pipeline lineage as OpenLineage events: maps Source/Output nodes to canonical/catalog collection identities with standard subset and symlinks facets, walks a `CompiledPlan` DAG to compute DIRECT per-column lineage and dataset-level INDIRECT influence (traced through composition bodies and `$doc` reads), assembles static or live events from caller-owned immutable lifecycle facts, and owns independently bounded external delivery.
+- Important public modules: `builder`, `dataset`, `delivery`, `emit`, `logical_identity`, `openlineage` (`event`, `facet`, `ndjson`).
+- Internal dependencies: `clinker-core-types`, `clinker-plan`, `clinker-record`, `cxl`.
 - Architecturally important external dependencies: `petgraph`, `serde`, `serde_json`.
-- Known tests/examples/benches: `crates/clinker-lineage/tests/composition_lineage.rs` plus fixtures; unit tests in module files; CLI-level behavior exercised through `crates/clinker` (`run --lineage`, `run --lineage-events`).
+- Known tests/examples/benches: `crates/clinker-lineage/tests/composition_lineage.rs`, `logical_identity.rs`, and `lifecycle_delivery.rs` plus fixtures; unit tests in module files; CLI-level behavior exercised through `crates/clinker` (`run --lineage`, `run --lineage-events`).
 - Confidence: High.
-- Evidence: `crates/clinker-lineage/src/lib.rs` (pinned to OpenLineage core `2-0-2`, `ColumnLineageDatasetFacet` `1-2-0`; re-exports `column_lineage`, `dataset_identity`, `run_events`, `LiveRunEmitter`, `write_ndjson`); `crates/clinker-lineage/Cargo.toml`.
+- Evidence: `crates/clinker-lineage/src/lib.rs` (pinned to OpenLineage core `2-0-2`, `ColumnLineageDatasetFacet` `1-2-0`; re-exports immutable lifecycle input types, `run_events`, and `write_ndjson`); `crates/clinker-lineage/Cargo.toml`.
 
 ### clinker-bench-support
 

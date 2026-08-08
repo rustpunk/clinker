@@ -580,29 +580,12 @@ impl PipelineConfig {
                 _ => continue,
             };
             let Some(directives) = log else { continue };
-            for (i, d) in directives.iter().enumerate() {
-                if let Some(every) = d.every {
-                    if every == 0 {
-                        diags.push(Diagnostic::error(
-                            "E011",
-                            format!(
-                                "transform {name:?}: log directive #{}: every must be >= 1",
-                                i + 1
-                            ),
-                            span_for(spanned),
-                        ));
-                    }
-                    if d.when != LogTiming::PerRecord {
-                        diags.push(Diagnostic::error(
-                            "E011",
-                            format!(
-                                "transform {name:?}: log directive #{}: 'every' is only valid with when: per_record",
-                                i + 1
-                            ),
-                            span_for(spanned),
-                        ));
-                    }
-                }
+            for error in transform::log_directive_set_validation_errors(directives) {
+                diags.push(Diagnostic::error(
+                    "E011",
+                    format!("transform {name:?}: {error}"),
+                    span_for(spanned),
+                ));
             }
         }
 
@@ -3976,13 +3959,30 @@ pub(crate) fn lower_node_to_plan_node(
                 };
             let write_set = extract_write_set(&typed);
             let has_distinct = extract_has_distinct(&typed);
+            let log = config.log.clone().unwrap_or_default();
+            // The gate predicates bind_schema typechecked, one slot per
+            // directive. An absent entry means bind rejected a condition (a
+            // diagnostic was already pushed); a short one would silently
+            // un-gate the tail directives, so both refuse to lower — the same
+            // guard the Route and Reshape arms apply to their per-item
+            // program sets.
+            let log_conditions = if log.is_empty() {
+                Vec::new()
+            } else {
+                let conditions = artifacts.transform_log_conditions.get(&id)?.clone();
+                if conditions.len() != log.len() {
+                    return None;
+                }
+                conditions
+            };
             Some(PlanNode::Transform {
                 name: name.to_string(),
                 id,
                 span,
                 resolved: Some(Box::new(PlanTransformPayload {
                     analytic_window: config.analytic_window.clone(),
-                    log: config.log.clone().unwrap_or_default(),
+                    log,
+                    log_conditions,
                     validations: config.validations.clone().unwrap_or_default(),
                     dlq_node: None,
                     typed,
@@ -5302,28 +5302,11 @@ pub(crate) fn validate_node_configs(nodes: &[Spanned<PipelineNode>]) -> Vec<Node
         } = &spanned.value
             && let Some(directives) = &body.log
         {
-            for (i, d) in directives.iter().enumerate() {
-                if let Some(every) = d.every {
-                    if every == 0 {
-                        violations.push(NodeConfigViolation {
-                            node_index,
-                            message: format!(
-                                "transform '{}': log directive #{}: every must be >= 1",
-                                header.name,
-                                i + 1,
-                            ),
-                        });
-                    } else if d.when != LogTiming::PerRecord {
-                        violations.push(NodeConfigViolation {
-                            node_index,
-                            message: format!(
-                                "transform '{}': log directive #{}: 'every' is only valid with when: per_record",
-                                header.name,
-                                i + 1,
-                            ),
-                        });
-                    }
-                }
+            for error in transform::log_directive_set_validation_errors(directives) {
+                violations.push(NodeConfigViolation {
+                    node_index,
+                    message: format!("transform '{}': {error}", header.name),
+                });
             }
         }
     }

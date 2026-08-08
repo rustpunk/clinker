@@ -18,6 +18,39 @@ use crate::executor::{parse_memory_limit, stage_metrics};
 use crate::pipeline::spill_merge::merge_sorted_runs;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, single_predecessor};
+
+/// Context carrier kept lazy until the node-kind guard has succeeded. Normal
+/// dispatch passes the live executor context directly; the feature-gated
+/// mismatch matrix uses the inert carrier to prove rejection precedes input
+/// drainage, sorting, spill, and buffer access.
+pub(crate) enum SortDispatchContext<'borrow, 'plan> {
+    Live(&'borrow mut ExecutorContext<'plan>),
+    #[cfg(feature = "test-utils")]
+    Inert,
+}
+
+impl<'borrow, 'plan> From<&'borrow mut ExecutorContext<'plan>>
+    for SortDispatchContext<'borrow, 'plan>
+{
+    fn from(ctx: &'borrow mut ExecutorContext<'plan>) -> Self {
+        Self::Live(ctx)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl crate::executor::dispatch::DispatchFaultGuard {
+    /// Execute the real sort boundary with an inert context so tests can prove
+    /// a wrong node returns before input or spill state is touched.
+    #[doc(hidden)]
+    pub fn dispatch_sort_mismatch_for_testing(
+        current_dag: &ExecutionPlanDag,
+        node_idx: NodeIndex,
+        node: &PlanNode,
+    ) -> Result<(), PipelineError> {
+        dispatch_sort(SortDispatchContext::Inert, current_dag, node_idx, node)
+    }
+}
+
 /// Lazily drained result of a stable authored-key sort. Resident populations
 /// iterate their already-sorted vector; spilled populations retain the shared
 /// bounded-fan-in merger so records reach a terminal writer without
@@ -56,20 +89,34 @@ impl Iterator for AuthoredSortStream {
 /// [`SourceRowId`](crate::executor::stream_event::SourceRowId) through the
 /// permutation), and emit the ordered run. Blocking: the full
 /// input run materializes before the first sorted record leaves.
-pub(crate) fn dispatch_sort(
-    ctx: &mut ExecutorContext<'_>,
+pub(crate) fn dispatch_sort<'borrow, 'plan>(
+    ctx: impl Into<SortDispatchContext<'borrow, 'plan>>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     node: &PlanNode,
-) -> Result<(), PipelineError> {
+) -> Result<(), PipelineError>
+where
+    'plan: 'borrow,
+{
     let PlanNode::Sort {
         ref name,
         ref sort_fields,
         ..
     } = *node
     else {
-        unreachable!("dispatch_sort called with non-Sort node");
+        return Err(crate::executor::invariant::dispatch_mismatch(
+            "dispatch_sort",
+            "sort",
+            node.kind_name(),
+            node.name(),
+        ));
     };
+    #[cfg(feature = "test-utils")]
+    let SortDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("sort dispatcher accessed inert context after accepting a sort node")
+    };
+    #[cfg(not(feature = "test-utils"))]
+    let SortDispatchContext::Live(ctx) = ctx.into();
     // Enforcer-sort dispatch. Carries `row_num` through
     // the sort permutation as the `SortBuffer<SourceRowId>`
     // payload — the Record itself carries every field

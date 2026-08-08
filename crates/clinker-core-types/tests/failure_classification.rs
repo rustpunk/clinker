@@ -277,6 +277,15 @@ mod taxonomy {
     }
 
     #[test]
+    fn page_body_limit_requires_policy_before_another_attempt() {
+        let failure = FailureClassification::for_code("rest.protocol.page_body_limit_reached")
+            .expect("registered REST page body limit");
+
+        assert_eq!(failure.category(), FailureCategory::SourceProtocol);
+        assert_eq!(failure.retry_advice(), RetryAdvice::PolicyRequired);
+    }
+
+    #[test]
     fn sanitization_rejects_sensitive_and_raw_payload_shapes() {
         let sentinels = [
             "record={ssn: 123-45-6789}",

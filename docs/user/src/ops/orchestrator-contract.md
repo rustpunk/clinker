@@ -1,100 +1,214 @@
-# Running Under a Workflow Orchestrator
+# Running Clinker Directly or Under a Supervisor
 
-Clinker is a finite batch job wrapped in a single CLI binary. That makes it a
-natural activity body (or task, or step) for an external workflow orchestrator.
-The orchestrator owns scheduling, retries, timeouts, and cross-job state;
-Clinker owns one bounded-memory pass over finite input.
+Clinker is a finite synchronous CLI. The ordinary command is the primary path
+and needs no worker, service, scheduler, or orchestration component:
 
-Clinker embeds no orchestrator SDK or worker runtime. An external worker
-launches `clinker run …` as a child process and observes the exit code, stderr,
-and optional metrics spool.
+```bash
+clinker run pipeline.yaml
+```
 
-## Exit codes and retry policy
+An external scheduler or workflow runner can opt into a versioned child-process
+protocol when it needs machine-readable lifecycle evidence:
 
-| Exit | Meaning | Recommended handling |
-|---|---|---|
-| `0` | Success; every output committed. | Activity success. |
-| `2` | Completed with records routed to the DLQ. | Activity success; inspect DLQ counts under your data-quality policy. |
-| `1` | Configuration, schema, or compile error. | Non-retryable for unchanged configuration and input. |
-| `3` | Fatal data-quality error or configured threshold exceeded. | Non-retryable by default; fix the data or pipeline. |
-| `4` | I/O, format, spill, or system error. | Retry with bounded backoff after checking whether the cause is transient. |
-| `130` | Interrupted by a graceful SIGINT or SIGTERM drain. | Cancellation, not failure. |
+```bash
+clinker run pipeline.yaml --machine ndjson-v1 --batch-id logical-batch
+```
 
-Exit `4` includes both transient faults and deterministic failures such as a
-malformed input or undersized spill cap, so keep retry attempts finite. Exit
-`2` is completion with warnings, not a crashed attempt.
+Machine mode does not change who owns the run. Clinker still validates,
+executes, cancels, and publishes one finite attempt. The parent process owns
+scheduling, retry and backoff, deadlines, heartbeats, process lifetime, and
+direct-child reaping. Clinker embeds no orchestrator SDK, worker, daemon, or
+service runtime.
 
-## Cancellation and SIGTERM
+## Stream ownership and compatibility
 
-Clinker installs a process-wide handler for SIGINT and SIGTERM. Either signal
-requests a graceful drain: in-flight work finishes and worker threads join. If
-cancellation wins the atomic publication gate, no staged output or sidecar is
-promoted and the process exits `130`.
+In machine mode, stdout contains only compact UTF-8 NDJSON and is flushed after
+each event. Human diagnostics and tracing use non-ANSI stderr. The parent must
+drain stdout and stderr concurrently; reading one pipe to completion before the
+other can deadlock when an OS pipe fills.
 
-Cancellation latency is bounded by the executor's polling points:
+Every event carries these fields:
 
-- operator chunk boundaries during streaming dispatch; and
-- every 4096 records while a blocking operator builds its in-memory arena.
+| Field | Meaning |
+|---|---|
+| `protocol` | Always `clinker.run`. |
+| `schema` | Protocol major version. `ndjson-v1` emits `1`. |
+| `event` | Lifecycle kind such as `started`, `plan_resolved`, `progress`, `publication_artifacts`, `completed`, `failed`, or `cancelled`. |
+| `seq` | Zero-based sequence, increasing by exactly one within this process. |
+| `batch_id` | Caller-supplied logical-batch correlation retained across retries. |
+| `execution_id` | Fresh non-overridable UUIDv7 generated for this process. |
+| `plan_identity` | `pending`, `resolved` with the semantic plan fingerprint, or `unavailable` after admission failure. |
 
-Set the orchestrator's cancellation grace period above the worst-case time for
-one such slice. Translate cancellation to SIGTERM and reserve SIGKILL for the
-end of that grace period.
+The resolved fingerprint covers the compiled topology, schemas, composition
+and CXL dependencies, winning channel/group config values, and all four
+runtime-variable scopes. It excludes deployment-only file locations and layer
+source formatting, so relocating equivalent inputs does not invalidate a
+pinned plan while a value that can change execution does.
 
-If interruption wins before publication, completed artifacts remain in hidden
-destination-local files for inspection and no new final is produced. If
-publication wins first, later signals do not interrupt the finite promotion
-loop. The run finishes publication and reports its ordinary terminal status.
-When cancellation wins, exit `130` takes precedence over DLQ-partial exit `2`.
+Progress events add a bounded logical phase, kind, elapsed time, and
+truncation flags. They never contain records, secrets, source URLs, or
+physical paths. Periodic records follow Clinker's own clock rather than
+internal engine activity, so a run inside one long operation keeps producing
+them; they stay advisory and bounded and never replace the parent's own
+heartbeat. Failed terminals add a stable failure code,
+broad category, sanitized message, and `retry_with_backoff`, `do_not_retry`, or
+`policy_required` advice. Before a publication-aware terminal, bounded
+`publication_artifacts` records carry the path-free inventory in ordered
+chunks. Artifact entries contain only `artifact_id`, `kind`, and `state`.
+The terminal carries the attempt's completeness, cleanup-debt count, total
+artifact count, and counts by artifact state. Every NDJSON record, including a
+maximum-cardinality inventory chunk and its terminal summary, is at most 16
+KiB.
 
-## Output atomicity and retry safety
+After plan resolution, Clinker starts the required machine-progress worker
+before source discovery, staging, attempt creation, sink writes, or lifecycle
+START. If that worker cannot be created, the stream ends with exactly one
+`infrastructure.runtime.transient` failed terminal and exit `4`; no run effect
+has started, and a supervisor may retry with backoff.
 
-Each output is atomic per artifact. It streams into a sibling hidden file and
-is renamed into its final path only after successful execution, followed by
-synchronization of the retained parent directory. Main outputs and metadata
-sidecars share one run-scoped publication ledger and collision namespace.
+A consumer must reject an unsupported `schema` major. Within schema 1 it may
+ignore additive fields and unknown nonterminal event kinds, but those additions
+carry no completion or failure meaning. Missing required fields, malformed
+UTF-8 or JSON, non-monotonic sequence, identity changes, duplicate terminals,
+or EOF without a terminal make the attempt incomplete.
 
-The consequences an orchestrator can rely on:
+## Terminal, exit, and artifact reconciliation
 
-- A failure before publication leaves no half-written final file. Previous
-  finals remain untouched and hidden partials are retained and logged.
-- A failure or hard kill during multi-artifact publication can leave an exact
-  subset of newly promoted, complete finals visible. The filesystem cannot
-  make several destination renames globally atomic.
-- A retry can replace that subset with the default `if_exists: overwrite`.
-  With `if_exists: error`, pass `--force` deliberately or change the policy.
-  `unique_suffix` gives each attempt a distinct race-safe destination.
-- Fan-out and `split:` outputs use the same ledger and remain hidden until the
-  complete pipeline reaches publication.
+Neither a terminal event nor a process status is sufficient alone. Accept a
+controlled outcome only when the supported terminal family, its embedded exit
+where present, the actual child status, and current-attempt artifact evidence
+agree:
 
-Consumers that need set-level consistency must wait for a successful process
-exit and verify the expected artifact set.
+| Terminal evidence | Required process status | Artifact interpretation | Adapter result |
+|---|---:|---|---|
+| `completed`, result `success`, exit `0` | `0` | Publication is complete; every reported artifact is individually complete. | Success. |
+| `completed`, result `completed_with_dlq`, exit `2` | `2` | Publication is complete and includes the reported complete DLQ artifact. | Completed under the caller's data-quality policy. |
+| `failed`, embedded exit `1`, `3`, or `4` | The same exit | Use the exact reported publication state. When `publication` is absent the state could not be reported; infer nothing about the visible set from its absence. A reported visible subset, if any, consists only of individually complete artifacts. | Failure; apply the typed retry advice and caller policy. |
+| `cancelled` | `130` | Graceful cancellation won before publication; final paths for this attempt remain unchanged. | Cancellation. |
+| No terminal, malformed stream, unsupported major, duplicate terminal, forced termination, or mismatched exit | Any | Do not infer current-attempt success from a pre-existing final or a visible complete subset. | Incomplete attempt. |
 
-## Idempotency
+Exit `4` is intentionally broad; the typed failed terminal distinguishes retry
+advice without requiring the parent to parse rendered diagnostics. EOF alone
+never proves success. A control-pipe failure can prevent terminal delivery, so
+even an otherwise plausible exit remains incomplete without matching terminal
+evidence.
 
-Every attempt is a fresh finite pass. Clinker has no checkpoint, resume cursor,
-or incremental state shared between attempts; a retry reprocesses all input.
-Retries are idempotent when both conditions hold:
+The terminal family follows the exit code, and the `completed` family covers
+only exit `0` and exit `2`. Any other non-cancellation exit is written as a
+`failed` terminal carrying the run's own failure classification, including
+after an earlier `failed` emission that could not be encoded and so left the
+single terminal slot free. A non-zero exit is never restated as result
+`success`; if no terminal can be encoded at all, the stream ends without one
+and the attempt is incomplete by the table above.
 
-- Inputs remain stable between attempts, ideally through immutable staging or
-  a fixed snapshot for each logical batch.
-- The caller supplies a stable `--batch-id` for all attempts of that logical
-  batch. Without it, each invocation generates a new UUID v7.
+Publication is atomic per artifact, not for the artifact set. A failure or
+uncontrolled stop during multi-artifact publication can leave an exact subset
+of newly promoted, individually complete finals visible. Consumers that need a
+complete set must wait for reconciled success and verify the expected artifact
+inventory. Reassemble artifact chunks only when every chunk index from zero to
+`chunk_count - 1` is present in sequence before the terminal and the assembled
+count matches the terminal's `artifact_count` and `state_counts`. Never treat a
+partial terminal stream as set-wide success.
 
-`--batch-id` provides correlation, not deduplication or exactly-once delivery.
+## Language-neutral adapter loop
 
-## Heartbeats
+1. Launch one child with a stable caller-owned `batch_id`, piped stdout and
+   stderr, and an overall attempt deadline. Retain only bounded sanitized tails
+   for diagnostics.
+2. Drain stdout and stderr concurrently. Parse stdout incrementally as UTF-8
+   NDJSON and validate the first record's protocol major, identities, and
+   sequence.
+3. Heartbeat the external scheduler on an independent cadence. Report only the
+   latest sanitized identity, sequence, logical phase/counts, and snapshot age;
+   do not wait for or translate a Clinker progress event into a heartbeat.
+4. Enforce a total Start-to-Close-style deadline for the whole process. A
+   no-progress timeout is an additional explicit deployment policy, not a
+   substitute for the overall deadline.
+5. On cancellation or deadline, deliver the platform's real graceful signal to
+   the direct child, keep both pipes draining, and start a separately bounded
+   cancellation grace period. If grace expires, force termination exactly once.
+   A forced stop is incomplete, not cancelled or successful.
+6. Always wait for and reap the direct child before joining both drain tasks.
+   Accept an outcome only through the terminal, process-status, and artifact
+   reconciliation table above.
+7. On retry, launch a completely fresh process from the beginning of the input
+   with the same `batch_id`. Require a new `execution_id`; retain no Clinker
+   progress event as checkpoint or resume state.
 
-Clinker does not embed an orchestrator heartbeat client. A supervising worker
-may heartbeat independently while the child is alive. Size the heartbeat
-timeout above one cancellation polling slice, and treat heartbeat details as
-advisory progress rather than a resume cursor.
+The heartbeat interval must be below the scheduler's heartbeat timeout. The
+overall attempt deadline must cover ordinary execution and publication; the
+grace period is a separate bounded interval for cooperative cancellation before
+forced termination.
 
-Current liveness surfaces are human log output and the metrics spool written at
-completion. Do not parse ordinary stdout or stderr as a versioned control
-protocol.
+## Cancellation and process trees
+
+Clinker installs handlers for SIGINT and SIGTERM. If graceful cancellation wins
+the atomic gate before publication, it exits `130` and leaves finals unchanged.
+If publication wins first, later signals do not relabel or erase already
+complete visible artifacts; the bounded promotion finishes with `completed` or
+`failed` truth.
+
+A cancellation is reported as a cancellation on every surface that reports it,
+and which source noticed the signal does not change that. A file source drains
+to a chunk boundary and stops; a source that observes cancellation while a
+request is already in flight — a REST page read, for instance — unwinds from
+inside that read. Both produce exit `130`, a `cancelled` machine terminal, and
+an OpenLineage `ABORT`. Cancellation is never reported as an engine failure
+class, so alerting keyed on the lineage or OTLP terminal does not page for an
+operator-initiated stop.
+
+Exit `130` also covers one non-signal case: a **required** machine lifecycle
+record that could not be written before publication. Clinker refuses to
+publish an outcome it cannot report, so a broken control pipe stops the attempt
+with finals unchanged. Discardable records are excluded from that rule — a lost
+periodic `progress` observation is reported on stderr and the run continues to
+its real outcome, and never converts a completed run into a cancellation.
+
+Signal-handler installation is admission-critical. If installation fails,
+Clinker exits with infrastructure status `4` before opening the machine
+protocol stream or touching sources, staging, attempts, outputs, or lineage.
+
+The direct-child contract is exercised on Linux with a real SIGTERM rather
+than a closed control pipe or an in-process cancellation shortcut. The
+cooperative case verifies exit `130`, a matching `cancelled` terminal,
+unchanged final paths, and child reaping while both bounded drains remain live.
+The uncooperative case verifies that the grace interval is independent of the
+overall attempt deadline, force happens once only after that interval, the
+direct child is reaped before drain joining, and the attempt remains
+incomplete. Process groups and descendant ownership are deliberately outside
+that direct-child proof.
+
+The adapter owns the platform termination domain. On POSIX, an adapter that
+creates descendants may place them in a process group and signal that group. On
+Windows, such an adapter may use a Job Object, including kill-on-close policy.
+These are adapter responsibilities: Clinker does not ship a process-group
+manager or Job Object owner. The parent must still reap the direct Clinker
+child after graceful or forced termination.
+
+## Retry and identity boundaries
+
+`batch_id` is correlation only. Each invocation generates a fresh
+`execution_id` and starts input from the beginning. Clinker has no cross-attempt
+checkpoint, resume cursor, deduplication state, distributed transaction, or
+exactly-once guarantee. Safe application retry depends on stable input and the
+destination's chosen `if_exists` policy.
+
+Cancellation and forced termination preserve failed-attempt evidence under
+the configured [storage retention policy](storage.md#output-publication-and-retained-attempts).
+An incomplete attempt keeps its staging directory and manifest without changing
+pre-existing finals; the manifest's `eligible_after` timestamp, 24 hours by
+default, controls when ordinary cleanup may reclaim it. An immediate retry does
+not resume or mutate that directory: it starts a new attempt with a fresh
+`execution_id` and its own staging state.
+
+Progress is advisory liveness evidence, not a durable checkpoint or external
+heartbeat. Machine events are control evidence, not a secret-bearing event bus
+or compliance log. Ordinary users remain free to run the standalone command
+without `--machine` or any supervisor.
 
 ## See also
 
+- [CLI Reference](cli-reference.md)
 - [Exit Codes & Error Diagnosis](exit-codes.md)
 - [Production Deployment](deployment.md)
 - [Metrics & Monitoring](metrics.md)

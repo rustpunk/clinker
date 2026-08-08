@@ -207,6 +207,13 @@ failure_registry! {
     "observability.configuration.policy_required", Observability, PolicyRequired, "observability policy is required";
     "observability.delivery.failed", Observability, RetryWithBackoff, "observability delivery failed";
     "observability.delivery.rejected", Observability, PolicyRequired, "observability delivery was rejected";
+    "source.data.invalid", SourceProtocol, DoNotRetry, "source data does not satisfy the admitted plan";
+    "rest.http.client_error", SourceProtocol, DoNotRetry, "REST source request was rejected";
+    "runtime.resource.memory_budget_exceeded", Infrastructure, PolicyRequired, "runtime memory budget was exceeded";
+    "admission.configuration.memory_budget_unsatisfiable", Configuration, DoNotRetry, "configured memory budget is below the runtime baseline";
+    "runtime.resource.spill_failed", Infrastructure, RetryWithBackoff, "runtime spill storage failed";
+    "runtime.resource.spill_cap_exceeded", Infrastructure, PolicyRequired, "configured spill budget was exceeded";
+    "rest.protocol.page_body_limit_reached", SourceProtocol, PolicyRequired, "REST response exceeded the fixed page body limit";
 }
 
 fn registry_entry(code: &str) -> Option<&'static RegistryEntry> {

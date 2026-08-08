@@ -1,342 +1,605 @@
-use crate::log_template::{self, LogTemplateContext};
-use clinker_plan::config::{LogDirective, LogLevel, LogTiming};
+//! Typed transform observability dispatch.
+//!
+//! Authored directives select stable events and explicit record fields. This
+//! module converts those directives into the closed telemetry vocabulary; it
+//! never writes directly, interpolates messages, or carries raw errors and
+//! records across the observability boundary.
 
-/// Runtime state for log directive execution.
-pub struct LogDispatcher {
-    directives: Vec<LogDirective>,
-    /// Per-directive record counter for `every` sampling.
-    counters: Vec<u64>,
+use std::sync::Arc;
+
+use clinker_plan::config::{LogDirective, LogLevel, LogTiming};
+use clinker_record::Record;
+use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator};
+use cxl::typecheck::TypedProgram;
+
+use crate::executor::NullStorage;
+use crate::telemetry::{
+    LogEvent, MetricKey, RunCorrelation, Severity, SignalField, SpanFact, SpanName, SpanStatus,
+    TelemetryProducer, bounded_identity, unix_nanos_now,
+};
+
+/// Logical run correlation supplied by the executor's stable context.
+pub(crate) struct TransformSignalContext<'a> {
+    pub(crate) execution_id: &'a str,
+    pub(crate) batch_id: &'a str,
+    pub(crate) pipeline_name: &'a str,
+    /// The transform's exported identity: its authored name at the top level,
+    /// and `<call site>.<name>` inside a composition body. Callers build this
+    /// through `ExecutorContext::qualified_node_name` rather than reading the
+    /// node's name directly, which inside a body is scope-local.
+    pub(crate) logical_node: &'a str,
 }
 
-impl LogDispatcher {
-    pub fn new(directives: Vec<LogDirective>) -> Self {
-        let counters = vec![0u64; directives.len()];
-        Self {
+/// Runtime state for one Transform's typed signal lifecycle.
+///
+/// `enabled == None` is the disabled fast path: it allocates no counters or
+/// correlation storage and every method returns before inspecting directives
+/// or records.
+pub(crate) struct LogDispatcher<'a> {
+    enabled: Option<EnabledDispatcher<'a>>,
+}
+
+struct EnabledDispatcher<'a> {
+    producer: TelemetryProducer,
+    directives: &'a [LogDirective],
+    cadence: Vec<u64>,
+    /// Compiled `condition` gate per directive, parallel to `directives` and
+    /// `cadence`. `None` where the directive declared no condition.
+    gates: Vec<Option<ProgramEvaluator>>,
+    /// Whether any `per_record` directive carries a gate, decided once here
+    /// because it cannot change afterwards and the answer is read per record.
+    wants_per_record_context: bool,
+    execution_id: Box<str>,
+    batch_id: Box<str>,
+    pipeline_name: Box<str>,
+    logical_node: Box<str>,
+    started_at_unix_nanos: u64,
+    saw_error: bool,
+    closed: bool,
+}
+
+impl<'a> LogDispatcher<'a> {
+    /// `conditions` carries one compiled gate slot per entry in `directives`,
+    /// in the same order — the pairing plan lowering guarantees.
+    pub(crate) fn new(
+        producer: Option<TelemetryProducer>,
+        directives: &'a [LogDirective],
+        conditions: &[Option<Arc<TypedProgram>>],
+        context: TransformSignalContext<'_>,
+    ) -> Self {
+        let enabled = producer.map(|producer| EnabledDispatcher {
+            producer,
             directives,
-            counters,
-        }
+            cadence: vec![0; directives.len()],
+            // Indexed by directive position, so it is built to that length
+            // rather than from `conditions` directly. Lowering already refuses
+            // to emit a node whose gate set is short, so a missing slot cannot
+            // occur; building this way keeps the per-record path free of a
+            // bounds panic regardless.
+            gates: (0..directives.len())
+                .map(|index| {
+                    conditions
+                        .get(index)
+                        .and_then(Option::as_ref)
+                        .map(|program| ProgramEvaluator::new(Arc::clone(program), false))
+                })
+                .collect(),
+            wants_per_record_context: directives.iter().zip(conditions.iter()).any(
+                |(directive, condition)| {
+                    directive.when == LogTiming::PerRecord && condition.is_some()
+                },
+            ),
+            execution_id: bounded_correlation(context.execution_id),
+            batch_id: bounded_correlation(context.batch_id),
+            pipeline_name: bounded_correlation(context.pipeline_name),
+            logical_node: bounded_correlation(context.logical_node),
+            started_at_unix_nanos: unix_nanos_now(),
+            saw_error: false,
+            closed: false,
+        });
+        Self { enabled }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.directives.is_empty()
+    pub(crate) fn fire_before_transform(&mut self) {
+        let Some(enabled) = self.enabled.as_mut() else {
+            return;
+        };
+        enabled
+            .producer
+            .record_metric(MetricKey::TransformStarted, 1);
+        // The span itself is admitted once, at close. This metric is what
+        // reaches a collector while the transform is still running.
+        enabled.started_at_unix_nanos = unix_nanos_now();
+        enabled.emit_timing(LogTiming::BeforeTransform, None);
     }
 
-    /// Fire all `before_transform` directives.
-    pub fn fire_before_transform(&self, ctx: &LogTemplateContext<'_>) {
-        for d in &self.directives {
-            if d.when == LogTiming::BeforeTransform {
-                emit_log(d, ctx, None);
-            }
-        }
+    /// Whether a per-record evaluation context will actually be read.
+    ///
+    /// Callers assemble that context per row, which costs a handful of
+    /// reference-count bumps and a source lookup. Only an authored `condition`
+    /// on a `per_record` directive reads it: a transform whose directives are
+    /// all `before`/`after`, or whose per-record directives carry no gate,
+    /// emits from the record alone. Answering "is observability configured at
+    /// all" would rebuild it for every row of those transforms too.
+    pub(crate) fn wants_per_record_context(&self) -> bool {
+        self.enabled
+            .as_ref()
+            .is_some_and(|enabled| enabled.wants_per_record_context)
     }
 
-    /// Fire all `after_transform` directives.
-    pub fn fire_after_transform(&self, ctx: &LogTemplateContext<'_>) {
-        for d in &self.directives {
-            if d.when == LogTiming::AfterTransform {
-                emit_log(d, ctx, None);
-            }
-        }
-    }
-
-    /// Fire all `per_record` directives for a record.
-    /// `record_fields` are the fields available for template resolution.
-    /// `condition_eval` is a closure that evaluates CXL condition expressions.
-    pub fn fire_per_record(
-        &mut self,
-        ctx: &LogTemplateContext<'_>,
-        condition_eval: Option<&dyn Fn(&str) -> bool>,
-    ) {
-        for (i, d) in self.directives.iter().enumerate() {
-            if d.when != LogTiming::PerRecord {
+    /// `eval_ctx` is the record's own evaluation context, used only to run
+    /// authored `condition` gates.
+    pub(crate) fn fire_per_record(&mut self, record: &Record, eval_ctx: &EvalContext<'_>) {
+        let Some(enabled) = self.enabled.as_mut() else {
+            return;
+        };
+        enabled
+            .producer
+            .record_metric(MetricKey::TransformRecords, 1);
+        for (index, directive) in enabled.directives.iter().enumerate() {
+            if directive.when != LogTiming::PerRecord {
                 continue;
             }
-
-            // Sampling: increment counter and check modulo
-            self.counters[i] += 1;
-            if let Some(every) = d.every
-                && self.counters[i] % every != 1
-                && every != 1
+            enabled.cadence[index] = enabled.cadence[index].saturating_add(1);
+            let every = directive.every.unwrap_or(1);
+            if !(enabled.cadence[index] - 1).is_multiple_of(every) {
+                continue;
+            }
+            // Cadence first, then the gate, so the two compose the way the
+            // reference documents them: `every: 100` with a condition logs
+            // every hundredth record that also matches, not every hundredth
+            // match.
+            if let Some(gate) = enabled.gates[index].as_mut()
+                && !gate_admits(gate, eval_ctx, record)
             {
-                // Skip unless it's the Nth record (1-indexed: fire on 1, 1+every, 1+2*every, ...)
-                // For every=1, fire on every record
-                if self.counters[i] != 1 && !(self.counters[i] - 1).is_multiple_of(every) {
-                    continue;
+                continue;
+            }
+            enabled.emit(directive, Some(record));
+        }
+    }
+
+    pub(crate) fn fire_on_error(&mut self, record: &Record) {
+        let Some(enabled) = self.enabled.as_mut() else {
+            return;
+        };
+        enabled.saw_error = true;
+        enabled
+            .producer
+            .record_metric(MetricKey::TransformErrors, 1);
+        enabled.emit_timing(LogTiming::OnError, Some(record));
+    }
+
+    /// Close the successful dispatch lifecycle. A recoverable record error is
+    /// reflected in the terminal span status while the transform still emits
+    /// its authored after event and completion metric.
+    pub(crate) fn finish(&mut self) {
+        let Some(enabled) = self.enabled.as_mut() else {
+            return;
+        };
+        enabled.emit_timing(LogTiming::AfterTransform, None);
+        enabled
+            .producer
+            .record_metric(MetricKey::TransformCompleted, 1);
+        enabled.close(if enabled.saw_error {
+            SpanStatus::Error
+        } else {
+            SpanStatus::Ok
+        });
+    }
+}
+
+impl EnabledDispatcher<'_> {
+    fn emit_timing(&self, timing: LogTiming, record: Option<&Record>) {
+        for directive in self.directives {
+            if directive.when == timing {
+                self.emit(directive, record);
+            }
+        }
+    }
+
+    fn emit(&self, directive: &LogDirective, record: Option<&Record>) {
+        let requested = directive.fields.as_deref().unwrap_or_default();
+        let mut fields = Vec::with_capacity(requested.len());
+        if let Some(record) = record {
+            for field in requested {
+                if let Some(value) = record.get(field) {
+                    fields.push(SignalField::from_record(field, value));
                 }
             }
-
-            // Condition check
-            if let Some(ref cond_expr) = d.condition
-                && let Some(eval_fn) = condition_eval
-                && !eval_fn(cond_expr)
-            {
-                continue;
-            }
-
-            emit_log(d, ctx, None);
         }
+        let _ = self.producer.emit_log(LogEvent {
+            event: &directive.name,
+            severity: severity(directive.level),
+            message: &directive.message,
+            correlation: RunCorrelation {
+                execution_id: &self.execution_id,
+                batch_id: &self.batch_id,
+                pipeline_name: &self.pipeline_name,
+            },
+            fields: &fields,
+        });
     }
 
-    /// Fire all `on_error` directives for a DLQ-routed record.
-    pub fn fire_on_error(&self, ctx: &LogTemplateContext<'_>, fields: Option<&[(String, String)]>) {
-        for d in &self.directives {
-            if d.when == LogTiming::OnError {
-                emit_log(d, ctx, fields);
-            }
+    fn close(&mut self, status: SpanStatus) {
+        if self.closed {
+            return;
         }
+        // A wall clock that stepped backwards mid-transform would otherwise
+        // produce a span that ends before it starts.
+        let ended_at_unix_nanos = unix_nanos_now().max(self.started_at_unix_nanos);
+        let _ = self.producer.emit_span(SpanFact {
+            name: SpanName::Transform,
+            status,
+            logical_node: &self.logical_node,
+            started_at_unix_nanos: self.started_at_unix_nanos,
+            ended_at_unix_nanos,
+        });
+        self.closed = true;
     }
 }
 
-fn emit_log(
-    directive: &LogDirective,
-    ctx: &LogTemplateContext<'_>,
-    extra_fields: Option<&[(String, String)]>,
-) {
-    let message = log_template::resolve_template(&directive.message, ctx);
-
-    // Build structured fields string
-    let fields_str = if let Some(ref field_names) = directive.fields {
-        let kv = log_template::extract_fields(field_names, ctx.record_fields);
-        if kv.is_empty() {
-            String::new()
-        } else {
-            let pairs: Vec<String> = kv.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-            format!(" {}", pairs.join(" "))
-        }
-    } else {
-        String::new()
-    };
-
-    let extra = if let Some(ef) = extra_fields {
-        let pairs: Vec<String> = ef.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-        if pairs.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", pairs.join(" "))
-        }
-    } else {
-        String::new()
-    };
-
-    let full_msg = format!("{}{}{}", message, fields_str, extra);
-
-    match directive.level {
-        LogLevel::Trace => tracing::trace!("{}", full_msg),
-        LogLevel::Debug => tracing::debug!("{}", full_msg),
-        LogLevel::Info => tracing::info!("{}", full_msg),
-        LogLevel::Warn => tracing::warn!("{}", full_msg),
-        LogLevel::Error => tracing::error!("{}", full_msg),
+impl Drop for EnabledDispatcher<'_> {
+    fn drop(&mut self) {
+        self.close(SpanStatus::Error);
     }
+}
+
+/// Run one directive's authored gate against the transform's input record.
+///
+/// A gate that fails to evaluate drops its own event and nothing else. This is
+/// a deliberate departure from the row-predicate path in `reshape_dispatch`,
+/// which propagates the error and fails the run: telemetry is best effort and
+/// must never change transform results or published output, so an unevaluable
+/// gate cannot be allowed to abort a pipeline. Dropping rather than emitting is
+/// the safe direction — the author asked for a subset, and a gate that cannot
+/// prove membership has not proven it.
+fn gate_admits(gate: &mut ProgramEvaluator, eval_ctx: &EvalContext<'_>, record: &Record) -> bool {
+    matches!(
+        gate.eval_record::<NullStorage>(eval_ctx, record, None),
+        Ok(EvalResult::Emit { .. } | EvalResult::EmitMany { .. })
+    )
+}
+
+const fn severity(level: LogLevel) -> Severity {
+    match level {
+        LogLevel::Trace => Severity::Trace,
+        LogLevel::Debug => Severity::Debug,
+        LogLevel::Info => Severity::Info,
+        LogLevel::Warn => Severity::Warn,
+        LogLevel::Error => Severity::Error,
+    }
+}
+
+/// Retain one identity string for the dispatcher's lifetime under the same
+/// ceiling the exporter applies, so a name too long to export whole is already
+/// marked here rather than exported as a plausible shorter identity.
+fn bounded_correlation(value: &str) -> Box<str> {
+    bounded_identity(value).into_owned().into_boxed_str()
 }
 
 #[cfg(test)]
 mod tests {
-    use clinker_record::Value;
-    use indexmap::IndexMap;
+    use std::sync::Arc;
 
-    use super::*;
-    use clinker_plan::config::{LogLevel, LogTiming};
+    use clinker_plan::config::{ClinkerToml, CompileContext, parse_config};
+    use clinker_plan::plan::execution::PlanNode;
+    use clinker_record::{Record, Schema, Value};
+    use cxl::eval::{EvalContext, StableEvalContext};
 
-    /// Run-stable logging context: everything available to a log template
-    /// except the current record's fields, which vary per record and are
-    /// supplied separately at context-build time.
-    ///
-    /// Test-only: production builds [`LogTemplateContext`] directly along the
-    /// `LogDispatcher::fire_*` path; this argument-grouping struct exists solely
-    /// to keep the test helper's constructor below the clippy argument-count
-    /// threshold without a suppression attribute.
-    struct LogContext<'a> {
-        transform_name: &'a str,
-        /// Only available in after_transform.
-        transform_duration_ms: Option<u64>,
-        source_file: &'a str,
-        source_row: u64,
-        pipeline_ok_count: u64,
-        pipeline_dlq_count: u64,
-        pipeline_total_count: u64,
-        pipeline_name: &'a str,
-        pipeline_execution_id: &'a str,
-        /// Only available in on_error.
-        dlq_error_category: Option<&'a str>,
-        /// Only available in on_error.
-        dlq_error_detail: Option<&'a str>,
-    }
+    use super::{LogDispatcher, TransformSignalContext};
+    use crate::telemetry::TelemetryArena;
 
-    /// Merges the current record's fields with the run-stable [`LogContext`]
-    /// into a [`LogTemplateContext`] for the test helpers below.
-    fn make_template_context<'a>(
-        record_fields: &'a IndexMap<String, Value>,
-        ctx: &LogContext<'a>,
-    ) -> LogTemplateContext<'a> {
-        LogTemplateContext {
-            record_fields,
-            transform_name: ctx.transform_name,
-            transform_duration_ms: ctx.transform_duration_ms,
-            source_file: ctx.source_file,
-            source_row: ctx.source_row,
-            pipeline_ok_count: ctx.pipeline_ok_count,
-            pipeline_dlq_count: ctx.pipeline_dlq_count,
-            pipeline_total_count: ctx.pipeline_total_count,
-            pipeline_name: ctx.pipeline_name,
-            pipeline_execution_id: ctx.pipeline_execution_id,
-            dlq_error_category: ctx.dlq_error_category,
-            dlq_error_detail: ctx.dlq_error_detail,
-        }
-    }
-
-    fn make_directive(level: LogLevel, when: LogTiming, message: &str) -> LogDirective {
-        LogDirective {
-            level,
-            when,
-            condition: None,
-            message: message.to_string(),
-            fields: None,
-            every: None,
-            log_rule: None,
-        }
-    }
-
-    fn empty_fields() -> IndexMap<String, Value> {
-        IndexMap::new()
-    }
-
-    fn test_ctx(fields: &IndexMap<String, Value>) -> LogTemplateContext<'_> {
-        make_template_context(
-            fields,
-            &LogContext {
-                transform_name: "test",
-                transform_duration_ms: None,
-                source_file: "input.csv",
-                source_row: 1,
-                pipeline_ok_count: 0,
-                pipeline_dlq_count: 0,
-                pipeline_total_count: 0,
-                pipeline_name: "pipeline",
-                pipeline_execution_id: "exec-id",
-                dlq_error_category: None,
-                dlq_error_detail: None,
-            },
-        )
-    }
-
-    #[test]
-    fn test_log_before_transform_fires_once() {
-        // Create dispatcher with a before_transform directive
-        let d = make_directive(LogLevel::Info, LogTiming::BeforeTransform, "starting");
-        let dispatcher = LogDispatcher::new(vec![d]);
-
-        let fields = empty_fields();
-        let ctx = test_ctx(&fields);
-        // This should fire without panicking (we can't capture tracing output in unit tests
-        // without tracing-test, but we verify it doesn't panic and the logic paths execute)
-        dispatcher.fire_before_transform(&ctx);
-    }
-
-    #[test]
-    fn test_log_after_transform_fires_once() {
-        let d = make_directive(
-            LogLevel::Info,
-            LogTiming::AfterTransform,
-            "done in {_transform_duration_ms}ms",
+    /// Compile a one-transform pipeline and hand back its directives paired
+    /// with the gate programs lowering produced for them.
+    fn compiled_directives(
+        condition: Option<&str>,
+    ) -> (
+        Vec<clinker_plan::config::LogDirective>,
+        Vec<Option<Arc<cxl::typecheck::TypedProgram>>>,
+    ) {
+        let gate = condition
+            .map(|expr| format!("\n          condition: \"{expr}\""))
+            .unwrap_or_default();
+        let yaml = format!(
+            r#"
+pipeline:
+  name: gate_runtime
+nodes:
+  - type: source
+    name: input
+    config:
+      name: input
+      type: csv
+      path: input.csv
+      schema:
+        - {{ name: amount, type: int }}
+  - type: transform
+    name: observe
+    input: input
+    config:
+      cxl: |
+        emit amount = amount
+      log:
+        - name: transform.seen
+          level: info
+          when: per_record
+          every: 1
+          message: seen
+          fields: [amount]{gate}
+  - type: output
+    name: output
+    input: observe
+    config:
+      name: output
+      type: csv
+      path: output.csv
+"#
         );
-        let dispatcher = LogDispatcher::new(vec![d]);
-
-        let fields = empty_fields();
-        let mut ctx = test_ctx(&fields);
-        ctx.transform_duration_ms = Some(150);
-        dispatcher.fire_after_transform(&ctx);
+        let plan = parse_config(&yaml)
+            .expect("fixture parses")
+            .compile(&CompileContext::default())
+            .expect("fixture compiles");
+        let payload = plan
+            .dag()
+            .graph
+            .node_weights()
+            .find_map(|node| match node {
+                PlanNode::Transform {
+                    resolved: Some(payload),
+                    ..
+                } => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("transform payload");
+        (payload.log.clone(), payload.log_conditions.clone())
     }
 
-    #[test]
-    fn test_log_on_error_fires_per_dlq() {
-        let d = make_directive(
-            LogLevel::Error,
-            LogTiming::OnError,
-            "error: {_cxl_dlq_error_category}",
+    /// Compile a one-transform pipeline whose transform is named `node_name`,
+    /// returning the name the plan kept. Establishes what configuration
+    /// actually admits before the dispatcher is asked to export a span for it.
+    fn compiled_transform_node_name(node_name: &str) -> String {
+        let yaml = format!(
+            r#"
+pipeline:
+  name: node_naming
+nodes:
+  - type: source
+    name: input
+    config:
+      name: input
+      type: csv
+      path: input.csv
+      schema:
+        - {{ name: amount, type: int }}
+  - type: transform
+    name: "{node_name}"
+    input: input
+    config:
+      cxl: |
+        emit amount = amount
+  - type: output
+    name: output
+    input: "{node_name}"
+    config:
+      name: output
+      type: csv
+      path: output.csv
+"#
         );
-        let dispatcher = LogDispatcher::new(vec![d]);
-
-        let fields = empty_fields();
-        let mut ctx = test_ctx(&fields);
-        ctx.dlq_error_category = Some("eval_error");
-        dispatcher.fire_on_error(&ctx, None);
+        let plan = parse_config(&yaml)
+            .expect("fixture parses")
+            .compile(&CompileContext::default())
+            .expect("fixture compiles");
+        plan.dag()
+            .graph
+            .node_weights()
+            .find_map(|node| match node {
+                PlanNode::Transform { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .expect("transform node")
     }
 
+    /// A node name is validated only for duplication, so `normalize orders`
+    /// compiles and runs. Its span has to reach the collector like any other:
+    /// dropping it left the operator with that transform's metrics and authored
+    /// log events present, the span absent, and nothing to explain the gap.
     #[test]
-    fn test_log_level1_every_sampling() {
-        let mut d = make_directive(LogLevel::Info, LogTiming::PerRecord, "record");
-        d.every = Some(100);
-        let mut dispatcher = LogDispatcher::new(vec![d]);
+    fn a_node_name_the_planner_accepts_still_closes_a_span() {
+        let node_name = compiled_transform_node_name("normalize orders");
+        assert_eq!(
+            node_name, "normalize orders",
+            "configuration applies no grammar to a node name"
+        );
 
-        let fields = empty_fields();
-        // Simulate 300 records — should fire on records 1, 101, 201 = 3 events
-        let mut fire_count = 0;
-        for i in 1..=300 {
-            let _ctx = make_template_context(
-                &fields,
-                &LogContext {
-                    transform_name: "t",
-                    transform_duration_ms: None,
-                    source_file: "f.csv",
-                    source_row: i,
-                    pipeline_ok_count: 0,
-                    pipeline_dlq_count: 0,
-                    pipeline_total_count: 0,
-                    pipeline_name: "p",
-                    pipeline_execution_id: "e",
-                    dlq_error_category: None,
-                    dlq_error_detail: None,
+        let (directives, conditions) = compiled_directives(None);
+        let policy = telemetry_policy();
+        let (producer, receiver) = TelemetryArena::reserve(&policy).expect("arena reserves");
+        {
+            let mut dispatcher = LogDispatcher::new(
+                Some(producer),
+                &directives,
+                &conditions,
+                TransformSignalContext {
+                    execution_id: "exec",
+                    batch_id: "batch",
+                    pipeline_name: "node_naming",
+                    logical_node: &node_name,
                 },
             );
-            // We can't easily count tracing events, so we test the counter logic
-            let d = &dispatcher.directives[0];
-            dispatcher.counters[0] += 1;
-            let counter = dispatcher.counters[0];
-            let every = d.every.unwrap();
-            if counter == 1 || (counter - 1).is_multiple_of(every) {
-                fire_count += 1;
+            dispatcher.fire_before_transform();
+            dispatcher.finish();
+        }
+
+        let mut spans = Vec::new();
+        while let Some(batch) = receiver.try_recv_batch() {
+            spans.extend(batch.traces().iter().map(|span| span.logical_node.clone()));
+        }
+        assert_eq!(
+            spans,
+            vec!["normalize orders".to_string()],
+            "the closed span must carry the authored node name"
+        );
+    }
+
+    fn telemetry_policy() -> clinker_plan::config::ResolvedObservabilityPolicy {
+        ClinkerToml::parse(
+            r#"
+[observability]
+arena_bytes = "768KB"
+ordinary_lane_bytes = "512KB"
+high_severity_lane_bytes = "256KB"
+max_batch_bytes = "8KB"
+max_attributes_per_event = 8
+max_attribute_bytes = "256B"
+drop_policy = "drop-newest"
+sample_every = 1
+rate_limit_per_second = 100000
+rate_limit_burst = 100000
+flush_timeout_ms = 1000
+
+[observability.otlp]
+endpoint = "https://collector.invalid"
+connect_timeout_ms = 100
+request_timeout_ms = 200
+retry_max_attempts = 1
+retry_total_timeout_ms = 500
+max_response_bytes = "1KB"
+
+[observability.otlp.auth]
+mode = "none"
+
+[observability.lineage]
+queue_bytes = "1KB"
+max_event_bytes = "512B"
+drop_policy = "drop-newest"
+flush_timeout_ms = 500
+identity_mode = "local_diagnostic_paths"
+
+[[observability.field_policy]]
+event = "transform.seen"
+field = "amount"
+action = "allow"
+"#,
+        )
+        .expect("policy parses")
+        .resolve_observability(None)
+        .expect("policy resolves")
+    }
+
+    /// Drive `amounts` through a dispatcher and return the `amount` attribute
+    /// of every log event that actually reached the telemetry arena.
+    fn emitted_amounts(condition: Option<&str>, amounts: &[i64]) -> Vec<String> {
+        let (directives, conditions) = compiled_directives(condition);
+        let policy = telemetry_policy();
+        let (producer, receiver) = TelemetryArena::reserve(&policy).expect("arena reserves");
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let stable = StableEvalContext::test_default();
+        let eval_ctx = EvalContext::test_default_borrowed(&stable);
+
+        {
+            let mut dispatcher = LogDispatcher::new(
+                Some(producer),
+                &directives,
+                &conditions,
+                TransformSignalContext {
+                    execution_id: "exec",
+                    batch_id: "batch",
+                    pipeline_name: "gate_runtime",
+                    logical_node: "observe",
+                },
+            );
+            for amount in amounts {
+                let record = Record::new(Arc::clone(&schema), vec![Value::Integer(*amount)]);
+                dispatcher.fire_per_record(&record, &eval_ctx);
             }
         }
-        assert_eq!(fire_count, 3, "every=100, 300 records → 3 events");
-    }
 
-    #[test]
-    fn test_log_level1_every_one() {
-        // every: 1 should fire on every record
-        let mut fire_count = 0;
-        for i in 1..=5u64 {
-            let counter = i;
-            let every = 1u64;
-            if counter == 1 || (counter - 1) % every == 0 {
-                fire_count += 1;
+        let mut seen = Vec::new();
+        while let Some(batch) = receiver.try_recv_batch() {
+            for log in batch.logs() {
+                if let Some(amount) = log.fields.get("amount") {
+                    seen.push(amount.clone());
+                }
             }
         }
-        assert_eq!(fire_count, 5, "every=1, 5 records → 5 events");
+        seen
     }
 
+    /// The capability itself: an authored gate must actually suppress the
+    /// records it excludes, not merely compile.
     #[test]
-    fn test_log_level1_multiple_directives() {
-        let d1 = make_directive(LogLevel::Info, LogTiming::PerRecord, "first");
-        let d2 = make_directive(LogLevel::Debug, LogTiming::PerRecord, "second");
-        let mut dispatcher = LogDispatcher::new(vec![d1, d2]);
-        assert_eq!(dispatcher.directives.len(), 2);
-
-        let fields = empty_fields();
-        let ctx = test_ctx(&fields);
-        // Should not panic — both directives fire
-        dispatcher.fire_per_record(&ctx, None);
+    fn condition_suppresses_non_matching_records() {
+        let gated = emitted_amounts(Some("amount > 1000"), &[500, 5000, 900, 2000]);
+        assert_eq!(
+            gated,
+            vec!["5000".to_string(), "2000".to_string()],
+            "only records satisfying the gate may emit"
+        );
     }
 
+    /// The same directive without a gate must still emit for every record —
+    /// otherwise the test above would pass on a dispatcher that emits nothing.
     #[test]
-    fn test_log_level1_condition_null_is_false() {
-        let mut d = make_directive(LogLevel::Info, LogTiming::PerRecord, "msg");
-        d.condition = Some("Amount > 1000".to_string());
-        let mut dispatcher = LogDispatcher::new(vec![d]);
+    fn absent_condition_leaves_every_record_emitting() {
+        let ungated = emitted_amounts(None, &[500, 5000, 900, 2000]);
+        assert_eq!(
+            ungated,
+            vec![
+                "500".to_string(),
+                "5000".to_string(),
+                "900".to_string(),
+                "2000".to_string()
+            ],
+            "a directive with no condition must be ungated"
+        );
+    }
 
-        let fields = empty_fields();
-        let ctx = test_ctx(&fields);
-        // Condition evaluator returns false
-        dispatcher.fire_per_record(&ctx, Some(&|_: &str| false));
-        // No panic — condition prevented firing
+    /// `every` is applied before the gate, which is what the reference
+    /// documents: `every: 2` with a condition logs every second record that
+    /// also matches, not every second match.
+    #[test]
+    fn cadence_is_applied_before_the_gate() {
+        let (mut directives, conditions) = compiled_directives(Some("amount > 1000"));
+        directives[0].every = Some(2);
+        let policy = telemetry_policy();
+        let (producer, receiver) = TelemetryArena::reserve(&policy).expect("arena reserves");
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let stable = StableEvalContext::test_default();
+        let eval_ctx = EvalContext::test_default_borrowed(&stable);
+
+        {
+            let mut dispatcher = LogDispatcher::new(
+                Some(producer),
+                &directives,
+                &conditions,
+                TransformSignalContext {
+                    execution_id: "exec",
+                    batch_id: "batch",
+                    pipeline_name: "gate_runtime",
+                    logical_node: "observe",
+                },
+            );
+            // Cadence admits positions 0 and 2 (values 5000 and 900); the gate
+            // then rejects 900. Gate-first would have admitted 5000 and 2000.
+            for amount in [5000_i64, 4000, 900, 2000] {
+                let record = Record::new(Arc::clone(&schema), vec![Value::Integer(amount)]);
+                dispatcher.fire_per_record(&record, &eval_ctx);
+            }
+        }
+
+        let mut seen = Vec::new();
+        while let Some(batch) = receiver.try_recv_batch() {
+            for log in batch.logs() {
+                if let Some(amount) = log.fields.get("amount") {
+                    seen.push(amount.clone());
+                }
+            }
+        }
+        assert_eq!(
+            seen,
+            vec!["5000".to_string()],
+            "cadence must select the record before the gate judges it"
+        );
     }
 }

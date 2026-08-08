@@ -117,6 +117,14 @@ pub struct CompileArtifacts {
     /// composition scopes from colliding.
     pub reshape_compiled:
         HashMap<PlanNodeId, Arc<Vec<crate::plan::execution::CompiledReshapeRule>>>,
+    /// Per-Transform typechecked log-directive gate predicates, keyed by the
+    /// Transform node's [`PlanNodeId`] — one entry per `config.log` directive,
+    /// in declaration order, `None` where the directive declared no
+    /// `condition`. Bind→lowering handoff: lowering zips these onto
+    /// `PlanTransformPayload.log_conditions`; the runtime reads only that
+    /// on-node copy. The entry is inserted only when every condition on the
+    /// node typechecked, so a short vec cannot reach lowering.
+    pub transform_log_conditions: HashMap<PlanNodeId, Vec<Option<Arc<TypedProgram>>>>,
     /// All bound composition bodies, keyed by `CompositionBodyId`. The
     /// top-level pipeline is NOT in this map — it lives on
     /// `CompiledPlan.dag()` directly. Only body scopes are here.
@@ -2518,6 +2526,68 @@ fn bind_schema_inner(
                     }
                     Err(d) => diags.push(d),
                 }
+                // Log-directive gates typecheck against the INPUT row, not the
+                // projected output: dispatch fires before the transform's own
+                // program runs, so an authored condition sees the record as it
+                // arrived. Wrapping in `filter` reuses the row-predicate
+                // lowering Reshape's `when` uses, which is what makes a
+                // non-boolean gate a normal type error instead of a runtime
+                // surprise.
+                if let Some(directives) = &config.log {
+                    // A gate is compiled as its own program, so a module alias
+                    // the transform declared is not in scope for it. Module-root
+                    // discovery already walks conditions, so the closure is
+                    // compiled and the alias is available — only the gate's own
+                    // program was missing the declaration that binds it.
+                    let use_prelude = module_use_prelude(&config.cxl.source);
+                    let mut compiled: Vec<Option<Arc<TypedProgram>>> =
+                        Vec::with_capacity(directives.len());
+                    let mut every_condition_bound = true;
+                    for (index, directive) in directives.iter().enumerate() {
+                        let Some(condition) = &directive.condition else {
+                            compiled.push(None);
+                            continue;
+                        };
+                        match typecheck_cxl(
+                            &format!("{name}:log[{index}]:condition"),
+                            &format!("{use_prelude}filter {}", condition.source),
+                            &upstream,
+                            AggregateMode::Row,
+                            span,
+                            &bind_ctx.scoped_vars,
+                        ) {
+                            // The condition is spliced into `filter <source>`, so a
+                            // source carrying a statement separator compiles into
+                            // statements the author never wrote into a gate — including
+                            // ones the gate's evaluator is not allocated to run. A gate
+                            // is one predicate; anything else is refused here rather
+                            // than reaching the first record.
+                            Ok(typed) if authored_gate_statements(&typed) == 1 => {
+                                compiled.push(Some(Arc::new(typed)));
+                            }
+                            Ok(typed) => {
+                                diags.push(Diagnostic::error(
+                                    "E373",
+                                    format!(
+                                        "transform `{name}` log[{index}].condition must be one predicate, but it parses as {} statements; write the gate as a single expression, for example `condition: \"amount > 1 and region == 'eu'\"`",
+                                        authored_gate_statements(&typed)
+                                    ),
+                                    LabeledSpan::primary(span, "log condition".to_string()),
+                                ));
+                                every_condition_bound = false;
+                            }
+                            Err(d) => {
+                                diags.push(d);
+                                every_condition_bound = false;
+                            }
+                        }
+                    }
+                    // Insert only on a complete set, so lowering's length guard
+                    // can treat a missing entry as "bind rejected this node".
+                    if every_condition_bound {
+                        artifacts.transform_log_conditions.insert(node_id, compiled);
+                    }
+                }
             }
             PipelineNode::Aggregate { header, config } => {
                 let upstream = match upstream_schema(&header.input.value, schema_by_name) {
@@ -3814,6 +3884,8 @@ fn bind_composition(
     // scope-local runtime key.
     let mut bound_body = BoundBody::empty(resolved_path);
     bound_body.body_scope = body_id.into();
+    bound_body.semantic_name = body_file.signature.name.clone();
+    bound_body.content_digest = body_file.semantic_digest;
     bound_body.graph = body_graph;
     bound_body.topo_order = body_topo;
     bound_body.name_to_idx = body_name_to_idx;
@@ -4616,6 +4688,43 @@ struct CxlTypecheckCtx<'a> {
     mode: &'a AggregateMode,
     span: Span,
     scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
+}
+
+/// The `use` declarations of a program, rendered back as CXL source.
+///
+/// Reconstructed from the parsed statements rather than sliced out of the
+/// authored text, so an alias reaches a gate in the one canonical spelling
+/// regardless of how it was written.
+fn module_use_prelude(source: &str) -> String {
+    let parsed = cxl::parser::Parser::parse(source);
+    let mut prelude = String::new();
+    for statement in &parsed.ast.statements {
+        if let Statement::UseStmt { path, alias, .. } = statement {
+            prelude.push_str("use ");
+            let segments: Vec<&str> = path.iter().map(AsRef::as_ref).collect();
+            prelude.push_str(&segments.join("."));
+            if let Some(alias) = alias {
+                prelude.push_str(" as ");
+                prelude.push_str(alias);
+            }
+            prelude.push('\n');
+        }
+    }
+    prelude
+}
+
+/// The statements a gate's author actually wrote.
+///
+/// The compiled program carries the transform's `use` declarations ahead of
+/// the predicate, and those are the engine's doing, not the author's — counting
+/// them would reject every gate in a transform that imports a module.
+fn authored_gate_statements(typed: &TypedProgram) -> usize {
+    typed
+        .program
+        .statements
+        .iter()
+        .filter(|statement| !matches!(statement, Statement::UseStmt { .. }))
+        .count()
 }
 
 #[allow(clippy::result_large_err)]

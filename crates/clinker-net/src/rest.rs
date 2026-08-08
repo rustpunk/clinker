@@ -35,12 +35,12 @@ use clinker_plan::config::{InputFormat, RestAuth, RestPagination, RestSourceConf
 use clinker_record::{FieldMetadata, Record, Schema, SchemaBuilder, Value};
 use indexmap::IndexMap;
 
-use crate::{io_err, schema_err};
+use crate::schema_err;
 
 use continuation::{AuthorizedUrl, ContinuationError, Origin};
 
 fn continuation_format_error(error: ContinuationError) -> FormatError {
-    io_err(error.to_string())
+    FormatError::classified(error.classification_code(), error.to_string())
 }
 
 /// Per-body cap. Each individual page body is bounded so a misbehaving
@@ -230,14 +230,17 @@ impl RestRecordSource {
             None => return Ok(false),
         };
         if self.pages_fetched >= self.cfg.max_pages {
-            return Err(io_err(format!(
-                "{}; rest source {:?}: page_limit_reached max_pages={} next_page={} target={}",
-                ContinuationError::for_code("rest.protocol.page_limit_reached"),
-                self.source_name,
-                self.cfg.max_pages,
-                self.pages_fetched.saturating_add(1),
-                url.diagnostic_target(),
-            )));
+            return Err(FormatError::classified(
+                "rest.protocol.page_limit_reached",
+                format!(
+                    "{}; rest source {:?}: page_limit_reached max_pages={} next_page={} target={}",
+                    ContinuationError::for_code("rest.protocol.page_limit_reached"),
+                    self.source_name,
+                    self.cfg.max_pages,
+                    self.pages_fetched.saturating_add(1),
+                    url.diagnostic_target(),
+                ),
+            ));
         }
         if !self.visited_pages.insert(url.as_str().to_owned()) {
             return Err(continuation_format_error(ContinuationError::for_code(
@@ -344,14 +347,16 @@ impl RestRecordSource {
         attempt: u32,
         failure: RequestFailure,
     ) -> FormatError {
-        io_err(format!(
+        let message = format!(
             "rest source {:?}: request_failed class={} attempt={} page={} target={}",
             self.source_name,
             failure.as_str(),
             attempt,
             self.pages_fetched.saturating_add(1),
             url.diagnostic_target(),
-        ))
+        );
+        let code = failure.classification_code();
+        FormatError::classified(code, message)
     }
 
     fn request_for(
@@ -408,10 +413,7 @@ impl RestRecordSource {
         let mut attempt: u32 = 0;
         loop {
             if self.shutdown.as_ref().is_some_and(|t| t.is_requested()) {
-                return Err(io_err(format!(
-                    "rest source {:?}: shutdown requested mid-request",
-                    self.source_name
-                )));
+                return Err(FormatError::Interrupted);
             }
             let mut url = start_url.clone();
             let mut redirects = HashSet::from([url.as_str().to_owned()]);
@@ -491,6 +493,20 @@ impl RestRecordSource {
                 };
                 return Ok(PageResponse { body, next_link });
             };
+            // A cancellation tears down the request we are inside, and the
+            // transport reports that teardown as the failure. Reporting it as
+            // an outage would page an on-call for an operator action.
+            //
+            // A status, though, means the peer answered: that verdict was
+            // reached before any signal arrived and stands on its own. Keying
+            // this on the retry budget instead reported a collector that had
+            // failed every attempt as a clean cancellation whenever a signal
+            // happened to be pending, and left the outage in no terminal.
+            if retry_failure.is_cancellable_transport()
+                && self.shutdown.as_ref().is_some_and(|t| t.is_requested())
+            {
+                return Err(FormatError::Interrupted);
+            }
             if attempt < self.cfg.retries {
                 attempt = attempt.saturating_add(1);
                 continue;
@@ -519,6 +535,31 @@ enum RequestFailure {
 }
 
 impl RequestFailure {
+    /// Whether a pending shutdown explains this failure.
+    ///
+    /// True only where the peer never answered, which is what tearing down a
+    /// request in flight produces. A status means the exchange completed and
+    /// the peer rejected it, and that verdict is independent of any signal
+    /// that arrives afterwards.
+    const fn is_cancellable_transport(self) -> bool {
+        matches!(
+            self,
+            Self::Timeout
+                | Self::Connection
+                | Self::ProxyConnection
+                | Self::Transport
+                | Self::Io(_)
+        )
+    }
+
+    const fn classification_code(self) -> &'static str {
+        match self {
+            Self::HttpStatus(400..=499) => "rest.http.client_error",
+            Self::BodyLimit => "rest.protocol.page_body_limit_reached",
+            _ => "infrastructure.runtime.source_unavailable",
+        }
+    }
+
     fn from_transport(error: &ureq::Error) -> Self {
         match error {
             ureq::Error::StatusCode(status) => Self::HttpStatus(*status),
@@ -894,5 +935,32 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 2, "each `Item` occurrence becomes its own record");
+    }
+
+    #[test]
+    fn continuation_classification_preserves_the_registered_code() {
+        let error = continuation_format_error(ContinuationError::for_code(
+            "rest.protocol.malformed_continuation",
+        ));
+        assert_eq!(
+            error.classification_code(),
+            Some("rest.protocol.malformed_continuation")
+        );
+    }
+
+    #[test]
+    fn page_body_limit_is_a_policy_required_protocol_failure() {
+        use clinker_core_types::{FailureCategory, FailureClassification, RetryAdvice};
+
+        let transport_error = ureq::Error::BodyExceedsLimit(MAX_PAGE_BYTES);
+        let request_failure = RequestFailure::from_transport(&transport_error);
+        assert!(matches!(request_failure, RequestFailure::BodyLimit));
+
+        let code = request_failure.classification_code();
+        assert_eq!(code, "rest.protocol.page_body_limit_reached");
+        let classification =
+            FailureClassification::for_code(code).expect("registered page body limit");
+        assert_eq!(classification.category(), FailureCategory::SourceProtocol);
+        assert_eq!(classification.retry_advice(), RetryAdvice::PolicyRequired);
     }
 }

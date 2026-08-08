@@ -287,8 +287,13 @@ fn request_failures_keep_safe_status_and_target_context() {
 
     let error = source
         .next_record()
-        .expect_err("HTTP rejection must fail the source")
-        .to_string();
+        .expect_err("HTTP rejection must fail the source");
+    assert_eq!(
+        error.classification_code(),
+        Some("rest.http.client_error"),
+        "fatal client errors must never be advertised as retryable infrastructure"
+    );
+    let error = error.to_string();
 
     assert!(error.contains("class=http_status_401"), "{error}");
     assert!(error.contains("attempt=1"), "{error}");
@@ -413,6 +418,26 @@ fn transient_body_timeout_retries_the_whole_page() {
 }
 
 #[test]
+fn exhausted_transient_request_keeps_retryable_classification() {
+    let _guard = network_test_guard();
+    let server = TestServer::spawn(vec![response(
+        503,
+        "Service Unavailable",
+        &[],
+        r#"{"error":"temporary"}"#,
+    )]);
+    let mut source = reader_with_retries(&format!("{}/start", server.url), 1, 0);
+
+    let error = source
+        .next_record()
+        .expect_err("exhausted transient response must fail the source");
+    assert_eq!(
+        error.classification_code(),
+        Some("infrastructure.runtime.source_unavailable")
+    );
+}
+
+#[test]
 fn malformed_link_metadata_fails_closed() {
     let _guard = network_test_guard();
     let server = TestServer::spawn(vec![ok(&[("Link", "</next; rel=next")], 1)]);
@@ -531,9 +556,19 @@ fn offered_continuation_beyond_page_bound_fails_instead_of_truncating() {
     let _guard = network_test_guard();
     let server = TestServer::spawn(vec![ok(&[("Link", "</next>; rel=next")], 1)]);
     let mut reader = reader(&format!("{}/start", server.url), 1);
-    let error = drain_ids(reader.as_mut()).expect_err("page-bound exhaustion must fail");
+    assert!(
+        reader.next_record().expect("first page").is_some(),
+        "first admitted page must produce its record"
+    );
+    let error = reader
+        .next_record()
+        .expect_err("page-bound exhaustion must fail");
+    assert_eq!(
+        error.classification_code(),
+        Some("rest.protocol.page_limit_reached")
+    );
     assert_classification(
-        &error,
+        &error.to_string(),
         "rest.protocol.page_limit_reached",
         "source_protocol",
         "policy_required",

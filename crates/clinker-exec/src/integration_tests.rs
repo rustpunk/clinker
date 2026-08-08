@@ -84,6 +84,7 @@ mod tests {
                 | PipelineError::OverlayDiagnostics(_)
                 | PipelineError::Compilation { .. }
                 | PipelineError::Internal { .. }
+                | PipelineError::DispatchMismatch { .. }
                 | PipelineError::SortOrderViolation { .. }
                 | PipelineError::MergeSortOrderViolation { .. }
                 | PipelineError::SchemaMismatch { .. }

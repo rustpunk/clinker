@@ -72,6 +72,10 @@ impl ContinuationError {
             .expect("REST continuation codes are registered in clinker-core-types");
         Self { classification }
     }
+
+    pub(crate) const fn classification_code(&self) -> &'static str {
+        self.classification.code()
+    }
 }
 
 impl fmt::Display for ContinuationError {
