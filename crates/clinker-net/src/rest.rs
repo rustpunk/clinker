@@ -548,14 +548,22 @@ impl RequestFailure {
     /// the peer rejected it, and that verdict is independent of any signal
     /// that arrives afterwards.
     const fn is_cancellable_transport(self) -> bool {
-        // `Transport` is deliberately absent. It is the catch-all for failures
-        // this mapping does not name, so it is an absence of information, not
-        // evidence that the peer never answered — and treating it as the
-        // latter turned a permanent failure into a clean cancellation whenever
-        // a signal happened to be pending.
+        // `Transport` is included, but only because every permanent failure
+        // that used to hide behind it is now named. It reached this catch-all
+        // for TLS errors once, and a certificate nobody trusts was reported as
+        // a clean cancellation; the fix was naming the TLS variants, not
+        // refusing the catch-all. What remains under it is a failure this
+        // mapping cannot identify, and when a shutdown is pending the
+        // cancellation is the one thing actually known — a peer that dropped
+        // the connection mid-request surfaces here on some hosts and as an I/O
+        // error on others, and both are the same operator action.
         matches!(
             self,
-            Self::Timeout | Self::Connection | Self::ProxyConnection | Self::Io(_)
+            Self::Timeout
+                | Self::Connection
+                | Self::ProxyConnection
+                | Self::Transport
+                | Self::Io(_)
         )
     }
 
@@ -941,13 +949,21 @@ mod tests {
             RequestFailure::Protocol,
             RequestFailure::BodyLimit,
             RequestFailure::HostNotFound,
-            RequestFailure::Transport,
         ] {
             assert!(
                 !permanent.is_cancellable_transport(),
-                "{permanent:?} is a verdict or an unknown, and a signal explains neither"
+                "{permanent:?} is a verdict the peer or the endpoint already gave"
             );
         }
+
+        // The catch-all is the opposite case: a failure this mapping cannot
+        // name. A dropped connection mid-request lands here on some hosts and
+        // as an I/O error on others, so refusing it reported one operator
+        // action two ways depending on the kernel.
+        assert!(
+            RequestFailure::Transport.is_cancellable_transport(),
+            "an unnamed transport failure under a pending shutdown is that shutdown"
+        );
     }
 
     /// Relabelling a failure by phase must not change whether it can be

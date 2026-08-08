@@ -2410,13 +2410,17 @@ fn truncate_lineage_destination(
     if path.as_os_str() == std::ffi::OsStr::new("-") {
         return Ok(());
     }
-    // Only a regular file is emptied here. Opening a FIFO for writing blocks
-    // until a reader attaches, and this runs on the run's own thread during
-    // admission — so a destination wired to a collector that connects a moment
-    // later would hang the run before it read a record, with no diagnostic and
-    // no timeout. A pipe or device has no previous contents to strip anyway,
-    // and the export worker opens it lazily on its own thread.
-    if std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
+    // Skipped only for a destination whose open can block. Opening a FIFO for
+    // writing waits for a reader, and this runs on the run's own thread during
+    // admission, so a destination wired to a collector that connects a moment
+    // later would hang the run before it read a record. A pipe or device has no
+    // previous contents to strip anyway.
+    //
+    // Resolved through symlinks deliberately. A link to a regular file is a
+    // regular destination — a "current run" indirection is exactly that — and
+    // treating the link itself as non-regular would leave the previous run's
+    // COMPLETE terminal in the target for a catalogue to attribute to this run.
+    if std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
         return Ok(());
     }
     std::fs::File::create(path)
@@ -3601,9 +3605,14 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 // run — which a catalogue reads as this one having succeeded.
                 // An empty file cannot be misread that way.
                 // A pipe or device is opened by the first write instead, on
-                // the thread that does the writing. Opening one here would
-                // block admission until a reader attached.
-                match std::fs::symlink_metadata(path) {
+                // the thread that does the writing, because opening one here
+                // would block admission until a reader attached. Everything
+                // else — including a symlink to a regular file — is opened
+                // now, which is what proves the destination writable before
+                // the run stages anything. Sending a directory or an unwritable
+                // path down the lazy path instead would produce a green run
+                // that exported nothing.
+                match std::fs::metadata(path) {
                     Ok(metadata) if !metadata.is_file() => Box::new(LazyLineageFile {
                         path: path.clone(),
                         file: None,

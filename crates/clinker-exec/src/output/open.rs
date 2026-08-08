@@ -81,7 +81,7 @@ where
         IfExistsPolicy::UniqueSuffix => {
             match stage_candidate(bare.clone(), PromotionDisposition::NoReplace, publication) {
                 Ok(output) => return Ok(output),
-                Err(error) if is_already_exists(&error) => {}
+                Err(error) if is_candidate_unavailable(&error) => {}
                 Err(error) => return Err(error),
             }
 
@@ -89,7 +89,7 @@ where
                 let candidate = path_for_n(Some(n)).map_err(PipelineError::Config)?;
                 match stage_candidate(candidate, PromotionDisposition::NoReplace, publication) {
                     Ok(output) => return Ok(output),
-                    Err(error) if is_already_exists(&error) => continue,
+                    Err(error) if is_candidate_unavailable(&error) => continue,
                     Err(error) => return Err(error),
                 }
             }
@@ -177,6 +177,33 @@ pub(crate) fn containment_error(error: ContainmentError) -> PipelineError {
 
 fn is_already_exists(error: &PipelineError) -> bool {
     matches!(error, PipelineError::Io(source) if source.kind() == std::io::ErrorKind::AlreadyExists)
+}
+
+/// Whether this candidate name is unavailable and the search should move on.
+///
+/// Exclusive creation reports a name already taken as `AlreadyExists`
+/// everywhere. Windows has a second way to say it: a name another thread is
+/// creating at the same moment can come back as a sharing violation, which the
+/// standard library maps to `PermissionDenied`. Treating that as a hard error
+/// made `unique_suffix` fail a run whenever two writers raced for one path,
+/// rather than taking the next suffix — which is the whole point of the policy.
+///
+/// Deliberately not applied on the other platforms. There, exclusive creation
+/// never reports a taken name this way, so a refused permission means the
+/// directory genuinely cannot be written and must surface.
+fn is_candidate_unavailable(error: &PipelineError) -> bool {
+    if is_already_exists(error) {
+        return true;
+    }
+    // `cfg!` rather than a `#[cfg]` block: every platform compiles the same
+    // tokens and the branch folds away, so this cannot build on one host and
+    // fail on the other — which matters for a rule that exists to describe the
+    // host it cannot be compiled on here.
+    cfg!(windows)
+        && matches!(
+            error,
+            PipelineError::Io(source) if source.kind() == std::io::ErrorKind::PermissionDenied
+        )
 }
 
 fn existing_output_error(path: &Path) -> PipelineError {
