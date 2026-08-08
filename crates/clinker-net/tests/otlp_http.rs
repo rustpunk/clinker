@@ -18,8 +18,8 @@ mod otlp_under_test;
 
 use otlp_under_test::{
     OtlpAuthentication, OtlpCredentialApplicationError, OtlpCredentialApplicator,
-    OtlpCredentialRequest, OtlpDeliveryBudget, OtlpDeliveryFailureKind, OtlpRetryCause, OtlpSignal,
-    admit_otlp_endpoint, admitted_loopback_endpoint, send_otlp_json,
+    OtlpCredentialRequest, OtlpDeliveryBounds, OtlpDeliveryBudget, OtlpDeliveryFailureKind,
+    OtlpRetryCause, OtlpSignal, admit_otlp_endpoint, admitted_loopback_endpoint, send_otlp_json,
 };
 
 #[derive(Debug)]
@@ -174,41 +174,41 @@ fn spawn_sequence_server(
 }
 
 fn budget(max_attempts: u32) -> OtlpDeliveryBudget {
-    OtlpDeliveryBudget::new(
-        64 * 1024,
-        4 * 1024,
+    OtlpDeliveryBudget::new(OtlpDeliveryBounds {
+        max_request_bytes: 64 * 1024,
+        max_response_bytes: 4 * 1024,
         max_attempts,
-        Duration::from_secs(2),
-        Duration::from_secs(2),
-        Duration::from_millis(1),
-        Duration::from_secs(5),
-    )
+        connect_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(2),
+        retry_backoff: Duration::from_millis(1),
+        total_timeout: Duration::from_secs(5),
+    })
     .expect("valid fixture budget")
 }
 
 fn response_budget(max_attempts: u32, max_response_bytes: u64) -> OtlpDeliveryBudget {
-    OtlpDeliveryBudget::new(
-        64 * 1024,
+    OtlpDeliveryBudget::new(OtlpDeliveryBounds {
+        max_request_bytes: 64 * 1024,
         max_response_bytes,
         max_attempts,
-        Duration::from_secs(1),
-        Duration::from_millis(40),
-        Duration::from_millis(1),
-        Duration::from_secs(2),
-    )
+        connect_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_millis(40),
+        retry_backoff: Duration::from_millis(1),
+        total_timeout: Duration::from_secs(2),
+    })
     .expect("valid response fixture budget")
 }
 
 fn total_timeout_budget() -> OtlpDeliveryBudget {
-    OtlpDeliveryBudget::new(
-        64 * 1024,
-        4 * 1024,
-        2,
-        Duration::from_secs(1),
-        Duration::from_secs(1),
-        Duration::from_millis(40),
-        Duration::from_millis(40),
-    )
+    OtlpDeliveryBudget::new(OtlpDeliveryBounds {
+        max_request_bytes: 64 * 1024,
+        max_response_bytes: 4 * 1024,
+        max_attempts: 2,
+        connect_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_secs(1),
+        retry_backoff: Duration::from_millis(40),
+        total_timeout: Duration::from_millis(40),
+    })
     .expect("valid total-timeout fixture budget")
 }
 
@@ -415,15 +415,15 @@ fn logs_metrics_traces_and_fault_matrix() {
     assert_eq!(failure.kind(), OtlpDeliveryFailureKind::InvalidPayload);
     assert_eq!(failure.attempts(), 0);
 
-    let request_cap = OtlpDeliveryBudget::new(
-        1,
-        4 * 1024,
-        1,
-        Duration::from_secs(1),
-        Duration::from_secs(1),
-        Duration::ZERO,
-        Duration::from_secs(2),
-    )
+    let request_cap = OtlpDeliveryBudget::new(OtlpDeliveryBounds {
+        max_request_bytes: 1,
+        max_response_bytes: 4 * 1024,
+        max_attempts: 1,
+        connect_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_secs(1),
+        retry_backoff: Duration::ZERO,
+        total_timeout: Duration::from_secs(2),
+    })
     .expect("valid request-cap fixture budget");
     let failure = send_otlp_json(
         &unreachable_endpoint,

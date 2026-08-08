@@ -28,9 +28,9 @@ use rest::RestRecordSource;
 
 pub use otlp::{
     AdmittedOtlpEndpoint, OtlpAuthentication, OtlpCredentialApplicationError,
-    OtlpCredentialApplicator, OtlpCredentialRequest, OtlpDeliveryBudget, OtlpDeliveryBudgetError,
-    OtlpDeliveryFailure, OtlpDeliveryFailureKind, OtlpDeliveryOutcome, OtlpEndpointAdmissionError,
-    OtlpRetryCause, OtlpSignal, admit_otlp_endpoint, send_otlp_json,
+    OtlpCredentialApplicator, OtlpCredentialRequest, OtlpDeliveryBounds, OtlpDeliveryBudget,
+    OtlpDeliveryBudgetError, OtlpDeliveryFailure, OtlpDeliveryFailureKind, OtlpDeliveryOutcome,
+    OtlpEndpointAdmissionError, OtlpRetryCause, OtlpSignal, admit_otlp_endpoint, send_otlp_json,
 };
 
 /// Build the REST record source for a `rest` Source from its declared

@@ -203,18 +203,45 @@ pub struct OtlpDeliveryBudget {
     total_timeout: Duration,
 }
 
+/// The authored bounds of one signal delivery, before validation.
+///
+/// Named rather than positional because four of the seven are a `Duration`:
+/// transposing a pair of them compiles cleanly and silently changes which
+/// deadline the transport enforces, which is the kind of mistake that only
+/// shows up as a misclassified failure against a real collector.
+///
+/// Construct an [`OtlpDeliveryBudget`] from one of these with
+/// [`OtlpDeliveryBudget::new`], which is where the bounds are checked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OtlpDeliveryBounds {
+    /// Largest request body the transport will send.
+    pub max_request_bytes: usize,
+    /// Largest response body the transport will read.
+    pub max_response_bytes: u64,
+    /// Total attempts, including the first.
+    pub max_attempts: u32,
+    /// Deadline for establishing the connection.
+    pub connect_timeout: Duration,
+    /// Deadline for the request once connected.
+    pub request_timeout: Duration,
+    /// Delay before the first retry.
+    pub retry_backoff: Duration,
+    /// Ceiling across every attempt.
+    pub total_timeout: Duration,
+}
+
 impl OtlpDeliveryBudget {
-    /// Construct a finite delivery budget.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        max_request_bytes: usize,
-        max_response_bytes: u64,
-        max_attempts: u32,
-        connect_timeout: Duration,
-        request_timeout: Duration,
-        retry_backoff: Duration,
-        total_timeout: Duration,
-    ) -> Result<Self, OtlpDeliveryBudgetError> {
+    /// Construct a finite delivery budget, or reject bounds that are not.
+    pub fn new(bounds: OtlpDeliveryBounds) -> Result<Self, OtlpDeliveryBudgetError> {
+        let OtlpDeliveryBounds {
+            max_request_bytes,
+            max_response_bytes,
+            max_attempts,
+            connect_timeout,
+            request_timeout,
+            retry_backoff,
+            total_timeout,
+        } = bounds;
         if max_request_bytes == 0
             || max_response_bytes == 0
             || max_response_bytes > usize::MAX as u64

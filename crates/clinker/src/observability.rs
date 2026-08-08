@@ -170,15 +170,15 @@ impl OtlpRuntimeBundle {
         let arena = ArenaBounds::from_policy(policy);
         let max_request_bytes = usize::try_from(arena.request_capacity_bytes())
             .map_err(|_| ObservabilityRuntimeError::Worker)?;
-        let delivery_budget = OtlpDeliveryBudget::new(
+        let delivery_budget = OtlpDeliveryBudget::new(clinker_net::OtlpDeliveryBounds {
             max_request_bytes,
-            otlp.max_response_bytes().get(),
-            otlp.retry_max_attempts().get(),
-            otlp.connect_timeout(),
-            otlp.request_timeout(),
-            otlp.retry_initial_backoff(),
-            otlp.retry_total_timeout(),
-        )
+            max_response_bytes: otlp.max_response_bytes().get(),
+            max_attempts: otlp.retry_max_attempts().get(),
+            connect_timeout: otlp.connect_timeout(),
+            request_timeout: otlp.request_timeout(),
+            retry_backoff: otlp.retry_initial_backoff(),
+            total_timeout: otlp.retry_total_timeout(),
+        })
         .map_err(ObservabilityRuntimeError::Budget)?;
         let bundle = Self {
             endpoint,
