@@ -596,6 +596,13 @@ impl RequestFailure {
 
     const fn classification_code(self) -> &'static str {
         match self {
+            // Ahead of the 4xx range, which would otherwise swallow these.
+            // Throttling and a request timeout are the server asking for
+            // later, not refusing: grouping them with the rest told a
+            // supervisor the batch could never succeed, so a rate-limited API
+            // permanently abandoned the day's records — while the OTLP
+            // transport in this same branch treats 429 as retryable.
+            Self::HttpStatus(408 | 429) => "infrastructure.runtime.source_unavailable",
             Self::HttpStatus(400..=499) => "rest.http.client_error",
             Self::BodyLimit => "rest.protocol.page_body_limit_reached",
             // A certificate the client will not trust, and a hostname that
@@ -612,11 +619,26 @@ impl RequestFailure {
             // a certificate the process cannot read was still re-queued
             // forever — the caller was corrected and the callee that produces
             // the operator-visible verdict was not.
+            // Only the kinds that can mean nothing but a local file this
+            // process cannot use. `InvalidData` and `InvalidInput` are absent
+            // deliberately: invalid data is how a plaintext reply to a TLS
+            // handshake arrives on the Unix hosts, so claiming it here sent a
+            // Linux operator to inspect certificate files that were fine while
+            // the identical misconfiguration stayed retryable on Windows,
+            // where it arrives as a reset. One deployment error, two verdicts.
+            //
+            // `ResponseIo` carries the same kinds once a reply had begun, and
+            // a certificate that cannot be read does not become readable
+            // because the peer answered first.
             Self::Io(
                 std::io::ErrorKind::PermissionDenied
                 | std::io::ErrorKind::NotFound
-                | std::io::ErrorKind::InvalidInput
-                | std::io::ErrorKind::InvalidData
+                | std::io::ErrorKind::IsADirectory
+                | std::io::ErrorKind::ReadOnlyFilesystem,
+            )
+            | Self::ResponseIo(
+                std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::NotFound
                 | std::io::ErrorKind::IsADirectory
                 | std::io::ErrorKind::ReadOnlyFilesystem,
             ) => "source.endpoint.unreadable_material",

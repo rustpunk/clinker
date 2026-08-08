@@ -1364,12 +1364,31 @@ fn parse_correction(field: &str, key: Option<&str>) -> Box<str> {
     correction.into_boxed_str()
 }
 
+/// The lines under a table header, or `None` when the document has no such
+/// table.
+///
+/// The header has to be a header: matched at the start of its own line, not
+/// anywhere in the text. A plain substring search also found one inside a
+/// commented-out example, and the body it then returned ended at the next real
+/// header — so a document whose actual defect was a misspelled key elsewhere
+/// was reported as missing a key from a table the author had deliberately
+/// commented out, with a correction naming something they never wrote.
 fn table_body<'a>(text: &'a str, requested: &str) -> Option<&'a str> {
     let header = format!("[{requested}]");
-    let start = text.find(&header)? + header.len();
-    let tail = &text[start..];
-    let end = tail.find("\n[").map_or(tail.len(), |relative| relative + 1);
-    Some(&tail[..end])
+    let mut offset = 0_usize;
+    let mut body_start = None;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if body_start.is_none() {
+            if trimmed == header {
+                body_start = Some(offset + line.len());
+            }
+        } else if trimmed.starts_with('[') {
+            return Some(&text[body_start?..offset]);
+        }
+        offset += line.len();
+    }
+    body_start.map(|start| &text[start..])
 }
 
 fn authored_key<'a>(body: &'a str, requested: &str) -> Option<&'a str> {
