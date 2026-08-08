@@ -4062,23 +4062,54 @@ pub(crate) fn transform_fused_consume(
             // The document context is cloned rather than borrowed from `rec`
             // so this context borrows locals only — the pass-through arm below
             // moves `rec` into the batcher, which a borrow of it would forbid.
-            let source_file_arc = Arc::clone(&last_file);
-            let rec_source_name_arc = source_name_arc_of(&rec);
-            let rec_doc_ctx = Arc::clone(rec.doc_ctx());
-            let eval_ctx = EvalContext {
-                stable: ctx.stable,
-                source_file: &source_file_arc,
-                source_row: rn.ordinal(),
-                source_path: &source_file_arc,
-                source_count: ctx.source_count_by_name(&rec_source_name_arc),
-                source_batch: ctx.source_batch_arc,
-                ingestion_timestamp: ctx.source_ingestion_timestamp,
-                source_name: &rec_source_name_arc,
-                doc_ctx: &rec_doc_ctx,
-            };
-            signals.fire_per_record(&rec, &eval_ctx);
+            // Skipped entirely when nothing will read it: a pass-through node
+            // in a deployment that configures no observability runs neither a
+            // gate nor a program, and the reference-count bumps and source
+            // lookup below would be per-record work with no reader.
+            let eval_inputs = (signals.is_enabled() || evaluator_opt.is_some()).then(|| {
+                let source_file_arc = Arc::clone(&last_file);
+                let rec_source_name_arc = source_name_arc_of(&rec);
+                let source_count = ctx.source_count_by_name(&rec_source_name_arc);
+                let rec_doc_ctx = Arc::clone(rec.doc_ctx());
+                (
+                    source_file_arc,
+                    rec_source_name_arc,
+                    rec_doc_ctx,
+                    source_count,
+                )
+            });
+            if let Some((source_file_arc, rec_source_name_arc, rec_doc_ctx, source_count)) =
+                eval_inputs.as_ref()
+            {
+                let eval_ctx = EvalContext {
+                    stable: ctx.stable,
+                    source_file: source_file_arc,
+                    source_row: rn.ordinal(),
+                    source_path: source_file_arc,
+                    source_count: *source_count,
+                    source_batch: ctx.source_batch_arc,
+                    ingestion_timestamp: ctx.source_ingestion_timestamp,
+                    source_name: rec_source_name_arc,
+                    doc_ctx: rec_doc_ctx,
+                };
+                signals.fire_per_record(&rec, &eval_ctx);
+            }
 
             if let Some(evaluator) = evaluator_opt.as_mut() {
+                let (source_file_arc, rec_source_name_arc, rec_doc_ctx, source_count) = eval_inputs
+                    .as_ref()
+                    .expect("an evaluator always assembles its evaluation context");
+                let eval_ctx = EvalContext {
+                    stable: ctx.stable,
+                    source_file: source_file_arc,
+                    source_row: rn.ordinal(),
+                    source_path: source_file_arc,
+                    source_count: *source_count,
+                    source_batch: ctx.source_batch_arc,
+                    ingestion_timestamp: ctx.source_ingestion_timestamp,
+                    source_name: rec_source_name_arc,
+                    doc_ctx: rec_doc_ctx,
+                };
                 let target_schema = output_schema
                     .as_ref()
                     .cloned()

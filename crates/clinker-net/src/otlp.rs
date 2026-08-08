@@ -451,6 +451,13 @@ pub struct OtlpDeliveryFailure {
     kind: OtlpDeliveryFailureKind,
     attempts: u32,
     classification: Option<FailureClassification>,
+    /// Whether the collector answered 200 before this failure.
+    ///
+    /// A reply that cannot be read loses the confirmation, not the delivery.
+    /// Counting such a batch as lost understates an export that arrived, and a
+    /// supervisor comparing accepted against the run's record counts would read
+    /// the shortfall as records the collector never received.
+    reached_collector: bool,
 }
 
 impl OtlpDeliveryFailure {
@@ -467,6 +474,14 @@ impl OtlpDeliveryFailure {
     /// Return the number of attempts consumed.
     pub const fn attempts(&self) -> u32 {
         self.attempts
+    }
+
+    /// Whether the collector accepted the batch before this failure.
+    ///
+    /// True only after a 200, where what failed was reading the reply. Callers
+    /// accounting for delivered items must count such a batch as accepted.
+    pub const fn reached_collector(&self) -> bool {
+        self.reached_collector
     }
 
     /// API classification: workspace-internal exposed API.
@@ -495,6 +510,7 @@ impl OtlpDeliveryFailure {
             signal,
             kind,
             attempts,
+            reached_collector: false,
             classification: code.map(|code| {
                 FailureClassification::for_code(code)
                     .expect("the append-only registry contains OTLP failure codes")
@@ -860,13 +876,20 @@ fn map_transport_error(
     OtlpDeliveryFailure::new(signal, kind, attempts)
 }
 
+/// Report a reply that could not be read from a collector that answered 200.
+///
+/// The batch is already ingested, so the failure is marked as having reached
+/// the collector: it is the confirmation that was lost, and accounting for the
+/// records as undelivered would report a healthy export as a lossy one.
 fn map_body_error(signal: OtlpSignal, attempts: u32, error: &ureq::Error) -> OtlpDeliveryFailure {
     let kind = match error {
         ureq::Error::BodyExceedsLimit(_) => OtlpDeliveryFailureKind::ResponseTooLarge,
         ureq::Error::Timeout(_) => OtlpDeliveryFailureKind::Timeout,
         _ => OtlpDeliveryFailureKind::Transport,
     };
-    OtlpDeliveryFailure::new(signal, kind, attempts)
+    let mut failure = OtlpDeliveryFailure::new(signal, kind, attempts);
+    failure.reached_collector = true;
+    failure
 }
 
 fn wait_for_retry(

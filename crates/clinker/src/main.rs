@@ -912,29 +912,25 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
 /// delivery failure is excluded for the same reason: it carries its own
 /// classification and did not come from a source read.
 fn is_cancelled_transport_error(error: &PipelineError) -> bool {
-    /// The kinds tearing down a read in progress produces.
+    /// The kinds that tearing down a read in progress produces.
     ///
-    /// A full disk, a refused permission, or a missing file is a real defect
-    /// that happened to coincide with a signal, and it keeps its identity —
-    /// being an `Io` error is not evidence of cancellation.
-    /// Named by what it cannot be, because a transport error carried up from a
-    /// source arrives with whatever kind that transport chose — frequently
-    /// `Other`, which no list of expected kinds would contain. What can be
-    /// enumerated is the opposite: the failures of the environment, which a
-    /// signal never causes and which a retry never fixes on its own.
+    /// Named by what it is rather than by what it is not. Listing exclusions
+    /// instead was tried and reverted: `ErrorKind::Other` is what the engine
+    /// stamps on its own wrapped defects — a spill run that failed to decode
+    /// during a k-way merge, a sidecar that could not be opened — and treating
+    /// the unlisted remainder as cancellation turned those into clean operator
+    /// stops whenever a signal happened to be pending. A defect that coincides
+    /// with a signal is still a defect, and one recorded nowhere is worse than
+    /// one recorded under the wrong kind.
     fn is_interrupted_read(io: &std::io::Error) -> bool {
-        !matches!(
+        matches!(
             io.kind(),
-            std::io::ErrorKind::StorageFull
-                | std::io::ErrorKind::QuotaExceeded
-                | std::io::ErrorKind::PermissionDenied
-                | std::io::ErrorKind::NotFound
-                | std::io::ErrorKind::ReadOnlyFilesystem
-                | std::io::ErrorKind::AlreadyExists
-                | std::io::ErrorKind::IsADirectory
-                | std::io::ErrorKind::NotADirectory
-                | std::io::ErrorKind::InvalidInput
-                | std::io::ErrorKind::InvalidData
+            std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::UnexpectedEof
         )
     }
 
@@ -1887,6 +1883,14 @@ fn lineage_export_failure(
                 | clinker_lineage::LineageAdmission::DroppedQueueFull
         )
     });
+    // An export that delivered nothing leaves nothing. The destination was
+    // emptied when the run was admitted, which is what stops a later step from
+    // reading the previous run's events as this run's; but an empty file is
+    // still a file a downstream step can upload as though it were the export.
+    // Absent is unambiguous where empty is not.
+    if outcome.accepted() == 0 && path.as_os_str() != std::ffi::OsStr::new("-") {
+        let _ = std::fs::remove_file(path);
+    }
     let detail = format!(
         "--lineage output {destination} is incomplete: {} of {expected} events were dropped before delivery ({listed}). Correction: ",
         rejected.len(),
@@ -1980,6 +1984,11 @@ struct LiveLineageOutput {
     /// arrive. A terminal for a run the consumer never saw start describes
     /// nothing it can attach to, so the pairing is tracked rather than assumed.
     started: bool,
+    /// The admitted START, kept so a run that never reaches its terminal can
+    /// still be closed against the identity the consumer already has.
+    start_facts: Option<clinker_lineage::RunLifecycleStartFacts>,
+    /// Whether a terminal has been offered for this run.
+    terminal_emitted: bool,
 }
 
 impl LiveLineageOutput {
@@ -1987,6 +1996,7 @@ impl LiveLineageOutput {
         let facts = lineage_start_facts(start);
         let event = clinker_lineage::start_event(&self.lineage, self.job.clone(), &facts);
         self.started = self.emit(event)?;
+        self.start_facts = Some(facts);
         Ok(())
     }
 
@@ -2003,6 +2013,7 @@ impl LiveLineageOutput {
         }
         let facts = lineage_lifecycle_facts(snapshot)?;
         let event = clinker_lineage::terminal_event(&self.lineage, self.job.clone(), &facts);
+        self.terminal_emitted = true;
         self.emit(event).map(|_| ()).map_err(PipelineError::Io)
     }
 
@@ -2040,10 +2051,50 @@ impl LiveLineageOutput {
         }
     }
 
-    fn finish(self) -> Option<clinker_lineage::LineageDeliveryOutcome> {
-        match self.sink {
+    fn finish(&mut self) -> Option<clinker_lineage::LineageDeliveryOutcome> {
+        // Before the sink goes away, so a run that reached here without a
+        // terminal is still closed against the consumer that saw its START.
+        self.close_open_run();
+        let sink = std::mem::replace(
+            &mut self.sink,
+            LiveLineageSink::LocalDiagnostic(Box::new(std::io::sink())),
+        );
+        match sink {
             LiveLineageSink::External(delivery) => Some(delivery.finish()),
             LiveLineageSink::LocalDiagnostic(_) => None,
+        }
+    }
+
+    /// Emit a terminal for a run the consumer was told had begun and that
+    /// never reported how it ended.
+    ///
+    /// A run that ended without saying how did not succeed, so this reports a
+    /// failure under the invariant code and carries no statistics, because
+    /// none were observed. Doing nothing instead leaves a lone START, and a
+    /// catalogue shows the run as still executing forever.
+    fn close_open_run(&mut self) {
+        if !self.started || self.terminal_emitted {
+            return;
+        }
+        let Some(start) = self.start_facts.clone() else {
+            return;
+        };
+        let facts = clinker_lineage::RunLifecycleFacts {
+            start,
+            terminal: clinker_lineage::RunLifecycleTerminalFacts {
+                event_time: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                outcome: clinker_lineage::Terminal::Fail {
+                    failure: clinker_core_types::FailureClassification::unknown_internal(
+                        "the run ended without recording a terminal",
+                    ),
+                },
+                stats: None,
+            },
+        };
+        let event = clinker_lineage::terminal_event(&self.lineage, self.job.clone(), &facts);
+        self.terminal_emitted = true;
+        if self.emit(event).is_err() {
+            tracing::warn!("lineage run left open: its closing event could not be written");
         }
     }
 }
@@ -2114,10 +2165,22 @@ fn lineage_error_kind(kind: std::io::ErrorKind) -> &'static str {
     }
 }
 
+impl Drop for LiveLineageOutput {
+    /// Close a run the consumer was told had begun.
+    ///
+    /// Every ordinary path emits its own terminal. What this covers is the one
+    /// that does not reach one: an early return between START and the
+    /// executor, or an unwind.
+    fn drop(&mut self) {
+        self.close_open_run();
+    }
+}
+
 fn finish_live_lineage(output: &mut Option<LiveLineageOutput>) {
-    if let Some(outcome) = output.take().and_then(LiveLineageOutput::finish) {
+    if let Some(outcome) = output.as_mut().and_then(LiveLineageOutput::finish) {
         report_lineage_delivery(outcome);
     }
+    output.take();
 }
 
 fn finish_otlp_delivery(
@@ -2161,6 +2224,26 @@ impl std::io::Write for ExternalLineageFileSink {
             None => Ok(()),
         }
     }
+}
+
+/// Empty the `--lineage` destination now that the export worker is running.
+///
+/// Deliberately after the worker starts, not before: a worker that fails to
+/// start has produced no effect, and the run is refused with the filesystem
+/// exactly as it was. Once the worker is up the run is committed to writing
+/// here, and emptying the file at that point is what stops a run that then
+/// fails before its first event from leaving the previous run's events — whose
+/// COMPLETE terminal a catalogue would attribute to this run.
+fn truncate_lineage_destination(path: &std::path::Path) -> Result<(), PipelineError> {
+    if path.as_os_str() == std::ffi::OsStr::new("-") {
+        return Ok(());
+    }
+    std::fs::File::create(path).map(|_| ()).map_err(|e| {
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+            "cannot open --lineage output {}: {e}",
+            path.display()
+        )))
+    })
 }
 
 #[cfg(debug_assertions)]
@@ -2225,6 +2308,11 @@ fn external_lineage_sink(path: &std::path::Path) -> Box<dyn std::io::Write + Sen
     let sink: Box<dyn std::io::Write + Send> = if path.as_os_str() == std::ffi::OsStr::new("-") {
         Box::new(std::io::stdout())
     } else {
+        // Created and emptied here, while the run is being admitted, rather
+        // than on the export worker at its first event. A run refused before it
+        // emits anything would otherwise leave the previous run's file intact,
+        // COMPLETE terminal and all, for a catalogue to read as this run having
+        // succeeded.
         Box::new(ExternalLineageFileSink {
             path: path.to_owned(),
             file: None,
@@ -3017,6 +3105,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 external_lineage_sink(path),
             )
             .map_err(lineage_worker_start_error)?;
+            truncate_lineage_destination(path)?;
             let mut rejected = Vec::new();
             for (index, event) in events.iter().enumerate() {
                 match delivery.try_emit(event) {
@@ -3259,11 +3348,14 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 )
                 .map_err(lineage_worker_start_error)?,
             );
+            truncate_lineage_destination(path)?;
             lineage_output = Some(LiveLineageOutput {
                 sink,
                 lineage,
                 job,
                 started: false,
+                start_facts: None,
+                terminal_emitted: false,
             });
         } else {
             // The local-diagnostic sink is a file the run opens, so refusing it
@@ -3303,6 +3395,8 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 lineage,
                 job,
                 started: false,
+                start_facts: None,
+                terminal_emitted: false,
             });
         }
     }
@@ -7359,10 +7453,10 @@ mod tests {
         );
 
         assert!(
-            is_cancelled_transport_error(&PipelineError::Io(std::io::Error::other(
-                "wrapped transport failure"
+            !is_cancelled_transport_error(&PipelineError::Io(std::io::Error::other(
+                "spill run decode failed during k-way merge"
             ))),
-            "a source transport reports its own kind, often Other, and is still a cancelled read"
+            "the engine stamps Other on its own wrapped defects; a pending signal does not absolve them"
         );
 
         for defect in [

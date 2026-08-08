@@ -72,6 +72,14 @@ not copied into the diagnostic. The complete observability policy, including
 the required OTLP and authentication tables, is documented under
 [lineage identity](metrics.md#lineage-identity).
 
+The destination file is emptied when the run is admitted, before any event is
+written — so a run that is refused, or that fails before emitting anything,
+leaves an empty file rather than the previous run's events. Point each run at
+a path you are willing to overwrite, and copy a record you want to keep before
+re-running against it. This applies to both `--lineage` and `--lineage-events`.
+An empty file means this run wrote nothing; it never means the previous run's
+result still stands.
+
 Path-derived dataset names remain available only through the exact local
 compatibility spelling below. This mode is visibly labeled on stderr and is
 for local diagnostics, not external delivery:

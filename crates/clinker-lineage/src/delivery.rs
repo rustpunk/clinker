@@ -478,7 +478,13 @@ impl LineageDelivery {
                 terminal
             }
             Err(mpsc::RecvTimeoutError::Timeout) => LineageDeliveryTerminal::DeadlineExceeded,
-            Err(mpsc::RecvTimeoutError::Disconnected) => LineageDeliveryTerminal::Shutdown,
+            // The worker sends its outcome before it returns, so a closed
+            // channel means it did not return — it unwound. Calling that a
+            // shutdown would report a dead exporter as a clean flush and leave
+            // whatever it had not written unaccounted for.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                LineageDeliveryTerminal::WriteFailed(io::ErrorKind::Other)
+            }
         };
         self.counters.outcome(terminal)
     }

@@ -262,7 +262,10 @@ impl OtlpDeliveryReport {
 
     fn record(&mut self, signal: OtlpSignal, result: DeliveryResult, item_count: u64) {
         let report = self.signal_mut(signal);
-        report.summary.accepted = report.summary.accepted.saturating_add(result.accepted());
+        report.summary.accepted = report
+            .summary
+            .accepted
+            .saturating_add(result.accepted(item_count));
         report.summary.rejected = report
             .summary
             .rejected
@@ -340,6 +343,8 @@ fn failure_hint(kind: OtlpDeliveryFailureKind) -> &'static str {
     }
 }
 
+/// One line describing how a signal's delivery ended, or `None` when it did
+/// not fail. Delivery outcomes are observations: this never gates the run.
 fn failure_line(name: &str, signal: &SignalDeliveryReport) -> Option<String> {
     let failures = signal.summary.failures;
     match signal.last_failure.as_ref()? {
@@ -374,9 +379,16 @@ enum DeliveryResult {
 }
 
 impl DeliveryResult {
-    fn accepted(&self) -> u64 {
+    /// Items the collector holds, whether or not it said so readably.
+    ///
+    /// A failure that reached the collector answered 200 before its reply
+    /// became unreadable, so the batch was ingested. Counting it as lost would
+    /// report a healthy export as a lossy one to anyone comparing this against
+    /// the run's record counts.
+    fn accepted(&self, item_count: u64) -> u64 {
         match self {
             Self::Typed(Ok(outcome)) => outcome.accepted(),
+            Self::Typed(Err(error)) if error.reached_collector() => item_count,
             #[cfg(debug_assertions)]
             Self::Injected { accepted, .. } => *accepted,
             #[cfg(test)]
@@ -393,6 +405,7 @@ impl DeliveryResult {
     fn rejected(&self, item_count: u64) -> u64 {
         match self {
             Self::Typed(Ok(outcome)) => outcome.rejected(),
+            Self::Typed(Err(error)) if error.reached_collector() => 0,
             Self::Typed(Err(_)) | Self::EncodingFailure => item_count,
             #[cfg(debug_assertions)]
             Self::Injected { rejected, .. } => *rejected,

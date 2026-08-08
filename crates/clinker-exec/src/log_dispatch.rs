@@ -105,9 +105,18 @@ impl<'a> LogDispatcher<'a> {
         enabled.emit_timing(LogTiming::BeforeTransform, None);
     }
 
+    /// Whether any signal is being produced for this transform.
+    ///
+    /// Callers assemble the per-record evaluation context, which costs a
+    /// handful of reference-count bumps and a source lookup per row. A
+    /// deployment that configures no observability reads none of it, so this
+    /// lets the hot loop skip building what nothing will look at.
+    pub(crate) const fn is_enabled(&self) -> bool {
+        self.enabled.is_some()
+    }
+
     /// `eval_ctx` is the record's own evaluation context, used only to run
-    /// authored `condition` gates. It is required even when no directive
-    /// declares one so the hot path never branches on dispatcher shape.
+    /// authored `condition` gates.
     pub(crate) fn fire_per_record(&mut self, record: &Record, eval_ctx: &EvalContext<'_>) {
         let Some(enabled) = self.enabled.as_mut() else {
             return;
