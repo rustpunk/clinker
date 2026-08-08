@@ -889,6 +889,62 @@ fn build_xml_config(
 mod tests {
     use super::*;
 
+    /// Which deadlines mean the peer never answered.
+    ///
+    /// The cancellation rule turns entirely on this, and getting it backwards
+    /// is silent: every behaviour test happened to exercise only `Connect` and
+    /// `RecvBody`, the two that were classified correctly, so an inversion of
+    /// the other three passed the whole suite. Each phase is named here so a
+    /// future edit has to state which side it belongs on.
+    #[test]
+    fn only_the_body_read_happens_after_the_peer_answered() {
+        for phase in [
+            ureq::Timeout::Connect,
+            ureq::Timeout::Resolve,
+            ureq::Timeout::SendRequest,
+            ureq::Timeout::SendBody,
+            ureq::Timeout::Await100,
+            ureq::Timeout::RecvResponse,
+            ureq::Timeout::Global,
+        ] {
+            let failure = RequestFailure::from_transport(&ureq::Error::Timeout(phase));
+            assert!(
+                failure.is_cancellable_transport(),
+                "{phase:?} expires with nothing received, so a cancellation explains it"
+            );
+        }
+
+        let body = RequestFailure::from_transport(&ureq::Error::Timeout(ureq::Timeout::RecvBody));
+        assert!(
+            !body.is_cancellable_transport(),
+            "a body read follows an answer, so the peer's verdict stands"
+        );
+    }
+
+    /// Relabelling a failure by phase must not change whether it can be
+    /// retried. Moving body-read failures onto their own variant silently
+    /// dropped three kinds, so a transient that used to survive a retry began
+    /// failing the run and discarding everything already pulled.
+    #[test]
+    fn a_phase_label_never_changes_what_is_retryable() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            let request_phase = RequestFailure::Io(kind);
+            assert_eq!(
+                request_phase.retryable_body_read(),
+                request_phase.in_response_phase().retryable_body_read(),
+                "{kind:?} must be equally retryable whichever phase observed it"
+            );
+        }
+    }
+
     #[test]
     fn append_query_picks_separator() {
         assert_eq!(append_query("http://h/r", &[("a", "1")]), "http://h/r?a=1");
