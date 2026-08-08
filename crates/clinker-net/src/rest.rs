@@ -547,7 +547,7 @@ impl RequestFailure {
     /// request in flight produces. A status means the exchange completed and
     /// the peer rejected it, and that verdict is independent of any signal
     /// that arrives afterwards.
-    const fn is_cancellable_transport(self) -> bool {
+    fn is_cancellable_transport(self) -> bool {
         // `Transport` is included, but only because every permanent failure
         // that used to hide behind it is now named. It reached this catch-all
         // for TLS errors once, and a certificate nobody trusts was reported as
@@ -557,13 +557,25 @@ impl RequestFailure {
         // cancellation is the one thing actually known — a peer that dropped
         // the connection mid-request surfaces here on some hosts and as an I/O
         // error on others, and both are the same operator action.
+        if let Self::Io(kind) = self {
+            // Not every local I/O failure. Reading a client certificate, a
+            // trust store, or a socket path the process may not open fails
+            // permanently and identically on every attempt, and a shutdown
+            // that happens to be pending does not explain it — the same harm
+            // the named verdicts exist to prevent.
+            return !matches!(
+                kind,
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::InvalidData
+                    | std::io::ErrorKind::IsADirectory
+                    | std::io::ErrorKind::ReadOnlyFilesystem
+            );
+        }
         matches!(
             self,
-            Self::Timeout
-                | Self::Connection
-                | Self::ProxyConnection
-                | Self::Transport
-                | Self::Io(_)
+            Self::Timeout | Self::Connection | Self::ProxyConnection | Self::Transport
         )
     }
 

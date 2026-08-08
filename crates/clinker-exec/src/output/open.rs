@@ -79,27 +79,8 @@ where
             }
         }
         IfExistsPolicy::UniqueSuffix => {
-            // A sharing violation clears as soon as the thread that was
-            // creating that name finishes; a directory this process may not
-            // write into never does, and the two arrive as the same error.
-            // Advancing on either is what makes the policy work under
-            // contention, so what separates them is how many the search sees:
-            // a race resolves within a few names, while a denial repeats on
-            // every one. Past this bound the denial is reported rather than
-            // walked past, because the alternative is a run that never
-            // terminates and never says why.
-            const MAX_DENIED_CANDIDATES: u32 = 64;
-            let mut denied = 0_u32;
-            let mut advance = |error: &PipelineError| -> bool {
-                if is_already_exists(error) {
-                    return true;
-                }
-                if !is_candidate_unavailable(error) {
-                    return false;
-                }
-                denied = denied.saturating_add(1);
-                denied <= MAX_DENIED_CANDIDATES
-            };
+            let mut search = SuffixSearch::default();
+            let mut advance = |error: &PipelineError| search.advance(error);
 
             match stage_candidate(bare.clone(), PromotionDisposition::NoReplace, publication) {
                 Ok(output) => return Ok(output),
@@ -194,6 +175,40 @@ pub(crate) fn containment_error(error: ContainmentError) -> PipelineError {
             PipelineError::Io(std::io::Error::other(error.to_string()))
         }
         other => PipelineError::Config(ConfigError::Validation(other.to_string())),
+    }
+}
+
+/// Decides whether a unique-suffix search may move to the next candidate.
+///
+/// A name already taken is always a reason to advance. A sharing violation —
+/// how Windows reports a name another thread is creating at that moment — is
+/// too, but only for as long as it looks like contention. A directory this
+/// process may not write into reports the identical error and never stops, so
+/// advancing on it forever means a run that neither finishes nor says why.
+///
+/// The two are told apart by whether the denials are consecutive. Contention
+/// clears the moment the competing thread finishes, so a successful advance
+/// past a taken name resets the count; a denial that repeats on every
+/// candidate reaches the bound and is reported.
+#[derive(Default)]
+pub(crate) struct SuffixSearch {
+    consecutive_denials: u32,
+}
+
+impl SuffixSearch {
+    /// How many consecutive denials still look like contention.
+    const MAX_CONSECUTIVE_DENIALS: u32 = 64;
+
+    pub(crate) fn advance(&mut self, error: &PipelineError) -> bool {
+        if is_already_exists(error) {
+            self.consecutive_denials = 0;
+            return true;
+        }
+        if !is_candidate_unavailable(error) {
+            return false;
+        }
+        self.consecutive_denials = self.consecutive_denials.saturating_add(1);
+        self.consecutive_denials <= Self::MAX_CONSECUTIVE_DENIALS
     }
 }
 

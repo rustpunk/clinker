@@ -263,16 +263,23 @@ impl OutputStagingRegistry {
                 result => result,
             },
             IfExistsPolicy::UniqueSuffix => {
+                // The same search the non-attempt path uses, and shared rather
+                // than copied: this is the path every CLI output takes, and it
+                // was left behind when the other one learned that Windows
+                // reports a contended name as a sharing violation. A test
+                // exercising only the other copy reported the policy fixed
+                // while the live path still failed the run.
+                let mut search = super::open::SuffixSearch::default();
                 match stage(bare.clone()) {
                     Ok(output) => return Ok(output),
-                    Err(error) if attempt_is_already_exists(&error) => {}
+                    Err(error) if search.advance(&error) => {}
                     Err(error) => return Err(error),
                 }
                 for n in 1_u64..=u64::MAX {
                     let candidate = path_for_n(Some(n)).map_err(PipelineError::Config)?;
                     match stage(candidate) {
                         Ok(output) => return Ok(output),
-                        Err(error) if attempt_is_already_exists(&error) => continue,
+                        Err(error) if search.advance(&error) => continue,
                         Err(error) => return Err(error),
                     }
                 }
