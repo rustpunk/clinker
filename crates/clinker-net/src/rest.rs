@@ -493,21 +493,20 @@ impl RestRecordSource {
                 };
                 return Ok(PageResponse { body, next_link });
             };
-            // A cancellation tears down the request we are inside, and the
-            // transport reports that teardown as the failure. Reporting it as
-            // an outage would page an on-call for an operator action.
-            //
-            // A status, though, means the peer answered: that verdict was
-            // reached before any signal arrived and stands on its own. Keying
-            // this on the retry budget instead reported a collector that had
-            // failed every attempt as a clean cancellation whenever a signal
-            // happened to be pending, and left the outage in no terminal.
-            if retry_failure.is_cancellable_transport()
-                && self.shutdown.as_ref().is_some_and(|t| t.is_requested())
+            // Cancellation abandons a retry that was going to happen, and it
+            // explains a teardown of the request we were inside — a transport
+            // failure where the peer never answered. What it does not do is
+            // erase a verdict already reached: a status means the exchange
+            // completed, and once no attempt remains that outage is the run's
+            // outcome whether or not a signal arrived afterwards. Reporting it
+            // as a clean cancellation left the outage in no terminal at all
+            // and had the orchestrator re-queue the batch.
+            let cancelled = self.shutdown.as_ref().is_some_and(|t| t.is_requested());
+            if cancelled && (attempt < self.cfg.retries || retry_failure.is_cancellable_transport())
             {
                 return Err(FormatError::Interrupted);
             }
-            if attempt < self.cfg.retries {
+            if !cancelled && attempt < self.cfg.retries {
                 attempt = attempt.saturating_add(1);
                 continue;
             }

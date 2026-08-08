@@ -804,7 +804,17 @@ fn is_tls_endpoint_mismatch(error: &ureq::Error, https_only: bool) -> bool {
     if !https_only {
         return false;
     }
-    !is_reachability_failure(error)
+    match error {
+        // A deadline names the phase it expired in, and a collector that is
+        // merely slow completed its handshake on every attempt. Calling that a
+        // mismatch sends an operator to a certificate that was working and
+        // buries the timeout that pointed at collector capacity.
+        ureq::Error::Timeout(_) => false,
+        // A credential that could not be applied never reached the wire, so
+        // there was no exchange to draw a conclusion from.
+        ureq::Error::Other(other) if other.is::<OtlpCredentialApplicationError>() => false,
+        error => !is_reachability_failure(error),
+    }
 }
 
 /// Whether `error` describes never having reached the peer.
@@ -817,9 +827,17 @@ fn is_reachability_failure(error: &ureq::Error) -> bool {
         | ureq::Error::ConnectionFailed
         | ureq::Error::ConnectProxyFailed(_) => true,
         ureq::Error::Timeout(ureq::Timeout::Connect | ureq::Timeout::Resolve) => true,
+        // Every kind that means no connection was ever made. Naming only
+        // refused and timed-out left an unroutable network reported as a peer
+        // that does not speak TLS.
         ureq::Error::Io(io) => matches!(
             io.kind(),
-            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::NetworkDown
+                | std::io::ErrorKind::AddrNotAvailable
         ),
         _ => false,
     }
@@ -877,14 +895,17 @@ fn map_transport_error(
         ureq::Error::Tls(_) | ureq::Error::Rustls(_) | ureq::Error::TlsRequired => {
             OtlpDeliveryFailureKind::Tls
         }
-        // Errors that fail before a handshake can begin (refused, unreachable)
-        // stay Transport, because those describe reachability rather than
-        // protocol.
-        error if is_tls_endpoint_mismatch(error, https_only) => OtlpDeliveryFailureKind::Tls,
-        ureq::Error::Timeout(_) => OtlpDeliveryFailureKind::Timeout,
+        // The named causes first. The mismatch check below concludes from the
+        // absence of a better explanation, so anything that carries its own
+        // has to be matched before it — a credential that never reached the
+        // wire, and a deadline that names the phase it expired in.
         ureq::Error::Other(other) if other.is::<OtlpCredentialApplicationError>() => {
             OtlpDeliveryFailureKind::CredentialApplication
         }
+        ureq::Error::Timeout(_) => OtlpDeliveryFailureKind::Timeout,
+        // Reachability failures stay Transport: those describe getting to the
+        // peer rather than what the peer turned out to be.
+        error if is_tls_endpoint_mismatch(error, https_only) => OtlpDeliveryFailureKind::Tls,
         _ => OtlpDeliveryFailureKind::Transport,
     };
     OtlpDeliveryFailure::new(signal, kind, attempts)
@@ -1149,6 +1170,32 @@ mod classification {
             assert!(
                 is_tls_endpoint_mismatch(&io(kind), true),
                 "{kind:?} is one host's spelling of a peer that never spoke TLS"
+            );
+        }
+    }
+
+    /// A conclusion drawn from the absence of a better explanation must never
+    /// outrank one that carries its own. Each of these has a named cause, and
+    /// each was reported as a TLS mismatch when the mismatch check ran first.
+    #[test]
+    fn a_failure_that_names_its_own_cause_is_never_called_a_mismatch() {
+        assert!(
+            !is_tls_endpoint_mismatch(&ureq::Error::Timeout(ureq::Timeout::RecvResponse), true),
+            "a collector that is merely slow completed its handshake every time"
+        );
+        assert!(
+            !is_tls_endpoint_mismatch(&ureq::Error::Timeout(ureq::Timeout::RecvBody), true),
+            "a body deadline expires long after any handshake"
+        );
+        for kind in [
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkDown,
+            ErrorKind::AddrNotAvailable,
+        ] {
+            assert!(
+                !is_tls_endpoint_mismatch(&io(kind), true),
+                "{kind:?} means no connection was made, so the peer said nothing about TLS"
             );
         }
     }
