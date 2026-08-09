@@ -290,21 +290,22 @@ impl OutputStagingRegistry {
                 // late rather than a different kind of failure.
                 let mut try_candidate =
                     |path: PathBuf| -> Result<Option<(PathBuf, File)>, PipelineError> {
-                        let taken = |search: &mut super::open::SuffixSearch| {
-                            search
-                                .advance_past_taken_name()
-                                .then_some(None)
-                                .ok_or_else(|| claimed_name_search_exhausted(&path))
-                        };
+                        // A taken name is not a denial, so it is bounded only
+                        // by the counter itself -- as an already-existing name
+                        // is. Each one moves the search to a candidate that
+                        // may be free, which is progress; the denial bounds
+                        // exist for candidates that never can be.
                         let key = destination_key_in(&path, &base);
                         if self.claimant_for_key(&key).is_some() {
-                            return taken(&mut search);
+                            search.advance_past_taken_name();
+                            return Ok(None);
                         }
                         match stage(path.clone()) {
                             Ok(output) => Ok(Some(output)),
                             Err(error) => {
                                 if self.claimant_for_key(&key).is_some() {
-                                    return taken(&mut search);
+                                    search.advance_past_taken_name();
+                                    return Ok(None);
                                 }
                                 if search.advance(&error) {
                                     Ok(None)
@@ -799,13 +800,6 @@ impl OutputStagingRegistry {
 /// Whether this candidate name is already claimed by another output of the
 /// same run, which the registry reports as a validation error rather than an
 /// I/O one because no file was involved.
-fn claimed_name_search_exhausted(path: &std::path::Path) -> PipelineError {
-    PipelineError::Config(ConfigError::Validation(format!(
-        "unique_suffix search for {} gave up: too many candidate names were already claimed by this run",
-        path.display(),
-    )))
-}
-
 fn collision_error(
     name: &str,
     final_path: &std::path::Path,

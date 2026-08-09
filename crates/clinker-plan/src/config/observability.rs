@@ -729,14 +729,13 @@ pub(crate) fn is_observability_toml_error(text: &str, error: &toml::de::Error) -
     is_observability_table(&table)
 }
 
-/// Whether a table's key path is inside the observability policy.
-///
-/// The first segment has to *be* `observability`, not merely start with it: a
-/// table whose one quoted name is `observability.otlp` is a different table,
-/// and claiming it for this subsystem reported someone else's error here with
-/// a correction naming keys that table never had.
 /// A table's key path as TOML spells it, quoting any segment that is not a
 /// bare key so the rendering is reversible.
+///
+/// Quoted through TOML's own serializer rather than Rust's `Debug`, which
+/// escapes several characters differently: a diagnostic is meant to hand the
+/// author something they can paste back, and a name rendered in the wrong
+/// escape syntax gives them a second parse error instead of a fix.
 fn render_path(path: &[String]) -> String {
     path.iter()
         .map(|segment| {
@@ -747,13 +746,19 @@ fn render_path(path: &[String]) -> String {
             {
                 segment.clone()
             } else {
-                format!("{segment:?}")
+                toml::Value::String(segment.clone()).to_string()
             }
         })
         .collect::<Vec<_>>()
         .join(".")
 }
 
+/// Whether a table's key path is inside the observability policy.
+///
+/// The first segment has to *be* `observability`, not merely start with it: a
+/// table whose one quoted name is `observability.otlp` is a different table,
+/// and claiming it for this subsystem reported someone else's error here with
+/// a correction naming keys that table never had.
 fn is_observability_table(path: &[String]) -> bool {
     path.first()
         .is_some_and(|segment| segment == "observability")

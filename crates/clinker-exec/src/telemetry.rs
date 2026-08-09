@@ -489,6 +489,10 @@ impl TelemetryProducer {
             return AdmissionOutcome::Dropped(DropReason::RateLimited);
         }
 
+        // The token is spent before the arena is asked, because asking needs
+        // the same lock and the limiter is what bounds how often we ask. A
+        // refusal gives it back: the budget counts signals that were exported,
+        // and a signal the arena refused was not one.
         match shared.admit(lane, signal) {
             Ok(bytes) => {
                 let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
@@ -497,14 +501,19 @@ impl TelemetryProducer {
                 AdmissionOutcome::Accepted { lane, bytes }
             }
             Err(DropReason::Full) => {
+                shared.rate.refund();
                 self.stats.full.fetch_add(1, Ordering::Relaxed);
                 AdmissionOutcome::Dropped(DropReason::Full)
             }
             Err(DropReason::Oversize) => {
+                shared.rate.refund();
                 self.stats.oversize.fetch_add(1, Ordering::Relaxed);
                 AdmissionOutcome::Dropped(DropReason::Oversize)
             }
-            Err(reason) => AdmissionOutcome::Dropped(reason),
+            Err(reason) => {
+                shared.rate.refund();
+                AdmissionOutcome::Dropped(reason)
+            }
         }
     }
 }
@@ -1189,6 +1198,17 @@ impl RateLimiter {
         }
         self.tokens -= 1;
         true
+    }
+
+    /// Return a token taken for a signal that was then refused elsewhere.
+    ///
+    /// The budget exists to bound how many signals reach a collector. A signal
+    /// the arena refused never reaches one, so spending the budget on it let a
+    /// burst of oversized events exhaust the bucket and silence the error the
+    /// operator had configured observability to see -- with the counters
+    /// blaming the rate limit rather than the events that caused it.
+    fn refund(&mut self) {
+        self.tokens = self.tokens.saturating_add(1).min(self.capacity);
     }
 }
 

@@ -24,7 +24,14 @@ use crate::openlineage::{
     SymlinksDatasetFacet,
 };
 
-/// The input datasets of a run, as bare identities (no facets).
+/// The input datasets of a run carrying only what is true regardless of how
+/// the run ended — the shape used on a `START` and on a `FAIL` or `ABORT`
+/// terminal.
+///
+/// The symmetric half of [`output_identities`], and the two state one rule: a
+/// symlink names the dataset and rides on every event, while the subset facet
+/// says which members this run touched and appears only where it finished
+/// touching them.
 fn input_identities(lineage: &PlanColumnLineage) -> Vec<Dataset> {
     lineage
         .inputs
@@ -143,9 +150,10 @@ fn outputs_with_lineage(lineage: &PlanColumnLineage) -> Vec<Dataset> {
 ///
 /// Both events share `run_id`, `job`, `event_time`, and the [`PRODUCER`] /
 /// [`OPENLINEAGE_SCHEMA_URL`] stamps. The `START` event announces the run with no
-/// datasets; the `COMPLETE` event carries the input datasets (facet-less) and the
-/// output datasets, each bearing its `columnLineage` facet. This is a static,
-/// plan-derived export, so a single `event_time` is used for both events.
+/// datasets; the `COMPLETE` event carries the input datasets with their
+/// identity facets and the output datasets, each bearing its `columnLineage`
+/// facet. This is a static, plan-derived export, so a single `event_time` is
+/// used for both events.
 pub fn run_events(
     lineage: &PlanColumnLineage,
     job: Job,

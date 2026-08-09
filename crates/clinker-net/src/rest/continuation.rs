@@ -175,24 +175,45 @@ pub(crate) fn next_link(
     // may normalize one copy -- a relative reference beside the absolute URL
     // it resolves to -- and comparing the raw text called those two different
     // pages, which is the same false conflict as the duplicate itself.
-    let mut targets: Vec<AuthorizedUrl> = Vec::new();
+    //
+    // Resolution failures are held rather than returned, so how many pages the
+    // reply names is decided before any one of them is judged. Returning the
+    // first failure instead reported a reply naming two different pages under
+    // whichever rule the first one happened to break, and an operator reading
+    // the classification was told about the wrong rule.
+    // A target that will not resolve is still a target: it counts toward how
+    // many pages the reply named, and is identified by what the reply said
+    // since there is nothing else to identify it by.
+    let mut targets: Vec<Result<AuthorizedUrl, String>> = Vec::new();
+    let mut unresolved: Option<ContinuationError> = None;
     for value in headers.get_all(ureq::http::header::LINK) {
         let value = value
             .to_str()
             .map_err(|_| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
         for target in parse_link_field(value)? {
-            let resolved = resolve_and_authorize(effective_url, &target, admitted_origin)?;
-            if !targets.contains(&resolved) {
-                targets.push(resolved);
+            let entry = match resolve_and_authorize(effective_url, &target, admitted_origin) {
+                Ok(resolved) => Ok(resolved),
+                Err(error) => {
+                    unresolved.get_or_insert(error);
+                    Err(target)
+                }
+            };
+            if !targets.contains(&entry) {
+                targets.push(entry);
             }
         }
     }
-    match targets.len() {
-        0 => Ok(None),
-        1 => Ok(targets.pop()),
-        _ => Err(ContinuationError::for_code(
+    if targets.len() > 1 {
+        return Err(ContinuationError::for_code(
             "rest.protocol.conflicting_continuation",
-        )),
+        ));
+    }
+    match targets.pop() {
+        Some(Ok(target)) => Ok(Some(target)),
+        Some(Err(_)) => Err(unresolved.unwrap_or_else(|| {
+            ContinuationError::for_code("rest.protocol.unresolvable_continuation")
+        })),
+        None => Ok(None),
     }
 }
 

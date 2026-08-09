@@ -194,8 +194,20 @@ impl Counters {
     }
 }
 
+/// One queued record and the number of bytes it was admitted against.
+///
+/// The charge travels with the record because the two sides of the accounting
+/// must agree and only one of them could otherwise derive it: the buffer
+/// carries its record separator, so charging the event on the way in and
+/// crediting the buffer on the way out drifted the accounted total down by a
+/// byte per record until it reached zero and the queue admitted without bound.
+struct QueuedRecord {
+    bytes: Box<[u8]>,
+    charge: usize,
+}
+
 struct QueueState {
-    events: VecDeque<Box<[u8]>>,
+    events: VecDeque<QueuedRecord>,
     queued_bytes: usize,
     closed: bool,
 }
@@ -227,7 +239,8 @@ impl DeliveryQueue {
         }
     }
 
-    /// Admit one event without waiting on capacity or the sink.
+    /// Admit one framed record without waiting on capacity or the sink,
+    /// charged as `event_bytes`.
     ///
     /// `lock_retries` bounds how many times the producer re-attempts the
     /// queue lock itself. The lock is held only for the length of one
@@ -235,13 +248,13 @@ impl DeliveryQueue {
     /// and `Condvar::wait` releasing it — so contention there says nothing
     /// about capacity, the cap, or the sink. Capacity and shutdown outcomes
     /// are never retried.
-    /// Admit one framed record, charged as `event_bytes`.
     ///
     /// The buffer carries its record separator so the sink writes it in one
     /// call, but the separator is framing this format adds rather than
     /// something the operator authored, and the budget it is admitted against
     /// is the same number that bounds the event. The slack is one byte per
-    /// queued record, bounded by the reservation.
+    /// queued record, bounded by the reservation, and the charge is stored
+    /// with the record so releasing it credits back exactly what it took.
     fn try_push(
         &self,
         event: Box<[u8]>,
@@ -267,7 +280,10 @@ impl DeliveryQueue {
             return QueueAdmission::Full;
         }
         state.queued_bytes += event_bytes;
-        state.events.push_back(event);
+        state.events.push_back(QueuedRecord {
+            bytes: event,
+            charge: event_bytes,
+        });
         drop(state);
         self.ready.notify_one();
         QueueAdmission::Accepted
@@ -279,9 +295,9 @@ impl DeliveryQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
-            if let Some(event) = state.events.pop_front() {
-                state.queued_bytes = state.queued_bytes.saturating_sub(event.len());
-                return Some(event);
+            if let Some(record) = state.events.pop_front() {
+                state.queued_bytes = state.queued_bytes.saturating_sub(record.charge);
+                return Some(record.bytes);
             }
             if state.closed {
                 return None;
@@ -546,6 +562,44 @@ mod tests {
             },
             inputs: vec![],
             outputs: vec![],
+        }
+    }
+
+    /// What a record takes on the way in, it gives back on the way out. The
+    /// two sides used different numbers -- the event on entry, the framed
+    /// buffer on exit -- so the accounted total fell by a byte per record
+    /// until it hit zero and the queue admitted without any bound at all,
+    /// which is the one thing a queue exists to prevent.
+    #[test]
+    fn a_record_releases_exactly_what_it_took() {
+        let event = event_of_known_size();
+        let exact = serde_json::to_vec(&event).expect("the probe event serializes");
+        let queue = DeliveryQueue::new(exact.len() * 4, exact.len());
+
+        for round in 0..64 {
+            let SerializedEvent::Bounded {
+                framed,
+                event_bytes,
+            } = serialize_event(&event, exact.len())
+            else {
+                panic!("the probe event is within the cap");
+            };
+            assert!(
+                matches!(
+                    queue.try_push(framed, event_bytes, 0),
+                    QueueAdmission::Accepted
+                ),
+                "round {round}: a queue emptied of every record has room again"
+            );
+            assert!(
+                queue.pop().is_some(),
+                "round {round}: the record comes back"
+            );
+            let queued = queue.state.lock().expect("uncontended").queued_bytes;
+            assert_eq!(
+                queued, 0,
+                "round {round}: an empty queue accounts for nothing"
+            );
         }
     }
 
