@@ -306,7 +306,15 @@ impl CappedEventBuffer {
         }
     }
 
-    fn finish(self) -> Box<[u8]> {
+    /// The bounded event, followed by the delimiter that separates it from
+    /// the next one. The delimiter is appended here rather than written
+    /// through the cap because `max_event_bytes` bounds the event an operator
+    /// authored, not the framing this format adds around it: charging the
+    /// newline against the same budget made the effective limit one byte
+    /// lower than the configured one, so an event measured at exactly the cap
+    /// was dropped and its run was left looking as though it never finished.
+    fn finish(mut self) -> Box<[u8]> {
+        self.bytes.push(b'\n');
         self.bytes.into_boxed_slice()
     }
 }
@@ -345,10 +353,7 @@ fn serialize_event(event: &RunEvent, limit: usize) -> SerializedEvent {
             SerializedEvent::EncodingFailed
         };
     }
-    match buffer.write_all(b"\n") {
-        Ok(()) => SerializedEvent::Bounded(buffer.finish()),
-        Err(_) => SerializedEvent::TooLarge,
-    }
+    SerializedEvent::Bounded(buffer.finish())
 }
 
 fn run_worker<W: Write>(queue: &DeliveryQueue, sink: &mut W) -> LineageDeliveryTerminal {
@@ -493,5 +498,60 @@ impl LineageDelivery {
 impl Drop for LineageDelivery {
     fn drop(&mut self) {
         self.queue.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openlineage::{EventType, Job, Run};
+
+    fn event_of_known_size() -> RunEvent {
+        RunEvent {
+            event_time: "2020-02-22T22:42:42Z".to_string(),
+            producer: "https://example/producer".to_string(),
+            schema_url: "https://example/schema".to_string(),
+            event_type: EventType::Complete,
+            run: Run::new("0190b7e0-0000-7000-8000-000000000000"),
+            job: Job {
+                namespace: "clinker".to_string(),
+                name: "orders".to_string(),
+                facets: None,
+            },
+            inputs: vec![],
+            outputs: vec![],
+        }
+    }
+
+    /// The cap bounds the event, not the framing. An operator who measures a
+    /// serialized event and sets `max_event_bytes` to exactly that number is
+    /// asking for that event to be admitted; charging the record separator
+    /// against the same budget dropped it instead, and because a lineage write
+    /// failure is reported rather than propagated, the run exited zero with
+    /// its terminal event missing and the catalog left showing it as running.
+    #[test]
+    fn an_event_measured_at_the_cap_is_admitted() {
+        let event = event_of_known_size();
+        let exact = serde_json::to_vec(&event).expect("the probe event serializes");
+
+        match serialize_event(&event, exact.len()) {
+            SerializedEvent::Bounded(bytes) => {
+                assert_eq!(
+                    bytes.len(),
+                    exact.len() + 1,
+                    "the delimiter is written outside the budget, not inside it"
+                );
+                assert_eq!(bytes.last(), Some(&b'\n'), "the record stays delimited");
+            }
+            _ => panic!("an event whose size equals the cap is within the cap"),
+        }
+
+        assert!(
+            matches!(
+                serialize_event(&event, exact.len().saturating_sub(1)),
+                SerializedEvent::TooLarge
+            ),
+            "one byte under the measured size is still over the cap"
+        );
     }
 }

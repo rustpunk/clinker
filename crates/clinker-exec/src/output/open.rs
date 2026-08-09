@@ -205,10 +205,23 @@ impl SuffixSearch {
     /// count alone never reaches its bound and the search never terminates.
     const MAX_TOTAL_DENIALS: u32 = 4096;
 
+    /// Move past a candidate whose name is taken for a reason this search
+    /// cannot read off an I/O error — another output in the same run having
+    /// claimed it, which arrives as a validation failure.
+    ///
+    /// It is a taken name like any other, so it resets the contention count.
+    /// Callers that recognised such a candidate themselves and skipped
+    /// `advance` entirely left the count standing, and a destination that
+    /// alternated claimed names with sharing violations reached the bound and
+    /// failed a run whose next suffix was free.
+    pub(crate) fn advance_past_taken_name(&mut self) -> bool {
+        self.consecutive_denials = 0;
+        true
+    }
+
     pub(crate) fn advance(&mut self, error: &PipelineError) -> bool {
         if is_already_exists(error) {
-            self.consecutive_denials = 0;
-            return true;
+            return self.advance_past_taken_name();
         }
         if !is_candidate_unavailable(error) {
             return false;
@@ -270,6 +283,46 @@ mod tests {
     fn touch(path: &Path) {
         let mut f = File::create(path).unwrap();
         f.write_all(b"x").unwrap();
+    }
+
+    /// Every way of moving past a taken name clears the contention count, not
+    /// just the one spelled as an I/O error. A caller that recognised a taken
+    /// candidate itself and returned early never reached this type at all, so
+    /// a destination alternating claimed names with sharing violations
+    /// accumulated denials that nothing reset and failed a run whose next
+    /// suffix was free.
+    ///
+    /// The count is asserted directly because the denial it counts is only
+    /// recognised on Windows: a behaviour-level test on this host would pass
+    /// without the rule holding.
+    #[test]
+    fn any_taken_name_clears_the_contention_count() {
+        let taken = PipelineError::Io(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+        let clears: [(&str, &dyn Fn(&mut SuffixSearch) -> bool); 2] = [
+            (
+                "a name this run already claimed",
+                &|search: &mut SuffixSearch| search.advance_past_taken_name(),
+            ),
+            ("a name already on disk", &|search: &mut SuffixSearch| {
+                search.advance(&taken)
+            }),
+        ];
+
+        for (name, clear) in clears {
+            let mut search = SuffixSearch::default();
+            search.consecutive_denials = SuffixSearch::MAX_CONSECUTIVE_DENIALS;
+            search.total_denials = 7;
+
+            assert!(clear(&mut search), "{name} is a reason to advance");
+            assert_eq!(
+                search.consecutive_denials, 0,
+                "{name} ends the run of denials"
+            );
+            assert_eq!(
+                search.total_denials, 7,
+                "{name} is not itself a denial, so the whole-search bound is untouched"
+            );
+        }
     }
 
     #[test]

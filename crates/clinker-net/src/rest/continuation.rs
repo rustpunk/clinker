@@ -160,17 +160,27 @@ pub(crate) fn resolve_and_authorize(
 }
 
 /// Parse every Link header and resolve exactly one `rel=next` target.
+///
+/// The conflict this refuses is a reply naming two different next pages, which
+/// no client can resolve. Naming the same page twice is not that: a reverse
+/// proxy that merges or repeats response headers produces it routinely, and
+/// refusing it aborted pagination after the first page and discarded the
+/// partial extract over an answer that was never ambiguous.
 pub(crate) fn next_link(
     headers: &ureq::http::HeaderMap,
     effective_url: &AuthorizedUrl,
     admitted_origin: &Origin,
 ) -> Result<Option<AuthorizedUrl>, ContinuationError> {
-    let mut targets = Vec::new();
+    let mut targets: Vec<String> = Vec::new();
     for value in headers.get_all(ureq::http::header::LINK) {
         let value = value
             .to_str()
             .map_err(|_| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
-        targets.extend(parse_link_field(value)?);
+        for target in parse_link_field(value)? {
+            if !targets.iter().any(|seen| *seen == target) {
+                targets.push(target);
+            }
+        }
     }
     match targets.as_slice() {
         [] => Ok(None),
@@ -182,23 +192,32 @@ pub(crate) fn next_link(
 }
 
 /// Read one redirect Location value and authorize it.
+///
+/// Two `Location` headers naming the same target are the same redirect said
+/// twice — the header-repeating proxies that produce duplicate `Link` headers
+/// produce these too, and only a reply naming two different targets is the
+/// ambiguity this refuses.
 pub(crate) fn redirect_location(
     headers: &ureq::http::HeaderMap,
     effective_url: &AuthorizedUrl,
     admitted_origin: &Origin,
 ) -> Result<AuthorizedUrl, ContinuationError> {
-    let mut locations = headers.get_all(ureq::http::header::LOCATION).iter();
-    let location = locations
-        .next()
-        .ok_or_else(|| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
-    if locations.next().is_some() {
-        return Err(ContinuationError::for_code(
-            "rest.protocol.conflicting_continuation",
-        ));
+    let mut location: Option<&str> = None;
+    for value in headers.get_all(ureq::http::header::LOCATION) {
+        let value = value
+            .to_str()
+            .map_err(|_| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
+        match location {
+            Some(seen) if seen != value => {
+                return Err(ContinuationError::for_code(
+                    "rest.protocol.conflicting_continuation",
+                ));
+            }
+            _ => location = Some(value),
+        }
     }
     let location = location
-        .to_str()
-        .map_err(|_| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
+        .ok_or_else(|| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
     resolve_and_authorize(effective_url, location, admitted_origin)
 }
 
@@ -453,6 +472,78 @@ fn unquote(value: &str) -> Result<String, ContinuationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn headers_of(name: ureq::http::HeaderName, values: &[&str]) -> ureq::http::HeaderMap {
+        let mut headers = ureq::http::HeaderMap::new();
+        for value in values {
+            headers.append(name.clone(), value.parse().expect("a valid header value"));
+        }
+        headers
+    }
+
+    /// A reply that names one next page twice is not a reply that names two.
+    /// Header-merging proxies repeat `Link` and `Location` routinely, and
+    /// treating a repeat as a conflict aborted pagination after the first page
+    /// and threw away everything already pulled. Both readers are checked
+    /// because the rule held at one of them and not its sibling.
+    #[test]
+    fn one_target_named_twice_is_not_a_conflict() {
+        let (origin, base) =
+            authorize_initial("https://api.example.test/v1/items").expect("initial URL");
+        let next = "<https://api.example.test/v1/items?page=2>; rel=\"next\"";
+
+        let repeated = next_link(
+            &headers_of(ureq::http::header::LINK, &[next, next]),
+            &base,
+            &origin,
+        )
+        .expect("the same next page named twice resolves")
+        .expect("there is a next page");
+        assert_eq!(
+            repeated.as_str(),
+            "https://api.example.test/v1/items?page=2"
+        );
+
+        let conflicting = next_link(
+            &headers_of(
+                ureq::http::header::LINK,
+                &[
+                    next,
+                    "<https://api.example.test/v1/items?page=9>; rel=\"next\"",
+                ],
+            ),
+            &base,
+            &origin,
+        )
+        .expect_err("two different next pages are still unresolvable");
+        assert_eq!(
+            conflicting.classification.code(),
+            "rest.protocol.conflicting_continuation"
+        );
+
+        let target = "https://api.example.test/v1/items?page=2";
+        let redirect = redirect_location(
+            &headers_of(ureq::http::header::LOCATION, &[target, target]),
+            &base,
+            &origin,
+        )
+        .expect("the same redirect target named twice resolves");
+        assert_eq!(redirect.as_str(), target);
+
+        let disagreeing = redirect_location(
+            &headers_of(
+                ureq::http::header::LOCATION,
+                &[target, "https://api.example.test/v1/items?page=9"],
+            ),
+            &base,
+            &origin,
+        )
+        .expect_err("two different redirect targets are still unresolvable");
+        assert_eq!(
+            disagreeing.classification.code(),
+            "rest.protocol.conflicting_continuation"
+        );
+    }
 
     #[test]
     fn effective_default_port_is_part_of_normalized_origin() {

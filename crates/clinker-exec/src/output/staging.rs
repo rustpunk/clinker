@@ -278,7 +278,10 @@ impl OutputStagingRegistry {
                 // with opposite outcomes depending on whether a run attempt
                 // happened to be active.
                 let mut advance = |error: &PipelineError| {
-                    is_intra_run_claim_collision(error) || search.advance(error)
+                    if is_intra_run_claim_collision(error) {
+                        return search.advance_past_taken_name();
+                    }
+                    search.advance(error)
                 };
                 match stage(bare.clone()) {
                     Ok(output) => return Ok(output),

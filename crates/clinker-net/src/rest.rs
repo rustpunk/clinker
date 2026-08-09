@@ -418,7 +418,15 @@ impl RestRecordSource {
             let mut url = start_url.clone();
             let mut redirects = HashSet::from([url.as_str().to_owned()]);
             let mut redirect_count = 0_u32;
-            let retry_failure = loop {
+            // Whether the peer answered before this attempt failed. The call
+            // site knows it: a failure from `call()` means no response line
+            // ever arrived, and one from the body read means it did. Deriving
+            // it afterwards from the error value cannot work — a dropped
+            // connection surfaces as a protocol error, an unexpected
+            // end-of-file, or the unnamed catch-all depending on how far the
+            // exchange got and which host it ran on, and the same variants are
+            // reachable from a peer that answered.
+            let (retry_failure, peer_answered) = loop {
                 let request = self.request_for(&url);
                 let mut response = match request.call() {
                     Ok(response) => response,
@@ -436,7 +444,7 @@ impl RestRecordSource {
                                 failure,
                             ));
                         }
-                        break failure;
+                        break (failure, false);
                     }
                 };
                 let status = response.status().as_u16();
@@ -474,7 +482,7 @@ impl RestRecordSource {
                 // doing and is a change of its own, because the 5xx path below
                 // retries with no pause either.
                 if (500..600).contains(&status) {
-                    break RequestFailure::HttpStatus(status);
+                    break (RequestFailure::HttpStatus(status), true);
                 }
                 if !(200..300).contains(&status) {
                     return Err(self.sanitized_request_failure(
@@ -499,7 +507,7 @@ impl RestRecordSource {
                     Err(error) => {
                         let failure = RequestFailure::from_transport(&error).in_response_phase();
                         if failure.retryable_body_read() {
-                            break failure;
+                            break (failure, true);
                         }
                         return Err(self.sanitized_request_failure(
                             &url,
@@ -511,15 +519,17 @@ impl RestRecordSource {
                 return Ok(PageResponse { body, next_link });
             };
             // Cancellation abandons a retry that was going to happen, and it
-            // explains a teardown of the request we were inside — a transport
-            // failure where the peer never answered. What it does not do is
-            // erase a verdict already reached: a status means the exchange
+            // explains a teardown of the request we were inside — a failure
+            // that arrived before the peer answered. What it does not do is
+            // erase a verdict already reached: an answer means the exchange
             // completed, and once no attempt remains that outage is the run's
             // outcome whether or not a signal arrived afterwards. Reporting it
             // as a clean cancellation left the outage in no terminal at all
             // and had the orchestrator re-queue the batch.
             let cancelled = self.shutdown.as_ref().is_some_and(|t| t.is_requested());
-            if cancelled && (attempt < self.cfg.retries || retry_failure.is_cancellable_transport())
+            if cancelled
+                && (attempt < self.cfg.retries
+                    || (!peer_answered && retry_failure.is_cancellable_transport()))
             {
                 return Err(FormatError::Interrupted);
             }
@@ -551,7 +561,15 @@ enum RequestFailure {
     Tls,
     ProxyConnection,
     Connection,
+    /// A reply that did not parse as HTTP, or a connection that ended before
+    /// one arrived. Which of the two it was depends on how far the exchange
+    /// got, so this says nothing about whether the request was well formed.
     Protocol,
+    /// A request this client could not route: a URI it could not parse, a
+    /// proxy address it could not use, a redirect it could not follow. The
+    /// material is local and permanent, so every attempt fails identically
+    /// and a shutdown arriving alongside it explains nothing.
+    Unroutable,
     BodyLimit,
     Io(std::io::ErrorKind),
     Transport,
@@ -593,9 +611,19 @@ impl RequestFailure {
                     | std::io::ErrorKind::ReadOnlyFilesystem
             );
         }
+        // `Protocol` is here because the caller only consults this rule when
+        // the peer never answered, and a connection that ends before a reply
+        // parses is spelled as a protocol error on some hosts and as an I/O
+        // error on others. `Unroutable` is not: it is local, permanent
+        // material, and it reached the same variant until this split — which
+        // is how a cancelled run whose URL was malformed reported an abort.
         matches!(
             self,
-            Self::Timeout | Self::Connection | Self::ProxyConnection | Self::Transport
+            Self::Timeout
+                | Self::Connection
+                | Self::ProxyConnection
+                | Self::Protocol
+                | Self::Transport
         )
     }
 
@@ -703,7 +731,7 @@ impl RequestFailure {
             | ureq::Error::Http(_)
             | ureq::Error::InvalidProxyUrl
             | ureq::Error::RedirectFailed
-            | ureq::Error::TooManyRedirects => Self::Protocol,
+            | ureq::Error::TooManyRedirects => Self::Unroutable,
             ureq::Error::ConnectProxyFailed(_) => Self::ProxyConnection,
             ureq::Error::ConnectionFailed => Self::Connection,
             ureq::Error::Protocol(_) => Self::Protocol,
@@ -723,7 +751,7 @@ impl RequestFailure {
             Self::Tls => "tls".to_owned(),
             Self::ProxyConnection => "proxy_connection".to_owned(),
             Self::Connection => "connection".to_owned(),
-            Self::Protocol => "protocol".to_owned(),
+            Self::Protocol | Self::Unroutable => "protocol".to_owned(),
             Self::BodyLimit => "body_limit".to_owned(),
             Self::Io(kind) => format!("io_{kind:?}").to_ascii_lowercase(),
             Self::Transport => "transport".to_owned(),
@@ -1034,13 +1062,14 @@ mod tests {
         for permanent in [
             RequestFailure::Tls,
             RequestFailure::HttpStatus(503),
-            RequestFailure::Protocol,
+            RequestFailure::Unroutable,
             RequestFailure::BodyLimit,
             RequestFailure::HostNotFound,
         ] {
             assert!(
                 !permanent.is_cancellable_transport(),
-                "{permanent:?} is a verdict the peer or the endpoint already gave"
+                "{permanent:?} is a verdict the peer gave or material this run \
+                 supplied, and a shutdown alongside it explains neither"
             );
         }
 
@@ -1051,6 +1080,24 @@ mod tests {
         assert!(
             RequestFailure::Transport.is_cancellable_transport(),
             "an unnamed transport failure under a pending shutdown is that shutdown"
+        );
+    }
+
+    #[test]
+    fn a_request_the_client_could_not_route_is_never_a_cancellation() {
+        // Both spellings of "no reply parsed" reach the cancellation rule with
+        // the peer having said nothing, so the rule cannot tell a dropped
+        // connection from a malformed URL by the error kind alone. It tells
+        // them apart because they are different variants — they were the same
+        // one until this split, and a run cancelled while pointed at a bad URI
+        // reported a clean abort instead of naming the configuration.
+        assert!(RequestFailure::Protocol.is_cancellable_transport());
+        assert!(!RequestFailure::Unroutable.is_cancellable_transport());
+        assert_eq!(
+            RequestFailure::Unroutable.classification_code(),
+            RequestFailure::Protocol.classification_code(),
+            "the split is about what a shutdown explains, not about what the \
+             run is told went wrong",
         );
     }
 

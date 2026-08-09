@@ -1364,6 +1364,53 @@ fn parse_correction(field: &str, key: Option<&str>) -> Box<str> {
     correction.into_boxed_str()
 }
 
+/// The table a line declares, as a dotted key, or `None` when the line is not
+/// a table header.
+///
+/// Answered by the TOML parser rather than by matching brackets. This code runs
+/// on a document the parser has already rejected, so the whole document cannot
+/// be parsed — but one line can, and a table header is exactly a line that
+/// parses on its own as a document declaring one table. Bracket matching kept
+/// giving different answers to the same question: requiring the line to end in
+/// `]` missed `[table]  # note`, accepting anything up to the first `]` read an
+/// array element inside a value as a header and truncated a header carrying a
+/// quoted key, and comparing header text byte-for-byte refused the legal
+/// `[ observability.otlp.auth ]` outright — so an author who wrote a header
+/// with inner spaces and omitted a required key got no diagnostic at all.
+///
+/// Every spelling the format allows is therefore accepted, and the name is
+/// normalized, so a caller looking for `observability.otlp.auth` finds it
+/// however the author spelled it.
+fn declared_table(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('[') {
+        return None;
+    }
+    let mut table = trimmed.parse::<toml::Table>().ok()?;
+    let mut path = Vec::new();
+    loop {
+        // A header declares one table, so each level holds exactly one entry;
+        // anything else is a line that merely parsed, not a header.
+        if table.len() != 1 {
+            return None;
+        }
+        let (key, value) = table.into_iter().next()?;
+        path.push(key);
+        table = match value {
+            toml::Value::Table(inner) => inner,
+            // `[[a.b]]` — the array-of-tables spelling of the same name.
+            toml::Value::Array(mut entries) if entries.len() == 1 => match entries.pop()? {
+                toml::Value::Table(inner) => inner,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if table.is_empty() {
+            return Some(path.join("."));
+        }
+    }
+}
+
 /// The lines under a table header, or `None` when the document has no such
 /// table.
 ///
@@ -1373,33 +1420,18 @@ fn parse_correction(field: &str, key: Option<&str>) -> Box<str> {
 /// header — so a document whose actual defect was a misspelled key elsewhere
 /// was reported as missing a key from a table the author had deliberately
 /// commented out, with a correction naming something they never wrote.
-/// The table header a line declares, ignoring a trailing comment.
-///
-/// TOML allows `[table]   # note` and a comment can also make a line *look*
-/// like a header without being one. Requiring the whole trimmed line to equal
-/// the header missed the first, and matching the header anywhere in the text
-/// matched the second — so this returns the header a line actually declares,
-/// which is neither.
-fn header_on_line(trimmed: &str) -> Option<&str> {
-    if !trimmed.starts_with('[') {
-        return None;
-    }
-    let end = trimmed.find(']')?;
-    Some(&trimmed[..=end])
-}
-
 fn table_body<'a>(text: &'a str, requested: &str) -> Option<&'a str> {
-    let header = format!("[{requested}]");
     let mut offset = 0_usize;
     let mut body_start = None;
     for line in text.split_inclusive('\n') {
-        let trimmed = line.trim();
-        if body_start.is_none() {
-            if header_on_line(trimmed) == Some(header.as_str()) {
-                body_start = Some(offset + line.len());
+        match declared_table(line) {
+            Some(declared) if body_start.is_none() => {
+                if declared == requested {
+                    body_start = Some(offset + line.len());
+                }
             }
-        } else if header_on_line(trimmed).is_some() {
-            return Some(&text[body_start?..offset]);
+            Some(_) => return Some(&text[body_start?..offset]),
+            None => {}
         }
         offset += line.len();
     }
@@ -1426,20 +1458,18 @@ fn authored_location(text: &str, offset: usize) -> (String, &str) {
         .or_else(|| lines.last().copied())
         .unwrap_or("");
 
-    let mut table = String::new();
-    for candidate in lines.iter().take(line_index.saturating_add(1)) {
-        let trimmed = candidate.trim();
-        // Through the same predicate `table_body` uses, so the two agree on
-        // which header a line declares. Requiring the line to end in `]` here
-        // meant a header carrying a trailing comment attributed the error to
-        // the table above it, with a correction naming a key the author never
-        // wrote in that table — the very misattribution the header matching
-        // was tightened to prevent, still live on the path that reports it.
-        if let Some(header) = header_on_line(trimmed) {
-            let inner = header.trim_start_matches('[').trim_end_matches(']');
-            table = inner.to_owned();
-        }
-    }
+    // Through the same reader `table_body` uses, so the two agree on which
+    // header a line declares and on what that table is called. They disagreed
+    // twice: once when only this path required a header to end in `]`, which
+    // attributed an error under `[table]  # note` to the table above it, and
+    // once when both accepted any bracketed text, which read an array element
+    // inside a value as the start of a new table.
+    let table = lines
+        .iter()
+        .take(line_index.saturating_add(1))
+        .filter_map(|candidate| declared_table(candidate))
+        .next_back()
+        .unwrap_or_default();
     (table, line)
 }
 
@@ -1463,4 +1493,91 @@ fn key_on_line(line: &str) -> Option<&str> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'))
     .then_some(key)
+}
+
+#[cfg(test)]
+mod diagnostic_scanner_tests {
+    use super::{authored_location, declared_table, table_body};
+
+    /// Every spelling of a table header the format allows names the same
+    /// table, and nothing else is a header. Bracket matching answered this
+    /// three different ways across three repairs — refusing legal headers,
+    /// truncating names at a quoted `]`, and reading array elements inside a
+    /// value as new tables — each of which sent an author to fix a table they
+    /// had not written while their real mistake went unnamed.
+    #[test]
+    fn a_header_is_read_the_way_the_format_defines_it() {
+        for spelling in [
+            "[observability.otlp.auth]",
+            "[ observability.otlp.auth ]",
+            "[observability.otlp.auth]  # bearer only",
+            "[observability.\"otlp\".auth]",
+            "[[observability.otlp.auth]]",
+            "  [observability.otlp.auth]",
+        ] {
+            assert_eq!(
+                declared_table(spelling).as_deref(),
+                Some("observability.otlp.auth"),
+                "{spelling:?} declares the table"
+            );
+        }
+
+        for not_a_header in [
+            "[1, 2]",
+            "endpoints = [",
+            "  \"https://example/v1\",",
+            "]",
+            "mode = \"bearer\"",
+            "# [observability.otlp.auth]",
+            "",
+        ] {
+            assert_eq!(
+                declared_table(not_a_header),
+                None,
+                "{not_a_header:?} declares no table"
+            );
+        }
+
+        assert_eq!(
+            declared_table("[observability.fields.\"a]b\"]").as_deref(),
+            Some("observability.fields.a]b"),
+            "a quoted segment is one segment, brackets and all"
+        );
+    }
+
+    /// The two readers agree by construction. They disagreed twice, and each
+    /// time an error was attributed to a table the author never wrote.
+    #[test]
+    fn both_readers_agree_on_which_table_a_line_belongs_to() {
+        let document = "\
+[observability]
+arena_bytes = 1024
+
+[ observability.otlp.auth ]  # spaced and commented
+endpoints = [
+  \"https://example/v1\",
+]
+token = \"\"
+";
+        let body = table_body(document, "observability.otlp.auth")
+            .expect("a legal header spelling names its table");
+        assert!(
+            body.contains("token = \"\""),
+            "the body runs to the end of the document"
+        );
+        assert!(
+            !body.contains("arena_bytes"),
+            "and does not reach back past its own header"
+        );
+
+        let offset = document
+            .find("token = \"\"")
+            .expect("the document contains the offending key");
+        let (table, line) = authored_location(document, offset);
+        assert_eq!(
+            table, "observability.otlp.auth",
+            "the array element `]` on its own line is not a new table"
+        );
+        assert_eq!(line, "token = \"\"");
+    }
 }
