@@ -927,3 +927,27 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   deciding when a run's destination identities are fixed -- most likely a
   resolution pass at admission whose results every later question is answered
   from, rather than a memo inside the function.
+- **52 (filed 2026-08-09, needs a maintainer decision):** Two destinations
+  spelled `out/data.csv` and `out/pending/../data.csv`, where `pending` does
+  not exist yet, get two identities and both producers are admitted for one
+  file. Reducing the `..` was tried and reverted: the reduction pops back into
+  the already-canonicalized prefix, after which further components are joined
+  as raw text and never resolved, so a symlinked directory reached past the
+  `..` produced a second identity for one file and, in the other direction,
+  merged two files into one. What a `..` names genuinely cannot be decided
+  without the filesystem, and the components it crosses may not exist yet.
+  The clean answer is probably a surface rule -- an admitted destination may
+  not use `..` beyond a directory that exists -- which is a user-facing
+  decision rather than a repair.
+- **53 (filed 2026-08-09, needs a maintainer decision):** `Link` and
+  `Location` headers are refused when they carry any byte outside visible
+  ASCII, because `HeaderValue::to_str` refuses those bytes -- not only invalid
+  UTF-8. A server that puts a non-ASCII character in a link's `title`, or in
+  a redirect target, therefore ends the pull and discards every record already
+  extracted. Reading the header lossily instead was tried and reverted: the
+  lossy string cannot distinguish "a parameter nothing reads lost bytes" from
+  "the target lost bytes", and both attempts at that distinction produced
+  worse failures -- one silently ending pagination as though the server had
+  finished, one refusing well-formed UTF-8 redirects outright. Doing it
+  correctly means parsing the field from bytes and decoding only the target,
+  which is the hand-rolled-parser decision already open as question 34.
