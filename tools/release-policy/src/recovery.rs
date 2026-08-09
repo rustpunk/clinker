@@ -1,6 +1,5 @@
 //! Strict validation for the Phase 3 recovery sign-off receipt.
 
-use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
 use serde::Deserialize;
@@ -511,21 +510,6 @@ fn validate_prohibitions(rows: &[ProhibitionRow], repository_root: &Path) -> Res
         PROHIBITIONS.iter().map(|row| row.id),
         "prohibition",
     )?;
-    let expected_sources = PROHIBITIONS
-        .iter()
-        .flat_map(|row| row.source_ids.iter().copied())
-        .collect::<BTreeSet<_>>();
-    let observed_sources = rows
-        .iter()
-        .flat_map(|row| row.source_ids.iter().map(String::as_str))
-        .collect::<BTreeSet<_>>();
-    let observed_count = rows.iter().map(|row| row.source_ids.len()).sum::<usize>();
-    if observed_sources != expected_sources || observed_sources.len() != observed_count {
-        return Err(policy(
-            "prohibition source IDs must have exact one-row coverage",
-        ));
-    }
-
     for (row, expected) in rows.iter().zip(PROHIBITIONS.iter()) {
         bounded_nonempty(&row.id, "prohibition id")?;
         pass(&row.status, "prohibition")?;

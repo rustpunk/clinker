@@ -209,6 +209,14 @@ pub(crate) fn next_link(
         // characters are checked where it is resolved.
         let value = String::from_utf8_lossy(value.as_bytes());
         for target in parse_link_field(&value)? {
+            // A target that lost bytes to the lossy read is not a target: the
+            // replacement character marks where a byte no client can act on
+            // used to be, and counting it would let one page named twice --
+            // once readably, once not -- look like two different pages. A
+            // parameter that lost bytes is still ignored, which is the point.
+            if target.contains('\u{fffd}') {
+                continue;
+            }
             targets.offer(&target, effective_url, admitted_origin);
         }
     }
@@ -284,6 +292,11 @@ pub(crate) fn redirect_location(
     let mut targets = TargetSet::default();
     for value in headers.get_all(ureq::http::header::LOCATION) {
         let value = String::from_utf8_lossy(value.as_bytes());
+        if value.contains('\u{fffd}') {
+            return Err(ContinuationError::for_code(
+                "rest.protocol.unresolvable_continuation",
+            ));
+        }
         targets.offer(&value, effective_url, admitted_origin);
     }
     let resolved = targets.into_one()?;

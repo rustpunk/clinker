@@ -937,9 +937,21 @@ fn is_cancelled_transport_error(error: &PipelineError) -> bool {
     match error {
         PipelineError::Io(io) => !is_observability_delivery_failure(io) && is_interrupted_read(io),
         PipelineError::Format(clinker_format::FormatError::Io(io)) => is_interrupted_read(io),
-        PipelineError::CompositionBodyError { inner, .. } => is_cancelled_transport_error(inner),
+        // A cancellation carried inside a wrapper counts, though a bare one
+        // does not: this answers whether an error should be *replaced* by
+        // `Interrupted`, and one that already is needs no replacing. The
+        // wrapper does -- a reader inside a composition body that observed the
+        // shutdown itself kept the body's identity out here, so an operator's
+        // interrupt was reported as the run failing.
+        PipelineError::CompositionBodyError { inner, .. } => {
+            matches!(**inner, PipelineError::Interrupted) || is_cancelled_transport_error(inner)
+        }
         PipelineError::Multiple(errors) => {
-            !errors.is_empty() && errors.iter().all(is_cancelled_transport_error)
+            !errors.is_empty()
+                && errors.iter().all(|error| {
+                    matches!(error, PipelineError::Interrupted)
+                        || is_cancelled_transport_error(error)
+                })
         }
         _ => false,
     }

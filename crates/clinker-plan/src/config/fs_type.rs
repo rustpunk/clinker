@@ -361,6 +361,12 @@ fn without_cur_dir(path: &Path) -> std::path::PathBuf {
 }
 
 /// `path` with its longest existing prefix canonicalized.
+///
+/// The walk steps over a `..` rather than stopping at it. `file_name` is
+/// `None` for such a component, and treating that as the end of the road left
+/// every path containing a `..` completely unresolved -- not merely its `..`,
+/// which is deliberate, but the existing prefix in front of it too, so two
+/// spellings of one file could pass a collision check.
 fn resolved_prefix(path: &Path) -> std::path::PathBuf {
     let mut unresolved: Vec<std::ffi::OsString> = Vec::new();
     let mut cursor = path;
@@ -372,13 +378,14 @@ fn resolved_prefix(path: &Path) -> std::path::PathBuf {
             }
             return rebuilt;
         }
-        match (cursor.file_name(), cursor.parent()) {
-            (Some(name), Some(parent)) => {
-                unresolved.push(name.to_owned());
-                cursor = parent;
-            }
-            _ => return path.to_path_buf(),
-        }
+        let Some(parent) = cursor.parent() else {
+            return path.to_path_buf();
+        };
+        let Some(last) = cursor.components().next_back() else {
+            return path.to_path_buf();
+        };
+        unresolved.push(last.as_os_str().to_owned());
+        cursor = parent;
     }
 }
 
@@ -794,6 +801,16 @@ mod tests {
             destination_identity(&real.join(".").join("out.csv")),
             destination_identity(&direct),
             "a `.` component names the same file"
+        );
+
+        // A `..` further along must not cost the prefix in front of it its
+        // resolution: leaving the `..` alone is deliberate, leaving the whole
+        // path alone let two spellings of one file pass a collision check.
+        let through_missing = real.join("later").join("..").join("out.csv");
+        assert_eq!(
+            destination_identity(&through_missing),
+            destination_identity(&real.join("later").join("..").join(".").join("out.csv")),
+            "the existing prefix is resolved either side of a `..`"
         );
 
         #[cfg(unix)]
