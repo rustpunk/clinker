@@ -821,3 +821,19 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   nothing. The distinct exit status is what carries the fact. Reopening this
   means deciding whether the protocol should gain a record for "refused before
   starting", which is a schema change and shares its shape with question 35.
+- **39 (filed 2026-08-09, needs a maintainer decision):**
+  `ObservabilityDropPolicy` has one variant, `DropNewest`, and its only match
+  arm is empty. It is a user-facing `clinker.toml` key with two accessors on
+  the resolved policies, so an author can set it and nothing they write
+  changes anything. Deleting it removes a documented surface, which is a
+  human rip-vs-wire decision rather than an agent's; wiring it means deciding
+  what the alternative behaviour is (drop-oldest, or refuse) and what a queue
+  that is already bounded should do differently under it.
+- **40 (filed 2026-08-09):** Four UTF-8 boundary-truncation helpers now exist:
+  `clinker-core-types/src/failure.rs`, `clinker-exec/src/telemetry.rs`,
+  `clinker-exec/src/progress.rs`, and `clinker-exec/src/executor/util.rs`.
+  They differ in return shape -- borrowed `&str`, owned `String` plus a
+  truncation flag, and a prefix-with-length -- which is why each was written
+  rather than reused, but the boundary walk is the same in all four and a
+  correction to it reaches only the copy whoever fixes it happens to find.
+  Collapsing them means agreeing one signature that serves every caller.

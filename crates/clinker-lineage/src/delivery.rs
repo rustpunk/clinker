@@ -11,10 +11,6 @@ use clinker_plan::config::{ObservabilityDropPolicy, ResolvedLineageDeliveryPolic
 
 use crate::RunEvent;
 
-/// How many times a finite export re-attempts the queue lock before it treats
-/// contention as a drop. Each attempt yields, and the lock is only ever held
-/// across a `VecDeque` push or pop, so exhausting this bound means something
-/// other than ordinary contention is wrong.
 /// How long a producer keeps trying for the queue lock before calling it
 /// contention. Orders of magnitude above the hold time, which is one
 /// `VecDeque` operation, so it only matters when the scheduler is against us.
@@ -199,11 +195,9 @@ impl Counters {
 
 /// One queued record and the number of bytes it was admitted against.
 ///
-/// The charge travels with the record because the two sides of the accounting
-/// must agree and only one of them could otherwise derive it: the buffer
-/// carries its record separator, so charging the event on the way in and
-/// crediting the buffer on the way out drifted the accounted total down by a
-/// byte per record until it reached zero and the queue admitted without bound.
+/// The charge travels with the record so the two sides of the accounting
+/// cannot disagree: what a record takes on the way in is what it gives back
+/// on the way out.
 struct QueuedRecord {
     bytes: Box<[u8]>,
     charge: usize,
@@ -232,14 +226,11 @@ impl DeliveryQueue {
     fn new(capacity_bytes: usize, max_event_bytes: usize) -> Self {
         let reserved_events = capacity_bytes.div_ceil(max_event_bytes).min(1_024);
         Self {
-            // One byte over the operator's figure, which is the framing of the
-            // single event that may sit exactly at the cap: the validator
-            // accepts `max_event_bytes == queue_bytes` and promises such an
-            // event enters an empty queue. Everything is charged at the size
-            // it actually occupies, so this is the whole of the excess --
-            // charging events and storing records instead left the slack
-            // growing with the number of records queued, which the reservation
-            // does not bound because it is an initial capacity and not a cap.
+            // One byte over the operator's figure: the framing of the single
+            // event that may sit exactly at the cap, which the validator
+            // accepts and promises will enter an empty queue. Every record is
+            // charged at the size it occupies, so this is the whole of the
+            // excess.
             capacity_bytes: capacity_bytes.saturating_add(1),
             state: Mutex::new(QueueState {
                 events: VecDeque::with_capacity(reserved_events),
@@ -253,19 +244,16 @@ impl DeliveryQueue {
     /// Admit one framed record without waiting on capacity or the sink.
     ///
     /// `patience` bounds how long the producer re-attempts the queue lock.
-    /// A count of yields was tried alongside it and removed: the two were
-    /// combined so that the count ran first and ignored the deadline, which
-    /// left the wait bounded by the thing the deadline was introduced to
-    /// replace. The lock is held only for the
+    /// The lock is held only for the
     /// length of one `VecDeque` push or pop — plus the instant between the
     /// worker taking it and `Condvar::wait` releasing it — so contention there
     /// says nothing about capacity, the cap, or the sink. Capacity and
     /// shutdown outcomes are never retried.
     ///
-    /// Time, because a count of yields measures the scheduler rather than the
-    /// contention: on a loaded host a whole count can be spent inside one
-    /// hold, and a record was dropped for a lock that was free microseconds
-    /// later. Waiting is still bounded and still never involves the sink.
+    /// Time rather than a count of attempts, because a count measures the
+    /// scheduler rather than the contention: on a loaded host a whole count
+    /// can be spent inside a single hold. Waiting is still bounded and still
+    /// never involves the sink.
     ///
     /// The record is charged at the size it occupies, separator included; the
     /// queue's own capacity carries the one byte of framing that the
@@ -351,25 +339,19 @@ impl CappedEventBuffer {
         }
     }
 
-    /// The bounded event followed by its record separator, and the size of
-    /// the event alone.
+    /// The bounded event followed by its record separator.
     ///
     /// The separator is in the buffer so one record is one write: the sink can
     /// share a handle with the run's own output, and two writes take that
     /// handle twice, letting an unrelated line land between an event and its
-    /// newline. It is not in the size, because `max_event_bytes` bounds the
-    /// event an operator authored and the queue admits against that same
-    /// number -- charging the framing to either made an event measured at
-    /// exactly the cap fail, once at the cap itself and once at the door of an
-    /// empty queue the validator sized to hold it.
+    /// newline. `max_event_bytes` bounds the event alone, which is why the
+    /// cap is applied while the buffer fills rather than to this result.
     fn finish(mut self) -> Box<[u8]> {
         self.bytes.push(b'\n');
-        // Shrunk to fit on the way out, which costs a copy whenever the
-        // reservation ran ahead of the event. That is the point: the
-        // reservation is sized for the cap, the queue holds these for as long
-        // as the sink is behind, and the queue's accounting is the number of
-        // bytes it admitted -- so carrying the spare capacity into the queue
-        // would put memory there that nothing is counting.
+        // Shrunk to fit, because the queue holds these for as long as the sink
+        // is behind and accounts for exactly the bytes it admitted. Carrying
+        // the reservation's spare capacity in would put memory there that
+        // nothing is counting.
         self.bytes.into_boxed_slice()
     }
 }

@@ -983,12 +983,14 @@ fn main() -> ExitCode {
                 .parse::<tracing_subscriber::filter::LevelFilter>()
                 .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO);
             // Diagnostics move to stderr exactly when standard output is
-            // carrying data a consumer parses: the machine stream, or a
-            // lineage export addressed to `-`. Human-formatted log lines
-            // written into either corrupt the feed. Everywhere else they stay
-            // on stdout, where the run's own completion summary is reported
-            // and where callers already expect to read it.
+            // carrying data a consumer parses: the machine stream, a lineage
+            // export addressed to `-`, or an explain document in one of the
+            // machine-readable formats. Human-formatted log lines written into
+            // any of those corrupt the feed. Everywhere else they stay on
+            // stdout, where the run's own completion summary is reported and
+            // where callers already expect to read it.
             let stdout_carries_data = args.machine.is_some()
+                || matches!(args.explain, Some(ExplainFormat::Json | ExplainFormat::Dot))
                 || [args.lineage.as_deref(), args.lineage_events.as_deref()]
                     .into_iter()
                     .flatten()

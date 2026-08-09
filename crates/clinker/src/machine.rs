@@ -143,10 +143,7 @@ impl Drop for MachineProgressWorker {
         // The join waits for a worker that is mid-write, which on a stream
         // nobody is reading is a wait on the reader. That is the same wait the
         // terminal write itself makes, so a stalled supervisor stalls the run
-        // either way. A flag suppressing the worker's next emission was tried
-        // to narrow that window and withdrawn: it also cancelled snapshots the
-        // worker had already become due for, which on a host with coarse timer
-        // granularity was every snapshot the run produced. Ordering is the
+        // either way. Ordering the last record against the terminal is the
         // terminal reservation's job, not this one's.
         let _ = self.stop_and_join();
     }
@@ -263,16 +260,14 @@ impl MachineEmitter {
         let notice = snapshot.event_limit_reached();
         let written = state.write_progress_staged(snapshot);
         if notice && !matches!(written, ProgressWrite::Written) && !state.notice_reoffered {
-            // The notice is a one-shot spent on being handed out. A record
-            // that did not go out has to give it back, or the stream falls
-            // silent for the rest of the run with nothing explaining why --
-            // the one record that explains it being the one that was lost.
+            // The notice is a one-shot spent on being handed out, so a record
+            // that did not go out gives it back -- otherwise the stream falls
+            // silent with the one record explaining why being the one lost.
             //
-            // Once. A failed write may still have buffered its bytes and sent
-            // them on a later flush, so re-offering can duplicate the notice;
-            // one extra is the price of not going silent, and an unbounded
-            // number is not. A sink that keeps refusing is reported by the
-            // failing-sink window instead.
+            // Once only: a failed write may still have buffered its bytes and
+            // sent them later, so re-offering can duplicate the notice. One
+            // extra is the price of not going silent; an unbounded number is
+            // not, and a sink that keeps refusing is reported by the window.
             state.notice_reoffered = true;
             state.progress.restore_event_limit_notice();
         }
@@ -330,12 +325,9 @@ impl MachineEmitter {
                             failing.get_or_insert((Instant::now(), error));
                         }
                     }
-                    // Measured from the first refusal, on every tick. Checked
-                    // only on the ticks that carried a record, it advanced
-                    // once per due record -- a second apart -- so the window
-                    // described a number of records rather than a duration,
-                    // and a run shorter than that many seconds never reached
-                    // it however long its sink had been dead.
+                    // Measured from the first refusal and checked on every
+                    // tick, so the window is a duration rather than a count of
+                    // the records that happen to fall due inside it.
                     if failing
                         .as_ref()
                         .is_some_and(|(since, _)| since.elapsed() >= patience)
@@ -584,12 +576,10 @@ impl MachineState {
     }
 
     fn write_encoded_event(&mut self, encoded: &[u8]) -> io::Result<()> {
-        // The number is spent on the attempt, not on the success. A failed
-        // write may have put part of a line on the wire, and a later record
-        // reusing that number would tell a supervisor two different things
-        // under one sequence -- unresolvable from the reading end. Advancing
-        // regardless turns a lost record into a gap in the numbering, which
-        // says exactly what happened: one record did not arrive.
+        // Spent on the attempt, not on the success. A failed write may have
+        // put part of a line on the wire, and two records under one sequence
+        // number are unresolvable from the reading end; a gap in the numbering
+        // says exactly what happened, which is that one record did not arrive.
         self.sequence = self.sequence.saturating_add(1);
         self.writer.write_all(encoded)?;
         self.writer.flush()
@@ -656,18 +646,9 @@ enum ProgressWrite {
     /// Nothing was attempted this tick -- no record was due, or none will be
     /// due again.
     ///
-    /// Neither evidence for the sink nor against it, and specifically not a
-    /// success: the worker ticks many times per due record, so counting an
-    /// idle tick as one cleared the failing-sink window on almost every pass
-    /// and the window could never elapse.
-    ///
-    /// It does not clear a latched refusal either. Only a record that got
-    /// through can do that, because only a record that got through shows the
-    /// sink working. When the records stop and the last one was refused, the
-    /// truthful thing to report is that the channel was failing when it was
-    /// last looked at -- concluding it had recovered, on the strength of
-    /// having stopped asking, is how a provably dead channel finished a run
-    /// with nothing said about it.
+    /// Evidence neither for the sink nor against it, and in particular not a
+    /// success: only a record that reached the sink shows the sink working,
+    /// and only that clears a latched refusal.
     Skipped,
     Written,
     /// The record could not be built. No later attempt can build it either.

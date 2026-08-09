@@ -289,6 +289,15 @@ pub(crate) fn redirect_location(
     resolved.ok_or_else(|| ContinuationError::for_code("rest.protocol.malformed_continuation"))
 }
 
+/// The port a scheme implies when none is written.
+const fn default_port(scheme: &str) -> Option<u16> {
+    match scheme.as_bytes() {
+        b"https" => Some(443),
+        b"http" => Some(80),
+        _ => None,
+    }
+}
+
 fn parse_absolute(
     raw: &str,
     failure_code: &'static str,
@@ -320,7 +329,18 @@ fn parse_absolute(
     let query = uri
         .query()
         .map_or(String::new(), |query| format!("?{query}"));
-    let authority = port.map_or(host.clone(), |port| format!("{host}:{port}"));
+    // An explicitly written default port is dropped, so one page has one
+    // rendering. The origin already treats `https://host` and
+    // `https://host:443` as the same place, and leaving the identity
+    // disagreeing with that made two spellings of one target count as two --
+    // refusing a reply as naming two next pages when it named one, and
+    // slipping past both the redirect-cycle guard and the visited-page set,
+    // which recognise a page by this string.
+    let authority = match port {
+        Some(port) if Some(port) == default_port(scheme.as_str()) => host.clone(),
+        Some(port) => format!("{host}:{port}"),
+        None => host.clone(),
+    };
     let normalized = format!("{scheme}://{authority}{normalized_path}{query}");
     uri = normalized
         .parse::<Uri>()
@@ -623,10 +643,17 @@ mod tests {
             &origin,
         )
         .expect("explicit default port is the same origin");
+        // And the same page: a default port written out is dropped, so one
+        // target has one identity however the reply spelled it.
         assert_eq!(
             explicit.as_str(),
-            "https://api.example.test:443/v1/items?page=2"
+            "https://api.example.test/v1/items?page=2"
         );
+
+        let implicit =
+            resolve_and_authorize(&base, "https://api.example.test/v1/items?page=2", &origin)
+                .expect("the same page without the port");
+        assert_eq!(explicit, implicit, "which is what makes them one target");
     }
 
     #[test]

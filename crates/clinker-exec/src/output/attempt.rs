@@ -5420,6 +5420,16 @@ fn destination_leaf(destination: &ValidatedPath) -> Result<String, AttemptError>
         ))
 }
 
+/// A stable key for a destination root, independent of whether the path
+/// exists yet.
+///
+/// Canonicalizing only when the whole path already exists made the key depend
+/// on when it was asked for: a host whose temporary directory is reached
+/// through a symlink answers with the resolved prefix once the directory is
+/// there and the unresolved one before, so a root registered at one moment
+/// failed to match the same root checked at another. The deepest existing
+/// ancestor is resolved instead, and the part that does not exist yet is
+/// appended unchanged.
 fn destination_root_key(path: &Path) -> String {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -5428,8 +5438,29 @@ fn destination_root_key(path: &Path) -> String {
             .map(|current| current.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     };
-    let normalized = absolute.canonicalize().unwrap_or(absolute);
-    clinker_plan::config::collision_key(&normalized.to_string_lossy())
+    clinker_plan::config::collision_key(&resolve_existing_prefix(&absolute).to_string_lossy())
+}
+
+/// `path` with its longest existing prefix canonicalized.
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let mut unresolved = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(resolved) = cursor.canonicalize() {
+            let mut rebuilt = resolved;
+            for component in unresolved.iter().rev() {
+                rebuilt.push(component);
+            }
+            return rebuilt;
+        }
+        match (cursor.file_name(), cursor.parent()) {
+            (Some(name), Some(parent)) => {
+                unresolved.push(name.to_owned());
+                cursor = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 fn persist_manifest_in_root(
