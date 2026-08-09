@@ -914,3 +914,16 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   cannot agree is a relative path against an absolute one naming the same
   file. There is no better answer without a working directory, and no caller
   is positioned to supply one, so the case is recorded rather than handled.
+- **51 (filed 2026-08-09, needs a maintainer decision):** `destination_identity`
+  consults the filesystem, so its answer for one path can change during a run
+  -- a run creates the very directories these paths name. Two properties are
+  both wanted and are in tension: the identity should be STABLE for a given
+  path across a run, and EQUAL for two spellings of one file. Remembering the
+  first answer buys stability and loses equality, because a path asked before
+  its directory exists keeps the unresolved answer while a different spelling
+  asked afterwards gets the resolved one. Resolving afresh each time buys
+  equality and loses stability, which is how `register_artifact` can re-derive
+  a root key that no longer matches the one admission stored. Settling it means
+  deciding when a run's destination identities are fixed -- most likely a
+  resolution pass at admission whose results every later question is answered
+  from, rather than a memo inside the function.

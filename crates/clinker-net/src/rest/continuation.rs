@@ -202,10 +202,13 @@ pub(crate) fn next_link(
     // pages, which is the same false conflict as the duplicate itself.
     let mut targets = TargetSet::default();
     for value in headers.get_all(ureq::http::header::LINK) {
-        let value = value
-            .to_str()
-            .map_err(|_| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
-        for target in parse_link_field(value)? {
+        // Read as text even when a byte is not ASCII. A server may put a
+        // title or a type in any encoding it likes, and refusing the field
+        // for a parameter nothing reads threw away the `rel=next` target
+        // beside it along with every record already pulled. The target's own
+        // characters are checked where it is resolved.
+        let value = String::from_utf8_lossy(value.as_bytes());
+        for target in parse_link_field(&value)? {
             targets.offer(&target, effective_url, admitted_origin);
         }
     }
@@ -280,10 +283,8 @@ pub(crate) fn redirect_location(
 ) -> Result<AuthorizedUrl, ContinuationError> {
     let mut targets = TargetSet::default();
     for value in headers.get_all(ureq::http::header::LOCATION) {
-        let value = value
-            .to_str()
-            .map_err(|_| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
-        targets.offer(value, effective_url, admitted_origin);
+        let value = String::from_utf8_lossy(value.as_bytes());
+        targets.offer(&value, effective_url, admitted_origin);
     }
     let resolved = targets.into_one()?;
     resolved.ok_or_else(|| ContinuationError::for_code("rest.protocol.malformed_continuation"))
@@ -449,12 +450,12 @@ fn parse_link_field(field: &str) -> Result<Vec<String>, ContinuationError> {
                 let Some((name, value)) = parameter.split_once('=') else {
                     continue;
                 };
-                if name.trim().eq_ignore_ascii_case("rel") {
-                    if rel.is_some() {
-                        return Err(ContinuationError::for_code(
-                            "rest.protocol.malformed_continuation",
-                        ));
-                    }
+                // The first `rel` wins and later ones are ignored, which is
+                // what RFC 8288 says to do with a repeated parameter. A
+                // gateway that appends a canonical `rel` to a link that
+                // already carried one produces this, and refusing it ended
+                // the pull and discarded every record already extracted.
+                if name.trim().eq_ignore_ascii_case("rel") && rel.is_none() {
                     rel = Some(unquote(value.trim())?);
                 }
             }
@@ -624,6 +625,23 @@ mod tests {
                 .contains("rel=")
                 .then_some("https://api.example.test/v1/items?page=2");
             assert_eq!(read.as_ref().map(AuthorizedUrl::as_str), expected);
+        }
+
+        // A repeated `rel`, and a title in an encoding this client does not
+        // need to understand: both leave the target perfectly readable.
+        for tolerated in [
+            "<https://api.example.test/v1/items?page=2>; rel=\"next\"; rel=\"next\"",
+            "<https://api.example.test/v1/items?page=2>; rel=\"next\"; \
+             title=\"p\u{e1}gina siguiente\"",
+        ] {
+            let read = next_link(
+                &headers_of(ureq::http::header::LINK, &[tolerated]),
+                &base,
+                &origin,
+            )
+            .unwrap_or_else(|error| panic!("{tolerated:?} is readable, got {error}"))
+            .expect("there is a next page");
+            assert_eq!(read.as_str(), "https://api.example.test/v1/items?page=2");
         }
 
         // A `;` and a `rel=` inside a quoted value belong to the value.
