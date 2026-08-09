@@ -80,14 +80,24 @@ fn inputs_with_identity_facets(lineage: &PlanColumnLineage) -> Vec<Dataset> {
         .collect()
 }
 
-/// The output datasets of a run as bare identities (no facets) — the shape used
-/// on a `START` and on a non-`COMPLETE` terminal event, which have no completed
-/// column lineage to attach.
+/// The output datasets of a run carrying only what is true regardless of how
+/// the run ended — the shape used on a `START` and on a `FAIL` or `ABORT`
+/// terminal, neither of which has completed column lineage to attach.
+///
+/// A symlink facet is included: an alternate name for a dataset is a property
+/// of the dataset, not a claim about this run, so a consumer that could
+/// resolve the identity for a successful run could not resolve it for a failed
+/// one, and the failure went unattributed to the dataset the operator was
+/// looking at. The subset facet is a per-run claim and stays out.
 fn output_identities(lineage: &PlanColumnLineage) -> Vec<Dataset> {
     lineage
         .outputs
         .iter()
-        .map(|out| Dataset::from(out.dataset.clone()))
+        .map(|out| {
+            let mut dataset = Dataset::from(out.dataset.clone());
+            dataset.facets = symlink_facets(&out.identity_facets);
+            dataset
+        })
         .collect()
 }
 

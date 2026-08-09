@@ -306,15 +306,17 @@ impl CappedEventBuffer {
         }
     }
 
-    /// The bounded event, followed by the delimiter that separates it from
-    /// the next one. The delimiter is appended here rather than written
-    /// through the cap because `max_event_bytes` bounds the event an operator
-    /// authored, not the framing this format adds around it: charging the
-    /// newline against the same budget made the effective limit one byte
-    /// lower than the configured one, so an event measured at exactly the cap
-    /// was dropped and its run was left looking as though it never finished.
-    fn finish(mut self) -> Box<[u8]> {
-        self.bytes.push(b'\n');
+    /// The bounded event, with no record separator.
+    ///
+    /// `max_event_bytes` bounds the event an operator authored, not the
+    /// framing the format adds around it, and the queue bounds the bytes it
+    /// is holding. Both are true only while the separator belongs to neither:
+    /// writing it through the cap made the effective limit one byte lower
+    /// than the configured one, and carrying it in the queued buffer made an
+    /// at-cap event fail to enter an empty queue whose size the validator
+    /// requires only to be at least the cap. The sink writes it instead,
+    /// which is where framing belongs.
+    fn finish(self) -> Box<[u8]> {
         self.bytes.into_boxed_slice()
     }
 }
@@ -358,7 +360,7 @@ fn serialize_event(event: &RunEvent, limit: usize) -> SerializedEvent {
 
 fn run_worker<W: Write>(queue: &DeliveryQueue, sink: &mut W) -> LineageDeliveryTerminal {
     while let Some(event) = queue.pop() {
-        if let Err(error) = sink.write_all(&event) {
+        if let Err(error) = sink.write_all(&event).and_then(|()| sink.write_all(b"\n")) {
             return LineageDeliveryTerminal::WriteFailed(error.kind());
         }
     }
@@ -523,6 +525,29 @@ mod tests {
         }
     }
 
+    /// The promise the validator makes to an author who sets `max_event_bytes`
+    /// equal to `queue_bytes`: an event at the cap enters an empty queue. It
+    /// held until the record separator was moved out of the cap and into the
+    /// queued buffer, which put an at-cap event one byte over the queue and
+    /// dropped every one of them on a policy the validator accepts.
+    #[test]
+    fn an_event_at_the_cap_enters_an_empty_queue() {
+        let event = event_of_known_size();
+        let exact = serde_json::to_vec(&event).expect("the probe event serializes");
+        let config = LineageDeliveryConfig::new(exact.len(), exact.len(), Duration::from_millis(1))
+            .expect("equal caps are a legal policy");
+        let queue = DeliveryQueue::new(config.queue_bytes, config.max_event_bytes);
+
+        let SerializedEvent::Bounded(bytes) = serialize_event(&event, config.max_event_bytes)
+        else {
+            panic!("an event at the cap is within the cap");
+        };
+        assert!(
+            matches!(queue.try_push(bytes, 0), QueueAdmission::Accepted),
+            "and an empty queue of the same size has room for it"
+        );
+    }
+
     /// The cap bounds the event, not the framing. An operator who measures a
     /// serialized event and sets `max_event_bytes` to exactly that number is
     /// asking for that event to be admitted; charging the record separator
@@ -538,10 +563,9 @@ mod tests {
             SerializedEvent::Bounded(bytes) => {
                 assert_eq!(
                     bytes.len(),
-                    exact.len() + 1,
-                    "the delimiter is written outside the budget, not inside it"
+                    exact.len(),
+                    "the queued buffer is the event, and the sink frames it"
                 );
-                assert_eq!(bytes.last(), Some(&b'\n'), "the record stays delimited");
             }
             _ => panic!("an event whose size equals the cap is within the cap"),
         }

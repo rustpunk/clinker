@@ -277,23 +277,31 @@ impl OutputStagingRegistry {
                 // wrote `out-1.json` and succeeded — the same authored YAML
                 // with opposite outcomes depending on whether a run attempt
                 // happened to be active.
-                let mut advance = |error: &PipelineError| {
-                    if is_intra_run_claim_collision(error) {
-                        return search.advance_past_taken_name();
-                    }
-                    search.advance(error)
-                };
-                match stage(bare.clone()) {
-                    Ok(output) => return Ok(output),
-                    Err(error) if advance(&error) => {}
-                    Err(error) => return Err(error),
+                // A name another output in this same run has already claimed
+                // is a taken candidate too. Asked of the ledger, because it is
+                // a fact the ledger holds -- not read back out of the wording
+                // of the diagnostic the collision would have produced.
+                let mut try_candidate =
+                    |path: PathBuf| -> Result<Option<(PathBuf, File)>, PipelineError> {
+                        if self.claimant_of(&path)?.is_some() {
+                            return search
+                                .advance_past_taken_name()
+                                .then_some(None)
+                                .ok_or_else(|| claimed_name_search_exhausted(&path));
+                        }
+                        match stage(path) {
+                            Ok(output) => Ok(Some(output)),
+                            Err(error) if search.advance(&error) => Ok(None),
+                            Err(error) => Err(error),
+                        }
+                    };
+                if let Some(output) = try_candidate(bare.clone())? {
+                    return Ok(output);
                 }
                 for n in 1_u64..=u64::MAX {
                     let candidate = path_for_n(Some(n)).map_err(PipelineError::Config)?;
-                    match stage(candidate) {
-                        Ok(output) => return Ok(output),
-                        Err(error) if advance(&error) => continue,
-                        Err(error) => return Err(error),
+                    if let Some(output) = try_candidate(candidate)? {
+                        return Ok(output);
                     }
                 }
                 Err(PipelineError::Io(std::io::Error::other(
@@ -440,15 +448,34 @@ impl OutputStagingRegistry {
         name: &str,
         final_path: &std::path::Path,
     ) -> Result<(), PipelineError> {
+        match self.claimant_of(final_path)? {
+            Some((first_name, first_path)) => {
+                Err(collision_error(name, final_path, &first_name, &first_path))
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// The producer that already claimed this destination in this run, if any.
+    ///
+    /// The unique-suffix search needs this as a fact, not as a diagnostic: it
+    /// used to recover it by matching the opening words of the formatted
+    /// collision message, so rewording a message an author reads would have
+    /// silently stopped the search recognising a claimed name -- with no
+    /// compiler or test failure at the rename.
+    pub(crate) fn claimant_of(
+        &self,
+        final_path: &std::path::Path,
+    ) -> Result<Option<(String, PathBuf)>, PipelineError> {
         let state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = destination_key(final_path)?;
-        if let Some((first_name, first_path)) = state.claims.get(&key) {
-            return Err(collision_error(name, final_path, first_name, first_path));
-        }
-        Ok(())
+        Ok(state
+            .claims
+            .get(&key)
+            .map(|(first_name, first_path)| (first_name.clone(), first_path.clone())))
     }
 
     /// Snapshot all hidden files that remain pending. This is used to report
@@ -748,12 +775,11 @@ impl OutputStagingRegistry {
 /// Whether this candidate name is already claimed by another output of the
 /// same run, which the registry reports as a validation error rather than an
 /// I/O one because no file was involved.
-fn is_intra_run_claim_collision(error: &PipelineError) -> bool {
-    matches!(
-        error,
-        PipelineError::Config(ConfigError::Validation(message))
-            if message.starts_with("output destination collision:")
-    )
+fn claimed_name_search_exhausted(path: &std::path::Path) -> PipelineError {
+    PipelineError::Config(ConfigError::Validation(format!(
+        "unique_suffix search for {} gave up: too many candidate names were already claimed by this run",
+        path.display(),
+    )))
 }
 
 fn collision_error(

@@ -64,16 +64,26 @@ where
     F: FnMut(Option<u64>) -> Result<PathBuf, ConfigError>,
 {
     let bare = path_for_n(None).map_err(PipelineError::Config)?;
+    // Once for the whole search. The unique-suffix loop asked the kernel for
+    // the same working directory on every candidate it tried, so a
+    // destination already holding a few thousand numbered files paid a few
+    // thousand identical `getcwd` calls before writing a byte.
+    let base = std::env::current_dir().map_err(PipelineError::Io)?;
 
     match policy {
         IfExistsPolicy::Overwrite => {
-            stage_candidate(bare, PromotionDisposition::Replace, publication)
+            stage_candidate(bare, PromotionDisposition::Replace, publication, &base)
         }
         IfExistsPolicy::Error => {
             if cli_force {
-                return stage_candidate(bare, PromotionDisposition::Replace, publication);
+                return stage_candidate(bare, PromotionDisposition::Replace, publication, &base);
             }
-            match stage_candidate(bare.clone(), PromotionDisposition::NoReplace, publication) {
+            match stage_candidate(
+                bare.clone(),
+                PromotionDisposition::NoReplace,
+                publication,
+                &base,
+            ) {
                 Err(error) if is_already_exists(&error) => Err(existing_output_error(&bare)),
                 result => result,
             }
@@ -82,7 +92,12 @@ where
             let mut search = SuffixSearch::default();
             let mut advance = |error: &PipelineError| search.advance(error);
 
-            match stage_candidate(bare.clone(), PromotionDisposition::NoReplace, publication) {
+            match stage_candidate(
+                bare.clone(),
+                PromotionDisposition::NoReplace,
+                publication,
+                &base,
+            ) {
                 Ok(output) => return Ok(output),
                 Err(error) if advance(&error) => {}
                 Err(error) => return Err(error),
@@ -90,7 +105,12 @@ where
 
             for n in 1u64..=u64::MAX {
                 let candidate = path_for_n(Some(n)).map_err(PipelineError::Config)?;
-                match stage_candidate(candidate, PromotionDisposition::NoReplace, publication) {
+                match stage_candidate(
+                    candidate,
+                    PromotionDisposition::NoReplace,
+                    publication,
+                    &base,
+                ) {
                     Ok(output) => return Ok(output),
                     Err(error) if advance(&error) => continue,
                     Err(error) => return Err(error),
@@ -123,8 +143,9 @@ fn stage_candidate(
     path: PathBuf,
     disposition: PromotionDisposition,
     publication: Option<&ResolvedPublicationPolicy>,
+    base: &Path,
 ) -> Result<(PathBuf, File, StagedOutput), PipelineError> {
-    let boundary = contained_boundary(&path, publication)?;
+    let boundary = contained_boundary(&path, publication, base)?;
     let (staged, file) = boundary.stage(disposition).map_err(containment_error)?;
     Ok((path, file, staged))
 }
@@ -132,9 +153,9 @@ fn stage_candidate(
 fn contained_boundary(
     path: &Path,
     publication: Option<&ResolvedPublicationPolicy>,
+    base: &Path,
 ) -> Result<OutputContainment, PipelineError> {
-    let base = std::env::current_dir().map_err(PipelineError::Io)?;
-    let validated = validate_path(path, &base, path.is_absolute()).map_err(|diagnostic| {
+    let validated = validate_path(path, base, path.is_absolute()).map_err(|diagnostic| {
         PipelineError::Config(ConfigError::Validation(format!(
             "{}: {}",
             diagnostic.code, diagnostic.message

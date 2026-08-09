@@ -26,6 +26,18 @@ const PROGRESS_TICK: Duration = Duration::from_millis(20);
 /// emits no periodic observation at all, which leaves the fault-injection
 /// tests racing a real timer against how fast the host reads the fixture
 /// rather than asserting the behaviour they name.
+/// Whether a failed liveness write is worth trying again next tick.
+///
+/// A signal-interrupted or momentarily-unready write says nothing about the
+/// next one. A closed or broken destination does: no later tick reaches a
+/// reader that is gone, so continuing would spin for the rest of the run.
+fn is_transient_progress_write(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
 fn progress_tick() -> Duration {
     #[cfg(debug_assertions)]
     if let Some(value) = std::env::var_os("CLINKER_TEST_MACHINE_PROGRESS_TICK_MS")
@@ -243,7 +255,19 @@ impl MachineEmitter {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
-                    emitter.emit_periodic()?;
+                    // A liveness record that could not be written this tick is
+                    // a reason to try again next tick, not a reason to stop
+                    // writing them. Returning on the first error left the run
+                    // going with no further records at all -- and since this
+                    // path deliberately does not trip the shutdown token,
+                    // nothing said so; a supervisor watching for liveness then
+                    // killed a healthy run. A closed reader is different: no
+                    // later tick can reach it either.
+                    if let Err(error) = emitter.emit_periodic()
+                        && !is_transient_progress_write(&error)
+                    {
+                        return Err(error);
+                    }
                 }
             })?;
         Ok(MachineProgressWorker {

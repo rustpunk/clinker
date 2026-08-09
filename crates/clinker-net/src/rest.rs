@@ -588,26 +588,19 @@ impl RequestFailure {
     /// the peer rejected it, and that verdict is independent of any signal
     /// that arrives afterwards.
     fn is_cancellable_transport(self) -> bool {
-        // `Transport` is included, but only because every permanent failure
-        // that used to hide behind it is now named. It reached this catch-all
-        // for TLS errors once, and a certificate nobody trusts was reported as
-        // a clean cancellation; the fix was naming the TLS variants, not
-        // refusing the catch-all. What remains under it is a failure this
-        // mapping cannot identify, and when a shutdown is pending the
-        // cancellation is the one thing actually known — a peer that dropped
-        // the connection mid-request surfaces here on some hosts and as an I/O
-        // error on others, and both are the same operator action.
+        // `Transport` is included: what reaches this catch-all is a failure
+        // the mapping above could not identify, and when a shutdown is pending
+        // the cancellation is the one thing actually known. Every permanent
+        // failure that could arrive here is named above, so nothing durable
+        // reaches it.
         if let Self::Io(kind) = self {
             // Not every local I/O failure. Reading a client certificate, a
             // trust store, or a socket path the process may not open fails
             // permanently and identically on every attempt, and a shutdown
-            // that happens to be pending does not explain it — the same harm
-            // the named verdicts exist to prevent.
-            // The same set the verdict calls unreadable local material, and
-            // no more. `InvalidData` and `InvalidInput` were left here after
-            // being removed there, so a cancelled run whose last error was a
-            // plaintext TLS handshake reported a retryable failure instead of
-            // an abort — the two rules disagreeing about one error kind.
+            // that happens to be pending does not explain it. This is the
+            // same set the unreadable-local-material verdict uses, and no
+            // more — the two rules have to name one list, or they disagree
+            // about a single error kind and one of them is wrong.
             return !matches!(
                 kind,
                 std::io::ErrorKind::PermissionDenied
@@ -702,20 +695,14 @@ impl RequestFailure {
     fn from_transport(error: &ureq::Error) -> Self {
         match error {
             ureq::Error::StatusCode(status) => Self::HttpStatus(*status),
-            // Split by phase. Collapsing every deadline into one made a body
-            // read that expired after the peer answered look like a peer that
-            // never did, so a signal arriving later erased the outage.
-            // Only the body read happens after the peer answered. Waiting for
-            // a response, sending the request, and waiting on a continue are
-            // all deadlines that expire with nothing received — a peer that
-            // accepted the connection and then said nothing has not answered,
-            // so a cancellation still explains them.
+            // Split by phase, because only the body read happens after the
+            // peer answered. Waiting for a response, sending the request, and
+            // waiting on a continue are all deadlines that expire with nothing
+            // received — a peer that accepted the connection and then said
+            // nothing has not answered.
             ureq::Error::Timeout(ureq::Timeout::RecvBody) => Self::ResponseTimeout,
             ureq::Error::Timeout(_) => Self::Timeout,
             ureq::Error::HostNotFound => Self::HostNotFound,
-            // Every TLS-layer failure, not just the one variant. An expired or
-            // untrusted certificate arrives as `Rustls`, which fell through to
-            // the catch-all and was then treated as a peer that never answered.
             // Every TLS-layer failure this build can produce, including the
             // one that is really the certificate material failing to parse.
             // All of them mean this endpoint's identity cannot be established,
