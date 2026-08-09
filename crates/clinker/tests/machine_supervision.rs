@@ -770,6 +770,11 @@ fn a_refused_liveness_record_does_not_end_a_healthy_run() {
     let output = machine_command(directory.path(), "refused-periodic")
         .env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "periodic_sink")
         .env("CLINKER_TEST_MACHINE_PROGRESS_TICK_MS", "1")
+        // Long enough that no run of this fixture reaches it. Without a stated
+        // window the assertion below depended on the default five seconds
+        // being longer than a loaded host takes, which is a race rather than
+        // a rule.
+        .env("CLINKER_TEST_MACHINE_SINK_PATIENCE_MS", "600000")
         .output()
         .expect("run with injected periodic sink failure");
 

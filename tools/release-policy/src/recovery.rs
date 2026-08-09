@@ -1,6 +1,6 @@
 //! Strict validation for the Phase 3 recovery sign-off receipt.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
 use serde::Deserialize;
@@ -455,7 +455,10 @@ fn validate(receipt: &Receipt, repository_root: &Path) -> Result<(), GateError> 
 }
 
 fn validate_commands(rows: &[CommandRow]) -> Result<(), GateError> {
-    let registry = COMMANDS.iter().copied().collect::<BTreeMap<_, _>>();
+    // `exact_row_ids` has already compared the whole id sequence element by
+    // element, so row `n` is `COMMANDS[n]` and there is nothing left for a
+    // registry lookup to find. Keeping one meant two unreachable "is not
+    // registered" arms a reader had to reason about.
     exact_row_ids(
         rows.iter().map(|row| row.id.as_str()),
         COMMANDS.iter().map(|(id, _)| *id),
@@ -473,11 +476,8 @@ fn validate_commands(rows: &[CommandRow]) -> Result<(), GateError> {
                 return Err(policy("command argv tokens must be shell-free"));
             }
         }
-        let expected_id = COMMANDS[index].0;
-        let expected_argv = registry
-            .get(row.id.as_str())
-            .ok_or_else(|| policy("command id is not registered"))?;
-        if row.id != expected_id || !same_strings(&row.argv, expected_argv) {
+        let (expected_id, expected_argv) = COMMANDS[index];
+        if !same_strings(&row.argv, expected_argv) {
             return Err(policy(format!("{expected_id} argv or order changed")));
         }
     }
@@ -485,7 +485,6 @@ fn validate_commands(rows: &[CommandRow]) -> Result<(), GateError> {
 }
 
 fn validate_checks(rows: &[CheckRow]) -> Result<(), GateError> {
-    let registry = CHECKS.iter().copied().collect::<BTreeMap<_, _>>();
     exact_row_ids(
         rows.iter().map(|row| row.id.as_str()),
         CHECKS.iter().map(|(id, _)| *id),
@@ -498,11 +497,8 @@ fn validate_checks(rows: &[CheckRow]) -> Result<(), GateError> {
             return Err(policy("check evidence_ids must not be empty"));
         }
         validate_string_list(&row.evidence_ids, "check evidence id")?;
-        let expected_id = CHECKS[index].0;
-        let expected = registry
-            .get(row.id.as_str())
-            .ok_or_else(|| policy("check id is not registered"))?;
-        if row.id != expected_id || !same_strings(&row.evidence_ids, expected) {
+        let (expected_id, expected) = CHECKS[index];
+        if !same_strings(&row.evidence_ids, expected) {
             return Err(policy(format!("{expected_id} evidence or order changed")));
         }
     }

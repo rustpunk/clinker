@@ -792,3 +792,22 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   the exit code must not change. Closing this properly means a schema-2 field
   on the terminal record stating whether the liveness channel survived, which
   is a protocol change rather than a repair.
+- **36 (filed 2026-08-09, needs a maintainer decision):** The recovery-matrix
+  release gate in `tools/release-policy/src/recovery.rs` is keyed on internal
+  planning identifiers, held as load-bearing constants rather than comments.
+  The project's comment rule keeps such labels out of Rust source, and they
+  are worse as constants: a reader cannot tell what they name, and the gate
+  stops matching the moment that planning artifact moves on. The gate is
+  validating a real receipt, so the identifiers cannot simply be deleted --
+  closing this means deciding what the receipt should be keyed on instead
+  (a content hash, a named capability set, or the command registry itself)
+  and reissuing the receipt against it.
+- **37 (filed 2026-08-09):** `LogDispatcher::emit` allocates one
+  `Vec<SignalField>` per emitted record on the per-record transform path
+  (`crates/clinker-exec/src/log_dispatch.rs`). A reusable scratch buffer is
+  not available: `SignalField<'a>` borrows both the field name and the record
+  value, so the vector cannot outlive the record it describes without unsafe
+  lifetime reuse. Directives with no `fields:` already allocate nothing, since
+  the vector is built with zero capacity. Removing the remaining cost means
+  either an inline-capacity vector (a new dependency) or an arena, both of
+  which are approval-gated decisions rather than repairs.

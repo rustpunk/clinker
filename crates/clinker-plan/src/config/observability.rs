@@ -724,8 +724,16 @@ pub(crate) fn is_observability_toml_error(text: &str, error: &toml::de::Error) -
     // Where the error is, not what the document happens to contain. A
     // whole-document test would claim an unrelated `[storage]` error for this
     // subsystem and report the wrong correction for it.
-    let offset = error.span().map_or(text.len(), |span| span.start);
-    let (table, _) = authored_location(text, offset);
+    // Where the error is, and only when the error says where it is. A failure
+    // with no span could be anywhere, and answering from the end of the
+    // document claimed whichever table happened to be written last -- so an
+    // unrelated failure was reported as this subsystem's, with an invented
+    // correction, in place of the parser's own message naming the offending
+    // key and line.
+    let Some(span) = error.span() else {
+        return false;
+    };
+    let (table, _) = authored_location(text, span.start);
     is_observability_table(&table)
 }
 

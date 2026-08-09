@@ -258,7 +258,11 @@ impl MachineEmitter {
     fn emit_periodic(&self) -> ProgressWrite {
         let mut state = self.lock_state();
         let Some(snapshot) = state.progress.periodic("executing") else {
-            return ProgressWrite::Skipped;
+            return if state.progress.periodic_budget_spent() {
+                ProgressWrite::Exhausted
+            } else {
+                ProgressWrite::Skipped
+            };
         };
         let notice = snapshot.event_limit_reached();
         let written = state.write_progress_staged(snapshot);
@@ -319,6 +323,10 @@ impl MachineEmitter {
                         // Only a record that got through says the sink is
                         // alive. A tick with nothing due says nothing.
                         ProgressWrite::Skipped => {}
+                        // Nothing more will be attempted, so the last refusal
+                        // is the last thing that will ever be known and is no
+                        // longer evidence of anything current.
+                        ProgressWrite::Exhausted => failing = None,
                         ProgressWrite::Written => failing = None,
                         // Nothing about a later tick makes an unbuildable
                         // record buildable.
@@ -336,16 +344,15 @@ impl MachineEmitter {
                     // described a number of records rather than a duration,
                     // and a run shorter than that many seconds never reached
                     // it however long its sink had been dead.
-                    if let Some((since, _)) = &failing
-                        && since.elapsed() >= patience
+                    if failing
+                        .as_ref()
+                        .is_some_and(|(since, _)| since.elapsed() >= patience)
                     {
+                        let (_, error) = failing.expect("just checked");
                         // A sink that has refused for the whole window is not
                         // behind, it is broken, and saying so is the point of
                         // this thread.
-                        return Err(failing.map_or_else(
-                            || io::Error::other("liveness sink stopped accepting records"),
-                            |(_, error)| error,
-                        ));
+                        return Err(error);
                     }
                 }
             })?;
@@ -646,7 +653,7 @@ impl MachineState {
 
     fn write_progress(&mut self, snapshot: ProgressSnapshot) -> io::Result<()> {
         match self.write_progress_staged(snapshot) {
-            ProgressWrite::Skipped | ProgressWrite::Written => Ok(()),
+            ProgressWrite::Skipped | ProgressWrite::Exhausted | ProgressWrite::Written => Ok(()),
             ProgressWrite::Unencodable(error) | ProgressWrite::Unsent(error) => Err(error),
         }
     }
@@ -660,6 +667,11 @@ enum ProgressWrite {
     /// success cleared the failing-sink window on almost every pass and the
     /// window could never elapse.
     Skipped,
+    /// No record will be offered again, so no further evidence about the sink
+    /// can arrive. Distinct from `Skipped`, which means only that none was due
+    /// yet: a window left running on the last refusal after the records stop
+    /// convicts a sink nobody is asking any more.
+    Exhausted,
     Written,
     /// The record could not be built. No later attempt can build it either.
     Unencodable(io::Error),

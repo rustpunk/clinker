@@ -200,45 +200,63 @@ pub(crate) fn next_link(
     // may normalize one copy -- a relative reference beside the absolute URL
     // it resolves to -- and comparing the raw text called those two different
     // pages, which is the same false conflict as the duplicate itself.
-    //
-    // Resolution failures are held rather than returned, so how many pages the
-    // reply names is decided before any one of them is judged. Returning the
-    // first failure instead reported a reply naming two different pages under
-    // whichever rule the first one happened to break, and an operator reading
-    // the classification was told about the wrong rule.
-    // A target that will not resolve is still a target: it counts toward how
-    // many pages the reply named, and is identified by what the reply said
-    // since there is nothing else to identify it by.
-    let mut targets: Vec<Result<AuthorizedUrl, String>> = Vec::new();
-    let mut unresolved: Option<ContinuationError> = None;
+    let mut targets = TargetSet::default();
     for value in headers.get_all(ureq::http::header::LINK) {
         let value = value
             .to_str()
             .map_err(|_| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
         for target in parse_link_field(value)? {
-            let entry = match resolve_then_authorize(effective_url, &target, admitted_origin) {
-                Ok(resolved) => Ok(resolved),
-                Err((rendered, error)) => {
-                    unresolved.get_or_insert(error);
-                    Err(rendered.unwrap_or_else(|| target.trim().to_owned()))
-                }
-            };
-            if !targets.contains(&entry) {
-                targets.push(entry);
-            }
+            targets.offer(&target, effective_url, admitted_origin);
         }
     }
-    if targets.len() > 1 {
-        return Err(ContinuationError::for_code(
-            "rest.protocol.conflicting_continuation",
-        ));
+    targets.into_one()
+}
+
+/// The distinct targets a reply named, and the first reason one of them was
+/// refused.
+///
+/// Shared by both continuation readers rather than written twice. How many
+/// pages a reply names has to be decided before any one of them is judged --
+/// otherwise a reply naming two different targets is reported under whichever
+/// rule the first one happened to break, and the operator is told about the
+/// wrong rule. That was fixed once in the link reader and left standing in the
+/// redirect reader, so the two disagreed about the same reply.
+#[derive(Default)]
+struct TargetSet {
+    /// Resolved where resolution succeeded; otherwise the best identity
+    /// available, because a target that will not resolve is still a target and
+    /// still counts toward how many the reply named.
+    seen: Vec<Result<AuthorizedUrl, String>>,
+    refusal: Option<ContinuationError>,
+}
+
+impl TargetSet {
+    fn offer(&mut self, reference: &str, base: &AuthorizedUrl, admitted_origin: &Origin) {
+        let entry = match resolve_then_authorize(base, reference, admitted_origin) {
+            Ok(resolved) => Ok(resolved),
+            Err((rendered, error)) => {
+                self.refusal.get_or_insert(error);
+                Err(rendered.unwrap_or_else(|| reference.trim().to_owned()))
+            }
+        };
+        if !self.seen.contains(&entry) {
+            self.seen.push(entry);
+        }
     }
-    match targets.pop() {
-        Some(Ok(target)) => Ok(Some(target)),
-        Some(Err(_)) => Err(unresolved.unwrap_or_else(|| {
-            ContinuationError::for_code("rest.protocol.unresolvable_continuation")
-        })),
-        None => Ok(None),
+
+    fn into_one(mut self) -> Result<Option<AuthorizedUrl>, ContinuationError> {
+        if self.seen.len() > 1 {
+            return Err(ContinuationError::for_code(
+                "rest.protocol.conflicting_continuation",
+            ));
+        }
+        match self.seen.pop() {
+            Some(Ok(target)) => Ok(Some(target)),
+            Some(Err(_)) => Err(self.refusal.unwrap_or_else(|| {
+                ContinuationError::for_code("rest.protocol.unresolvable_continuation")
+            })),
+            None => Ok(None),
+        }
     }
 }
 
@@ -253,21 +271,14 @@ pub(crate) fn redirect_location(
     effective_url: &AuthorizedUrl,
     admitted_origin: &Origin,
 ) -> Result<AuthorizedUrl, ContinuationError> {
-    let mut resolved: Option<AuthorizedUrl> = None;
+    let mut targets = TargetSet::default();
     for value in headers.get_all(ureq::http::header::LOCATION) {
         let value = value
             .to_str()
             .map_err(|_| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
-        let candidate = resolve_and_authorize(effective_url, value, admitted_origin)?;
-        match &resolved {
-            Some(seen) if *seen != candidate => {
-                return Err(ContinuationError::for_code(
-                    "rest.protocol.conflicting_continuation",
-                ));
-            }
-            _ => resolved = Some(candidate),
-        }
+        targets.offer(value, effective_url, admitted_origin);
     }
+    let resolved = targets.into_one()?;
     resolved.ok_or_else(|| ContinuationError::for_code("rest.protocol.malformed_continuation"))
 }
 
