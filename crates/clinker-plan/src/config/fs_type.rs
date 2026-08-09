@@ -311,6 +311,61 @@ fn probe_case_sensitive(dir: &Path) -> io::Result<bool> {
 ///
 /// Both the config-time DLQ-collision check and the runtime DLQ partitioner key
 /// on this single function so their notions of "same file" cannot drift.
+/// The identity of a destination path: one physical location, one key.
+///
+/// Two producers naming one file must be recognised as naming one file, and a
+/// root registered before its directory exists must match the same root
+/// checked afterwards. Both need the path reduced the same way, so both go
+/// through here rather than each keying on the text it happens to hold.
+///
+/// The reduction is lexical first -- `a/./b` and `a/b` are one path -- and
+/// then resolves the longest prefix that exists, which is what makes a
+/// symlinked parent and its target the same destination. What does not exist
+/// yet cannot be resolved and is kept as written.
+#[must_use]
+pub fn destination_identity(path: &Path) -> String {
+    collision_key(&resolved_prefix(&lexically_reduced(path)).to_string_lossy())
+}
+
+/// `path` with `.` removed and `..` applied to the component before it.
+fn lexically_reduced(path: &Path) -> std::path::PathBuf {
+    let mut reduced = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !reduced.pop() {
+                    reduced.push(component.as_os_str());
+                }
+            }
+            other => reduced.push(other.as_os_str()),
+        }
+    }
+    reduced
+}
+
+/// `path` with its longest existing prefix canonicalized.
+fn resolved_prefix(path: &Path) -> std::path::PathBuf {
+    let mut unresolved: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(resolved) = cursor.canonicalize() {
+            let mut rebuilt = resolved;
+            for name in unresolved.iter().rev() {
+                rebuilt.push(name);
+            }
+            return rebuilt;
+        }
+        match (cursor.file_name(), cursor.parent()) {
+            (Some(name), Some(parent)) => {
+                unresolved.push(name.to_owned());
+                cursor = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 pub fn collision_key(path: &str) -> String {
     if case_sensitive_dir(Path::new(path)).unwrap_or(true) {
         path.to_string()

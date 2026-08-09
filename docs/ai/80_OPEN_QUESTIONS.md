@@ -837,3 +837,18 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   rather than reused, but the boundary walk is the same in all four and a
   correction to it reaches only the copy whoever fixes it happens to find.
   Collapsing them means agreeing one signature that serves every caller.
+- **41 (filed 2026-08-09):** Under `if_exists: unique_suffix` on the
+  attempt-owned path, a destination the process cannot write into is retried
+  up to the shared suffix-search bound before the run fails, and the
+  diagnostic then names the last candidate tried -- `report_64.csv` -- rather
+  than the template the author wrote. The retrying is deliberate (a contended
+  name on Windows reports the same error kind as a permanent refusal, which is
+  why the bound exists), but the message should name the authored destination
+  and say how many candidates were attempted. Fixing it means carrying the
+  template into the failure, which the search does not currently hold.
+- **42 (filed 2026-08-09):** The dispatcher set is now written out four times:
+  the fault-injection enum, its string-to-variant map, the re-dispatch match
+  in `dispatch.rs`, and the twelve per-file mismatch helpers. This is the same
+  duplication as open question 33 seen from the test-support side; whatever
+  single carrier resolves 33 should absorb these too, so the count is one
+  place rather than four.

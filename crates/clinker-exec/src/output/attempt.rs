@@ -5420,16 +5420,11 @@ fn destination_leaf(destination: &ValidatedPath) -> Result<String, AttemptError>
         ))
 }
 
-/// A stable key for a destination root, independent of whether the path
-/// exists yet.
+/// A stable key for a destination root.
 ///
-/// Canonicalizing only when the whole path already exists made the key depend
-/// on when it was asked for: a host whose temporary directory is reached
-/// through a symlink answers with the resolved prefix once the directory is
-/// there and the unresolved one before, so a root registered at one moment
-/// failed to match the same root checked at another. The deepest existing
-/// ancestor is resolved instead, and the part that does not exist yet is
-/// appended unchanged.
+/// Through the shared destination identity, so a root and an output
+/// destination inside it are reduced the same way: one physical location has
+/// one key wherever it is asked about.
 fn destination_root_key(path: &Path) -> String {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -5438,29 +5433,7 @@ fn destination_root_key(path: &Path) -> String {
             .map(|current| current.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     };
-    clinker_plan::config::collision_key(&resolve_existing_prefix(&absolute).to_string_lossy())
-}
-
-/// `path` with its longest existing prefix canonicalized.
-fn resolve_existing_prefix(path: &Path) -> PathBuf {
-    let mut unresolved = Vec::new();
-    let mut cursor = path;
-    loop {
-        if let Ok(resolved) = cursor.canonicalize() {
-            let mut rebuilt = resolved;
-            for component in unresolved.iter().rev() {
-                rebuilt.push(component);
-            }
-            return rebuilt;
-        }
-        match (cursor.file_name(), cursor.parent()) {
-            (Some(name), Some(parent)) => {
-                unresolved.push(name.to_owned());
-                cursor = parent;
-            }
-            _ => return path.to_path_buf(),
-        }
-    }
+    clinker_plan::config::destination_identity(&absolute)
 }
 
 fn persist_manifest_in_root(
@@ -5650,4 +5623,46 @@ fn validate_bounded_text(
         return Err(AttemptError::InvalidManifest(message));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod destination_root_key_tests {
+    use super::destination_root_key;
+
+    /// One directory has one key, however the path reached it and whether or
+    /// not it exists yet. The key decides whether two roots are the same root,
+    /// so a second spelling becomes a second root that tries to create the
+    /// attempt directory a second time, and a key that changes once the
+    /// directory appears stops matching the root it was registered under.
+    ///
+    /// The same identity answers for an output destination, so a root and a
+    /// file inside it cannot disagree about which physical location they mean.
+    #[test]
+    fn one_directory_has_one_key() {
+        let root = tempfile::tempdir().expect("temporary destination");
+        let direct = root.path().join("out");
+        let indirect = root.path().join(".").join("out");
+        let roundabout = root.path().join("out").join("..").join("out");
+
+        for (name, path) in [("indirect", &indirect), ("roundabout", &roundabout)] {
+            assert_eq!(
+                destination_root_key(path),
+                destination_root_key(&direct),
+                "{name} names the same directory before it exists"
+            );
+        }
+
+        std::fs::create_dir(&direct).expect("create the destination");
+        for (name, path) in [
+            ("direct", &direct),
+            ("indirect", &indirect),
+            ("roundabout", &roundabout),
+        ] {
+            assert_eq!(
+                destination_root_key(path),
+                destination_root_key(&direct),
+                "{name} still names it once it does"
+            );
+        }
+    }
 }

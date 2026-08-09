@@ -347,6 +347,19 @@ pub(crate) fn log_directive_set_validation_errors(directives: &[LogDirective]) -
             "`log` may request at most {MAX_LOG_SELECTED_FIELDS_PER_TRANSFORM} fields in aggregate across one transform"
         ));
     }
+    // One name, one event. A collector groups records by the event name, so
+    // two directives sharing one name on the same transform publish records
+    // with different field sets under a single identity and nothing downstream
+    // can tell which is which.
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for directive in directives {
+        if !directive.name.is_empty() && !seen.insert(directive.name.as_str()) {
+            errors.push(format!(
+                "`log` event name {:?} is declared more than once on this transform; give each event its own name",
+                directive.name
+            ));
+        }
+    }
     for (index, directive) in directives.iter().enumerate() {
         errors.extend(
             directive

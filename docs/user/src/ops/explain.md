@@ -47,6 +47,11 @@ The buffer class is a pre-runtime signal for memory pressure: a `materialized` n
 clinker run pipeline.yaml --explain json
 ```
 
+Standard output carries only the JSON document: plan warnings and other human
+diagnostics are written to stderr in this format and in `dot`, so redirecting
+stdout into a parser is safe. Read stderr as well if you want to see them --
+under `--explain text` they remain on stdout alongside the plan.
+
 Produces a machine-readable JSON object for programmatic consumption. Useful for:
 
 - CI pipelines that need to assert plan properties

@@ -248,7 +248,21 @@ impl RestRecordSource {
             )));
         }
 
-        let bytes = self.get_with_retry(&url)?;
+        let page = self.get_with_retry(&url)?;
+        // The URL the reply came from, too. A redirect can land on a page the
+        // pager has already read, and recording only what was asked for let
+        // that page be fetched again and every one of its records emitted a
+        // second time.
+        if page.effective != url
+            && !self
+                .visited_pages
+                .insert(page.effective.as_str().to_owned())
+        {
+            return Err(continuation_format_error(ContinuationError::for_code(
+                "rest.protocol.unsupported_continuation",
+            )));
+        }
+        let bytes = page;
         self.pages_fetched += 1;
 
         // Advance the cursor for the strategies whose continuation signal
@@ -521,7 +535,11 @@ impl RestRecordSource {
                         ));
                     }
                 };
-                return Ok(PageResponse { body, next_link });
+                return Ok(PageResponse {
+                    body,
+                    next_link,
+                    effective: url.clone(),
+                });
             };
             // Cancellation abandons a retry that was going to happen, and it
             // explains a teardown of the request we were inside — a failure
@@ -783,6 +801,10 @@ impl RequestFailure {
 struct PageResponse {
     body: Vec<u8>,
     next_link: Option<AuthorizedUrl>,
+    /// Where the reply actually came from, which is not the requested URL when
+    /// a redirect was followed. The pager records both, because a page reached
+    /// through a redirect is the same page and must not be read twice.
+    effective: AuthorizedUrl,
 }
 
 impl RecordSource for RestRecordSource {

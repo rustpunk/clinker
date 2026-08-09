@@ -845,7 +845,7 @@ fn destination_key_in(path: &std::path::Path, base: &std::path::Path) -> String 
     } else {
         base.join(path)
     };
-    clinker_plan::config::collision_key(&absolute.to_string_lossy())
+    clinker_plan::config::destination_identity(&absolute)
 }
 
 fn attempt_error_to_pipeline(error: AttemptError) -> PipelineError {
