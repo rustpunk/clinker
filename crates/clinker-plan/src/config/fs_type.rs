@@ -360,13 +360,19 @@ fn without_cur_dir(path: &Path) -> std::path::PathBuf {
         .collect()
 }
 
-/// `path` with its longest existing prefix canonicalized.
+/// `path` with its longest existing prefix canonicalized and the remainder
+/// reduced.
 ///
-/// The walk steps over a `..` rather than stopping at it. `file_name` is
+/// The walk steps over a `..` rather than stopping at it -- `file_name` is
 /// `None` for such a component, and treating that as the end of the road left
-/// every path containing a `..` completely unresolved -- not merely its `..`,
-/// which is deliberate, but the existing prefix in front of it too, so two
-/// spellings of one file could pass a collision check.
+/// the existing prefix in front of it unresolved too.
+///
+/// The remainder is then reduced lexically, `..` included, which is safe
+/// precisely because none of it exists: a component that is not there cannot
+/// be a symlink, so there is nothing for the kernel to follow and `x/..` can
+/// only mean the directory above. That is what makes it different from
+/// reducing the path before resolving it, where a `..` may sit behind a link
+/// and name somewhere else entirely.
 fn resolved_prefix(path: &Path) -> std::path::PathBuf {
     let mut unresolved: Vec<std::ffi::OsString> = Vec::new();
     let mut cursor = path;
@@ -374,7 +380,11 @@ fn resolved_prefix(path: &Path) -> std::path::PathBuf {
         if let Ok(resolved) = cursor.canonicalize() {
             let mut rebuilt = resolved;
             for name in unresolved.iter().rev() {
-                rebuilt.push(name);
+                if name == ".." {
+                    rebuilt.pop();
+                } else {
+                    rebuilt.push(name);
+                }
             }
             return rebuilt;
         }
@@ -806,11 +816,25 @@ mod tests {
         // A `..` further along must not cost the prefix in front of it its
         // resolution: leaving the `..` alone is deliberate, leaving the whole
         // path alone let two spellings of one file pass a collision check.
-        let through_missing = real.join("later").join("..").join("out.csv");
+        // A `..` past the end of what exists cancels: nothing that is not
+        // there can be a symlink, so there is nothing for the kernel to
+        // follow and the pair can only mean the directory above.
         assert_eq!(
-            destination_identity(&through_missing),
-            destination_identity(&real.join("later").join("..").join(".").join("out.csv")),
-            "the existing prefix is resolved either side of a `..`"
+            destination_identity(&real.join("later").join("..").join("out.csv")),
+            destination_identity(&direct),
+            "a `..` over a directory that does not exist names the one above"
+        );
+        assert_eq!(
+            destination_identity(
+                &real
+                    .join("a")
+                    .join("b")
+                    .join("..")
+                    .join("..")
+                    .join("out.csv")
+            ),
+            destination_identity(&direct),
+            "and so does a run of them"
         );
 
         #[cfg(unix)]

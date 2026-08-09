@@ -207,17 +207,22 @@ pub(crate) fn next_link(
         // for a parameter nothing reads threw away the `rel=next` target
         // beside it along with every record already pulled. The target's own
         // characters are checked where it is resolved.
+        let lossy = value.to_str().is_err();
         let value = String::from_utf8_lossy(value.as_bytes());
         for target in parse_link_field(&value)? {
-            // A target that lost bytes to the lossy read is not a target: the
-            // replacement character marks where a byte no client can act on
-            // used to be, and counting it would let one page named twice --
-            // once readably, once not -- look like two different pages. A
-            // parameter that lost bytes is still ignored, which is the point.
-            if target.contains('\u{fffd}') {
-                continue;
+            // A target from a field that did not read cleanly is offered as
+            // one that cannot be resolved, not skipped. It is still a page the
+            // reply named, so it still counts; dropping it instead left the
+            // set empty and ended pagination as though the server had said
+            // there was no next page, which turned a truncated extract into a
+            // successful run. Whether the read was lossy is asked of the
+            // header, not of the target: a target may legitimately contain the
+            // replacement character.
+            if lossy && target.contains('\u{fffd}') {
+                targets.offer_unusable(target);
+            } else {
+                targets.offer(&target, effective_url, admitted_origin);
             }
-            targets.offer(&target, effective_url, admitted_origin);
         }
     }
     targets.into_one()
@@ -242,6 +247,21 @@ struct TargetSet {
 }
 
 impl TargetSet {
+    /// Record a target the reply named that this client cannot act on.
+    ///
+    /// It counts toward how many pages were named -- a reply naming one
+    /// unusable page is not a reply naming none -- and the refusal it carries
+    /// is what the caller reports when it turns out to be the only one.
+    fn offer_unusable(&mut self, identity: String) {
+        self.refusal.get_or_insert_with(|| {
+            ContinuationError::for_code("rest.protocol.unresolvable_continuation")
+        });
+        let entry = Err(Some(identity));
+        if !self.seen.contains(&entry) {
+            self.seen.push(entry);
+        }
+    }
+
     fn offer(&mut self, reference: &str, base: &AuthorizedUrl, admitted_origin: &Origin) {
         let entry = match resolve_then_authorize(base, reference, admitted_origin) {
             Ok(resolved) => Ok(resolved),
@@ -291,13 +311,17 @@ pub(crate) fn redirect_location(
 ) -> Result<AuthorizedUrl, ContinuationError> {
     let mut targets = TargetSet::default();
     for value in headers.get_all(ureq::http::header::LOCATION) {
+        // Offered rather than returned on, so how many targets the reply
+        // named is still decided before any of them is judged -- returning
+        // here reported a reply naming two different places under whichever
+        // rule the first one broke.
+        let lossy = value.to_str().is_err();
         let value = String::from_utf8_lossy(value.as_bytes());
-        if value.contains('\u{fffd}') {
-            return Err(ContinuationError::for_code(
-                "rest.protocol.unresolvable_continuation",
-            ));
+        if lossy {
+            targets.offer_unusable(value.into_owned());
+        } else {
+            targets.offer(&value, effective_url, admitted_origin);
         }
-        targets.offer(&value, effective_url, admitted_origin);
     }
     let resolved = targets.into_one()?;
     resolved.ok_or_else(|| ContinuationError::for_code("rest.protocol.malformed_continuation"))
@@ -639,6 +663,25 @@ mod tests {
                 .then_some("https://api.example.test/v1/items?page=2");
             assert_eq!(read.as_ref().map(AuthorizedUrl::as_str), expected);
         }
+
+        // A reply naming a page this client cannot act on says there IS a
+        // next page. Reporting no next page instead ends the pull as though
+        // the server had finished, which turns a truncated extract into a
+        // successful run.
+        let mut mangled = ureq::http::HeaderMap::new();
+        mangled.append(
+            ureq::http::header::LINK,
+            ureq::http::HeaderValue::from_bytes(
+                b"<https://api.example.test/v1/\xffitems?page=2>; rel=\"next\"",
+            )
+            .expect("a header value with a byte that is not UTF-8"),
+        );
+        let refused = next_link(&mangled, &base, &origin)
+            .expect_err("a page named unreadably is still a page named");
+        assert_eq!(
+            refused.classification_code(),
+            "rest.protocol.unresolvable_continuation"
+        );
 
         // A repeated `rel`, and a title in an encoding this client does not
         // need to understand: both leave the target perfectly readable.
