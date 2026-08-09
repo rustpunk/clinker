@@ -177,7 +177,7 @@ pub(crate) fn next_link(
             .to_str()
             .map_err(|_| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
         for target in parse_link_field(value)? {
-            if !targets.iter().any(|seen| *seen == target) {
+            if !targets.contains(&target) {
                 targets.push(target);
             }
         }

@@ -749,3 +749,24 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   `clinker guess` inference follow-on remains open as question 31. This current
   wording supersedes the earlier archive claim that the decimal token was
   retired.
+- **32 (filed 2026-08-08):** `send_otlp_json` re-parses each payload into a
+  `serde_json::Value` tree to count the items it contains
+  (`crates/clinker-net/src/otlp.rs`, `validate_and_count_payload`), although
+  the producer already counted them while encoding and passes the count to
+  `DeliveryBackend::deliver`. The second parse is not redundant as written:
+  this is a public entry point taking arbitrary bytes, and the walk also
+  checks the payload matches the selected signal envelope. Removing it means
+  either trusting a caller-supplied count at a validated boundary, or
+  deserializing into shape-only types whose elements are `IgnoredAny` so the
+  count survives without a DOM. The second is the better answer and is a
+  change of its own; the cost today is one extra parse and an allocation of
+  the payload's order on the exporter thread, per request.
+- **33 (filed 2026-08-08):** Twelve dispatchers each carry their own
+  `<Kind>DispatchContext` enum, `From` impl, and
+  `dispatch_<kind>_mismatch_for_testing` helper (for example
+  `crates/clinker-exec/src/executor/cull_dispatch.rs`), differing in nothing
+  but the operator name. One generic carrier in `dispatch.rs` would serve all
+  of them. Left as is for now because collapsing them touches every operator
+  entry point at once; the risk is that a thirteenth operator copies the block
+  again, or that one copy is edited inconsistently and quietly loses its
+  mismatch guard.

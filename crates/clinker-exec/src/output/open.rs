@@ -297,8 +297,10 @@ mod tests {
     /// without the rule holding.
     #[test]
     fn any_taken_name_clears_the_contention_count() {
+        type Clear<'a> = &'a dyn Fn(&mut SuffixSearch) -> bool;
+
         let taken = PipelineError::Io(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
-        let clears: [(&str, &dyn Fn(&mut SuffixSearch) -> bool); 2] = [
+        let clears: [(&str, Clear<'_>); 2] = [
             (
                 "a name this run already claimed",
                 &|search: &mut SuffixSearch| search.advance_past_taken_name(),
@@ -309,9 +311,10 @@ mod tests {
         ];
 
         for (name, clear) in clears {
-            let mut search = SuffixSearch::default();
-            search.consecutive_denials = SuffixSearch::MAX_CONSECUTIVE_DENIALS;
-            search.total_denials = 7;
+            let mut search = SuffixSearch {
+                consecutive_denials: SuffixSearch::MAX_CONSECUTIVE_DENIALS,
+                total_denials: 7,
+            };
 
             assert!(clear(&mut search), "{name} is a reason to advance");
             assert_eq!(
