@@ -770,3 +770,14 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   entry point at once; the risk is that a thirteenth operator copies the block
   again, or that one copy is edited inconsistently and quietly loses its
   mismatch guard.
+- **34 (filed 2026-08-08, needs a maintainer decision):** RFC 8288 `Link`
+  header parsing in `crates/clinker-net/src/rest/continuation.rs`
+  (`parse_link_field`, `split_link_values`, `unquote`) is hand-rolled — roughly
+  a hundred lines of quoted-string, comma, and semicolon tokenizing, including
+  the `rel` token-list and escaping corners. AGENTS.md is explicit that
+  hand-rolling a parser a vetted crate provides is a dependency decision taken
+  without review, so this needs approving as either a dependency or a
+  deliberate exception rather than being grown further. Each mis-handled corner
+  of the grammar is a pagination failure against a real server, and this file
+  has now been repaired twice for exactly that class of defect. No behavior
+  change is proposed here; the decision is which way to close it.

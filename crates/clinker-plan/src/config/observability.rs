@@ -685,15 +685,17 @@ impl ObservabilityConfigError {
         let offset = error.span().map_or(text.len(), |span| span.start);
         let (table, line) = authored_location(text, offset);
         let key = key_on_line(line);
-        // Compared segment by segment. A table whose single quoted name is
-        // `observability.otlp` is not the nested `[observability.otlp]`, and
-        // reading the two as one attributed a diagnostic to a table holding
-        // something else entirely.
+        // Rendered the way the author spelled it, so a segment whose name
+        // contains a dot stays quoted. Joining the segments plainly made
+        // `[observability."otlp.auth"]` read as the nested
+        // `[observability.otlp.auth]`, and the correction then told the author
+        // to add a key to a table that is not in their file while the key they
+        // actually mis-wrote went unnamed.
         let field = match (&table, key) {
             (path, Some(key)) if is_observability_table(path) => {
-                format!("{}.{key}", path.join("."))
+                format!("{}.{key}", render_path(path))
             }
-            (path, None) if is_observability_table(path) => path.join("."),
+            (path, None) if is_observability_table(path) => render_path(path),
             _ => "observability".to_owned(),
         };
 
@@ -733,6 +735,25 @@ pub(crate) fn is_observability_toml_error(text: &str, error: &toml::de::Error) -
 /// table whose one quoted name is `observability.otlp` is a different table,
 /// and claiming it for this subsystem reported someone else's error here with
 /// a correction naming keys that table never had.
+/// A table's key path as TOML spells it, quoting any segment that is not a
+/// bare key so the rendering is reversible.
+fn render_path(path: &[String]) -> String {
+    path.iter()
+        .map(|segment| {
+            if !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            {
+                segment.clone()
+            } else {
+                format!("{segment:?}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 fn is_observability_table(path: &[String]) -> bool {
     path.first()
         .is_some_and(|segment| segment == "observability")

@@ -171,20 +171,25 @@ pub(crate) fn next_link(
     effective_url: &AuthorizedUrl,
     admitted_origin: &Origin,
 ) -> Result<Option<AuthorizedUrl>, ContinuationError> {
-    let mut targets: Vec<String> = Vec::new();
+    // Compared after resolution, not before. A proxy that repeats the header
+    // may normalize one copy -- a relative reference beside the absolute URL
+    // it resolves to -- and comparing the raw text called those two different
+    // pages, which is the same false conflict as the duplicate itself.
+    let mut targets: Vec<AuthorizedUrl> = Vec::new();
     for value in headers.get_all(ureq::http::header::LINK) {
         let value = value
             .to_str()
             .map_err(|_| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
         for target in parse_link_field(value)? {
-            if !targets.contains(&target) {
-                targets.push(target);
+            let resolved = resolve_and_authorize(effective_url, &target, admitted_origin)?;
+            if !targets.contains(&resolved) {
+                targets.push(resolved);
             }
         }
     }
-    match targets.as_slice() {
-        [] => Ok(None),
-        [target] => resolve_and_authorize(effective_url, target, admitted_origin).map(Some),
+    match targets.len() {
+        0 => Ok(None),
+        1 => Ok(targets.pop()),
         _ => Err(ContinuationError::for_code(
             "rest.protocol.conflicting_continuation",
         )),
@@ -202,23 +207,22 @@ pub(crate) fn redirect_location(
     effective_url: &AuthorizedUrl,
     admitted_origin: &Origin,
 ) -> Result<AuthorizedUrl, ContinuationError> {
-    let mut location: Option<&str> = None;
+    let mut resolved: Option<AuthorizedUrl> = None;
     for value in headers.get_all(ureq::http::header::LOCATION) {
         let value = value
             .to_str()
             .map_err(|_| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
-        match location {
-            Some(seen) if seen != value => {
+        let candidate = resolve_and_authorize(effective_url, value, admitted_origin)?;
+        match &resolved {
+            Some(seen) if *seen != candidate => {
                 return Err(ContinuationError::for_code(
                     "rest.protocol.conflicting_continuation",
                 ));
             }
-            _ => location = Some(value),
+            _ => resolved = Some(candidate),
         }
     }
-    let location = location
-        .ok_or_else(|| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
-    resolve_and_authorize(effective_url, location, admitted_origin)
+    resolved.ok_or_else(|| ContinuationError::for_code("rest.protocol.malformed_continuation"))
 }
 
 fn parse_absolute(

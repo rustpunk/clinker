@@ -270,29 +270,48 @@ impl OutputStagingRegistry {
                 // exercising only the other copy reported the policy fixed
                 // while the live path still failed the run.
                 let mut search = super::open::SuffixSearch::default();
+                // Once for the whole search, not once per candidate: the
+                // ledger lookup and the staging admission each resolved the
+                // same working directory, so a destination already holding a
+                // few thousand numbered files paid two `getcwd` calls per
+                // name before writing a byte.
+                let base = std::env::current_dir().map_err(PipelineError::Io)?;
                 // A name another output in this same run has already claimed
-                // is a taken candidate too, and it arrives as a validation
-                // error rather than an I/O one. Without this the attempt path
-                // aborted on the first collision while the non-attempt path
-                // wrote `out-1.json` and succeeded — the same authored YAML
-                // with opposite outcomes depending on whether a run attempt
-                // happened to be active.
-                // A name another output in this same run has already claimed
-                // is a taken candidate too. Asked of the ledger, because it is
-                // a fact the ledger holds -- not read back out of the wording
-                // of the diagnostic the collision would have produced.
+                // is a taken candidate too. Asked of the ledger, because that
+                // is a fact the ledger holds -- not read back out of the
+                // wording of the diagnostic the collision would have produced,
+                // where rewording a message an author reads would silently
+                // change what this search does.
+                //
+                // Asked twice: once before staging, and once after a staging
+                // failure, because the claim can be recorded by another
+                // producer in between. The ledger is the authority either way,
+                // so the later answer is the same taken name arriving a moment
+                // late rather than a different kind of failure.
                 let mut try_candidate =
                     |path: PathBuf| -> Result<Option<(PathBuf, File)>, PipelineError> {
-                        if self.claimant_of(&path)?.is_some() {
-                            return search
+                        let taken = |search: &mut super::open::SuffixSearch| {
+                            search
                                 .advance_past_taken_name()
                                 .then_some(None)
-                                .ok_or_else(|| claimed_name_search_exhausted(&path));
+                                .ok_or_else(|| claimed_name_search_exhausted(&path))
+                        };
+                        let key = destination_key_in(&path, &base);
+                        if self.claimant_for_key(&key).is_some() {
+                            return taken(&mut search);
                         }
-                        match stage(path) {
+                        match stage(path.clone()) {
                             Ok(output) => Ok(Some(output)),
-                            Err(error) if search.advance(&error) => Ok(None),
-                            Err(error) => Err(error),
+                            Err(error) => {
+                                if self.claimant_for_key(&key).is_some() {
+                                    return taken(&mut search);
+                                }
+                                if search.advance(&error) {
+                                    Ok(None)
+                                } else {
+                                    Err(error)
+                                }
+                            }
                         }
                     };
                 if let Some(output) = try_candidate(bare.clone())? {
@@ -467,15 +486,20 @@ impl OutputStagingRegistry {
         &self,
         final_path: &std::path::Path,
     ) -> Result<Option<(String, PathBuf)>, PipelineError> {
+        let key = destination_key(final_path)?;
+        Ok(self.claimant_for_key(&key))
+    }
+
+    /// The claimant of a destination whose key is already resolved.
+    pub(crate) fn claimant_for_key(&self, key: &str) -> Option<(String, PathBuf)> {
         let state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let key = destination_key(final_path)?;
-        Ok(state
+        state
             .claims
-            .get(&key)
-            .map(|(first_name, first_path)| (first_name.clone(), first_path.clone())))
+            .get(key)
+            .map(|(first_name, first_path)| (first_name.clone(), first_path.clone()))
     }
 
     /// Snapshot all hidden files that remain pending. This is used to report
@@ -796,16 +820,24 @@ fn collision_error(
 }
 
 fn destination_key(path: &std::path::Path) -> Result<String, PipelineError> {
+    if path.is_absolute() {
+        return Ok(destination_key_in(path, std::path::Path::new("")));
+    }
+    let base = std::env::current_dir().map_err(PipelineError::Io)?;
+    Ok(destination_key_in(path, &base))
+}
+
+/// The collision key for a path already resolved against a known base.
+///
+/// A search that tries thousands of candidate names asks the kernel for the
+/// same working directory each time otherwise.
+fn destination_key_in(path: &std::path::Path, base: &std::path::Path) -> String {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map_err(PipelineError::Io)?
-            .join(path)
+        base.join(path)
     };
-    Ok(clinker_plan::config::collision_key(
-        &absolute.to_string_lossy(),
-    ))
+    clinker_plan::config::collision_key(&absolute.to_string_lossy())
 }
 
 fn attempt_error_to_pipeline(error: AttemptError) -> PipelineError {

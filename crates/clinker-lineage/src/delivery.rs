@@ -235,8 +235,19 @@ impl DeliveryQueue {
     /// and `Condvar::wait` releasing it — so contention there says nothing
     /// about capacity, the cap, or the sink. Capacity and shutdown outcomes
     /// are never retried.
-    fn try_push(&self, event: Box<[u8]>, lock_retries: usize) -> QueueAdmission {
-        let event_bytes = event.len();
+    /// Admit one framed record, charged as `event_bytes`.
+    ///
+    /// The buffer carries its record separator so the sink writes it in one
+    /// call, but the separator is framing this format adds rather than
+    /// something the operator authored, and the budget it is admitted against
+    /// is the same number that bounds the event. The slack is one byte per
+    /// queued record, bounded by the reservation.
+    fn try_push(
+        &self,
+        event: Box<[u8]>,
+        event_bytes: usize,
+        lock_retries: usize,
+    ) -> QueueAdmission {
         let mut remaining = lock_retries;
         let mut state = loop {
             match self.state.try_lock() {
@@ -306,18 +317,21 @@ impl CappedEventBuffer {
         }
     }
 
-    /// The bounded event, with no record separator.
+    /// The bounded event followed by its record separator, and the size of
+    /// the event alone.
     ///
-    /// `max_event_bytes` bounds the event an operator authored, not the
-    /// framing the format adds around it, and the queue bounds the bytes it
-    /// is holding. Both are true only while the separator belongs to neither:
-    /// writing it through the cap made the effective limit one byte lower
-    /// than the configured one, and carrying it in the queued buffer made an
-    /// at-cap event fail to enter an empty queue whose size the validator
-    /// requires only to be at least the cap. The sink writes it instead,
-    /// which is where framing belongs.
-    fn finish(self) -> Box<[u8]> {
-        self.bytes.into_boxed_slice()
+    /// The separator is in the buffer so one record is one write: the sink can
+    /// share a handle with the run's own output, and two writes take that
+    /// handle twice, letting an unrelated line land between an event and its
+    /// newline. It is not in the size, because `max_event_bytes` bounds the
+    /// event an operator authored and the queue admits against that same
+    /// number -- charging the framing to either made an event measured at
+    /// exactly the cap fail, once at the cap itself and once at the door of an
+    /// empty queue the validator sized to hold it.
+    fn finish(mut self) -> (Box<[u8]>, usize) {
+        let event_bytes = self.bytes.len();
+        self.bytes.push(b'\n');
+        (self.bytes.into_boxed_slice(), event_bytes)
     }
 }
 
@@ -337,7 +351,10 @@ impl Write for CappedEventBuffer {
 
 /// Outcome of bounding one event into an owned buffer.
 enum SerializedEvent {
-    Bounded(Box<[u8]>),
+    Bounded {
+        framed: Box<[u8]>,
+        event_bytes: usize,
+    },
     TooLarge,
     EncodingFailed,
 }
@@ -355,12 +372,16 @@ fn serialize_event(event: &RunEvent, limit: usize) -> SerializedEvent {
             SerializedEvent::EncodingFailed
         };
     }
-    SerializedEvent::Bounded(buffer.finish())
+    let (framed, event_bytes) = buffer.finish();
+    SerializedEvent::Bounded {
+        framed,
+        event_bytes,
+    }
 }
 
 fn run_worker<W: Write>(queue: &DeliveryQueue, sink: &mut W) -> LineageDeliveryTerminal {
     while let Some(event) = queue.pop() {
-        if let Err(error) = sink.write_all(&event).and_then(|()| sink.write_all(b"\n")) {
+        if let Err(error) = sink.write_all(&event) {
             return LineageDeliveryTerminal::WriteFailed(error.kind());
         }
     }
@@ -435,8 +456,11 @@ impl LineageDelivery {
     }
 
     fn emit(&self, event: &RunEvent, lock_retries: usize) -> LineageAdmission {
-        let bytes = match serialize_event(event, self.config.max_event_bytes) {
-            SerializedEvent::Bounded(bytes) => bytes,
+        let (bytes, event_bytes) = match serialize_event(event, self.config.max_event_bytes) {
+            SerializedEvent::Bounded {
+                framed,
+                event_bytes,
+            } => (framed, event_bytes),
             SerializedEvent::TooLarge => {
                 Counters::increment(&self.counters.dropped);
                 return LineageAdmission::DroppedEventTooLarge;
@@ -446,7 +470,7 @@ impl LineageDelivery {
                 return LineageAdmission::DroppedEncodingFailed;
             }
         };
-        match self.queue.try_push(bytes, lock_retries) {
+        match self.queue.try_push(bytes, event_bytes, lock_retries) {
             QueueAdmission::Accepted => {
                 Counters::increment(&self.counters.accepted);
                 LineageAdmission::Accepted
@@ -538,12 +562,24 @@ mod tests {
             .expect("equal caps are a legal policy");
         let queue = DeliveryQueue::new(config.queue_bytes, config.max_event_bytes);
 
-        let SerializedEvent::Bounded(bytes) = serialize_event(&event, config.max_event_bytes)
+        let SerializedEvent::Bounded {
+            framed,
+            event_bytes,
+        } = serialize_event(&event, config.max_event_bytes)
         else {
             panic!("an event at the cap is within the cap");
         };
+        assert_eq!(
+            event_bytes,
+            exact.len(),
+            "the event is charged, not its framing"
+        );
+        assert_eq!(framed.last(), Some(&b'\n'), "one record is one write");
         assert!(
-            matches!(queue.try_push(bytes, 0), QueueAdmission::Accepted),
+            matches!(
+                queue.try_push(framed, event_bytes, 0),
+                QueueAdmission::Accepted
+            ),
             "and an empty queue of the same size has room for it"
         );
     }
@@ -560,11 +596,11 @@ mod tests {
         let exact = serde_json::to_vec(&event).expect("the probe event serializes");
 
         match serialize_event(&event, exact.len()) {
-            SerializedEvent::Bounded(bytes) => {
+            SerializedEvent::Bounded { event_bytes, .. } => {
                 assert_eq!(
-                    bytes.len(),
+                    event_bytes,
                     exact.len(),
-                    "the queued buffer is the event, and the sink frames it"
+                    "the cap bounds the event, and the framing is charged to neither budget"
                 );
             }
             _ => panic!("an event whose size equals the cap is within the cap"),

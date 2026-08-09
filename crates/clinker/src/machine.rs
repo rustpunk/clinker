@@ -226,7 +226,15 @@ impl MachineEmitter {
         let Some(snapshot) = state.progress.periodic("executing") else {
             return Ok(());
         };
-        state.write_progress(snapshot)
+        let notice = snapshot.event_limit_reached();
+        let written = state.write_progress(snapshot);
+        if written.is_err() && notice {
+            // The notice is a one-shot, and it was spent handing this snapshot
+            // out. Losing its only record would leave the stream stopping with
+            // nothing saying why.
+            state.progress.restore_event_limit_notice();
+        }
+        written
     }
 
     /// Start the periodic liveness worker.
@@ -490,10 +498,15 @@ impl MachineState {
     }
 
     fn write_encoded_event(&mut self, encoded: &[u8]) -> io::Result<()> {
-        self.writer.write_all(encoded)?;
-        self.writer.flush()?;
+        // The number is spent on the attempt, not on the success. A failed
+        // write may have put part of a line on the wire, and a later record
+        // reusing that number would tell a supervisor two different things
+        // under one sequence -- unresolvable from the reading end. Advancing
+        // regardless turns a lost record into a gap in the numbering, which
+        // says exactly what happened: one record did not arrive.
         self.sequence = self.sequence.saturating_add(1);
-        Ok(())
+        self.writer.write_all(encoded)?;
+        self.writer.flush()
     }
 
     fn write_progress(&mut self, snapshot: ProgressSnapshot) -> io::Result<()> {

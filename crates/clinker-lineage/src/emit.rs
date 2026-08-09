@@ -26,7 +26,17 @@ use crate::openlineage::{
 
 /// The input datasets of a run, as bare identities (no facets).
 fn input_identities(lineage: &PlanColumnLineage) -> Vec<Dataset> {
-    lineage.inputs.iter().cloned().map(Dataset::from).collect()
+    lineage
+        .inputs
+        .iter()
+        .cloned()
+        .map(|identity| {
+            let facts = lineage.input_identity_facets.get(&identity);
+            let mut dataset = Dataset::from(identity);
+            dataset.facets = facts.and_then(symlink_facets);
+            dataset
+        })
+        .collect()
 }
 
 /// The alternate identities authorized for a dataset, as the dataset-level
@@ -59,8 +69,11 @@ fn subset_facet(
     DatasetSubsetFacet::new(identity.subsets(), direction)
 }
 
-/// The input datasets of a completed/terminal run with their authorized
-/// standard subset and symlink facets.
+/// The input datasets of a run that finished reading them, with the subset
+/// facet naming the members it actually consumed.
+///
+/// Only a `COMPLETE` may say that. See [`input_identities`] for the shape the
+/// other events use.
 fn inputs_with_identity_facets(lineage: &PlanColumnLineage) -> Vec<Dataset> {
     lineage
         .inputs
@@ -82,13 +95,15 @@ fn inputs_with_identity_facets(lineage: &PlanColumnLineage) -> Vec<Dataset> {
 
 /// The output datasets of a run carrying only what is true regardless of how
 /// the run ended — the shape used on a `START` and on a `FAIL` or `ABORT`
-/// terminal, neither of which has completed column lineage to attach.
+/// terminal, neither of which has a completed claim to make.
 ///
-/// A symlink facet is included: an alternate name for a dataset is a property
-/// of the dataset, not a claim about this run, so a consumer that could
-/// resolve the identity for a successful run could not resolve it for a failed
-/// one, and the failure went unattributed to the dataset the operator was
-/// looking at. The subset facet is a per-run claim and stays out.
+/// One rule, and it applies to inputs the same way (see [`input_identities`]):
+/// a symlink is an alternate name for the dataset wherever it appears, so it
+/// belongs on every event; the subset facet says which members *this run*
+/// touched, so it belongs only where the run finished touching them. Attaching
+/// it to a failed terminal recorded consumption of members a run that died
+/// early never read; omitting the symlink left that failure unattributed to
+/// the dataset an operator would go looking at.
 fn output_identities(lineage: &PlanColumnLineage) -> Vec<Dataset> {
     lineage
         .outputs
@@ -284,7 +299,11 @@ pub fn terminal_event(
         event_type,
         run,
         job: correlated_job(job, &lifecycle.start),
-        inputs: inputs_with_identity_facets(lineage),
+        inputs: if matches!(event_type, EventType::Complete) {
+            inputs_with_identity_facets(lineage)
+        } else {
+            input_identities(lineage)
+        },
         outputs,
     }
 }
@@ -502,6 +521,90 @@ mod tests {
         let back: RunEvent =
             serde_json::from_str(&serde_json::to_string(&complete).unwrap()).expect("round trip");
         assert_eq!(complete, back);
+    }
+
+    /// One rule, both roles, every event. A symlink names the dataset and is
+    /// always true of it; the subset names what this run touched and is only
+    /// true where the run finished touching it. Applying that to outputs and
+    /// not inputs left a failed run claiming it had read members it never
+    /// reached, and left a START unable to resolve an alternate identity that
+    /// a COMPLETE could.
+    #[test]
+    fn only_a_completed_run_claims_which_members_it_touched() {
+        use crate::logical_identity::{
+            DatasetIdentifierType, DatasetSubset, ExternalDatasetIdentity, LineageIdentityContext,
+            LineageNodeBinding, SymlinkIdentifier,
+        };
+
+        let read = LineageNodeBinding::new(
+            "in",
+            ExternalDatasetIdentity::catalog("analytics", "orders").unwrap(),
+        )
+        .with_subset(DatasetSubset::input("dt=2026-08-07").unwrap())
+        .with_symlink(
+            SymlinkIdentifier::new("hive://cluster", "db.orders", DatasetIdentifierType::Table)
+                .unwrap(),
+        );
+        let written = LineageNodeBinding::new(
+            "out",
+            ExternalDatasetIdentity::catalog("analytics", "summary").unwrap(),
+        )
+        .with_subset(DatasetSubset::output("dt=2026-08-07").unwrap())
+        .with_symlink(
+            SymlinkIdentifier::new("hive://cluster", "db.summary", DatasetIdentifierType::Table)
+                .unwrap(),
+        );
+
+        let mut lineage = sample_lineage();
+        lineage.input_identity_facets = BTreeMap::from([(
+            lineage.inputs[0].clone(),
+            LineageIdentityContext::external([read])
+                .unwrap()
+                .require("in")
+                .unwrap()
+                .facets(),
+        )]);
+        lineage.outputs[0].identity_facets = LineageIdentityContext::external([written])
+            .unwrap()
+            .require("out")
+            .unwrap()
+            .facets();
+
+        let start = serde_json::to_value(start_event(&lineage, sample_job(), &start_facts()))
+            .expect("the start event serializes");
+        for terminal in [
+            Terminal::Abort,
+            Terminal::Fail {
+                failure: FailureClassification::for_code("source.data.invalid")
+                    .expect("registered failure"),
+            },
+        ] {
+            let event =
+                serde_json::to_value(terminal_event(&lineage, sample_job(), &lifecycle(terminal)))
+                    .expect("the terminal event serializes");
+            for (role, bucket) in [("inputs", "inputFacets"), ("outputs", "outputFacets")] {
+                let dataset = &event[role][0];
+                assert!(
+                    dataset.get(bucket).is_none() || dataset[bucket].get("subset").is_none(),
+                    "a run that did not finish makes no claim about the {role} it touched"
+                );
+                assert!(
+                    dataset["facets"]["symlinks"]["identifiers"][0]["name"].is_string(),
+                    "but the {role} dataset's other name is true either way"
+                );
+            }
+        }
+        for role in ["inputs", "outputs"] {
+            assert!(
+                start[role][0]["facets"]["symlinks"]["identifiers"][0]["name"].is_string(),
+                "and it is resolvable from the {role} of a START too"
+            );
+            assert!(
+                start[role][0].get("inputFacets").is_none()
+                    && start[role][0].get("outputFacets").is_none(),
+                "a START has touched nothing yet"
+            );
+        }
     }
 
     /// A dataset with no authorized subset carries neither position bucket, so
