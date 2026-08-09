@@ -406,9 +406,14 @@ impl RestRecordSource {
     }
 
     /// GET with bounded transient-failure retry. 5xx and connect/timeout
-    /// errors retry up to `cfg.retries`; a 4xx is a fatal hard error
-    /// (the request is malformed, retrying cannot help). Polls the
-    /// shutdown token between attempts so cancellation lands promptly.
+    /// errors retry up to `cfg.retries`. A 4xx returns without another
+    /// attempt, which is not the same as saying no attempt could ever
+    /// succeed: 408 and 429 are classified retry-with-backoff, because a
+    /// request that was too slow or too frequent can succeed later. This
+    /// loop has no delay to offer them, so it hands that advice to whoever
+    /// supervises the run rather than re-requesting an endpoint that has
+    /// just asked to be left alone. Polls the shutdown token between
+    /// attempts so cancellation lands promptly.
     fn get_with_retry(&self, start_url: &AuthorizedUrl) -> Result<PageResponse, FormatError> {
         let mut attempt: u32 = 0;
         loop {
