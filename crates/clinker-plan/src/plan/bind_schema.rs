@@ -1331,7 +1331,10 @@ pub(crate) fn validate_dlq_per_source(
             } else {
                 format!(
                     "collides with {prev_label} ({prev_path:?}) — these paths name \
-                     the same file on a case-insensitive output filesystem"
+                     the same file: they may differ only in case on a \
+                     case-insensitive output filesystem, differ only in being \
+                     written relatively or absolutely, or reach one directory \
+                     through a symlink"
                 )
             };
             diags.push(Diagnostic::error(
@@ -1409,7 +1412,8 @@ pub(crate) fn validate_output_path_collisions(
                 format!(
                     "collides with {prev_label} ({prev_path:?}) — these paths name the \
                      same file: they may differ only in case on a case-insensitive \
-                     output filesystem, or reach one directory through a symlink"
+                     output filesystem, differ only in being written relatively or \
+                     absolutely, or reach one directory through a symlink"
                 )
             };
             diags.push(Diagnostic::error(

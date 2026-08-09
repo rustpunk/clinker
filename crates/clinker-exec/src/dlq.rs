@@ -178,27 +178,36 @@ pub fn partition_dlq_entries<'a>(
     let mut index_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     // The same identity the plan-time DLQ check uses, so a partition the
     // planner treated as one file is one bucket here rather than two writers
-    // on it.
+    // on it. Resolved once per configured path while the buckets are built:
+    // it consults the filesystem, so asking again per record would both cost
+    // a walk per record and let the answer move under a run that is still
+    // creating its destination directories -- and an entry whose key no
+    // longer matched any bucket had nowhere to go.
     let key_of = |p: &Path| clinker_plan::config::destination_identity(p);
+    let mut bucket_of_source: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    let mut pipeline_bucket = None;
     if let Some(p) = dlq_config.path.as_deref() {
         let pb = PathBuf::from(p);
         index_of.insert(key_of(&pb), 0);
         buckets.push((pb, Vec::new()));
+        pipeline_bucket = Some(0);
     }
-    for path in per_source_paths.values() {
-        index_of.entry(key_of(path)).or_insert_with(|| {
+    for (source, path) in per_source_paths {
+        let index = *index_of.entry(key_of(path.as_path())).or_insert_with(|| {
             buckets.push((path.clone(), Vec::new()));
             buckets.len() - 1
         });
+        bucket_of_source.insert(source.as_ref(), index);
     }
 
     for entry in entries {
-        let target = per_source_paths
+        // By the name the entry carries, not by re-deriving its path's
+        // identity: every destination an entry can have was keyed above, so
+        // this lookup answers from what was decided then.
+        if let Some(&i) = bucket_of_source
             .get(entry.source_name.as_ref())
-            .cloned()
-            .or_else(|| dlq_config.path.as_deref().map(PathBuf::from));
-        if let Some(target) = target
-            && let Some(&i) = index_of.get(&key_of(&target))
+            .or(pipeline_bucket.as_ref())
         {
             buckets[i].1.push(entry);
         }

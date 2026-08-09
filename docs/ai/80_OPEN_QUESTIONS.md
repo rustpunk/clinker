@@ -882,3 +882,20 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   -- to compute a digest most runs never read. Making the digest lazy needs a
   decision about where it is memoized, since the parsed value is discarded
   before the digest's consumers run.
+- **47 (filed 2026-08-09):** The `log` event-shape rule ("one event name, one
+  set of fields") is enforced per node slice, so it holds within the top-level
+  nodes and within each composition body, but a body transform and a top-level
+  transform declaring one event name with different fields are never compared.
+  Threading a shared registry through `validate_node_configs` is not the
+  answer: a composition instantiated twice legitimately repeats its own
+  events, so the same body's directives would collide with themselves. The
+  right place is after composition expansion, where every transform is
+  flattened and each instantiation is already distinct -- which is a different
+  pass from the one the rule lives in today.
+- **48 (filed 2026-08-09):** Every `validate_node_configs` violation -- the
+  per-transform `batch_size` rule, the `log` directive rules, and the new
+  event-shape rule -- surfaces at the top level as a bare
+  `ConfigError::Validation` carrying a message with no diagnostic code and no
+  span, while the same violation inside a composition body is reported as
+  E115 with a span. Giving the family codes and spans is a diagnostics change
+  across all of its members rather than a repair to one of them.
