@@ -811,3 +811,13 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   the vector is built with zero capacity. Removing the remaining cost means
   either an inline-capacity vector (a new dependency) or an arena, both of
   which are approval-gated decisions rather than repairs.
+- **38 (filed 2026-08-09, resolved as designed):** A machine-mode run that
+  cannot install its signal handler exits 4 having written nothing to the
+  protocol stream, so a supervisor reading only the stream sees a process exit
+  without a word. Reviewed and kept: the refusal is deliberately pre-effect --
+  `signal_handler_installation_failure_is_preeffect` asserts the filesystem is
+  untouched and the stream unopened -- and a `started` record would announce a
+  run that never began, which is a worse thing for a stream to say than
+  nothing. The distinct exit status is what carries the fact. Reopening this
+  means deciding whether the protocol should gain a record for "refused before
+  starting", which is a schema change and shares its shape with question 35.

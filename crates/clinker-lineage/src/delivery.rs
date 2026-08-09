@@ -15,8 +15,6 @@ use crate::RunEvent;
 /// contention as a drop. Each attempt yields, and the lock is only ever held
 /// across a `VecDeque` push or pop, so exhausting this bound means something
 /// other than ordinary contention is wrong.
-const PRODUCER_LOCK_RETRIES: usize = 64;
-
 /// How long a producer keeps trying for the queue lock before calling it
 /// contention. Orders of magnitude above the hold time, which is one
 /// `VecDeque` operation, so it only matters when the scheduler is against us.
@@ -234,7 +232,15 @@ impl DeliveryQueue {
     fn new(capacity_bytes: usize, max_event_bytes: usize) -> Self {
         let reserved_events = capacity_bytes.div_ceil(max_event_bytes).min(1_024);
         Self {
-            capacity_bytes,
+            // One byte over the operator's figure, which is the framing of the
+            // single event that may sit exactly at the cap: the validator
+            // accepts `max_event_bytes == queue_bytes` and promises such an
+            // event enters an empty queue. Everything is charged at the size
+            // it actually occupies, so this is the whole of the excess --
+            // charging events and storing records instead left the slack
+            // growing with the number of records queued, which the reservation
+            // does not bound because it is an initial capacity and not a cap.
+            capacity_bytes: capacity_bytes.saturating_add(1),
             state: Mutex::new(QueueState {
                 events: VecDeque::with_capacity(reserved_events),
                 queued_bytes: 0,
@@ -244,44 +250,36 @@ impl DeliveryQueue {
         }
     }
 
-    /// Admit one framed record without waiting on capacity or the sink,
-    /// charged as `event_bytes`.
+    /// Admit one framed record without waiting on capacity or the sink.
     ///
-    /// `lock_retries` bounds how many times the producer re-attempts the
-    /// queue lock itself, alongside a deadline. The lock is held only for the
+    /// `patience` bounds how long the producer re-attempts the queue lock.
+    /// A count of yields was tried alongside it and removed: the two were
+    /// combined so that the count ran first and ignored the deadline, which
+    /// left the wait bounded by the thing the deadline was introduced to
+    /// replace. The lock is held only for the
     /// length of one `VecDeque` push or pop — plus the instant between the
     /// worker taking it and `Condvar::wait` releasing it — so contention there
     /// says nothing about capacity, the cap, or the sink. Capacity and
     /// shutdown outcomes are never retried.
     ///
-    /// The deadline is what actually bounds the wait, because a count of
-    /// yields measures the scheduler rather than the contention: on a loaded
-    /// host the whole budget can be spent inside one hold, and a record was
-    /// dropped for a lock that was free microseconds later. Waiting is still
-    /// bounded and still never involves the sink.
+    /// Time, because a count of yields measures the scheduler rather than the
+    /// contention: on a loaded host a whole count can be spent inside one
+    /// hold, and a record was dropped for a lock that was free microseconds
+    /// later. Waiting is still bounded and still never involves the sink.
     ///
-    /// The buffer carries its record separator so the sink writes it in one
-    /// call, but the separator is framing this format adds rather than
-    /// something the operator authored, and the budget it is admitted against
-    /// is the same number that bounds the event. The slack is one byte per
-    /// queued record, bounded by the reservation, and the charge is stored
-    /// with the record so releasing it credits back exactly what it took.
-    fn try_push(
-        &self,
-        event: Box<[u8]>,
-        event_bytes: usize,
-        lock_retries: usize,
-    ) -> QueueAdmission {
-        let mut remaining = lock_retries;
-        let deadline = Instant::now().checked_add(PRODUCER_LOCK_PATIENCE);
+    /// The record is charged at the size it occupies, separator included; the
+    /// queue's own capacity carries the one byte of framing that the
+    /// at-the-cap promise needs, so nothing has to be admitted against a
+    /// figure different from the one it costs. The charge is stored with the
+    /// record so releasing it credits back exactly what it took.
+    fn try_push(&self, event: Box<[u8]>, patience: Duration) -> QueueAdmission {
+        let deadline = Instant::now().checked_add(patience);
         let mut state = loop {
             match self.state.try_lock() {
                 Ok(state) => break state,
                 Err(TryLockError::WouldBlock)
-                    if remaining > 0
-                        || deadline.is_some_and(|deadline| Instant::now() < deadline) =>
+                    if deadline.is_some_and(|deadline| Instant::now() < deadline) =>
                 {
-                    remaining = remaining.saturating_sub(1);
                     thread::yield_now();
                 }
                 Err(TryLockError::WouldBlock) => return QueueAdmission::Busy,
@@ -291,13 +289,14 @@ impl DeliveryQueue {
         if state.closed {
             return QueueAdmission::Closed;
         }
-        if event_bytes > self.capacity_bytes.saturating_sub(state.queued_bytes) {
+        if event.len() > self.capacity_bytes.saturating_sub(state.queued_bytes) {
             return QueueAdmission::Full;
         }
-        state.queued_bytes += event_bytes;
+        let charge = event.len();
+        state.queued_bytes += charge;
         state.events.push_back(QueuedRecord {
             bytes: event,
-            charge: event_bytes,
+            charge,
         });
         drop(state);
         self.ready.notify_one();
@@ -363,8 +362,7 @@ impl CappedEventBuffer {
     /// number -- charging the framing to either made an event measured at
     /// exactly the cap fail, once at the cap itself and once at the door of an
     /// empty queue the validator sized to hold it.
-    fn finish(mut self) -> (Box<[u8]>, usize) {
-        let event_bytes = self.bytes.len();
+    fn finish(mut self) -> Box<[u8]> {
         self.bytes.push(b'\n');
         // Shrunk to fit on the way out, which costs a copy whenever the
         // reservation ran ahead of the event. That is the point: the
@@ -372,7 +370,7 @@ impl CappedEventBuffer {
         // as the sink is behind, and the queue's accounting is the number of
         // bytes it admitted -- so carrying the spare capacity into the queue
         // would put memory there that nothing is counting.
-        (self.bytes.into_boxed_slice(), event_bytes)
+        self.bytes.into_boxed_slice()
     }
 }
 
@@ -392,10 +390,7 @@ impl Write for CappedEventBuffer {
 
 /// Outcome of bounding one event into an owned buffer.
 enum SerializedEvent {
-    Bounded {
-        framed: Box<[u8]>,
-        event_bytes: usize,
-    },
+    Bounded { framed: Box<[u8]> },
     TooLarge,
     EncodingFailed,
 }
@@ -413,10 +408,8 @@ fn serialize_event(event: &RunEvent, limit: usize) -> SerializedEvent {
             SerializedEvent::EncodingFailed
         };
     }
-    let (framed, event_bytes) = buffer.finish();
     SerializedEvent::Bounded {
-        framed,
-        event_bytes,
+        framed: buffer.finish(),
     }
 }
 
@@ -493,15 +486,12 @@ impl LineageDelivery {
     /// reported by capacity, and byte caps and worker shutdown are reported
     /// on their own terms.
     pub fn try_emit(&self, event: &RunEvent) -> LineageAdmission {
-        self.emit(event, PRODUCER_LOCK_RETRIES)
+        self.emit(event, PRODUCER_LOCK_PATIENCE)
     }
 
-    fn emit(&self, event: &RunEvent, lock_retries: usize) -> LineageAdmission {
-        let (bytes, event_bytes) = match serialize_event(event, self.config.max_event_bytes) {
-            SerializedEvent::Bounded {
-                framed,
-                event_bytes,
-            } => (framed, event_bytes),
+    fn emit(&self, event: &RunEvent, patience: Duration) -> LineageAdmission {
+        let bytes = match serialize_event(event, self.config.max_event_bytes) {
+            SerializedEvent::Bounded { framed } => framed,
             SerializedEvent::TooLarge => {
                 Counters::increment(&self.counters.dropped);
                 return LineageAdmission::DroppedEventTooLarge;
@@ -511,7 +501,7 @@ impl LineageDelivery {
                 return LineageAdmission::DroppedEncodingFailed;
             }
         };
-        match self.queue.try_push(bytes, event_bytes, lock_retries) {
+        match self.queue.try_push(bytes, patience) {
             QueueAdmission::Accepted => {
                 Counters::increment(&self.counters.accepted);
                 LineageAdmission::Accepted
@@ -602,16 +592,12 @@ mod tests {
         let queue = DeliveryQueue::new(exact.len() * 4, exact.len());
 
         for round in 0..64 {
-            let SerializedEvent::Bounded {
-                framed,
-                event_bytes,
-            } = serialize_event(&event, exact.len())
-            else {
+            let SerializedEvent::Bounded { framed } = serialize_event(&event, exact.len()) else {
                 panic!("the probe event is within the cap");
             };
             assert!(
                 matches!(
-                    queue.try_push(framed, event_bytes, 0),
+                    queue.try_push(framed, Duration::ZERO),
                     QueueAdmission::Accepted
                 ),
                 "round {round}: a queue emptied of every record has room again"
@@ -641,22 +627,15 @@ mod tests {
             .expect("equal caps are a legal policy");
         let queue = DeliveryQueue::new(config.queue_bytes, config.max_event_bytes);
 
-        let SerializedEvent::Bounded {
-            framed,
-            event_bytes,
-        } = serialize_event(&event, config.max_event_bytes)
+        let SerializedEvent::Bounded { framed } = serialize_event(&event, config.max_event_bytes)
         else {
             panic!("an event at the cap is within the cap");
         };
-        assert_eq!(
-            event_bytes,
-            exact.len(),
-            "the event is charged, not its framing"
-        );
-        assert_eq!(framed.last(), Some(&b'\n'), "one record is one write");
+        assert_eq!(framed.len(), exact.len() + 1, "one record is one write");
+        assert_eq!(framed.last(), Some(&b'\n'), "and it carries its separator");
         assert!(
             matches!(
-                queue.try_push(framed, event_bytes, 0),
+                queue.try_push(framed, Duration::ZERO),
                 QueueAdmission::Accepted
             ),
             "and an empty queue of the same size has room for it"
@@ -675,11 +654,11 @@ mod tests {
         let exact = serde_json::to_vec(&event).expect("the probe event serializes");
 
         match serialize_event(&event, exact.len()) {
-            SerializedEvent::Bounded { event_bytes, .. } => {
+            SerializedEvent::Bounded { framed } => {
                 assert_eq!(
-                    event_bytes,
-                    exact.len(),
-                    "the cap bounds the event, and the framing is charged to neither budget"
+                    framed.len(),
+                    exact.len() + 1,
+                    "the cap bounds the event the operator authored, not the framing"
                 );
             }
             _ => panic!("an event whose size equals the cap is within the cap"),

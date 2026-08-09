@@ -271,9 +271,10 @@ impl LineageIdentityContext {
         Ok(Self { bindings: by_node })
     }
 
-    /// Consume the immutable external identity portion of a resolved 03-41
-    /// policy.  The policy already rejects partial and ambiguous author forms;
-    /// this boundary additionally validates canonical naming syntax.
+    /// Consume the immutable external identity portion of a resolved lineage
+    /// delivery policy. The policy already rejects partial and ambiguous
+    /// author forms; this boundary additionally validates canonical naming
+    /// syntax.
     pub fn from_resolved(
         policy: &ResolvedLineageDeliveryPolicy,
     ) -> Result<Self, LineageIdentityError> {

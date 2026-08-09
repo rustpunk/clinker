@@ -226,7 +226,7 @@ struct TargetSet {
     /// Resolved where resolution succeeded; otherwise the best identity
     /// available, because a target that will not resolve is still a target and
     /// still counts toward how many the reply named.
-    seen: Vec<Result<AuthorizedUrl, String>>,
+    seen: Vec<Result<AuthorizedUrl, Option<String>>>,
     refusal: Option<ContinuationError>,
 }
 
@@ -236,7 +236,14 @@ impl TargetSet {
             Ok(resolved) => Ok(resolved),
             Err((rendered, error)) => {
                 self.refusal.get_or_insert(error);
-                Err(rendered.unwrap_or_else(|| reference.trim().to_owned()))
+                // A reference that will not resolve has no identity of its
+                // own, and the text the reply happened to use is not one: the
+                // same unusable target written relatively and absolutely
+                // compares unequal that way, so one bad target was counted as
+                // two and reported as a reply naming two different pages. All
+                // of them collapse to a single unresolvable target instead,
+                // which is what the reply names -- one page nobody can fetch.
+                Err(rendered)
             }
         };
         if !self.seen.contains(&entry) {

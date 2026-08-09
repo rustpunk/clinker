@@ -258,11 +258,7 @@ impl MachineEmitter {
     fn emit_periodic(&self) -> ProgressWrite {
         let mut state = self.lock_state();
         let Some(snapshot) = state.progress.periodic("executing") else {
-            return if state.progress.periodic_budget_spent() {
-                ProgressWrite::Exhausted
-            } else {
-                ProgressWrite::Skipped
-            };
+            return ProgressWrite::Skipped;
         };
         let notice = snapshot.event_limit_reached();
         let written = state.write_progress_staged(snapshot);
@@ -323,10 +319,6 @@ impl MachineEmitter {
                         // Only a record that got through says the sink is
                         // alive. A tick with nothing due says nothing.
                         ProgressWrite::Skipped => {}
-                        // Nothing more will be attempted, so the last refusal
-                        // is the last thing that will ever be known and is no
-                        // longer evidence of anything current.
-                        ProgressWrite::Exhausted => failing = None,
                         ProgressWrite::Written => failing = None,
                         // Nothing about a later tick makes an unbuildable
                         // record buildable.
@@ -653,7 +645,7 @@ impl MachineState {
 
     fn write_progress(&mut self, snapshot: ProgressSnapshot) -> io::Result<()> {
         match self.write_progress_staged(snapshot) {
-            ProgressWrite::Skipped | ProgressWrite::Exhausted | ProgressWrite::Written => Ok(()),
+            ProgressWrite::Skipped | ProgressWrite::Written => Ok(()),
             ProgressWrite::Unencodable(error) | ProgressWrite::Unsent(error) => Err(error),
         }
     }
@@ -661,17 +653,22 @@ impl MachineState {
 
 /// How far a progress record got.
 enum ProgressWrite {
-    /// No record was due this tick, so nothing was attempted. Distinct from
-    /// `Written`, which the caller reads as evidence the sink is alive: the
-    /// worker ticks many times per due record, so calling an idle tick a
-    /// success cleared the failing-sink window on almost every pass and the
-    /// window could never elapse.
+    /// Nothing was attempted this tick -- no record was due, or none will be
+    /// due again.
+    ///
+    /// Neither evidence for the sink nor against it, and specifically not a
+    /// success: the worker ticks many times per due record, so counting an
+    /// idle tick as one cleared the failing-sink window on almost every pass
+    /// and the window could never elapse.
+    ///
+    /// It does not clear a latched refusal either. Only a record that got
+    /// through can do that, because only a record that got through shows the
+    /// sink working. When the records stop and the last one was refused, the
+    /// truthful thing to report is that the channel was failing when it was
+    /// last looked at -- concluding it had recovered, on the strength of
+    /// having stopped asking, is how a provably dead channel finished a run
+    /// with nothing said about it.
     Skipped,
-    /// No record will be offered again, so no further evidence about the sink
-    /// can arrive. Distinct from `Skipped`, which means only that none was due
-    /// yet: a window left running on the last refusal after the records stop
-    /// convicts a sink nobody is asking any more.
-    Exhausted,
     Written,
     /// The record could not be built. No later attempt can build it either.
     Unencodable(io::Error),

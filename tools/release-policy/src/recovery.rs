@@ -598,12 +598,12 @@ fn exact_row_ids<'a>(
     expected: impl Iterator<Item = &'a str>,
     label: &str,
 ) -> Result<(), GateError> {
+    // Sequence equality, which subsumes the set comparison this also used to
+    // make: equal sequences have equal sets, and unequal ones already fail
+    // here, so the set clause never decided anything a reader had to weigh.
     let observed = observed.collect::<Vec<_>>();
     let expected = expected.collect::<Vec<_>>();
-    let observed_set = observed.iter().copied().collect::<BTreeSet<_>>();
-    let expected_set = expected.iter().copied().collect::<BTreeSet<_>>();
-    if observed.len() != observed_set.len() || observed_set != expected_set || observed != expected
-    {
+    if observed != expected {
         return Err(policy(format!(
             "{label} rows must match the exact registry"
         )));

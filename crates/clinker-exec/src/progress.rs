@@ -155,17 +155,6 @@ impl BoundedProgress {
         Some(self.snapshot(phase, ProgressKind::Periodic, now, false))
     }
 
-    /// Whether any further periodic record will ever be offered.
-    ///
-    /// A caller judging the liveness sink needs this: once no record is
-    /// offered again, no further evidence about the sink can arrive, and a
-    /// window still running on the last refusal would convict a sink that had
-    /// recovered -- or one that was never asked again.
-    #[must_use]
-    pub fn periodic_budget_spent(&self) -> bool {
-        self.periodic_emitted >= self.max_periodic_events && self.periodic_limit_reported
-    }
-
     /// Give back the one-shot event-limit notice for a record that may not
     /// have arrived.
     ///

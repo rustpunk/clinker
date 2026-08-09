@@ -1012,6 +1012,12 @@ fn main() -> ExitCode {
                 // status is 4 and the environment is what has to change:
                 // another handler already owns these signals, or a sandbox
                 // policy refuses them.
+                //
+                // Nothing is announced either. A `started` record would claim
+                // a run that never began, and the protocol's own rule is that
+                // this refusal leaves no trace at all -- so the supervisor
+                // learns of it from the exit status and stderr, which is why
+                // the status is a distinct one.
                 eprintln!(
                     "clinker: failed to install signal handler: {e}. Correction: run clinker as the process that owns SIGINT and SIGTERM, or relax the sandbox policy that refuses them"
                 );

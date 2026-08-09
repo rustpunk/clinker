@@ -1190,9 +1190,24 @@ impl RateLimiter {
             .saturating_mul(u128::from(self.per_second))
             / 1_000_000_000;
         if refill > 0 {
-            let refill = u64::try_from(refill).unwrap_or(u64::MAX);
-            self.tokens = self.tokens.saturating_add(refill).min(self.capacity);
-            self.last_refill = now;
+            let whole = u64::try_from(refill).unwrap_or(u64::MAX);
+            self.tokens = self.tokens.saturating_add(whole).min(self.capacity);
+            // Advanced by the time those whole tokens cost, not to now. Moving
+            // it to now threw away whatever fraction of the next token had
+            // already accrued, so a caller arriving a little more often than
+            // one token's worth of time lost most of a token every call and
+            // the sustained rate settled below the configured one.
+            let consumed = u128::from(whole)
+                .saturating_mul(1_000_000_000)
+                .checked_div(u128::from(self.per_second))
+                .unwrap_or(0);
+            self.last_refill = u64::try_from(consumed)
+                .ok()
+                .and_then(|nanos| {
+                    self.last_refill
+                        .checked_add(std::time::Duration::from_nanos(nanos))
+                })
+                .unwrap_or(now);
         }
         if self.tokens == 0 {
             return false;
