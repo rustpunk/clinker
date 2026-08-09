@@ -899,3 +899,18 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   span, while the same violation inside a composition body is reported as
   E115 with a span. Giving the family codes and spans is a diagnostics change
   across all of its members rather than a repair to one of them.
+- **49 (filed 2026-08-09, needs a maintainer decision):** A dead-lettered
+  record whose source has no `per_source` DLQ override, in a pipeline with no
+  top-level `error_handling.dlq.path`, has no destination and is dropped.
+  That is the documented contract of `partition_dlq_entries`, but nothing
+  tells the operator: the run counts the record as dead-lettered and writes it
+  nowhere. The right place to catch it is admission -- a pipeline that can
+  dead-letter from a source it has given no sidecar is a configuration gap
+  detectable before any record is read -- which needs the set of
+  dead-letterable sources, available in the plan but not to this function.
+- **50 (filed 2026-08-09):** `destination_identity` falls back to the
+  unresolved path when `current_dir()` fails. Every caller then falls back
+  identically, so two relative spellings still agree with each other; what
+  cannot agree is a relative path against an absolute one naming the same
+  file. There is no better answer without a working directory, and no caller
+  is positioned to supply one, so the case is recorded rather than handled.

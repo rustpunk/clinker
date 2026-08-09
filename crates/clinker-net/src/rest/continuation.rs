@@ -441,12 +441,10 @@ fn parse_link_field(field: &str) -> Result<Vec<String>, ContinuationError> {
                     "rest.protocol.malformed_continuation",
                 ));
             }
-            for parameter in parameters.split(';').skip(1) {
+            for parameter in split_parameters(parameters)? {
                 let parameter = parameter.trim();
                 if parameter.is_empty() {
-                    return Err(ContinuationError::for_code(
-                        "rest.protocol.malformed_continuation",
-                    ));
+                    continue;
                 }
                 let Some((name, value)) = parameter.split_once('=') else {
                     continue;
@@ -515,12 +513,47 @@ fn split_link_values(field: &str) -> Result<Vec<&str>, ContinuationError> {
         ));
     }
     entries.push(&field[start..]);
-    if entries.iter().any(|entry| entry.trim().is_empty()) {
+    // A blank element is noise, not a malformed reply: an empty `Link` header
+    // and a trailing comma both produce one, and both are gateways saying
+    // there is no next page. Refusing the whole field ended the pull with a
+    // protocol error and threw away every record already pulled.
+    entries.retain(|entry| !entry.trim().is_empty());
+    Ok(entries)
+}
+
+/// Split a link's parameters on `;`, ignoring separators inside a quoted
+/// value.
+///
+/// A quoted parameter may contain anything, `;` and `rel=` included. Splitting
+/// on the character alone read one such value as a second `rel`, and a reply
+/// carrying a title or type that happened to contain a semicolon aborted the
+/// pull and discarded everything already extracted.
+fn split_parameters(parameters: &str) -> Result<Vec<&str>, ContinuationError> {
+    let mut parts = Vec::new();
+    let mut start = 0_usize;
+    let mut in_quote = false;
+    let mut escaped = false;
+    for (index, character) in parameters.char_indices() {
+        match character {
+            _ if escaped => escaped = false,
+            '\\' if in_quote => escaped = true,
+            '"' => in_quote = !in_quote,
+            ';' if !in_quote => {
+                parts.push(&parameters[start..index]);
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if in_quote || escaped {
         return Err(ContinuationError::for_code(
             "rest.protocol.malformed_continuation",
         ));
     }
-    Ok(entries)
+    parts.push(&parameters[start..]);
+    // The leading empty part before the first `;`, which the caller has
+    // already required to be there.
+    Ok(parts.split_off(1))
 }
 
 fn unquote(value: &str) -> Result<String, ContinuationError> {
@@ -567,6 +600,43 @@ mod tests {
             headers.append(name.clone(), value.parse().expect("a valid header value"));
         }
         headers
+    }
+
+    /// Header noise a client can resolve is not a malformed reply. A gateway
+    /// with no next page emits an empty `Link` or a trailing comma, and a
+    /// quoted parameter may contain anything the grammar allows -- including
+    /// the characters the field is split on. Refusing either ended the pull
+    /// with a protocol error and discarded every record already extracted.
+    #[test]
+    fn noise_a_client_can_resolve_does_not_end_the_pull() {
+        let (origin, base) =
+            authorize_initial("https://api.example.test/v1/items").expect("initial URL");
+        let next = "<https://api.example.test/v1/items?page=2>; rel=\"next\"";
+
+        for spelling in ["", "   ", &format!("{next},"), &format!(",{next}")] {
+            let read = next_link(
+                &headers_of(ureq::http::header::LINK, &[spelling]),
+                &base,
+                &origin,
+            )
+            .unwrap_or_else(|error| panic!("{spelling:?} is readable, got {error}"));
+            let expected = spelling
+                .contains("rel=")
+                .then_some("https://api.example.test/v1/items?page=2");
+            assert_eq!(read.as_ref().map(AuthorizedUrl::as_str), expected);
+        }
+
+        // A `;` and a `rel=` inside a quoted value belong to the value.
+        let quoted = "<https://api.example.test/v1/items?page=2>; \
+                      title=\"a; rel=first\"; rel=\"next\"";
+        let read = next_link(
+            &headers_of(ureq::http::header::LINK, &[quoted]),
+            &base,
+            &origin,
+        )
+        .expect("a quoted parameter is one parameter")
+        .expect("there is a next page");
+        assert_eq!(read.as_str(), "https://api.example.test/v1/items?page=2");
     }
 
     /// A reply that names one next page twice is not a reply that names two.
