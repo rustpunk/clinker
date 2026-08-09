@@ -756,6 +756,42 @@ fn grace_expiry_forces_reaps_and_retries_fresh() {
     );
 }
 
+/// A sink that refuses a liveness record is not the same as a record that
+/// cannot be built. The first may be a reader that is briefly behind, so the
+/// worker keeps trying and the run finishes normally; the second can never
+/// succeed. Judging both by the error kind got each of them wrong in turn,
+/// and the injected fault only ever fired in the encode stage, so the
+/// keep-trying branch had no test that could reach it.
+#[test]
+fn a_refused_liveness_record_does_not_end_a_healthy_run() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "out.csv", 4_096, true);
+
+    let output = machine_command(directory.path(), "refused-periodic")
+        .env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "periodic_sink")
+        .env("CLINKER_TEST_MACHINE_PROGRESS_TICK_MS", "1")
+        .output()
+        .expect("run with injected periodic sink failure");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a refused observation is not a reason to fail the run\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("\"event\":\"completed\"")),
+        "and the run still reaches its terminal\nstdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"kind\":\"periodic\""),
+        "while every periodic record was in fact refused\nstdout:\n{stdout}"
+    );
+}
+
 /// A periodic snapshot is a discardable observation. Losing one must not
 /// relabel a run that executed to completion as interrupted, abandon its
 /// attempt, and report the conventional SIGINT status for a run no operator

@@ -155,6 +155,19 @@ impl BoundedProgress {
         Some(self.snapshot(phase, ProgressKind::Periodic, now, false))
     }
 
+    /// Give back the one-shot event-limit notice for a record that may not
+    /// have arrived.
+    ///
+    /// The flag is spent when the snapshot is handed out, not when a reader
+    /// sees it. Without this, one failed write of the cap notice silenced the
+    /// stream for the rest of the run with nothing saying why: every later
+    /// call returns `None`, so the record explaining the silence was the one
+    /// record lost. The caller's own retrying is bounded, so re-offering it
+    /// cannot go on forever.
+    pub fn restore_event_limit_notice(&mut self) {
+        self.periodic_limit_reported = false;
+    }
+
     fn snapshot(
         &self,
         phase: &str,

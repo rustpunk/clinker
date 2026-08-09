@@ -67,9 +67,12 @@ Current normal dependencies are intentional: `clinker-plan`, `clinker-record`,
 - No randomness, and no clock in event assembly: the CLI supplies every
   timestamp that appears in an event. Do not add `chrono::Utc::now()`-style
   calls to the emit path.
-- The bounded delivery worker is the one exception, and only for its own
-  deadlines: it reads `Instant::now()` to enforce the configured flush timeout.
-  That clock never reaches an event field.
+- Bounded waits are the exception, and only for their own deadlines: the
+  delivery worker reads `Instant::now()` to enforce the configured flush
+  timeout, and a producer reads it to bound how long it waits for the queue
+  lock before calling the queue contended. Neither clock reaches an event
+  field, which is what the rule above protects: the rule is about what an
+  event says, not about whether a bounded wait may be measured in time.
 
 ## Important invariants
 

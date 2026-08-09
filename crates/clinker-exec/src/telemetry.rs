@@ -1201,13 +1201,15 @@ impl RateLimiter {
         true
     }
 
-    /// Return a token taken for a signal that was then refused elsewhere.
+    /// Return a token taken for a signal the arena then refused for free.
     ///
-    /// The budget exists to bound how many signals reach a collector. A signal
-    /// the arena refused never reaches one, so spending the budget on it let a
-    /// burst of oversized events exhaust the bucket and silence the error the
-    /// operator had configured observability to see -- with the counters
-    /// blaming the rate limit rather than the events that caused it.
+    /// The budget bounds two things at once: how many signals reach a
+    /// collector, and how much work is spent deciding. A refusal that cost
+    /// nothing bounds neither, so charging for it let a burst of drops
+    /// exhaust the bucket and silence the error an operator had configured
+    /// observability to see. A refusal reached by serializing the signal is
+    /// the work the budget exists to bound and stays spent -- see the call
+    /// site, which refunds `Full` and not `Oversize`.
     fn refund(&mut self) {
         self.tokens = self.tokens.saturating_add(1).min(self.capacity);
     }

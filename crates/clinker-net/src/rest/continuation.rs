@@ -108,8 +108,26 @@ pub(crate) fn resolve_and_authorize(
     reference: &str,
     admitted_origin: &Origin,
 ) -> Result<AuthorizedUrl, ContinuationError> {
-    let candidate = resolve(base, reference)?;
-    authorize_origin(candidate, admitted_origin)
+    match resolve_then_authorize(base, reference, admitted_origin) {
+        Ok(url) => Ok(url),
+        Err((_, error)) => Err(error),
+    }
+}
+
+/// Resolve and authorize, keeping what resolution produced when authorization
+/// then refuses it.
+///
+/// The caller comparing targets needs the resolved URL of a refused one, and
+/// resolving a second time to recover it repeated the whole parse for a value
+/// that was already in hand.
+fn resolve_then_authorize(
+    base: &AuthorizedUrl,
+    reference: &str,
+    admitted_origin: &Origin,
+) -> Result<AuthorizedUrl, (Option<String>, ContinuationError)> {
+    let candidate = resolve(base, reference).map_err(|error| (None, error))?;
+    let rendered = candidate.rendered.clone();
+    authorize_origin(candidate, admitted_origin).map_err(|error| (Some(rendered), error))
 }
 
 /// Resolve a reference against the effective response URL, without judging
@@ -166,18 +184,6 @@ fn resolve(base: &AuthorizedUrl, reference: &str) -> Result<AuthorizedUrl, Conti
     parse_absolute(&rendered, "rest.protocol.unresolvable_continuation")
 }
 
-/// What a reference names, as far as resolution can say, for comparison only.
-///
-/// Two spellings of one off-origin page resolve to one URL and are one target;
-/// compared as the raw text the reply happened to use they looked like two,
-/// and a reply naming a single forbidden page was reported as naming two
-/// different ones -- losing the rule that was actually broken. A reference
-/// that will not even resolve has nothing else to be identified by, so it
-/// falls back to what the reply said.
-fn resolved_identity(base: &AuthorizedUrl, reference: &str) -> String {
-    resolve(base, reference).map_or_else(|_| reference.trim().to_owned(), |url| url.rendered)
-}
-
 /// Parse every Link header and resolve exactly one `rel=next` target.
 ///
 /// The conflict this refuses is a reply naming two different next pages, which
@@ -210,11 +216,11 @@ pub(crate) fn next_link(
             .to_str()
             .map_err(|_| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
         for target in parse_link_field(value)? {
-            let entry = match resolve_and_authorize(effective_url, &target, admitted_origin) {
+            let entry = match resolve_then_authorize(effective_url, &target, admitted_origin) {
                 Ok(resolved) => Ok(resolved),
-                Err(error) => {
+                Err((rendered, error)) => {
                     unresolved.get_or_insert(error);
-                    Err(resolved_identity(effective_url, &target))
+                    Err(rendered.unwrap_or_else(|| target.trim().to_owned()))
                 }
             };
             if !targets.contains(&entry) {

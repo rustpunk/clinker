@@ -3,12 +3,12 @@
 use std::io::{self, BufWriter, Write};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clinker_core_types::FailureClassification;
 use clinker_exec::output::attempt::{ArtifactKind, ArtifactState, AttemptPublicationOutcome};
 use clinker_exec::pipeline::shutdown::ShutdownToken;
-use clinker_exec::progress::{BoundedProgress, ProgressSnapshot};
+use clinker_exec::progress::{BoundedProgress, ProgressKind, ProgressSnapshot};
 
 use crate::observability::ObservabilitySummary;
 use crate::{MachineFormat, RunArgs};
@@ -20,17 +20,24 @@ const PUBLICATION_ARTIFACTS_PER_EVENT: usize = 64;
 /// actually reaches the stream; this only bounds how late a due snapshot is.
 const PROGRESS_TICK: Duration = Duration::from_millis(20);
 
-/// Whether a failed liveness write is worth trying again next tick.
+/// How long the liveness worker keeps trying a sink that will not take a
+/// record before it reports the sink as failed.
 ///
-/// Named the other way round, by what ends the worker: a reader that is gone.
-/// No later tick reaches one, so continuing would spin for the rest of the
-/// run. Everything else -- a signal-interrupted write, a momentarily unready
-/// one, a filesystem that is full this second -- says nothing about the next
-/// tick, and listing the few kinds worth retrying instead meant an unlisted
-/// one silently stopped every remaining liveness record on a run that was
-/// still healthy.
-fn is_transient_progress_write(error: &io::Error) -> bool {
-    !matches!(
+/// The error kind cannot answer this. Listing the kinds worth retrying stopped
+/// a healthy run on the first unlisted one; listing the kinds worth giving up
+/// on retried a full filesystem for the rest of the run and reported success,
+/// because a filesystem that is full and a reader that is merely behind
+/// present identically at the first attempt and differ only in whether they
+/// clear. Time is what distinguishes them, so time is what bounds the trying.
+const PROGRESS_SINK_PATIENCE: Duration = Duration::from_secs(5);
+
+/// Whether a failed write means the reader is already gone.
+///
+/// Only the unambiguous cases, which are worth ending on immediately rather
+/// than spending the patience window discovering. Everything else is left to
+/// that window.
+fn reader_is_gone(error: &io::Error) -> bool {
+    matches!(
         error.kind(),
         io::ErrorKind::BrokenPipe
             | io::ErrorKind::ConnectionReset
@@ -233,12 +240,16 @@ impl MachineEmitter {
         let Some(snapshot) = state.progress.periodic("executing") else {
             return ProgressWrite::Written;
         };
-        // The notice is a one-shot and is not given back on a failed write.
-        // The bytes go into a buffered writer, so a write that reports failure
-        // has usually kept them and will send them on a later flush; handing
-        // the flag back produced a fresh notice every tick instead, turning
-        // the bounded stream the notice announces into an unbounded one.
-        state.write_progress_staged(snapshot)
+        let notice = snapshot.event_limit_reached();
+        let written = state.write_progress_staged(snapshot);
+        if notice && !matches!(written, ProgressWrite::Written) {
+            // The notice is a one-shot spent on being handed out. A record
+            // that did not go out has to give it back, or the stream falls
+            // silent for the rest of the run with nothing explaining why --
+            // the one record that explains it being the one that was lost.
+            state.progress.restore_event_limit_notice();
+        }
+        written
     }
 
     /// Start the periodic liveness worker.
@@ -262,6 +273,7 @@ impl MachineEmitter {
         let handle = thread::Builder::new()
             .name("clinker-machine-progress".to_owned())
             .spawn(move || {
+                let mut failing_since: Option<Instant> = None;
                 loop {
                     match receiver.recv_timeout(tick) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -276,14 +288,25 @@ impl MachineEmitter {
                     // killed a healthy run. A closed reader is different: no
                     // later tick can reach it either.
                     match emitter.emit_periodic() {
-                        ProgressWrite::Written => {}
+                        ProgressWrite::Written => failing_since = None,
                         // Nothing about a later tick makes an unbuildable
-                        // record buildable, and a reader that is gone is gone.
+                        // record buildable.
                         ProgressWrite::Unencodable(error) => return Err(error),
-                        ProgressWrite::Unsent(error) if !is_transient_progress_write(&error) => {
+                        ProgressWrite::Unsent(error) if reader_is_gone(&error) => {
                             return Err(error);
                         }
-                        ProgressWrite::Unsent(_) => {}
+                        ProgressWrite::Unsent(error) => {
+                            // A sink that has refused every record for the
+                            // whole window is not behind, it is broken, and
+                            // saying so is the point of this thread. Reporting
+                            // nothing left an orchestrator watching a stream
+                            // that had silently stopped while the run exited
+                            // with its ordinary code.
+                            let since = *failing_since.get_or_insert(Instant::now());
+                            if since.elapsed() >= PROGRESS_SINK_PATIENCE {
+                                return Err(error);
+                            }
+                        }
                     }
                 }
             })?;
@@ -506,6 +529,22 @@ impl MachineState {
         Ok(encoded)
     }
 
+    /// A fault in the sink stage, for the periodic record only.
+    ///
+    /// Gated on the record's own kind, as the encode-stage point is: a
+    /// transition record is written through the same path, and refusing one
+    /// fails the run rather than exercising the branch under test.
+    #[cfg(debug_assertions)]
+    fn injected_sink_failure(&self, kind: ProgressKind) -> Option<io::Error> {
+        let point = std::env::var_os("CLINKER_TEST_MACHINE_WRITE_FAILURE")?;
+        (point.to_string_lossy() == "periodic_sink" && kind == ProgressKind::Periodic).then(|| {
+            io::Error::new(
+                io::ErrorKind::StorageFull,
+                "injected machine sink failure at periodic",
+            )
+        })
+    }
+
     fn write_encoded_event(&mut self, encoded: &[u8]) -> io::Result<()> {
         // The number is spent on the attempt, not on the success. A failed
         // write may have put part of a line on the wire, and a later record
@@ -535,9 +574,10 @@ impl MachineState {
         if self.terminal_reserved {
             return ProgressWrite::Written;
         }
+        let kind = snapshot.kind();
         let progress = serde_json::json!({
             "phase": snapshot.phase(),
-            "kind": snapshot.kind().as_str(),
+            "kind": kind.as_str(),
             "elapsed_ms": snapshot.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         });
         let fields = serde_json::Map::from_iter([
@@ -554,6 +594,11 @@ impl MachineState {
             Ok(encoded) => encoded,
             Err(error) => return ProgressWrite::Unencodable(error),
         };
+        #[cfg(debug_assertions)]
+        if let Some(error) = self.injected_sink_failure(kind) {
+            self.sequence = self.sequence.saturating_add(1);
+            return ProgressWrite::Unsent(error);
+        }
         match self.write_encoded_event(&encoded) {
             Ok(()) => ProgressWrite::Written,
             Err(error) => ProgressWrite::Unsent(error),
@@ -701,7 +746,12 @@ fn injected_write_failure(
         return false;
     };
     match point.to_string_lossy().as_ref() {
-        "periodic" => event == "progress" && fields["progress"]["kind"] == "periodic",
+        // Two periodic points, because the two stages are judged differently
+        // and a fault that only ever fires in one of them leaves the other
+        // branch with no test that can reach it.
+        "periodic" | "periodic_sink" => {
+            event == "progress" && fields["progress"]["kind"] == "periodic"
+        }
         "finalizing" => {
             event == "progress"
                 && fields["progress"]["kind"] == "transition"

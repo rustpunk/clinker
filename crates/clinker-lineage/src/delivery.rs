@@ -342,10 +342,12 @@ struct CappedEventBuffer {
 
 impl CappedEventBuffer {
     fn new(limit: usize) -> Self {
-        // Room for the separator too, so appending it never reallocates a
-        // buffer that filled the reservation exactly.
+        // The clamp first, then room for the separator: adding before
+        // clamping put the byte back where the clamp took it away, so an
+        // event that filled a 64 KiB cap exactly still reallocated on the one
+        // push the headroom exists for.
         Self {
-            bytes: Vec::with_capacity(limit.saturating_add(1).min(64 * 1024)),
+            bytes: Vec::with_capacity((limit.min(64 * 1024)).saturating_add(1)),
             limit,
         }
     }
