@@ -790,6 +790,44 @@ fn a_refused_liveness_record_does_not_end_a_healthy_run() {
         !stdout.contains("\"kind\":\"periodic\""),
         "while every periodic record was in fact refused\nstdout:\n{stdout}"
     );
+    // The distinguishing assertion. A record that cannot be built ends the
+    // worker and is reported here; a record the sink refused is retried and
+    // is not. Without this the test passed through the fatal path while
+    // claiming to cover the retry -- which is exactly what it did, because
+    // the encode-stage injector matched this point too.
+    assert!(
+        !stderr.contains("machine progress channel failed"),
+        "and the worker kept going rather than ending on it\nstderr:\n{stderr}"
+    );
+}
+
+/// A sink that refuses every record for the whole window is not a reader that
+/// is behind, and saying so is the point of the thread. Reporting nothing left
+/// an orchestrator watching a stream that had stopped while the run exited
+/// normally -- which is what happened when an idle tick, of which there are
+/// many per due record, counted as evidence the sink was alive.
+#[test]
+fn a_sink_that_never_recovers_is_reported() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "out.csv", 4_096, true);
+
+    let output = machine_command(directory.path(), "dead-sink")
+        .env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "periodic_sink")
+        .env("CLINKER_TEST_MACHINE_PROGRESS_TICK_MS", "1")
+        .env("CLINKER_TEST_MACHINE_SINK_PATIENCE_MS", "50")
+        .output()
+        .expect("run with a permanently refusing periodic sink");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("machine progress channel failed"),
+        "a sink refusing for the whole window is reported\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "and it is still only an observation: it does not fail the run\nstderr:\n{stderr}"
+    );
 }
 
 /// A periodic snapshot is a discardable observation. Losing one must not

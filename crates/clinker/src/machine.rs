@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use clinker_core_types::FailureClassification;
 use clinker_exec::output::attempt::{ArtifactKind, ArtifactState, AttemptPublicationOutcome};
 use clinker_exec::pipeline::shutdown::ShutdownToken;
-use clinker_exec::progress::{BoundedProgress, ProgressKind, ProgressSnapshot};
+#[cfg(debug_assertions)]
+use clinker_exec::progress::ProgressKind;
+use clinker_exec::progress::{BoundedProgress, ProgressSnapshot};
 
 use crate::observability::ObservabilitySummary;
 use crate::{MachineFormat, RunArgs};
@@ -30,6 +32,20 @@ const PROGRESS_TICK: Duration = Duration::from_millis(20);
 /// present identically at the first attempt and differ only in whether they
 /// clear. Time is what distinguishes them, so time is what bounds the trying.
 const PROGRESS_SINK_PATIENCE: Duration = Duration::from_secs(5);
+
+/// Resolve the failing-sink window.
+///
+/// Overridable in debug builds for the same reason the tick is: a test that
+/// waits out the real window spends five seconds proving one branch.
+fn progress_sink_patience() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(value) = std::env::var_os("CLINKER_TEST_MACHINE_SINK_PATIENCE_MS")
+        && let Ok(millis) = value.to_string_lossy().parse::<u64>()
+    {
+        return Duration::from_millis(millis);
+    }
+    PROGRESS_SINK_PATIENCE
+}
 
 /// Whether a failed write means the reader is already gone.
 ///
@@ -76,6 +92,9 @@ struct MachineState {
     sequence: u64,
     plan_identity: serde_json::Value,
     terminal_reserved: bool,
+    /// Whether the one-shot event-limit notice has already been re-offered
+    /// after a record that did not go out. It is offered again at most once.
+    notice_reoffered: bool,
     /// Classification of a `failed` terminal whose encoding did not fit the
     /// event bound. The slot is still free after such a failure, so this is
     /// what the next terminal attempt must report instead of inventing one.
@@ -170,6 +189,7 @@ impl MachineEmitter {
                 sequence: 0,
                 plan_identity: serde_json::json!({"status": "pending"}),
                 terminal_reserved: false,
+                notice_reoffered: false,
                 attempted_failure: None,
                 observability: None,
                 observability_progress: None,
@@ -238,15 +258,22 @@ impl MachineEmitter {
     fn emit_periodic(&self) -> ProgressWrite {
         let mut state = self.lock_state();
         let Some(snapshot) = state.progress.periodic("executing") else {
-            return ProgressWrite::Written;
+            return ProgressWrite::Skipped;
         };
         let notice = snapshot.event_limit_reached();
         let written = state.write_progress_staged(snapshot);
-        if notice && !matches!(written, ProgressWrite::Written) {
+        if notice && !matches!(written, ProgressWrite::Written) && !state.notice_reoffered {
             // The notice is a one-shot spent on being handed out. A record
             // that did not go out has to give it back, or the stream falls
             // silent for the rest of the run with nothing explaining why --
             // the one record that explains it being the one that was lost.
+            //
+            // Once. A failed write may still have buffered its bytes and sent
+            // them on a later flush, so re-offering can duplicate the notice;
+            // one extra is the price of not going silent, and an unbounded
+            // number is not. A sink that keeps refusing is reported by the
+            // failing-sink window instead.
+            state.notice_reoffered = true;
             state.progress.restore_event_limit_notice();
         }
         written
@@ -273,7 +300,8 @@ impl MachineEmitter {
         let handle = thread::Builder::new()
             .name("clinker-machine-progress".to_owned())
             .spawn(move || {
-                let mut failing_since: Option<Instant> = None;
+                let patience = progress_sink_patience();
+                let mut failing: Option<(Instant, io::Error)> = None;
                 loop {
                     match receiver.recv_timeout(tick) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -288,7 +316,10 @@ impl MachineEmitter {
                     // killed a healthy run. A closed reader is different: no
                     // later tick can reach it either.
                     match emitter.emit_periodic() {
-                        ProgressWrite::Written => failing_since = None,
+                        // Only a record that got through says the sink is
+                        // alive. A tick with nothing due says nothing.
+                        ProgressWrite::Skipped => {}
+                        ProgressWrite::Written => failing = None,
                         // Nothing about a later tick makes an unbuildable
                         // record buildable.
                         ProgressWrite::Unencodable(error) => return Err(error),
@@ -296,17 +327,25 @@ impl MachineEmitter {
                             return Err(error);
                         }
                         ProgressWrite::Unsent(error) => {
-                            // A sink that has refused every record for the
-                            // whole window is not behind, it is broken, and
-                            // saying so is the point of this thread. Reporting
-                            // nothing left an orchestrator watching a stream
-                            // that had silently stopped while the run exited
-                            // with its ordinary code.
-                            let since = *failing_since.get_or_insert(Instant::now());
-                            if since.elapsed() >= PROGRESS_SINK_PATIENCE {
-                                return Err(error);
-                            }
+                            failing.get_or_insert((Instant::now(), error));
                         }
+                    }
+                    // Measured from the first refusal, on every tick. Checked
+                    // only on the ticks that carried a record, it advanced
+                    // once per due record -- a second apart -- so the window
+                    // described a number of records rather than a duration,
+                    // and a run shorter than that many seconds never reached
+                    // it however long its sink had been dead.
+                    if let Some((since, _)) = &failing
+                        && since.elapsed() >= patience
+                    {
+                        // A sink that has refused for the whole window is not
+                        // behind, it is broken, and saying so is the point of
+                        // this thread.
+                        return Err(failing.map_or_else(
+                            || io::Error::other("liveness sink stopped accepting records"),
+                            |(_, error)| error,
+                        ));
                     }
                 }
             })?;
@@ -572,7 +611,7 @@ impl MachineState {
         // handshake — a supervisor that stops reading at the terminal would
         // otherwise be handed one more line it can never attribute.
         if self.terminal_reserved {
-            return ProgressWrite::Written;
+            return ProgressWrite::Skipped;
         }
         let kind = snapshot.kind();
         let progress = serde_json::json!({
@@ -607,7 +646,7 @@ impl MachineState {
 
     fn write_progress(&mut self, snapshot: ProgressSnapshot) -> io::Result<()> {
         match self.write_progress_staged(snapshot) {
-            ProgressWrite::Written => Ok(()),
+            ProgressWrite::Skipped | ProgressWrite::Written => Ok(()),
             ProgressWrite::Unencodable(error) | ProgressWrite::Unsent(error) => Err(error),
         }
     }
@@ -615,6 +654,12 @@ impl MachineState {
 
 /// How far a progress record got.
 enum ProgressWrite {
+    /// No record was due this tick, so nothing was attempted. Distinct from
+    /// `Written`, which the caller reads as evidence the sink is alive: the
+    /// worker ticks many times per due record, so calling an idle tick a
+    /// success cleared the failing-sink window on almost every pass and the
+    /// window could never elapse.
+    Skipped,
     Written,
     /// The record could not be built. No later attempt can build it either.
     Unencodable(io::Error),
@@ -746,12 +791,11 @@ fn injected_write_failure(
         return false;
     };
     match point.to_string_lossy().as_ref() {
-        // Two periodic points, because the two stages are judged differently
-        // and a fault that only ever fires in one of them leaves the other
-        // branch with no test that can reach it.
-        "periodic" | "periodic_sink" => {
-            event == "progress" && fields["progress"]["kind"] == "periodic"
-        }
+        // Only the encode stage. `periodic_sink` is the sink-stage point and
+        // is matched there; claiming it here shadowed it, because encoding
+        // runs first -- so the branch the sink point exists to reach was
+        // still unreachable and its test passed through the fatal path.
+        "periodic" => event == "progress" && fields["progress"]["kind"] == "periodic",
         "finalizing" => {
             event == "progress"
                 && fields["progress"]["kind"] == "transition"
@@ -844,6 +888,7 @@ mod tests {
             sequence: 0,
             plan_identity: serde_json::json!({"status": "resolved"}),
             terminal_reserved: false,
+            notice_reoffered: false,
             attempted_failure: None,
             observability: None,
             observability_progress: None,

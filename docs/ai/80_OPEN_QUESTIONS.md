@@ -781,3 +781,14 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   of the grammar is a pagination failure against a real server, and this file
   has now been repaired twice for exactly that class of defect. No behavior
   change is proposed here; the decision is which way to close it.
+- **35 (filed 2026-08-09, needs a maintainer decision):** When the machine
+  protocol's liveness worker gives up on a sink that has refused records for
+  the whole patience window, the only report is a `tracing` warning on stderr.
+  A supervisor consuming the protocol stream alone still sees an ordinary
+  successful terminal and cannot learn the liveness channel died. The two
+  obvious in-band answers are both blocked: the stream itself is the thing
+  that failed, so a record announcing it may not arrive either, and the
+  bulkhead rule says a delivery outcome never determines process status, so
+  the exit code must not change. Closing this properly means a schema-2 field
+  on the terminal record stating whether the liveness channel survived, which
+  is a protocol change rather than a repair.
