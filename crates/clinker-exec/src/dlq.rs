@@ -169,9 +169,11 @@ pub fn partition_dlq_entries<'a>(
     // case-insensitive output filesystem (macOS APFS / Windows NTFS default)
     // `errors.csv` and `Errors.csv` name one physical file; keying buckets on
     // the raw `PathBuf` would open two writers onto it and let the per-source
-    // and pipeline-wide records overwrite each other. Folding is conditional on
-    // the actual target filesystem (the same `collision_key` the config-time
-    // check uses), so case-sensitive Linux still keeps distinct files distinct.
+    // and pipeline-wide records overwrite each other. Two paths are one file
+    // through the same `destination_identity` the config-time check uses --
+    // case folding conditional on the actual target filesystem, a symlinked
+    // parent resolved, a relative and an absolute spelling reconciled -- so
+    // case-sensitive Linux still keeps distinct files distinct.
     // The bucket's display `PathBuf` is the first path that claimed the key —
     // pipeline-wide wins, matching the static check's first-insertion-wins.
     let mut buckets: Vec<(PathBuf, Vec<&'a DlqEntry>)> = Vec::new();
