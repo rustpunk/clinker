@@ -176,7 +176,10 @@ pub fn partition_dlq_entries<'a>(
     // pipeline-wide wins, matching the static check's first-insertion-wins.
     let mut buckets: Vec<(PathBuf, Vec<&'a DlqEntry>)> = Vec::new();
     let mut index_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let key_of = |p: &Path| clinker_plan::config::collision_key(&p.to_string_lossy());
+    // The same identity the plan-time DLQ check uses, so a partition the
+    // planner treated as one file is one bucket here rather than two writers
+    // on it.
+    let key_of = |p: &Path| clinker_plan::config::destination_identity(p);
     if let Some(p) = dlq_config.path.as_deref() {
         let pb = PathBuf::from(p);
         index_of.insert(key_of(&pb), 0);

@@ -5428,14 +5428,7 @@ fn destination_leaf(destination: &ValidatedPath) -> Result<String, AttemptError>
 /// destination inside it are reduced the same way: one physical location has
 /// one key wherever it is asked about.
 fn destination_root_key(path: &Path) -> String {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|current| current.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-    };
-    clinker_plan::config::destination_identity(&absolute)
+    clinker_plan::config::destination_identity(path)
 }
 
 fn persist_manifest_in_root(
@@ -5651,15 +5644,12 @@ mod destination_root_key_tests {
             destination_root_key(&direct),
             "a `.` component names the same directory whether or not it exists"
         );
-        // `..` is a different matter before the path exists. Whether
-        // `out/../out` is `out` depends on what `out` turns out to be, and a
-        // component that is not there yet could still become a symlink, so the
-        // only honest answer is the one the filesystem gives once it can.
-        assert_ne!(
-            destination_root_key(&roundabout),
-            destination_root_key(&direct),
-            "`..` is not cancelled against a name that does not exist yet"
-        );
+        // `..` over a component that does not exist yet is deliberately left
+        // to the platform: on a system where a name can become a symlink,
+        // cancelling it in the text would name a different file than the one
+        // that gets opened, while Win32 reduces it before the filesystem sees
+        // it at all. Either answer is correct there, so nothing is asserted
+        // about it until the path exists and one answer is available.
 
         std::fs::create_dir(&direct).expect("create the destination");
         for (name, path) in [

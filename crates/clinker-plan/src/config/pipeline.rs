@@ -572,13 +572,6 @@ impl PipelineConfig {
         // ── Stage 6: D3b — log directive sanity ─────────────────────
         // Mirrors the `validate_config` pass but against the nodes:
         // taxonomy directly (so new-shape YAML is covered too).
-        // One event name means one event shape, across the whole pipeline. A
-        // collector groups records by that name and carries no node identity,
-        // so two transforms publishing the same name with different fields
-        // hand it records nothing downstream can tell apart. Several
-        // transforms emitting the *same* event is legitimate and stays legal.
-        let mut event_shapes: std::collections::BTreeMap<&str, (&str, Vec<&str>)> =
-            std::collections::BTreeMap::new();
         for spanned in &self.nodes {
             let (name, log) = match &spanned.value {
                 PipelineNode::Transform { header, config } => {
@@ -593,27 +586,6 @@ impl PipelineConfig {
                     format!("transform {name:?}: {error}"),
                     span_for(spanned),
                 ));
-            }
-            for directive in directives {
-                let fields: Vec<&str> = directive.fields.as_ref().map_or_else(Vec::new, |fields| {
-                    fields.iter().map(String::as_str).collect()
-                });
-                match event_shapes.get(directive.name.as_str()) {
-                    Some((first, first_fields)) if *first_fields != fields => {
-                        diags.push(Diagnostic::error(
-                            "E011",
-                            format!(
-                                "transform {name:?}: `log` event {:?} is also declared by transform {first:?} with different fields; one event name carries one set of fields",
-                                directive.name
-                            ),
-                            span_for(spanned),
-                        ));
-                    }
-                    Some(_) => {}
-                    None => {
-                        event_shapes.insert(directive.name.as_str(), (name, fields));
-                    }
-                }
             }
         }
 
@@ -5323,6 +5295,16 @@ pub(crate) fn validate_node_configs(nodes: &[Spanned<PipelineNode>]) -> Vec<Node
     }
 
     // Validate log directives on Transform nodes.
+    //
+    // One event name carries one set of fields across every transform checked
+    // together, because a collector groups records by that name and holds no
+    // node identity: two transforms publishing different fields under one name
+    // hand it records nothing downstream can separate. Several transforms
+    // emitting the same event stay legal. The rule lives here rather than
+    // beside the top-level nodes so a transform inside a composition body is
+    // held to it too.
+    let mut event_shapes: std::collections::BTreeMap<&str, (&str, Vec<&str>)> =
+        std::collections::BTreeMap::new();
     for (node_index, spanned) in nodes.iter().enumerate() {
         if let PipelineNode::Transform {
             header,
@@ -5335,6 +5317,32 @@ pub(crate) fn validate_node_configs(nodes: &[Spanned<PipelineNode>]) -> Vec<Node
                     node_index,
                     message: format!("transform '{}': {error}", header.name),
                 });
+            }
+            for directive in directives {
+                // Compared as a set: `[a, b]` and `[b, a]` request the same
+                // fields, and an event is its fields rather than their order.
+                let mut fields: Vec<&str> =
+                    directive.fields.as_ref().map_or_else(Vec::new, |fields| {
+                        fields.iter().map(String::as_str).collect()
+                    });
+                fields.sort_unstable();
+                fields.dedup();
+                match event_shapes.get(directive.name.as_str()) {
+                    Some((first, first_fields)) if *first_fields != fields => {
+                        violations.push(NodeConfigViolation {
+                            node_index,
+                            message: format!(
+                                "transform '{}': `log` event '{}' is also declared by transform '{first}' with different fields; one event name carries one set of fields",
+                                header.name, directive.name
+                            ),
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        event_shapes
+                            .insert(directive.name.as_str(), (header.name.as_str(), fields));
+                    }
+                }
             }
         }
     }

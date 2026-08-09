@@ -870,3 +870,15 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   resolution was added to remove, in the one case the walk cannot cross. A
   correct answer needs the share root treated as resolvable in its own right;
   it needs a Windows host to verify, which this branch has only through CI.
+- **45 (filed 2026-08-09):** The per-directory case-sensitivity memo in
+  `fs_type.rs` is process-global and never invalidated. Within one run that is
+  sound -- the answer is a property of the volume -- but a long-lived embedder
+  that removed a directory and recreated the path on a different volume would
+  get the earlier answer. Bounding it means either scoping the memo to a run
+  (the natural owner is the staging registry, which does not currently reach
+  this function) or keying it on volume identity rather than path.
+- **46 (filed 2026-08-09):** `CompositionFile::parse` parses every composition
+  YAML twice -- once into the typed form and once into a `serde_json::Value`
+  -- to compute a digest most runs never read. Making the digest lazy needs a
+  decision about where it is memoized, since the parsed value is discarded
+  before the digest's consumers run.

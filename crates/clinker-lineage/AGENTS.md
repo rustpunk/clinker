@@ -21,9 +21,10 @@ is a plan-time, read-only consumer of `clinker-plan`: it never runs pipelines.
   value-carrying reads, INDIRECT influence for reads in route / cull / combine
   predicates.
 - Assemble run events (`emit`): a static `START`/`COMPLETE` pair for the
-  plan-derived `run --lineage` export, or live run-lifecycle events via
-  `emit::LiveRunEmitter` (a `START` at run begin, a terminal
-  `COMPLETE`/`FAIL`/`ABORT` carrying real run stats).
+  plan-derived `run --lineage` export, or live run-lifecycle events built from
+  `RunLifecycleFacts` -- a `START` at run begin, a terminal
+  `COMPLETE`/`FAIL`/`ABORT` carrying real run stats -- and handed to the
+  bounded delivery worker in `delivery`.
 - Own the OpenLineage wire model and NDJSON writer (`openlineage`), pinned to
   core spec `2-0-2` and `ColumnLineageDatasetFacet` `1-2-0`; structs are
   hand-rolled against the published JSON Schema because no general-purpose
@@ -31,10 +32,15 @@ is a plan-time, read-only consumer of `clinker-plan`: it never runs pipelines.
 
 ## Important public APIs
 
-- `column_lineage(...)` -> `PlanColumnLineage` / `OutputColumnLineage`
+- `column_lineage_external(...)` / `column_lineage_local_diagnostic_paths(...)`
+  -> `PlanColumnLineage` / `OutputColumnLineage`
 - `dataset_identity(...)` / `DatasetId`
 - `run_events(...)`, `start_event(...)`, `terminal_event(...)`, `RunStats`,
-  `Terminal`, `LiveRunEmitter`
+  `Terminal`, `RunLifecycleFacts` / `RunLifecycleStartFacts` /
+  `RunLifecycleTerminalFacts`
+- `LineageDelivery` and its `LineageDeliveryConfig` / `LineageAdmission` /
+  `LineageDeliveryOutcome` / `LineageDeliveryTerminal`
+- `LineageIdentityContext` / `LineageIdentityError`
 - `openlineage::write_ndjson` plus the event/facet model re-exports
 
 ## Internal module map

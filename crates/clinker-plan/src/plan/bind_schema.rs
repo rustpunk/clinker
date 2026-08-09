@@ -1408,7 +1408,8 @@ pub(crate) fn validate_output_path_collisions(
             } else {
                 format!(
                     "collides with {prev_label} ({prev_path:?}) — these paths name the \
-                     same file on a case-insensitive output filesystem"
+                     same file: they may differ only in case on a case-insensitive \
+                     output filesystem, or reach one directory through a symlink"
                 )
             };
             diags.push(Diagnostic::error(

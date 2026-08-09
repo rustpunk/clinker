@@ -337,9 +337,19 @@ fn probe_case_sensitive(dir: &Path) -> io::Result<bool> {
 /// are not the same: when the component before it is a symlink, the kernel
 /// follows the link and then goes up from where it lands, so cancelling the
 /// pair lexically names a different file than the one that will be opened.
+/// A relative path is resolved against the working directory first, so the
+/// same file named relatively in one place and absolutely in another has one
+/// identity. Leaving that to callers is what let the plan-time check and the
+/// runtime ledger key one destination two ways and report a pipeline clean
+/// that the run then refused.
 #[must_use]
 pub fn destination_identity(path: &Path) -> String {
-    collision_key(&resolved_prefix(&without_cur_dir(path)).to_string_lossy())
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    };
+    collision_key(&resolved_prefix(&without_cur_dir(&absolute)).to_string_lossy())
 }
 
 /// `path` with its `.` components dropped.

@@ -845,6 +845,8 @@ fn destination_key_in(path: &std::path::Path, base: &std::path::Path) -> String 
     } else {
         base.join(path)
     };
+    // Already absolute here, because a search resolves its base once rather
+    // than per candidate; the identity would otherwise do it every time.
     clinker_plan::config::destination_identity(&absolute)
 }
 
