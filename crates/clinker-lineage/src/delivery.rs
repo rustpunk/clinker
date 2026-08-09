@@ -17,6 +17,11 @@ use crate::RunEvent;
 /// other than ordinary contention is wrong.
 const PRODUCER_LOCK_RETRIES: usize = 64;
 
+/// How long a producer keeps trying for the queue lock before calling it
+/// contention. Orders of magnitude above the hold time, which is one
+/// `VecDeque` operation, so it only matters when the scheduler is against us.
+const PRODUCER_LOCK_PATIENCE: Duration = Duration::from_millis(50);
+
 /// Fixed delivery limits copied from the admitted workspace policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LineageDeliveryConfig {
@@ -243,11 +248,17 @@ impl DeliveryQueue {
     /// charged as `event_bytes`.
     ///
     /// `lock_retries` bounds how many times the producer re-attempts the
-    /// queue lock itself. The lock is held only for the length of one
-    /// `VecDeque` push or pop — plus the instant between the worker taking it
-    /// and `Condvar::wait` releasing it — so contention there says nothing
-    /// about capacity, the cap, or the sink. Capacity and shutdown outcomes
-    /// are never retried.
+    /// queue lock itself, alongside a deadline. The lock is held only for the
+    /// length of one `VecDeque` push or pop — plus the instant between the
+    /// worker taking it and `Condvar::wait` releasing it — so contention there
+    /// says nothing about capacity, the cap, or the sink. Capacity and
+    /// shutdown outcomes are never retried.
+    ///
+    /// The deadline is what actually bounds the wait, because a count of
+    /// yields measures the scheduler rather than the contention: on a loaded
+    /// host the whole budget can be spent inside one hold, and a record was
+    /// dropped for a lock that was free microseconds later. Waiting is still
+    /// bounded and still never involves the sink.
     ///
     /// The buffer carries its record separator so the sink writes it in one
     /// call, but the separator is framing this format adds rather than
@@ -262,11 +273,15 @@ impl DeliveryQueue {
         lock_retries: usize,
     ) -> QueueAdmission {
         let mut remaining = lock_retries;
+        let deadline = Instant::now().checked_add(PRODUCER_LOCK_PATIENCE);
         let mut state = loop {
             match self.state.try_lock() {
                 Ok(state) => break state,
-                Err(TryLockError::WouldBlock) if remaining > 0 => {
-                    remaining -= 1;
+                Err(TryLockError::WouldBlock)
+                    if remaining > 0
+                        || deadline.is_some_and(|deadline| Instant::now() < deadline) =>
+                {
+                    remaining = remaining.saturating_sub(1);
                     thread::yield_now();
                 }
                 Err(TryLockError::WouldBlock) => return QueueAdmission::Busy,
@@ -327,8 +342,10 @@ struct CappedEventBuffer {
 
 impl CappedEventBuffer {
     fn new(limit: usize) -> Self {
+        // Room for the separator too, so appending it never reallocates a
+        // buffer that filled the reservation exactly.
         Self {
-            bytes: Vec::with_capacity(limit.min(64 * 1024)),
+            bytes: Vec::with_capacity(limit.saturating_add(1).min(64 * 1024)),
             limit,
         }
     }
@@ -347,6 +364,12 @@ impl CappedEventBuffer {
     fn finish(mut self) -> (Box<[u8]>, usize) {
         let event_bytes = self.bytes.len();
         self.bytes.push(b'\n');
+        // Shrunk to fit on the way out, which costs a copy whenever the
+        // reservation ran ahead of the event. That is the point: the
+        // reservation is sized for the cap, the queue holds these for as long
+        // as the sink is behind, and the queue's accounting is the number of
+        // bytes it admitted -- so carrying the spare capacity into the queue
+        // would put memory there that nothing is counting.
         (self.bytes.into_boxed_slice(), event_bytes)
     }
 }

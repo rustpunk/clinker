@@ -490,9 +490,14 @@ impl TelemetryProducer {
         }
 
         // The token is spent before the arena is asked, because asking needs
-        // the same lock and the limiter is what bounds how often we ask. A
-        // refusal gives it back: the budget counts signals that were exported,
-        // and a signal the arena refused was not one.
+        // the same lock and the limiter is what bounds how often we ask.
+        //
+        // Given back only when the refusal cost nothing. A full arena is
+        // detected before the signal is serialized, so charging for it let a
+        // burst of drops exhaust the budget and silence the error an operator
+        // configured observability to see. An oversize is detected by
+        // serializing into the slot and finding it does not fit -- that work
+        // is what the budget exists to bound, so it stays spent.
         match shared.admit(lane, signal) {
             Ok(bytes) => {
                 let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
@@ -506,14 +511,10 @@ impl TelemetryProducer {
                 AdmissionOutcome::Dropped(DropReason::Full)
             }
             Err(DropReason::Oversize) => {
-                shared.rate.refund();
                 self.stats.oversize.fetch_add(1, Ordering::Relaxed);
                 AdmissionOutcome::Dropped(DropReason::Oversize)
             }
-            Err(reason) => {
-                shared.rate.refund();
-                AdmissionOutcome::Dropped(reason)
-            }
+            Err(reason) => AdmissionOutcome::Dropped(reason),
         }
     }
 }

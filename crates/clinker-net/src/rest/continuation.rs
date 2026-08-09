@@ -108,6 +108,14 @@ pub(crate) fn resolve_and_authorize(
     reference: &str,
     admitted_origin: &Origin,
 ) -> Result<AuthorizedUrl, ContinuationError> {
+    let candidate = resolve(base, reference)?;
+    authorize_origin(candidate, admitted_origin)
+}
+
+/// Resolve a reference against the effective response URL, without judging
+/// which origin it landed on. Syntax only; [`resolve_and_authorize`] adds the
+/// origin and downgrade rules on top.
+fn resolve(base: &AuthorizedUrl, reference: &str) -> Result<AuthorizedUrl, ContinuationError> {
     let reference = reference.trim();
     if reference.is_empty() || reference.bytes().any(|byte| byte.is_ascii_control()) {
         return Err(ContinuationError::for_code(
@@ -155,8 +163,19 @@ pub(crate) fn resolve_and_authorize(
         )
     };
 
-    let candidate = parse_absolute(&rendered, "rest.protocol.unresolvable_continuation")?;
-    authorize_origin(candidate, admitted_origin)
+    parse_absolute(&rendered, "rest.protocol.unresolvable_continuation")
+}
+
+/// What a reference names, as far as resolution can say, for comparison only.
+///
+/// Two spellings of one off-origin page resolve to one URL and are one target;
+/// compared as the raw text the reply happened to use they looked like two,
+/// and a reply naming a single forbidden page was reported as naming two
+/// different ones -- losing the rule that was actually broken. A reference
+/// that will not even resolve has nothing else to be identified by, so it
+/// falls back to what the reply said.
+fn resolved_identity(base: &AuthorizedUrl, reference: &str) -> String {
+    resolve(base, reference).map_or_else(|_| reference.trim().to_owned(), |url| url.rendered)
 }
 
 /// Parse every Link header and resolve exactly one `rel=next` target.
@@ -195,7 +214,7 @@ pub(crate) fn next_link(
                 Ok(resolved) => Ok(resolved),
                 Err(error) => {
                     unresolved.get_or_insert(error);
-                    Err(target)
+                    Err(resolved_identity(effective_url, &target))
                 }
             };
             if !targets.contains(&entry) {

@@ -253,10 +253,12 @@ impl OutputStagingRegistry {
             IfExistsPolicy::Error if cli_force => PromotionDisposition::Replace,
             IfExistsPolicy::Error | IfExistsPolicy::UniqueSuffix => PromotionDisposition::NoReplace,
         };
-        let stage = |path: PathBuf| self.stage_attempt_candidate(kind, &name, disposition, path);
+        let stage = |path: PathBuf, base: Option<&Path>| {
+            self.stage_attempt_candidate(kind, &name, disposition, path, base)
+        };
         match policy {
-            IfExistsPolicy::Overwrite => stage(bare),
-            IfExistsPolicy::Error => match stage(bare.clone()) {
+            IfExistsPolicy::Overwrite => stage(bare, None),
+            IfExistsPolicy::Error => match stage(bare.clone(), None) {
                 Err(error) if !cli_force && attempt_is_already_exists(&error) => {
                     Err(attempt_existing_output_error(&bare))
                 }
@@ -300,7 +302,7 @@ impl OutputStagingRegistry {
                             search.advance_past_taken_name();
                             return Ok(None);
                         }
-                        match stage(path.clone()) {
+                        match stage(path.clone(), Some(&base)) {
                             Ok(output) => Ok(Some(output)),
                             Err(error) => {
                                 if self.claimant_for_key(&key).is_some() {
@@ -337,6 +339,7 @@ impl OutputStagingRegistry {
         name: &str,
         disposition: PromotionDisposition,
         final_path: PathBuf,
+        base: Option<&Path>,
     ) -> Result<(PathBuf, File), PipelineError> {
         let attempt = self
             .attempt
@@ -346,9 +349,19 @@ impl OutputStagingRegistry {
                 node: name.to_owned(),
                 detail: "attempt-owned output registry has no run attempt".to_owned(),
             })?;
-        let base = std::env::current_dir().map_err(PipelineError::Io)?;
+        // Resolved by the caller when it is walking candidates, so a search
+        // over a directory already holding thousands of numbered files does
+        // not ask the kernel for the same answer once per name.
+        let owned;
+        let base = match base {
+            Some(base) => base,
+            None => {
+                owned = std::env::current_dir().map_err(PipelineError::Io)?;
+                &owned
+            }
+        };
         let destination =
-            validate_path(&final_path, &base, final_path.is_absolute()).map_err(|diagnostic| {
+            validate_path(&final_path, base, final_path.is_absolute()).map_err(|diagnostic| {
                 PipelineError::Config(ConfigError::Validation(format!(
                     "{}: {}",
                     diagnostic.code, diagnostic.message
@@ -797,9 +810,10 @@ impl OutputStagingRegistry {
     }
 }
 
-/// Whether this candidate name is already claimed by another output of the
-/// same run, which the registry reports as a validation error rather than an
-/// I/O one because no file was involved.
+/// The diagnostic for two producers in one run resolving to one destination.
+///
+/// Reported as a validation error rather than an I/O one because no file was
+/// involved: the second producer never reached the filesystem.
 fn collision_error(
     name: &str,
     final_path: &std::path::Path,

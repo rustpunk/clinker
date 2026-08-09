@@ -20,24 +20,31 @@ const PUBLICATION_ARTIFACTS_PER_EVENT: usize = 64;
 /// actually reaches the stream; this only bounds how late a due snapshot is.
 const PROGRESS_TICK: Duration = Duration::from_millis(20);
 
+/// Whether a failed liveness write is worth trying again next tick.
+///
+/// Named the other way round, by what ends the worker: a reader that is gone.
+/// No later tick reaches one, so continuing would spin for the rest of the
+/// run. Everything else -- a signal-interrupted write, a momentarily unready
+/// one, a filesystem that is full this second -- says nothing about the next
+/// tick, and listing the few kinds worth retrying instead meant an unlisted
+/// one silently stopped every remaining liveness record on a run that was
+/// still healthy.
+fn is_transient_progress_write(error: &io::Error) -> bool {
+    !matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+    )
+}
+
 /// Resolve the worker's wake cadence.
 ///
 /// Overridable in debug builds because a run that finishes inside one tick
 /// emits no periodic observation at all, which leaves the fault-injection
 /// tests racing a real timer against how fast the host reads the fixture
 /// rather than asserting the behaviour they name.
-/// Whether a failed liveness write is worth trying again next tick.
-///
-/// A signal-interrupted or momentarily-unready write says nothing about the
-/// next one. A closed or broken destination does: no later tick reaches a
-/// reader that is gone, so continuing would spin for the rest of the run.
-fn is_transient_progress_write(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-    )
-}
-
 fn progress_tick() -> Duration {
     #[cfg(debug_assertions)]
     if let Some(value) = std::env::var_os("CLINKER_TEST_MACHINE_PROGRESS_TICK_MS")
@@ -221,20 +228,17 @@ impl MachineEmitter {
     /// protocol allows to be missing. A control channel that is genuinely
     /// broken still fails closed at the next *required* record — the
     /// finalizing transition or the terminal.
-    fn emit_periodic(&self) -> io::Result<()> {
+    fn emit_periodic(&self) -> ProgressWrite {
         let mut state = self.lock_state();
         let Some(snapshot) = state.progress.periodic("executing") else {
-            return Ok(());
+            return ProgressWrite::Written;
         };
-        let notice = snapshot.event_limit_reached();
-        let written = state.write_progress(snapshot);
-        if written.is_err() && notice {
-            // The notice is a one-shot, and it was spent handing this snapshot
-            // out. Losing its only record would leave the stream stopping with
-            // nothing saying why.
-            state.progress.restore_event_limit_notice();
-        }
-        written
+        // The notice is a one-shot and is not given back on a failed write.
+        // The bytes go into a buffered writer, so a write that reports failure
+        // has usually kept them and will send them on a later flush; handing
+        // the flag back produced a fresh notice every tick instead, turning
+        // the bounded stream the notice announces into an unbounded one.
+        state.write_progress_staged(snapshot)
     }
 
     /// Start the periodic liveness worker.
@@ -271,10 +275,15 @@ impl MachineEmitter {
                     // nothing said so; a supervisor watching for liveness then
                     // killed a healthy run. A closed reader is different: no
                     // later tick can reach it either.
-                    if let Err(error) = emitter.emit_periodic()
-                        && !is_transient_progress_write(&error)
-                    {
-                        return Err(error);
+                    match emitter.emit_periodic() {
+                        ProgressWrite::Written => {}
+                        // Nothing about a later tick makes an unbuildable
+                        // record buildable, and a reader that is gone is gone.
+                        ProgressWrite::Unencodable(error) => return Err(error),
+                        ProgressWrite::Unsent(error) if !is_transient_progress_write(&error) => {
+                            return Err(error);
+                        }
+                        ProgressWrite::Unsent(_) => {}
                     }
                 }
             })?;
@@ -509,14 +518,22 @@ impl MachineState {
         self.writer.flush()
     }
 
-    fn write_progress(&mut self, snapshot: ProgressSnapshot) -> io::Result<()> {
+    /// Write a progress record, saying which stage failed if one did.
+    ///
+    /// The two stages fail for unrelated reasons and only one of them can
+    /// succeed on a later attempt. Building the record depends on nothing but
+    /// the record, so a failure there will repeat identically every tick;
+    /// handing it to the sink depends on the reader, which may simply be
+    /// behind. Judging them by error kind instead put a permanent encoding
+    /// fault into a loop that retried it for the rest of the run.
+    fn write_progress_staged(&mut self, snapshot: ProgressSnapshot) -> ProgressWrite {
         // The terminal record is the last record of a run. A progress writer
         // runs on its own thread and can still be mid-tick when the run ends,
         // so the reservation is what orders them rather than the shutdown
         // handshake — a supervisor that stops reading at the terminal would
         // otherwise be handed one more line it can never attribute.
         if self.terminal_reserved {
-            return Ok(());
+            return ProgressWrite::Written;
         }
         let progress = serde_json::json!({
             "phase": snapshot.phase(),
@@ -533,8 +550,32 @@ impl MachineState {
                 }),
             ),
         ]);
-        self.write_event("progress", fields)
+        let encoded = match self.encode_event("progress", fields, self.sequence) {
+            Ok(encoded) => encoded,
+            Err(error) => return ProgressWrite::Unencodable(error),
+        };
+        match self.write_encoded_event(&encoded) {
+            Ok(()) => ProgressWrite::Written,
+            Err(error) => ProgressWrite::Unsent(error),
+        }
     }
+
+    fn write_progress(&mut self, snapshot: ProgressSnapshot) -> io::Result<()> {
+        match self.write_progress_staged(snapshot) {
+            ProgressWrite::Written => Ok(()),
+            ProgressWrite::Unencodable(error) | ProgressWrite::Unsent(error) => Err(error),
+        }
+    }
+}
+
+/// How far a progress record got.
+enum ProgressWrite {
+    Written,
+    /// The record could not be built. No later attempt can build it either.
+    Unencodable(io::Error),
+    /// The record was built but the sink refused it. The next tick may fare
+    /// better, unless the reader is gone.
+    Unsent(io::Error),
 }
 
 fn failure_fields(

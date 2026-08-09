@@ -736,21 +736,34 @@ pub(crate) fn is_observability_toml_error(text: &str, error: &toml::de::Error) -
 /// escapes several characters differently: a diagnostic is meant to hand the
 /// author something they can paste back, and a name rendered in the wrong
 /// escape syntax gives them a second parse error instead of a fix.
+///
+/// Through the serializer's *key* position specifically. Asking it to render
+/// the same text as a value spells a newline-bearing name as a multi-line
+/// string, which TOML does not accept as a key at all -- so the correction
+/// was unparseable in exactly the case the quoting exists to handle.
 fn render_path(path: &[String]) -> String {
     path.iter()
-        .map(|segment| {
-            if !segment.is_empty()
-                && segment
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-            {
-                segment.clone()
-            } else {
-                toml::Value::String(segment.clone()).to_string()
-            }
-        })
+        .map(|segment| render_key(segment))
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// One key segment as TOML spells it in key position.
+fn render_key(segment: &str) -> String {
+    if !segment.is_empty()
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return segment.to_owned();
+    }
+    let mut table = toml::Table::new();
+    table.insert(segment.to_owned(), toml::Value::Integer(0));
+    let rendered = table.to_string();
+    rendered
+        .trim_end()
+        .rsplit_once(" = ")
+        .map_or_else(|| segment.to_owned(), |(key, _)| key.to_owned())
 }
 
 /// Whether a table's key path is inside the observability policy.
@@ -1585,6 +1598,26 @@ mod diagnostic_scanner_tests {
                 declared(not_a_header),
                 None,
                 "{not_a_header:?} declares no table"
+            );
+        }
+    }
+
+    /// A rendered path is TOML an author can paste. It is produced in key
+    /// position, because the same serializer asked for a value spells a
+    /// newline-bearing name as a multi-line string -- which TOML does not
+    /// accept as a key, so the correction failed to parse in exactly the case
+    /// the quoting exists to handle.
+    #[test]
+    fn a_rendered_path_parses_back_as_the_table_it_names() {
+        for segment in ["plain", "a.b", "a\nb", "a\"b", "a\u{7f}b", "", "with space"] {
+            let path = vec!["observability".to_owned(), segment.to_owned()];
+            let rendered = super::render_path(&path);
+            let document = format!("[{rendered}]\n");
+            let parsed = super::declared_table(&document, "")
+                .unwrap_or_else(|| panic!("{segment:?} renders a header TOML accepts: {document}"));
+            assert_eq!(
+                parsed, path,
+                "{segment:?} round trips through its rendering"
             );
         }
     }
