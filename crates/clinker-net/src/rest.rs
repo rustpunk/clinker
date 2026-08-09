@@ -424,17 +424,12 @@ impl RestRecordSource {
                     Ok(response) => response,
                     Err(error) => {
                         let failure = RequestFailure::from_transport(&error);
-                        // A 4xx is the server refusing, and retrying it cannot
-                        // help — except for the two that are not refusals.
-                        // Throttling and a request timeout ask for later, so
-                        // they break into the retry loop like a 5xx rather
-                        // than returning here. Labelling them retryable
-                        // without this changed only what the run said about
-                        // itself: it still abandoned the batch on the first
-                        // 429, while now claiming it had backed off.
-                        if matches!(failure, RequestFailure::HttpStatus(400..=499))
-                            && !matches!(failure, RequestFailure::HttpStatus(408 | 429))
-                        {
+                        // Every 4xx returns here, including the two that ask
+                        // for later rather than refusing: this loop has no
+                        // delay to offer them, so retrying would only hurry
+                        // the server that asked us to slow down. They are
+                        // classified retryable so the supervisor waits.
+                        if matches!(failure, RequestFailure::HttpStatus(400..=499)) {
                             return Err(self.sanitized_request_failure(
                                 &url,
                                 attempt.saturating_add(1),
@@ -466,9 +461,19 @@ impl RestRecordSource {
                     url = target;
                     continue;
                 }
-                // Retried for the same reason a 5xx is: the server asked for
-                // later rather than refusing.
-                if (500..600).contains(&status) || matches!(status, 408 | 429) {
+                // Deliberately not retried in this loop, which sleeps for
+                // nothing between attempts. Re-requesting a throttled endpoint
+                // `retries` times without pause answers "please wait" by
+                // asking again immediately, and providers that escalate turn
+                // that into a ban — worse than either giving up or waiting.
+                //
+                // The classification still says retry-with-backoff, which is
+                // advice to whoever supervises this run and does have a delay
+                // to apply. Honouring it here needs a bounded, shutdown-aware
+                // wait that this reader does not have; adding one is worth
+                // doing and is a change of its own, because the 5xx path below
+                // retries with no pause either.
+                if (500..600).contains(&status) {
                     break RequestFailure::HttpStatus(status);
                 }
                 if !(200..300).contains(&status) {

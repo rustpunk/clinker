@@ -1429,15 +1429,14 @@ fn authored_location(text: &str, offset: usize) -> (String, &str) {
     let mut table = String::new();
     for candidate in lines.iter().take(line_index.saturating_add(1)) {
         let trimmed = candidate.trim();
-        if let Some(inner) = trimmed
-            .strip_prefix("[[")
-            .and_then(|value| value.strip_suffix("]]"))
-        {
-            table = inner.to_owned();
-        } else if let Some(inner) = trimmed
-            .strip_prefix('[')
-            .and_then(|value| value.strip_suffix(']'))
-        {
+        // Through the same predicate `table_body` uses, so the two agree on
+        // which header a line declares. Requiring the line to end in `]` here
+        // meant a header carrying a trailing comment attributed the error to
+        // the table above it, with a correction naming a key the author never
+        // wrote in that table — the very misattribution the header matching
+        // was tightened to prevent, still live on the path that reports it.
+        if let Some(header) = header_on_line(trimmed) {
+            let inner = header.trim_start_matches('[').trim_end_matches(']');
             table = inner.to_owned();
         }
     }
@@ -1445,7 +1444,20 @@ fn authored_location(text: &str, offset: usize) -> (String, &str) {
 }
 
 fn key_on_line(line: &str) -> Option<&str> {
-    let key = line.split_once('=')?.0.trim();
+    let raw = line.split_once('=')?.0.trim();
+    // TOML permits a quoted key, and an author who writes `"mode" = "bearer"`
+    // has written `mode`. Reading the quotes as part of the name made the
+    // required-key check report a key missing that was present and correct,
+    // sending the author to fix something they had already done while their
+    // real mistake went unnamed.
+    let key = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            raw.strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(raw);
     (!key.is_empty()
         && key
             .bytes()
