@@ -4143,9 +4143,11 @@ impl AttemptPublication {
         let mut claims = BTreeMap::new();
         let mut destination_roots = BTreeMap::new();
         for registration in &registrations {
-            let destination_key = clinker_plan::config::collision_key(
-                &registration.destination.as_path().to_string_lossy(),
-            );
+            // The same identity the destination roots below are keyed on, so
+            // two registrations naming one file through different spellings
+            // are one claim rather than two admitted side by side.
+            let destination_key =
+                clinker_plan::config::destination_identity(registration.destination.as_path());
             if let Some(first) =
                 claims.insert(destination_key, registration.producer_label.as_str())
             {
@@ -5644,13 +5646,20 @@ mod destination_root_key_tests {
         let indirect = root.path().join(".").join("out");
         let roundabout = root.path().join("out").join("..").join("out");
 
-        for (name, path) in [("indirect", &indirect), ("roundabout", &roundabout)] {
-            assert_eq!(
-                destination_root_key(path),
-                destination_root_key(&direct),
-                "{name} names the same directory before it exists"
-            );
-        }
+        assert_eq!(
+            destination_root_key(&indirect),
+            destination_root_key(&direct),
+            "a `.` component names the same directory whether or not it exists"
+        );
+        // `..` is a different matter before the path exists. Whether
+        // `out/../out` is `out` depends on what `out` turns out to be, and a
+        // component that is not there yet could still become a symlink, so the
+        // only honest answer is the one the filesystem gives once it can.
+        assert_ne!(
+            destination_root_key(&roundabout),
+            destination_root_key(&direct),
+            "`..` is not cancelled against a name that does not exist yet"
+        );
 
         std::fs::create_dir(&direct).expect("create the destination");
         for (name, path) in [
@@ -5661,7 +5670,7 @@ mod destination_root_key_tests {
             assert_eq!(
                 destination_root_key(path),
                 destination_root_key(&direct),
-                "{name} still names it once it does"
+                "{name} names it once the filesystem can answer"
             );
         }
     }

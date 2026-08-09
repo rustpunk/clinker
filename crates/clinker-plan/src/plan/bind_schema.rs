@@ -1287,7 +1287,7 @@ pub(crate) fn validate_dlq_per_source(
     let mut paths: HashMap<String, (String, String)> = HashMap::new();
     if let Some(p) = dlq.path.as_deref() {
         paths.insert(
-            crate::config::collision_key(p),
+            crate::config::destination_identity(std::path::Path::new(p)),
             (p.to_string(), "error_handling.dlq.path".to_string()),
         );
     }
@@ -1317,7 +1317,7 @@ pub(crate) fn validate_dlq_per_source(
         }
         if let Some(p) = per.path.as_deref()
             && let Some((prev_path, prev_label)) = paths.insert(
-                crate::config::collision_key(p),
+                crate::config::destination_identity(std::path::Path::new(p)),
                 (
                     p.to_string(),
                     format!("error_handling.dlq.per_source.{src_name}.path"),
@@ -1351,11 +1351,12 @@ pub(crate) fn validate_dlq_per_source(
 /// APFS / Windows NTFS) paths differing only in case (`out.csv` / `Out.csv`)
 /// name one file.
 ///
-/// Case is folded conditionally via [`crate::config::collision_key`] — the
-/// same primitive the DLQ collision check uses — so two legitimately-distinct
-/// files on case-sensitive Linux are not flagged. Paths are compared
-/// as-authored; collisions that only emerge after path-template token
-/// resolution are left to runtime. DLQ-vs-DLQ collisions stay owned by
+/// Keyed through [`crate::config::destination_identity`] — the same identity
+/// the runtime staging registry uses — so a collision the run would refuse is
+/// refused here instead, before any record is read. Case is folded
+/// conditionally within it, so two legitimately-distinct files on
+/// case-sensitive Linux are not flagged. Collisions that only emerge after
+/// path-template token resolution are still left to runtime. DLQ-vs-DLQ collisions stay owned by
 /// [`validate_dlq_per_source`] (E318): this pass seeds the map with DLQ paths
 /// only to catch Output-vs-DLQ overlap, and never re-reports a DLQ-only
 /// collision.
@@ -1372,14 +1373,14 @@ pub(crate) fn validate_output_path_collisions(
     if let Some(dlq) = dlq {
         if let Some(p) = dlq.path.as_deref() {
             paths.insert(
-                crate::config::collision_key(p),
+                crate::config::destination_identity(std::path::Path::new(p)),
                 (p.to_string(), "error_handling.dlq.path".to_string()),
             );
         }
         for (src_name, per) in &dlq.per_source {
             if let Some(p) = per.path.as_deref() {
                 paths.insert(
-                    crate::config::collision_key(p),
+                    crate::config::destination_identity(std::path::Path::new(p)),
                     (
                         p.to_string(),
                         format!("error_handling.dlq.per_source.{src_name}.path"),
@@ -1399,7 +1400,7 @@ pub(crate) fn validate_output_path_collisions(
         }
         let name = config.output.name.as_str();
         if let Some((prev_path, prev_label)) = paths.insert(
-            crate::config::collision_key(p),
+            crate::config::destination_identity(std::path::Path::new(p)),
             (p.to_string(), format!("output {name:?}")),
         ) {
             let collide_note = if prev_path == p {

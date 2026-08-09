@@ -852,3 +852,21 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   duplication as open question 33 seen from the test-support side; whatever
   single carrier resolves 33 should absorb these too, so the count is one
   place rather than four.
+- **43 (filed 2026-08-09, needs a maintainer decision):** `collision_key`
+  folds case with `to_ascii_lowercase`, so on a case-insensitive volume two
+  paths differing only in a non-ASCII letter's case (`Ärger.csv` and
+  `ärger.csv`) are one file to the filesystem and two keys to us -- both
+  producers admitted, one file written twice. Folding correctly needs Unicode
+  simple case folding, and the exact fold a volume applies is filesystem
+  specific (NTFS uses a frozen table, APFS a normalization-insensitive one),
+  so this is a dependency-and-semantics decision rather than a repair. The
+  present fold is the safe direction for the case-sensitive default: it never
+  merges two paths a filesystem might keep distinct.
+- **44 (filed 2026-08-09):** `destination_identity` returns the path
+  unresolved when the walk up reaches a component with no parent, which on
+  Windows includes a UNC share root. A destination on a share that is
+  momentarily unreachable therefore gets a different identity than the same
+  destination once the share responds -- the same before/after divergence the
+  resolution was added to remove, in the one case the walk cannot cross. A
+  correct answer needs the share root treated as resolvable in its own right;
+  it needs a Windows host to verify, which this branch has only through CI.

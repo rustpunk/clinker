@@ -207,7 +207,31 @@ pub fn case_sensitive_dir(path: &Path) -> io::Result<bool> {
             "no existing ancestor directory to probe for case-sensitivity",
         )
     })?;
-    probe_case_sensitive(&dir)
+    remembered_case_sensitivity(&dir)
+}
+
+/// The probe result for a directory, asked of the filesystem once.
+///
+/// The probe creates and removes a file, and the answer is a property of the
+/// volume rather than of the moment. A search over numbered candidate names in
+/// one directory asks for a key per candidate, which without this writes and
+/// unlinks a file per candidate in the directory it is about to write into.
+fn remembered_case_sensitivity(dir: &Path) -> io::Result<bool> {
+    static REMEMBERED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, bool>>,
+    > = std::sync::OnceLock::new();
+    let remembered =
+        REMEMBERED.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    if let Ok(seen) = remembered.lock()
+        && let Some(answer) = seen.get(dir)
+    {
+        return Ok(*answer);
+    }
+    let answer = probe_case_sensitive(dir)?;
+    if let Ok(mut seen) = remembered.lock() {
+        seen.insert(dir.to_path_buf(), answer);
+    }
+    Ok(answer)
 }
 
 /// Walk up from `path`'s parent to the first directory that exists. Returns
@@ -297,20 +321,6 @@ fn probe_case_sensitive(dir: &Path) -> io::Result<bool> {
     Ok(!insensitive)
 }
 
-/// Canonical collision key for an output path: the key under which two paths
-/// are considered to name the *same physical file*.
-///
-/// On a case-insensitive output filesystem (macOS APFS / Windows NTFS default)
-/// paths differing only in case resolve to one file, so their keys must
-/// coincide; on a case-sensitive one they are distinct files and must not. Case
-/// is folded *conditionally* — only when [`case_sensitive_dir`] reports the
-/// target filesystem folds it — so two legitimately-distinct files on
-/// case-sensitive Linux are never falsely merged. A probe failure falls back to
-/// the raw (case-sensitive) key, the safe default that never merges two paths
-/// the filesystem might keep distinct.
-///
-/// Both the config-time DLQ-collision check and the runtime DLQ partitioner key
-/// on this single function so their notions of "same file" cannot drift.
 /// The identity of a destination path: one physical location, one key.
 ///
 /// Two producers naming one file must be recognised as naming one file, and a
@@ -318,30 +328,26 @@ fn probe_case_sensitive(dir: &Path) -> io::Result<bool> {
 /// checked afterwards. Both need the path reduced the same way, so both go
 /// through here rather than each keying on the text it happens to hold.
 ///
-/// The reduction is lexical first -- `a/./b` and `a/b` are one path -- and
-/// then resolves the longest prefix that exists, which is what makes a
-/// symlinked parent and its target the same destination. What does not exist
-/// yet cannot be resolved and is kept as written.
+/// `.` components are dropped first, because they never change which file a
+/// path names. The longest existing prefix is then resolved, which is what
+/// makes a symlinked parent and its target one destination; what does not
+/// exist yet cannot be resolved and is kept as written.
+///
+/// `..` is left to that resolution rather than applied to the text. The two
+/// are not the same: when the component before it is a symlink, the kernel
+/// follows the link and then goes up from where it lands, so cancelling the
+/// pair lexically names a different file than the one that will be opened.
 #[must_use]
 pub fn destination_identity(path: &Path) -> String {
-    collision_key(&resolved_prefix(&lexically_reduced(path)).to_string_lossy())
+    collision_key(&resolved_prefix(&without_cur_dir(path)).to_string_lossy())
 }
 
-/// `path` with `.` removed and `..` applied to the component before it.
-fn lexically_reduced(path: &Path) -> std::path::PathBuf {
-    let mut reduced = std::path::PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if !reduced.pop() {
-                    reduced.push(component.as_os_str());
-                }
-            }
-            other => reduced.push(other.as_os_str()),
-        }
-    }
-    reduced
+/// `path` with its `.` components dropped.
+fn without_cur_dir(path: &Path) -> std::path::PathBuf {
+    path.components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .map(std::path::Component::as_os_str)
+        .collect()
 }
 
 /// `path` with its longest existing prefix canonicalized.
@@ -366,6 +372,20 @@ fn resolved_prefix(path: &Path) -> std::path::PathBuf {
     }
 }
 
+/// Canonical collision key for an output path: the key under which two paths
+/// are considered to name the *same physical file*.
+///
+/// On a case-insensitive output filesystem (macOS APFS / Windows NTFS default)
+/// paths differing only in case resolve to one file, so their keys must
+/// coincide; on a case-sensitive one they are distinct files and must not. Case
+/// is folded *conditionally* — only when [`case_sensitive_dir`] reports the
+/// target filesystem folds it — so two legitimately-distinct files on
+/// case-sensitive Linux are never falsely merged. A probe failure falls back to
+/// the raw (case-sensitive) key, the safe default that never merges two paths
+/// the filesystem might keep distinct.
+///
+/// Both the config-time DLQ-collision check and the runtime DLQ partitioner key
+/// on this single function so their notions of "same file" cannot drift.
 pub fn collision_key(path: &str) -> String {
     if case_sensitive_dir(Path::new(path)).unwrap_or(true) {
         path.to_string()
@@ -746,5 +766,44 @@ mod tests {
             !p.exists(),
             "ProbeFile must remove its file even while the stack unwinds"
         );
+    }
+
+    /// One physical location, one identity. `.` never changes which file a
+    /// path names, so it is dropped; a symlinked parent and its target are the
+    /// same place, so the existing prefix is resolved; and `..` is left to
+    /// that resolution, because cancelling it against a symlink names a
+    /// different file than the kernel will open.
+    #[test]
+    fn one_location_has_one_identity() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).expect("create the real directory");
+
+        let direct = real.join("out.csv");
+        assert_eq!(
+            destination_identity(&real.join(".").join("out.csv")),
+            destination_identity(&direct),
+            "a `.` component names the same file"
+        );
+
+        #[cfg(unix)]
+        {
+            let link = root.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).expect("link to the real directory");
+            assert_eq!(
+                destination_identity(&link.join("out.csv")),
+                destination_identity(&direct),
+                "and so does a symlinked parent, which is what the resolution is for"
+            );
+
+            // `link/../out.csv` is `<root>/out.csv` only if `..` is cancelled
+            // against the link's own name; the kernel resolves the link first
+            // and goes up from `real`, which is the same place.
+            assert_eq!(
+                destination_identity(&link.join("..").join("out.csv")),
+                destination_identity(&root.path().join("out.csv")),
+                "`..` after a symlink goes up from where the link lands"
+            );
+        }
     }
 }

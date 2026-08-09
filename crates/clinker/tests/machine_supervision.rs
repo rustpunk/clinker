@@ -914,10 +914,16 @@ fn sigterm_inside_a_rest_read_records_an_abort_lineage_terminal() {
         sigterm_sent_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("supervisor sent SIGTERM");
-        // Drop the connection without a response. The child is blocked inside
-        // the request when the signal trips, so the transport failure lands
-        // after cancellation and the reader reports the interruption rather
-        // than reaching a clean page boundary.
+        // The signal has been sent, not yet handled. What this test is about
+        // is the order of the two: the reader must already know the run is
+        // cancelled when the connection goes away, or it reads the drop as an
+        // ordinary transport failure and reports infrastructure instead of an
+        // abort. Delivery and handling are separated by the child's scheduler,
+        // so the drop waits well past any plausible gap rather than racing it.
+        std::thread::sleep(Duration::from_millis(250));
+        // Then drop without a response. The child is blocked inside the
+        // request, so the teardown lands after cancellation and the reader
+        // reports the interruption rather than a clean page boundary.
         drop(stream);
     });
 
