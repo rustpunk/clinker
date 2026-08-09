@@ -805,15 +805,6 @@ mod tests {
             "a `.` component names the same file"
         );
 
-        // A `..` further along must not cost the prefix in front of it its
-        // resolution. What the `..` itself names is left as written -- see
-        // open question 52.
-        assert_eq!(
-            destination_identity(&real.join("later").join("..").join("out.csv")),
-            destination_identity(&real.join(".").join("later").join("..").join("out.csv")),
-            "the prefix in front of a `..` is resolved"
-        );
-
         #[cfg(unix)]
         {
             let link = root.path().join("link");
@@ -822,6 +813,26 @@ mod tests {
                 destination_identity(&link.join("out.csv")),
                 destination_identity(&direct),
                 "and so does a symlinked parent, which is what the resolution is for"
+            );
+
+            // A `..` further along must not cost the prefix in front of it its
+            // resolution. Asserted through the link, because comparing two
+            // spellings that reduce to the same text proves nothing: what is
+            // being checked is that the prefix was resolved at all. What the
+            // `..` itself names is left as written -- see open question 52.
+            let through_link = link.join("later").join("..").join("out.csv");
+            assert!(
+                destination_identity(&through_link).starts_with(
+                    &destination_identity(&real)
+                        .trim_end_matches("out.csv")
+                        .to_owned()
+                ),
+                "the prefix in front of a `..` is resolved through the link"
+            );
+            assert_eq!(
+                destination_identity(&through_link),
+                destination_identity(&real.join("later").join("..").join("out.csv")),
+                "so the link and its target agree either side of one"
             );
 
             // `link/../out.csv` is `<root>/out.csv` only if `..` is cancelled

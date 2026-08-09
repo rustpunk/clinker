@@ -261,9 +261,9 @@ struct FieldPolicyConfig {
 
 /// Non-blocking behavior for a full preallocated observability queue.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ObservabilityDropPolicy {
     #[default]
-    #[serde(rename = "drop-newest")]
     DropNewest,
 }
 
@@ -1345,7 +1345,7 @@ fn parse_correction(field: &str, key: Option<&str>) -> Box<str> {
     } else {
         match field {
             "observability.drop_policy" | "observability.lineage.drop_policy" => {
-                "set `drop_policy = \"drop-newest\"`".to_owned()
+                "set `drop_policy = \"drop_newest\"`".to_owned()
             }
             "observability.lineage.identity_mode" => {
                 "set `identity_mode = \"external\"`, or explicitly select `identity_mode = \"local_diagnostic_paths\"` for local-only compatibility".to_owned()

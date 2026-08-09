@@ -26,7 +26,7 @@ high_severity_lane_bytes = "{high}"
 max_batch_bytes = "512B"
 max_attributes_per_event = 4
 max_attribute_bytes = "64B"
-drop_policy = "drop-newest"
+drop_policy = "drop_newest"
 sample_every = 1
 rate_limit_per_second = 1000
 rate_limit_burst = 1000
@@ -46,7 +46,7 @@ mode = "none"
 [observability.lineage]
 queue_bytes = "1KB"
 max_event_bytes = "512B"
-drop_policy = "drop-newest"
+drop_policy = "drop_newest"
 flush_timeout_ms = 500
 identity_mode = "local_diagnostic_paths"
 
@@ -121,7 +121,7 @@ high_severity_lane_bytes = "{high}"
 max_batch_bytes = "512B"
 max_attributes_per_event = 8
 max_attribute_bytes = "{max_attribute}"
-drop_policy = "drop-newest"
+drop_policy = "drop_newest"
 sample_every = {sample_every}
 rate_limit_per_second = {rate_limit_per_second}
 rate_limit_burst = {rate_limit_burst}
@@ -141,7 +141,7 @@ mode = "none"
 [observability.lineage]
 queue_bytes = "1KB"
 max_event_bytes = "512B"
-drop_policy = "drop-newest"
+drop_policy = "drop_newest"
 flush_timeout_ms = 500
 identity_mode = "local_diagnostic_paths"
 {field_policy}

@@ -31,7 +31,7 @@ high_severity_lane_bytes = "1MB"
 max_batch_bytes = "250KB"
 max_attributes_per_event = 20
 max_attribute_bytes = "2KB"
-drop_policy = "drop-newest"
+drop_policy = "drop_newest"
 sample_every = 5
 rate_limit_per_second = 120
 rate_limit_burst = 240
@@ -51,7 +51,7 @@ max_response_bytes = "64KB"
 [observability.lineage]
 queue_bytes = "2MB"
 max_event_bytes = "50KB"
-drop_policy = "drop-newest"
+drop_policy = "drop_newest"
 flush_timeout_ms = 4000
 identity_mode = "external"
 

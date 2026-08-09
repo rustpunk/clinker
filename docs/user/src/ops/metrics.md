@@ -209,7 +209,7 @@ high_severity_lane_bytes = "1MB"
 max_batch_bytes = "256KB"
 max_attributes_per_event = 32
 max_attribute_bytes = "4KB"
-drop_policy = "drop-newest"
+drop_policy = "drop_newest"
 sample_every = 1
 rate_limit_per_second = 1000
 rate_limit_burst = 1000
@@ -229,7 +229,7 @@ mode = "none"
 [observability.lineage]
 queue_bytes = "1MB"
 max_event_bytes = "64KB"
-drop_policy = "drop-newest"
+drop_policy = "drop_newest"
 flush_timeout_ms = 5000
 identity_mode = "external"
 
@@ -297,7 +297,7 @@ Node names are exported verbatim under the same treatment. A name is never
 dropped for the characters it contains, so a Transform named with a space or a
 non-ASCII character still produces a span.
 
-Both delivery paths admit with `drop_policy = "drop-newest"`; there is no
+Both delivery paths admit with `drop_policy = "drop_newest"`; there is no
 blocking, unbounded, or disk-spool spelling. The telemetry arena contains two
 disjoint lanes: `trace`, `debug`, and `info` signals occupy the ordinary lane,
 while `warn` and `error` occupy the high-severity lane. The lineage queue is a

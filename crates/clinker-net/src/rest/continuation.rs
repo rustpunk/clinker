@@ -202,9 +202,10 @@ pub(crate) fn next_link(
     // pages, which is the same false conflict as the duplicate itself.
     let mut targets = TargetSet::default();
     for value in headers.get_all(ureq::http::header::LINK) {
-        let value = value
-            .to_str()
-            .map_err(|_| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
+        let Ok(value) = value.to_str() else {
+            targets.offer_unreadable(value.as_bytes());
+            continue;
+        };
         for target in parse_link_field(value)? {
             targets.offer(&target, effective_url, admitted_origin);
         }
@@ -231,6 +232,23 @@ struct TargetSet {
 }
 
 impl TargetSet {
+    /// Record a header value this client cannot read at all.
+    ///
+    /// It counts: a reply naming a page in bytes we refuse is still a reply
+    /// that named a page, and returning on it instead reported a reply naming
+    /// two different places under whichever rule the first one broke. The
+    /// bytes are the only identity available, so two copies of one unreadable
+    /// value are still one target.
+    fn offer_unreadable(&mut self, bytes: &[u8]) {
+        self.refusal.get_or_insert_with(|| {
+            ContinuationError::for_code("rest.protocol.malformed_continuation")
+        });
+        let entry = Err(Some(format!("{bytes:?}")));
+        if !self.seen.contains(&entry) {
+            self.seen.push(entry);
+        }
+    }
+
     fn offer(&mut self, reference: &str, base: &AuthorizedUrl, admitted_origin: &Origin) {
         let entry = match resolve_then_authorize(base, reference, admitted_origin) {
             Ok(resolved) => Ok(resolved),
@@ -280,9 +298,10 @@ pub(crate) fn redirect_location(
 ) -> Result<AuthorizedUrl, ContinuationError> {
     let mut targets = TargetSet::default();
     for value in headers.get_all(ureq::http::header::LOCATION) {
-        let value = value
-            .to_str()
-            .map_err(|_| ContinuationError::for_code("rest.protocol.malformed_continuation"))?;
+        let Ok(value) = value.to_str() else {
+            targets.offer_unreadable(value.as_bytes());
+            continue;
+        };
         targets.offer(value, effective_url, admitted_origin);
     }
     let resolved = targets.into_one()?;

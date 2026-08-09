@@ -1339,7 +1339,7 @@ high_severity_lane_bytes = "256KB"
 max_batch_bytes = "8KB"
 max_attributes_per_event = 8
 max_attribute_bytes = "{max_attribute_bytes}"
-drop_policy = "drop-newest"
+drop_policy = "drop_newest"
 sample_every = 1
 rate_limit_per_second = 100000
 rate_limit_burst = 100000
@@ -1359,7 +1359,7 @@ mode = "none"
 [observability.lineage]
 queue_bytes = "1KB"
 max_event_bytes = "512B"
-drop_policy = "drop-newest"
+drop_policy = "drop_newest"
 flush_timeout_ms = 500
 identity_mode = "local_diagnostic_paths"
 

@@ -951,3 +951,15 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   finished, one refusing well-formed UTF-8 redirects outright. Doing it
   correctly means parsing the field from bytes and decoding only the target,
   which is the hand-rolled-parser decision already open as question 34.
+- **54 (filed 2026-08-09, needs a maintainer decision):** When a dispatch
+  failure ends a run, `execute_dag` joins every ingest thread before returning
+  the diagnostic, so no reader or spill handle outlives the run. The comment
+  justifies it by every receiver having been dropped, which frees a source
+  waiting on the pipeline but not one parked in a network read against a
+  server that has sent nothing: that source is waiting on the peer, and the
+  join waits with it. Tripping the run's shutdown token before joining would
+  free it, but the token is what tells the rest of the process a run was
+  cancelled rather than failed, and turning it on inside a failure path
+  changes what several other decisions see. The alternative -- detaching the
+  threads again -- is what the join was introduced to stop. Needs a decision
+  about which of the two the failure path should prefer.
