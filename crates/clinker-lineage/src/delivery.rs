@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, TryLockError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -241,6 +241,40 @@ impl DeliveryQueue {
         }
     }
 
+    /// Take the queue lock, recovering the guard if the lock is poisoned.
+    ///
+    /// Every path that touches the queue recovers, so one lock cannot carry
+    /// two policies: a producer that panics under the lock would otherwise
+    /// turn every later emit into a permanent "the queue is closed" while the
+    /// worker on the same lock kept draining as though nothing had happened.
+    /// Lineage is optional observability whose failures are reported and never
+    /// propagated, so the panic of one producer must not silently end the
+    /// run's lineage.
+    ///
+    /// Recovery re-derives `queued_bytes` from the charges the deque actually
+    /// holds, which is what keeps the bound trustworthy: the only state a
+    /// panic can leave inconsistent is a charge added without its record, and
+    /// re-deriving discards that guess rather than carrying it. Each record
+    /// owns the charge it was admitted against, so the sum is the queue's true
+    /// occupancy and not an estimate of it. The flag is then cleared, because
+    /// the invariant is restored and leaving it set would re-derive on every
+    /// lock for the rest of the run.
+    fn lock_state(&self) -> MutexGuard<'_, QueueState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => self.recovered(poisoned.into_inner()),
+        }
+    }
+
+    fn recovered<'queue>(
+        &'queue self,
+        mut state: MutexGuard<'queue, QueueState>,
+    ) -> MutexGuard<'queue, QueueState> {
+        state.queued_bytes = state.events.iter().map(|record| record.charge).sum();
+        self.state.clear_poison();
+        state
+    }
+
     /// Admit one framed record without waiting on capacity or the sink.
     ///
     /// `patience` bounds how long the producer re-attempts the queue lock.
@@ -271,7 +305,9 @@ impl DeliveryQueue {
                     thread::yield_now();
                 }
                 Err(TryLockError::WouldBlock) => return QueueAdmission::Busy,
-                Err(TryLockError::Poisoned(_)) => return QueueAdmission::Closed,
+                Err(TryLockError::Poisoned(poisoned)) => {
+                    break self.recovered(poisoned.into_inner());
+                }
             }
         };
         if state.closed {
@@ -292,10 +328,7 @@ impl DeliveryQueue {
     }
 
     fn pop(&self) -> Option<Box<[u8]>> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.lock_state();
         loop {
             if let Some(record) = state.events.pop_front() {
                 state.queued_bytes = state.queued_bytes.saturating_sub(record.charge);
@@ -304,18 +337,15 @@ impl DeliveryQueue {
             if state.closed {
                 return None;
             }
-            state = self
-                .ready
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = match self.ready.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => self.recovered(poisoned.into_inner()),
+            };
         }
     }
 
     fn close(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.lock_state();
         state.closed = true;
         drop(state);
         self.ready.notify_all();
@@ -594,6 +624,50 @@ mod tests {
                 "round {round}: an empty queue accounts for nothing"
             );
         }
+    }
+
+    /// One lock, one policy. A producer that panics under the queue lock would
+    /// otherwise turn every later emit into "the queue is closed" while the
+    /// worker on the same lock drained on, ending the run's lineage silently.
+    /// Recovery re-derives the accounting, so the charge such a panic can
+    /// leave without its record does not permanently shrink the bound.
+    #[test]
+    fn a_panicked_producer_leaves_the_queue_usable_and_exactly_accounted() {
+        let event = event_of_known_size();
+        let exact = serde_json::to_vec(&event).expect("the probe event serializes");
+        let stray = exact.len();
+        let queue = Arc::new(DeliveryQueue::new(exact.len() * 4, exact.len()));
+
+        let poisoner = Arc::clone(&queue);
+        let outcome = thread::spawn(move || {
+            let mut state = poisoner.state.lock().expect("the first lock is clean");
+            // A charge applied without the record it was charged for: the one
+            // inconsistency a panic between the two updates can leave behind.
+            state.queued_bytes += stray;
+            panic!("a producer panics while holding the queue lock");
+        })
+        .join();
+        assert!(outcome.is_err(), "the producer panicked under the lock");
+        assert!(queue.state.is_poisoned(), "which poisons the queue lock");
+
+        let SerializedEvent::Bounded { framed } = serialize_event(&event, exact.len()) else {
+            panic!("the probe event is within the cap");
+        };
+        let charge = framed.len();
+        assert!(
+            matches!(
+                queue.try_push(framed, Duration::ZERO),
+                QueueAdmission::Accepted
+            ),
+            "a later emit still enters the queue"
+        );
+        assert!(!queue.state.is_poisoned(), "and the lock is usable again");
+        assert_eq!(
+            queue.state.lock().expect("uncontended").queued_bytes,
+            charge,
+            "the queue accounts for the record it holds and nothing besides"
+        );
+        assert!(queue.pop().is_some(), "and the worker still drains it");
     }
 
     /// The promise the validator makes to an author who sets `max_event_bytes`

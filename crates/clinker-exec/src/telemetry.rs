@@ -348,6 +348,7 @@ impl TelemetryArena {
         let receiver = TelemetryReceiver {
             shared,
             metrics,
+            stats,
             retained,
         };
         Ok((producer, receiver))
@@ -400,22 +401,30 @@ impl TelemetryProducer {
             return AdmissionOutcome::Dropped(DropReason::InvalidLogicalIdentity);
         }
 
+        // The scan runs before admission, because the policy decides what a
+        // record may say regardless of whether this one is kept. Its totals
+        // are credited only once the record is admitted: they tell an operator
+        // what the field policy did to the telemetry that was exported, and
+        // counting the records that sampling, rate limiting, or a full arena
+        // threw away inflated them by the whole sampling factor.
         let privacy = PrivacyScan::new(&self.policy, event.event, event.fields);
-        self.stats
-            .denied_fields
-            .fetch_add(privacy.denied, Ordering::Relaxed);
-        self.stats
-            .truncated_fields
-            .fetch_add(privacy.truncated, Ordering::Relaxed);
-        self.stats
-            .attribute_limit_drops
-            .fetch_add(privacy.limit_drops, Ordering::Relaxed);
-
         let filtered = FilteredLog {
             event,
             policy: &self.policy,
         };
-        self.admit(event.severity.lane(), &QueuedSignal::Log(filtered))
+        let outcome = self.admit(event.severity.lane(), &QueuedSignal::Log(filtered));
+        if matches!(outcome, AdmissionOutcome::Accepted { .. }) {
+            self.stats
+                .denied_fields
+                .fetch_add(privacy.denied, Ordering::Relaxed);
+            self.stats
+                .truncated_fields
+                .fetch_add(privacy.truncated, Ordering::Relaxed);
+            self.stats
+                .attribute_limit_drops
+                .fetch_add(privacy.limit_drops, Ordering::Relaxed);
+        }
+        outcome
     }
 
     /// Admit one closed trace fact without accepting arbitrary attributes.
@@ -463,6 +472,7 @@ impl TelemetryProducer {
             full_drops: self.stats.full.load(Ordering::Relaxed),
             oversize_drops: self.stats.oversize.load(Ordering::Relaxed),
             invalid_drops: self.stats.invalid.load(Ordering::Relaxed),
+            undecodable_drops: self.stats.undecodable.load(Ordering::Relaxed),
         }
     }
 
@@ -523,6 +533,7 @@ impl TelemetryProducer {
 pub struct TelemetryReceiver {
     shared: Arc<Mutex<ArenaState>>,
     metrics: Arc<MetricCounters>,
+    stats: Arc<ProducerCounters>,
     retained: Arc<RetainedAccounting>,
 }
 
@@ -549,6 +560,14 @@ impl TelemetryReceiver {
                     StoredSignal::Trace(trace) => traces.push(trace),
                 }
                 serialized_bytes = serialized_bytes.saturating_add(len as u64);
+            } else {
+                // Admission already credited this signal to `accepted`, so
+                // leaving the failure uncounted would report a signal as
+                // exported that no collector ever received. The slot is still
+                // reclaimed below: telemetry is optional, and a signal that
+                // cannot be read back must not hold arena bytes or stop the
+                // rest of the batch from draining.
+                self.stats.undecodable.fetch_add(1, Ordering::Relaxed);
             }
             shared.release(token);
             self.retained.subtract(token.lane, len as u64);
@@ -671,6 +690,9 @@ pub struct ArenaSnapshot {
     pub full_drops: u64,
     pub oversize_drops: u64,
     pub invalid_drops: u64,
+    /// Signals counted in `accepted` whose stored bytes could not be read back
+    /// at drain, and so were never exported.
+    pub undecodable_drops: u64,
 }
 
 #[derive(Serialize)]
@@ -1274,6 +1296,7 @@ struct ProducerCounters {
     full: AtomicU64,
     oversize: AtomicU64,
     invalid: AtomicU64,
+    undecodable: AtomicU64,
 }
 
 #[derive(Default)]
@@ -1518,6 +1541,41 @@ replacement = "{replacement}"
             AdmissionOutcome::Dropped(DropReason::InvalidLogicalIdentity)
         );
         assert_eq!(producer.snapshot().invalid_drops, 1);
+    }
+
+    /// Admission counts a signal as accepted before the drain reads it back,
+    /// so a slot that no longer parses is a loss the operator-facing totals
+    /// would otherwise hide inside `accepted`.
+    #[test]
+    fn a_stored_signal_that_cannot_be_read_back_is_counted_as_a_drop() {
+        let (producer, receiver) = arena("64B");
+        let outcome = producer.emit_log(LogEvent {
+            event: "transform.seen",
+            severity: Severity::Info,
+            message: "seen",
+            correlation: correlation(),
+            fields: &[],
+        });
+        assert!(outcome.is_accepted(), "log was not admitted: {outcome:?}");
+
+        {
+            let mut shared = receiver.shared.lock().expect("arena lock");
+            let token = *shared.queue.front().expect("one queued signal");
+            let (offset, len) = shared.slot_location(token);
+            shared.bytes[offset..offset + len].fill(b'~');
+        }
+
+        assert!(
+            receiver.try_recv_batch().is_none(),
+            "an unreadable signal must not reach a batch"
+        );
+        let snapshot = producer.snapshot();
+        assert_eq!(snapshot.accepted, 1);
+        assert_eq!(snapshot.undecodable_drops, 1);
+        assert_eq!(
+            snapshot.retained_bytes, 0,
+            "the slot must be reclaimed like any other drained signal"
+        );
     }
 
     #[test]

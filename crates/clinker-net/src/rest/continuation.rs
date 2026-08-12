@@ -200,17 +200,41 @@ pub(crate) fn next_link(
     // may normalize one copy -- a relative reference beside the absolute URL
     // it resolves to -- and comparing the raw text called those two different
     // pages, which is the same false conflict as the duplicate itself.
+    //
+    // A header this client cannot read, or cannot parse, is held rather than
+    // returned on. It is not offered as a target either: an unreadable field
+    // may have named no next page, one, or several, and calling it one
+    // invented a page a readable `rel=next` beside it then conflicted with.
+    // Holding it keeps the count honest -- a reply that genuinely names two
+    // different pages is still reported as the conflict it is -- while a
+    // reply whose continuation cannot be established is still refused.
     let mut targets = TargetSet::default();
+    let mut unreadable: Option<ContinuationError> = None;
     for value in headers.get_all(ureq::http::header::LINK) {
         let Ok(value) = value.to_str() else {
-            targets.offer_unreadable(value.as_bytes());
+            unreadable.get_or_insert_with(|| {
+                ContinuationError::for_code("rest.protocol.malformed_continuation")
+            });
             continue;
         };
-        for target in parse_link_field(value)? {
-            targets.offer(&target, effective_url, admitted_origin);
+        match parse_link_field(value) {
+            Ok(parsed) => {
+                for target in parsed {
+                    targets.offer(&target, effective_url, admitted_origin);
+                }
+            }
+            Err(error) => {
+                unreadable.get_or_insert(error);
+            }
         }
     }
-    targets.into_one()
+    let resolved = targets.into_one()?;
+    // Only once no conflict was found: a field we could not read might have
+    // named the page this one did not.
+    if let Some(error) = unreadable {
+        return Err(error);
+    }
+    Ok(resolved)
 }
 
 /// The distinct targets a reply named, and the first reason one of them was
@@ -232,23 +256,6 @@ struct TargetSet {
 }
 
 impl TargetSet {
-    /// Record a header value this client cannot read at all.
-    ///
-    /// It counts: a reply naming a page in bytes we refuse is still a reply
-    /// that named a page, and returning on it instead reported a reply naming
-    /// two different places under whichever rule the first one broke. The
-    /// bytes are the only identity available, so two copies of one unreadable
-    /// value are still one target.
-    fn offer_unreadable(&mut self, bytes: &[u8]) {
-        self.refusal.get_or_insert_with(|| {
-            ContinuationError::for_code("rest.protocol.malformed_continuation")
-        });
-        let entry = Err(Some(format!("{bytes:?}")));
-        if !self.seen.contains(&entry) {
-            self.seen.push(entry);
-        }
-    }
-
     fn offer(&mut self, reference: &str, base: &AuthorizedUrl, admitted_origin: &Origin) {
         let entry = match resolve_then_authorize(base, reference, admitted_origin) {
             Ok(resolved) => Ok(resolved),
@@ -297,14 +304,20 @@ pub(crate) fn redirect_location(
     admitted_origin: &Origin,
 ) -> Result<AuthorizedUrl, ContinuationError> {
     let mut targets = TargetSet::default();
+    let mut unreadable: Option<ContinuationError> = None;
     for value in headers.get_all(ureq::http::header::LOCATION) {
         let Ok(value) = value.to_str() else {
-            targets.offer_unreadable(value.as_bytes());
+            unreadable.get_or_insert_with(|| {
+                ContinuationError::for_code("rest.protocol.malformed_continuation")
+            });
             continue;
         };
         targets.offer(value, effective_url, admitted_origin);
     }
     let resolved = targets.into_one()?;
+    if let Some(error) = unreadable {
+        return Err(error);
+    }
     resolved.ok_or_else(|| ContinuationError::for_code("rest.protocol.malformed_continuation"))
 }
 
@@ -669,6 +682,34 @@ mod tests {
         .expect("a quoted parameter is one parameter")
         .expect("there is a next page");
         assert_eq!(read.as_str(), "https://api.example.test/v1/items?page=2");
+    }
+
+    /// A header this client cannot read is not a page it named. Counting one
+    /// as a target invented a next page that a readable `rel=next` beside it
+    /// then conflicted with -- so a reply naming exactly one page was refused
+    /// as naming two, under the wrong rule. The refusal is still made, after
+    /// the readable targets have been counted.
+    #[test]
+    fn an_unreadable_header_is_not_a_page_the_reply_named() {
+        let (origin, base) =
+            authorize_initial("https://api.example.test/v1/items").expect("initial URL");
+        let mut headers = headers_of(
+            ureq::http::header::LINK,
+            &["<https://api.example.test/v1/items?page=2>; rel=\"next\""],
+        );
+        headers.append(
+            ureq::http::header::LINK,
+            ureq::http::HeaderValue::from_bytes(b"</v1/prev>; rel=\"prev\"; title=\"\xff\"")
+                .expect("a header carrying a byte outside visible ASCII"),
+        );
+
+        let refused = next_link(&headers, &base, &origin)
+            .expect_err("a field that cannot be read leaves the continuation unestablished");
+        assert_eq!(
+            refused.classification_code(),
+            "rest.protocol.malformed_continuation",
+            "and it is named as unreadable, not as a conflict between two pages"
+        );
     }
 
     /// A reply that names one next page twice is not a reply that names two.

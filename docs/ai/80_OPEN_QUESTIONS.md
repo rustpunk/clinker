@@ -963,3 +963,12 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   changes what several other decisions see. The alternative -- detaching the
   threads again -- is what the join was introduced to stop. Needs a decision
   about which of the two the failure path should prefer.
+- **55 (filed 2026-08-12):** `run` in `crates/clinker/src/main.rs` is roughly
+  1,840 lines and interleaves machine-stream emission, lineage sink setup,
+  OTLP worker lifecycle, and publication in one function. Splitting it is the
+  right change and is not attempted here: it is a large mechanical diff across
+  the path every CLI invocation takes, proposed at the end of a branch whose
+  review history shows late restructuring in this area generating its own
+  defects. The split wants its own change with its own review, and the natural
+  seams are the four concerns already listed -- each of which currently shares
+  only local variables with the others.

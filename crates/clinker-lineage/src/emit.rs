@@ -16,34 +16,23 @@
 use clinker_core_types::FailureClassification;
 
 use crate::builder::PlanColumnLineage;
+use crate::dataset::DatasetId;
 use crate::logical_identity::{DatasetIdentityFacets, DatasetSubsetDirection};
 use crate::openlineage::{
-    BatchRunFacet, ClinkerFailureRunFacet, Dataset, DatasetFacets, DatasetSubsetFacet,
-    ErrorMessageRunFacet, EventType, InputDatasetFacets, Job, OPENLINEAGE_SCHEMA_URL,
-    OutputDatasetFacets, PRODUCER, Run, RunEvent, RunFacets, RunStatsFacet, SemanticPlanJobFacet,
-    SymlinksDatasetFacet,
+    BatchRunFacet, ClinkerFailureRunFacet, ColumnLineageDatasetFacet, Dataset, DatasetFacets,
+    DatasetSubsetFacet, ErrorMessageRunFacet, EventType, InputDatasetFacets, Job,
+    OPENLINEAGE_SCHEMA_URL, OutputDatasetFacets, PRODUCER, Run, RunEvent, RunFacets, RunStatsFacet,
+    SemanticPlanJobFacet, SymlinksDatasetFacet,
 };
 
-/// The input datasets of a run carrying only what is true regardless of how
-/// the run ended — the shape used on a `START` and on a `FAIL` or `ABORT`
-/// terminal.
-///
-/// The symmetric half of [`output_identities`], and the two state one rule: a
-/// symlink names the dataset and rides on every event, while the subset facet
-/// says which members this run touched and appears only where it finished
-/// touching them.
-fn input_identities(lineage: &PlanColumnLineage) -> Vec<Dataset> {
-    lineage
-        .inputs
-        .iter()
-        .cloned()
-        .map(|identity| {
-            let facts = lineage.input_identity_facets.get(&identity);
-            let mut dataset = Dataset::from(identity);
-            dataset.facets = facts.and_then(symlink_facets);
-            dataset
-        })
-        .collect()
+/// How much of the run an event is entitled to describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunProgress {
+    /// A `START`, or a `FAIL` / `ABORT` terminal: the run has reached no
+    /// finished claim about the datasets it named.
+    Unfinished,
+    /// A `COMPLETE` terminal: the run is done touching what it named.
+    Finished,
 }
 
 /// The alternate identities authorized for a dataset, as the dataset-level
@@ -76,71 +65,82 @@ fn subset_facet(
     DatasetSubsetFacet::new(identity.subsets(), direction)
 }
 
-/// The input datasets of a run that finished reading them, with the subset
-/// facet naming the members it actually consumed.
+/// One dataset as it appears in one position of one event.
 ///
-/// Only a `COMPLETE` may say that. See [`input_identities`] for the shape the
-/// other events use.
-fn inputs_with_identity_facets(lineage: &PlanColumnLineage) -> Vec<Dataset> {
+/// Which facets an event may attach follows from what it can honestly assert,
+/// so the whole rule is decided here, once, for both roles:
+///
+/// - a symlink is an alternate name for the dataset itself and is true wherever
+///   the dataset appears, so it rides on every event in either position;
+///   omitting it on a failure leaves that failure unattributed to the dataset
+///   an operator would go looking at;
+/// - the subset names the members *this run* touched, which only a run that
+///   finished touching them can claim, so it appears on a `COMPLETE` alone —
+///   in the position bucket its schema names, never in the dataset's own
+///   `facets`;
+/// - column lineage describes produced values, so only a finished output has
+///   one to offer, and an input never does.
+fn positioned_dataset(
+    dataset: DatasetId,
+    identity: Option<&DatasetIdentityFacets>,
+    direction: DatasetSubsetDirection,
+    progress: RunProgress,
+    column_lineage: Option<&ColumnLineageDatasetFacet>,
+) -> Dataset {
+    let mut positioned = Dataset::from(dataset);
+    positioned.facets = identity.and_then(symlink_facets);
+    if progress == RunProgress::Finished {
+        if let Some(subset) = identity.and_then(|facts| subset_facet(facts, direction)) {
+            match direction {
+                DatasetSubsetDirection::Input => {
+                    positioned.input_facets = Some(InputDatasetFacets {
+                        subset: Some(subset),
+                    });
+                }
+                DatasetSubsetDirection::Output => {
+                    positioned.output_facets = Some(OutputDatasetFacets {
+                        subset: Some(subset),
+                    });
+                }
+            }
+        }
+        if let Some(facet) = column_lineage {
+            positioned.facets.get_or_insert_default().column_lineage = Some(facet.clone());
+        }
+    }
+    positioned
+}
+
+/// The input datasets of a run, in the shape `progress` entitles the event to.
+fn input_datasets(lineage: &PlanColumnLineage, progress: RunProgress) -> Vec<Dataset> {
     lineage
         .inputs
         .iter()
-        .cloned()
         .map(|identity| {
-            let facts = lineage.input_identity_facets.get(&identity);
-            let mut dataset = Dataset::from(identity);
-            dataset.facets = facts.and_then(symlink_facets);
-            dataset.input_facets = facts
-                .and_then(|facts| subset_facet(facts, DatasetSubsetDirection::Input))
-                .map(|subset| InputDatasetFacets {
-                    subset: Some(subset),
-                });
-            dataset
+            positioned_dataset(
+                identity.clone(),
+                lineage.input_identity_facets.get(identity),
+                DatasetSubsetDirection::Input,
+                progress,
+                None,
+            )
         })
         .collect()
 }
 
-/// The output datasets of a run carrying only what is true regardless of how
-/// the run ended — the shape used on a `START` and on a `FAIL` or `ABORT`
-/// terminal, neither of which has a completed claim to make.
-///
-/// One rule, and it applies to inputs the same way (see [`input_identities`]):
-/// a symlink is an alternate name for the dataset wherever it appears, so it
-/// belongs on every event; the subset facet says which members *this run*
-/// touched, so it belongs only where the run finished touching them. Attaching
-/// it to a failed terminal recorded consumption of members a run that died
-/// early never read; omitting the symlink left that failure unattributed to
-/// the dataset an operator would go looking at.
-fn output_identities(lineage: &PlanColumnLineage) -> Vec<Dataset> {
+/// The output datasets of a run, in the shape `progress` entitles the event to.
+fn output_datasets(lineage: &PlanColumnLineage, progress: RunProgress) -> Vec<Dataset> {
     lineage
         .outputs
         .iter()
         .map(|out| {
-            let mut dataset = Dataset::from(out.dataset.clone());
-            dataset.facets = symlink_facets(&out.identity_facets);
-            dataset
-        })
-        .collect()
-}
-
-/// The output datasets of a run, each bearing its `columnLineage` facet — the
-/// shape used on a `COMPLETE` event.
-fn outputs_with_lineage(lineage: &PlanColumnLineage) -> Vec<Dataset> {
-    lineage
-        .outputs
-        .iter()
-        .map(|out| {
-            let mut dataset = Dataset::from(out.dataset.clone());
-            let mut facets = symlink_facets(&out.identity_facets).unwrap_or_default();
-            facets.column_lineage = Some(out.facet.clone());
-            dataset.facets = Some(facets);
-            dataset.output_facets =
-                subset_facet(&out.identity_facets, DatasetSubsetDirection::Output).map(|subset| {
-                    OutputDatasetFacets {
-                        subset: Some(subset),
-                    }
-                });
-            dataset
+            positioned_dataset(
+                out.dataset.clone(),
+                Some(&out.identity_facets),
+                DatasetSubsetDirection::Output,
+                progress,
+                Some(&out.facet),
+            )
         })
         .collect()
 }
@@ -256,8 +256,8 @@ pub fn start_event(
             }),
         },
         job: correlated_job(job, lifecycle),
-        inputs: input_identities(lineage),
-        outputs: output_identities(lineage),
+        inputs: input_datasets(lineage, RunProgress::Unfinished),
+        outputs: output_datasets(lineage, RunProgress::Unfinished),
     }
 }
 
@@ -295,10 +295,9 @@ pub fn terminal_event(
             clinker_failure: failure.map(ClinkerFailureRunFacet::from_classification),
         }),
     };
-    let outputs = if matches!(event_type, EventType::Complete) {
-        outputs_with_lineage(lineage)
-    } else {
-        output_identities(lineage)
+    let progress = match event_type {
+        EventType::Complete => RunProgress::Finished,
+        _ => RunProgress::Unfinished,
     };
     RunEvent {
         event_time: lifecycle.terminal.event_time.clone(),
@@ -307,12 +306,8 @@ pub fn terminal_event(
         event_type,
         run,
         job: correlated_job(job, &lifecycle.start),
-        inputs: if matches!(event_type, EventType::Complete) {
-            inputs_with_identity_facets(lineage)
-        } else {
-            input_identities(lineage)
-        },
-        outputs,
+        inputs: input_datasets(lineage, progress),
+        outputs: output_datasets(lineage, progress),
     }
 }
 

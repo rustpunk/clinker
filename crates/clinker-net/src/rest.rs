@@ -549,9 +549,20 @@ impl RestRecordSource {
             // outcome whether or not a signal arrived afterwards. Reporting it
             // as a clean cancellation left the outage in no terminal at all
             // and had the orchestrator re-queue the batch.
+            //
+            // Abandoning a retry only counts when the retry could have
+            // achieved something. A misrouted URL or an unreadable client
+            // certificate fails the same way on every attempt, so a signal
+            // arriving while one was pending explains nothing -- and calling
+            // it a cancellation had an orchestrator re-queue a batch against a
+            // misconfiguration that can never succeed. Whether another attempt
+            // could succeed is read from the failure's own classification
+            // rather than from a second list of variants kept in step by hand.
             let cancelled = self.shutdown.as_ref().is_some_and(|t| t.is_requested());
+            let abandoned_a_useful_retry =
+                attempt < self.cfg.retries && retry_failure.another_attempt_could_succeed();
             if cancelled
-                && (attempt < self.cfg.retries
+                && (abandoned_a_useful_retry
                     || (!peer_answered && retry_failure.is_cancellable_transport()))
             {
                 return Err(FormatError::Interrupted);
@@ -605,6 +616,21 @@ impl RequestFailure {
     /// request in flight produces. A status means the exchange completed and
     /// the peer rejected it, and that verdict is independent of any signal
     /// that arrives afterwards.
+    /// Whether retrying this failure could produce a different answer.
+    ///
+    /// Built on the same list that decides cancellability rather than a
+    /// second one kept in step by hand, plus the statuses this loop itself
+    /// re-requests. It cannot be read from the failure's classification code:
+    /// a request this client could not route and a reply it could not parse
+    /// deliberately share one code, because they are one thing to the
+    /// operator and two different things to the retry.
+    fn another_attempt_could_succeed(self) -> bool {
+        if let Self::HttpStatus(status) = self {
+            return (500..600).contains(&status) || matches!(status, 408 | 429);
+        }
+        self.is_cancellable_transport()
+    }
+
     fn is_cancellable_transport(self) -> bool {
         // `Transport` is included: what reaches this catch-all is a failure
         // the mapping above could not identify, and when a shutdown is pending
@@ -1095,6 +1121,39 @@ mod tests {
             RequestFailure::Transport.is_cancellable_transport(),
             "an unnamed transport failure under a pending shutdown is that shutdown"
         );
+    }
+
+    /// Abandoning a retry is only a cancellation when the retry could have
+    /// achieved something. The permanence rule was reachable in isolation but
+    /// not at its call site, because "a retry remains" was checked first and
+    /// answered yes on every attempt before the last -- so a misrouted URL
+    /// under a pending signal reported a clean cancellation and an
+    /// orchestrator re-queued a batch that could never succeed.
+    #[test]
+    fn a_retry_that_could_not_have_helped_is_not_worth_abandoning() {
+        for permanent in [
+            RequestFailure::Unroutable,
+            RequestFailure::Tls,
+            RequestFailure::HostNotFound,
+            RequestFailure::Io(std::io::ErrorKind::PermissionDenied),
+            RequestFailure::HttpStatus(404),
+        ] {
+            assert!(
+                !permanent.another_attempt_could_succeed(),
+                "{permanent:?} fails the same way however many attempts remain"
+            );
+        }
+
+        for transient in [
+            RequestFailure::HttpStatus(503),
+            RequestFailure::HttpStatus(429),
+            RequestFailure::HttpStatus(408),
+        ] {
+            assert!(
+                transient.another_attempt_could_succeed(),
+                "{transient:?} is what a remaining attempt is for"
+            );
+        }
     }
 
     #[test]

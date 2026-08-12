@@ -727,19 +727,20 @@ fn publication_payloads_from_artifacts(
             )])
         })
         .collect();
-    let mut state_counts = serde_json::Map::from_iter([
-        ("staging".to_owned(), serde_json::json!(0)),
-        ("ready".to_owned(), serde_json::json!(0)),
-        ("promoting".to_owned(), serde_json::json!(0)),
-        ("published".to_owned(), serde_json::json!(0)),
-        ("visible_unsynchronized".to_owned(), serde_json::json!(0)),
-        ("unpublished".to_owned(), serde_json::json!(0)),
-    ]);
+    let mut state_counts = serde_json::Map::from_iter(
+        ARTIFACT_STATES
+            .into_iter()
+            .map(|state| (artifact_state(state), serde_json::json!(0))),
+    );
     for artifact in &artifacts {
         let Some(key) = artifact["state"].as_str() else {
             continue;
         };
-        let count = state_counts[key].as_u64().unwrap_or(0).saturating_add(1);
+        let count = state_counts
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(1);
         state_counts.insert(key.to_owned(), serde_json::json!(count));
     }
     let summary = serde_json::json!({
@@ -761,15 +762,45 @@ fn artifact_kind(kind: ArtifactKind) -> &'static str {
     }
 }
 
-fn artifact_state(state: ArtifactState) -> &'static str {
-    match state {
-        ArtifactState::Staging => "staging",
-        ArtifactState::Ready => "ready",
-        ArtifactState::Promoting => "promoting",
-        ArtifactState::Published => "published",
-        ArtifactState::VisibleUnsynchronized => "visible_unsynchronized",
-        ArtifactState::Unpublished => "unpublished",
+/// Artifact states the publication summary carries a count for, in the order
+/// the schema-1 summary lists them.
+const ARTIFACT_STATES: [ArtifactState; 6] = [
+    ArtifactState::Staging,
+    ArtifactState::Ready,
+    ArtifactState::Promoting,
+    ArtifactState::Published,
+    ArtifactState::VisibleUnsynchronized,
+    ArtifactState::Unpublished,
+];
+
+/// Wire spelling of an artifact state for the schema-1 machine protocol.
+///
+/// The token is taken from the enum's serde representation, which is the same
+/// representation the on-disk attempt manifest carries, so the protocol and the
+/// manifest cannot spell one state two ways. Serializing a fieldless variant
+/// into a JSON string does not fail; the fallback derives the identical
+/// `snake_case` token from the variant name so the protocol still emits a
+/// stable token rather than failing the run.
+fn artifact_state(state: ArtifactState) -> String {
+    match serde_json::to_value(state) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => snake_case(&format!("{state:?}")),
     }
+}
+
+fn snake_case(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (index, character) in name.char_indices() {
+        if character.is_ascii_uppercase() {
+            if index > 0 {
+                out.push('_');
+            }
+            out.push(character.to_ascii_lowercase());
+        } else {
+            out.push(character);
+        }
+    }
+    out
 }
 
 #[cfg(debug_assertions)]
@@ -857,6 +888,30 @@ mod tests {
             .filter(|line| !line.is_empty())
             .map(|line| serde_json::from_str(line).expect("every record is JSON"))
             .collect()
+    }
+
+    /// Pins the schema-1 tokens a supervisor parses, so a variant rename that
+    /// changes the wire vocabulary has to be a deliberate protocol change.
+    #[test]
+    fn artifact_state_tokens_are_the_schema_1_spellings() {
+        assert_eq!(
+            ARTIFACT_STATES.map(artifact_state).as_slice(),
+            [
+                "staging",
+                "ready",
+                "promoting",
+                "published",
+                "visible_unsynchronized",
+                "unpublished",
+            ]
+        );
+    }
+
+    #[test]
+    fn artifact_state_fallback_matches_the_serde_token() {
+        for state in ARTIFACT_STATES {
+            assert_eq!(snake_case(&format!("{state:?}")), artifact_state(state));
+        }
     }
 
     fn capturing_emitter() -> (MachineEmitter, SharedSink) {
