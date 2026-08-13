@@ -1864,28 +1864,51 @@ const LINEAGE_EXPORT_REPORTED_DROPS: usize = 4;
 /// The caller must not use this on a verdict that leaves the export worker
 /// running: a detached worker re-creates the destination on its next write,
 /// which would put a truncated event stream back after the removal.
-fn remove_empty_lineage_export(path: &std::path::Path) -> Option<PipelineError> {
+///
+/// Reports whether the operator is still left holding an export, so a
+/// diagnostic that describes the destination's state describes one that exists.
+fn remove_empty_lineage_export(
+    path: &std::path::Path,
+) -> (LineageExportRemains, Option<PipelineError>) {
     // Standard output is not a path. Resolving it as one makes an ordinary
     // file named `-` in the working directory this run's destination, and a
     // stdout export would unlink a file the operator never named.
     if path.as_os_str() == std::ffi::OsStr::new("-") {
-        return None;
+        return (LineageExportRemains::Kept, None);
     }
     // `symlink_metadata`, so a symlink is not a regular file here. Following
     // it would report the target's size and then unlink the link instead of
     // the target, destroying the operator's configured path while leaving the
     // empty artifact exactly where it was. A symlinked destination is left
     // alone: an ambiguous empty file is a smaller harm than a broken link.
-    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let Some(metadata) = std::fs::symlink_metadata(path).ok() else {
+        return (LineageExportRemains::Kept, None);
+    };
     if !metadata.is_file() || metadata.len() != 0 {
-        return None;
+        return (LineageExportRemains::Kept, None);
     }
-    std::fs::remove_file(path).err().map(|error| {
-        observability_delivery_error(format!(
-            "--lineage output {} is empty and could not be removed: {error}. Correction: delete it before publishing this run's artifacts, so an empty file is not read as its lineage export",
-            path.display()
-        ))
-    })
+    // A removal that fails leaves the empty file exactly where it was, so this
+    // still reports an export the operator holds — an empty one, which ends on
+    // a record boundary as truthfully as any other.
+    match std::fs::remove_file(path) {
+        Ok(()) => (LineageExportRemains::Removed, None),
+        Err(error) => (
+            LineageExportRemains::Kept,
+            Some(observability_delivery_error(format!(
+                "--lineage output {} is empty and could not be removed: {error}. Correction: delete it before publishing this run's artifacts, so an empty file is not read as its lineage export",
+                path.display()
+            ))),
+        ),
+    }
+}
+
+/// Whether a failed `--lineage` export left the operator holding a destination.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineageExportRemains {
+    /// Bytes are on the destination, and a publish step would pick them up.
+    Kept,
+    /// The destination was empty and is gone; there is no file to describe.
+    Removed,
 }
 
 fn lineage_destination(path: &std::path::Path) -> String {
@@ -1938,8 +1961,10 @@ fn lineage_export_failure(
     // A failure to remove is reported only when nothing else is — every verdict
     // below already tells the operator the export did not complete, and that is
     // the more useful of the two diagnostics.
-    let removal = match outcome.terminal() {
-        clinker_lineage::LineageDeliveryTerminal::DeadlineExceeded => None,
+    let (remains, removal) = match outcome.terminal() {
+        clinker_lineage::LineageDeliveryTerminal::DeadlineExceeded => {
+            (LineageExportRemains::Kept, None)
+        }
         _ => remove_empty_lineage_export(path),
     };
     match outcome.terminal() {
@@ -1952,8 +1977,35 @@ fn lineage_export_failure(
         // supervisor is free to retry.
         clinker_lineage::LineageDeliveryTerminal::WriteFailed(kind)
         | clinker_lineage::LineageDeliveryTerminal::FlushFailed(kind) => {
+            // A sink that refused a write is not the same fact as the state it
+            // was left in, and this path can leave either of the two files the
+            // deadline path can: a refusal that transferred nothing stops on a
+            // record boundary, one that transferred part of a record does not.
+            // Nothing about the destination distinguishes them from the outside,
+            // so the run has to say which — the same `records_complete` fact,
+            // exact here because the export sink is unbuffered and every record
+            // is newline-framed, so the bytes it accepted are the bytes on the
+            // destination.
+            //
+            // What it cannot borrow from the deadline path is the correction.
+            // There the export was going fine and ran out of time, so re-running
+            // is the whole answer; here the destination itself refused, and where
+            // the retry should point is already decided below by whether the
+            // refusal is permanent. This adds only the disposal of what is
+            // already on the destination, which that choice does not cover.
+            let (state, disposal) = match (remains, outcome.records_complete()) {
+                (LineageExportRemains::Removed, _) => ("", ""),
+                (LineageExportRemains::Kept, true) => (
+                    "; the export it left ends on a record boundary and is readable as NDJSON",
+                    "",
+                ),
+                (LineageExportRemains::Kept, false) => (
+                    "; the export it left ends inside a record and is not readable as NDJSON",
+                    "discard that partial export rather than publishing it as this run's lineage, then ",
+                ),
+            };
             let observed = format!(
-                "cannot write --lineage output {destination}: the export sink reported {} ({}) after {} of {expected} events entered the export queue. Correction: ",
+                "cannot write --lineage output {destination}: the export sink reported {} ({}) after {} of {expected} events entered the export queue{state}. Correction: {disposal}",
                 outcome.terminal().as_str(),
                 lineage_error_kind(kind),
                 outcome.accepted(),
@@ -2639,6 +2691,7 @@ struct QualificationLineageSink {
     inner: Box<dyn std::io::Write + Send>,
     mode: QualificationLineageSinkMode,
     blocked: bool,
+    writes: usize,
 }
 
 #[cfg(debug_assertions)]
@@ -2646,6 +2699,12 @@ struct QualificationLineageSink {
 enum QualificationLineageSinkMode {
     PermissionDenied,
     WriteFailed,
+    /// Takes one whole record, then refuses. Leaves a destination that stops on
+    /// a record boundary — the readable half of what a write failure can leave.
+    WriteFailedAfterRecord,
+    /// Takes part of a record, then refuses. Leaves a destination that stops
+    /// inside a record — the half no conformant NDJSON reader can finish.
+    WriteFailedMidRecord,
     FlushFailed,
     HangAfterFirstWrite,
 }
@@ -2653,12 +2712,28 @@ enum QualificationLineageSinkMode {
 #[cfg(debug_assertions)]
 impl std::io::Write for QualificationLineageSink {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.writes += 1;
+        let mut bytes = bytes;
         match self.mode {
             QualificationLineageSinkMode::PermissionDenied => {
                 return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
             }
             QualificationLineageSinkMode::WriteFailed => {
                 return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            QualificationLineageSinkMode::WriteFailedAfterRecord => {
+                if self.writes > 1 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                }
+            }
+            QualificationLineageSinkMode::WriteFailedMidRecord => {
+                if self.writes > 1 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                }
+                // A short accepted count is what a destination reports when it
+                // takes part of a record, and the caller is obliged to offer the
+                // rest in a further call — which this then refuses.
+                bytes = &bytes[..bytes.len().div_ceil(2)];
             }
             QualificationLineageSinkMode::FlushFailed
             | QualificationLineageSinkMode::HangAfterFirstWrite => {}
@@ -2711,6 +2786,10 @@ fn external_lineage_sink(path: &std::path::Path) -> Box<dyn std::io::Write + Sen
         match mode.to_string_lossy().as_ref() {
             "permission-denied" => Some(QualificationLineageSinkMode::PermissionDenied),
             "write-failed" => Some(QualificationLineageSinkMode::WriteFailed),
+            "write-failed-after-record" => {
+                Some(QualificationLineageSinkMode::WriteFailedAfterRecord)
+            }
+            "write-failed-mid-record" => Some(QualificationLineageSinkMode::WriteFailedMidRecord),
             "flush-failed" => Some(QualificationLineageSinkMode::FlushFailed),
             "hang-after-first-write" => Some(QualificationLineageSinkMode::HangAfterFirstWrite),
             _ => None,
@@ -2720,6 +2799,7 @@ fn external_lineage_sink(path: &std::path::Path) -> Box<dyn std::io::Write + Sen
             inner: sink,
             mode,
             blocked: false,
+            writes: 0,
         });
     }
     sink

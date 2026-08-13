@@ -269,6 +269,23 @@ that never got out" and is simply re-run. An export that "ends inside a record
 and is not readable as NDJSON" must be discarded rather than published as this
 run's lineage, and only then re-run.
 
+A sink write or flush failure leaves the same two files, and says so the same
+way. Where the deadline path ran out of time on an export that was otherwise
+going fine, here the destination itself refused, so two separate facts are
+reported: what the destination was left holding, and where the retry should
+point. An export that "ends on a record boundary and is readable as NDJSON" is
+reported without a disposal instruction; one that "ends inside a record and is
+not readable as NDJSON" must be discarded first, and the correction says so
+ahead of the retry advice. The retry advice itself is unchanged — a permanent
+refusal (permission denied, read-only filesystem, a directory) asks for a
+different destination, anything else asks for a re-run — because re-running
+against a destination that has just refused a write may refuse it again.
+
+Nothing is said about a destination that is not there: a failure that wrote no
+bytes at all leaves an empty file, which this path removes so a publish step
+cannot upload it as the run's lineage, and the diagnostic then describes no
+file.
+
 This external worker is not a second identity mode and does not make local
 paths suitable as catalog identity. The explicit `local_diagnostic_paths`
 mode remains a synchronous compatibility path for local file or console

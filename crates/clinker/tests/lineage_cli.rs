@@ -1321,3 +1321,134 @@ fn plan_only_lineage_deadline_says_whether_the_export_it_kept_is_readable() {
         "the pasteable deadline correction is still offered: {stderr}"
     );
 }
+
+/// Run a plan-only `--lineage` export against a fault-injected sink.
+fn run_plan_only_lineage_with_sink(workspace: &Path, mode: &str) -> std::process::Output {
+    write_pipeline(workspace, "./out.csv");
+    external_lineage_policy(workspace, true);
+    Command::new(clinker_bin())
+        .current_dir(workspace)
+        .env("CLINKER_TEST_LINEAGE_SINK", mode)
+        .args(["run", "pipeline.yaml", "--lineage", "lineage.ndjson"])
+        .output()
+        .expect("run faulted lineage export")
+}
+
+/// A write failure that stopped between records leaves a readable export.
+///
+/// The destination refusing a write says nothing about where in the stream it
+/// stopped, and a refusal that took a whole record first leaves valid NDJSON —
+/// the same publishable-in-the-meantime artifact the deadline path can leave.
+/// Reported without a discard instruction, because there is nothing unreadable
+/// to discard.
+#[test]
+fn plan_only_lineage_write_failure_between_records_says_the_export_is_readable() {
+    let workspace = tempfile::tempdir().expect("failing export workspace");
+    let output = run_plan_only_lineage_with_sink(workspace.path(), "write-failed-after-record");
+
+    assert_eq!(output.status.code(), Some(4));
+    let export = workspace.path().join("lineage.ndjson");
+    assert!(
+        std::fs::metadata(&export).is_ok_and(|metadata| metadata.len() > 0),
+        "the sink took a record, so the operator is left holding a file to describe"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("records_complete=true"),
+        "the delivery line must report the destination's own completeness: {stderr}"
+    );
+    let unwrapped = unwrap_diagnostic(&stderr);
+    assert!(
+        unwrapped.contains("cannot write --lineage output"),
+        "{stderr}"
+    );
+    assert!(
+        unwrapped.contains("ends on a record boundary and is readable as NDJSON"),
+        "a write failure must say what state the file it kept is in: {stderr}"
+    );
+    assert!(
+        !unwrapped.contains("discard that partial export"),
+        "a readable export must not be reported as one that has to be thrown away: {stderr}"
+    );
+    assert!(
+        unwrapped.contains("Correction: re-run the export"),
+        "the retry advice for a transient refusal is unchanged: {stderr}"
+    );
+}
+
+/// A write failure that stopped inside a record leaves an unreadable export.
+#[test]
+fn plan_only_lineage_write_failure_mid_record_says_the_export_is_unreadable() {
+    let workspace = tempfile::tempdir().expect("failing export workspace");
+    let output = run_plan_only_lineage_with_sink(workspace.path(), "write-failed-mid-record");
+
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("records_complete=false"),
+        "the delivery line must report the destination's own completeness: {stderr}"
+    );
+    let unwrapped = unwrap_diagnostic(&stderr);
+    assert!(
+        unwrapped.contains("ends inside a record and is not readable as NDJSON"),
+        "a truncated destination is the one state a consumer cannot see: {stderr}"
+    );
+    assert!(
+        unwrapped.contains(
+            "Correction: discard that partial export rather than publishing it as this run's lineage, then re-run the export"
+        ),
+        "an unreadable kept file needs the disposal instruction ahead of the retry: {stderr}"
+    );
+    assert!(
+        !unwrapped.contains("ends on a record boundary"),
+        "a truncated export must not be described as a short one: {stderr}"
+    );
+}
+
+/// A flush failure reaches the destination's state through the same fact.
+///
+/// Every record was taken before the flush was refused, so this is always the
+/// readable state — and the operator still has to be told, because a file that
+/// simply ends looks identical to the truncated one.
+#[test]
+fn plan_only_lineage_flush_failure_says_the_export_it_kept_is_readable() {
+    let workspace = tempfile::tempdir().expect("failing export workspace");
+    let output = run_plan_only_lineage_with_sink(workspace.path(), "flush-failed");
+
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let unwrapped = unwrap_diagnostic(&stderr);
+    assert!(
+        unwrapped.contains("flush-failed") || unwrapped.contains("write-zero"),
+        "the diagnostic still names what the sink reported: {stderr}"
+    );
+    assert!(
+        unwrapped.contains("ends on a record boundary and is readable as NDJSON"),
+        "a flush failure must say what state the file it kept is in: {stderr}"
+    );
+    assert!(
+        !unwrapped.contains("discard that partial export"),
+        "a readable export must not be reported as one that has to be thrown away: {stderr}"
+    );
+}
+
+/// A failure that wrote nothing describes no file at all.
+///
+/// The empty destination is removed on this path, so a state clause here would
+/// send the operator to inspect a file that is not there.
+#[test]
+fn plan_only_lineage_write_failure_that_left_nothing_describes_no_export() {
+    let workspace = tempfile::tempdir().expect("failing export workspace");
+    let output = run_plan_only_lineage_with_sink(workspace.path(), "write-failed");
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(
+        !workspace.path().join("lineage.ndjson").exists(),
+        "an export that wrote nothing leaves no file"
+    );
+    let unwrapped = unwrap_diagnostic(&String::from_utf8_lossy(&output.stderr));
+    assert!(
+        !unwrapped.contains("the export it left"),
+        "there is no export left to describe: {unwrapped}"
+    );
+}
