@@ -71,9 +71,23 @@ const LINEAGE_METADATA_DEPENDENCIES: [ExpectedMetadataDependency; 7] = [
     ExpectedMetadataDependency::normal("serde", &["derive", "rc"], true),
     ExpectedMetadataDependency::normal("serde_json", &["preserve_order"], true),
 ];
-const LOCK_PACKAGE_COUNT: usize = 306;
+/// The resolved graph this policy has been shown, as a count and a digest over
+/// every locked package's name, version, source and checksum.
+///
+/// It says nothing about which packages those are on purpose: naming them here
+/// would be a second list to keep true beside `Cargo.toml`, and the two would
+/// disagree. What each third-party edge is for, and why it rather than an
+/// alternative, is recorded next to its declaration in the workspace manifest;
+/// this pair only refuses a graph nobody has looked at.
+///
+/// Both move together, and moving them is the recorded act of approving what
+/// changed — so change them only for an addition that has actually been
+/// approved, never to make a red gate green. The values are whatever
+/// [`check_lock_membership`] computes for the approved `Cargo.lock`, which is
+/// what its own failure reports as `found`.
+const LOCK_PACKAGE_COUNT: usize = 308;
 pub const LOCK_PACKAGE_DIGEST: &str =
-    "7da8d283ee6695b4cfca690ef88b5e37d3c4f2d697f664a63e9bb64c860e069d";
+    "a6a8aa1a76d44e16dc67e954ec61581fa06d276e1fcf9e0fc6829bddad4666c2";
 
 #[derive(Clone, Copy)]
 struct ExpectedMetadataDependency {

@@ -1025,14 +1025,17 @@ fn a_lost_periodic_observation_does_not_cancel_a_completed_run() {
     let directory = fixture();
     write_pipeline(directory.path(), "out.csv", 4_096, true);
 
-    // Wake the liveness worker faster than the default cadence. At the default
-    // the first observation is not due until 20 ms into execution, so a host
-    // that reads the 512-file fixture faster than that emits no periodic at
-    // all: the injected failure never fires and the test asserts nothing about
-    // the behaviour it names.
+    // Hold the run until the worker has attempted its first record, so the
+    // injected failure has fired before anything else can end the run. Without
+    // the barrier this test asserts nothing on a host that reads the fixture
+    // faster than the first observation is due -- it passed only because this
+    // fixture is larger than the one whose sibling test failed that way on
+    // macOS and Windows. The faster tick then only shortens a wait that is
+    // already guaranteed to end.
     let output = machine_command(directory.path(), "lost-periodic")
         .env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "periodic")
         .env("CLINKER_TEST_MACHINE_PROGRESS_TICK_MS", "1")
+        .env("CLINKER_TEST_MACHINE_PROGRESS_AWAIT_FIRST_OBSERVATION", "1")
         .output()
         .expect("run with injected periodic write failure");
 
@@ -1152,11 +1155,16 @@ fn a_liveness_verdict_is_reported_even_when_the_run_never_reaches_finish() {
     let directory = fixture();
     write_unresolvable_second_source_pipeline(directory.path());
 
-    // Wake the worker faster than the default cadence, so its first — and
-    // under this injection, fatal — observation is due well before discovery
-    // walks the 1024-file source and the second source fails to resolve.
+    // Hold the run at the worker's start until the worker has made its first
+    // — and under this injection, fatal — observation. What is under test is
+    // what becomes of that verdict when the run leaves early, so the verdict
+    // has to exist before the run leaves. Racing a 1 ms tick against a
+    // 1024-file discovery walk established that on one platform and not on
+    // others; the barrier establishes it on all of them, and the tick override
+    // now only shortens a wait that is guaranteed to end.
     let output = machine_command(directory.path(), "dropped-liveness-verdict")
         .env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "periodic")
+        .env("CLINKER_TEST_MACHINE_PROGRESS_AWAIT_FIRST_OBSERVATION", "1")
         .env("CLINKER_TEST_MACHINE_PROGRESS_TICK_MS", "1")
         .output()
         .expect("run that fails before the executor");

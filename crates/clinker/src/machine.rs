@@ -453,11 +453,15 @@ impl MachineEmitter {
         let emitter = self.clone();
         let tick = progress_tick();
         let (stop, receiver) = mpsc::sync_channel(1);
+        #[cfg(debug_assertions)]
+        let (observed, first_observation) = mpsc::sync_channel::<()>(1);
         let handle = thread::Builder::new()
             .name("clinker-machine-progress".to_owned())
             .spawn(move || {
                 let patience = progress_sink_patience();
                 let mut failing: Option<(Instant, io::Error)> = None;
+                #[cfg(debug_assertions)]
+                let mut observed = Some(observed);
                 loop {
                     match receiver.recv_timeout(tick) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -471,7 +475,20 @@ impl MachineEmitter {
                     // nothing said so; a supervisor watching for liveness then
                     // killed a healthy run. A closed reader is different: no
                     // later tick can reach it either.
-                    match emitter.emit_periodic() {
+                    let write = emitter.emit_periodic();
+                    // Announce the first tick on which a record was actually
+                    // attempted, for the sake of a caller that asked to be
+                    // held until this thread has observed something. The
+                    // announcement is made before the outcome is judged, so it
+                    // is made on the tick that ends the worker as well as on
+                    // one that does not.
+                    #[cfg(debug_assertions)]
+                    if !matches!(write, ProgressWrite::Skipped)
+                        && let Some(sender) = observed.take()
+                    {
+                        let _ = sender.try_send(());
+                    }
+                    match write {
                         // Only a record that got through says the sink is
                         // alive. A tick with nothing due says nothing.
                         ProgressWrite::Skipped => {}
@@ -501,6 +518,25 @@ impl MachineEmitter {
                     }
                 }
             })?;
+        // Hold the run here until the worker has made its first observation,
+        // when a test asks for it.
+        //
+        // The worker's verdict is only interesting once it has observed
+        // something, and what it observes is decided by the injected fault,
+        // not by the clock. Without this the tests that assert on that verdict
+        // had to bet that a tick fell before the run reached whatever ends it
+        // — a bet that held on one platform and not on others. The first
+        // observation is always due, because `BoundedProgress` returns a
+        // snapshot for the first periodic call of a run, so the wait ends
+        // after one tick. It also ends if the worker goes away before making
+        // it: the sender lives on that thread, so a panicked worker
+        // disconnects the channel rather than stranding the run here.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("CLINKER_TEST_MACHINE_PROGRESS_AWAIT_FIRST_OBSERVATION").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            let _ = first_observation.recv();
+        }
         Ok(MachineProgressWorker {
             stop,
             handle: Some(handle),
