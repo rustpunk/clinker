@@ -550,23 +550,56 @@ fn arena_admission_loss_reaches_the_machine_terminal_and_standard_error() {
 /// shutdown that dropped nothing. A line that appears on every run reading
 /// all-zeroes is noise an operator learns to skip, which is how the one run
 /// that did lose signals gets skipped with it.
+///
+/// Asserted as an equivalence against this run's own counters rather than as
+/// "this run prints nothing". Nothing configured in this pipeline discards a
+/// signal, but a producer that offers one while the drain thread holds the
+/// arena lock is refused and credited to `contended` — a real drop, correctly
+/// reported, and one the drain can only make rare rather than impossible. A
+/// test that demands silence is therefore betting on a collision not
+/// happening. The rule itself is checked exhaustively against synthetic
+/// counters in `clinker::observability`; what belongs out here is that both
+/// surfaces of a real run agree — the terminal's counters and the line's
+/// presence are read from one accounting, so the line appears exactly when
+/// that accounting has something to say.
 #[test]
-fn a_run_that_dropped_nothing_prints_no_admission_line() {
+fn the_admission_line_appears_exactly_when_this_run_has_a_loss_to_report() {
     let root = fixture();
     write_two_lane_pipeline(root.path(), 2);
     write_sampling_policy(root.path(), 1);
     let capture = root.path().join("otlp.ndjson");
 
-    let output = invoke_sampled(root.path(), &capture, false);
+    let output = invoke_sampled(root.path(), &capture, true);
     assert!(
         output.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let terminal = machine_events(&output)
+        .last()
+        .cloned()
+        .expect("machine terminal");
+    let admission = &terminal["observability"]["admission"];
+    let count = |value: &serde_json::Value| value.as_u64().expect("a counter");
+    let dropped_total: u64 = admission["dropped"]
+        .as_object()
+        .expect("drop reasons")
+        .values()
+        .map(count)
+        .sum();
+    let has_something_to_report = dropped_total > 0
+        || !admission["counts_complete"]
+            .as_bool()
+            .expect("completeness flag")
+        || count(&admission["arena_recoveries"]) > 0
+        || count(&admission["fields"]["missing"]) > 0;
+
     let diagnostic = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !diagnostic.contains("telemetry admission outcome"),
-        "a run with no admission loss must stay silent: {diagnostic}"
+    assert_eq!(
+        diagnostic.contains("clinker: telemetry admission outcome:"),
+        has_something_to_report,
+        "the line is printed exactly when the accounting beside it says \
+         something was lost: {admission:#?}\nstderr: {diagnostic}"
     );
 }
 

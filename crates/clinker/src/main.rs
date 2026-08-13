@@ -2437,50 +2437,18 @@ fn report_lineage_delivery(outcome: clinker_lineage::LineageDeliveryOutcome) {
 /// silently truncated dataset. Lineage already reports its losses this way;
 /// telemetry, the noisier of the two, said nothing.
 ///
-/// Suppressed when every counter is zero, exactly as the lineage line is
-/// suppressed on a clean shutdown that dropped nothing: a run that lost no
-/// telemetry has nothing to report about losing telemetry.
-///
-/// Counters that are not a final accounting are never suppressed, whatever
-/// they say. All-zero mid-drain numbers are not evidence of a clean run, and
-/// staying silent on them reports a run that may well have lost signals as one
-/// that certainly did not.
-///
-/// Two counters outside `dropped` break the silence on their own. A missing
-/// field is an attribute the collector never received, and an arena recovery
-/// is telemetry having panicked under its own guard — neither is a signal
-/// count, and both are things nobody configured. The `denied` and `truncated`
-/// field counters stay silent by contrast because they are policy doing
-/// exactly what an operator asked it to do.
+/// Suppressed when the accounting has nothing to report, exactly as the
+/// lineage line is suppressed on a clean shutdown that dropped nothing: a run
+/// that lost no telemetry has nothing to report about losing telemetry. Which
+/// counters that covers, and why the two outside `dropped` break the silence
+/// on their own, is
+/// [`observability::AdmissionSummary::standard_error_line`] — which is also
+/// where the line itself is built, so that both the rule and the text it
+/// produces are decided by a snapshot rather than by a run.
 fn report_telemetry_admission(admission: observability::AdmissionSummary) {
-    if admission.dropped_total() == 0
-        && admission.counts_complete
-        && admission.arena_recoveries == 0
-        && admission.fields.missing == 0
-    {
-        return;
+    if let Some(line) = admission.standard_error_line() {
+        eprintln!("{line}");
     }
-    let dropped = admission.dropped;
-    let lanes = admission.lanes;
-    eprintln!(
-        "clinker: telemetry admission outcome: accepted={} dropped={} sampled={} rate_limited={} queue_full={} contended={} oversize={} invalid_identity={} undecodable={} ordinary_sampled={} ordinary_queue_full={} high_sampled={} high_queue_full={} missing_fields={} arena_recoveries={} counts_complete={}",
-        admission.accepted,
-        admission.dropped_total(),
-        dropped.sampled,
-        dropped.rate_limited,
-        dropped.queue_full,
-        dropped.contended,
-        dropped.oversize,
-        dropped.invalid_identity,
-        dropped.undecodable,
-        lanes.ordinary.sampled,
-        lanes.ordinary.queue_full,
-        lanes.high_severity.sampled,
-        lanes.high_severity.queue_full,
-        admission.fields.missing,
-        admission.arena_recoveries,
-        admission.counts_complete,
-    );
 }
 
 /// Whether a sink that refused a write will refuse the identical retry.

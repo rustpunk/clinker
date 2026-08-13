@@ -244,6 +244,53 @@ impl AdmissionSummary {
     pub(crate) fn dropped_total(self) -> u64 {
         self.dropped.total()
     }
+
+    /// The standard-error line this accounting is worth, or `None` when it has
+    /// nothing to say about lost telemetry.
+    ///
+    /// Built here rather than at the point it is printed so the suppression
+    /// rule can be checked against a snapshot: whether a run collides with its
+    /// own drain thread and refuses a signal is a property of the moment, so
+    /// no run is a reliable witness to the nothing-to-report case.
+    ///
+    /// Four separate claims keep the line, and any one of them alone. Counters
+    /// that are not final are not evidence of a clean run — all-zero mid-drain
+    /// numbers describe a count that stopped, not a run that lost nothing. A
+    /// missing field is an attribute the collector never received, and an
+    /// arena recovery is telemetry having panicked under its own guard;
+    /// neither is a signal count, and nobody configured either. The `denied`
+    /// and `truncated` field counters stay out of it by contrast, because they
+    /// are policy doing exactly what an operator asked it to do.
+    pub(crate) fn standard_error_line(self) -> Option<String> {
+        if self.dropped_total() == 0
+            && self.counts_complete
+            && self.arena_recoveries == 0
+            && self.fields.missing == 0
+        {
+            return None;
+        }
+        let dropped = self.dropped;
+        let lanes = self.lanes;
+        Some(format!(
+            "clinker: telemetry admission outcome: accepted={} dropped={} sampled={} rate_limited={} queue_full={} contended={} oversize={} invalid_identity={} undecodable={} ordinary_sampled={} ordinary_queue_full={} high_sampled={} high_queue_full={} missing_fields={} arena_recoveries={} counts_complete={}",
+            self.accepted,
+            self.dropped_total(),
+            dropped.sampled,
+            dropped.rate_limited,
+            dropped.queue_full,
+            dropped.contended,
+            dropped.oversize,
+            dropped.invalid_identity,
+            dropped.undecodable,
+            lanes.ordinary.sampled,
+            lanes.ordinary.queue_full,
+            lanes.high_severity.sampled,
+            lanes.high_severity.queue_full,
+            self.fields.missing,
+            self.arena_recoveries,
+            self.counts_complete,
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1923,6 +1970,16 @@ mod tests {
         serde_json::to_vec(record).expect("record serializes").len()
     }
 
+    /// An arena that lost nothing, kept every field it was asked for, and
+    /// never faulted under its own guard.
+    fn snapshot_of_a_clean_run() -> ArenaSnapshot {
+        ArenaSnapshot {
+            missing_field_drops: 0,
+            arena_recoveries: 0,
+            ..snapshot_reporting_a_miss_and_a_recovery()
+        }
+    }
+
     /// An arena reporting one missed field and one recovered panic, and
     /// nothing else. Every other counter is zero so a mapping that routed
     /// either value into the wrong group is visible as a non-zero it cannot
@@ -1985,6 +2042,82 @@ mod tests {
                 .values()
                 .all(|count| count == 0),
             "neither counter may appear under a drop reason: {encoded:#?}"
+        );
+    }
+
+    /// The standard-error line is suppressed exactly when the accounting has
+    /// nothing to say, and each thing it can say breaks the silence alone.
+    ///
+    /// Checked against a snapshot rather than against a run, because a run is
+    /// not a witness to the silent case: a producer that meets the drain
+    /// thread at the arena lock is refused and credited to `contended`. That
+    /// is a real drop, correctly reported, and the drain holds that lock for a
+    /// shorter time than it used to rather than for no time at all — so a run
+    /// asserted to print nothing is asserting that a collision did not happen,
+    /// which is a property of the schedule and not of the rule.
+    #[test]
+    fn an_accounting_with_nothing_to_report_is_suppressed_and_any_loss_breaks_it() {
+        assert_eq!(
+            AdmissionSummary::from_arena(snapshot_of_a_clean_run(), true).standard_error_line(),
+            None,
+            "a final count of a run that lost nothing has nothing to report"
+        );
+
+        /// A counter that must keep the line, paired with the text its
+        /// presence must produce.
+        type Breaker = (&'static str, fn(&mut ArenaSnapshot));
+
+        let breakers: [Breaker; 9] = [
+            ("sampled=1", |snapshot| snapshot.sampled_drops = 1),
+            ("rate_limited=1", |snapshot| snapshot.rate_limited_drops = 1),
+            ("queue_full=1", |snapshot| snapshot.full_drops = 1),
+            ("contended=1", |snapshot| snapshot.contention_drops = 1),
+            ("oversize=1", |snapshot| snapshot.oversize_drops = 1),
+            ("invalid_identity=1", |snapshot| snapshot.invalid_drops = 1),
+            ("undecodable=1", |snapshot| snapshot.undecodable_drops = 1),
+            ("missing_fields=1", |snapshot| {
+                snapshot.missing_field_drops = 1;
+            }),
+            ("arena_recoveries=1", |snapshot| {
+                snapshot.arena_recoveries = 1;
+            }),
+        ];
+        for (reported, break_the_silence) in breakers {
+            let mut snapshot = snapshot_of_a_clean_run();
+            break_the_silence(&mut snapshot);
+            let line = AdmissionSummary::from_arena(snapshot, true)
+                .standard_error_line()
+                .unwrap_or_else(|| panic!("a run reporting {reported} is not a silent one"));
+            assert!(
+                line.contains(reported),
+                "the line must name what broke the silence: {line}"
+            );
+        }
+
+        let unfinished = AdmissionSummary::from_arena(snapshot_of_a_clean_run(), false)
+            .standard_error_line()
+            .expect("counters that are not final are reported however they read");
+        assert!(
+            unfinished.contains("dropped=0") && unfinished.contains("counts_complete=false"),
+            "all-zero counters read from an arena still being drained are not \
+             evidence of a clean run, and the line says which of the two it \
+             is: {unfinished}"
+        );
+    }
+
+    /// Field policy doing what an operator configured it to do is not a loss,
+    /// and reporting it would put a line on every run of a pipeline that denies
+    /// or truncates a field by design.
+    #[test]
+    fn configured_field_policy_leaves_the_admission_line_suppressed() {
+        let mut snapshot = snapshot_of_a_clean_run();
+        snapshot.denied_fields = 4;
+        snapshot.truncated_fields = 2;
+        snapshot.attribute_limit_drops = 1;
+        assert_eq!(
+            AdmissionSummary::from_arena(snapshot, true).standard_error_line(),
+            None,
+            "denied, truncated and attribute-limited fields are policy, not loss"
         );
     }
 

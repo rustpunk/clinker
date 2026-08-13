@@ -1812,34 +1812,47 @@ mod tests {
     /// the collision check reported E317 for two genuinely different files,
     /// refusing a valid pipeline. Each component now answers to the directory
     /// that actually holds it.
+    ///
+    /// Read off the key one path produces rather than off a pair of
+    /// case-variant sibling directories. Two directories differing only in
+    /// case can be *created* only where the container keeps case, and the
+    /// temporary volume does not on macOS — the second `create_dir_all` is a
+    /// no-op there, `canonicalize` hands back the one on-disk spelling, and
+    /// the pair the fixture meant to build is one directory named twice. The
+    /// single chain here exists under one spelling on every platform, and
+    /// every verdict the rule reads is seeded, so the expected key is the same
+    /// everywhere: `Reports` is answered by `root`, which keeps case, and `CI`
+    /// by `Reports`, which folds it. One verdict for the whole path cannot
+    /// produce that key whichever verdict it picks.
     #[test]
     fn a_component_folds_under_its_own_directory_not_the_deepest_one() {
         let root = tempfile::tempdir().expect("tempdir");
         let root = root.path().canonicalize().expect("canonical tempdir");
-        for leaf in ["Reports/ci", "reports/ci"] {
-            std::fs::create_dir_all(root.join(leaf)).expect("mkdir");
-        }
+        let inner = root.join("Reports").join("CI");
+        std::fs::create_dir_all(&inner).expect("mkdir");
 
-        // `root` keeps case, and the two directories inside it stand for two
-        // case-insensitive volumes mounted there.
+        // `root` keeps case; `Reports` stands for a case-insensitive volume
+        // mounted inside it, and `CI` for a directory on that volume. A probe
+        // answers for the names *inside* the directory it runs in, so it is
+        // the seeded verdict of `root` that decides how `Reports` keys.
         CASE_ANSWERS.remember(&root, true);
-        for folding in [root.join("Reports"), root.join("reports")] {
-            CASE_ANSWERS.remember(&folding, false);
-            CASE_ANSWERS.remember(&folding.join("ci"), false);
-        }
+        CASE_ANSWERS.remember(&root.join("Reports"), false);
+        CASE_ANSWERS.remember(&inner, false);
 
-        let upper = destination_identity(&root.join("Reports/ci/out.csv"));
-        let lower = destination_identity(&root.join("reports/ci/out.csv"));
-        assert_ne!(
-            upper, lower,
-            "`Reports` and `reports` sit in a directory that keeps case, so they \
-             are two destinations however the volumes beneath them behave"
+        let key = destination_identity(&inner.join("Out.csv"));
+        let separator = std::path::MAIN_SEPARATOR;
+        assert!(
+            key.ends_with(&format!("Reports{separator}ci{separator}out.csv")),
+            "`Reports` sits in a directory that keeps case and `CI` in one that \
+             folds it, so the two adjacent components key differently: {key}"
         );
 
-        // The folding volumes still fold the names they actually hold.
+        // The folding volume still folds the names it actually holds, which is
+        // the consequence the per-component rule must not cost: two spellings
+        // inside it are one destination.
         assert_eq!(
-            destination_identity(&root.join("Reports/ci/Out.csv")),
-            destination_identity(&root.join("Reports/ci/out.csv")),
+            destination_identity(&inner.join("Out.csv")),
+            destination_identity(&inner.join("out.csv")),
             "a name inside a case-insensitive volume is still one destination"
         );
     }
