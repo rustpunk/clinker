@@ -718,7 +718,12 @@ fn logs_metrics_traces_and_fault_matrix() {
     )
     .expect_err("total worker deadline must bound retry backoff");
     handle.join().expect("join total-timeout fixture");
-    assert_eq!(failure.kind(), OtlpDeliveryFailureKind::Timeout);
+    assert_eq!(
+        failure.kind(),
+        OtlpDeliveryFailureKind::RetryExhausted(OtlpRetryCause::CollectorUnavailable),
+        "the deadline stops the wait, and what the delivery ran out of is \
+         retries it could afford against a collector asking for later"
+    );
     assert_eq!(failure.attempts(), 1);
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind connect-failure fixture");
@@ -980,26 +985,87 @@ fn a_requested_wait_longer_than_the_budget_is_reported_as_the_throttle() {
 }
 
 /// The date form of `Retry-After` needs calendar arithmetic this crate has no
-/// dependency for. A wait that cannot be read is not a wait that may be
-/// shortened to the configured backoff, so the delivery stops and says the
-/// collector is throttling it.
+/// dependency for, and gateways in front of a collector send it routinely. A
+/// wait that cannot be read is not a wait that may be shortened to zero, and
+/// it is no evidence the budget is spent either — ending the export on it
+/// abandoned at the first 503 a batch the growing backoff recovers.
 #[test]
-fn a_requested_wait_this_client_cannot_read_is_never_shortened() {
+fn a_requested_wait_this_client_cannot_read_is_waited_out_as_backoff() {
     let (address, handle) = spawn_sequence_server(vec![
         FixtureResponse::immediate(503, br#"{}"#.to_vec())
             .with_header("Retry-After", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        FixtureResponse::immediate(200, br#"{}"#.to_vec()),
     ]);
     let endpoint = admitted_loopback_endpoint(address);
+    let measurable_backoff = OtlpDeliveryBudget::new(OtlpDeliveryBounds {
+        max_request_bytes: 64 * 1024,
+        max_response_bytes: 4 * 1024,
+        max_attempts: 3,
+        connect_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(2),
+        retry_backoff: Duration::from_millis(150),
+        total_timeout: Duration::from_secs(10),
+    })
+    .expect("valid unreadable-hint fixture budget");
+    let started = Instant::now();
+    let outcome = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &measurable_backoff,
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect("the attempt after the ordinary backoff is accepted");
+    let waited = started.elapsed();
+    let requests = handle.join().expect("join unreadable-wait fixture");
+
+    assert_eq!(
+        requests.len(),
+        2,
+        "an unreadable hint costs the delivery a wait, not its remaining attempts"
+    );
+    assert_eq!(outcome.attempts(), 2);
+    assert!(
+        waited >= Duration::from_millis(140),
+        "the retry waited what it owed with no header at all: {waited:?}"
+    );
+}
+
+/// A backoff that outgrows the budget is the retry running out, not the
+/// collector running slow. Checking the deadline only where a `Retry-After`
+/// had been read left the computed ladder to be slept out to the deadline and
+/// reported as a timeout — pointing a supervisor at collector latency for a
+/// delivery that had hit a throttle.
+#[test]
+fn a_backoff_the_budget_cannot_contain_names_the_throttle_not_the_deadline() {
+    let (address, handle) =
+        spawn_sequence_server(vec![FixtureResponse::immediate(503, br#"{}"#.to_vec())]);
+    let endpoint = admitted_loopback_endpoint(address);
+    let outgrown = OtlpDeliveryBudget::new(OtlpDeliveryBounds {
+        max_request_bytes: 64 * 1024,
+        max_response_bytes: 4 * 1024,
+        max_attempts: 6,
+        connect_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(2),
+        // The first wait already fills the whole delivery, so the ladder is
+        // outgrown at the first retry rather than several doublings in.
+        retry_backoff: Duration::from_millis(300),
+        total_timeout: Duration::from_millis(300),
+    })
+    .expect("valid outgrown-ladder fixture budget");
+    let started = Instant::now();
     let failure = send_otlp_json(
         &endpoint,
         OtlpSignal::Logs,
         &logs_payload(),
-        &budget(3),
+        &outgrown,
         &|| false,
         OtlpAuthentication::None,
     )
-    .expect_err("an unreadable wait stops the delivery");
-    let requests = handle.join().expect("join unreadable-wait fixture");
+    .expect_err("no attempt remains that the deadline can hold");
+    let elapsed = started.elapsed();
+    let requests = handle.join().expect("join outgrown-ladder fixture");
 
     assert_eq!(
         requests.len(),
@@ -1008,7 +1074,50 @@ fn a_requested_wait_this_client_cannot_read_is_never_shortened() {
     );
     assert_eq!(
         failure.kind(),
-        OtlpDeliveryFailureKind::RetryExhausted(OtlpRetryCause::CollectorUnavailable)
+        OtlpDeliveryFailureKind::RetryExhausted(OtlpRetryCause::CollectorUnavailable),
+        "the export ran out of retries it could afford, which is what the \
+         collector's 503 asked for"
+    );
+    assert_eq!(failure.attempts(), 1);
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "the budget was not spent sleeping: {elapsed:?}"
+    );
+}
+
+/// The same rule on the transport side. A connect failure whose next wait
+/// cannot fit the deadline is the connection not recovering, and it was
+/// reported as a timeout because the deadline check lived in one arm of the
+/// retry decision rather than at the wait every arm goes through.
+#[test]
+fn a_transport_retry_the_budget_cannot_hold_names_the_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind unreachable fixture");
+    let address = listener.local_addr().expect("unreachable fixture address");
+    drop(listener);
+    let endpoint = admitted_loopback_endpoint(address);
+    let outgrown = OtlpDeliveryBudget::new(OtlpDeliveryBounds {
+        max_request_bytes: 64 * 1024,
+        max_response_bytes: 4 * 1024,
+        max_attempts: 4,
+        connect_timeout: Duration::from_millis(300),
+        request_timeout: Duration::from_millis(300),
+        retry_backoff: Duration::from_millis(300),
+        total_timeout: Duration::from_millis(300),
+    })
+    .expect("valid transport-ladder fixture budget");
+    let failure = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &outgrown,
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect_err("a connection that did not open and cannot be retried in time");
+
+    assert_eq!(
+        failure.kind(),
+        OtlpDeliveryFailureKind::RetryExhausted(OtlpRetryCause::Connect)
     );
     assert_eq!(failure.attempts(), 1);
 }

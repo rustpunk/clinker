@@ -525,7 +525,7 @@ impl RestRecordSource {
                     Ok(body) => body,
                     Err(error) => {
                         let failure = RequestFailure::from_transport(&error).in_response_phase();
-                        if failure.retryable_body_read() {
+                        if failure.another_attempt_could_succeed_in(RetryPhase::AfterAnswer) {
                             break (failure, true);
                         }
                         return Err(self.sanitized_request_failure(
@@ -559,8 +559,9 @@ impl RestRecordSource {
             // could succeed is read from the failure's own classification
             // rather than from a second list of variants kept in step by hand.
             let cancelled = self.shutdown.as_ref().is_some_and(|t| t.is_requested());
+            let phase = RetryPhase::from_peer_answered(peer_answered);
             let abandoned_a_useful_retry =
-                attempt < self.cfg.retries && retry_failure.another_attempt_could_succeed();
+                attempt < self.cfg.retries && retry_failure.another_attempt_could_succeed_in(phase);
             if cancelled
                 && (abandoned_a_useful_retry
                     || (!peer_answered && retry_failure.is_cancellable_transport()))
@@ -577,7 +578,7 @@ impl RestRecordSource {
             // number, as though something had been tried and had varied.
             if !cancelled
                 && attempt < self.cfg.retries
-                && retry_failure.another_attempt_could_succeed()
+                && retry_failure.another_attempt_could_succeed_in(phase)
             {
                 attempt = attempt.saturating_add(1);
                 continue;
@@ -620,6 +621,28 @@ enum RequestFailure {
     Transport,
 }
 
+/// How far an exchange had got when it failed, which decides what a retry
+/// could still win.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryPhase {
+    /// Nothing had been received: the request may never have reached a peer.
+    BeforeAnswer,
+    /// The peer had begun replying, so it is reachable and answering.
+    AfterAnswer,
+}
+
+impl RetryPhase {
+    /// The page loop knows the phase from where the failure came back, not
+    /// from the failure itself: the same error kinds are reachable in both.
+    const fn from_peer_answered(peer_answered: bool) -> Self {
+        if peer_answered {
+            Self::AfterAnswer
+        } else {
+            Self::BeforeAnswer
+        }
+    }
+}
+
 impl RequestFailure {
     /// Whether retrying this failure could produce a different answer.
     ///
@@ -640,43 +663,73 @@ impl RequestFailure {
     /// this client could not route and a reply it could not parse deliberately
     /// share one code, because they are one thing to the operator and two
     /// different things to the retry.
-    fn another_attempt_could_succeed(self) -> bool {
+    ///
+    /// The phase is an input because the two phases are not asking the same
+    /// question. A body read that failed has established what a request that
+    /// never got an answer has not: the endpoint is reachable and answering,
+    /// so a reachability failure is no longer a candidate explanation, and a
+    /// reply that arrived unreadable is evidence about the payload rather than
+    /// about the link. Answering both from the request-phase reading
+    /// re-requested a page whose body had failed permanently — a corrupt
+    /// stream, a reply that would not parse — once per remaining attempt, each
+    /// paying the full per-request deadline to reach the same verdict at a
+    /// higher attempt number.
+    fn another_attempt_could_succeed_in(self, phase: RetryPhase) -> bool {
         match self {
             // The statuses this loop re-requests: a server asking for later
-            // rather than refusing.
+            // rather than refusing. A status is a verdict the peer reached, so
+            // the phase that observed it cannot change the answer.
             Self::HttpStatus(status) => (500..600).contains(&status) || matches!(status, 408 | 429),
             // Settled facts about the endpoint, or about material this run
             // supplied. A misrouted URL, an untrusted certificate, a name that
             // does not resolve, and a page past the size cap all fail
             // identically however many attempts remain.
             Self::Tls | Self::HostNotFound | Self::Unroutable | Self::BodyLimit => false,
-            // Not every local I/O failure. Reading a client certificate, a
-            // trust store, or a socket path the process may not open fails
-            // permanently and identically on every attempt. This is the same
-            // set the unreadable-local-material verdict uses, and no more —
-            // the two rules have to name one list, or they disagree about a
-            // single error kind and one of them is wrong. The phase that
-            // observed it changes nothing: a certificate that cannot be read
-            // does not become readable because the peer answered first.
-            Self::Io(kind) | Self::ResponseIo(kind) => !matches!(
-                kind,
-                std::io::ErrorKind::PermissionDenied
-                    | std::io::ErrorKind::NotFound
-                    | std::io::ErrorKind::IsADirectory
-                    | std::io::ErrorKind::ReadOnlyFilesystem
-            ),
-            // `Transport` is included: what reaches that catch-all is a failure
-            // the mapping could not identify, and every permanent failure that
-            // could arrive there is named above, so nothing durable reaches it.
-            // `Protocol` likewise — a connection that ends before a reply
-            // parses is spelled as a protocol error on some hosts and as an I/O
-            // error on others.
-            Self::Timeout
-            | Self::ResponseTimeout
-            | Self::Connection
-            | Self::ProxyConnection
-            | Self::Protocol
-            | Self::Transport => true,
+            Self::Io(kind) | Self::ResponseIo(kind) => match phase {
+                // Not every local I/O failure. Reading a client certificate, a
+                // trust store, or a socket path the process may not open fails
+                // permanently and identically on every attempt. This is the
+                // same set the unreadable-local-material verdict uses, and no
+                // more — the two rules have to name one list, or they disagree
+                // about a single error kind and one of them is wrong.
+                RetryPhase::BeforeAnswer => !matches!(
+                    kind,
+                    std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::IsADirectory
+                        | std::io::ErrorKind::ReadOnlyFilesystem
+                ),
+                // Mid-reply, the open question is narrower: did the connection
+                // carrying the body come apart? These are the kinds that answer
+                // yes. Anything else reached a reader that was being served
+                // bytes, so re-requesting cannot change what those bytes were.
+                RetryPhase::AfterAnswer => matches!(
+                    kind,
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::WouldBlock
+                ),
+            },
+            // A deadline is retryable in either phase — a slow reply is the
+            // ordinary transient. `Connection` too: a stream that comes apart
+            // under a reader is spelled as a failed connection on some hosts.
+            Self::Timeout | Self::ResponseTimeout | Self::Connection => true,
+            // Before an answer, `Transport` is a failure the mapping could not
+            // identify and every permanent one that could arrive there is named
+            // above, so nothing durable reaches it; `Protocol` covers a
+            // connection ending before a reply parses, and `ProxyConnection` a
+            // hop that may come back. After an answer none of the three is
+            // about reaching the endpoint any more: they are what a reply that
+            // began arriving and then would not be read looks like — a
+            // decompression that failed, a framing that did not hold — and a
+            // second request fetches the same bytes.
+            Self::ProxyConnection | Self::Protocol | Self::Transport => {
+                matches!(phase, RetryPhase::BeforeAnswer)
+            }
         }
     }
 
@@ -701,7 +754,7 @@ impl RequestFailure {
         ) {
             return false;
         }
-        self.another_attempt_could_succeed()
+        self.another_attempt_could_succeed_in(RetryPhase::BeforeAnswer)
     }
 
     /// Re-label a failure observed while reading a reply the peer had already
@@ -827,17 +880,6 @@ impl RequestFailure {
             Self::Io(kind) => format!("io_{kind:?}").to_ascii_lowercase(),
             Self::Transport => "transport".to_owned(),
         }
-    }
-
-    /// Whether the page loop re-reads after this body-read failure.
-    ///
-    /// The same question as [`Self::another_attempt_could_succeed`], asked
-    /// where the loop acts on it. It delegates rather than answering, so what
-    /// the loop retries and what the cancellation rule counts as a retry worth
-    /// abandoning are one rule by construction: the two cannot drift apart
-    /// again without deleting this line.
-    fn retryable_body_read(self) -> bool {
-        self.another_attempt_could_succeed()
     }
 }
 
@@ -1158,7 +1200,7 @@ mod tests {
             RequestFailure::HttpStatus(404),
         ] {
             assert!(
-                !permanent.another_attempt_could_succeed(),
+                !permanent.another_attempt_could_succeed_in(RetryPhase::BeforeAnswer),
                 "{permanent:?} fails the same way however many attempts remain"
             );
         }
@@ -1169,7 +1211,7 @@ mod tests {
             RequestFailure::HttpStatus(408),
         ] {
             assert!(
-                transient.another_attempt_could_succeed(),
+                transient.another_attempt_could_succeed_in(RetryPhase::BeforeAnswer),
                 "{transient:?} is what a remaining attempt is for"
             );
         }
@@ -1196,7 +1238,9 @@ mod tests {
     /// Relabelling a failure by phase must not change whether it can be
     /// retried. Moving body-read failures onto their own variant silently
     /// dropped three kinds, so a transient that used to survive a retry began
-    /// failing the run and discarding everything already pulled.
+    /// failing the run and discarding everything already pulled. The label and
+    /// the phase are separate inputs: `ResponseIo` says which variant carries
+    /// the kind, and the phase says what the loop had already learned.
     #[test]
     fn a_phase_label_never_changes_what_is_retryable() {
         for kind in [
@@ -1208,11 +1252,55 @@ mod tests {
             std::io::ErrorKind::Interrupted,
             std::io::ErrorKind::WouldBlock,
         ] {
-            let request_phase = RequestFailure::Io(kind);
-            assert_eq!(
-                request_phase.retryable_body_read(),
-                request_phase.in_response_phase().retryable_body_read(),
-                "{kind:?} must be equally retryable whichever phase observed it"
+            let failure = RequestFailure::Io(kind);
+            for phase in [RetryPhase::BeforeAnswer, RetryPhase::AfterAnswer] {
+                assert_eq!(
+                    failure.another_attempt_could_succeed_in(phase),
+                    failure
+                        .in_response_phase()
+                        .another_attempt_could_succeed_in(phase),
+                    "{kind:?} must be equally retryable whichever variant carries it"
+                );
+            }
+        }
+    }
+
+    /// A body that failed after the peer began sending has settled something a
+    /// request that never got an answer had not. Reading both phases from the
+    /// request-phase answer re-requested a page whose body could not be read —
+    /// a stream that would not decompress, a reply that would not parse — once
+    /// per remaining attempt, each paying the full per-request deadline to
+    /// reach the same verdict at a higher attempt number.
+    #[test]
+    fn a_reply_that_arrived_unreadable_is_not_fetched_again() {
+        for settled in [
+            RequestFailure::Protocol,
+            RequestFailure::Transport,
+            RequestFailure::ProxyConnection,
+            RequestFailure::ResponseIo(std::io::ErrorKind::InvalidData),
+            RequestFailure::ResponseIo(std::io::ErrorKind::Other),
+        ] {
+            assert!(
+                settled.another_attempt_could_succeed_in(RetryPhase::BeforeAnswer),
+                "{settled:?} before an answer may be the link, which a retry can win"
+            );
+            assert!(
+                !settled.another_attempt_could_succeed_in(RetryPhase::AfterAnswer),
+                "{settled:?} after an answer is about the reply, and a second \
+                 request fetches the same bytes"
+            );
+        }
+
+        for dropped in [
+            RequestFailure::ResponseTimeout,
+            RequestFailure::Connection,
+            RequestFailure::ResponseIo(std::io::ErrorKind::ConnectionReset),
+            RequestFailure::ResponseIo(std::io::ErrorKind::UnexpectedEof),
+        ] {
+            assert!(
+                dropped.another_attempt_could_succeed_in(RetryPhase::AfterAnswer),
+                "{dropped:?} is a reply that came apart in transit, which is \
+                 what the remaining attempts are for"
             );
         }
     }
@@ -1263,13 +1351,24 @@ mod tests {
     /// never been told about, so a page dropped mid-read under a deliberate
     /// shutdown was retried and then reported as a temporarily unavailable
     /// source — advice a supervisor honours by re-queuing the cancelled batch.
+    ///
+    /// One table, read at the phase the loop is in, is what keeps them
+    /// agreeing. The census holds the two properties that table must have over
+    /// every shape a failure can take.
     #[test]
     fn what_the_loop_retries_is_what_a_shutdown_abandons() {
         for failure in every_failure_shape() {
-            assert_eq!(
-                failure.retryable_body_read(),
-                failure.another_attempt_could_succeed(),
-                "{failure:?} must answer one question one way"
+            assert!(
+                !failure.another_attempt_could_succeed_in(RetryPhase::AfterAnswer)
+                    || failure.another_attempt_could_succeed_in(RetryPhase::BeforeAnswer),
+                "{failure:?} must not become retryable by being observed later: \
+                 an answered exchange has learned more, not less"
+            );
+            assert!(
+                !failure.is_cancellable_transport()
+                    || failure.another_attempt_could_succeed_in(RetryPhase::BeforeAnswer),
+                "{failure:?} cannot be both a retry worth abandoning and a \
+                 retry that could not have helped"
             );
         }
     }
@@ -1286,7 +1385,7 @@ mod tests {
             RequestFailure::ResponseIo(std::io::ErrorKind::BrokenPipe),
         ] {
             assert!(
-                failure.another_attempt_could_succeed(),
+                failure.another_attempt_could_succeed_in(RetryPhase::AfterAnswer),
                 "{failure:?} is retried by the page loop, so a signal that \
                  cancels the retry explains the outcome"
             );

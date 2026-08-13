@@ -695,44 +695,25 @@ pub fn send_otlp_json(
                     // rather than hurry it, having no delay to offer; this
                     // path has one, so it honours what was asked for.
                     let delay = match retry_after_hint(response.headers()) {
+                        // No sooner than asked, and no sooner than the growing
+                        // backoff would have waited anyway.
                         Some(RetryAfterHint::Delay(requested)) => {
-                            // No sooner than asked, and no sooner than the
-                            // growing backoff would have waited anyway.
-                            let delay =
-                                requested.max(backoff_after(budget.retry_backoff, attempts));
-                            // Sleeping out a wait the budget cannot contain
-                            // would spend the whole delivery deadline to
-                            // report a timeout. What is actually known is that
-                            // the collector asked for longer than this export
-                            // has, which is the throttle, said with the retry
-                            // advice a supervisor can act on.
-                            if Instant::now()
-                                .checked_add(delay)
-                                .is_none_or(|resume| resume > deadline)
-                            {
-                                return Err(OtlpDeliveryFailure::new(
-                                    signal,
-                                    OtlpDeliveryFailureKind::RetryExhausted(cause),
-                                    attempts,
-                                ));
-                            }
-                            delay
+                            requested.max(backoff_after(budget.retry_backoff, attempts))
                         }
-                        // A wait this client cannot compute is not a wait it
-                        // may shorten to zero. Re-requesting is the failure
-                        // being fixed here, so an unreadable hint stops the
-                        // delivery with the same throttle verdict and leaves
-                        // the retry to whoever supervises the run.
-                        Some(RetryAfterHint::Unreadable) => {
-                            return Err(OtlpDeliveryFailure::new(
-                                signal,
-                                OtlpDeliveryFailureKind::RetryExhausted(cause),
-                                attempts,
-                            ));
+                        // An unreadable hint is not a licence to ask again
+                        // immediately, and it is not evidence the budget is
+                        // spent either. Which of the two legal spellings a
+                        // gateway chose says nothing about the collector, and
+                        // ending the export on the HTTP-date one abandoned at
+                        // the first 503 a batch the growing backoff had been
+                        // recovering. So the client waits what it would have
+                        // waited with no header at all, which is never shorter
+                        // than the wait it cannot read the length of.
+                        Some(RetryAfterHint::Unreadable) | None => {
+                            backoff_after(budget.retry_backoff, attempts)
                         }
-                        None => backoff_after(budget.retry_backoff, attempts),
                     };
-                    wait_for_retry(signal, attempts, delay, deadline, shutdown_requested)?;
+                    wait_for_retry(signal, attempts, delay, deadline, cause, shutdown_requested)?;
                     continue;
                 }
                 return Err(OtlpDeliveryFailure::new(
@@ -750,12 +731,13 @@ pub fn send_otlp_json(
                 ));
             }
             Err(error) => match retryable_transport(&error) {
-                Some(_cause) if attempts < budget.max_attempts => {
+                Some(cause) if attempts < budget.max_attempts => {
                     wait_for_retry(
                         signal,
                         attempts,
                         backoff_after(budget.retry_backoff, attempts),
                         deadline,
+                        cause,
                         shutdown_requested,
                     )?;
                 }
@@ -1088,9 +1070,10 @@ fn map_body_error(signal: OtlpSignal, attempts: u32, error: &ureq::Error) -> Otl
 /// whole attempt budget inside one of its own recovery windows.
 ///
 /// Nothing here is a bound: the growth saturates rather than wrapping, and
-/// [`wait_for_retry`] is what stops the wait, cutting it at the delivery
-/// deadline the whole call is already bounded by. A doubling that outgrows the
-/// budget therefore costs the remaining attempts and never the deadline.
+/// [`wait_for_retry`] is what stops the wait, refusing any delay that would
+/// outlast the delivery deadline the whole call is already bounded by. A
+/// doubling that outgrows the budget therefore costs the remaining attempts
+/// and never the deadline.
 fn backoff_after(first: Duration, attempts: u32) -> Duration {
     // `attempts` counts the one that just failed, so the first retry doubles
     // nothing. The exponent is capped where `u32` stops being able to hold the
@@ -1106,8 +1089,9 @@ enum RetryAfterHint {
     /// A wait it could not. RFC 9110 §10.2.3 also spells the field as an
     /// HTTP-date, and reading one needs calendar arithmetic this crate has no
     /// dependency for. Guessing shorter is the very thing the field exists to
-    /// prevent, so an unread hint is treated as one that cannot be honoured
-    /// rather than one that can be ignored.
+    /// prevent, so the caller waits its ordinary backoff — a delay it owed this
+    /// attempt regardless — rather than reading an unread hint as permission to
+    /// ask again at once.
     Unreadable,
 }
 
@@ -1133,14 +1117,33 @@ fn retry_after_hint(headers: &ureq::http::HeaderMap) -> Option<RetryAfterHint> {
     longest.map(RetryAfterHint::Delay)
 }
 
+/// Sleep out one inter-attempt wait, or refuse the retry the wait was for.
+///
+/// Every retry in this transport passes through here, which is what keeps one
+/// answer for a wait the budget cannot contain. Deciding that per call site
+/// gave the same exhausted budget two names: a wait the collector had asked
+/// for was reported as the throttle, and the identical overrun of a computed
+/// backoff was slept out to the deadline and reported as a timeout — pointing
+/// a supervisor at collector latency for a delivery that had run out of
+/// attempts. `cause` is what did not recover, so the refusal names it.
 fn wait_for_retry(
     signal: OtlpSignal,
     attempts: u32,
     backoff: Duration,
     deadline: Instant,
+    cause: OtlpRetryCause,
     shutdown_requested: &dyn Fn() -> bool,
 ) -> Result<(), OtlpDeliveryFailure> {
-    let retry_deadline = Instant::now().checked_add(backoff).unwrap_or(deadline);
+    let resume = Instant::now()
+        .checked_add(backoff)
+        .filter(|resume| *resume <= deadline)
+        .ok_or_else(|| {
+            OtlpDeliveryFailure::new(
+                signal,
+                OtlpDeliveryFailureKind::RetryExhausted(cause),
+                attempts,
+            )
+        })?;
     loop {
         if shutdown_requested() {
             return Err(OtlpDeliveryFailure::new(
@@ -1150,18 +1153,11 @@ fn wait_for_retry(
             ));
         }
         let now = Instant::now();
-        if now >= retry_deadline {
+        if now >= resume {
             return Ok(());
         }
-        if now >= deadline {
-            return Err(OtlpDeliveryFailure::new(
-                signal,
-                OtlpDeliveryFailureKind::Timeout,
-                attempts,
-            ));
-        }
         thread::sleep(
-            retry_deadline
+            resume
                 .saturating_duration_since(now)
                 .min(Duration::from_millis(10)),
         );
