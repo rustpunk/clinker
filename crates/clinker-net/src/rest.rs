@@ -610,63 +610,82 @@ enum RequestFailure {
 }
 
 impl RequestFailure {
-    /// Whether a pending shutdown explains this failure.
-    ///
-    /// True only where the peer never answered, which is what tearing down a
-    /// request in flight produces. A status means the exchange completed and
-    /// the peer rejected it, and that verdict is independent of any signal
-    /// that arrives afterwards.
     /// Whether retrying this failure could produce a different answer.
     ///
-    /// Built on the same list that decides cancellability rather than a
-    /// second one kept in step by hand, plus the statuses this loop itself
-    /// re-requests. It cannot be read from the failure's classification code:
-    /// a request this client could not route and a reply it could not parse
-    /// deliberately share one code, because they are one thing to the
-    /// operator and two different things to the retry.
+    /// The single place this crate decides a failure is transient. Both the
+    /// page loop, which acts on it, and the cancellation rule, which asks
+    /// whether a signal abandoned a retry worth having, read this one answer.
+    /// They used to keep a list each and disagreed about a body read dropped
+    /// mid-page: the loop retried it and the cancellation rule had never been
+    /// told, so a deliberately cancelled run reported an unavailable source
+    /// with advice to back off, and a supervisor re-queued the batch.
+    ///
+    /// It cannot be read from the failure's classification code: a request
+    /// this client could not route and a reply it could not parse deliberately
+    /// share one code, because they are one thing to the operator and two
+    /// different things to the retry.
     fn another_attempt_could_succeed(self) -> bool {
-        if let Self::HttpStatus(status) = self {
-            return (500..600).contains(&status) || matches!(status, 408 | 429);
-        }
-        self.is_cancellable_transport()
-    }
-
-    fn is_cancellable_transport(self) -> bool {
-        // `Transport` is included: what reaches this catch-all is a failure
-        // the mapping above could not identify, and when a shutdown is pending
-        // the cancellation is the one thing actually known. Every permanent
-        // failure that could arrive here is named above, so nothing durable
-        // reaches it.
-        if let Self::Io(kind) = self {
+        match self {
+            // The statuses this loop re-requests: a server asking for later
+            // rather than refusing.
+            Self::HttpStatus(status) => (500..600).contains(&status) || matches!(status, 408 | 429),
+            // Settled facts about the endpoint, or about material this run
+            // supplied. A misrouted URL, an untrusted certificate, a name that
+            // does not resolve, and a page past the size cap all fail
+            // identically however many attempts remain.
+            Self::Tls | Self::HostNotFound | Self::Unroutable | Self::BodyLimit => false,
             // Not every local I/O failure. Reading a client certificate, a
             // trust store, or a socket path the process may not open fails
-            // permanently and identically on every attempt, and a shutdown
-            // that happens to be pending does not explain it. This is the
-            // same set the unreadable-local-material verdict uses, and no
-            // more — the two rules have to name one list, or they disagree
-            // about a single error kind and one of them is wrong.
-            return !matches!(
+            // permanently and identically on every attempt. This is the same
+            // set the unreadable-local-material verdict uses, and no more —
+            // the two rules have to name one list, or they disagree about a
+            // single error kind and one of them is wrong. The phase that
+            // observed it changes nothing: a certificate that cannot be read
+            // does not become readable because the peer answered first.
+            Self::Io(kind) | Self::ResponseIo(kind) => !matches!(
                 kind,
                 std::io::ErrorKind::PermissionDenied
                     | std::io::ErrorKind::NotFound
                     | std::io::ErrorKind::IsADirectory
                     | std::io::ErrorKind::ReadOnlyFilesystem
-            );
-        }
-        // `Protocol` is here because the caller only consults this rule when
-        // the peer never answered, and a connection that ends before a reply
-        // parses is spelled as a protocol error on some hosts and as an I/O
-        // error on others. `Unroutable` is not: it is local, permanent
-        // material, and it reached the same variant until this split — which
-        // is how a cancelled run whose URL was malformed reported an abort.
-        matches!(
-            self,
+            ),
+            // `Transport` is included: what reaches that catch-all is a failure
+            // the mapping could not identify, and every permanent failure that
+            // could arrive there is named above, so nothing durable reaches it.
+            // `Protocol` likewise — a connection that ends before a reply
+            // parses is spelled as a protocol error on some hosts and as an I/O
+            // error on others.
             Self::Timeout
-                | Self::Connection
-                | Self::ProxyConnection
-                | Self::Protocol
-                | Self::Transport
-        )
+            | Self::ResponseTimeout
+            | Self::Connection
+            | Self::ProxyConnection
+            | Self::Protocol
+            | Self::Transport => true,
+        }
+    }
+
+    /// Whether a pending shutdown explains this failure.
+    ///
+    /// A narrowing of the transience rule above rather than a second list of
+    /// variants: a failure no remaining attempt could have survived is not one
+    /// a signal explains either. On top of that the peer must never have
+    /// answered, which is what tearing down a request in flight produces. A
+    /// status is a verdict the peer reached, and the response-phase spellings
+    /// are only reachable once it began replying; neither is undone by a
+    /// signal arriving afterwards.
+    ///
+    /// `Unroutable` is excluded through the rule above: it is local, permanent
+    /// material, and it shared a variant with `Protocol` until they were split
+    /// — which is how a cancelled run whose URL was malformed reported a clean
+    /// abort.
+    fn is_cancellable_transport(self) -> bool {
+        if matches!(
+            self,
+            Self::HttpStatus(_) | Self::ResponseTimeout | Self::ResponseIo(_)
+        ) {
+            return false;
+        }
+        self.another_attempt_could_succeed()
     }
 
     /// Re-label a failure observed while reading a reply the peer had already
@@ -794,31 +813,15 @@ impl RequestFailure {
         }
     }
 
+    /// Whether the page loop re-reads after this body-read failure.
+    ///
+    /// The same question as [`Self::another_attempt_could_succeed`], asked
+    /// where the loop acts on it. It delegates rather than answering, so what
+    /// the loop retries and what the cancellation rule counts as a retry worth
+    /// abandoning are one rule by construction: the two cannot drift apart
+    /// again without deleting this line.
     fn retryable_body_read(self) -> bool {
-        matches!(
-            self,
-            Self::Timeout
-                | Self::ResponseTimeout
-                | Self::Connection
-                | Self::ResponseIo(
-                    std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::UnexpectedEof
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::Interrupted
-                        | std::io::ErrorKind::WouldBlock
-                )
-                | Self::Io(
-                    std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::UnexpectedEof
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::Interrupted
-                        | std::io::ErrorKind::WouldBlock
-                )
-        )
+        self.another_attempt_could_succeed()
     }
 }
 
@@ -1194,6 +1197,86 @@ mod tests {
                 request_phase.retryable_body_read(),
                 request_phase.in_response_phase().retryable_body_read(),
                 "{kind:?} must be equally retryable whichever phase observed it"
+            );
+        }
+    }
+
+    /// Every shape a failure can take, so a census test cannot silently miss
+    /// the one variant a rule was never taught about.
+    fn every_failure_shape() -> Vec<RequestFailure> {
+        let kinds = [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::IsADirectory,
+            std::io::ErrorKind::ReadOnlyFilesystem,
+        ];
+        let mut shapes = vec![
+            RequestFailure::Timeout,
+            RequestFailure::ResponseTimeout,
+            RequestFailure::HostNotFound,
+            RequestFailure::Tls,
+            RequestFailure::ProxyConnection,
+            RequestFailure::Connection,
+            RequestFailure::Protocol,
+            RequestFailure::Unroutable,
+            RequestFailure::BodyLimit,
+            RequestFailure::Transport,
+        ];
+        for status in [200, 301, 400, 404, 408, 429, 500, 503] {
+            shapes.push(RequestFailure::HttpStatus(status));
+        }
+        for kind in kinds {
+            shapes.push(RequestFailure::Io(kind));
+            shapes.push(RequestFailure::ResponseIo(kind));
+        }
+        shapes
+    }
+
+    /// "Will the loop retry this?" and "could a retry have succeeded?" are one
+    /// question, and answering it in two places is how they disagreed: the
+    /// body-read list carried response-phase failures the permanence rule had
+    /// never been told about, so a page dropped mid-read under a deliberate
+    /// shutdown was retried and then reported as a temporarily unavailable
+    /// source — advice a supervisor honours by re-queuing the cancelled batch.
+    #[test]
+    fn what_the_loop_retries_is_what_a_shutdown_abandons() {
+        for failure in every_failure_shape() {
+            assert_eq!(
+                failure.retryable_body_read(),
+                failure.another_attempt_could_succeed(),
+                "{failure:?} must answer one question one way"
+            );
+        }
+    }
+
+    /// A reply the peer began sending and then dropped is the ordinary way a
+    /// cancelled run's in-flight page ends. The retry it abandons was real, so
+    /// the run's outcome is the cancellation.
+    #[test]
+    fn a_dropped_body_read_is_a_retry_worth_abandoning() {
+        for failure in [
+            RequestFailure::ResponseTimeout,
+            RequestFailure::ResponseIo(std::io::ErrorKind::ConnectionReset),
+            RequestFailure::ResponseIo(std::io::ErrorKind::UnexpectedEof),
+            RequestFailure::ResponseIo(std::io::ErrorKind::BrokenPipe),
+        ] {
+            assert!(
+                failure.another_attempt_could_succeed(),
+                "{failure:?} is retried by the page loop, so a signal that \
+                 cancels the retry explains the outcome"
+            );
+            assert!(
+                !failure.is_cancellable_transport(),
+                "{failure:?} is only reachable once the peer began replying"
             );
         }
     }

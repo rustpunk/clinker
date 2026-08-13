@@ -41,9 +41,19 @@ Every event carries these fields:
 
 The resolved fingerprint covers the compiled topology, schemas, composition
 and CXL dependencies, winning channel/group config values, and all four
-runtime-variable scopes. It excludes deployment-only file locations and layer
-source formatting, so relocating equivalent inputs does not invalidate a
-pinned plan while a value that can change execution does.
+runtime-variable scopes. A composition contributes the body each call site
+actually binds, so two channels that patch one shared body differently are
+two plans. It excludes deployment-only file locations and layer source
+formatting, so relocating equivalent inputs does not invalidate a pinned plan
+while a value that can change execution does. Where rejected records are
+written is a location and is excluded; *whether* they are written is not — a
+pipeline with no `error_handling.dlq.path` and no per-source override
+discards them, and reads as a different plan from one that keeps them.
+
+The `version` field carries the fingerprint schema, currently `2`. A digest
+is comparable only with another digest of the same version: when the schema
+changes, the same pipeline yields a different digest, and the version is how
+a consumer holding a pinned value tells that apart from a changed plan.
 
 Progress events add a bounded logical phase, kind, elapsed time, and
 truncation flags. They never contain records, secrets, source URLs, or
@@ -84,6 +94,17 @@ ignore additive fields and unknown nonterminal event kinds, but those additions
 carry no completion or failure meaning. Missing required fields, malformed
 UTF-8 or JSON, non-monotonic sequence, identity changes, duplicate terminals,
 or EOF without a terminal make the attempt incomplete.
+
+Records reach the stream whole or not at all, and a parent that reads slowly
+does not change what the stream says. A record the pipe refuses is not written,
+takes no `seq` with it, and is not what the next record is numbered after, so a
+lost advisory observation leaves the numbering dense rather than shifting every
+record after it. A record the pipe accepts only part of is completed by the
+next write of this stream — never restarted — so a momentarily full pipe cannot
+produce two copies of one record or two terminals. What was already delivered
+is likewise not repeated: a terminal retried after a refusal sends only the
+inventory chunks the pipe has not taken, so each chunk index appears exactly
+once ahead of the terminal that counts them.
 
 ## Terminal, exit, and artifact reconciliation
 

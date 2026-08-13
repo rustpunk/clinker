@@ -197,14 +197,12 @@ impl RawCompositionFile {
         file_id: FileId,
         source_path: std::path::PathBuf,
         content_digest: [u8; 32],
-        semantic_digest: [u8; 32],
     ) -> CompositionFile {
         let signature = self.compose.finalize(file_id, source_path);
         CompositionFile {
             signature,
             nodes: self.nodes,
             content_digest,
-            semantic_digest,
         }
     }
 }

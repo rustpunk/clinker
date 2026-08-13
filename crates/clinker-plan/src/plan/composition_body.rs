@@ -108,9 +108,11 @@ pub struct BoundBody {
     /// User-facing `_compose.name`, retained without its physical path.
     pub semantic_name: String,
 
-    /// BLAKE3 of the canonical parsed composition content, excluding
-    /// deployment-only locators.
-    pub content_digest: [u8; 32],
+    /// BLAKE3 of this call site's bound composition — the typed contract
+    /// and the typed body after channel patches and external schema files
+    /// were folded in, excluding deployment-only locators. Two call sites
+    /// of one file differ here when a channel patched one of them.
+    pub semantic_digest: [u8; 32],
 
     /// Body's mini-DAG of lowered `PlanNode`s. NodeIndices here live
     /// in their own space — they do not collide with NodeIndices in
@@ -242,7 +244,7 @@ impl BoundBody {
             body_scope: BodyScopeId::SENTINEL,
             signature_path,
             semantic_name: String::new(),
-            content_digest: [0; 32],
+            semantic_digest: [0; 32],
             graph: DiGraph::new(),
             topo_order: Vec::new(),
             name_to_idx: HashMap::new(),

@@ -794,6 +794,104 @@ fn grace_expiry_forces_reaps_and_retries_fresh() {
     );
 }
 
+/// A refused liveness record must not renumber the rest of the run.
+///
+/// The worker deliberately swallows a refused periodic observation so a
+/// healthy run still produces its output and exits 0. That is only true from
+/// the supervisor's side if the record it lost took no sequence number with
+/// it: this adapter reconciles any gap as an incomplete attempt, so one
+/// momentarily full pipe would otherwise condemn a run that executed
+/// correctly and reported every required record.
+#[test]
+fn a_refused_liveness_record_leaves_the_stream_densely_numbered() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "out.csv", 4_096, true);
+
+    let mut command = machine_command(directory.path(), "dense-after-refusal");
+    command
+        .env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "periodic_sink")
+        .env("CLINKER_TEST_MACHINE_PROGRESS_TICK_MS", "1")
+        // Longer than this fixture takes, so the run ends before the failing
+        // sink window does and the refusals stay advisory.
+        .env("CLINKER_TEST_MACHINE_SINK_PATIENCE_MS", "600000");
+    let result = run_child(command, ProcessConfig::new(PROCESS_DEADLINE)).expect("supervised run");
+
+    assert_eq!(
+        result.outcome(),
+        ControlledOutcome::Success,
+        "a lost advisory record is not a broken stream\nevents: {:?}\nstderr: {}",
+        result.stdout.events(),
+        String::from_utf8_lossy(result.stderr.retained_tail())
+    );
+    assert_eq!(result.status_code(), Some(0));
+    assert!(
+        !result
+            .stdout
+            .events()
+            .iter()
+            .any(|event| event["progress"]["kind"] == "periodic"),
+        "while every periodic record was in fact refused: {:?}",
+        result.stdout.events()
+    );
+    for (sequence, event) in result.stdout.events().iter().enumerate() {
+        assert_eq!(
+            event["seq"],
+            serde_json::json!(sequence),
+            "the delivered stream is numbered from zero without gaps: {:?}",
+            result.stdout.events()
+        );
+    }
+}
+
+/// A terminal the sink refuses after taking the inventory must not make the
+/// retry repeat a chunk the reader already has.
+///
+/// The chunk index is the record's position in the inventory, and an adapter
+/// reassembling indices zero through `chunk_count - 1` in sequence rejects a
+/// repeated one. Re-sending the whole inventory therefore turned a recovered
+/// terminal whose artifact evidence was correct into an incomplete attempt —
+/// over a fault that was purely on the reporting channel.
+#[test]
+fn a_terminal_retried_after_a_refusal_reconciles_with_its_inventory() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "published.csv", 1, false);
+
+    let mut command = machine_command(directory.path(), "retried-terminal");
+    command.env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "terminal_sink");
+    let result = run_child(command, ProcessConfig::new(PROCESS_DEADLINE)).expect("supervised run");
+
+    assert!(
+        directory.path().join("published.csv").exists(),
+        "the run published before its terminal was refused"
+    );
+    assert_eq!(
+        result.outcome(),
+        ControlledOutcome::Failed,
+        "the recovered terminal reconciles against its own inventory\nevents: {:?}\nstderr: {}",
+        result.stdout.events(),
+        String::from_utf8_lossy(result.stderr.retained_tail())
+    );
+    assert_eq!(result.status_code(), Some(4));
+    let chunks = result
+        .stdout
+        .events()
+        .iter()
+        .filter(|event| event["event"] == "publication_artifacts")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|event| event["publication"]["chunk_index"].clone())
+            .collect::<Vec<_>>(),
+        [serde_json::json!(0)],
+        "the chunk the sink took is not sent again: {:?}",
+        result.stdout.events()
+    );
+    let terminal = result.stdout.events().last().expect("terminal");
+    assert_eq!(terminal["event"], "failed");
+    assert_eq!(terminal["publication"]["artifact_count"], 1);
+}
+
 /// A sink that refuses a liveness record is not the same as a record that
 /// cannot be built. The first may be a reader that is briefly behind, so the
 /// worker keeps trying and the run finishes normally; the second can never

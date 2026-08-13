@@ -853,7 +853,7 @@ mod port_tag_guard_tests {
             body_scope: body_id.into(),
             signature_path: std::path::PathBuf::from("compositions/test.comp.yaml"),
             semantic_name: "test".to_string(),
-            content_digest: [0; 32],
+            semantic_digest: [0; 32],
             graph: body_graph,
             topo_order: Vec::new(),
             name_to_idx: HashMap::new(),

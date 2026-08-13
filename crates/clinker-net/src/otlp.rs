@@ -1111,8 +1111,19 @@ fn count_metrics(resources: &[serde_json::Value]) -> Option<u64> {
                 ] {
                     if let Some(data) = metric.get(kind) {
                         matching_kinds = matching_kinds.saturating_add(1);
-                        let points = data.as_object()?.get("dataPoints")?.as_array()?;
-                        metric_points = u64::try_from(points.len()).ok()?;
+                        // An absent `dataPoints` is an empty one. Protobuf-JSON
+                        // omits a repeated field with nothing in it, so a sum
+                        // that recorded nothing this interval arrives without
+                        // the key — the same shape the scope and resource
+                        // levels above already tolerate. Requiring it here
+                        // failed the whole payload, and one empty metric had a
+                        // whole export dropped before a byte was sent and the
+                        // operator told their configuration was invalid.
+                        let points = match data.as_object()?.get("dataPoints") {
+                            Some(points) => points.as_array()?.len(),
+                            None => 0,
+                        };
+                        metric_points = u64::try_from(points).ok()?;
                     }
                 }
                 if matching_kinds != 1 {

@@ -531,7 +531,11 @@ For an enabled run, the CLI's first capability transition calls the network
 crate's sole endpoint-admission API. That API accepts one HTTPS origin and
 derives exactly three routes: `/v1/logs`, `/v1/metrics`, and `/v1/traces`.
 Relative, malformed, HTTP, credential-bearing, path-bearing, query-bearing,
-fragment-bearing, and already signal-specific endpoint text is rejected as
+fragment-bearing, and already signal-specific endpoint text is rejected — and
+so is text that is not exactly the origin it names: surrounding whitespace, or
+any embedded control character such as a carriage return, is refused rather
+than trimmed or ignored, so no endpoint value can smuggle a header into a
+request. Each is rejected as
 `observability.otlp.endpoint` with a pasteable HTTPS-origin correction before
 source discovery, output attempts, arena reservation, worker construction, or
 network effects. Rejected text is not echoed.
@@ -609,6 +613,10 @@ previous export, not a running total, and carries the `startTimeUnixNano` and
 `timeUnixNano` bounding that interval. Sum the deltas to get the run total;
 reading any single point as an absolute value will understate the run, often by
 a large factor on a long one.
+
+An instrument that recorded nothing in an interval carries no points for it.
+That is an ordinary interval, not a malformed export: the batch is delivered
+and the points its other instruments did record arrive intact.
 
 **Transforms that a correlated commit re-runs.** A pipeline with a relaxed
 correlation-key aggregate converges at commit time: the engine re-runs the

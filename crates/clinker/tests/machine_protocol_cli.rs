@@ -185,7 +185,7 @@ fn protocol_success_is_one_ordered_machine_only_stream() {
         .expect("plan identity event");
     assert_eq!(plan_resolved["plan_identity"]["status"], "resolved");
     assert_eq!(plan_resolved["plan_identity"]["algorithm"], "blake3");
-    assert_eq!(plan_resolved["plan_identity"]["version"], 1);
+    assert_eq!(plan_resolved["plan_identity"]["version"], 2);
     assert_eq!(
         plan_resolved["plan_identity"]["digest"]
             .as_str()

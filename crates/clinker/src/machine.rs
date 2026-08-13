@@ -1,6 +1,6 @@
 //! Sole ownership of the optional machine-run stream.
 
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -86,9 +86,37 @@ pub(crate) struct MachineEmitter {
 }
 
 struct MachineState {
-    writer: BufWriter<Box<dyn Write + Send>>,
+    /// The sink itself, with no buffering layer of our own between it and the
+    /// record.
+    ///
+    /// A `BufWriter` here retained the unwritten remainder of a short write in
+    /// a buffer this emitter could not see, so a record the sink had refused
+    /// completed itself on the next flush — after a retry had already written
+    /// the whole record again. Two terminals under one contract that carries
+    /// exactly one. What is on the stream has to be derived from what the sink
+    /// took, and that is only knowable by handing it the bytes directly.
+    writer: Box<dyn Write + Send>,
+    /// The one record the sink has taken part of, if it took part of one.
+    ///
+    /// Its remainder is owned here rather than by the sink, so a short write
+    /// is recoverable: the next attempt finishes this record before writing
+    /// anything after it, and no new bytes are ever appended to a line the
+    /// sink has not been given in full. A record the sink took *nothing* of is
+    /// not held here — it never reached the stream, so there is nothing to
+    /// finish. Bounded by [`MAX_EVENT_BYTES`], the largest record this
+    /// protocol admits.
+    pending: Option<PendingRecord>,
     batch_id: String,
     execution_id: String,
+    /// The number the *next* accepted record carries.
+    ///
+    /// Consumed by acceptance, not by the attempt: a record the sink refused
+    /// never reached a reader, so leaving its number unused is what keeps the
+    /// stream densely numbered from zero. Both consumers require that — the
+    /// published contract states `seq` increases by exactly one, and the
+    /// reference adapter reconciles a gap as an incomplete attempt — and a
+    /// discardable liveness record refused by a momentarily full pipe would
+    /// otherwise shift every later number in a run that went on to succeed.
     sequence: u64,
     plan_identity: serde_json::Value,
     /// Whether a terminal record has been handed to the sink in full.
@@ -127,6 +155,17 @@ struct MachineState {
     /// making the artifact evidence a supervisor reads depend on whether the
     /// first write happened to succeed.
     publication: Option<TerminalPublication>,
+    /// How many of the retained publication's inventory records the sink has
+    /// taken in full.
+    ///
+    /// A retry resumes from here instead of restarting the inventory. The
+    /// chunk index a record carries is its position in the inventory, so
+    /// re-sending a chunk the sink already took puts two records with the same
+    /// index on one stream, and a consumer told to reassemble chunks zero
+    /// through `chunk_count - 1` in sequence rejects that — including the
+    /// reference adapter, which then reports a recovered terminal whose
+    /// content is correct as an incomplete attempt.
+    publication_chunks_sent: usize,
     progress: BoundedProgress,
 }
 
@@ -136,6 +175,50 @@ struct MachineState {
 struct TerminalPublication {
     artifact_events: Vec<serde_json::Map<String, serde_json::Value>>,
     summary: serde_json::Value,
+}
+
+/// What accepting a record settles, beyond its sequence number.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RecordRole {
+    Ordinary,
+    /// One `publication_artifacts` chunk of the retained publication.
+    Inventory,
+    /// The run's terminal. Accepting it spends the one terminal slot.
+    Terminal,
+}
+
+/// A record handed to the sink that the sink has not taken in full.
+struct PendingRecord {
+    encoded: Vec<u8>,
+    /// How many leading bytes the sink has taken. The record is delivered when
+    /// this reaches `encoded.len()` *and* the sink has flushed: a writer with
+    /// its own buffer can report bytes as taken and still be holding them.
+    taken: usize,
+    role: RecordRole,
+}
+
+impl PendingRecord {
+    /// Push the remainder to the sink, returning once the whole record is out.
+    ///
+    /// On error the record keeps exactly what it has left to send, so the next
+    /// attempt continues the same line rather than starting a second copy of
+    /// it.
+    fn deliver(&mut self, writer: &mut (dyn Write + Send)) -> io::Result<()> {
+        while self.taken < self.encoded.len() {
+            match writer.write(&self.encoded[self.taken..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "machine sink accepted no bytes of a record",
+                    ));
+                }
+                Ok(taken) => self.taken = self.taken.saturating_add(taken),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        writer.flush()
+    }
 }
 
 pub(crate) struct MachineProgressWorker {
@@ -210,7 +293,8 @@ impl MachineEmitter {
     fn with_writer(batch_id: String, writer: Box<dyn Write + Send>) -> Self {
         Self {
             state: Arc::new(Mutex::new(MachineState {
-                writer: BufWriter::new(writer),
+                writer,
+                pending: None,
                 batch_id,
                 execution_id: uuid::Uuid::now_v7().to_string(),
                 sequence: 0,
@@ -222,6 +306,7 @@ impl MachineEmitter {
                 observability_progress: None,
                 observability_admission: None,
                 publication: None,
+                publication_chunks_sent: 0,
                 progress: BoundedProgress::default(),
             })),
             shutdown: ShutdownToken::new(),
@@ -519,8 +604,9 @@ impl MachineState {
         event: &'static str,
         fields: serde_json::Map<String, serde_json::Value>,
     ) -> io::Result<()> {
+        self.resume_pending()?;
         let encoded = self.encode_event(event, fields, self.sequence)?;
-        self.write_encoded_event(&encoded)
+        self.write_encoded_event(&encoded, RecordRole::Ordinary)
     }
 
     /// Terminal for an exit code the `completed` family cannot express.
@@ -572,6 +658,9 @@ impl MachineState {
     ) -> io::Result<TerminalOutcome> {
         if publication.is_some() {
             self.publication = publication;
+            // A new inventory is numbered from its own start, so nothing sent
+            // for a previous one counts against it.
+            self.publication_chunks_sent = 0;
         }
         let (artifact_events, summary) = match self.publication.clone() {
             Some(publication) => (publication.artifact_events, Some(publication.summary)),
@@ -592,11 +681,13 @@ impl MachineState {
     /// that window used to end the run with no terminal at all while telling
     /// the caller the terminal had been written.
     ///
-    /// A retry after such a failure re-emits the inventory records the first
-    /// attempt already sent. That is the intended trade: the inventory is
-    /// keyed by `artifact_id` and carries its own chunk index, so a repeated
-    /// chunk is reconcilable from the reading end, whereas a stream with no
-    /// terminal is not recoverable at all.
+    /// A retry after such a failure sends the whole inventory the terminal
+    /// counts, minus the chunks the sink already took. The intent is
+    /// unchanged — the terminal always arrives with its complete artifact
+    /// evidence ahead of it — but the evidence is assembled from what the sink
+    /// accepted rather than from what was attempted, so each chunk index
+    /// appears exactly once and a reader reassembling zero through
+    /// `chunk_count - 1` in sequence gets the set the summary counts.
     fn write_terminal_records(
         &mut self,
         event: &'static str,
@@ -604,6 +695,10 @@ impl MachineState {
         artifact_events: Vec<serde_json::Map<String, serde_json::Value>>,
         publication_summary: Option<serde_json::Value>,
     ) -> io::Result<TerminalOutcome> {
+        // A terminal the sink took only part of is still that terminal.
+        // Finishing it here is what makes the retry `main` performs report
+        // `AlreadyWritten` instead of putting a second one on the stream.
+        self.resume_pending()?;
         if self.terminal_reserved {
             return Ok(TerminalOutcome::AlreadyWritten);
         }
@@ -637,6 +732,7 @@ impl MachineState {
         // the stream, and cannot suppress a later diagnostic terminal.
         let inventory = artifact_events
             .into_iter()
+            .skip(self.publication_chunks_sent)
             .enumerate()
             .map(|(offset, fields)| {
                 self.encode_event(
@@ -653,10 +749,13 @@ impl MachineState {
         )?;
 
         for record in inventory {
-            self.write_encoded_event(&record)?;
+            self.write_encoded_event(&record, RecordRole::Inventory)?;
         }
-        self.write_encoded_event(&terminal)?;
-        self.terminal_reserved = true;
+        #[cfg(debug_assertions)]
+        if let Some(error) = injected_terminal_sink_failure() {
+            return Err(error);
+        }
+        self.write_encoded_event(&terminal, RecordRole::Terminal)?;
         Ok(TerminalOutcome::Written)
     }
 
@@ -711,14 +810,69 @@ impl MachineState {
         })
     }
 
-    fn write_encoded_event(&mut self, encoded: &[u8]) -> io::Result<()> {
-        // Spent on the attempt, not on the success. A failed write may have
-        // put part of a line on the wire, and two records under one sequence
-        // number are unresolvable from the reading end; a gap in the numbering
-        // says exactly what happened, which is that one record did not arrive.
+    /// Hand one whole record to the sink.
+    ///
+    /// A record is delivered or it is not: nothing is written after a record
+    /// the sink has taken only part of, so the stream never carries a line
+    /// that a later write completes into a duplicate. The state a delivered
+    /// record settles — its sequence number, its inventory position, the
+    /// terminal slot — moves only when the sink has taken the whole of it.
+    ///
+    /// Callers resume any pending record *before* encoding, because completing
+    /// one advances the sequence number the next record must carry.
+    fn write_encoded_event(&mut self, encoded: &[u8], role: RecordRole) -> io::Result<()> {
+        debug_assert!(
+            self.pending.is_none(),
+            "a record is encoded only once the sink has taken the previous one"
+        );
+        self.pending = Some(PendingRecord {
+            encoded: encoded.to_vec(),
+            taken: 0,
+            role,
+        });
+        self.resume_pending()
+    }
+
+    /// Finish the record the sink took only part of, if there is one.
+    ///
+    /// Called before every write, so a record left half-delivered by a sink
+    /// that was momentarily full is completed by the next attempt rather than
+    /// re-sent whole. Until it completes, nothing else can be written: bytes
+    /// appended to an unterminated line would corrupt both records.
+    fn resume_pending(&mut self) -> io::Result<()> {
+        let Some(mut pending) = self.pending.take() else {
+            return Ok(());
+        };
+        match pending.deliver(self.writer.as_mut()) {
+            Ok(()) => {
+                self.accept(pending.role);
+                Ok(())
+            }
+            Err(error) => {
+                // A sink that took nothing did not put this record on the
+                // stream at all, and a record that is not on the stream is
+                // simply one that did not happen: it holds no sequence number
+                // and nothing has to be finished before the next write. Only
+                // bytes the sink actually took oblige the next attempt to
+                // complete the line they started.
+                if pending.taken > 0 {
+                    self.pending = Some(pending);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Record what the sink has taken.
+    fn accept(&mut self, role: RecordRole) {
         self.sequence = self.sequence.saturating_add(1);
-        self.writer.write_all(encoded)?;
-        self.writer.flush()
+        match role {
+            RecordRole::Ordinary => {}
+            RecordRole::Inventory => {
+                self.publication_chunks_sent = self.publication_chunks_sent.saturating_add(1);
+            }
+            RecordRole::Terminal => self.terminal_reserved = true,
+        }
     }
 
     /// Write a progress record, saying which stage failed if one did.
@@ -730,6 +884,14 @@ impl MachineState {
     /// behind. Judging them by error kind instead put a permanent encoding
     /// fault into a loop that retried it for the rest of the run.
     fn write_progress_staged(&mut self, snapshot: ProgressSnapshot) -> ProgressWrite {
+        // Before the reservation is read, not after: a terminal the sink took
+        // only part of is finished here, and finishing it is what makes the
+        // reservation below true. Writing a progress record first would put a
+        // line after the terminal on a stream whose last record is the
+        // terminal by contract.
+        if let Err(error) = self.resume_pending() {
+            return ProgressWrite::Unsent(error);
+        }
         // The terminal record is the last record of a run. A progress writer
         // runs on its own thread and can still be mid-tick when the run ends,
         // so the reservation is what orders them rather than the shutdown
@@ -760,10 +922,11 @@ impl MachineState {
         };
         #[cfg(debug_assertions)]
         if let Some(error) = self.injected_sink_failure(kind) {
-            self.sequence = self.sequence.saturating_add(1);
+            // The injected refusal stands in for a sink that took nothing, so
+            // it leaves the sequence number free exactly as a real one does.
             return ProgressWrite::Unsent(error);
         }
-        match self.write_encoded_event(&encoded) {
+        match self.write_encoded_event(&encoded, RecordRole::Ordinary) {
             Ok(()) => ProgressWrite::Written,
             Err(error) => ProgressWrite::Unsent(error),
         }
@@ -984,6 +1147,30 @@ fn injected_write_failure(
     }
 }
 
+/// A sink that takes the inventory and refuses the terminal, once.
+///
+/// The encode-stage points cannot reach this: encoding runs before any record
+/// is written, so a terminal that fails to encode leaves the inventory unsent
+/// too, and the retry that follows has nothing to resume. What a supervisor
+/// pipe actually does — take some records and then refuse — is only reachable
+/// at the sink stage, and it is the case in which a retry could re-send a
+/// chunk the reader already has.
+///
+/// One-shot, so the retry the refusal exists to provoke can get through.
+#[cfg(debug_assertions)]
+fn injected_terminal_sink_failure() -> Option<io::Error> {
+    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let point = std::env::var_os("CLINKER_TEST_MACHINE_WRITE_FAILURE")?;
+    (point.to_string_lossy() == "terminal_sink"
+        && !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed))
+    .then(|| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "injected machine sink refusal at terminal",
+        )
+    })
+}
+
 fn stdout_conflict(args: &RunArgs) -> Option<&'static str> {
     if args.explain.is_some() {
         Some("--explain")
@@ -1082,6 +1269,67 @@ mod tests {
         }
     }
 
+    /// Sink that takes a bounded number of *bytes* and then refuses, standing
+    /// in for a supervisor pipe with room for part of a record.
+    ///
+    /// This is what `RefusingSink` cannot model: a pipe does not refuse a
+    /// record, it refuses a byte, and the bytes it took before refusing are
+    /// already on the wire.
+    #[derive(Clone)]
+    struct ShortWritingSink {
+        accepted: SharedSink,
+        budget: Arc<Mutex<usize>>,
+    }
+
+    impl ShortWritingSink {
+        fn new(bytes: usize) -> Self {
+            Self {
+                accepted: SharedSink(Arc::new(Mutex::new(Vec::new()))),
+                budget: Arc::new(Mutex::new(bytes)),
+            }
+        }
+
+        fn allow(&self, bytes: usize) {
+            *self
+                .budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = bytes;
+        }
+
+        fn accepted_bytes(&self) -> Vec<u8> {
+            self.accepted
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl Write for ShortWritingSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let taken = {
+                let mut budget = self
+                    .budget
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let taken = (*budget).min(bytes.len());
+                *budget -= taken;
+                taken
+            };
+            if taken == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "injected sink refusal",
+                ));
+            }
+            self.accepted.write(&bytes[..taken])
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.accepted.flush()
+        }
+    }
+
     fn events(sink: &SharedSink) -> Vec<serde_json::Value> {
         let bytes = sink
             .0
@@ -1138,7 +1386,8 @@ mod tests {
 
     fn state_writing_to(writer: Box<dyn Write + Send>) -> MachineState {
         MachineState {
-            writer: BufWriter::new(writer),
+            writer,
+            pending: None,
             batch_id: "batch".to_owned(),
             execution_id: "018f47a2-9a41-7a27-b4d6-4f7137e3c159".to_owned(),
             sequence: 0,
@@ -1150,6 +1399,7 @@ mod tests {
             observability_progress: None,
             observability_admission: None,
             publication: None,
+            publication_chunks_sent: 0,
             progress: BoundedProgress::default(),
         }
     }
@@ -1384,6 +1634,194 @@ mod tests {
                 "completed",
             ],
             "the retry re-sends the whole inventory ahead of the terminal it counts: {stream:#?}"
+        );
+    }
+
+    /// A short write followed by a refusal must not produce two terminals.
+    ///
+    /// This is the case a supervisor pipe presents: it takes part of a record
+    /// and then blocks. The terminal slot is spent by a terminal the sink
+    /// took, so the slot is still free here and `main` retries — and the
+    /// stream must end with one terminal record, not with the tail of the
+    /// first one followed by a whole second copy.
+    #[test]
+    fn a_terminal_the_sink_took_only_part_of_is_never_written_twice() {
+        let sink = ShortWritingSink::new(48);
+        let mut state = state_writing_to(Box::new(sink.clone()));
+        let failure = FailureClassification::for_code("attempt.publication.promotion_failed")
+            .expect("registered code");
+
+        assert!(
+            state
+                .write_terminal_records("failed", failure_fields(&failure, 4), Vec::new(), None)
+                .is_err(),
+            "the sink blocks partway through the terminal record"
+        );
+        let partial = sink.accepted_bytes();
+        assert!(
+            !partial.is_empty() && !partial.ends_with(b"\n"),
+            "the sink took part of the record: {}",
+            String::from_utf8_lossy(&partial)
+        );
+        assert!(
+            !state.terminal_reserved,
+            "a terminal the sink has not taken in full is not the run's terminal"
+        );
+
+        // The retry `main` makes against the still-free slot.
+        sink.allow(usize::MAX);
+        assert_eq!(
+            state
+                .write_terminal_records("failed", failure_fields(&failure, 4), Vec::new(), None)
+                .expect("the refused terminal is completed rather than re-sent"),
+            TerminalOutcome::AlreadyWritten
+        );
+
+        // `events` parses every line, so a record completed by a later write
+        // and then written again would fail here as malformed JSON before the
+        // count below could pass.
+        let stream = events(&sink.accepted);
+        assert_eq!(
+            stream.len(),
+            1,
+            "one record was attempted, so one record is on the stream: {stream:#?}"
+        );
+        assert_eq!(stream[0]["event"], "failed");
+        assert_eq!(stream[0]["seq"], 0);
+        assert_eq!(
+            sink.accepted_bytes()
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count(),
+            1,
+            "and it is terminated exactly once"
+        );
+    }
+
+    /// A record the sink refused leaves the numbering dense.
+    ///
+    /// Both consumers of this stream require `seq` to increase by exactly one:
+    /// the published contract says so, and the reference adapter reconciles a
+    /// gap as an incomplete attempt. One discardable liveness record refused
+    /// by a momentarily full pipe — which the worker deliberately swallows so
+    /// a healthy run still exits 0 — would otherwise shift every later number
+    /// and condemn the whole run.
+    #[test]
+    fn a_record_the_sink_refused_consumes_no_sequence_number() {
+        let sink = RefusingSink::new(1);
+        let mut state = state_writing_to(Box::new(sink.clone()));
+        state
+            .write_event("started", serde_json::Map::new())
+            .expect("the sink takes the first record");
+        assert_eq!(state.sequence, 1);
+
+        assert!(
+            state
+                .write_event("plan_resolved", serde_json::Map::new())
+                .is_err(),
+            "the sink refuses the second"
+        );
+        assert_eq!(
+            state.sequence, 1,
+            "a number is consumed by a record that reached the sink, not by an attempt"
+        );
+
+        sink.allow(4);
+        state
+            .write_event("plan_resolved", serde_json::Map::new())
+            .expect("a later record still writes");
+
+        let stream = events(&sink.accepted);
+        assert_eq!(
+            stream
+                .iter()
+                .map(|event| event["seq"].as_u64().expect("sequence"))
+                .collect::<Vec<_>>(),
+            [0, 1],
+            "the delivered stream is densely numbered from zero: {stream:#?}"
+        );
+    }
+
+    /// A retried terminal does not re-send inventory the sink already took.
+    ///
+    /// Each chunk carries its index in the inventory, and a consumer is told
+    /// to reassemble indices zero through `chunk_count - 1` in sequence. A
+    /// retry that restarts the inventory puts two records with index zero on
+    /// the stream, so a terminal whose content is correct is read as
+    /// unreconcilable.
+    #[test]
+    fn a_retried_terminal_does_not_repeat_a_chunk_the_sink_took() {
+        let sink = RefusingSink::new(1);
+        let mut state = state_writing_to(Box::new(sink.clone()));
+        let artifacts = (0..130)
+            .map(|index| {
+                serde_json::json!({
+                    "artifact_id": format!("artifact-{index:08x}"),
+                    "kind": "fan_out",
+                    "state": "published",
+                })
+            })
+            .collect::<Vec<_>>();
+        let (artifact_events, summary) = publication_payloads_from_artifacts(true, 0, artifacts);
+        assert_eq!(artifact_events.len(), 3);
+
+        assert!(
+            state
+                .write_terminal_for(
+                    "completed",
+                    serde_json::Map::from_iter([
+                        ("result".to_owned(), serde_json::json!("success")),
+                        ("exit_code".to_owned(), serde_json::json!(0)),
+                    ]),
+                    Some(TerminalPublication {
+                        artifact_events,
+                        summary,
+                    }),
+                )
+                .is_err(),
+            "the sink takes the first chunk and refuses the second"
+        );
+
+        sink.allow(16);
+        assert_eq!(
+            state
+                .write_terminal_for(
+                    "completed",
+                    serde_json::Map::from_iter([
+                        ("result".to_owned(), serde_json::json!("success")),
+                        ("exit_code".to_owned(), serde_json::json!(0)),
+                    ]),
+                    None,
+                )
+                .expect("the terminal slot is still free"),
+            TerminalOutcome::Written
+        );
+
+        let stream = events(&sink.accepted);
+        let chunks = stream
+            .iter()
+            .filter(|event| event["event"] == "publication_artifacts")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|event| event["publication"]["chunk_index"].as_u64().expect("index"))
+                .collect::<Vec<_>>(),
+            [0, 1, 2],
+            "every chunk index appears exactly once, in order: {stream:#?}"
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|event| event["publication"]["chunk_count"] == 3),
+            "and each states the same inventory size: {stream:#?}"
+        );
+        assert_eq!(
+            stream
+                .iter()
+                .map(|event| event["seq"].as_u64().expect("sequence"))
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
         );
     }
 

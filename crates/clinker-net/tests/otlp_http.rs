@@ -400,6 +400,98 @@ fn endpoint_admission_and_successful_post() {
     );
 }
 
+/// An interval in which one instrument recorded nothing, alongside one that
+/// did. Protobuf-JSON omits a repeated field with nothing in it, so the empty
+/// sum arrives with no `dataPoints` key at all.
+fn metrics_payload_with_an_idle_instrument() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "resourceMetrics": [{
+            "scopeMetrics": [{
+                "metrics": [
+                    {
+                        "name": "items.dropped",
+                        "unit": "1",
+                        "sum": {"aggregationTemporality": 1, "isMonotonic": true}
+                    },
+                    {
+                        "name": "items.processed",
+                        "unit": "1",
+                        "sum": {
+                            "aggregationTemporality": 1,
+                            "isMonotonic": true,
+                            "dataPoints": [
+                                {"startTimeUnixNano": "1", "timeUnixNano": "2", "asInt": "1"},
+                                {"startTimeUnixNano": "2", "timeUnixNano": "3", "asInt": "2"}
+                            ]
+                        }
+                    }
+                ]
+            }]
+        }]
+    }))
+    .expect("serialize idle-instrument fixture metrics")
+}
+
+/// An instrument that recorded nothing this interval is an ordinary interval,
+/// not a malformed payload. Counting it as fatal dropped the whole export
+/// before a byte was sent — losing the points the other instrument did
+/// record — and told the operator their observability configuration was
+/// invalid.
+#[test]
+fn an_instrument_that_recorded_nothing_does_not_discard_the_export() {
+    let payload = metrics_payload_with_an_idle_instrument();
+    let (address, handle) = spawn_server(200, br#"{}"#.to_vec());
+    let endpoint = admitted_loopback_endpoint(address);
+    let outcome = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Metrics,
+        &payload,
+        &budget(1),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect("an empty interval is still a deliverable export");
+    let captured = handle.join().expect("join idle-instrument fixture");
+
+    assert_eq!(
+        outcome.accepted(),
+        2,
+        "the points the other instrument recorded are what the export carries"
+    );
+    assert_eq!(outcome.rejected(), 0);
+    assert_eq!(captured.body, payload);
+}
+
+/// Deployment text reaches this boundary as written. The configuration layer
+/// checks an endpoint against a trimmed copy of the value and stores the
+/// untrimmed one, so padding and embedded control characters can arrive here
+/// intact — and a CRLF admitted into a request would be a header the
+/// deployment never wrote. The admission rule refuses them whatever the layer
+/// above did, and refuses them without echoing the text back.
+#[test]
+fn an_endpoint_carrying_padding_or_control_characters_is_never_admitted() {
+    for rejected in [
+        "  https://collector.example.com  ",
+        "https://collector.example.com\r\nX-Injected: 1",
+        "  https://collector.example.com\r\nX-Injected: 1  ",
+        "https://collector.example.com\n",
+        "\thttps://collector.example.com",
+        "https://collector.example.com\u{7f}",
+        "https://collector.example.com\u{0}",
+    ] {
+        let error = match clinker_net::admit_otlp_endpoint(rejected) {
+            Ok(_) => panic!("expected endpoint rejection for {rejected:?}"),
+            Err(error) => error,
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("observability.otlp.endpoint"));
+        assert!(
+            !rendered.contains("X-Injected"),
+            "the rejected text is never rendered back"
+        );
+    }
+}
+
 #[test]
 fn logs_metrics_traces_and_fault_matrix() {
     let unreachable_endpoint = admitted_loopback_endpoint("127.0.0.1:1".parse().unwrap());

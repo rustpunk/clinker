@@ -544,6 +544,50 @@ fn shutdown_request_stops_the_reader_at_the_next_page_boundary() {
     );
 }
 
+/// A cancelled run whose in-flight page dies mid-body is a cancellation, not
+/// an outage. The peer answered, so the "did the peer answer?" rule does not
+/// apply; what applies is that the loop was going to retry the body read, and
+/// the signal took that retry away. Reporting it as a temporarily unavailable
+/// source told a supervisor to back off and try again, and it re-queued a
+/// batch an operator had just stopped.
+#[test]
+fn shutdown_during_a_body_read_surfaces_as_typed_interruption() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncating server");
+    let address = listener.local_addr().expect("truncating server address");
+    let token = ShutdownToken::detached();
+    let server_token = token.clone();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept first request");
+        read_request(&mut stream).expect("read first request");
+        // A complete response head promising more body than will arrive, so
+        // the peer has answered and the body read is what fails. The signal is
+        // requested before the socket closes, exactly as a cancellation
+        // arriving while a page is in flight.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 512\r\nConnection: close\r\n\r\n";
+        stream.write_all(head).expect("write response head");
+        stream
+            .write_all(b"[{\"id\":0,")
+            .expect("write partial body");
+        stream.flush().expect("flush partial body");
+        server_token.request();
+        drop(stream);
+    });
+    let url = format!("http://{address}/rows");
+    let mut reader = build_reader("", 1, &url);
+    reader.set_shutdown_token(token);
+
+    let error = reader
+        .next_record()
+        .expect_err("a truncated body under a pending shutdown must interrupt");
+    handle.join().expect("join truncating server");
+
+    assert!(
+        matches!(error, clinker_format::FormatError::Interrupted),
+        "a cancelled run must not report its own cancellation as a retryable \
+         source failure: got {error:?}"
+    );
+}
+
 #[test]
 fn shutdown_between_retries_surfaces_as_typed_interruption() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind retry server");
