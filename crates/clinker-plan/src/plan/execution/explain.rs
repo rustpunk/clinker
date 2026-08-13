@@ -61,6 +61,72 @@ fn transform_cxl_sources(config: &PipelineConfig) -> Vec<(String, String)> {
     out
 }
 
+/// A declared order written the way its author wrote it — field and
+/// direction, in key order.
+///
+/// Direction is part of the order, not decoration: a forward two-cursor scan
+/// needs an ascending key, so a descending declaration is disqualifying for
+/// the same consumers a per-partition scope disqualifies. Printing the fields
+/// alone left an author looking at a global, sorted input that did not get the
+/// scan, with nothing on the page to say why.
+fn order_fields_label(order: &[crate::config::SortField]) -> String {
+    order
+        .iter()
+        .map(|field| {
+            let direction = match field.order {
+                crate::config::SortOrder::Asc => "asc",
+                crate::config::SortOrder::Desc => "desc",
+            };
+            format!("{} {direction}", field.field)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The scope of a node's declared order, or `None` where it declares none.
+///
+/// The one place this file decides whether there is an order to qualify.
+/// `sort_order` says "no order" two ways — absent, and present but empty —
+/// and a streaming aggregate produces the second, so a site testing only
+/// for presence labels a node that orders nothing as ordering everything.
+/// Every reader goes through here so the two spellings cannot be handled
+/// differently in different blocks.
+fn declared_order_scope(props: &crate::plan::properties::NodeProperties) -> Option<String> {
+    props
+        .ordering
+        .sort_order
+        .as_ref()
+        .filter(|order| !order.is_empty())
+        .map(|_| order_scope_label(&props.partitioning.kind))
+}
+
+/// How wide an ordering fact holds on a stream with this partitioning.
+///
+/// Names the partition keys when there are any, because "per file" is
+/// only useful to an author who can see which key splits the stream.
+///
+/// This reads the partitioning shape, which is what the range-join
+/// eligibility rule reads too. It is not a claim about what a node
+/// physically emits: a planner-synthesized Sort inherits its parent's
+/// partitioning while draining and ordering the whole input, so its scope
+/// is reported as the narrower of the two. The engine's edge-level
+/// `OrderScope` in the compiled order contract answers the same question
+/// for verified source order; the two are separate vocabularies today.
+fn order_scope_label(kind: &crate::plan::properties::PartitioningKind) -> String {
+    if kind.carries_global_order() {
+        return "global (one ordered sequence across the input)".to_string();
+    }
+    let keys = kind.partition_keys();
+    if keys.is_empty() {
+        "per partition (not one ordered sequence)".to_string()
+    } else {
+        format!(
+            "per partition on {} (not one ordered sequence)",
+            keys.join(", ")
+        )
+    }
+}
+
 /// Human-readable strategy label for the multi-line `--explain` block.
 /// `GraceHash` appends its `1 << partition_bits` partition count, since it
 /// really does hash-partition its build side into that many on-disk buckets.
@@ -489,8 +555,15 @@ impl ExecutionPlanDag {
                 out.push_str(&format!("{}:\n", node.id_slug()));
                 match &props.ordering.sort_order {
                     Some(order) => {
-                        let fields: Vec<String> = order.iter().map(|s| s.field.clone()).collect();
-                        out.push_str(&format!("  ordering: {}\n", fields.join(", ")));
+                        out.push_str(&format!("  ordering: {}\n", order_fields_label(order)));
+                        // How wide the order above was proven, which is what
+                        // decides whether a consumer needing one sequence may
+                        // rely on it. Printed next to the order rather than
+                        // left to be inferred from the partitioning line
+                        // below it.
+                        if let Some(scope) = declared_order_scope(props) {
+                            out.push_str(&format!("  ordering_scope: {scope}\n"));
+                        }
                     }
                     None => out.push_str("  ordering: <none>\n"),
                 }
@@ -969,6 +1042,36 @@ impl ExecutionPlanDag {
             combine_strategy_display(strategy)
         ));
 
+        // The scope of each input's declared order, reported from the same
+        // property the strategy choice consulted. A sort-merge scan needs
+        // one ordered sequence per input, so an input reading "per
+        // partition" here is the reason a range join it would otherwise
+        // have qualified for is running another strategy instead.
+        let order_note = |input_name: &str| -> String {
+            let Some(props) = self
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .find(|&pred| self.graph[pred].name() == input_name)
+                .and_then(|pred| self.node_properties.get(&pred))
+            else {
+                return String::new();
+            };
+            let Some(scope) = declared_order_scope(props) else {
+                return String::new();
+            };
+            // Both facts eligibility reads, side by side: what the order is,
+            // and how wide it was proven. Reported, not judged — the rule that
+            // turns them into a strategy lives in the planner, and a second
+            // copy of it here would be free to disagree with the first.
+            let fields = props
+                .ordering
+                .sort_order
+                .as_ref()
+                .map(|order| order_fields_label(order))
+                .unwrap_or_default();
+            format!(", order {fields} — {scope}")
+        };
+
         let drive_label = if driving_input.is_empty() {
             "<unselected>"
         } else {
@@ -977,7 +1080,8 @@ impl ExecutionPlanDag {
         let drive_rows =
             format_estimated_rows(inputs_for_node.and_then(|m| m.get(drive_label)), statistics);
         out.push_str(&format!(
-            "  Driving input: {drive_label} (probe, est. {drive_rows} rows)\n",
+            "  Driving input: {drive_label} (probe, est. {drive_rows} rows{})\n",
+            order_note(drive_label),
         ));
 
         for build_name in build_inputs {
@@ -987,7 +1091,8 @@ impl ExecutionPlanDag {
                 statistics,
             );
             out.push_str(&format!(
-                "  Build input: {build_name} ({role}, est. {rows} rows)\n",
+                "  Build input: {build_name} ({role}, est. {rows} rows{})\n",
+                order_note(build_name.as_str()),
             ));
         }
 
@@ -2187,6 +2292,67 @@ fn combine_operand_qualified(expr: &cxl::ast::Expr, input: &std::sync::Arc<str>)
             .collect::<Vec<_>>()
             .join("."),
         _ => format!("{}.<expr>", input),
+    }
+}
+
+#[cfg(test)]
+mod order_scope_tests {
+    use super::*;
+    use crate::config::{SortField, SortOrder};
+    use crate::plan::properties::{NodeProperties, PartitioningKind};
+
+    fn ordered_by(fields: Option<Vec<SortField>>) -> NodeProperties {
+        let mut props = NodeProperties::unordered_single();
+        props.ordering.sort_order = fields;
+        props
+    }
+
+    /// `sort_order` says "no order" two ways, and only one of them is
+    /// absence. A streaming aggregate carries `Some(vec![])`, so a reader
+    /// that tests for presence alone reports the width of a sequence that
+    /// was never ordered — and reports it as `global`, the widest claim
+    /// available, on the line an author reads to understand why a join
+    /// chose its strategy.
+    #[test]
+    fn an_order_of_no_fields_has_no_scope_to_report() {
+        assert_eq!(ordered_by(None).ordering.sort_order, None);
+        assert!(
+            declared_order_scope(&ordered_by(None)).is_none(),
+            "a node declaring no order has no scope"
+        );
+        assert!(
+            declared_order_scope(&ordered_by(Some(Vec::new()))).is_none(),
+            "an order over no fields is not an order, however it is spelled"
+        );
+    }
+
+    /// The other half: a real order still reports one, and reports the
+    /// width its partitioning actually gives it.
+    #[test]
+    fn a_real_order_reports_the_width_its_partitioning_gives_it() {
+        let one_field = || {
+            Some(vec![SortField {
+                field: "key".to_string(),
+                order: SortOrder::Asc,
+                null_order: None,
+            }])
+        };
+
+        let global = ordered_by(one_field());
+        assert!(
+            declared_order_scope(&global).is_some_and(|scope| scope.starts_with("global")),
+            "an unpartitioned stream orders the whole edge"
+        );
+
+        let mut per_file = ordered_by(one_field());
+        per_file.partitioning.kind = PartitioningKind::FilePartitioned {
+            keys: vec!["$source.file".to_string()],
+        };
+        let scope = declared_order_scope(&per_file).expect("a declared order reports a scope");
+        assert!(
+            scope.contains("per partition") && scope.contains("$source.file"),
+            "a partitioned stream names the key its order is scoped to: {scope}"
+        );
     }
 }
 

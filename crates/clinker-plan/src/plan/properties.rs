@@ -253,6 +253,33 @@ pub enum PartitioningProvenance {
 }
 
 impl PartitioningKind {
+    /// Whether a sort declared on this stream orders the whole edge, or
+    /// only the inside of each partition.
+    ///
+    /// A sort proof is exactly as wide as the stream it was proven over.
+    /// A multi-file Source verifies its `sort_order` within each physical
+    /// file, so two files that each ascend say nothing about their
+    /// concatenation — the second may open below where the first closed.
+    /// Every partitioned shape shares that gap: what holds inside a
+    /// partition is not a claim about the sequence a consumer reads. Only
+    /// an unpartitioned stream carries one ordered sequence, and `Merge`
+    /// is what produces one from partitioned inputs.
+    ///
+    /// Consumers whose contract is per-partition read the sort order
+    /// directly and do not ask this; it answers for the ones that need a
+    /// single sequence, such as a sort-merge scan.
+    pub fn carries_global_order(&self) -> bool {
+        match self {
+            PartitioningKind::Single => true,
+            // Enumerated rather than matched by wildcard: a partitioning
+            // shape added later must state whether a sort over it means
+            // the whole edge, instead of inheriting an answer.
+            PartitioningKind::HashPartitioned { .. }
+            | PartitioningKind::RoundRobin { .. }
+            | PartitioningKind::FilePartitioned { .. } => false,
+        }
+    }
+
     /// Borrow the partition keys (if any) carried by a partitioned
     /// stream. Returns an empty slice for `Single` and `RoundRobin`.
     pub fn partition_keys(&self) -> &[String] {
