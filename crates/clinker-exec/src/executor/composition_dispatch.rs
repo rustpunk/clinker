@@ -30,20 +30,71 @@ use crate::executor::schema_check::check_input_schema;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
+/// Context carrier kept lazy until the node-kind guard has succeeded. Normal
+/// dispatch passes the live executor context directly; the feature-gated
+/// mismatch matrix uses the inert carrier to prove rejection precedes body
+/// lookup, buffer scoping, and downstream access.
+pub(crate) enum CompositionDispatchContext<'borrow, 'plan> {
+    Live(&'borrow mut ExecutorContext<'plan>),
+    #[cfg(feature = "test-utils")]
+    Inert,
+}
+
+impl<'borrow, 'plan> From<&'borrow mut ExecutorContext<'plan>>
+    for CompositionDispatchContext<'borrow, 'plan>
+{
+    fn from(ctx: &'borrow mut ExecutorContext<'plan>) -> Self {
+        Self::Live(ctx)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl crate::executor::dispatch::DispatchFaultGuard {
+    /// Execute the real composition boundary with an inert context so tests
+    /// can prove a wrong node returns before body or buffer state is touched.
+    #[doc(hidden)]
+    pub fn dispatch_composition_mismatch_for_testing(
+        current_dag: &ExecutionPlanDag,
+        node_idx: NodeIndex,
+        node: &PlanNode,
+    ) -> Result<(), PipelineError> {
+        dispatch_composition(
+            CompositionDispatchContext::Inert,
+            current_dag,
+            node_idx,
+            node,
+        )
+    }
+}
+
 /// Execute the `Composition` arm for `node_idx`: collect parent-scope
 /// records per declared input port, swap `current_dag` to the body's
 /// mini-DAG, walk the body topo through the shared dispatcher, then collect
 /// the body's first declared output port and write it to this node's buffer
 /// in the parent scope.
-pub(crate) fn dispatch_composition(
-    ctx: &mut ExecutorContext<'_>,
+pub(crate) fn dispatch_composition<'borrow, 'plan>(
+    ctx: impl Into<CompositionDispatchContext<'borrow, 'plan>>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     node: &PlanNode,
-) -> Result<(), PipelineError> {
+) -> Result<(), PipelineError>
+where
+    'plan: 'borrow,
+{
     let PlanNode::Composition { ref name, body, .. } = *node else {
-        unreachable!("dispatch_composition called with non-Composition node");
+        return Err(crate::executor::invariant::dispatch_mismatch(
+            "dispatch_composition",
+            "composition",
+            node.kind_name(),
+            node.name(),
+        ));
     };
+    #[cfg(feature = "test-utils")]
+    let CompositionDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("composition dispatcher accessed inert context after accepting a composition node")
+    };
+    #[cfg(not(feature = "test-utils"))]
+    let CompositionDispatchContext::Live(ctx) = ctx.into();
     // Recursive body execution: collect parent-scope records
     // per declared input port, swap `current_dag` to the body's
     // mini-DAG, walk the body's topo, then collect the body's
@@ -405,6 +456,11 @@ fn execute_composition_body(
         .replace(bound_body.node_input_refs.clone());
 
     ctx.window_runtime.active_stack.push(body_id);
+    // Body node names are body-local; telemetry names them by this call site so
+    // two invocations of one composition stay tellable apart. Pushed with the
+    // window-runtime scope and popped with it below.
+    ctx.composition_call_sites
+        .push(composition_name.to_string());
 
     // Increment depth before recursing. The walk and output harvest execute
     // inside one captured Result; parent-scope restoration below runs before
@@ -504,6 +560,7 @@ fn execute_composition_body(
     }
     ctx.window_arena_consumer_ids = saved_arena_ids;
     ctx.window_runtime.active_stack.pop();
+    ctx.composition_call_sites.pop();
     ctx.window_runtime.remove_body_scope(bound_body.body_scope);
 
     walk_and_harvest

@@ -547,25 +547,14 @@ impl PipelineConfig {
         ));
 
         // ── Stage 5: D3b — dotted-name check ────────────────────────
-        // `.` is reserved for branch references (e.g. "route.high").
-        // Enforced structurally here against the nodes: taxonomy.
+        // Every node in the taxonomy, with no per-variant filter: the
+        // reserved character is a property of a node name, not of the
+        // kind of node wearing it, so a variant added later is covered
+        // by walking `self.nodes` rather than by a match arm.
         for spanned in &self.nodes {
-            let name = spanned.value.name();
-            if matches!(
-                spanned.value,
-                PipelineNode::Transform { .. }
-                    | PipelineNode::Aggregate { .. }
-                    | PipelineNode::Route { .. }
-            ) && name.contains('.')
+            if let Some(diag) = dotted_node_name_diagnostic(spanned.value.name(), span_for(spanned))
             {
-                diags.push(Diagnostic::error(
-                    "E010",
-                    format!(
-                        "transform name {name:?} is invalid: '.' is reserved \
-                         for branch references (use underscores or hyphens)"
-                    ),
-                    span_for(spanned),
-                ));
+                diags.push(diag);
             }
         }
 
@@ -580,29 +569,12 @@ impl PipelineConfig {
                 _ => continue,
             };
             let Some(directives) = log else { continue };
-            for (i, d) in directives.iter().enumerate() {
-                if let Some(every) = d.every {
-                    if every == 0 {
-                        diags.push(Diagnostic::error(
-                            "E011",
-                            format!(
-                                "transform {name:?}: log directive #{}: every must be >= 1",
-                                i + 1
-                            ),
-                            span_for(spanned),
-                        ));
-                    }
-                    if d.when != LogTiming::PerRecord {
-                        diags.push(Diagnostic::error(
-                            "E011",
-                            format!(
-                                "transform {name:?}: log directive #{}: 'every' is only valid with when: per_record",
-                                i + 1
-                            ),
-                            span_for(spanned),
-                        ));
-                    }
-                }
+            for error in transform::log_directive_set_validation_errors(directives) {
+                diags.push(Diagnostic::error(
+                    "E011",
+                    format!("transform {name:?}: {error}"),
+                    span_for(spanned),
+                ));
             }
         }
 
@@ -772,6 +744,9 @@ impl PipelineConfig {
             self.error_handling.dlq.as_ref(),
             &mut diags,
         );
+        // After composition expansion, so a body transform and a top-level one
+        // declaring one event name are finally compared against each other.
+        crate::plan::bind_schema::validate_log_event_shapes(&self.nodes, &artifacts, &mut diags);
 
         // Early-abort optimization: CXL compile errors (parse E202,
         // name-resolution E203, type E200), source-schema errors (E201),
@@ -3976,13 +3951,30 @@ pub(crate) fn lower_node_to_plan_node(
                 };
             let write_set = extract_write_set(&typed);
             let has_distinct = extract_has_distinct(&typed);
+            let log = config.log.clone().unwrap_or_default();
+            // The gate predicates bind_schema typechecked, one slot per
+            // directive. An absent entry means bind rejected a condition (a
+            // diagnostic was already pushed); a short one would silently
+            // un-gate the tail directives, so both refuse to lower — the same
+            // guard the Route and Reshape arms apply to their per-item
+            // program sets.
+            let log_conditions = if log.is_empty() {
+                Vec::new()
+            } else {
+                let conditions = artifacts.transform_log_conditions.get(&id)?.clone();
+                if conditions.len() != log.len() {
+                    return None;
+                }
+                conditions
+            };
             Some(PlanNode::Transform {
                 name: name.to_string(),
                 id,
                 span,
                 resolved: Some(Box::new(PlanTransformPayload {
                     analytic_window: config.analytic_window.clone(),
-                    log: config.log.clone().unwrap_or_default(),
+                    log,
+                    log_conditions,
                     validations: config.validations.clone().unwrap_or_default(),
                     dlq_node: None,
                     typed,
@@ -4538,6 +4530,36 @@ pub fn reserved_names_for(scope: pipeline_node::VarScope) -> &'static [&'static 
         pipeline_node::VarScope::Source => RESERVED_SOURCE_NAMES,
         pipeline_node::VarScope::Record => RESERVED_RECORD_NAMES,
     }
+}
+
+/// The E010 diagnostic for a node name carrying the reserved `.`, or
+/// `None` when the name is clean.
+///
+/// `.` addresses something other than a node: a branch of a route
+/// (`split.high`) and a node inside a composition call site
+/// (`enrich.ref`). A node whose own name carries one renders identically
+/// to one of those paths, so the key derived from it names two different
+/// things — a top-level output `enrich.ref` and the body node `ref` under
+/// call site `enrich` are indistinguishable downstream. The rule holds for
+/// every node kind, so callers pass a name and a span and never a variant.
+pub(crate) fn dotted_node_name_diagnostic(
+    name: &str,
+    span: clinker_core_types::LabeledSpan,
+) -> Option<clinker_core_types::Diagnostic> {
+    if !name.contains('.') {
+        return None;
+    }
+    let corrected = name.replace('.', "_");
+    Some(clinker_core_types::Diagnostic::error(
+        "E010",
+        format!(
+            "node name {name:?} is invalid: '.' is reserved for branch \
+             references and composition call-site paths; rename the node to \
+             {corrected:?} (use underscores or hyphens) and update every \
+             reference to it"
+        ),
+        span,
+    ))
 }
 
 /// Post-deserialization validation.
@@ -5294,7 +5316,13 @@ pub(crate) fn validate_node_configs(nodes: &[Spanned<PipelineNode>]) -> Vec<Node
         }
     }
 
-    // Validate log directives on Transform nodes.
+    // Validate the log-directive set on each Transform node in isolation.
+    //
+    // What one directive says about itself, and what one node's directives say
+    // about each other, is answerable from this slice alone. Whether two
+    // transforms agree on what an event *name* means is not: they may sit in
+    // different scopes and only meet after composition expansion, so that rule
+    // lives in the plan-wide `validate_log_event_shapes` pass instead.
     for (node_index, spanned) in nodes.iter().enumerate() {
         if let PipelineNode::Transform {
             header,
@@ -5302,28 +5330,11 @@ pub(crate) fn validate_node_configs(nodes: &[Spanned<PipelineNode>]) -> Vec<Node
         } = &spanned.value
             && let Some(directives) = &body.log
         {
-            for (i, d) in directives.iter().enumerate() {
-                if let Some(every) = d.every {
-                    if every == 0 {
-                        violations.push(NodeConfigViolation {
-                            node_index,
-                            message: format!(
-                                "transform '{}': log directive #{}: every must be >= 1",
-                                header.name,
-                                i + 1,
-                            ),
-                        });
-                    } else if d.when != LogTiming::PerRecord {
-                        violations.push(NodeConfigViolation {
-                            node_index,
-                            message: format!(
-                                "transform '{}': log directive #{}: 'every' is only valid with when: per_record",
-                                header.name,
-                                i + 1,
-                            ),
-                        });
-                    }
-                }
+            for error in transform::log_directive_set_validation_errors(directives) {
+                violations.push(NodeConfigViolation {
+                    node_index,
+                    message: format!("transform '{}': {error}", header.name),
+                });
             }
         }
     }

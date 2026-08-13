@@ -16,6 +16,7 @@ pub(crate) mod document_dlq;
 pub(crate) mod envelope;
 pub(crate) mod envelope_dispatch;
 mod ingest;
+pub(crate) mod invariant;
 pub(crate) mod merge_dispatch;
 pub mod node_buffer;
 pub(crate) mod node_buffer_spill;
@@ -43,6 +44,9 @@ pub(crate) mod window_runtime;
 
 pub use batch_handoff::DEFAULT_BATCH_SIZE;
 use context::build_stable_eval_context;
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub use dispatch::DispatchFaultGuard;
 pub use dlq::DlqEntry;
 pub(crate) use dlq::TypeErrorEvent;
 use ingest::{IngestTaskOutcome, ingest_source};
@@ -790,20 +794,7 @@ impl PipelineExecutor {
             ingest_handles.push(handle);
         }
 
-        let DispatchOutcome {
-            counters,
-            dlq_entries,
-            peak_rss_bytes,
-            mut watermarks,
-            per_source_rollback_cursors,
-            per_source_record_counts,
-            per_source_dlq_counts,
-            cumulative_spill_bytes,
-            per_stage_spill_bytes,
-            peak_consumer_usage_bytes,
-            mut interrupted,
-            advisories,
-        } = Self::execute_dag(
+        let dispatch_outcome = match Self::execute_dag(
             &DagExecInputs {
                 config,
                 source_configs: &source_configs,
@@ -822,7 +813,35 @@ impl PipelineExecutor {
             },
             &mut collector,
             counters,
-        )?;
+        ) {
+            Ok(outcome) => outcome,
+            Err(dispatch_error) => {
+                // `execute_dag` has already dropped or drained every receiver,
+                // so each finite source worker can now finish. Join all of
+                // them before returning the original dispatcher failure: a
+                // detached ingest thread would keep reader and spill handles
+                // alive beyond the failed run's lifecycle boundary.
+                for handle in ingest_handles {
+                    let _ = handle.join();
+                }
+                return Err(dispatch_error);
+            }
+        };
+
+        let DispatchOutcome {
+            counters,
+            dlq_entries,
+            peak_rss_bytes,
+            mut watermarks,
+            per_source_rollback_cursors,
+            per_source_record_counts,
+            per_source_dlq_counts,
+            cumulative_spill_bytes,
+            per_stage_spill_bytes,
+            peak_consumer_usage_bytes,
+            mut interrupted,
+            advisories,
+        } = dispatch_outcome;
 
         // Collect ingest-task outcomes: per-source row counts and the
         // per-(source, file) watermark observations each task captured
@@ -1333,6 +1352,7 @@ impl PipelineExecutor {
             output_configs: &output_configs,
             primary_output: &output_configs[0],
             stable: &stable,
+            telemetry_producer: params.telemetry_producer.clone(),
             source_batch_arc: &source_batch_arc,
             source_count_per_source,
             source_ingestion_timestamp,
@@ -1376,6 +1396,7 @@ impl PipelineExecutor {
             collector,
             recursion_depth: 0,
             current_body_node_input_refs: None,
+            composition_call_sites: Vec::new(),
             spill_root,
             spill_root_path,
             window_runtime,
@@ -1389,6 +1410,9 @@ impl PipelineExecutor {
             commit_step_path: dispatch::CommitStepPath::NotSelected,
             region_input_buffers: HashMap::new(),
             in_deferred_dispatch: false,
+            transform_signal_carry: crate::log_dispatch::ParkedTransformSignals::new(
+                params.telemetry_producer.clone(),
+            ),
             streaming_output_senders,
             streaming_output_nodes,
             streaming_aggregate_ingest_edges,
@@ -1809,6 +1833,76 @@ mod tests {
     //! in-crate symbols.
 
     use super::*;
+
+    #[test]
+    fn route_dispatch_mismatch_returns_typed_error() {
+        let config = clinker_plan::config::parse_config(
+            r#"
+pipeline:
+  name: dispatch_mismatch
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      glob: ./*.csv
+      files:
+        on_no_match: skip
+      schema:
+        - { name: id, type: string }
+  - type: transform
+    name: normalize_orders
+    input: orders
+    config:
+      cxl: "emit id = id"
+  - type: output
+    name: out
+    input: normalize_orders
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+        )
+        .expect("pipeline parses");
+        let (dag, ()) = PipelineExecutor::explain_dag(&config).expect("pipeline compiles");
+        let (node_idx, node) = dag
+            .graph
+            .node_indices()
+            .map(|idx| (idx, &dag.graph[idx]))
+            .find(|(_, node)| node.name() == "normalize_orders")
+            .expect("compiled transform exists");
+
+        let error = crate::executor::route_dispatch::dispatch_route(
+            crate::executor::route_dispatch::InertRouteDispatchContext,
+            &dag,
+            node_idx,
+            node,
+        )
+        .expect_err("a transform cannot be dispatched as a route");
+
+        let PipelineError::DispatchMismatch {
+            dispatcher,
+            expected_kind,
+            actual_kind,
+            node,
+        } = &error
+        else {
+            panic!("expected DispatchMismatch, got {error}");
+        };
+        assert_eq!(*dispatcher, "dispatch_route");
+        assert_eq!(*expected_kind, "route");
+        assert_eq!(*actual_kind, "transform");
+        assert_eq!(node, "normalize_orders");
+
+        let classification = error
+            .failure_classification()
+            .expect("dispatch mismatches have a registered classification");
+        assert_eq!(classification.code(), "runtime.invariant.dispatch_mismatch");
+        assert_eq!(classification.category().as_str(), "internal_invariant");
+        assert_eq!(classification.retry_advice().as_str(), "policy_required");
+    }
 
     #[test]
     fn mapping_advisories_follow_output_declaration_order() {

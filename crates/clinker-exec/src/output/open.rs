@@ -64,33 +64,57 @@ where
     F: FnMut(Option<u64>) -> Result<PathBuf, ConfigError>,
 {
     let bare = path_for_n(None).map_err(PipelineError::Config)?;
+    // Once for the whole search. The unique-suffix loop asked the kernel for
+    // the same working directory on every candidate it tried, so a
+    // destination already holding a few thousand numbered files paid a few
+    // thousand identical `getcwd` calls before writing a byte.
+    let base = std::env::current_dir().map_err(PipelineError::Io)?;
 
     match policy {
         IfExistsPolicy::Overwrite => {
-            stage_candidate(bare, PromotionDisposition::Replace, publication)
+            stage_candidate(bare, PromotionDisposition::Replace, publication, &base)
         }
         IfExistsPolicy::Error => {
             if cli_force {
-                return stage_candidate(bare, PromotionDisposition::Replace, publication);
+                return stage_candidate(bare, PromotionDisposition::Replace, publication, &base);
             }
-            match stage_candidate(bare.clone(), PromotionDisposition::NoReplace, publication) {
+            match stage_candidate(
+                bare.clone(),
+                PromotionDisposition::NoReplace,
+                publication,
+                &base,
+            ) {
                 Err(error) if is_already_exists(&error) => Err(existing_output_error(&bare)),
                 result => result,
             }
         }
         IfExistsPolicy::UniqueSuffix => {
-            match stage_candidate(bare.clone(), PromotionDisposition::NoReplace, publication) {
+            let mut search = SuffixSearch::default();
+
+            match stage_candidate(
+                bare.clone(),
+                PromotionDisposition::NoReplace,
+                publication,
+                &base,
+            ) {
                 Ok(output) => return Ok(output),
-                Err(error) if is_already_exists(&error) => {}
+                // The authored name itself. Its error already names the path
+                // the author wrote, so it is returned as it stands.
+                Err(error) if search.advance(&error) => {}
                 Err(error) => return Err(error),
             }
 
             for n in 1u64..=u64::MAX {
                 let candidate = path_for_n(Some(n)).map_err(PipelineError::Config)?;
-                match stage_candidate(candidate, PromotionDisposition::NoReplace, publication) {
+                match stage_candidate(
+                    candidate,
+                    PromotionDisposition::NoReplace,
+                    publication,
+                    &base,
+                ) {
                     Ok(output) => return Ok(output),
-                    Err(error) if is_already_exists(&error) => continue,
-                    Err(error) => return Err(error),
+                    Err(error) if search.advance(&error) => continue,
+                    Err(error) => return Err(suffix_search_failure(&bare, error, &search)),
                 }
             }
             Err(PipelineError::Io(std::io::Error::other(
@@ -120,8 +144,9 @@ fn stage_candidate(
     path: PathBuf,
     disposition: PromotionDisposition,
     publication: Option<&ResolvedPublicationPolicy>,
+    base: &Path,
 ) -> Result<(PathBuf, File, StagedOutput), PipelineError> {
-    let boundary = contained_boundary(&path, publication)?;
+    let boundary = contained_boundary(&path, publication, base)?;
     let (staged, file) = boundary.stage(disposition).map_err(containment_error)?;
     Ok((path, file, staged))
 }
@@ -129,9 +154,9 @@ fn stage_candidate(
 fn contained_boundary(
     path: &Path,
     publication: Option<&ResolvedPublicationPolicy>,
+    base: &Path,
 ) -> Result<OutputContainment, PipelineError> {
-    let base = std::env::current_dir().map_err(PipelineError::Io)?;
-    let validated = validate_path(path, &base, path.is_absolute()).map_err(|diagnostic| {
+    let validated = validate_path(path, base, path.is_absolute()).map_err(|diagnostic| {
         PipelineError::Config(ConfigError::Validation(format!(
             "{}: {}",
             diagnostic.code, diagnostic.message
@@ -175,8 +200,153 @@ pub(crate) fn containment_error(error: ContainmentError) -> PipelineError {
     }
 }
 
+/// Decides whether a unique-suffix search may move to the next candidate.
+///
+/// A name already taken is always a reason to advance. A sharing violation —
+/// how Windows reports a name another thread is creating at that moment — is
+/// too, but only for as long as it looks like contention. A directory this
+/// process may not write into reports the identical error and never stops, so
+/// advancing on it forever means a run that neither finishes nor says why.
+///
+/// The two are told apart by whether the denials are consecutive. Contention
+/// clears the moment the competing thread finishes, so a successful advance
+/// past a taken name resets the count; a denial that repeats on every
+/// candidate reaches the bound and is reported.
+#[derive(Default)]
+pub(crate) struct SuffixSearch {
+    consecutive_denials: u32,
+    total_denials: u32,
+}
+
+impl SuffixSearch {
+    /// How many denials in a row still look like contention.
+    const MAX_CONSECUTIVE_DENIALS: u32 = 64;
+    /// How many a whole search may meet before the answer is a denial
+    /// regardless of spacing. A destination that is both permanently denied
+    /// and concurrently written alternates the two errors, so the consecutive
+    /// count alone never reaches its bound and the search never terminates.
+    const MAX_TOTAL_DENIALS: u32 = 4096;
+
+    /// Move past a candidate whose name is taken for a reason this search
+    /// cannot read off an I/O error — another output in the same run having
+    /// claimed it, which arrives as a validation failure.
+    ///
+    /// It is a taken name like any other, so it resets the contention count.
+    /// Callers that recognised such a candidate themselves and skipped
+    /// `advance` entirely left the count standing, and a destination that
+    /// alternated claimed names with sharing violations reached the bound and
+    /// failed a run whose next suffix was free.
+    pub(crate) fn advance_past_taken_name(&mut self) -> bool {
+        self.consecutive_denials = 0;
+        true
+    }
+
+    pub(crate) fn advance(&mut self, error: &PipelineError) -> bool {
+        if is_already_exists(error) {
+            return self.advance_past_taken_name();
+        }
+        if !is_candidate_unavailable(error) {
+            return false;
+        }
+        self.consecutive_denials = self.consecutive_denials.saturating_add(1);
+        self.total_denials = self.total_denials.saturating_add(1);
+        self.consecutive_denials <= Self::MAX_CONSECUTIVE_DENIALS
+            && self.total_denials <= Self::MAX_TOTAL_DENIALS
+    }
+
+    /// Whether the search stopped because the denials never let up, rather than
+    /// because a candidate failed for a reason the search does not walk past.
+    ///
+    /// The two end the same loop and call for different diagnostics: the second
+    /// is a fact about the candidate that failed, while the first is a fact
+    /// about the destination as a whole.
+    pub(crate) fn exhausted_by_denials(&self) -> bool {
+        self.consecutive_denials > Self::MAX_CONSECUTIVE_DENIALS
+            || self.total_denials > Self::MAX_TOTAL_DENIALS
+    }
+}
+
+/// Report a destination that refused every candidate under the name its author
+/// wrote.
+///
+/// A unique-suffix search that runs out of patience has, by then, been refused
+/// on `out-1.csv` through `out-64.csv` — names no author ever typed and no
+/// author can act on. Returning the last of those made the diagnostic point at
+/// a generated string and hid both the authored destination and the fact that
+/// the name was never the problem. The path here is `bare`, the authored
+/// template's own rendering, in keeping with how the `Error` policy already
+/// reports a destination it cannot take.
+///
+/// The failing candidate contributes its error kind and nothing else. Its
+/// rendered message names a generated path too, so quoting it would put the
+/// name back in the text the correction was removing it from.
+pub(crate) fn unwritable_destination_error(
+    authored: &Path,
+    candidate_error: &PipelineError,
+) -> PipelineError {
+    let kind = match candidate_error {
+        PipelineError::Io(source) => source.kind(),
+        _ => std::io::ErrorKind::PermissionDenied,
+    };
+    let location = match authored.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            format!("its directory ({})", parent.display())
+        }
+        _ => "its directory".to_owned(),
+    };
+    PipelineError::Io(std::io::Error::new(
+        kind,
+        format!(
+            "cannot create output {}: every `unique_suffix` candidate for this destination was \
+             refused ({kind:?}), so the destination and not the name is what refused. Check write \
+             permission on {location}, or point `path:` at a directory this run may write.",
+            authored.display()
+        ),
+    ))
+}
+
+/// Decide, at the end of a unique-suffix search, which failure the author is
+/// told about: the destination's own refusal, or the candidate's.
+pub(crate) fn suffix_search_failure(
+    authored: &Path,
+    candidate_error: PipelineError,
+    search: &SuffixSearch,
+) -> PipelineError {
+    if search.exhausted_by_denials() {
+        return unwritable_destination_error(authored, &candidate_error);
+    }
+    candidate_error
+}
+
 fn is_already_exists(error: &PipelineError) -> bool {
     matches!(error, PipelineError::Io(source) if source.kind() == std::io::ErrorKind::AlreadyExists)
+}
+
+/// Whether this candidate name is unavailable and the search should move on.
+///
+/// Exclusive creation reports a name already taken as `AlreadyExists`
+/// everywhere. Windows has a second way to say it: a name another thread is
+/// creating at the same moment can come back as a sharing violation, which the
+/// standard library maps to `PermissionDenied`. Treating that as a hard error
+/// made `unique_suffix` fail a run whenever two writers raced for one path,
+/// rather than taking the next suffix — which is the whole point of the policy.
+///
+/// Deliberately not applied on the other platforms. There, exclusive creation
+/// never reports a taken name this way, so a refused permission means the
+/// directory genuinely cannot be written and must surface.
+fn is_candidate_unavailable(error: &PipelineError) -> bool {
+    if is_already_exists(error) {
+        return true;
+    }
+    // `cfg!` rather than a `#[cfg]` block: every platform compiles the same
+    // tokens and the branch folds away, so this cannot build on one host and
+    // fail on the other — which matters for a rule that exists to describe the
+    // host it cannot be compiled on here.
+    cfg!(windows)
+        && matches!(
+            error,
+            PipelineError::Io(source) if source.kind() == std::io::ErrorKind::PermissionDenied
+        )
 }
 
 fn existing_output_error(path: &Path) -> PipelineError {
@@ -198,6 +368,113 @@ mod tests {
     fn touch(path: &Path) {
         let mut f = File::create(path).unwrap();
         f.write_all(b"x").unwrap();
+    }
+
+    /// Every way of moving past a taken name clears the contention count, not
+    /// just the one spelled as an I/O error. A caller that recognised a taken
+    /// candidate itself and returned early never reached this type at all, so
+    /// a destination alternating claimed names with sharing violations
+    /// accumulated denials that nothing reset and failed a run whose next
+    /// suffix was free.
+    ///
+    /// The count is asserted directly because the denial it counts is only
+    /// recognised on Windows: a behaviour-level test on this host would pass
+    /// without the rule holding.
+    #[test]
+    fn any_taken_name_clears_the_contention_count() {
+        type Clear<'a> = &'a dyn Fn(&mut SuffixSearch) -> bool;
+
+        let taken = PipelineError::Io(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+        let clears: [(&str, Clear<'_>); 2] = [
+            (
+                "a name this run already claimed",
+                &|search: &mut SuffixSearch| search.advance_past_taken_name(),
+            ),
+            ("a name already on disk", &|search: &mut SuffixSearch| {
+                search.advance(&taken)
+            }),
+        ];
+
+        for (name, clear) in clears {
+            let mut search = SuffixSearch {
+                consecutive_denials: SuffixSearch::MAX_CONSECUTIVE_DENIALS,
+                total_denials: 7,
+            };
+
+            assert!(clear(&mut search), "{name} is a reason to advance");
+            assert_eq!(
+                search.consecutive_denials, 0,
+                "{name} ends the run of denials"
+            );
+            assert_eq!(
+                search.total_denials, 7,
+                "{name} is not itself a denial, so the whole-search bound is untouched"
+            );
+        }
+    }
+
+    /// A destination that refuses every candidate is reported under the name
+    /// its author wrote.
+    ///
+    /// The search walks past a denial for as long as it could still be
+    /// contention, so by the time it gives up it has been refused on
+    /// `out-1.csv` through `out-64.csv`. Returning the last of those named a
+    /// path nobody wrote, in a message whose only actionable content was the
+    /// name it had invented — while the authored destination, and the fact that
+    /// the name was never what refused, went unmentioned.
+    ///
+    /// Asserted against the search state directly: the denial this walks past
+    /// is only recognised on Windows, so a behaviour-level test on this host
+    /// would pass without the rule holding.
+    #[test]
+    fn a_destination_that_refuses_every_candidate_is_reported_under_the_authored_name() {
+        let denial = || {
+            PipelineError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "output containment stage failed for /data/out-64.csv: Permission denied",
+            ))
+        };
+        // The state a search leaves behind when it has met one denial more than
+        // it is willing to read as contention.
+        let search = SuffixSearch {
+            consecutive_denials: SuffixSearch::MAX_CONSECUTIVE_DENIALS + 1,
+            total_denials: SuffixSearch::MAX_CONSECUTIVE_DENIALS + 1,
+        };
+        assert!(
+            search.exhausted_by_denials(),
+            "which is a search that gave up because the denials never let up"
+        );
+
+        let reported =
+            suffix_search_failure(Path::new("/data/out.csv"), denial(), &search).to_string();
+        assert!(
+            reported.contains("/data/out.csv"),
+            "the authored destination must be named: {reported}"
+        );
+        assert!(
+            !reported.contains("out-64.csv"),
+            "and a generated candidate must not be: {reported}"
+        );
+        assert!(
+            reported.contains("/data"),
+            "the directory is what refused, so the author is pointed at it: {reported}"
+        );
+    }
+
+    /// A candidate that failed for a reason the search never walks past — a
+    /// denial on this host, among others — is reported exactly as it arrived.
+    /// Rewriting that one would replace a specific failure with a general
+    /// claim about the destination that the search has no evidence for.
+    #[test]
+    fn a_failure_the_search_does_not_walk_past_is_reported_as_it_stands() {
+        let search = SuffixSearch::default();
+        let error = PipelineError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "output containment stage failed for /data/missing/out-1.csv: No such file",
+        ));
+        let reported =
+            suffix_search_failure(Path::new("/data/out.csv"), error, &search).to_string();
+        assert!(reported.contains("No such file"), "{reported}");
     }
 
     #[test]

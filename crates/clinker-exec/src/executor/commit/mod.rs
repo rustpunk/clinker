@@ -228,7 +228,23 @@ pub(crate) fn orchestrate(
     // sees the cumulative error history from every iteration.
     merge_archive_into_live(&mut ctx.correlation_buffers, error_archive);
 
-    flush::flush_buffered(ctx, current_dag, &scope)
+    let flushed = flush::flush_buffered(ctx, current_dag, &scope);
+    // After the flush, so a transform dispatched on the way out is still part
+    // of the execution being closed, and on the failure path too: a converge
+    // that ends badly still ran, and a span left open would be the one signal
+    // an operator went looking for.
+    close_converged_transform_signals(ctx);
+    flushed
+}
+
+/// Report each transform the converge passed over as the one execution it was.
+///
+/// Every pass replaced the last, so what is left in the carry is the converged
+/// pass: one span covering the whole loop, one `started`/`completed` pair, and
+/// record and error counts an operator can sum across transforms without
+/// reading a four-iteration converge as four times the rows.
+fn close_converged_transform_signals(ctx: &mut ExecutorContext<'_>) {
+    ctx.transform_signal_carry.close_converged();
 }
 
 /// Capture every error_messages / error_rows entry from the live

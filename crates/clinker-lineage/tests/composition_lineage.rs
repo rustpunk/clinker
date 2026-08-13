@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use clinker_lineage::{
     DatasetId, FieldLineage, InputField, OutputColumnLineage, PlanColumnLineage, Transformation,
-    TransformationSubtype, TransformationType, column_lineage,
+    TransformationSubtype, TransformationType, column_lineage_local_diagnostic_paths,
 };
 use clinker_plan::CompileContext;
 use clinker_plan::config::parse_config;
@@ -37,7 +37,7 @@ fn compile_fixture(yaml: &str) -> CompiledPlan {
 }
 
 fn lineage_of(yaml: &str) -> PlanColumnLineage {
-    column_lineage(&compile_fixture(yaml), &fixtures_root())
+    column_lineage_local_diagnostic_paths(&compile_fixture(yaml), &fixtures_root())
 }
 
 /// The deterministic `file:` terminal name a source `path: <rel>` resolves to
@@ -444,4 +444,412 @@ nodes:
         }],
         "only the real envelope source should be an input"
     );
+}
+
+/// A composition body may declare its own source. It reads a file nothing at
+/// the call site feeds, so it is a logical dataset in its own right — not one
+/// the call site's identity could stand in for — and under external identity
+/// mode the author has to bind it like any other.
+///
+/// It is bound by its call-site path, `<composition>.<source>`, because a body
+/// carries its own node-name space: the pipeline below has a top-level `ref`
+/// and a body `ref`, and a bare key would hand both the same identity and
+/// attribute one's columns to the other. That path is also what a channel
+/// `sources:` patch uses to reach the same source.
+mod body_declared_source {
+    use super::*;
+
+    use clinker_lineage::column_lineage_external;
+    use clinker_lineage::logical_identity::{
+        ExternalDatasetIdentity, LineageIdentityContext, LineageIdentityError, LineageNodeBinding,
+    };
+
+    const PIPELINE: &str = r#"
+pipeline: { name: body_source_identity }
+nodes:
+  - type: source
+    name: ref
+    config:
+      name: ref
+      type: csv
+      path: data/top.csv
+      schema: [{ name: x, type: int }]
+  - type: composition
+    name: enrich
+    input: ref
+    use: ../compositions/own_source.comp.yaml
+    inputs:
+      driver: ref
+  - type: output
+    name: out
+    input: enrich
+    config: { name: out, type: csv, path: out/out.csv }
+"#;
+
+    fn binding(node: &str, name: &str) -> LineageNodeBinding {
+        LineageNodeBinding::new(
+            node,
+            ExternalDatasetIdentity::catalog("analytics", name).expect("catalog identity"),
+        )
+    }
+
+    /// Preflight enumerates the body, so an unbound body source is refused
+    /// before the run starts and the diagnostic names the key that fixes it.
+    #[test]
+    fn an_unbound_body_source_is_named_at_plan_time() {
+        let identities = LineageIdentityContext::external([
+            binding("ref", "top_customers"),
+            binding("out", "enriched"),
+        ])
+        .expect("complete top-level context");
+
+        let err = column_lineage_external(&compile_fixture(PIPELINE), &identities)
+            .expect_err("a body-declared source needs its own identity");
+        assert_eq!(
+            err,
+            LineageIdentityError::MissingNode {
+                node: "enrich.ref".to_string()
+            },
+            "the diagnostic must name the call-site path, which the author can bind"
+        );
+    }
+
+    /// Binding that key resolves it, and the body source stays a distinct
+    /// dataset from the identically-named top-level node.
+    #[test]
+    fn a_bound_body_source_is_its_own_dataset() {
+        let identities = LineageIdentityContext::external([
+            binding("ref", "top_customers"),
+            binding("enrich.ref", "reference_codes"),
+            binding("out", "enriched"),
+        ])
+        .expect("complete context");
+
+        let lineage = column_lineage_external(&compile_fixture(PIPELINE), &identities)
+            .expect("every dataset node is bound");
+
+        let names: Vec<&str> = lineage.inputs.iter().map(|id| id.name.as_str()).collect();
+        assert!(
+            names.contains(&"top_customers") && names.contains(&"reference_codes"),
+            "both sources are declared inputs, under their own identities: {names:?}"
+        );
+        assert_eq!(
+            lineage.outputs[0].dataset.name, "enriched",
+            "the sink keeps its own binding"
+        );
+
+        // The output column the body produces derives from the body source's
+        // column, so the edge lands on the body source's identity.
+        let label = lineage.outputs[0]
+            .facet
+            .fields
+            .get("label")
+            .expect("the body's emitted column reaches the sink");
+        assert_eq!(
+            label
+                .input_fields
+                .iter()
+                .map(|f| (f.name.as_str(), f.field.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("reference_codes", "code")]
+        );
+    }
+
+    /// A top-level node named `enrich.ref` once compiled: `.` was reserved in a
+    /// transform, aggregate, and route name, but not in a source, output, or
+    /// composition one. Joining a call site to a body node with a bare `.`
+    /// therefore gave that node and the body source `ref` under composition
+    /// `enrich` one key. Nothing detected it — the required keys are collected
+    /// into a set, and the duplicate check guards bindings rather than nodes —
+    /// so one binding answered for both, and the run published a single dataset
+    /// as both an input and an output, each carrying the other's column edges.
+    ///
+    /// Two changes closed it, and this test pins the outer one: the key join
+    /// escapes a name's own `.`, which makes the collision unrepresentable, and
+    /// the planner now refuses a `.` in any node name, which makes it
+    /// unreachable. Lineage therefore never receives this pipeline at all. The
+    /// escape stays covered where it can still be exercised — directly, in
+    /// `builder`'s `distinct_node_paths_get_distinct_identity_keys` — so it
+    /// remains a safety net rather than the only thing standing between the
+    /// engine and a silently merged dataset. Should the naming rule ever be
+    /// relaxed, this test fails first and points at the escape.
+    #[test]
+    fn a_dotted_node_name_does_not_collide_with_a_call_site_path() {
+        const COLLIDING: &str = r#"
+pipeline: { name: dotted_output_name }
+nodes:
+  - type: source
+    name: drive
+    config:
+      name: drive
+      type: csv
+      path: data/top.csv
+      schema: [{ name: x, type: int }]
+  - type: composition
+    name: enrich
+    input: drive
+    use: ../compositions/own_source.comp.yaml
+    inputs:
+      driver: drive
+  - type: output
+    name: enrich.ref
+    input: enrich
+    config: { name: enrich.ref, type: csv, path: out/out.csv }
+"#;
+
+        let diags = parse_config(COLLIDING)
+            .expect("the colliding pipeline is well-formed YAML")
+            .compile(&CompileContext::with_pipeline_dir(
+                fixtures_root(),
+                "pipelines",
+            ))
+            .expect_err("a node named for a call-site path must not compile");
+
+        let refusal = diags
+            .iter()
+            .find(|d| d.code == "E010")
+            .unwrap_or_else(|| panic!("expected E010 for the dotted output; got: {diags:?}"));
+        assert!(
+            refusal.message.contains("enrich.ref") && refusal.message.contains("enrich_ref"),
+            "the refusal names the output and the name it should take instead: {:?}",
+            refusal.message
+        );
+    }
+
+    /// A binding key is capped at 128 bytes, and the cap is applied to a key
+    /// composed from names that carry no cap of their own. A long call-site
+    /// name over a body node name therefore produced a key no binding could
+    /// spell — and the run reported it as a *missing* binding, telling the
+    /// author to add one that both the identity context and the configuration
+    /// boundary refuse. The diagnostic asked for something the tool would not
+    /// accept.
+    ///
+    /// The cap stays, because it is the same bound the configuration boundary
+    /// applies and a binding key has to fit through both. What changes is the
+    /// diagnostic: it names the constraint and leaves the author the correction
+    /// that works — rename the pipeline nodes the key is composed from.
+    #[test]
+    fn a_composed_key_over_the_cap_names_a_correction_the_author_can_make() {
+        let call_site = "e".repeat(130);
+        let pipeline = format!(
+            r#"
+pipeline: {{ name: long_call_site }}
+nodes:
+  - type: source
+    name: drive
+    config:
+      name: drive
+      type: csv
+      path: data/top.csv
+      schema: [{{ name: x, type: int }}]
+  - type: composition
+    name: {call_site}
+    input: drive
+    use: ../compositions/own_source.comp.yaml
+    inputs:
+      driver: drive
+  - type: output
+    name: out
+    input: {call_site}
+    config: {{ name: out, type: csv, path: out/out.csv }}
+"#
+        );
+
+        let identities = LineageIdentityContext::external([
+            binding("drive", "driver_rows"),
+            binding("out", "published_report"),
+        ])
+        .expect("both bindable nodes are bound");
+
+        let err = column_lineage_external(&compile_fixture(&pipeline), &identities)
+            .expect_err("the body source's key cannot be bound");
+        let expected_key = format!("{call_site}.ref");
+        assert_eq!(
+            err,
+            LineageIdentityError::UnbindableNode {
+                node: expected_key.clone(),
+                bytes: expected_key.len(),
+            }
+        );
+
+        // The key the author would have to write is refused by the same bound,
+        // which is why asking for it would have been a dead end.
+        assert_eq!(
+            LineageIdentityContext::external([binding(&expected_key, "reference_codes")])
+                .expect_err("a key over the cap is not a binding key"),
+            LineageIdentityError::InvalidNode {
+                node: expected_key.clone()
+            }
+        );
+
+        let diagnostic = err.to_string();
+        assert!(
+            diagnostic.contains("rename those pipeline nodes"),
+            "the correction has to be one the author can carry out: {diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains("add one canonical datasource"),
+            "and must not be the one that asks for a refused binding: {diagnostic}"
+        );
+    }
+
+    /// The same pipeline under local diagnostic paths — the mode that already
+    /// walked body sources — resolves both to distinct path-derived datasets.
+    /// External mode now reaches the same node set rather than aborting.
+    #[test]
+    fn local_diagnostic_paths_resolve_the_same_node_set() {
+        let lineage = lineage_of(PIPELINE);
+        let names: Vec<&str> = lineage.inputs.iter().map(|id| id.name.as_str()).collect();
+        assert!(
+            names.contains(&file_dataset("data/top.csv").as_str())
+                && names.contains(&file_dataset("data/ref.csv").as_str()),
+            "both sources are inputs under their declared paths: {names:?}"
+        );
+    }
+}
+
+/// Whether a source splits per record type is decided from the resolved
+/// schemas the plan retains, and that table is built from the top-level
+/// `nodes:` list alone. A body source shares the identity key space with every
+/// other lookup in the walk, so it never reads a top-level entry — and a body
+/// source of its own has no entry to read.
+mod multi_record_schemas_are_a_top_level_table {
+    use super::*;
+
+    /// The declaration a top-level `ref` carries: two record types, one of
+    /// which declares `code` — the column the body's own `ref` declares too.
+    const TOP_LEVEL_MULTI_RECORD: &str = r#"
+pipeline: { name: shadowed_multi_record }
+nodes:
+  - type: source
+    name: ref
+    config:
+      name: ref
+      type: fixed_width
+      path: data/payments.txt
+      schema:
+        discriminator: { start: 0, width: 1 }
+        records:
+          - id: header
+            tag: H
+            columns:
+              - { name: batch_id, type: string, start: 1, width: 9 }
+          - id: detail
+            tag: D
+            columns:
+              - { name: code, type: string, start: 1, width: 4 }
+  - type: transform
+    name: drive
+    input: ref
+    config:
+      cxl: |
+        emit x = 1
+  - type: composition
+    name: enrich
+    input: drive
+    use: ../compositions/own_source.comp.yaml
+    inputs:
+      driver: drive
+  - type: output
+    name: out
+    input: enrich
+    config: { name: out, type: csv, path: out/out.csv }
+"#;
+
+    /// A body source named the same as a top-level multi-record source is a
+    /// plain single-schema CSV. Reading the top-level declaration for it would
+    /// split the body's dataset by record types it does not have and attribute
+    /// its `code` column to `<body dataset>#detail` — a dataset no source in
+    /// the plan declares, and one that would be read as a record type of the
+    /// top-level file.
+    #[test]
+    fn a_body_source_does_not_inherit_a_top_level_declaration() {
+        let lineage = lineage_of(TOP_LEVEL_MULTI_RECORD);
+        let names: Vec<&str> = lineage.inputs.iter().map(|id| id.name.as_str()).collect();
+
+        let body = file_dataset("data/ref.csv");
+        assert!(
+            names.contains(&body.as_str()),
+            "the body source is an input under its own path: {names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with(&body) && *name != body),
+            "the body source declares one flat schema, so it has no record-type \
+             datasets: {names:?}"
+        );
+
+        // The top-level source keeps its own split, so the fix is a key
+        // correction rather than a disabling of the split.
+        let top = file_dataset("data/payments.txt");
+        assert!(
+            names.contains(&format!("{top}#header").as_str())
+                && names.contains(&format!("{top}#detail").as_str()),
+            "the top-level multi-record source still splits: {names:?}"
+        );
+
+        assert_field(
+            &only_output(&lineage).facet.fields,
+            "label",
+            &[direct(&body, "code", TransformationSubtype::Identity)],
+        );
+    }
+
+    /// A multi-record source declared inside a body keeps every column on its
+    /// container dataset. The plan retains no resolved schema for a body node,
+    /// so there is nothing to split by — the builder's documented limitation.
+    /// The columns still land on a dataset the run declares as an input, which
+    /// is what a consumer resolves a column edge against.
+    #[test]
+    fn a_body_multi_record_source_is_attributed_to_its_container() {
+        let lineage = lineage_of(
+            r#"
+pipeline: { name: body_multi_record }
+nodes:
+  - type: source
+    name: drv
+    config:
+      name: drv
+      type: csv
+      path: data/src.csv
+      schema: [{ name: x, type: int }]
+  - type: composition
+    name: enrich
+    input: drv
+    use: ../compositions/own_multi_record.comp.yaml
+    inputs:
+      driver: drv
+  - type: output
+    name: out
+    input: enrich
+    config: { name: out, type: csv, path: out/out.csv }
+"#,
+        );
+
+        let ledger = file_dataset("data/ledger.txt");
+        let names: Vec<&str> = lineage.inputs.iter().map(|id| id.name.as_str()).collect();
+        assert!(
+            names.contains(&ledger.as_str()),
+            "the body source is an input: {names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with(&ledger) && *name != ledger),
+            "no record-type dataset is derived for a body source: {names:?}"
+        );
+
+        let fields = &only_output(&lineage).facet.fields;
+        assert_field(
+            fields,
+            "batch",
+            &[direct(&ledger, "batch_id", TransformationSubtype::Identity)],
+        );
+        assert_field(
+            fields,
+            "total",
+            &[direct(&ledger, "amount", TransformationSubtype::Identity)],
+        );
+    }
 }

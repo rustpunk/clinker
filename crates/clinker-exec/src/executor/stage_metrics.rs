@@ -173,7 +173,14 @@ impl StageTimer {
         #[cfg(feature = "bench-alloc")]
         let (heap_delta, heap_count) = {
             let change = self.region.change();
-            (Some(change.net_bytes()), Some(change.allocs as u64))
+            // The accounting allocator measures in `isize`; this metric is
+            // `i64` so the number means the same thing on a 32-bit host as on
+            // a 64-bit one. Only this feature builds the line, so nothing
+            // outside a benchmark build ever compiled it.
+            (
+                i64::try_from(change.net_bytes()).ok(),
+                Some(change.allocs as u64),
+            )
         };
         #[cfg(not(feature = "bench-alloc"))]
         let (heap_delta, heap_count) = (None, None);
@@ -486,11 +493,19 @@ mod tests {
     fn test_stage_metrics_default_heap_fields_none() {
         let timer = StageTimer::new(StageName::Compile);
         let metrics = timer.finish(0, 0);
-        // Without bench-alloc feature, heap fields are None
+        // Both ways round. Asserting only the feature-off case left the
+        // feature-on build with a test that read its result and checked
+        // nothing, so the line that fills these fields stopped compiling
+        // without any test noticing.
         #[cfg(not(feature = "bench-alloc"))]
         {
             assert!(metrics.heap_delta_bytes.is_none());
             assert!(metrics.heap_alloc_count.is_none());
+        }
+        #[cfg(feature = "bench-alloc")]
+        {
+            assert!(metrics.heap_delta_bytes.is_some());
+            assert!(metrics.heap_alloc_count.is_some());
         }
     }
 

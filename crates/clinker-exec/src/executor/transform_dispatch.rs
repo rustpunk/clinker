@@ -23,20 +23,56 @@ use crate::executor::schema_check::check_input_schema;
 use crate::executor::{
     WindowedEvalCtx, evaluate_single_transform, evaluate_single_transform_windowed,
 };
+use crate::log_dispatch::{LogDispatcher, TransformSignalContext};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
+
+/// Context carrier kept lazy until the node-kind guard has succeeded. Normal
+/// dispatch passes the live executor context directly; the feature-gated
+/// mismatch matrix uses the inert carrier to prove rejection precedes
+/// evaluator and buffer access.
+pub(crate) enum TransformDispatchContext<'borrow, 'plan> {
+    Live(&'borrow mut ExecutorContext<'plan>),
+    #[cfg(feature = "test-utils")]
+    Inert,
+}
+
+impl<'borrow, 'plan> From<&'borrow mut ExecutorContext<'plan>>
+    for TransformDispatchContext<'borrow, 'plan>
+{
+    fn from(ctx: &'borrow mut ExecutorContext<'plan>) -> Self {
+        Self::Live(ctx)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl crate::executor::dispatch::DispatchFaultGuard {
+    /// Execute the real transform boundary with an inert context so tests can
+    /// prove a wrong node returns before evaluator or buffer state is touched.
+    #[doc(hidden)]
+    pub fn dispatch_transform_mismatch_for_testing(
+        current_dag: &ExecutionPlanDag,
+        node_idx: NodeIndex,
+        node: &PlanNode,
+    ) -> Result<(), PipelineError> {
+        dispatch_transform(TransformDispatchContext::Inert, current_dag, node_idx, node)
+    }
+}
 
 /// Execute the `Transform` arm for `node_idx`: drive per-record CXL
 /// evaluation (filter, projection, distinct, emit_each fan-out) over the
 /// predecessor's records, taking the streaming-fused path off a Source
 /// receiver when the pre-pass flagged this Transform eligible and the
 /// buffered `node_buffers` path otherwise. Stateless and streaming.
-pub(crate) fn dispatch_transform(
-    ctx: &mut ExecutorContext<'_>,
+pub(crate) fn dispatch_transform<'borrow, 'plan>(
+    ctx: impl Into<TransformDispatchContext<'borrow, 'plan>>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     node: &PlanNode,
-) -> Result<(), PipelineError> {
+) -> Result<(), PipelineError>
+where
+    'plan: 'borrow,
+{
     let PlanNode::Transform {
         ref name,
         window_index,
@@ -45,8 +81,19 @@ pub(crate) fn dispatch_transform(
         ..
     } = *node
     else {
-        unreachable!("dispatch_transform called with non-Transform node");
+        return Err(crate::executor::invariant::dispatch_mismatch(
+            "dispatch_transform",
+            "transform",
+            node.kind_name(),
+            node.name(),
+        ));
     };
+    #[cfg(feature = "test-utils")]
+    let TransformDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("transform dispatcher accessed inert context after accepting a transform node")
+    };
+    #[cfg(not(feature = "test-utils"))]
+    let TransformDispatchContext::Live(ctx) = ctx.into();
     // Streaming-fused path: when the pre-pass has flagged this
     // Transform as eligible (sole upstream is a Source whose
     // receiver lives in `ctx.source_records`, non-windowed,
@@ -149,6 +196,39 @@ pub(crate) fn dispatch_transform(
         has_distinct,
         payload.max_expansion,
     );
+    // Inside a composition body `name` is body-local: two call sites of one
+    // composition run the same names through the same telemetry producer, so
+    // the exported identity is the call-site path, not the bare name.
+    let logical_node = ctx.qualified_node_name(name).into_owned();
+    // A commit-pass dispatch is one pass of a converge that may run this
+    // transform again, so its signals belong to the converge rather than to the
+    // pass. The state is taken out here and handed back below; the orchestrator
+    // reports it once, after the loop stops.
+    let signal_context = TransformSignalContext {
+        execution_id: &ctx.stable.pipeline_execution_id,
+        batch_id: &ctx.stable.pipeline_batch_id,
+        pipeline_name: &ctx.stable.pipeline_name,
+        logical_node: &logical_node,
+    };
+    let deferred_pass = ctx.in_deferred_dispatch;
+    let mut signals = if deferred_pass {
+        let carry = ctx.transform_signal_carry.take(&logical_node);
+        LogDispatcher::deferred(
+            ctx.telemetry_producer.clone(),
+            &payload.log,
+            &payload.log_conditions,
+            signal_context,
+            carry,
+        )
+    } else {
+        LogDispatcher::new(
+            ctx.telemetry_producer.clone(),
+            &payload.log,
+            &payload.log_conditions,
+            signal_context,
+        )
+    };
+    signals.fire_before_transform();
 
     let expected_input = current_dag.graph[node_idx]
         .expected_input_schema_in(current_dag)
@@ -250,6 +330,10 @@ pub(crate) fn dispatch_transform(
         let source_name_arc = source_name_arc_of(&record);
         let eval_ctx =
             ctx.eval_ctx_for_record(&source_file_arc, &source_name_arc, rn, record.doc_ctx());
+        // Dispatch runs before the transform's program, so an authored gate
+        // sees the record as it arrived — the input row the gate was
+        // typechecked against.
+        signals.fire_per_record(&record, &eval_ctx);
 
         let target_schema = output_schema
             .as_ref()
@@ -330,6 +414,7 @@ pub(crate) fn dispatch_transform(
                 }
             }
             Err((transform_name, eval_err)) => {
+                signals.fire_on_error(&record);
                 dispatch_transform_eval_error(ctx, record, rn, transform_name, eval_err)?;
             }
         }
@@ -355,6 +440,10 @@ pub(crate) fn dispatch_transform(
         input_puncts,
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
+    signals.finish();
+    if let Some(carry) = signals.into_carry() {
+        ctx.transform_signal_carry.park(logical_node, carry);
+    }
 
     Ok(())
 }

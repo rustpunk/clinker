@@ -272,6 +272,8 @@ pub enum ResourceKind {
 pub struct CompositionFile {
     pub signature: CompositionSignature,
     pub nodes: Vec<Spanned<PipelineNode>>,
+    /// BLAKE3 of the exact composition source bytes read during planning.
+    pub content_digest: [u8; 32],
 }
 
 impl CompositionFile {
@@ -287,8 +289,221 @@ impl CompositionFile {
         source_path: PathBuf,
     ) -> Result<CompositionFile, YamlError> {
         let raw: raw::RawCompositionFile = crate::yaml::from_str(yaml)?;
-        Ok(raw.finalize(file_id, source_path))
+        Ok(raw.finalize(
+            file_id,
+            source_path,
+            *blake3::hash(yaml.as_bytes()).as_bytes(),
+        ))
     }
+
+    /// BLAKE3 of this composition's execution meaning: the typed contract
+    /// and the typed body as they stand right now, excluding deployment
+    /// locators, spans, and description text.
+    ///
+    /// Computed from the typed values rather than the authored bytes, and
+    /// on demand rather than at parse, because the body a call site binds
+    /// is not the body the file spelled: `bind_composition` applies channel
+    /// `sources:` patches and folds external `.schema.yaml` files into the
+    /// body nodes after parsing. A digest taken at parse time would report
+    /// two differently-patched call sites of one body as identical. Working
+    /// from typed values also means a default written out longhand, a
+    /// float spelled as an integer, or a reworded `description:` reads as
+    /// the same composition it deserializes to.
+    #[must_use]
+    pub fn semantic_digest(&self) -> [u8; 32] {
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|node| {
+                let mut value =
+                    serde_json::to_value(&node.value).unwrap_or(serde_json::Value::Null);
+                strip_node_deployment_locators(&mut value);
+                value
+            })
+            .collect::<Vec<_>>();
+        hash_semantic_json(&serde_json::json!({
+            "compose": semantic_signature(&self.signature),
+            "nodes": nodes,
+        }))
+    }
+}
+
+/// Reduce a composition contract to the part that decides what the body
+/// computes: port shapes, output wiring, config and resource declarations,
+/// and scoped-variable opt-ins. The file's own location, its span table,
+/// and every `description:` are excluded — none of them can change a
+/// record.
+fn semantic_signature(signature: &CompositionSignature) -> serde_json::Value {
+    let inputs = signature
+        .inputs
+        .iter()
+        .map(|(port, decl)| {
+            (
+                port.clone(),
+                serde_json::json!({
+                    "schema": decl.schema,
+                    "required": decl.required,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let outputs = signature
+        .outputs
+        .iter()
+        .map(|(port, alias)| {
+            (
+                port.clone(),
+                serde_json::Value::String(alias.internal_ref.value.clone()),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let config_schema = signature
+        .config_schema
+        .iter()
+        .map(|(param, decl)| {
+            (
+                param.clone(),
+                serde_json::json!({
+                    "type": param_type_label(decl.param_type),
+                    "required": decl.required,
+                    "default": decl.default,
+                    "enum": decl.enum_values,
+                    "range": decl.range.map(|(min, max)| serde_json::json!([min, max])),
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let resources_schema = signature
+        .resources_schema
+        .iter()
+        .map(|(resource, decl)| {
+            (
+                resource.clone(),
+                serde_json::json!({
+                    "kind": match decl.kind {
+                        ResourceKind::File => "file",
+                    },
+                    "required": decl.required,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::json!({
+        "name": signature.name,
+        "inputs": inputs,
+        "outputs": outputs,
+        "config_schema": config_schema,
+        "resources_schema": resources_schema,
+        "scoped_vars": {
+            "pipeline": signature.scoped_vars_schema.pipeline,
+            "source": signature.scoped_vars_schema.source,
+            "record": signature.scoped_vars_schema.record,
+        },
+    })
+}
+
+const fn param_type_label(param_type: ParamType) -> &'static str {
+    match param_type {
+        ParamType::String => "string",
+        ParamType::Int => "int",
+        ParamType::Float => "float",
+        ParamType::Bool => "bool",
+        ParamType::Path => "path",
+    }
+}
+
+/// Remove the file locations a node names, leaving everything that decides
+/// what it computes. Shared with the plan-level identity reduction so a
+/// body node and a top-level node agree on what counts as deployment.
+pub(crate) fn strip_node_deployment_locators(node: &mut serde_json::Value) {
+    let Some(object) = node.as_object_mut() else {
+        return;
+    };
+    match object.get("type").and_then(serde_json::Value::as_str) {
+        Some("source") => {
+            if let Some(config) = object
+                .get_mut("config")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                config.remove("path");
+                config.remove("paths");
+            }
+        }
+        Some("output") => {
+            if let Some(config) = object
+                .get_mut("config")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                config.remove("path");
+            }
+        }
+        Some("composition") => {
+            object.remove("use");
+            object.remove("resources");
+        }
+        _ => {}
+    }
+}
+
+fn hash_semantic_json(value: &serde_json::Value) -> [u8; 32] {
+    fn write_len(hasher: &mut blake3::Hasher, len: usize) {
+        hasher.update(&(len as u64).to_le_bytes());
+    }
+
+    fn write_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+        write_len(hasher, bytes.len());
+        hasher.update(bytes);
+    }
+
+    fn hash_value(hasher: &mut blake3::Hasher, value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Null => {
+                hasher.update(&[0]);
+            }
+            serde_json::Value::Bool(value) => {
+                hasher.update(&[1, u8::from(*value)]);
+            }
+            serde_json::Value::Number(value) => {
+                hasher.update(&[2]);
+                if let Some(value) = value.as_i64() {
+                    hasher.update(&[0]);
+                    hasher.update(&value.to_le_bytes());
+                } else if let Some(value) = value.as_u64() {
+                    hasher.update(&[1]);
+                    hasher.update(&value.to_le_bytes());
+                } else if let Some(value) = value.as_f64() {
+                    hasher.update(&[2]);
+                    hasher.update(&value.to_bits().to_le_bytes());
+                }
+            }
+            serde_json::Value::String(value) => {
+                hasher.update(&[3]);
+                write_bytes(hasher, value.as_bytes());
+            }
+            serde_json::Value::Array(values) => {
+                hasher.update(&[4]);
+                write_len(hasher, values.len());
+                for value in values {
+                    hash_value(hasher, value);
+                }
+            }
+            serde_json::Value::Object(object) => {
+                hasher.update(&[5]);
+                write_len(hasher, object.len());
+                let mut entries = object.iter().collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                for (key, value) in entries {
+                    write_bytes(hasher, key.as_bytes());
+                    hash_value(hasher, value);
+                }
+            }
+        }
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"clinker.composition.semantic-content.v2\0");
+    hash_value(&mut hasher, value);
+    *hasher.finalize().as_bytes()
 }
 
 // =========================================================================

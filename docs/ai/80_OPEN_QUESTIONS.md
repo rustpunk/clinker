@@ -749,3 +749,285 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   `clinker guess` inference follow-on remains open as question 31. This current
   wording supersedes the earlier archive claim that the decimal token was
   retired.
+- **32 (filed 2026-08-08):** `send_otlp_json` re-parses each payload into a
+  `serde_json::Value` tree to count the items it contains
+  (`crates/clinker-net/src/otlp.rs`, `validate_and_count_payload`), although
+  the producer already counted them while encoding and passes the count to
+  `DeliveryBackend::deliver`. The second parse is not redundant as written:
+  this is a public entry point taking arbitrary bytes, and the walk also
+  checks the payload matches the selected signal envelope. Removing it means
+  either trusting a caller-supplied count at a validated boundary, or
+  deserializing into shape-only types whose elements are `IgnoredAny` so the
+  count survives without a DOM. The second is the better answer and is a
+  change of its own; the cost today is one extra parse and an allocation of
+  the payload's order on the exporter thread, per request.
+- **33 (filed 2026-08-08):** Twelve dispatchers each carry their own
+  `<Kind>DispatchContext` enum, `From` impl, and
+  `dispatch_<kind>_mismatch_for_testing` helper (for example
+  `crates/clinker-exec/src/executor/cull_dispatch.rs`), differing in nothing
+  but the operator name. One generic carrier in `dispatch.rs` would serve all
+  of them. Left as is for now because collapsing them touches every operator
+  entry point at once; the risk is that a thirteenth operator copies the block
+  again, or that one copy is edited inconsistently and quietly loses its
+  mismatch guard.
+- **34 (filed 2026-08-08, needs a maintainer decision):** RFC 8288 `Link`
+  header parsing in `crates/clinker-net/src/rest/continuation.rs`
+  (`parse_link_field`, `split_link_values`, `unquote`) is hand-rolled — roughly
+  a hundred lines of quoted-string, comma, and semicolon tokenizing, including
+  the `rel` token-list and escaping corners. AGENTS.md is explicit that
+  hand-rolling a parser a vetted crate provides is a dependency decision taken
+  without review, so this needs approving as either a dependency or a
+  deliberate exception rather than being grown further. Each mis-handled corner
+  of the grammar is a pagination failure against a real server, and this file
+  has now been repaired twice for exactly that class of defect. No behavior
+  change is proposed here; the decision is which way to close it.
+  Updated 2026-08-12: a search of the ecosystem found no crate that parses
+  RFC 8288 over bytes -- the `&str` interfaces of the candidates carry the
+  exact defect question 53 describes -- so the parser was ported to bytes and
+  kept. What changed in its favour is that the adversary is now automated
+  rather than imagined: `no_byte_sequence_panics_or_yields_an_unusable_target`
+  runs the parser over a fixed corpus built from exhaustive delimiter
+  sequences, every single-byte mutation and truncation of a well-formed field,
+  and a seeded random sweep of the full byte range. The dependency-versus-
+  exception decision is still a maintainer's; the evidence for the exception
+  is stronger than it was.
+- **35 (filed 2026-08-09, needs a maintainer decision):** When the machine
+  protocol's liveness worker gives up on a sink that has refused records for
+  the whole patience window, the only report is a `tracing` warning on stderr.
+  A supervisor consuming the protocol stream alone still sees an ordinary
+  successful terminal and cannot learn the liveness channel died. The two
+  obvious in-band answers are both blocked: the stream itself is the thing
+  that failed, so a record announcing it may not arrive either, and the
+  bulkhead rule says a delivery outcome never determines process status, so
+  the exit code must not change. Closing this properly means a schema-2 field
+  on the terminal record stating whether the liveness channel survived, which
+  is a protocol change rather than a repair.
+- **36 (filed 2026-08-09, needs a maintainer decision):** The recovery-matrix
+  release gate in `tools/release-policy/src/recovery.rs` is keyed on internal
+  planning identifiers, held as load-bearing constants rather than comments.
+  The project's comment rule keeps such labels out of Rust source, and they
+  are worse as constants: a reader cannot tell what they name, and the gate
+  stops matching the moment that planning artifact moves on. The gate is
+  validating a real receipt, so the identifiers cannot simply be deleted --
+  closing this means deciding what the receipt should be keyed on instead
+  (a content hash, a named capability set, or the command registry itself)
+  and reissuing the receipt against it.
+- **37 (filed 2026-08-09):** `LogDispatcher::emit` allocates one
+  `Vec<SignalField>` per emitted record on the per-record transform path
+  (`crates/clinker-exec/src/log_dispatch.rs`). A reusable scratch buffer is
+  not available: `SignalField<'a>` borrows both the field name and the record
+  value, so the vector cannot outlive the record it describes without unsafe
+  lifetime reuse. Directives with no `fields:` already allocate nothing, since
+  the vector is built with zero capacity. Removing the remaining cost means
+  either an inline-capacity vector (a new dependency) or an arena, both of
+  which are approval-gated decisions rather than repairs.
+- **38 (filed 2026-08-09, resolved as designed):** A machine-mode run that
+  cannot install its signal handler exits 4 having written nothing to the
+  protocol stream, so a supervisor reading only the stream sees a process exit
+  without a word. Reviewed and kept: the refusal is deliberately pre-effect --
+  `signal_handler_installation_failure_is_preeffect` asserts the filesystem is
+  untouched and the stream unopened -- and a `started` record would announce a
+  run that never began, which is a worse thing for a stream to say than
+  nothing. The distinct exit status is what carries the fact. Reopening this
+  means deciding whether the protocol should gain a record for "refused before
+  starting", which is a schema change and shares its shape with question 35.
+- **39 (filed 2026-08-09, needs a maintainer decision):**
+  `ObservabilityDropPolicy` has one variant, `DropNewest`, and its only match
+  arm is empty. It is a user-facing `clinker.toml` key with two accessors on
+  the resolved policies, so an author can set it and nothing they write
+  changes anything. Deleting it removes a documented surface, which is a
+  human rip-vs-wire decision rather than an agent's; wiring it means deciding
+  what the alternative behaviour is (drop-oldest, or refuse) and what a queue
+  that is already bounded should do differently under it.
+- **40 (filed 2026-08-09):** Four UTF-8 boundary-truncation helpers now exist:
+  `clinker-core-types/src/failure.rs`, `clinker-exec/src/telemetry.rs`,
+  `clinker-exec/src/progress.rs`, and `clinker-exec/src/executor/util.rs`.
+  They differ in return shape -- borrowed `&str`, owned `String` plus a
+  truncation flag, and a prefix-with-length -- which is why each was written
+  rather than reused, but the boundary walk is the same in all four and a
+  correction to it reaches only the copy whoever fixes it happens to find.
+  Collapsing them means agreeing one signature that serves every caller.
+- **41 (filed 2026-08-09):** Under `if_exists: unique_suffix` on the
+  attempt-owned path, a destination the process cannot write into is retried
+  up to the shared suffix-search bound before the run fails, and the
+  diagnostic then names the last candidate tried -- `report_64.csv` -- rather
+  than the template the author wrote. The retrying is deliberate (a contended
+  name on Windows reports the same error kind as a permanent refusal, which is
+  why the bound exists), but the message should name the authored destination
+  and say how many candidates were attempted. Fixing it means carrying the
+  template into the failure, which the search does not currently hold.
+- **42 (filed 2026-08-09):** The dispatcher set is now written out four times:
+  the fault-injection enum, its string-to-variant map, the re-dispatch match
+  in `dispatch.rs`, and the twelve per-file mismatch helpers. This is the same
+  duplication as open question 33 seen from the test-support side; whatever
+  single carrier resolves 33 should absorb these too, so the count is one
+  place rather than four.
+- **43 (filed 2026-08-09, needs a maintainer decision):** `collision_key`
+  folds case with `to_ascii_lowercase`, so on a case-insensitive volume two
+  paths differing only in a non-ASCII letter's case (`Ärger.csv` and
+  `ärger.csv`) are one file to the filesystem and two keys to us -- both
+  producers admitted, one file written twice. Folding correctly needs Unicode
+  simple case folding, and the exact fold a volume applies is filesystem
+  specific (NTFS uses a frozen table, APFS a normalization-insensitive one),
+  so this is a dependency-and-semantics decision rather than a repair. The
+  present fold is the safe direction for the case-sensitive default: it never
+  merges two paths a filesystem might keep distinct.
+- **44 (filed 2026-08-09):** `destination_identity` returns the path
+  unresolved when the walk up reaches a component with no parent, which on
+  Windows includes a UNC share root. A destination on a share that is
+  momentarily unreachable therefore gets a different identity than the same
+  destination once the share responds -- the same before/after divergence the
+  resolution was added to remove, in the one case the walk cannot cross. A
+  correct answer needs the share root treated as resolvable in its own right;
+  it needs a Windows host to verify, which this branch has only through CI.
+- **45 (filed 2026-08-09):** The per-directory case-sensitivity memo in
+  `fs_type.rs` is process-global and never invalidated. Within one run that is
+  sound -- the answer is a property of the volume -- but a long-lived embedder
+  that removed a directory and recreated the path on a different volume would
+  get the earlier answer. Bounding it means either scoping the memo to a run
+  (the natural owner is the staging registry, which does not currently reach
+  this function) or keying it on volume identity rather than path.
+- **46 (filed 2026-08-09):** `CompositionFile::parse` parses every composition
+  YAML twice -- once into the typed form and once into a `serde_json::Value`
+  -- to compute a digest most runs never read. Making the digest lazy needs a
+  decision about where it is memoized, since the parsed value is discarded
+  before the digest's consumers run.
+- **47 (filed 2026-08-09, RESOLVED 2026-08-13):** The `log` event-shape rule
+  ("one event name, one set of fields") was enforced per node slice, so a body
+  transform and a top-level transform declaring one event name with different
+  fields were never compared. It now lives in
+  `bind_schema::validate_log_event_shapes`, a plan-wide pass that runs after
+  composition expansion over the top-level nodes and every bound body's lowered
+  transforms, and reports E375. The registry the earlier note ruled out is in
+  fact sound there: it compares *field sets*, so a composition instantiated
+  twice agrees with itself and only a genuine disagreement is reported.
+- **48 (filed 2026-08-09, narrowed 2026-08-13):** Every `validate_node_configs`
+  violation -- the per-transform `batch_size` rule and the `log` directive
+  rules -- surfaces at the top level as a bare `ConfigError::Validation`
+  carrying a message with no diagnostic code and no span, while the same
+  violation inside a composition body is reported as E115 with a span. Giving
+  the family codes and spans is a diagnostics change across all of its members
+  rather than a repair to one of them. (The event-shape rule left the family
+  with question 47 and now carries E375; its span is synthetic for a different
+  reason -- a cross-scope conflict has two locations and no single offence.)
+- **49 (filed 2026-08-09, needs a maintainer decision):** A dead-lettered
+  record whose source has no `per_source` DLQ override, in a pipeline with no
+  top-level `error_handling.dlq.path`, has no destination and is dropped.
+  That is the documented contract of `partition_dlq_entries`, but nothing
+  tells the operator: the run counts the record as dead-lettered and writes it
+  nowhere. The right place to catch it is admission -- a pipeline that can
+  dead-letter from a source it has given no sidecar is a configuration gap
+  detectable before any record is read -- which needs the set of
+  dead-letterable sources, available in the plan but not to this function.
+- **50 (filed 2026-08-09):** `destination_identity` falls back to the
+  unresolved path when `current_dir()` fails. Every caller then falls back
+  identically, so two relative spellings still agree with each other; what
+  cannot agree is a relative path against an absolute one naming the same
+  file. There is no better answer without a working directory, and no caller
+  is positioned to supply one, so the case is recorded rather than handled.
+- **51 (filed 2026-08-09, needs a maintainer decision):** `destination_identity`
+  consults the filesystem, so its answer for one path can change during a run
+  -- a run creates the very directories these paths name. Two properties are
+  both wanted and are in tension: the identity should be STABLE for a given
+  path across a run, and EQUAL for two spellings of one file. Remembering the
+  first answer buys stability and loses equality, because a path asked before
+  its directory exists keeps the unresolved answer while a different spelling
+  asked afterwards gets the resolved one. Resolving afresh each time buys
+  equality and loses stability, which is how `register_artifact` can re-derive
+  a root key that no longer matches the one admission stored. Settling it means
+  deciding when a run's destination identities are fixed -- most likely a
+  resolution pass at admission whose results every later question is answered
+  from, rather than a memo inside the function.
+- **52 (filed 2026-08-09; closed 2026-08-12):** Two destinations spelled
+  `out/data.csv` and `out/pending/../data.csv`, where `pending` does not exist
+  yet, got two identities, so both producers were admitted for one file.
+  `resolved_prefix` now cancels a `..` against the component in front of it
+  when the filesystem has answered that that component does not exist, and
+  leaves it as written otherwise. That is the line the earlier attempt was
+  missing: the danger in reducing `a/../b` textually is that `a` may be a
+  symlink, whose `..` goes up from where the link lands rather than from `a`'s
+  parent -- and a name that does not exist is not a symlink. Absence is
+  established with `symlink_metadata`, not inferred from the canonicalize
+  failure, which also covers `EACCES` and `ELOOP` -- cases where a symlink is
+  exactly what may be there. A `..` that cancels the whole tail pops the
+  resolved prefix, which came out of `canonicalize` and so holds no symlinks;
+  at the root the pop is a no-op, as `/..` is for the kernel. No surface rule
+  was needed. Note that the pipeline surface refuses a `..` in an authored
+  path outright (`E-SEC-001`) before the identity is ever asked for, so the
+  fix is what keeps the identity truthful for callers that key paths the
+  traversal check never saw -- the staging registry, the attempt ledger, and
+  the DLQ partitioner.
+- **53 (filed 2026-08-09; the `Link` half was closed 2026-08-12, the
+  `Location` half still needs a maintainer decision):** `Link` and `Location`
+  headers were refused when they carried any byte outside visible ASCII,
+  because `HeaderValue::to_str` refuses those bytes -- not only invalid UTF-8.
+  A server that puts a non-ASCII character in a link's `title`, or in a
+  redirect target, therefore ended the pull and discarded every record already
+  extracted. Reading the header lossily instead was tried and reverted: the
+  lossy string cannot distinguish "a parameter nothing reads lost bytes" from
+  "the target lost bytes", and both attempts at that distinction produced
+  worse failures -- one silently ending pagination as though the server had
+  finished, one refusing well-formed UTF-8 redirects outright. `Link` is now
+  parsed from `HeaderValue::as_bytes` with only the target inside `<...>`
+  decoded, which makes that distinction structural rather than guessed at.
+  `Location` still goes through `to_str`, where the same split buys nothing --
+  the whole value is the target and must be decoded either way. What is left
+  open there is only a classification: a redirect target that is valid UTF-8
+  outside ASCII is refused as an unreadable header rather than reaching URL
+  parsing and being refused as the unresolvable target it is.
+- **54 (filed 2026-08-09, needs a maintainer decision):** When a dispatch
+  failure ends a run, `execute_dag` joins every ingest thread before returning
+  the diagnostic, so no reader or spill handle outlives the run. The comment
+  justifies it by every receiver having been dropped, which frees a source
+  waiting on the pipeline but not one parked in a network read against a
+  server that has sent nothing: that source is waiting on the peer, and the
+  join waits with it. Tripping the run's shutdown token before joining would
+  free it, but the token is what tells the rest of the process a run was
+  cancelled rather than failed, and turning it on inside a failure path
+  changes what several other decisions see. The alternative -- detaching the
+  threads again -- is what the join was introduced to stop. Needs a decision
+  about which of the two the failure path should prefer.
+- **55 (filed 2026-08-12):** `run` in `crates/clinker/src/main.rs` is roughly
+  1,840 lines and interleaves machine-stream emission, lineage sink setup,
+  OTLP worker lifecycle, and publication in one function. Splitting it is the
+  right change and is not attempted here: it is a large mechanical diff across
+  the path every CLI invocation takes, proposed at the end of a branch whose
+  review history shows late restructuring in this area generating its own
+  defects. The split wants its own change with its own review, and the natural
+  seams are the four concerns already listed -- each of which currently shares
+  only local variables with the others.
+- **56 (filed 2026-08-13):** `identity_of` now folds each path component under
+  a probe of that component's own containing directory, which is exact wherever
+  the directory can be probed. Where it cannot -- an unwritable `/` or
+  `/Users`, the common case for a non-root process -- the component falls back
+  to the whole-path verdict, which is the answer the function gave everywhere
+  before, so nothing regresses and the improvement simply does not reach those
+  components. Making it exact there needs a read-only way to ask a directory
+  how it folds names, which no platform exposes; the alternative of defaulting
+  an unprobeable component to "folds nothing" is worse, because it would stop
+  folding `/Users/Foo` on the very volume that folds it. This is a fourth axis
+  of imprecision beside the three already documented on `collision_key`.
+- **57 (filed 2026-08-13, needs a maintainer decision):** `Retry-After` is now
+  honoured on the OTLP export path, but only its delay-seconds spelling. The
+  HTTP-date spelling is read as "stop here": the delivery reports
+  `RetryExhausted` rather than retrying, because guessing a shorter wait is
+  exactly what the field exists to prevent. Reading a date needs calendar
+  arithmetic, which this crate has no dependency for and which the project
+  forbids hand-rolling. So the choice is a date dependency, or the current
+  behaviour of declining to retry a collector that answered in a spelling we
+  cannot read. Nothing is wrong today -- a throttled export is reported, not
+  hurried -- but a collector that only ever answers in dates gets no retries
+  at all.
+- **58 (filed 2026-08-13, needs a maintainer decision):** The two transports
+  disagree about `Io(InvalidData)`. `otlp.rs` treats it as a settled TLS
+  mismatch and does not retry; `rest.rs` deliberately excludes it from its
+  permanent set and calls it `source_unavailable`, retryable, on the stated
+  grounds that the same misconfiguration arrives as a reset on Windows and
+  naming it would give one deployment error two verdicts. Both arguments are
+  sound in isolation and they cannot both be right for the same byte sequence.
+  Related and probably the more useful half: ureq's rustls transport reports a
+  refused handshake as `Io(InvalidData)` rather than `Rustls(_)` -- confirmed
+  empirically by serving a well-formed fatal `handshake_failure` alert -- so
+  `rest.rs`'s `Tls` and `HostNotFound` classifications, and the
+  `source.endpoint.untrusted_tls` code they feed, may rarely fire for the case
+  they were written for.

@@ -422,6 +422,7 @@ fn parse_dotted_path(path: &str) -> Result<(&str, &str), ProvenanceExplainError>
 /// matching `docs/explain/<code>.md`; the section-coverage contract is
 /// enforced by `test_explain_docs_all_have_required_sections`.
 pub const EXPLAIN_PAGES: &[(&str, &str)] = &[
+    ("E010", include_str!("../../../../docs/explain/E010.md")),
     ("E200", include_str!("../../../../docs/explain/E200.md")),
     ("E202", include_str!("../../../../docs/explain/E202.md")),
     ("E203", include_str!("../../../../docs/explain/E203.md")),
@@ -501,6 +502,8 @@ pub const EXPLAIN_PAGES: &[(&str, &str)] = &[
     ("E370", include_str!("../../../../docs/explain/E370.md")),
     ("E371", include_str!("../../../../docs/explain/E371.md")),
     ("E372", include_str!("../../../../docs/explain/E372.md")),
+    ("E373", include_str!("../../../../docs/explain/E373.md")),
+    ("E374", include_str!("../../../../docs/explain/E374.md")),
     ("E323", include_str!("../../../../docs/explain/E323.md")),
     ("E150b", include_str!("../../../../docs/explain/E150b.md")),
     ("E150c", include_str!("../../../../docs/explain/E150c.md")),

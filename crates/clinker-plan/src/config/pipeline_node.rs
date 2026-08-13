@@ -824,10 +824,9 @@ impl PipelineNode {
     /// CXL, in stable configuration order.
     ///
     /// This exhaustive match is the sole structural admission boundary for
-    /// module-root discovery. `fallback_span` is used for the two legacy CXL
-    /// surfaces that are still represented as plain strings (validation
-    /// checks and log conditions); all [`CxlSource`] fields retain their own
-    /// authored span.
+    /// module-root discovery. `fallback_span` is used for the one legacy CXL
+    /// surface still represented as a plain string (validation checks); all
+    /// [`CxlSource`] fields retain their own authored span.
     pub fn visit_cxl_fields(
         &self,
         scope: CxlFieldScope,
@@ -865,9 +864,9 @@ impl PipelineNode {
                     for (index, directive) in directives.iter().enumerate() {
                         if let Some(condition) = &directive.condition {
                             emit(
-                                condition,
+                                &condition.source,
                                 format!("config.log[{index}].condition"),
-                                fallback_span,
+                                condition.span,
                             );
                         }
                     }
@@ -1321,7 +1320,10 @@ pub struct TransformBody {
     /// CXL `$window.*` runtime binding, which is orthogonal.
     #[serde(default)]
     pub analytic_window: Option<AnalyticWindowSpec>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::config::transform::deserialize_log_directives"
+    )]
     pub log: Option<Vec<crate::config::LogDirective>>,
     #[serde(default)]
     pub validations: Option<Vec<crate::config::ValidationEntry>>,

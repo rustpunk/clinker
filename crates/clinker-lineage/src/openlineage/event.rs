@@ -3,7 +3,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::facet::{
-    ColumnLineageDatasetFacet, ErrorMessageRunFacet, PipelineJobFacet, RunStatsFacet,
+    BatchRunFacet, ClinkerFailureRunFacet, ColumnLineageDatasetFacet, DatasetSubsetFacet,
+    ErrorMessageRunFacet, PipelineJobFacet, RunStatsFacet, SemanticPlanJobFacet,
+    SymlinksDatasetFacet,
 };
 
 /// A single OpenLineage run-state event.
@@ -70,17 +72,23 @@ impl Run {
 
 /// The facet bundle attached to a [`Run`].
 ///
-/// `clinker_runStats` is a producer-defined facet carrying whole-run record
-/// counts and timing; `errorMessage` is the standard OpenLineage failure facet,
-/// present only on a `FAIL` event.
+/// `clinker_batch` carries shared immutable batch correlation,
+/// `clinker_runStats` carries whole-run counts and timing, and failures carry
+/// both the standard `errorMessage` and sanitized `clinker_failure` facets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RunFacets {
+    /// Shared immutable caller batch ID for this admitted run.
+    #[serde(rename = "clinker_batch", skip_serializing_if = "Option::is_none")]
+    pub clinker_batch: Option<BatchRunFacet>,
     /// Clinker run-statistics facet (producer-defined).
     #[serde(rename = "clinker_runStats", skip_serializing_if = "Option::is_none")]
     pub run_stats: Option<RunStatsFacet>,
     /// Standard OpenLineage error-message facet, on a `FAIL` event only.
     #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
     pub error_message: Option<ErrorMessageRunFacet>,
+    /// Sanitized stable failure classification, on a `FAIL` event only.
+    #[serde(rename = "clinker_failure", skip_serializing_if = "Option::is_none")]
+    pub clinker_failure: Option<ClinkerFailureRunFacet>,
 }
 
 /// The job (pipeline) a [`Run`] is an execution of.
@@ -105,33 +113,77 @@ impl Job {
             name: name.into(),
             facets: Some(JobFacets {
                 clinker_pipeline: Some(PipelineJobFacet::new(source_hash)),
+                clinker_semantic_plan: None,
             }),
         }
     }
 }
 
 /// The facet bundle attached to a [`Job`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobFacets {
     /// Clinker pipeline-source fingerprint facet (producer-defined).
     #[serde(rename = "clinker_pipeline", skip_serializing_if = "Option::is_none")]
     pub clinker_pipeline: Option<PipelineJobFacet>,
+    /// Effective semantic-plan fingerprint supplied by the shared lifecycle.
+    #[serde(
+        rename = "clinker_semanticPlan",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub clinker_semantic_plan: Option<SemanticPlanJobFacet>,
 }
 
 /// An input or output dataset referenced by a run event.
+///
+/// The spec splits a dataset's facets by where the dataset sits in the event.
+/// `facets` carries facets that describe the dataset itself and are true of it
+/// wherever it appears; `inputFacets` and `outputFacets` carry facets that are
+/// statements about *this run's* read or write of it. The core spec models the
+/// split as two types (`InputDataset` / `OutputDataset`) that each extend one
+/// `Dataset`; one struct with a position-specific bucket per role is the same
+/// shape on the wire, and a dataset only ever occupies one position, so at most
+/// one of the two is ever set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dataset {
     pub namespace: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facets: Option<DatasetFacets>,
+    #[serde(rename = "inputFacets", skip_serializing_if = "Option::is_none")]
+    pub input_facets: Option<InputDatasetFacets>,
+    #[serde(rename = "outputFacets", skip_serializing_if = "Option::is_none")]
+    pub output_facets: Option<OutputDatasetFacets>,
 }
 
-/// The facet bundle attached to a [`Dataset`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The facet bundle attached to a [`Dataset`] itself, in either position.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatasetFacets {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symlinks: Option<SymlinksDatasetFacet>,
     #[serde(rename = "columnLineage", skip_serializing_if = "Option::is_none")]
     pub column_lineage: Option<ColumnLineageDatasetFacet>,
+}
+
+/// The facet bundle describing this run's read of an input [`Dataset`].
+///
+/// The subset facet names the concrete members the run actually consumed, which
+/// is a fact about the read and not about the collection, so its schema type is
+/// `InputSubsetInputDatasetFacet` — an `InputDatasetFacet`, admissible here and
+/// nowhere else.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputDatasetFacets {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subset: Option<DatasetSubsetFacet>,
+}
+
+/// The facet bundle describing this run's write of an output [`Dataset`].
+///
+/// Mirrors [`InputDatasetFacets`] for the output position: the subset facet here
+/// is an `OutputSubsetOutputDatasetFacet`, i.e. an `OutputDatasetFacet`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputDatasetFacets {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subset: Option<DatasetSubsetFacet>,
 }
 
 #[cfg(test)]
@@ -192,13 +244,18 @@ mod tests {
                 namespace: "file".to_string(),
                 name: "/data/orders.csv".to_string(),
                 facets: None,
+                input_facets: None,
+                output_facets: None,
             }],
             outputs: vec![Dataset {
                 namespace: "file".to_string(),
                 name: "/out/summary.csv".to_string(),
                 facets: Some(DatasetFacets {
                     column_lineage: Some(facet),
+                    ..DatasetFacets::default()
                 }),
+                input_facets: None,
+                output_facets: None,
             }],
         }
     }
@@ -285,6 +342,7 @@ mod tests {
                 schema_url: CLINKER_PIPELINE_FACET_SCHEMA_URL.to_string(),
                 source_hash: "deadbeef".to_string(),
             }),
+            ..JobFacets::default()
         });
         let v = serde_json::to_value(&event).unwrap();
         let facet = &v["job"]["facets"]["clinker_pipeline"];
@@ -304,6 +362,7 @@ mod tests {
         event.run.facets = Some(RunFacets {
             run_stats: Some(RunStatsFacet::new(100, 97, 3, 1234)),
             error_message: Some(ErrorMessageRunFacet::new("source read failed")),
+            ..RunFacets::default()
         });
         let v = serde_json::to_value(&event).unwrap();
         // Run facets nest under `run.facets` with the spec-cased keys.

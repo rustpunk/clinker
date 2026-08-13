@@ -30,7 +30,9 @@ use super::containment::{
     AnchoredDirectory, ContainedEntryKind, ContainmentError, OutputContainment,
     PromotionDisposition,
 };
-use super::staging::{AttemptCommitStage, OutputStagingRegistry, PublicationOutcome};
+use super::staging::{
+    AttemptCommitStage, CommittedVisibility, OutputStagingRegistry, PublicationOutcome,
+};
 use crate::pipeline::shutdown::ShutdownToken;
 
 const MANIFEST_SCHEMA: &str = "clinker.attempt-manifest/v1";
@@ -491,6 +493,38 @@ impl AttemptPublicationOutcome {
     }
 }
 
+/// Publication error paired with the exact path-free visibility observed at
+/// the failure boundary.
+#[derive(Debug)]
+pub struct AttemptPublicationFailure {
+    source: Box<AttemptError>,
+    outcome: AttemptPublicationOutcome,
+}
+
+impl AttemptPublicationFailure {
+    /// Underlying publication failure.
+    pub fn source_error(&self) -> &AttemptError {
+        self.source.as_ref()
+    }
+
+    /// Per-artifact visibility after the failed publication attempt.
+    pub fn outcome(&self) -> &AttemptPublicationOutcome {
+        &self.outcome
+    }
+}
+
+impl std::fmt::Display for AttemptPublicationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for AttemptPublicationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Explicit capability token for callers that sanitize physical paths before
 /// rendering them outside trusted diagnostics.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -894,8 +928,15 @@ pub enum AttemptFault {
     Digest,
     ManifestReplace,
     PromotionInterrupted,
+    PromotionInterruptedAfterFirst,
     BeforeRename,
     DirectorySync,
+    /// First artifact becomes visible without its parent-directory
+    /// synchronization, then the terminal manifest write fails.
+    DirectorySyncThenManifestReplace,
+    /// First artifact publishes but leaks its staged file, then promotion of
+    /// the second artifact is interrupted.
+    CleanupThenPromotionInterrupted,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -3936,7 +3977,7 @@ impl RunAttemptPublication {
         &self,
         registry: &OutputStagingRegistry,
         shutdown: &ShutdownToken,
-    ) -> Result<Option<AttemptPublicationOutcome>, AttemptError> {
+    ) -> Result<Option<AttemptPublicationOutcome>, AttemptPublicationFailure> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4102,9 +4143,11 @@ impl AttemptPublication {
         let mut claims = BTreeMap::new();
         let mut destination_roots = BTreeMap::new();
         for registration in &registrations {
-            let destination_key = clinker_plan::config::collision_key(
-                &registration.destination.as_path().to_string_lossy(),
-            );
+            // The same identity the destination roots below are keyed on, so
+            // two registrations naming one file through different spellings
+            // are one claim rather than two admitted side by side.
+            let destination_key =
+                clinker_plan::config::destination_identity(registration.destination.as_path());
             if let Some(first) =
                 claims.insert(destination_key, registration.producer_label.as_str())
             {
@@ -4865,7 +4908,15 @@ impl AttemptPublication {
                 artifact.state = ArtifactState::Promoting;
                 self.persist_replacement(intent, false)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
-                if fault == Some(AttemptFault::PromotionInterrupted) {
+                if fault == Some(AttemptFault::PromotionInterrupted)
+                    || (matches!(
+                        fault,
+                        Some(
+                            AttemptFault::PromotionInterruptedAfterFirst
+                                | AttemptFault::CleanupThenPromotionInterrupted
+                        )
+                    ) && index == 1)
+                {
                     return Err(std::io::Error::other(
                         "injected interruption after durable promotion intent",
                     ));
@@ -4884,8 +4935,11 @@ impl AttemptPublication {
             Some(AttemptFault::BeforeRename) => {
                 registry.commit_all_inner(Some(0), None, None, Some(&mut barrier))
             }
-            Some(AttemptFault::DirectorySync) => {
+            Some(AttemptFault::DirectorySync | AttemptFault::DirectorySyncThenManifestReplace) => {
                 registry.commit_all_inner(None, Some(0), None, Some(&mut barrier))
+            }
+            Some(AttemptFault::CleanupThenPromotionInterrupted) => {
+                registry.commit_all_inner(None, None, Some(0), Some(&mut barrier))
             }
             _ => registry.commit_all_with_stage_control(&mut barrier),
         };
@@ -4894,6 +4948,24 @@ impl AttemptPublication {
             Err(error) => {
                 let mut incomplete = self.manifest.clone();
                 incomplete.state = AttemptState::Incomplete;
+                for (manifest, runtime) in
+                    incomplete.artifacts.iter_mut().zip(self.artifacts.iter())
+                {
+                    // A committed ledger entry is definitive, and a rename that
+                    // outlived its parent-directory synchronization is visible
+                    // without being durable. Otherwise retain durable promotion
+                    // intent so a fresh handle-relative query can reconcile
+                    // whether the rename became visible.
+                    match registry.committed_visibility(&runtime.final_path) {
+                        Some(CommittedVisibility::Published) => {
+                            manifest.state = ArtifactState::Published;
+                        }
+                        Some(CommittedVisibility::VisibleUnsynchronized) => {
+                            manifest.state = ArtifactState::VisibleUnsynchronized;
+                        }
+                        None => {}
+                    }
+                }
                 self.persist_replacement(incomplete, false)?;
                 self.terminal = true;
                 return Err(error.into());
@@ -4925,7 +4997,10 @@ impl AttemptPublication {
                 }
             }
         }
-        self.persist_replacement(finished, false)?;
+        self.persist_replacement(
+            finished,
+            fault == Some(AttemptFault::DirectorySyncThenManifestReplace),
+        )?;
         self.terminal = true;
         if outcome.is_complete() {
             for artifact_id in artifact_ids {
@@ -4958,15 +5033,45 @@ impl AttemptPublication {
     ///
     /// # Errors
     ///
-    /// Returns [`AttemptError`] for invalid transitions, manifest persistence,
-    /// containment, or publication failures.
+    /// Returns [`AttemptPublicationFailure`] for invalid transitions, manifest
+    /// persistence, containment, or publication failures. The failure always
+    /// includes the exact path-free visibility observed at the boundary.
     pub fn publish_run(
         &mut self,
         registry: &OutputStagingRegistry,
         shutdown: &ShutdownToken,
-    ) -> Result<Option<AttemptPublicationOutcome>, AttemptError> {
-        let Some(outcome) = self.publish(registry, shutdown)? else {
-            return Ok(None);
+    ) -> Result<Option<AttemptPublicationOutcome>, AttemptPublicationFailure> {
+        let outcome = match self.publish(registry, shutdown) {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => return Ok(None),
+            Err(source) => {
+                let artifacts = self
+                    .artifacts
+                    .iter()
+                    .map(|runtime| ArtifactPublicationResult {
+                        artifact_id: runtime.artifact_id.clone(),
+                        kind: runtime.kind,
+                        logical_leaf: runtime.logical_leaf.clone(),
+                        state: match registry.committed_visibility(&runtime.final_path) {
+                            Some(CommittedVisibility::Published) => ArtifactState::Published,
+                            Some(CommittedVisibility::VisibleUnsynchronized) => {
+                                ArtifactState::VisibleUnsynchronized
+                            }
+                            None => ArtifactState::Unpublished,
+                        },
+                    })
+                    .collect();
+                return Err(AttemptPublicationFailure {
+                    source: Box::new(source),
+                    outcome: AttemptPublicationOutcome::Incomplete {
+                        execution_id: self.execution_id.clone(),
+                        artifacts,
+                        // Promotions that already leaked a staged file owe
+                        // reclamation whether or not publication finished.
+                        cleanup_debt_count: registry.recorded_cleanup_debt_count(),
+                    },
+                });
+            }
         };
         let cleanup_debt_count = outcome.cleanup_debt().len();
         let artifacts = self
@@ -5317,16 +5422,13 @@ fn destination_leaf(destination: &ValidatedPath) -> Result<String, AttemptError>
         ))
 }
 
+/// A stable key for a destination root.
+///
+/// Through the shared destination identity, so a root and an output
+/// destination inside it are reduced the same way: one physical location has
+/// one key wherever it is asked about.
 fn destination_root_key(path: &Path) -> String {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|current| current.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-    };
-    let normalized = absolute.canonicalize().unwrap_or(absolute);
-    clinker_plan::config::collision_key(&normalized.to_string_lossy())
+    clinker_plan::config::destination_identity(path)
 }
 
 fn persist_manifest_in_root(
@@ -5516,4 +5618,50 @@ fn validate_bounded_text(
         return Err(AttemptError::InvalidManifest(message));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod destination_root_key_tests {
+    use super::destination_root_key;
+
+    /// One directory has one key, however the path reached it and whether or
+    /// not it exists yet. The key decides whether two roots are the same root,
+    /// so a second spelling becomes a second root that tries to create the
+    /// attempt directory a second time, and a key that changes once the
+    /// directory appears stops matching the root it was registered under.
+    ///
+    /// The same identity answers for an output destination, so a root and a
+    /// file inside it cannot disagree about which physical location they mean.
+    #[test]
+    fn one_directory_has_one_key() {
+        let root = tempfile::tempdir().expect("temporary destination");
+        let direct = root.path().join("out");
+        let indirect = root.path().join(".").join("out");
+        let roundabout = root.path().join("out").join("..").join("out");
+
+        assert_eq!(
+            destination_root_key(&indirect),
+            destination_root_key(&direct),
+            "a `.` component names the same directory whether or not it exists"
+        );
+        // `..` over a component that does not exist yet is deliberately left
+        // to the platform: on a system where a name can become a symlink,
+        // cancelling it in the text would name a different file than the one
+        // that gets opened, while Win32 reduces it before the filesystem sees
+        // it at all. Either answer is correct there, so nothing is asserted
+        // about it until the path exists and one answer is available.
+
+        std::fs::create_dir(&direct).expect("create the destination");
+        for (name, path) in [
+            ("direct", &direct),
+            ("indirect", &indirect),
+            ("roundabout", &roundabout),
+        ] {
+            assert_eq!(
+                destination_root_key(path),
+                destination_root_key(&direct),
+                "{name} names it once the filesystem can answer"
+            );
+        }
+    }
 }

@@ -113,10 +113,27 @@ downgrades, malformed or conflicting `rel="next"` metadata, redirect or
 continuation cycles, and traversal beyond the configured bounds fail before a
 foreign or repeated request is sent.
 
+Normalization resolves `.` and `..` exactly as RFC 3986 does, and changes
+nothing else about the path. An empty segment is a segment: `/v1//items/../p`
+names `/v1//p`, not `/v1/p`, because a doubled slash is a different resource on
+any server that does not collapse it. A path ending in `..` resolves to the
+directory above, trailing slash included. Two targets that differ only in an
+empty segment therefore stay two pages, and a pull that visits both is not a
+continuation cycle.
+
 `Link` continuation metadata is parsed and authorized only when
 `pagination.strategy` is `link_header`. Other strategies ignore it because
 their continuation authority comes from the configured offset, cursor, or
 single-request contract.
+
+A `Link` header is read as bytes, so a parameter this reader never consults —
+a `title` or a `type` carrying an accented character, an emoji, or anything
+else outside ASCII — does not affect the pull. Only the target inside `<…>` is
+decoded, because only the target has to become a URL: a target that is not
+valid UTF-8 is reported as malformed metadata. When a header carries several
+comma-separated links and one of them cannot be parsed, the rest are still
+read, so a reply naming two different next pages is reported as the conflict
+it is rather than as unreadable metadata.
 
 ### Authentication
 
@@ -166,8 +183,15 @@ proxy or vendor error therefore remains actionable without copying credentials
 or signed query parameters into logs.
 
 A retryable body-delivery failure discards the partial body and retries the
-whole page within the same bounded retry budget. Body-size violations,
-protocol errors, and TLS failures remain fatal.
+whole page within the same bounded retry budget. What counts as retryable is
+one rule for the whole request, whichever phase observed the failure: a
+dropped, reset, or timed-out exchange is retried, and a failure that would
+arrive identically on every attempt is not. Body-size violations, TLS
+failures, an unroutable URL, a host that does not resolve, and local material
+this process cannot read are therefore fatal at once rather than retried —
+reported against attempt 1, and without spending `timeout_secs` once per
+remaining attempt on a condition that cannot change. `retries` is a ceiling on
+attempts worth making, not a number of attempts every failure receives.
 
 A partial-page decode failure routes that page's offending rows to the
 DLQ per-row, exactly like a file source; it does not abort the pull.
@@ -178,3 +202,11 @@ On `SIGINT`/`SIGTERM` the reader polls its cancellation handle at each
 page boundary and stops cleanly with a normal end-of-input — the same
 graceful drain a file source performs. The `timeout_secs` per-request
 bound caps how long a single in-flight request can delay that stop.
+
+A request already in flight when the signal arrives is reported as a
+cancellation too, not as a failing endpoint — including a page whose body was
+being read when the connection dropped, which the reader would otherwise have
+retried. What the signal took away was that retry, so the run's outcome is the
+cancellation. An endpoint that would have failed identically however many
+attempts remained is still reported as that endpoint failure, because no
+retry was lost: a supervisor re-queuing the batch would only repeat it.

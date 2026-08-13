@@ -59,6 +59,14 @@ impl ShutdownToken {
     }
 
     /// Check whether shutdown has been requested on this token.
+    ///
+    /// A single load and no write. Every operator chunk boundary on every
+    /// worker thread polls this, and all clones share one cache line, so a
+    /// read-modify-write here would turn a read-only predicate into
+    /// cross-core coherence traffic in the engine's hottest poll. Run
+    /// liveness is reported on the progress worker's own clock and is never
+    /// derived from how often this predicate is called — a run wedged inside
+    /// one long operation polls nothing and is still alive.
     pub fn is_requested(&self) -> bool {
         self.state.load(Ordering::SeqCst) == CANCELLED
     }
@@ -93,33 +101,43 @@ fn register(state: &Arc<AtomicU8>) {
     guard.push(Arc::downgrade(state));
 }
 
-/// Install the SIGINT + SIGTERM handler. Safe to call multiple times — only
-/// the first call wins. The handler walks the live-token registry and trips
-/// every flag.
+#[cfg(not(target_arch = "wasm32"))]
+fn cached_signal_handler_installation(
+    cache: &OnceLock<Result<(), String>>,
+    install: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    cache.get_or_init(install).clone()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn install_process_signal_handler() -> Result<(), String> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CLINKER_TEST_SIGNAL_HANDLER_FAILURE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        return Err("injected signal-handler installation failure".to_owned());
+    }
+
+    // ctrlc with "termination" feature handles both SIGINT and SIGTERM.
+    ctrlc::set_handler(move || {
+        let guard = registry().lock().expect("shutdown registry poisoned");
+        for weak in guard.iter() {
+            if let Some(state) = weak.upgrade() {
+                let _ =
+                    state.compare_exchange(ACTIVE, CANCELLED, Ordering::SeqCst, Ordering::SeqCst);
+            }
+        }
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// Install the SIGINT + SIGTERM handler. Safe to call multiple times: every
+/// caller observes the complete result of the first installation attempt.
+/// The handler walks the live-token registry and trips every flag.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn install_signal_handler() -> Result<(), String> {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    let mut result = Ok(());
-    INIT.call_once(|| {
-        // ctrlc with "termination" feature handles both SIGINT and SIGTERM.
-        if let Err(e) = ctrlc::set_handler(move || {
-            let guard = registry().lock().expect("shutdown registry poisoned");
-            for weak in guard.iter() {
-                if let Some(state) = weak.upgrade() {
-                    let _ = state.compare_exchange(
-                        ACTIVE,
-                        CANCELLED,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    );
-                }
-            }
-        }) {
-            result = Err(e.to_string());
-        }
-    });
-    result
+    static INSTALLATION: OnceLock<Result<(), String>> = OnceLock::new();
+    cached_signal_handler_installation(&INSTALLATION, install_process_signal_handler)
 }
 
 /// No-op on wasm32: the web build has no process to signal, so there is no
@@ -128,6 +146,32 @@ pub fn install_signal_handler() -> Result<(), String> {
 #[cfg(target_arch = "wasm32")]
 pub fn install_signal_handler() -> Result<(), String> {
     Ok(())
+}
+
+/// Send SIGTERM to a live direct child owned by the caller.
+///
+/// This helper exists only for Linux test-support consumers. It deliberately
+/// accepts a [`std::process::Child`] rather than a raw PID so callers cannot
+/// use it for process groups, descendants, or unrelated processes.
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
+pub fn request_direct_child_sigterm(child: &mut std::process::Child) -> std::io::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "direct child exited before SIGTERM",
+        ));
+    }
+    let pid = i32::try_from(child.id()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "direct child PID does not fit the platform pid type",
+        )
+    })?;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .map_err(std::io::Error::from)
 }
 
 #[cfg(test)]
@@ -171,6 +215,42 @@ mod tests {
         publishing.request();
         assert!(!publishing.is_requested());
         assert!(publishing.try_begin_publication());
+    }
+
+    #[test]
+    fn polling_the_predicate_never_moves_the_state_machine() {
+        let token = ShutdownToken::detached();
+        for _ in 0..64 {
+            assert!(!token.is_requested());
+        }
+        assert!(token.try_begin_publication());
+        for _ in 0..64 {
+            assert!(!token.is_requested());
+        }
+        token.request();
+        assert!(!token.is_requested());
+        assert!(token.try_begin_publication());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn failed_signal_installation_is_cached_for_every_caller() {
+        use std::sync::atomic::AtomicUsize;
+
+        let cache = OnceLock::new();
+        let attempts = AtomicUsize::new(0);
+        let first = cached_signal_handler_installation(&cache, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err("original installation failure".to_owned())
+        });
+        let second = cached_signal_handler_installation(&cache, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        assert_eq!(first, Err("original installation failure".to_owned()));
+        assert_eq!(second, first);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]

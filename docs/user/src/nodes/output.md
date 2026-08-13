@@ -84,6 +84,13 @@ period and only when the lock is acquirable, proving that no live publisher owns
 it. If reservation cleanup fails after successful publication, Clinker exits
 `4` and names both the visible final and stale reservation as cleanup debt.
 
+When `unique_suffix` can find no name at all because the destination itself
+refuses every candidate — the directory is not writable by this run — the
+diagnostic names the path you wrote, not the numbered candidate the search
+happened to stop on, and says that the destination rather than the name is what
+refused. Fix the directory's permissions, or point `path:` somewhere this run
+may write.
+
 Rendered fan-out paths are validated as new output paths. Directory traversal,
 an absolute result produced from a relative template, symbolic-link/reparse
 ancestors, and cross-filesystem promotion fail before a final is touched. Create
@@ -106,6 +113,50 @@ unrendered base template. Main outputs and sidecars share the same publication
 ledger, so a path collision between any two of them fails before publication
 and names both producers. Counters that are not known at sidecar-preparation
 time are omitted from the JSON rather than written as misleading zeroes.
+
+## When two paths are the same destination
+
+Two Output nodes — or an Output node and a DLQ path — that resolve to one file
+are rejected at plan time with `E322`, before any record is read. Deciding that
+means deciding when two differently-spelled paths name one file, and that
+depends on the volume you are writing to, not on the text. Clinker measures the
+volume rather than guessing from its type, by creating and removing a probe file
+in the destination directory.
+
+Two paths are the same destination when they differ only in:
+
+- **`.` components, or relative versus absolute spelling.** `./out/errors.csv`
+  and `/data/out/errors.csv` from `/data` are one file everywhere.
+- **A symlinked parent directory.** The existing part of each path is resolved,
+  so a link and its target are one place.
+- **Letter case — only on a volume that ignores case.** The default macOS
+  (APFS) and Windows (NTFS) volumes do; ext4, xfs, and btrfs do not. Where it
+  applies, it covers the whole of Unicode, not just ASCII: `Ärger.csv` and
+  `ärger.csv` are one file, as are `Σ.csv` and `σ.csv`. `straße.csv` and
+  `strasse.csv` are always **two** files — no filesystem treats them as one.
+- **Unicode normal form — only on a volume that ignores it.** APFS and HFS+ do,
+  in both their case-sensitive and case-insensitive variants; ext4 and NTFS do
+  not. Where it applies, `café.csv` written with a precomposed `é` and the same
+  name written as `e` plus a combining accent are one file. This is independent
+  of the case rule: a case-*sensitive* APFS volume ignores normal form while
+  still telling `Café.csv` and `café.csv` apart.
+
+Because the last two depend on the volume, the same pipeline can be accepted on
+Linux and rejected on macOS. That is not an inconsistency — the two disks really
+do behave differently, and the rejection is the one that prevented a file from
+being written twice.
+
+Two limits are worth knowing:
+
+- Clinker may report a collision on a volume that would in fact have kept the
+  two files apart — for instance on an older Windows volume whose case table
+  predates a character you used. The run stops with both paths named, and
+  renaming either one clears it.
+- The reverse is possible on Windows, which folds some letters according to
+  Turkish and Azeri rules that no locale-independent table reproduces. `İ.csv`
+  and `i.csv` may be one file on such a volume while Clinker still sees two. If
+  you write output paths that differ only in dotted or dotless `I`, give them
+  distinct names.
 
 ## Direct broadcast to several outputs
 

@@ -449,6 +449,10 @@ fn recurse_into_body(
     // `(Some(body_id), edge_id)` — the same key the forward-pass
     // body walker used when it tee'd cross-region inputs.
     ctx.window_runtime.active_stack.push(body_id);
+    // The commit pass re-enters the body the forward pass already walked, so a
+    // span or event it produces has to name the same call site that pass named.
+    ctx.composition_call_sites
+        .push(parent_dag.graph[composition_idx].name().to_string());
 
     // Body-scoped detect + recompute: detect against the body's
     // own DAG so the producer/region walk uses body-local
@@ -574,6 +578,7 @@ fn recurse_into_body(
     // through `top` again, mirroring the forward-pass body executor's
     // exit ordering.
     ctx.window_runtime.active_stack.pop();
+    ctx.composition_call_sites.pop();
     ctx.window_runtime.remove_body_scope(bound_body.body_scope);
     ctx.current_body_node_input_refs = saved_body_refs;
     ctx.source_records = saved_combine;

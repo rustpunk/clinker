@@ -193,6 +193,7 @@ failure_registry! {
     "admission.configuration.policy_required", Configuration, PolicyRequired, "deployment policy is required before execution";
     "infrastructure.runtime.transient", Infrastructure, RetryWithBackoff, "temporary runtime infrastructure failure";
     "infrastructure.runtime.source_unavailable", Infrastructure, RetryWithBackoff, "source infrastructure is temporarily unavailable";
+    "infrastructure.delivery.unreportable_outcome", Infrastructure, PolicyRequired, "run outcome could not be reported after publication";
     "attempt.publication.registration_failed", Publication, PolicyRequired, "attempt artifact registration failed";
     "attempt.publication.finalization_failed", Publication, RetryWithBackoff, "attempt artifact finalization failed";
     "attempt.publication.manifest_failed", Publication, RetryWithBackoff, "attempt manifest persistence failed";
@@ -207,6 +208,16 @@ failure_registry! {
     "observability.configuration.policy_required", Observability, PolicyRequired, "observability policy is required";
     "observability.delivery.failed", Observability, RetryWithBackoff, "observability delivery failed";
     "observability.delivery.rejected", Observability, PolicyRequired, "observability delivery was rejected";
+    "source.data.invalid", SourceProtocol, DoNotRetry, "source data does not satisfy the admitted plan";
+    "rest.http.client_error", SourceProtocol, DoNotRetry, "REST source request was rejected";
+    "source.endpoint.untrusted_tls", SourceProtocol, PolicyRequired, "source endpoint did not present a trusted TLS identity";
+    "source.endpoint.unresolvable", SourceProtocol, PolicyRequired, "source endpoint host could not be resolved";
+    "source.endpoint.unreadable_material", SourceProtocol, PolicyRequired, "source endpoint material could not be read from local storage";
+    "runtime.resource.memory_budget_exceeded", Infrastructure, PolicyRequired, "runtime memory budget was exceeded";
+    "admission.configuration.memory_budget_unsatisfiable", Configuration, DoNotRetry, "configured memory budget is below the runtime baseline";
+    "runtime.resource.spill_failed", Infrastructure, RetryWithBackoff, "runtime spill storage failed";
+    "runtime.resource.spill_cap_exceeded", Infrastructure, PolicyRequired, "configured spill budget was exceeded";
+    "rest.protocol.page_body_limit_reached", SourceProtocol, PolicyRequired, "REST response exceeded the fixed page body limit";
 }
 
 fn registry_entry(code: &str) -> Option<&'static RegistryEntry> {

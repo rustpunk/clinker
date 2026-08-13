@@ -852,6 +852,8 @@ mod port_tag_guard_tests {
         let body = crate::plan::composition_body::BoundBody {
             body_scope: body_id.into(),
             signature_path: std::path::PathBuf::from("compositions/test.comp.yaml"),
+            semantic_name: "test".to_string(),
+            semantic_digest: [0; 32],
             graph: body_graph,
             topo_order: Vec::new(),
             name_to_idx: HashMap::new(),

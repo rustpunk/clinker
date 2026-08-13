@@ -143,7 +143,8 @@ A `batch_size` of `0` is rejected at config load (a zero-event batch never flush
 
 ## Log directives
 
-Log directives control diagnostic output during transform execution:
+Log directives declare bounded structured diagnostic events during transform
+execution:
 
 ```yaml
 - type: transform
@@ -154,14 +155,18 @@ Log directives control diagnostic output during transform execution:
       emit id = id
       emit result = compute(value)
     log:
-      - level: info
+      - name: transform.record_processed
+        level: info
         when: per_record
         every: 1000
         message: "Processed record"
-      - level: warn
+        fields: [id]
+      - name: transform.record_failed
+        level: warn
         when: on_error
         message: "Record failed processing"
-      - level: debug
+      - name: transform.started
+        level: debug
         when: before_transform
         message: "Starting transform"
 ```
@@ -170,13 +175,123 @@ Log directives control diagnostic output during transform execution:
 
 | Field | Required | Description |
 |-------|----------|-------------|
+| `name` | Yes | Stable event name: a bounded dotted identifier using ASCII letters, digits, or underscores |
 | `level` | Yes | `trace`, `debug`, `info`, `warn`, or `error` |
 | `when` | Yes | `before_transform`, `after_transform`, `per_record`, or `on_error` |
-| `message` | Yes | Log message text |
-| `every` | No | Only log every N records (for `per_record` timing) |
-| `condition` | No | CXL boolean expression -- only log when true |
-| `fields` | No | List of field names to include in the log output |
-| `log_rule` | No | Reference to an external log rule definition |
+| `message` | Yes | Static event message, at most 1024 UTF-8 bytes. Interpolation is rejected; request record values with `fields` instead |
+| `every` | For `per_record` | Positive record interval. It is required for every `per_record` event, including explicit `every: 1`, and rejected for other timings |
+| `fields` | No | Up to 256 unique record field names requested as structured attributes. Available only for `per_record` and `on_error` events |
+| `condition` | No | CXL boolean expression; the event fires only for records where it is true. Available only for `when: per_record`, and at most 512 UTF-8 bytes |
+
+A transform may declare at most 32 events and request at most 256 fields in
+aggregate across them. Event names and field selectors use the same grammar as
+deployment field policy: dot-separated segments beginning with an ASCII letter
+or underscore, followed by ASCII letters, digits, or underscores.
+
+`fields` is the only channel by which record data reaches an event — `message`
+is static text. A selector naming a field the incoming record does not carry
+contributes nothing, so a directive whose selectors all miss would publish an
+event with no attributes at all, which reads exactly like a run whose records
+were empty.
+
+Clinker refuses that when the pipeline compiles (E374). The rejection names the
+selector, lists the columns the input row does carry, and — when your spelling
+is close to one of them — gives you the corrected `fields:` line to paste:
+
+```
+[E374] transform `enrich` log[0].fields requests `orderId`, which the input
+record does not carry; the upstream row has `order_id`, `amount`, `region` —
+write `fields: [order_id]`
+```
+
+Selectors bind against the transform's **input** row, for `per_record` and
+`on_error` alike: dispatch fires before this transform's own `cxl:` block, so a
+column the transform produces cannot be requested. Request the columns it reads
+instead.
+
+The check decides what the declared schema can decide. A column that reaches
+the transform through an open composition port is not visible to it, and a
+selector naming one of those is still checked only at run time — counted in the
+run's admission accounting under the missing-field total.
+
+### One event name, one set of fields
+
+An event name is the identity a collector groups records by, and it carries no
+node identity of its own. Two transforms may emit the same event — that is how
+one thing that happens in several places is reported as one thing — but they
+have to declare the same `fields`, or the collector receives two record shapes
+under one name and nothing downstream can separate them.
+
+Clinker checks this across the whole pipeline, composition bodies included, and
+refuses a disagreement with E375:
+
+```
+[E375] transform "shape" in composition "customer_enrichment": `log` event
+"transform.customer_seen" is also declared by transform "seen" with different
+fields; one event name carries one set of fields — give both declarations the
+same `fields`, or give one of them its own event name
+```
+
+A composition used twice is not a conflict: both instances declare the same
+event with the same fields, and agreement is what the rule asks for.
+
+### Logging only the records you care about
+
+`every` thins a per-record event by count. `condition` selects it by content —
+use it when the interesting records are rare and you want all of them rather
+than every thousandth record:
+
+```yaml
+    log:
+      - name: transform.large_order
+        level: info
+        when: per_record
+        every: 1
+        condition: "amount > 1000"
+        message: "large order"
+        fields: [order_id, amount]
+```
+
+The two compose: `every` is applied first, then `condition`, so `every: 100`
+with a condition logs every hundredth record *that also matches*.
+
+A condition is CXL, checked when the pipeline compiles. It must resolve to a
+boolean, and it is evaluated against the transform's **input** record — the one
+that arrived, before this transform's own `cxl:` block runs. A field the
+transform only produces is therefore not in scope; write the condition in terms
+of the fields the transform reads.
+
+A condition decides only *whether* an event fires. It cannot add anything to
+one: the values that leave the process are still exactly the `fields` you
+requested, each still subject to deployment policy. Narrowing a condition can
+never widen what is exported.
+
+Transform declarations name events, request fields, and may gate a per-record
+event on its own input; they do not choose a destination, credentials, routing,
+redaction, or sampling policy. Each requested event-field pair is denied unless
+deployment observability policy explicitly allows, hashes, or replaces it.
+Telemetry delivery is bounded and best effort and cannot change transform
+results or published output — including a condition that fails to evaluate,
+which drops its event rather than failing the run.
+
+Every transform event also carries the fixed correlation fields
+`execution_id`, `batch_id`, and `pipeline_name`. Unlike requested record
+fields, these are **not** default-deny and are **not** gated by
+`field_policy`: they are engine-supplied identity that never derives from a
+source, and they are what makes an exported event joinable to the machine
+stream and to the lineage events. A deployment that allows an event without
+also writing three correlation rules still gets telemetry it can correlate.
+
+Because they are exported verbatim, choose a `--batch-id` that is safe to send
+to your collector — an identifier, not a tenant name or anything else you
+would not want retained there. A `field_policy` rule naming one of these three
+fields does not redact it. Source paths, records, secrets, and raw error text
+are never implicit attributes.
+
+The former `log_rule` directive key and pipeline-level `log_rules` block are
+rejected. Move event identity and safe field requests into the transform's
+`log:` entries as shown above; keep routing, privacy, credentials, and sampling
+in deployment policy.
 
 ## Complete example
 
@@ -216,8 +331,10 @@ Log directives control diagnostic output during transform execution:
         severity: warn
         message: "Salary should be positive"
     log:
-      - level: info
+      - name: transform.employee_processed
+        level: info
         when: per_record
         every: 5000
         message: "Processing employees"
+        fields: [employee_id]
 ```

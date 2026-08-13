@@ -63,7 +63,9 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [features]
-test-utils = []
+# `nix/signal` serves one Linux test-support helper. Enabling it here rather
+# than unconditionally keeps a test capability out of the shipped runtime.
+test-utils = ["nix/signal"]
 bench-alloc = ["dep:clinker-bench-support", "clinker-bench-support/bench-alloc"]
 
 [dev-dependencies]

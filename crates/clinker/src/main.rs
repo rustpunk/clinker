@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use clinker_core_types::FailureClassification;
 use serde::Serialize;
 
 use clinker_exec::executor::PipelineExecutor;
@@ -9,7 +10,16 @@ use clinker_exec::metrics::{self, ExecutionMetrics};
 use clinker_plan::config::utils::parse_memory_limit_bytes_strict;
 use clinker_plan::error::PipelineError;
 
+mod lifecycle;
+mod machine;
+mod observability;
 mod refactor;
+
+use lifecycle::{
+    LifecycleFactsError, RunCorrelationIdentity, RunCountFacts, RunLifecycleFacts,
+    RunLifecycleSnapshot, RunLifecycleStartFacts, RunTerminalOutcome,
+};
+use machine::MachineEmitter;
 
 /// Bounded-memory batch ETL engine for CXL pipelines.
 #[derive(Parser, Debug)]
@@ -483,6 +493,13 @@ pub enum ExplainFormat {
     Dot,
 }
 
+/// Versioned machine-readable run protocol.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum MachineFormat {
+    /// Compact UTF-8 NDJSON using `clinker.run` schema version 1.
+    NdjsonV1,
+}
+
 /// Arguments for `clinker run`.
 #[derive(Parser, Debug)]
 pub struct RunArgs {
@@ -505,6 +522,11 @@ pub struct RunArgs {
     #[arg(long, help_heading = "Execution")]
     pub batch_id: Option<String>,
 
+    /// Emit one ordered machine lifecycle on stdout. Consumers must reject
+    /// unsupported major schema versions; schema-1 additions are compatible.
+    #[arg(long, value_enum, help_heading = "Output")]
+    pub machine: Option<MachineFormat>,
+
     /// Print execution plan and exit (no data read).
     /// Optionally specify format: text (default), json, dot.
     #[arg(
@@ -516,9 +538,10 @@ pub struct RunArgs {
     )]
     pub explain: Option<ExplainFormat>,
 
-    /// Build column lineage and write OpenLineage NDJSON, then exit (no data
-    /// read). Give a file path, or `-` for stdout. A plan-only export, so it
-    /// cannot be combined with --explain, --dry-run, or -n.
+    /// Preflight the workspace lineage identity policy, build column lineage,
+    /// and write OpenLineage NDJSON, then exit (no data read). Give a file path,
+    /// or `-` for stdout. A plan-only export, so it cannot be combined with
+    /// --explain, --dry-run, or -n.
     #[arg(
         long,
         value_name = "PATH",
@@ -527,14 +550,14 @@ pub struct RunArgs {
     )]
     pub lineage: Option<PathBuf>,
 
-    /// Run the pipeline and emit live OpenLineage run events (a START at run
-    /// begin, then a terminal COMPLETE / FAIL / ABORT with real timing and row
-    /// counts) as NDJSON to a file path, or `-` for stdout. Unlike --lineage
-    /// (a static plan-only export that exits without reading data), this
-    /// processes data, so it cannot be combined with --lineage, --explain,
-    /// --dry-run, or -n. Prefer a file path for a clean NDJSON stream: with `-`,
-    /// the run's own stdout output (e.g. the spill-volume summary) interleaves
-    /// with the events.
+    /// Preflight the workspace lineage identity policy, run the pipeline, and
+    /// emit live OpenLineage run events (a START at run begin, then a terminal
+    /// COMPLETE / FAIL / ABORT with real timing and row counts) as NDJSON to a
+    /// file path, or `-` for stdout. Unlike --lineage (a static plan-only export
+    /// that exits without reading data), this processes data, so it cannot be
+    /// combined with --lineage, --explain, --dry-run, or -n. Prefer a file path
+    /// for a clean NDJSON stream: with `-`, the run's own stdout output (e.g. the
+    /// spill-volume summary) interleaves with the events.
     #[arg(
         long = "lineage-events",
         value_name = "PATH",
@@ -734,6 +757,7 @@ fn pipeline_error_exit_code(error: &PipelineError) -> u8 {
         | PipelineError::OverlayDiagnostics(_)
         | PipelineError::Compilation { .. }
         | PipelineError::Internal { .. }
+        | PipelineError::DispatchMismatch { .. }
         | PipelineError::SortOrderViolation { .. }
         | PipelineError::MergeSortOrderViolation { .. }
         | PipelineError::SchemaMismatch { .. }
@@ -775,6 +799,184 @@ fn pipeline_error_exit_code(error: &PipelineError) -> u8 {
     }
 }
 
+fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::FailureClassification {
+    use clinker_core_types::{FailureClassification, RetryAdvice};
+
+    // Registry text only. These classifications leave the host — the machine
+    // terminal carries the message, and `--lineage` ships the OpenLineage
+    // error facet to an external collector — so what may appear in them is a
+    // question about disclosure, not about convenience.
+    //
+    // Carrying `error.to_string()` was tried and withdrawn twice. The
+    // sanitizer that guards it matches shapes: absolute paths, debug braces,
+    // credential labels. Engine error text is not a shape. A combine key
+    // rendered from a record is a bare number; a staging collision is a
+    // relative path; neither is recognisable to a shape rule, and each new
+    // variant is another chance to be wrong in the same direction. The detail
+    // an engineer needs is on stderr, which does not leave the host.
+    let registered = |code| {
+        FailureClassification::for_code(code)
+            .unwrap_or_else(|| FailureClassification::unknown_internal("unregistered failure"))
+    };
+    match error {
+        PipelineError::Io(error) if is_observability_delivery_failure(error) => {
+            registered("observability.delivery.failed")
+        }
+        // Ordered before the general I/O arm: the outcome of a published run
+        // is not a transient runtime fault, and the advice a supervisor acts
+        // on turns on that difference.
+        PipelineError::Io(error) if is_unreportable_outcome(error) => {
+            registered("infrastructure.delivery.unreportable_outcome")
+        }
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(message))
+            if split_leading_code(message)
+                .is_some_and(|(code, _)| code == "observability.configuration.invalid") =>
+        {
+            registered("observability.configuration.invalid")
+        }
+        PipelineError::Format(format_error) => {
+            if let Some(code) = format_error.classification_code() {
+                return registered(code);
+            }
+            if matches!(format_error, clinker_format::FormatError::Io(_)) {
+                registered("infrastructure.runtime.transient")
+            } else {
+                registered("source.data.invalid")
+            }
+        }
+        PipelineError::Config(_)
+        | PipelineError::Schema(_)
+        | PipelineError::PlanDiagnostics { .. }
+        | PipelineError::OverlayDiagnostics(_)
+        | PipelineError::Compilation { .. } => registered("admission.configuration.invalid"),
+        PipelineError::Internal { .. }
+        | PipelineError::MergeSortOrderViolation { .. }
+        | PipelineError::CompositionDepthExceeded { .. }
+        | PipelineError::CompositionBodyMissing { .. }
+        | PipelineError::CompositionUnknownPort { .. }
+        | PipelineError::SchemaMismatch { .. } => registered("runtime.invariant.plan_mismatch"),
+        PipelineError::DispatchMismatch { .. } => {
+            error.failure_classification().unwrap_or_else(|| {
+                FailureClassification::unknown_internal(
+                    "dispatch mismatch classification unavailable",
+                )
+            })
+        }
+        PipelineError::CompositionBodyError { inner, .. } => classify_pipeline_error(inner),
+        PipelineError::Io(_) | PipelineError::ThreadPool(_) => {
+            registered("infrastructure.runtime.transient")
+        }
+        PipelineError::Spill(_) => registered("runtime.resource.spill_failed"),
+        PipelineError::SpillCapExceeded { .. } => registered("runtime.resource.spill_cap_exceeded"),
+        PipelineError::Multiple(errors) => errors
+            .iter()
+            .map(classify_pipeline_error)
+            .min_by_key(|classification| {
+                let retry_rank = match classification.retry_advice() {
+                    RetryAdvice::DoNotRetry => 0_u8,
+                    RetryAdvice::PolicyRequired => 1,
+                    RetryAdvice::RetryWithBackoff => 2,
+                };
+                (retry_rank, classification.code())
+            })
+            .unwrap_or_else(|| registered("runtime.invariant.unknown")),
+        PipelineError::Eval(_)
+        | PipelineError::Accumulator { .. }
+        | PipelineError::SortOrderViolation { .. }
+        | PipelineError::CombineMissingMatch { .. }
+        | PipelineError::CombineRangeKeyOutOfRange { .. }
+        | PipelineError::CombineOutputCapExceeded { .. }
+        | PipelineError::EnvelopeMultiHeaderConflict { .. }
+        | PipelineError::EnvelopeHeaderGrainUnmatched { .. }
+        | PipelineError::EnvelopeHeaderMultipleForGrain { .. }
+        | PipelineError::DlqRateExceeded { .. }
+        | PipelineError::TypeErrorThresholdExceeded { .. }
+        | PipelineError::CorrelationGroupOverflow { .. } => registered("source.data.invalid"),
+        PipelineError::MemoryBudgetExceeded { .. } => {
+            registered("runtime.resource.memory_budget_exceeded")
+        }
+        PipelineError::UnsatisfiableMemoryBudget { .. } => {
+            registered("admission.configuration.memory_budget_unsatisfiable")
+        }
+        // Cancellation is an operator action, not a defect: it is retryable and
+        // it is not an engine invariant violation. Callers that can distinguish
+        // a cancelled run should use `run_terminal_outcome` instead of asking
+        // for a failure classification at all.
+        PipelineError::Interrupted => registered("infrastructure.runtime.transient"),
+    }
+}
+
+/// Whether `error` is the shape a source cancelled mid-read unwinds with.
+///
+/// A cancelled socket read surfaces the transport's own I/O error rather than
+/// [`PipelineError::Interrupted`], so a genuinely interrupted run can arrive
+/// wearing an I/O failure and must still be reported as a cancellation. Only
+/// that shape qualifies. A sort order violation, a DLQ rate breach, or a spill
+/// cap that happened to be unwinding when a signal arrived is a real defect,
+/// and rewriting it would file a failed batch as a clean stop — the orchestrator
+/// would re-queue it and the cause would appear nowhere. An observability
+/// delivery failure is excluded for the same reason: it carries its own
+/// classification and did not come from a source read.
+fn is_cancelled_transport_error(error: &PipelineError) -> bool {
+    /// The kinds that tearing down a read in progress produces.
+    ///
+    /// Named by what it is rather than by what it is not. Listing exclusions
+    /// instead was tried and reverted: `ErrorKind::Other` is what the engine
+    /// stamps on its own wrapped defects — a spill run that failed to decode
+    /// during a k-way merge, a sidecar that could not be opened — and treating
+    /// the unlisted remainder as cancellation turned those into clean operator
+    /// stops whenever a signal happened to be pending. A defect that coincides
+    /// with a signal is still a defect, and one recorded nowhere is worse than
+    /// one recorded under the wrong kind.
+    fn is_interrupted_read(io: &std::io::Error) -> bool {
+        matches!(
+            io.kind(),
+            std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::UnexpectedEof
+        )
+    }
+
+    match error {
+        PipelineError::Io(io) => !is_observability_delivery_failure(io) && is_interrupted_read(io),
+        PipelineError::Format(clinker_format::FormatError::Io(io)) => is_interrupted_read(io),
+        // A cancellation carried inside a wrapper counts, though a bare one
+        // does not: this answers whether an error should be *replaced* by
+        // `Interrupted`, and one that already is needs no replacing. The
+        // wrapper does -- a reader inside a composition body that observed the
+        // shutdown itself kept the body's identity out here, so an operator's
+        // interrupt was reported as the run failing.
+        PipelineError::CompositionBodyError { inner, .. } => {
+            matches!(**inner, PipelineError::Interrupted) || is_cancelled_transport_error(inner)
+        }
+        PipelineError::Multiple(errors) => {
+            !errors.is_empty()
+                && errors.iter().all(|error| {
+                    matches!(error, PipelineError::Interrupted)
+                        || is_cancelled_transport_error(error)
+                })
+        }
+        _ => false,
+    }
+}
+
+/// The lifecycle terminal a finished run earned.
+///
+/// Cancellation is [`RunTerminalOutcome::Abort`] regardless of which source
+/// observed the shutdown token first. A file source drains and returns a report
+/// flagged `interrupted`; a REST source cancelled inside a page read returns
+/// [`PipelineError::Interrupted`] instead, and both are the same operator
+/// action on the lineage and OTLP terminals.
+fn run_terminal_outcome(error: &PipelineError) -> RunTerminalOutcome {
+    match error {
+        PipelineError::Interrupted => RunTerminalOutcome::Abort,
+        other => RunTerminalOutcome::Fail(classify_pipeline_error(other)),
+    }
+}
+
 fn main() -> ExitCode {
     let attempts_invocation = std::env::args_os()
         .nth(1)
@@ -798,21 +1000,105 @@ fn main() -> ExitCode {
                 .log_level
                 .parse::<tracing_subscriber::filter::LevelFilter>()
                 .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO);
-            tracing_subscriber::fmt().with_max_level(filter).init();
+            // Diagnostics move to stderr exactly when standard output is
+            // carrying data a consumer parses: the machine stream, a lineage
+            // export addressed to `-`, or an explain document in one of the
+            // machine-readable formats. Human-formatted log lines written into
+            // any of those corrupt the feed. Everywhere else they stay on
+            // stdout, where the run's own completion summary is reported and
+            // where callers already expect to read it.
+            let stdout_carries_data = args.machine.is_some()
+                || matches!(args.explain, Some(ExplainFormat::Json | ExplainFormat::Dot))
+                || [args.lineage.as_deref(), args.lineage_events.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|path| path.as_os_str() == std::ffi::OsStr::new("-"));
+            if stdout_carries_data {
+                tracing_subscriber::fmt()
+                    .with_max_level(filter)
+                    .with_writer(std::io::stderr)
+                    .with_ansi(false)
+                    .init();
+            } else {
+                tracing_subscriber::fmt().with_max_level(filter).init();
+            }
 
             // Install the process-wide SIGINT/SIGTERM handler before the
             // run starts so an interrupt during a long pipeline trips the
-            // run's shutdown token. Idempotent — the first call wins.
+            // run's shutdown token. Every caller observes the first result.
             if let Err(e) = clinker_exec::pipeline::shutdown::install_signal_handler() {
-                eprintln!("clinker: failed to install signal handler: {e}");
+                // Nothing has been read, written, or staged at this point, and
+                // the run refuses to start one it could not later cancel. The
+                // status is 4 and the environment is what has to change:
+                // another handler already owns these signals, or a sandbox
+                // policy refuses them.
+                //
+                // Nothing is announced either. A `started` record would claim
+                // a run that never began, and the protocol's own rule is that
+                // this refusal leaves no trace at all -- so the supervisor
+                // learns of it from the exit status and stderr, which is why
+                // the status is a distinct one.
+                eprintln!(
+                    "clinker: failed to install signal handler: {e}. Correction: run clinker as the process that owns SIGINT and SIGTERM, or relax the sandbox policy that refuses them"
+                );
+                return ExitCode::from(4);
+            }
+
+            let machine = match MachineEmitter::admit(args) {
+                Ok(machine) => machine,
+                Err(message) => {
+                    eprintln!("clinker: {message}");
+                    return ExitCode::from(1);
+                }
+            };
+            // A required lifecycle record the supervisor will never see, at a
+            // point where nothing has been published. That is the documented
+            // 130: the run refuses to publish an outcome it cannot report, and
+            // the attempt's final paths are unchanged. Reporting infrastructure
+            // here instead would make a supervisor classify one condition two
+            // ways depending only on which record happened to fail first.
+            if let Some(emitter) = machine.as_ref()
+                && let Err(error) = emitter.emit_started()
+            {
+                eprintln!("clinker: cannot write machine protocol: {error}");
+                return ExitCode::from(130);
+            }
+            if let Some(emitter) = machine.as_ref()
+                && let Err(error) = emitter.emit_progress_transition("planning")
+            {
+                eprintln!("clinker: cannot write machine protocol: {error}");
+                return ExitCode::from(130);
             }
 
             // The executor is fully synchronous — call it directly.
-            match run(args) {
-                Ok(code) => ExitCode::from(code),
+            match run(args, machine.as_ref()) {
+                Ok(code) => {
+                    if let Some(emitter) = machine.as_ref()
+                        && let Err(error) = emitter.emit_completed(code)
+                    {
+                        eprintln!("clinker: cannot write machine terminal event: {error}");
+                        // A run that concluded 130 published nothing, and an
+                        // unwritable terminal does not change that. A run that
+                        // did publish cannot be relabelled a cancellation, so
+                        // there the unreportable terminal is infrastructure.
+                        return ExitCode::from(if code == 130 { 130 } else { 4 });
+                    }
+                    ExitCode::from(code)
+                }
                 Err(e) => {
+                    let exit_code = pipeline_error_exit_code(&e);
+                    if let Some(emitter) = machine.as_ref() {
+                        let terminal_result = if matches!(e, PipelineError::Interrupted) {
+                            emitter.emit_completed(exit_code)
+                        } else {
+                            emitter.emit_failed(exit_code, &classify_pipeline_error(&e))
+                        };
+                        if let Err(error) = terminal_result {
+                            eprintln!("clinker: cannot write machine terminal event: {error}");
+                        }
+                    }
                     render_pipeline_error(&e, &args.config);
-                    ExitCode::from(pipeline_error_exit_code(&e))
+                    ExitCode::from(exit_code)
                 }
             }
         }
@@ -1151,11 +1437,14 @@ fn with_explain_pointer(code: &str, message: &str, help: Option<String>) -> Opti
 /// A large family of plan-time gates reports through
 /// `ConfigError::Validation(format!("[E346] ..."))` rather than as a structured
 /// `Diagnostic`, so the code the user needs is carried in the message text.
-/// `None` for a message that names no code, or names one the registry does not
-/// list — an unregistered `[...]` is ordinary prose, not a code.
+/// `None` for a message that names no code, or names one neither the diagnostic
+/// nor shared failure-classification registry lists — an unregistered `[...]`
+/// is ordinary prose, not a code.
 fn split_leading_code(message: &str) -> Option<(&str, &str)> {
     let (code, body) = message.strip_prefix('[')?.split_once(']')?;
-    clinker_core_types::diagnostic::is_registered(code).then(|| (code, body.trim_start()))
+    (clinker_core_types::diagnostic::is_registered(code)
+        || FailureClassification::for_code(code).is_some())
+    .then(|| (code, body.trim_start()))
 }
 
 /// Turn one of a diagnostic's spans into a miette label against `text`.
@@ -1475,7 +1764,1079 @@ fn resolve_compile_anchor(
 /// attached — the failing setting lives in `clinker.toml`, not the pipeline
 /// YAML the diagnostic renderer carries as its `NamedSource`.
 fn storage_config_error(e: clinker_plan::config::StorageConfigError) -> PipelineError {
-    PipelineError::Config(clinker_plan::config::ConfigError::Validation(e.to_string()))
+    match e {
+        clinker_plan::config::StorageConfigError::Observability(error) => {
+            observability_configuration_error(error)
+        }
+        error => PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+            error.to_string(),
+        )),
+    }
+}
+
+const OBSERVABILITY_CONFIGURATION_INVALID: &str = "observability.configuration.invalid";
+
+fn observability_configuration_error(error: impl std::fmt::Display) -> PipelineError {
+    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+        "[{OBSERVABILITY_CONFIGURATION_INVALID}] {error}"
+    )))
+}
+
+#[derive(Debug)]
+struct ObservabilityDeliveryFailure {
+    message: String,
+}
+
+impl std::fmt::Display for ObservabilityDeliveryFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ObservabilityDeliveryFailure {}
+
+fn observability_delivery_error(error: impl std::fmt::Display) -> PipelineError {
+    PipelineError::Io(std::io::Error::other(ObservabilityDeliveryFailure {
+        message: error.to_string(),
+    }))
+}
+
+fn is_observability_delivery_failure(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<ObservabilityDeliveryFailure>())
+}
+
+/// A machine terminal that could not be delivered for a run that had already
+/// published.
+#[derive(Debug)]
+struct UnreportableOutcome {
+    message: String,
+}
+
+impl std::fmt::Display for UnreportableOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UnreportableOutcome {}
+
+/// The failure a run raises when its outputs are live and the terminal saying
+/// so could not be written.
+///
+/// It is deliberately not a plain I/O failure. A plain one classifies as
+/// `infrastructure.runtime.transient`, whose advice is `retry_with_backoff` —
+/// so a momentary `WouldBlock` on the supervisor's own pipe, at the one moment
+/// the terminal is written, asked the supervisor to re-run a batch whose
+/// finals were already visible. The delivery of a report is not evidence about
+/// what the run did, and it must not be allowed to become the loudest
+/// evidence: the artifacts stay published, the terminal still carries them,
+/// and the advice becomes one no supervisor can act on unattended.
+fn unreportable_outcome_error(error: std::io::Error) -> PipelineError {
+    PipelineError::Io(std::io::Error::other(UnreportableOutcome {
+        message: error.to_string(),
+    }))
+}
+
+fn is_unreportable_outcome(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<UnreportableOutcome>())
+}
+
+fn lineage_worker_start_error(_error: std::io::Error) -> PipelineError {
+    observability_delivery_error(
+        "the bounded lineage exporter could not start before execution. Correction: reduce host resource pressure or disable external lineage delivery",
+    )
+}
+
+/// How many dropped events a diagnostic names before it summarizes the rest.
+const LINEAGE_EXPORT_REPORTED_DROPS: usize = 4;
+
+/// Remove a lineage destination this run truncated and never wrote to.
+///
+/// Only a regular file. A destination that always reports zero length —
+/// `/dev/null`, a FIFO, any character device — is a successful export, not an
+/// empty one, and unlinking it would take the device node with it on a
+/// container running as root.
+///
+/// The caller must not use this on a verdict that leaves the export worker
+/// running: a detached worker re-creates the destination on its next write,
+/// which would put a truncated event stream back after the removal.
+///
+/// Reports whether the operator is still left holding an export, so a
+/// diagnostic that describes the destination's state describes one that exists.
+fn remove_empty_lineage_export(
+    path: &std::path::Path,
+) -> (LineageExportRemains, Option<PipelineError>) {
+    // Standard output is not a path. Resolving it as one makes an ordinary
+    // file named `-` in the working directory this run's destination, and a
+    // stdout export would unlink a file the operator never named.
+    if path.as_os_str() == std::ffi::OsStr::new("-") {
+        return (LineageExportRemains::Kept, None);
+    }
+    // `symlink_metadata`, so a symlink is not a regular file here. Following
+    // it would report the target's size and then unlink the link instead of
+    // the target, destroying the operator's configured path while leaving the
+    // empty artifact exactly where it was. A symlinked destination is left
+    // alone: an ambiguous empty file is a smaller harm than a broken link.
+    let Some(metadata) = std::fs::symlink_metadata(path).ok() else {
+        return (LineageExportRemains::Kept, None);
+    };
+    if !metadata.is_file() || metadata.len() != 0 {
+        return (LineageExportRemains::Kept, None);
+    }
+    // A removal that fails leaves the empty file exactly where it was, so this
+    // still reports an export the operator holds — an empty one, which ends on
+    // a record boundary as truthfully as any other.
+    match std::fs::remove_file(path) {
+        Ok(()) => (LineageExportRemains::Removed, None),
+        Err(error) => (
+            LineageExportRemains::Kept,
+            Some(observability_delivery_error(format!(
+                "--lineage output {} is empty and could not be removed: {error}. Correction: delete it before publishing this run's artifacts, so an empty file is not read as its lineage export",
+                path.display()
+            ))),
+        ),
+    }
+}
+
+/// Whether a failed `--lineage` export left the operator holding a destination.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineageExportRemains {
+    /// Bytes are on the destination, and a publish step would pick them up.
+    Kept,
+    /// The destination was empty and is gone; there is no file to describe.
+    Removed,
+}
+
+fn lineage_destination(path: &std::path::Path) -> String {
+    if path.as_os_str() == std::ffi::OsStr::new("-") {
+        "standard output".to_owned()
+    } else {
+        path.display().to_string()
+    }
+}
+
+fn lineage_admission_reason(admission: clinker_lineage::LineageAdmission) -> &'static str {
+    match admission {
+        clinker_lineage::LineageAdmission::Accepted => "was admitted",
+        clinker_lineage::LineageAdmission::DroppedEventTooLarge => {
+            "serialized larger than `observability.lineage.max_event_bytes`"
+        }
+        clinker_lineage::LineageAdmission::DroppedEncodingFailed => "could not be serialized",
+        clinker_lineage::LineageAdmission::DroppedQueueFull => {
+            "did not fit the remaining `observability.lineage.queue_bytes` capacity"
+        }
+        clinker_lineage::LineageAdmission::DroppedProducerBusy => {
+            "found the export queue momentarily locked"
+        }
+        clinker_lineage::LineageAdmission::DroppedShutdown => {
+            "arrived after the export worker had already stopped"
+        }
+    }
+}
+
+/// Diagnose a plan-only `--lineage` export that did not deliver every event.
+///
+/// Returns `None` only when every event was admitted and the worker drained
+/// and flushed the destination. This export is the whole invocation, so a
+/// partial or unwritten one is a run failure — the opposite of the
+/// `--lineage-events` bulkhead alongside a live run, whose delivery outcome
+/// deliberately cannot redefine run truth.
+fn lineage_export_failure(
+    path: &std::path::Path,
+    expected: usize,
+    rejected: &[(usize, clinker_lineage::LineageAdmission)],
+    outcome: clinker_lineage::LineageDeliveryOutcome,
+) -> Option<PipelineError> {
+    let destination = lineage_destination(path);
+    // The destination was emptied once the exporter started, so an export that
+    // then wrote nothing leaves a zero-byte file for a publish step to upload
+    // as though it were the export. Skipped on `DeadlineExceeded`, the one
+    // verdict that returns while the worker is still running: removing the file
+    // there would race a writer that re-creates it.
+    //
+    // A failure to remove is reported only when nothing else is — every verdict
+    // below already tells the operator the export did not complete, and that is
+    // the more useful of the two diagnostics.
+    let (remains, removal) = match outcome.terminal() {
+        clinker_lineage::LineageDeliveryTerminal::DeadlineExceeded => {
+            (LineageExportRemains::Kept, None)
+        }
+        _ => remove_empty_lineage_export(path),
+    };
+    match outcome.terminal() {
+        // Whether the same invocation could ever succeed is what separates
+        // these, and the diagnostic has to say the same thing its retry advice
+        // does. A destination the process may not write will refuse every
+        // identical retry, so it is a configuration failure and the correction
+        // names a different destination. A reader that went away or a write
+        // that timed out may not recur, so it stays a delivery failure the
+        // supervisor is free to retry.
+        clinker_lineage::LineageDeliveryTerminal::WriteFailed(kind)
+        | clinker_lineage::LineageDeliveryTerminal::FlushFailed(kind) => {
+            // A sink that refused a write is not the same fact as the state it
+            // was left in, and this path can leave either of the two files the
+            // deadline path can: a refusal that transferred nothing stops on a
+            // record boundary, one that transferred part of a record does not.
+            // Nothing about the destination distinguishes them from the outside,
+            // so the run has to say which — the same `records_complete` fact,
+            // exact here because the export sink is unbuffered and every record
+            // is newline-framed, so the bytes it accepted are the bytes on the
+            // destination.
+            //
+            // What it cannot borrow from the deadline path is the correction.
+            // There the export was going fine and ran out of time, so re-running
+            // is the whole answer; here the destination itself refused, and where
+            // the retry should point is already decided below by whether the
+            // refusal is permanent. This adds only the disposal of what is
+            // already on the destination, which that choice does not cover.
+            let (state, disposal) = match (remains, outcome.records_complete()) {
+                (LineageExportRemains::Removed, _) => ("", ""),
+                (LineageExportRemains::Kept, true) => (
+                    "; the export it left ends on a record boundary and is readable as NDJSON",
+                    "",
+                ),
+                (LineageExportRemains::Kept, false) => (
+                    "; the export it left ends inside a record and is not readable as NDJSON",
+                    "discard that partial export rather than publishing it as this run's lineage, then ",
+                ),
+            };
+            let observed = format!(
+                "cannot write --lineage output {destination}: the export sink reported {} ({}) after {} of {expected} events entered the export queue{state}. Correction: {disposal}",
+                outcome.terminal().as_str(),
+                lineage_error_kind(kind),
+                outcome.accepted(),
+            );
+            return Some(if is_permanent_sink_refusal(kind) {
+                observability_configuration_error(format!(
+                    "{observed}point --lineage at a writable destination, for example `--lineage ./lineage.ndjson`"
+                ))
+            } else {
+                observability_delivery_error(format!(
+                    "{observed}re-run the export; if it recurs, point --lineage at a different destination"
+                ))
+            });
+        }
+        // A collector that was merely slow this time is the same phenomenon
+        // `FlushFailed(TimedOut)` reports one layer down, and one slow
+        // collector must not produce two opposite instructions depending on
+        // which layer noticed it. Retryable, with a correction that offers the
+        // deadline as the fix if it keeps happening.
+        clinker_lineage::LineageDeliveryTerminal::DeadlineExceeded => {
+            // This is the one verdict that keeps what it wrote, so the operator
+            // is left holding a file — and the two files this path can leave
+            // want opposite handling. One is short: valid NDJSON missing its
+            // tail, which a catalogue can still read and a diff can still
+            // compare. The other stops inside a record, and every conformant
+            // reader fails on it. Nothing about the destination distinguishes
+            // them from the outside, which is why the run has to say which.
+            let (state, correction) = if outcome.records_complete() {
+                (
+                    "the partial export it left ends on a record boundary, short by the events that never got out",
+                    "re-run the export",
+                )
+            } else {
+                (
+                    "the partial export it left ends inside a record and is not readable as NDJSON",
+                    "discard that partial export rather than publishing it as this run's lineage, then re-run",
+                )
+            };
+            return Some(observability_delivery_error(format!(
+                "--lineage output {destination} did not finish writing within the configured lineage flush deadline; {state}. Correction: {correction}; if it recurs, raise the deadline in clinker.toml:\n\n  [observability.lineage]\n  flush_timeout_ms = 30000"
+            )));
+        }
+        clinker_lineage::LineageDeliveryTerminal::Shutdown => {}
+    }
+    if rejected.is_empty() {
+        return removal;
+    }
+
+    let mut listed = rejected
+        .iter()
+        .take(LINEAGE_EXPORT_REPORTED_DROPS)
+        .map(|(index, admission)| {
+            format!(
+                "event {} {}",
+                index + 1,
+                lineage_admission_reason(*admission)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if let Some(remaining) = rejected.len().checked_sub(LINEAGE_EXPORT_REPORTED_DROPS)
+        && remaining > 0
+    {
+        listed.push_str(&format!("; and {remaining} more"));
+    }
+
+    // Only the byte caps have a configuration correction. Do not offer one for
+    // a serializer failure or a stopped worker: raising a cap would not change
+    // the outcome and the author would stop looking for the real cause.
+    let capped = rejected.iter().any(|(_, admission)| {
+        matches!(
+            admission,
+            clinker_lineage::LineageAdmission::DroppedEventTooLarge
+                | clinker_lineage::LineageAdmission::DroppedQueueFull
+        )
+    });
+    let detail = format!(
+        "--lineage output {destination} is incomplete: {} of {expected} events were dropped before delivery ({listed}). Correction: ",
+        rejected.len(),
+    );
+    // The classification has to agree with the correction. A breached cap is
+    // answered by editing the caps, so it is a configuration failure and must
+    // not be retried unchanged; a serializer failure or a momentarily locked
+    // queue is answered by running it again, and filing that as invalid
+    // configuration would tell a supervisor to refuse the retry the diagnostic
+    // just asked for.
+    if capped {
+        Some(observability_configuration_error(format!(
+            "{detail}raise the lineage caps in clinker.toml:\n\n  [observability.lineage]\n  queue_bytes = \"1MB\"\n  max_event_bytes = \"1MB\""
+        )))
+    } else {
+        Some(observability_delivery_error(format!(
+            "{detail}re-run the export; if it recurs, remove --lineage and report the diagnostic above"
+        )))
+    }
+}
+
+enum CliLineageIdentity {
+    External(clinker_lineage::LineageIdentityContext),
+    LocalDiagnosticPaths,
+}
+
+struct CliLineageConfiguration {
+    identity: CliLineageIdentity,
+    delivery: Option<clinker_lineage::LineageDeliveryConfig>,
+}
+
+fn resolve_cli_lineage_configuration(
+    observability: &clinker_plan::config::ResolvedObservabilityPolicy,
+) -> Result<CliLineageConfiguration, PipelineError> {
+    let lineage = observability.lineage().ok_or_else(|| {
+        observability_configuration_error(
+            "lineage export requires an explicit [observability.lineage] identity policy",
+        )
+    })?;
+    match lineage.identity_mode() {
+        clinker_plan::config::LineageIdentityMode::External => {
+            let identity = clinker_lineage::LineageIdentityContext::from_resolved(lineage)
+                .map_err(observability_configuration_error)?;
+            let delivery = clinker_lineage::LineageDeliveryConfig::from_resolved(lineage)
+                .map_err(observability_configuration_error)?;
+            Ok(CliLineageConfiguration {
+                identity: CliLineageIdentity::External(identity),
+                delivery: Some(delivery),
+            })
+        }
+        clinker_plan::config::LineageIdentityMode::LocalDiagnosticPaths => {
+            eprintln!(
+                "clinker: lineage identity mode: local_diagnostic_paths (local diagnostic compatibility only)"
+            );
+            Ok(CliLineageConfiguration {
+                identity: CliLineageIdentity::LocalDiagnosticPaths,
+                delivery: None,
+            })
+        }
+    }
+}
+
+fn build_cli_lineage(
+    compiled: &clinker_plan::plan::CompiledPlan,
+    identity: &CliLineageIdentity,
+    base_dir: &std::path::Path,
+) -> Result<clinker_lineage::PlanColumnLineage, PipelineError> {
+    match identity {
+        CliLineageIdentity::External(context) => {
+            clinker_lineage::column_lineage_external(compiled, context)
+                .map_err(observability_configuration_error)
+        }
+        CliLineageIdentity::LocalDiagnosticPaths => Ok(
+            clinker_lineage::column_lineage_local_diagnostic_paths(compiled, base_dir),
+        ),
+    }
+}
+
+/// A destination opened on first write rather than at admission.
+///
+/// Used for anything that is not a regular file. Opening a FIFO for writing
+/// blocks until a reader attaches, so doing it during admission — on the run's
+/// own thread, before discovery — hangs a run whose collector connects a moment
+/// later. A regular file is still opened eagerly, because proving it writable
+/// before the run stages anything is the point of doing it there.
+struct LazyLineageFile {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl std::io::Write for LazyLineageFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let file = match self.file {
+            Some(ref mut file) => file,
+            None => self.file.insert(std::fs::File::create(&self.path)?),
+        };
+        std::io::Write::write(file, bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(file) => std::io::Write::flush(file),
+            None => Ok(()),
+        }
+    }
+}
+
+enum LiveLineageSink {
+    External(clinker_lineage::LineageDelivery),
+    LocalDiagnostic(Box<dyn std::io::Write>),
+}
+
+struct LiveLineageOutput {
+    sink: LiveLineageSink,
+    lineage: clinker_lineage::PlanColumnLineage,
+    job: clinker_lineage::Job,
+    /// Whether the consumer was told this run began.
+    ///
+    /// The bounded sink can refuse an event, so a START is not guaranteed to
+    /// arrive. A terminal for a run the consumer never saw start describes
+    /// nothing it can attach to, so the pairing is tracked rather than assumed.
+    started: bool,
+    /// The admitted START, kept so a run that never reaches its terminal can
+    /// still be closed against the identity the consumer already has.
+    start_facts: Option<clinker_lineage::RunLifecycleStartFacts>,
+    /// Whether a terminal has been accepted by the sink for this run.
+    terminal_emitted: bool,
+    /// This run's real terminal, when the sink refused it. Re-offered before
+    /// any synthetic close, so a completed run is never reported as failed.
+    refused_terminal: Option<clinker_lineage::RunEvent>,
+}
+
+impl LiveLineageOutput {
+    fn emit_start(&mut self, start: &RunLifecycleStartFacts) {
+        let facts = lineage_start_facts(start);
+        let event = clinker_lineage::start_event(&self.lineage, self.job.clone(), &facts);
+        // A failed write is reported, never propagated. Lineage is an optional
+        // observation of the run, and the external sink already treats a
+        // refusal this way — propagating the local sink's error instead made a
+        // healthy pipeline exit 4 because something downstream closed the pipe
+        // it was writing events to, and made success depend on which identity
+        // mode was configured rather than on the data.
+        self.started = match self.emit(event) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                tracing::warn!(error = %error, "this run's lineage START could not be written");
+                false
+            }
+        };
+        self.start_facts = Some(facts);
+    }
+
+    fn emit_terminal(&mut self, snapshot: &RunLifecycleSnapshot) -> Result<(), PipelineError> {
+        // A refused START makes this run's record partial; withholding the
+        // terminal too would make it empty. The terminal is the event that
+        // carries the column lineage and the run statistics, and events are
+        // keyed by run identity rather than by arrival order, so a consumer can
+        // attach one whose START it never received. Report the gap and send it.
+        if !self.started {
+            tracing::warn!(
+                "this run's lineage START was never admitted; its terminal describes a run the consumer has no start record for"
+            );
+        }
+        let facts = lineage_lifecycle_facts(snapshot)?;
+        let event = clinker_lineage::terminal_event(&self.lineage, self.job.clone(), &facts);
+        // Marked emitted only if the sink took it. Setting the flag first
+        // meant a terminal the bounded queue refused still disabled the
+        // fallback that exists to close the run, so the consumer kept a START
+        // with no terminal — the state that fallback was written to prevent.
+        //
+        // The refused event is kept rather than discarded: it carries this
+        // run's real outcome, and closing a completed run with the synthetic
+        // failure would trade an open run for a wrong one.
+        match self.emit(event.clone()) {
+            // Refused, not failed: the sink is alive and said no. Keep the
+            // event so a drained queue can still take this run's real outcome.
+            Ok(false) => {
+                self.refused_terminal = Some(event);
+                Ok(())
+            }
+            Ok(true) => {
+                self.terminal_emitted = true;
+                Ok(())
+            }
+            // The write itself failed. This run produced a terminal and the
+            // sink could not take it, so the fallback must not append a
+            // synthetic failure describing a different outcome — a completed
+            // run would be published as failed. Record the attempt and report
+            // the error.
+            Err(error) => {
+                self.terminal_emitted = true;
+                Err(PipelineError::Io(error))
+            }
+        }
+    }
+
+    /// Offer one event to the sink. `Ok(false)` means it was refused.
+    fn emit(&mut self, event: clinker_lineage::RunEvent) -> std::io::Result<bool> {
+        match &mut self.sink {
+            LiveLineageSink::External(delivery) => {
+                // Whether the consumer ever sees this event is the admission's
+                // answer, and it was being discarded — so a refused event was
+                // indistinguishable from a delivered one, and the pairing below
+                // could not be maintained. Delivery stays optional: a refusal
+                // is reported, never propagated, because an observation of the
+                // run must not decide the run.
+                let admission = delivery.try_emit(&event);
+                if admission != clinker_lineage::LineageAdmission::Accepted {
+                    tracing::warn!(
+                        admission = ?admission,
+                        "lineage event was refused by the bounded sink"
+                    );
+                    return Ok(false);
+                }
+                #[cfg(debug_assertions)]
+                if std::env::var_os("CLINKER_TEST_LINEAGE_REPEAT").as_deref()
+                    == Some(std::ffi::OsStr::new("64"))
+                {
+                    for _ in 1..64 {
+                        let _ = delivery.try_emit(&event);
+                    }
+                }
+                Ok(true)
+            }
+            LiveLineageSink::LocalDiagnostic(writer) => {
+                clinker_lineage::write_ndjson(std::slice::from_ref(&event), writer).map(|()| true)
+            }
+        }
+    }
+
+    fn finish(&mut self) -> Option<clinker_lineage::LineageDeliveryOutcome> {
+        // Before the sink goes away, so a run that reached here without a
+        // terminal is still closed against the consumer that saw its START.
+        self.close_open_run();
+        let sink = std::mem::replace(
+            &mut self.sink,
+            LiveLineageSink::LocalDiagnostic(Box::new(std::io::sink())),
+        );
+        match sink {
+            LiveLineageSink::External(delivery) => Some(delivery.finish()),
+            LiveLineageSink::LocalDiagnostic(_) => None,
+        }
+    }
+
+    /// Emit a terminal for a run the consumer was told had begun and that
+    /// never reported how it ended.
+    ///
+    /// A run that ended without saying how did not succeed, so this reports a
+    /// failure under the invariant code and carries no statistics, because
+    /// none were observed. Doing nothing instead leaves a lone START, and a
+    /// catalogue shows the run as still executing forever.
+    fn close_open_run(&mut self) {
+        if self.terminal_emitted {
+            return;
+        }
+        // The run's own terminal, if the sink refused it earlier. Offered
+        // again before anything else, and regardless of whether the START was
+        // admitted: `emit_terminal` sends it either way because it carries the
+        // column lineage and the run statistics, and a consumer attaches it by
+        // run identity. Gating this on the START meant a run whose START and
+        // terminal were both refused by a momentarily full queue delivered
+        // nothing at all, even once the queue had drained.
+        if let Some(event) = self.refused_terminal.take() {
+            if self.emit(event).unwrap_or(false) {
+                self.terminal_emitted = true;
+                return;
+            }
+            tracing::warn!("lineage run left open: its own terminal was refused twice");
+            return;
+        }
+        // Nothing of this run's own to send. A synthetic close is only
+        // meaningful to a consumer that saw the run begin.
+        if !self.started {
+            return;
+        }
+        let Some(start) = self.start_facts.clone() else {
+            return;
+        };
+        let facts = clinker_lineage::RunLifecycleFacts {
+            start,
+            terminal: clinker_lineage::RunLifecycleTerminalFacts {
+                event_time: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                outcome: clinker_lineage::Terminal::Fail {
+                    failure: clinker_core_types::FailureClassification::unknown_internal(
+                        "the run ended without recording a terminal",
+                    ),
+                },
+                stats: None,
+            },
+        };
+        let event = clinker_lineage::terminal_event(&self.lineage, self.job.clone(), &facts);
+        // Same rule as the real terminal: the flag records what the sink took,
+        // not what was offered. Setting it first and then checking only for an
+        // error let a refusal — the sink alive and saying no — be dropped while
+        // the run was recorded as closed.
+        match self.emit(event) {
+            Ok(true) => self.terminal_emitted = true,
+            Ok(false) => tracing::warn!(
+                "lineage run left open: its closing event was refused by the export queue"
+            ),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "lineage run left open: its closing event could not be written"
+            ),
+        }
+    }
+}
+
+/// Say on standard error what the lineage export lost, and what state it left
+/// its destination in.
+///
+/// `records_complete` is the destination's own completeness, and it is the one
+/// fact a consumer cannot recover for itself: a file that stops inside a record
+/// simply ends, with nothing in it to say that more was coming. The counters
+/// beside it cannot answer that either — a run that gave up on a slow
+/// destination reports the same accepted total whether the last record made it
+/// out whole or not.
+///
+/// An incomplete destination breaks the clean-run silence on its own, exactly
+/// as incomplete counts do on the telemetry line. It is not a count of anything
+/// lost, so a run that dropped nothing would otherwise report nothing while
+/// leaving an unreadable file behind.
+fn report_lineage_delivery(outcome: clinker_lineage::LineageDeliveryOutcome) {
+    if outcome.terminal() != clinker_lineage::LineageDeliveryTerminal::Shutdown
+        || outcome.dropped() > 0
+        || !outcome.records_complete()
+    {
+        let error_kind = match outcome.terminal() {
+            clinker_lineage::LineageDeliveryTerminal::WriteFailed(kind)
+            | clinker_lineage::LineageDeliveryTerminal::FlushFailed(kind) => {
+                lineage_error_kind(kind)
+            }
+            clinker_lineage::LineageDeliveryTerminal::Shutdown
+            | clinker_lineage::LineageDeliveryTerminal::DeadlineExceeded => "none",
+        };
+        eprintln!(
+            "clinker: lineage delivery outcome: status={} error_kind={} accepted={} dropped={} full={} records_complete={}",
+            outcome.terminal().as_str(),
+            error_kind,
+            outcome.accepted(),
+            outcome.dropped(),
+            outcome.full(),
+            outcome.records_complete()
+        );
+    }
+}
+
+/// Say on standard error that telemetry was lost, and why.
+///
+/// The machine terminal carries this in full, but a run without
+/// `--machine ndjson-v1` discards that object entirely — so without this line
+/// a run whose arena refused most of its signals reported a clean export of a
+/// silently truncated dataset. Lineage already reports its losses this way;
+/// telemetry, the noisier of the two, said nothing.
+///
+/// Suppressed when the accounting has nothing to report, exactly as the
+/// lineage line is suppressed on a clean shutdown that dropped nothing: a run
+/// that lost no telemetry has nothing to report about losing telemetry. Which
+/// counters that covers, and why the two outside `dropped` break the silence
+/// on their own, is
+/// [`observability::AdmissionSummary::standard_error_line`] — which is also
+/// where the line itself is built, so that both the rule and the text it
+/// produces are decided by a snapshot rather than by a run.
+fn report_telemetry_admission(admission: observability::AdmissionSummary) {
+    if let Some(line) = admission.standard_error_line() {
+        eprintln!("{line}");
+    }
+}
+
+/// Whether a sink that refused a write will refuse the identical retry.
+///
+/// The distinction decides the retry advice a supervisor acts on. Permission,
+/// a missing directory, a read-only filesystem, and a path that is the wrong
+/// kind of thing are properties of the destination rather than of the moment,
+/// so re-running unchanged is wasted work.
+///
+/// A full disk is deliberately not here. It reads like a permanent property
+/// and is usually a temporary one: the run that filled the volume, or a
+/// neighbour on it, releases the space and the next attempt succeeds. Telling
+/// an operator to choose a different destination for it would be advice about
+/// the wrong thing.
+fn is_permanent_sink_refusal(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::ReadOnlyFilesystem
+            | std::io::ErrorKind::IsADirectory
+            | std::io::ErrorKind::InvalidInput
+    )
+}
+
+/// Name the observed failure for the operator.
+///
+/// Every kind [`is_permanent_sink_refusal`] treats as permanent appears here:
+/// those are the ones whose diagnostic tells the author to choose a different
+/// destination, and a correction is only actionable next to the reason for it.
+fn lineage_error_kind(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::PermissionDenied => "permission-denied",
+        std::io::ErrorKind::NotFound => "not-found",
+        std::io::ErrorKind::ReadOnlyFilesystem => "read-only-filesystem",
+        std::io::ErrorKind::StorageFull => "storage-full",
+        std::io::ErrorKind::IsADirectory => "is-a-directory",
+        std::io::ErrorKind::InvalidInput => "invalid-input",
+        std::io::ErrorKind::BrokenPipe => "broken-pipe",
+        std::io::ErrorKind::WriteZero => "write-zero",
+        std::io::ErrorKind::TimedOut => "timed-out",
+        _ => "other",
+    }
+}
+
+impl Drop for LiveLineageOutput {
+    /// Close a run the consumer was told had begun.
+    ///
+    /// Every ordinary path emits its own terminal and finishes the exporter.
+    /// What this covers is the one that reaches neither: an early return
+    /// between START and the point where the run reports how it ended, which
+    /// otherwise leaves a lone START and a catalogue showing the run as
+    /// executing forever.
+    ///
+    /// It runs the whole finish rather than only emitting, because the
+    /// external exporter delivers on its own thread: enqueuing a terminal and
+    /// returning would drop the queue and detach that thread, and the process
+    /// would exit before the event this exists to guarantee had been written.
+    ///
+    /// Unwinding is not covered. The release profile aborts on panic, so there
+    /// is no unwind for a destructor to run during.
+    fn drop(&mut self) {
+        if let Some(outcome) = self.finish() {
+            report_lineage_delivery(outcome);
+        }
+    }
+}
+
+fn finish_live_lineage(output: &mut Option<LiveLineageOutput>) {
+    if let Some(outcome) = output.as_mut().and_then(LiveLineageOutput::finish) {
+        report_lineage_delivery(outcome);
+    }
+    output.take();
+}
+
+fn finish_otlp_delivery(
+    worker: &mut Option<observability::OtlpWorker>,
+    producer: Option<&clinker_exec::telemetry::TelemetryProducer>,
+    lifecycle: &RunLifecycleFacts,
+    machine: Option<&MachineEmitter>,
+) {
+    let Some(worker) = worker.take() else {
+        return;
+    };
+    let summary = worker.finish(lifecycle.snapshot());
+    if let Some(emitter) = machine {
+        emitter.set_observability_summary(summary);
+    }
+    // Read after the flush. `undecodable` is credited by the receiver as it
+    // drains, so an arena read before the worker finished would report a loss
+    // the run had not finished discovering.
+    //
+    // A flush that expired on its deadline detaches its worker instead of
+    // joining it — the bound on a cancelled or finishing run is not negotiable
+    // against an unresponsive collector — so on that path the worker is still
+    // draining while this reads, and the counts are a mid-drain sample. They
+    // are reported as one: marked incomplete rather than silently partial,
+    // which is the difference between "nothing was lost" and "we could not
+    // finish counting".
+    let Some(producer) = producer else {
+        return;
+    };
+    let admission =
+        observability::AdmissionSummary::from_arena(producer.snapshot(), summary.flush_complete);
+    if let Some(emitter) = machine {
+        emitter.set_observability_admission(admission);
+    }
+    report_telemetry_admission(admission);
+}
+
+struct ExternalLineageFileSink {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl ExternalLineageFileSink {
+    fn file(&mut self) -> std::io::Result<&mut std::fs::File> {
+        if self.file.is_none() {
+            self.file = Some(std::fs::File::create(&self.path)?);
+        }
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("lineage file sink initialization failed"))
+    }
+}
+
+impl std::io::Write for ExternalLineageFileSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(self.file()?, bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(file) => std::io::Write::flush(file),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Empty the `--lineage` destination now that the export worker is running.
+///
+/// Deliberately after the worker starts, not before: a worker that fails to
+/// start has produced no effect, and the run is refused with the filesystem
+/// exactly as it was. Once the worker is up the run is committed to writing
+/// here, and emptying the file at that point is what stops a run that then
+/// fails before its first event from leaving the previous run's events — whose
+/// COMPLETE terminal a catalogue would attribute to this run.
+fn truncate_lineage_destination(
+    flag: &'static str,
+    path: &std::path::Path,
+) -> Result<(), PipelineError> {
+    if path.as_os_str() == std::ffi::OsStr::new("-") {
+        return Ok(());
+    }
+    // Skipped only for a destination whose open can block. Opening a FIFO for
+    // writing waits for a reader, and this runs on the run's own thread during
+    // admission, so a destination wired to a collector that connects a moment
+    // later would hang the run before it read a record. A pipe or device has no
+    // previous contents to strip anyway.
+    //
+    // Resolved through symlinks deliberately. A link to a regular file is a
+    // regular destination — a "current run" indirection is exactly that — and
+    // treating the link itself as non-regular would leave the previous run's
+    // COMPLETE terminal in the target for a catalogue to attribute to this run.
+    if std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file() && !metadata.is_dir()) {
+        return Ok(());
+    }
+    std::fs::File::create(path)
+        .map(|_| ())
+        .map_err(|e| lineage_open_error(flag, path, &e))
+}
+
+/// Classify a destination this run could not open.
+///
+/// Every site that opens a lineage destination reports through here, so one
+/// operator-visible condition cannot produce two exit classes depending on
+/// which identity mode or which flag reached it first.
+fn lineage_open_error(
+    flag: &'static str,
+    path: &std::path::Path,
+    error: &std::io::Error,
+) -> PipelineError {
+    let detail = format!("cannot open {flag} output {}: {error}", path.display());
+    {
+        // The same split the write path uses: a destination the process may
+        // never write refuses every identical retry and is a configuration
+        // failure, while a full volume or a momentarily unavailable mount is
+        // one a supervisor should try again. Classifying every open failure as
+        // configuration would tell it to give up on both.
+        if is_permanent_sink_refusal(error.kind()) {
+            // Through the helper, not a bare validation error: the leading code
+            // is what `classify_pipeline_error` matches to report this as an
+            // observability problem rather than an invalid pipeline, which is
+            // what decides whose queue the alert lands in.
+            observability_configuration_error(format!(
+                "{detail}. Correction: point {flag} at a writable destination"
+            ))
+        } else {
+            observability_delivery_error(format!(
+                "{detail}. Correction: re-run the export; if it recurs, point {flag} at a different destination"
+            ))
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+struct QualificationLineageSink {
+    inner: Box<dyn std::io::Write + Send>,
+    mode: QualificationLineageSinkMode,
+    blocked: bool,
+    writes: usize,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy)]
+enum QualificationLineageSinkMode {
+    PermissionDenied,
+    WriteFailed,
+    /// Takes one whole record, then refuses. Leaves a destination that stops on
+    /// a record boundary — the readable half of what a write failure can leave.
+    WriteFailedAfterRecord,
+    /// Takes part of a record, then refuses. Leaves a destination that stops
+    /// inside a record — the half no conformant NDJSON reader can finish.
+    WriteFailedMidRecord,
+    FlushFailed,
+    HangAfterFirstWrite,
+}
+
+#[cfg(debug_assertions)]
+impl std::io::Write for QualificationLineageSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.writes += 1;
+        let mut bytes = bytes;
+        match self.mode {
+            QualificationLineageSinkMode::PermissionDenied => {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            QualificationLineageSinkMode::WriteFailed => {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            QualificationLineageSinkMode::WriteFailedAfterRecord => {
+                if self.writes > 1 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                }
+            }
+            QualificationLineageSinkMode::WriteFailedMidRecord => {
+                if self.writes > 1 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                }
+                // A short accepted count is what a destination reports when it
+                // takes part of a record, and the caller is obliged to offer the
+                // rest in a further call — which this then refuses.
+                bytes = &bytes[..bytes.len().div_ceil(2)];
+            }
+            QualificationLineageSinkMode::FlushFailed
+            | QualificationLineageSinkMode::HangAfterFirstWrite => {}
+        }
+        self.inner.write_all(bytes)?;
+        self.inner.flush()?;
+        if matches!(self.mode, QualificationLineageSinkMode::HangAfterFirstWrite) && !self.blocked {
+            self.blocked = true;
+            eprintln!("clinker: lineage sink received bytes; blocking for qualification");
+            let released = std::sync::Mutex::new(false);
+            let release = std::sync::Condvar::new();
+            let mut released = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = release
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()?;
+        if matches!(self.mode, QualificationLineageSinkMode::FlushFailed) {
+            Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn external_lineage_sink(path: &std::path::Path) -> Box<dyn std::io::Write + Send> {
+    let sink: Box<dyn std::io::Write + Send> = if path.as_os_str() == std::ffi::OsStr::new("-") {
+        Box::new(std::io::stdout())
+    } else {
+        // Created and emptied here, while the run is being admitted, rather
+        // than on the export worker at its first event. A run refused before it
+        // emits anything would otherwise leave the previous run's file intact,
+        // COMPLETE terminal and all, for a catalogue to read as this run having
+        // succeeded.
+        Box::new(ExternalLineageFileSink {
+            path: path.to_owned(),
+            file: None,
+        })
+    };
+    #[cfg(debug_assertions)]
+    if let Some(mode) = std::env::var_os("CLINKER_TEST_LINEAGE_SINK").and_then(|mode| {
+        match mode.to_string_lossy().as_ref() {
+            "permission-denied" => Some(QualificationLineageSinkMode::PermissionDenied),
+            "write-failed" => Some(QualificationLineageSinkMode::WriteFailed),
+            "write-failed-after-record" => {
+                Some(QualificationLineageSinkMode::WriteFailedAfterRecord)
+            }
+            "write-failed-mid-record" => Some(QualificationLineageSinkMode::WriteFailedMidRecord),
+            "flush-failed" => Some(QualificationLineageSinkMode::FlushFailed),
+            "hang-after-first-write" => Some(QualificationLineageSinkMode::HangAfterFirstWrite),
+            _ => None,
+        }
+    }) {
+        return Box::new(QualificationLineageSink {
+            inner: sink,
+            mode,
+            blocked: false,
+            writes: 0,
+        });
+    }
+    sink
+}
+
+fn lineage_start_facts(start: &RunLifecycleStartFacts) -> clinker_lineage::RunLifecycleStartFacts {
+    let fingerprint = start.fingerprint();
+    clinker_lineage::RunLifecycleStartFacts {
+        batch_id: start.batch_id().to_owned(),
+        execution_id: start.execution_id().to_owned(),
+        plan_fingerprint_algorithm: fingerprint.algorithm().to_owned(),
+        plan_fingerprint_version: fingerprint.version(),
+        plan_fingerprint_digest: clinker_exec::output::sidecar::hash_to_hex(&fingerprint.digest()),
+        event_time: start
+            .started_at()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    }
+}
+
+fn lineage_lifecycle_facts(
+    snapshot: &RunLifecycleSnapshot,
+) -> Result<clinker_lineage::RunLifecycleFacts, PipelineError> {
+    let terminal = snapshot.terminal().ok_or_else(|| PipelineError::Internal {
+        op: "lineage lifecycle snapshot",
+        node: "pipeline".to_owned(),
+        detail: "terminal facts are unavailable".to_owned(),
+    })?;
+    let outcome = match terminal.outcome() {
+        RunTerminalOutcome::Complete => clinker_lineage::Terminal::Complete,
+        RunTerminalOutcome::Abort => clinker_lineage::Terminal::Abort,
+        RunTerminalOutcome::Fail(failure) => clinker_lineage::Terminal::Fail {
+            failure: failure.clone(),
+        },
+    };
+    let counts = terminal.measured_counts();
+    Ok(clinker_lineage::RunLifecycleFacts {
+        start: lineage_start_facts(snapshot.start()),
+        terminal: clinker_lineage::RunLifecycleTerminalFacts {
+            event_time: terminal
+                .finished_at()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            outcome,
+            stats: counts.map(|counts| clinker_lineage::RunStats {
+                records_read: counts.records_read,
+                records_written: counts.records_written,
+                records_dlq: counts.records_dlq,
+                duration_ms: terminal.duration_ms(),
+            }),
+        },
+    })
+}
+
+fn lifecycle_error(error: impl std::fmt::Display) -> PipelineError {
+    PipelineError::Internal {
+        op: "run lifecycle facts",
+        node: "pipeline".to_owned(),
+        detail: error.to_string(),
+    }
+}
+
+fn lifecycle_admission_error(error: LifecycleFactsError) -> PipelineError {
+    match error {
+        LifecycleFactsError::InvalidBatchId => PipelineError::Config(
+            clinker_plan::config::ConfigError::Validation(error.to_string()),
+        ),
+        LifecycleFactsError::InvalidExecutionId | LifecycleFactsError::TerminalAlreadyRecorded => {
+            lifecycle_error(error)
+        }
+    }
 }
 
 /// Map a comprehensive run-startup storage-validation failure onto the
@@ -1645,7 +3006,7 @@ fn publication_error_category(error: &clinker_exec::output::attempt::AttemptErro
     }
 }
 
-fn run(args: &RunArgs) -> Result<u8, PipelineError> {
+fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineError> {
     // Resolve CLINKER_ENV
     if let Some(env_name) = args
         .env
@@ -1678,6 +3039,16 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // same resolved root the validator re-derives.
     let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
         .map_err(storage_config_error)?;
+    let observability_policy = clinker_toml
+        .resolve_observability(None)
+        .map_err(observability_configuration_error)?;
+    let mut otlp_runtime = observability::OtlpRuntimeBundle::admit(&observability_policy)
+        .map_err(observability_configuration_error)?;
+    let lineage_configuration = if args.lineage.is_some() || args.lineage_events.is_some() {
+        Some(resolve_cli_lineage_configuration(&observability_policy)?)
+    } else {
+        None
+    };
     let group_layout = clinker_toml.group.clone();
     let catalog_config = clinker_toml.catalog.clone();
     let storage_config = clinker_toml.storage;
@@ -1872,8 +3243,13 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // provenance sidecar. Generated before --explain so resolved-path
     // summaries match the values the actual run would use. The id pair
     // re-rolls per invocation; consumers correlate runs via batch_id.
-    let execution_id = uuid::Uuid::now_v7().to_string();
-    let batch_id = args.resolved_batch_id();
+    let execution_id = machine.map_or_else(
+        || uuid::Uuid::now_v7().to_string(),
+        |emitter| emitter.execution_id(),
+    );
+    let batch_id = machine.map_or_else(|| args.resolved_batch_id(), |emitter| emitter.batch_id());
+    let correlation_identity = RunCorrelationIdentity::new(batch_id.clone(), execution_id.clone())
+        .map_err(lifecycle_admission_error)?;
     let pipeline_hash = pipeline_config.source_hash;
     let timestamp_str = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
     let mut source_name_by_node: std::collections::HashMap<String, String> =
@@ -1960,9 +3336,29 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     ),
                 )
             })?;
-        if let Some(res) = &overlay_resolution {
+        let effective_runtime_variables = if let Some(res) = &overlay_resolution {
             let overlay = res.apply_config_and_vars(&mut compiled_plan, &pipeline_config);
             abort_on_overlay_errors(&overlay)?;
+            clinker_plan::plan::EffectiveRuntimeVariables {
+                static_vars: overlay.static_vars,
+                pipeline_vars: overlay.pipeline_vars,
+                source_vars: overlay.source_vars,
+                record_vars: overlay.record_vars,
+            }
+        } else {
+            clinker_plan::plan::EffectiveRuntimeVariables::default()
+        };
+        if let Some(emitter) = machine {
+            let fingerprint = compiled_plan
+                .semantic_fingerprint_with_runtime_variables(&effective_runtime_variables)
+                .map_err(|error| PipelineError::Internal {
+                    op: "machine semantic fingerprint",
+                    node: "pipeline".to_owned(),
+                    detail: error.to_string(),
+                })?;
+            emitter
+                .emit_plan_resolved(fingerprint)
+                .map_err(PipelineError::Io)?;
         }
         let dag = compiled_plan.dag();
         let statistics = compiled_plan.statistics();
@@ -2085,28 +3481,117 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 plan_line_anchors_trusted(cfg, overlay_contributed(overlay_resolution.as_ref())),
             )
         })?;
-        if let Some(res) = &overlay_resolution {
+        let effective_runtime_variables = if let Some(res) = &overlay_resolution {
             let overlay = res.apply_config_and_vars(&mut compiled_plan, cfg);
             abort_on_overlay_errors(&overlay)?;
+            clinker_plan::plan::EffectiveRuntimeVariables {
+                static_vars: overlay.static_vars,
+                pipeline_vars: overlay.pipeline_vars,
+                source_vars: overlay.source_vars,
+                record_vars: overlay.record_vars,
+            }
+        } else {
+            clinker_plan::plan::EffectiveRuntimeVariables::default()
+        };
+        let lineage = build_cli_lineage(
+            &compiled_plan,
+            &lineage_configuration
+                .as_ref()
+                .expect("lineage configuration is resolved whenever --lineage is set")
+                .identity,
+            &lineage_base_dir,
+        )?;
+
+        let fingerprint = compiled_plan
+            .semantic_fingerprint_with_runtime_variables(&effective_runtime_variables)
+            .map_err(|error| PipelineError::Internal {
+                op: "run semantic fingerprint",
+                node: "pipeline".to_owned(),
+                detail: error.to_string(),
+            })?;
+        if let Some(emitter) = machine
+            && let Err(error) = emitter.emit_plan_resolved(fingerprint)
+        {
+            // The same required record, at the same point, as the run path's
+            // `plan_resolved`: the supervisor will never see this run's
+            // outcome and nothing has been written yet, so the run stops
+            // before it can produce one. Reporting infrastructure here
+            // instead would classify one condition two ways depending only on
+            // whether the invocation was asked for a document or a run.
+            tracing::warn!(error = %error, "machine lifecycle record failed before the plan-only export");
+            return Err(PipelineError::Interrupted);
         }
 
-        let lineage = clinker_lineage::column_lineage(&compiled_plan, &lineage_base_dir);
         let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
         let job = clinker_lineage::Job::for_pipeline(cfg.pipeline.name.clone(), source_hash);
-        let event_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let events = clinker_lineage::run_events(&lineage, &execution_id, job, &event_time);
+        let started_at = chrono::Utc::now();
+        let lifecycle =
+            RunLifecycleFacts::new(correlation_identity.clone(), fingerprint, started_at);
+        lifecycle
+            .record_terminal(
+                started_at,
+                RunTerminalOutcome::Complete,
+                // A plan-only export runs nothing, so there are no counts to
+                // report and zeros would claim it ran and read nothing.
+                None,
+            )
+            .map_err(lifecycle_error)?;
+        let lifecycle_snapshot = lineage_lifecycle_facts(&lifecycle.snapshot())?;
+        let events = clinker_lineage::run_events(&lineage, job, &lifecycle_snapshot);
 
-        let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
-            Box::new(std::io::stdout().lock())
+        let configuration = lineage_configuration
+            .as_ref()
+            .expect("lineage configuration is resolved whenever --lineage is set");
+        if let Some(delivery_config) = configuration.delivery {
+            let delivery = clinker_lineage::LineageDelivery::start(
+                delivery_config,
+                external_lineage_sink(path),
+            )
+            .map_err(lineage_worker_start_error)?;
+            truncate_lineage_destination("--lineage", path)?;
+            let mut rejected = Vec::new();
+            for (index, event) in events.iter().enumerate() {
+                match delivery.try_emit(event) {
+                    clinker_lineage::LineageAdmission::Accepted => {}
+                    admission => rejected.push((index, admission)),
+                }
+            }
+            let outcome = delivery.finish();
+            report_lineage_delivery(outcome);
+            // Unlike `--lineage-events`, which is a bulkhead alongside a real
+            // run, this export IS the invocation. An unwritten or partial
+            // export that still exits 0 leaves a CI step uploading a stale
+            // file from a previous run, or none at all.
+            if let Some(error) = lineage_export_failure(path, events.len(), &rejected, outcome) {
+                return Err(error);
+            }
         } else {
-            Box::new(std::fs::File::create(path).map_err(|e| {
-                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                    "cannot open --lineage output {}: {e}",
-                    path.display()
-                )))
-            })?)
-        };
-        clinker_lineage::write_ndjson(&events, writer).map_err(PipelineError::Io)?;
+            let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
+                Box::new(std::io::stdout().lock())
+            } else {
+                Box::new(
+                    std::fs::File::create(path)
+                        .map_err(|e| lineage_open_error("--lineage", path, &e))?,
+                )
+            };
+            clinker_lineage::write_ndjson(&events, writer).map_err(PipelineError::Io)?;
+        }
+        // A plan-only export runs no attempt, so it says so explicitly rather
+        // than leaving the terminal's inventory absent — an omission the
+        // contract's success row reads as publication complete, and which the
+        // reference adapter reads as a stream it cannot accept.
+        //
+        // The document is written and flushed above, so by here this
+        // invocation has published everything it was going to publish. A
+        // refused terminal is a fault on the reporting channel and is raised
+        // as one — the same failure the run path raises for a published
+        // attempt — rather than as a transient runtime fault whose advice
+        // would ask a supervisor to re-run an export that already exists.
+        if let Some(emitter) = machine {
+            emitter
+                .emit_completed_without_attempt()
+                .map_err(unreportable_outcome_error)?;
+        }
         return Ok(0);
     }
 
@@ -2193,6 +3678,50 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         channel_record_vars.extend(overlay.record_vars);
     }
 
+    // Resolve every emitted source/output identity before discovery, staging,
+    // publication-attempt creation, or lineage-sink opening. A missing or
+    // ambiguous external binding is an admission failure, not a mid-run event.
+    let mut live_lineage = if args.lineage_events.is_some() {
+        Some(build_cli_lineage(
+            &compiled_plan,
+            &lineage_configuration
+                .as_ref()
+                .expect("lineage configuration is resolved whenever --lineage-events is set")
+                .identity,
+            &lineage_base_dir,
+        )?)
+    } else {
+        None
+    };
+
+    let effective_runtime_variables = clinker_plan::plan::EffectiveRuntimeVariables {
+        static_vars: channel_static_vars,
+        pipeline_vars: channel_pipeline_vars,
+        source_vars: channel_source_vars,
+        record_vars: channel_record_vars,
+    };
+
+    let semantic_fingerprint = compiled_plan
+        .semantic_fingerprint_with_runtime_variables(&effective_runtime_variables)
+        .map_err(|error| PipelineError::Internal {
+            op: "run semantic fingerprint",
+            node: "pipeline".to_owned(),
+            detail: error.to_string(),
+        })?;
+    if let Some(emitter) = machine {
+        // Required records, and nothing has been staged or published yet. An
+        // I/O failure here is not infrastructure to report as such: it is a
+        // supervisor that will never see this run's outcome, so the run stops
+        // before it can publish one, which is what 130 says.
+        if let Err(error) = emitter
+            .emit_plan_resolved(semantic_fingerprint)
+            .and_then(|()| emitter.emit_progress_transition("executing"))
+        {
+            tracing::warn!(error = %error, "machine lifecycle record failed before execution");
+            return Err(PipelineError::Interrupted);
+        }
+    }
+
     if args.dry_run && args.dry_run_n.is_none() {
         // Compile-validation mode (no -n): the plan and any channel/group
         // overlay are fully checked, but runtime source discovery, reader and
@@ -2205,6 +3734,168 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             pipeline_config.transform_node_count(),
         );
         return Ok(0);
+    }
+
+    // Construct every optional worker before discovery, staging, publication
+    // attempts, sink writes, or lifecycle START. A capability failure is an
+    // admission error; a worker that starts successfully remains an optional
+    // bulkhead whose later delivery outcome cannot redefine run truth.
+    let shutdown_token = machine.map_or_else(
+        clinker_exec::pipeline::shutdown::ShutdownToken::new,
+        MachineEmitter::shutdown_token,
+    );
+    let machine_progress = machine
+        .map(MachineEmitter::start_execution_progress)
+        .transpose()
+        .map_err(PipelineError::Io)?;
+    let telemetry_handles = otlp_runtime
+        .as_ref()
+        .map(|runtime| runtime.reserve_arena(&observability_policy))
+        .transpose()
+        .map_err(observability_delivery_error)?;
+    // The exporter names this run on every envelope it ships, including the
+    // metrics and spans a pipeline produces whether or not it authors any `log:`
+    // directives. Bounded here in the spelling the log records already use, so
+    // one run reads the same across all three signals.
+    let telemetry_correlation = clinker_exec::telemetry::RunCorrelation::bounded(
+        &execution_id,
+        &batch_id,
+        &pipeline_config.pipeline.name,
+    );
+    let (telemetry_producer, mut otlp_worker) = match (otlp_runtime.take(), telemetry_handles) {
+        (Some(runtime), Some((producer, receiver))) => (
+            Some(producer),
+            Some(
+                observability::OtlpWorker::start(
+                    runtime,
+                    receiver,
+                    shutdown_token.clone(),
+                    telemetry_correlation,
+                )
+                .map_err(observability_delivery_error)?,
+            ),
+        ),
+        (None, None) => (None, None),
+        _ => {
+            return Err(PipelineError::Internal {
+                op: "observability runtime composition",
+                node: "pipeline".to_owned(),
+                detail: "admitted runtime and reserved telemetry arena disagree".to_owned(),
+            });
+        }
+    };
+    // Handed over as soon as the worker exists, so a terminal written on any
+    // path between here and the flush still reports what had been delivered.
+    // Pushing the summary only at the flush left exactly the early failures —
+    // the ones an operator most needs to interpret — with no field at all.
+    if let (Some(emitter), Some(worker)) = (machine, otlp_worker.as_ref()) {
+        emitter.attach_observability_progress(worker.progress_handle());
+    }
+    // The arena, on the same terms and for the same reason. `finish_otlp_delivery`
+    // runs only on the paths that reach a recorded terminal, and every early
+    // return between here and the executor — storage validation, a lineage
+    // destination that will not open, a source that does not resolve — bypassed
+    // it. The terminal then omitted `observability.admission` entirely, which the
+    // field defines as "no arena was reserved" for a run that had reserved one.
+    // Handing the arena over here is what makes the accounting unskippable.
+    if let (Some(emitter), Some(producer)) = (machine, telemetry_producer.as_ref()) {
+        emitter.attach_observability_arena(producer.clone());
+    }
+    let mut lineage_output: Option<LiveLineageOutput> = None;
+    if let Some(path) = &args.lineage_events {
+        let configuration = lineage_configuration
+            .as_ref()
+            .expect("lineage configuration is resolved whenever --lineage-events is set");
+        if let Some(delivery_config) = configuration.delivery {
+            let lineage = live_lineage
+                .take()
+                .expect("live lineage is preflighted whenever --lineage-events is set");
+            let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
+            let job = clinker_lineage::Job::for_pipeline(
+                pipeline_config.pipeline.name.clone(),
+                source_hash,
+            );
+            let sink = LiveLineageSink::External(
+                clinker_lineage::LineageDelivery::start(
+                    delivery_config,
+                    external_lineage_sink(path),
+                )
+                .map_err(lineage_worker_start_error)?,
+            );
+            truncate_lineage_destination("--lineage-events", path)?;
+            lineage_output = Some(LiveLineageOutput {
+                sink,
+                lineage,
+                job,
+                started: false,
+                start_facts: None,
+                terminal_emitted: false,
+                refused_terminal: None,
+            });
+        } else {
+            // The local-diagnostic sink is a file the run opens, so refusing it
+            // is an admission failure like any other worker's. Opening it here
+            // rather than after discovery means an unwritable destination stops
+            // the run before it has copied a staged source or created a
+            // publication attempt it would then have to abandon.
+            let lineage = live_lineage
+                .take()
+                .expect("live lineage is preflighted whenever --lineage-events is set");
+            let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
+            let job = clinker_lineage::Job::for_pipeline(
+                pipeline_config.pipeline.name.clone(),
+                source_hash,
+            );
+            let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
+                // Unlocked stdout handle: locking per write avoids deadlocking the run's
+                // own stdout prints (the spill-volume summary and completion line).
+                Box::new(std::io::stdout())
+            } else {
+                // Emptied here, when the run is admitted, rather than at its
+                // first event. A destination this run was handed is this run's
+                // to overwrite, and holding the previous run's events until the
+                // first write means a run that fails before emitting anything
+                // leaves a file whose COMPLETE terminal belongs to a different
+                // run — which a catalogue reads as this one having succeeded.
+                // An empty file cannot be misread that way.
+                // A pipe or device is opened by the first write instead, on
+                // the thread that does the writing, because opening one here
+                // would block admission until a reader attached. Everything
+                // else — including a symlink to a regular file — is opened
+                // now, which is what proves the destination writable before
+                // the run stages anything. Sending a directory or an unwritable
+                // path down the lazy path instead would produce a green run
+                // that exported nothing.
+                match std::fs::metadata(path) {
+                    // Neither a file nor a directory: a pipe, socket, or
+                    // device, whose open is what can block. A directory is
+                    // excluded deliberately — it is also "not a file", and
+                    // letting it defer produced a run that exited 0 having
+                    // exported nothing, because every later write failed with
+                    // EISDIR and lineage write failures are only reported.
+                    // Opening it here is what refuses it.
+                    Ok(metadata) if !metadata.is_file() && !metadata.is_dir() => {
+                        Box::new(LazyLineageFile {
+                            path: path.clone(),
+                            file: None,
+                        })
+                    }
+                    _ => Box::new(
+                        std::fs::File::create(path)
+                            .map_err(|e| lineage_open_error("--lineage-events", path, &e))?,
+                    ),
+                }
+            };
+            lineage_output = Some(LiveLineageOutput {
+                sink: LiveLineageSink::LocalDiagnostic(writer),
+                lineage,
+                job,
+                started: false,
+                start_facts: None,
+                terminal_emitted: false,
+                refused_terminal: None,
+            });
+        }
     }
 
     // Discovery pre-pass: resolve every File source's matcher to its file set
@@ -2654,113 +4345,125 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         output_staging: output_staging.clone(),
         auto_commit_staged: false,
     };
-    // Fresh per-run shutdown token. `ShutdownToken::new()` auto-registers
-    // with the process-wide signal-handler registry installed in `main`,
-    // so a SIGINT/SIGTERM during the run trips it; the executor polls it
-    // at operator chunk boundaries and unwinds gracefully.
-    let shutdown_token = clinker_exec::pipeline::shutdown::ShutdownToken::new();
     let run_params = clinker_exec::executor::PipelineRunParams {
         execution_id: execution_id.clone(),
         batch_id: batch_id.clone(),
-        pipeline_vars: channel_pipeline_vars,
-        static_vars: channel_static_vars,
-        source_vars: channel_source_vars,
-        record_vars: channel_record_vars,
+        pipeline_vars: effective_runtime_variables.pipeline_vars,
+        static_vars: effective_runtime_variables.static_vars,
+        source_vars: effective_runtime_variables.source_vars,
+        record_vars: effective_runtime_variables.record_vars,
+        telemetry_producer: telemetry_producer.clone(),
         shutdown_token: Some(shutdown_token.clone()),
         spill_root_dir: spill_root_dir.clone(),
         spill_disk_cap_bytes,
         spill_compress: storage_config.spill.compress,
     };
-    // Live run-lifecycle lineage (--lineage-events). Unlike --lineage (a static,
-    // plan-only export that exits before reading data), this rides the actual run:
-    // build the plan-derived column lineage once from the overlaid `compiled_plan`,
-    // open the NDJSON sink, and emit a START now — before the executor runs — so a
-    // mid-run crash still leaves an observable open run. The terminal
-    // COMPLETE/FAIL/ABORT is emitted at the run boundaries below; the emitter's
-    // Drop closes any started-but-unterminated run out as FAIL, covering the
-    // early-return output-commit paths between here and the success terminal.
-    let mut lineage_emitter: Option<clinker_lineage::LiveRunEmitter<Box<dyn std::io::Write>>> =
-        None;
-    let mut lineage_started_at: Option<chrono::DateTime<chrono::Utc>> = None;
-    if let Some(path) = &args.lineage_events {
-        let lineage = clinker_lineage::column_lineage(&compiled_plan, &lineage_base_dir);
-        let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
-        let job =
-            clinker_lineage::Job::for_pipeline(pipeline_config.pipeline.name.clone(), source_hash);
-        let started_at = chrono::Utc::now();
-        let start_time = started_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
-            // Unlocked stdout handle: locking per write avoids deadlocking the run's
-            // own stdout prints (the spill-volume summary and completion line).
-            Box::new(std::io::stdout())
-        } else {
-            Box::new(std::fs::File::create(path).map_err(|e| {
-                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                    "cannot open --lineage-events output {}: {e}",
-                    path.display()
-                )))
-            })?)
-        };
-        let mut emitter = clinker_lineage::LiveRunEmitter::new(
-            writer,
-            lineage,
-            job,
-            execution_id.clone(),
-            start_time,
-        );
-        emitter.emit_start().map_err(PipelineError::Io)?;
-        lineage_started_at = Some(started_at);
-        lineage_emitter = Some(emitter);
+    // One CLI-owned fact source starts immediately before the finite executor.
+    // Optional lineage receives only bounded owned snapshots from it; the sink
+    // has no terminal authority and cannot mint or reconstruct correlation IDs.
+    let run_lifecycle = RunLifecycleFacts::new(
+        correlation_identity,
+        semantic_fingerprint,
+        chrono::Utc::now(),
+    );
+    // The START is offered, and whether it lands is the sink's business. A
+    // lineage event that could not be written is reported on stderr and in the
+    // delivery summary; it does not decide whether this run executes.
+    if let Some(output) = lineage_output.as_mut() {
+        output.emit_start(&run_lifecycle.start_snapshot());
     }
 
     // The executor recompiles `compiled_plan.config()` — already the effective,
     // post-overlay config — so the context it recompiles under must NOT carry
     // the overlay ops again (they would double-apply and collide). For a plain
     // run this is identical to `compile_ctx.clone()` (the op stream is empty).
-    let mut report = match PipelineExecutor::run_plan_with_readers_writers_in_context(
+    let execution_result = PipelineExecutor::run_plan_with_readers_writers_in_context(
         &compiled_plan,
         readers,
         registry,
         &run_params,
         compile_ctx.without_overlay_ops(),
-    ) {
+    );
+    // The periodic worker only ever writes discardable observations. A lost
+    // snapshot is not run-controlling evidence: the protocol's required
+    // records are the lifecycle transitions and the terminal, and those still
+    // fail closed below. Treating an advisory write error as an interruption
+    // would abandon a run that finished, discard its staged output, and report
+    // 130 for a run nothing cancelled.
+    if let Some(error) = machine_progress.and_then(|worker| worker.finish().err()) {
+        tracing::warn!(error = %error, "machine progress channel failed");
+    }
+    let mut report = match execution_result {
         Ok(report) => report,
         Err(e) => {
-            // Live lineage: the executor failed — close the run out as FAIL with the
-            // error message before propagating. Best-effort: a lineage-sink write
-            // failure must not mask the real pipeline error.
-            if let Some(emitter) = lineage_emitter.as_mut() {
-                let now = chrono::Utc::now();
-                let duration_ms = lineage_started_at
-                    .map(|s| (now - s).num_milliseconds().max(0))
-                    .unwrap_or(0);
-                let event_time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                let stats = clinker_lineage::RunStats {
-                    duration_ms,
-                    ..Default::default()
-                };
-                if let Err(err) = emitter.emit_terminal(
-                    &event_time,
-                    clinker_lineage::Terminal::Fail {
-                        error: e.to_string(),
-                    },
-                    stats,
-                ) {
-                    tracing::warn!(error = %err, "failed to write FAIL lineage event");
-                }
-            }
             // A failed run keeps its staged copies so the operator can inspect
             // the exact inputs the failure saw (cleanup = on_success); only
             // cleanup = always reaps them on failure.
             source_stager.cleanup(false);
-            run_attempt.abandon().map_err(|attempt_error| {
-                PipelineError::Io(std::io::Error::other(format!(
+            // A source cancelled mid-read reports whatever its transport
+            // produced: a file source drains and returns a report flagged
+            // interrupted, while a socket read unwinds with the transport's own
+            // I/O error. Both are one operator action, so normalize before the
+            // outcome is derived — otherwise the same cancellation is an
+            // infrastructure failure or a cancellation depending on which
+            // source noticed first, and under load that varies run to run.
+            //
+            // A signal arriving while the run was already failing for its own
+            // reasons is not that case, and the error keeps its identity.
+            let e = if shutdown_token.is_requested() && is_cancelled_transport_error(&e) {
+                tracing::warn!(error = %e, "cancelled run unwound through a transport error");
+                PipelineError::Interrupted
+            } else {
+                e
+            };
+            let terminal_error = match run_attempt.abandon() {
+                Ok(()) => e,
+                Err(attempt_error) => PipelineError::Io(std::io::Error::other(format!(
                     "pipeline failed and attempt state could not be persisted: {attempt_error}"
-                )))
-            })?;
-            return Err(e);
+                ))),
+            };
+            run_lifecycle
+                .record_terminal(
+                    chrono::Utc::now(),
+                    // A source that surfaces the tripped shutdown token as an
+                    // error — a REST read cancelled mid-page — unwinds through
+                    // here rather than through `report.interrupted`. The same
+                    // operator SIGTERM against a file source records ABORT, and
+                    // one signal must not produce two different lineage
+                    // terminals depending on which source observed it.
+                    run_terminal_outcome(&terminal_error),
+                    // Execution returned an error rather than a report, so no
+                    // counts were observed. Reporting zeros here told a
+                    // catalogue that a run which failed at four million records
+                    // had read none of them.
+                    None,
+                )
+                .map_err(lifecycle_error)?;
+            if let Some(output) = lineage_output.as_mut()
+                && let Err(err) = output.emit_terminal(&run_lifecycle.snapshot())
+            {
+                tracing::warn!(error = %err, "failed to write FAIL lineage event");
+            }
+            finish_otlp_delivery(
+                &mut otlp_worker,
+                telemetry_producer.as_ref(),
+                &run_lifecycle,
+                machine,
+            );
+            finish_live_lineage(&mut lineage_output);
+            return Err(terminal_error);
         }
     };
+
+    if let Some(emitter) = machine
+        && let Err(error) = emitter.emit_progress_transition("finalizing")
+    {
+        tracing::warn!(error = %error, "machine finalization transition failed");
+        // A required lifecycle record the supervisor will never see. Fail
+        // closed at the last point before staged output becomes visible:
+        // never publish an attempt whose outcome cannot be reported.
+        report.interrupted = true;
+    }
 
     let counters = &report.counters;
     let dlq_entries = &report.dlq_entries;
@@ -2880,24 +4583,75 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     })();
     if let Err(error) = publication_preparation {
         source_stager.cleanup(false);
-        run_attempt.abandon().map_err(|attempt_error| {
-            PipelineError::Io(std::io::Error::other(format!(
+        let terminal_error = match run_attempt.abandon() {
+            Ok(()) => error,
+            Err(attempt_error) => PipelineError::Io(std::io::Error::other(format!(
                 "publication preparation failed and attempt state could not be persisted: {attempt_error}"
-            )))
-        })?;
-        return Err(error);
+            ))),
+        };
+        run_lifecycle
+            .record_terminal(
+                chrono::Utc::now(),
+                RunTerminalOutcome::Fail(classify_pipeline_error(&terminal_error)),
+                Some(RunCountFacts {
+                    records_read: counters.total_count,
+                    records_written: counters.records_written,
+                    records_dlq: counters.dlq_count,
+                }),
+            )
+            .map_err(lifecycle_error)?;
+        if let Some(output) = lineage_output.as_mut()
+            && let Err(lineage_error) = output.emit_terminal(&run_lifecycle.snapshot())
+        {
+            tracing::warn!(error = %lineage_error, "failed to write FAIL lineage event");
+        }
+        finish_otlp_delivery(
+            &mut otlp_worker,
+            telemetry_producer.as_ref(),
+            &run_lifecycle,
+            machine,
+        );
+        finish_live_lineage(&mut lineage_output);
+        return Err(terminal_error);
     }
 
     let mut publication_failure: Option<String> = None;
+    let mut publication_failure_code: Option<&'static str> = None;
+    let mut publication_outcome = None;
     if report.interrupted {
-        run_attempt.abandon().map_err(|error| {
-            PipelineError::Io(std::io::Error::other(format!(
+        if let Err(error) = run_attempt.abandon() {
+            let error = PipelineError::Io(std::io::Error::other(format!(
                 "interrupted attempt state could not be persisted: {error}"
-            )))
-        })?;
+            )));
+            run_lifecycle
+                .record_terminal(
+                    chrono::Utc::now(),
+                    RunTerminalOutcome::Fail(classify_pipeline_error(&error)),
+                    Some(RunCountFacts {
+                        records_read: counters.total_count,
+                        records_written: counters.records_written,
+                        records_dlq: counters.dlq_count,
+                    }),
+                )
+                .map_err(lifecycle_error)?;
+            if let Some(output) = lineage_output.as_mut()
+                && let Err(lineage_error) = output.emit_terminal(&run_lifecycle.snapshot())
+            {
+                tracing::warn!(error = %lineage_error, "failed to write FAIL lineage event");
+            }
+            finish_otlp_delivery(
+                &mut otlp_worker,
+                telemetry_producer.as_ref(),
+                &run_lifecycle,
+                machine,
+            );
+            finish_live_lineage(&mut lineage_output);
+            return Err(error);
+        }
     } else {
         match run_attempt.mark_all_ready() {
             Err(_) => {
+                publication_failure_code = Some("attempt.publication.finalization_failed");
                 if run_attempt.abandon().is_err() {
                     publication_failure = Some(publication_failure_diagnostic(
                         &execution_id,
@@ -2910,39 +4664,56 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     ));
                 }
             }
-            Ok(()) => match run_attempt.publish_run(&output_staging, &shutdown_token) {
+            Ok(()) => {
+                if let Some(emitter) = machine
+                    && let Err(error) = emitter.emit_progress_transition("publishing")
+                {
+                    // The emitter trips the run's shutdown token on a failed
+                    // write, and `publish_run` polls that token before the
+                    // first final rename, so this failure still fails closed
+                    // through the cancellation gate below.
+                    tracing::warn!(error = %error, "machine publication transition failed");
+                }
+                match run_attempt.publish_run(&output_staging, &shutdown_token) {
                 Ok(None) => report.interrupted = true,
-                Ok(Some(clinker_exec::output::attempt::AttemptPublicationOutcome::Complete {
+                Ok(Some(outcome @ clinker_exec::output::attempt::AttemptPublicationOutcome::Complete {
                     cleanup_debt_count: 0,
                     ..
-                })) => {}
-                Ok(Some(clinker_exec::output::attempt::AttemptPublicationOutcome::Complete {
+                })) => publication_outcome = Some(outcome),
+                Ok(Some(outcome @ clinker_exec::output::attempt::AttemptPublicationOutcome::Complete {
                     cleanup_debt_count,
                     ..
                 })) => {
+                    publication_failure_code = Some("attempt.publication.finalization_failed");
                     publication_failure = Some(publication_failure_diagnostic(
                         &execution_id,
                         PublicationFailureKind::CleanupDebt(cleanup_debt_count),
                     ));
+                    publication_outcome = Some(outcome);
                 }
-                Ok(Some(
-                    clinker_exec::output::attempt::AttemptPublicationOutcome::Incomplete {
-                        cleanup_debt_count,
-                        ..
-                    },
-                )) => {
+                Ok(Some(outcome @ clinker_exec::output::attempt::AttemptPublicationOutcome::Incomplete {
+                    cleanup_debt_count,
+                    ..
+                })) => {
+                    publication_failure_code = Some("attempt.publication.promotion_failed");
                     publication_failure = Some(publication_failure_diagnostic(
                         &execution_id,
                         PublicationFailureKind::Incomplete(cleanup_debt_count),
                     ));
+                    publication_outcome = Some(outcome);
                 }
                 Err(error) => {
+                    publication_failure_code = Some("attempt.publication.promotion_failed");
                     publication_failure = Some(publication_failure_diagnostic(
                         &execution_id,
-                        PublicationFailureKind::Publish(publication_error_category(&error)),
+                        PublicationFailureKind::Publish(publication_error_category(
+                            error.source_error(),
+                        )),
                     ));
+                    publication_outcome = Some(error.outcome().clone());
                 }
-            },
+                }
+            }
         }
     }
 
@@ -2963,7 +4734,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // each stage's real spilled bytes against the pre-run `--explain` per-stage
     // estimate (the calibration loop #176 exists for). Printed only when a stage
     // actually spilled; a run that stayed in memory adds no noise.
-    if !report.per_stage_spill_bytes.is_empty() {
+    if machine.is_none() && !report.per_stage_spill_bytes.is_empty() {
         println!("=== Spill Volume (actual, per stage) ===");
         for (stage, bytes) in &report.per_stage_spill_bytes {
             println!("  {stage} → {bytes} bytes");
@@ -2997,37 +4768,40 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         0
     };
 
-    // Live lineage: the run finished — close it out at the true run boundary
-    // (outputs persisted, DLQ written). An interrupted drain is an ABORT; every
-    // other outcome — including a DLQ-partial success — is a COMPLETE, so the
-    // column-lineage facets and the run's final row counts ride the terminal
-    // event. Best-effort: a lineage-sink write failure must not fail a run whose
-    // data outputs are already committed.
-    if let Some(emitter) = lineage_emitter.as_mut() {
-        let stats = clinker_lineage::RunStats {
-            records_read: counters.total_count,
-            records_written: counters.records_written,
-            records_dlq: counters.dlq_count,
-            duration_ms: (report.finished_at - report.started_at)
-                .num_milliseconds()
-                .max(0),
-        };
-        let outcome = if report.interrupted {
-            clinker_lineage::Terminal::Abort
-        } else if let Some(error) = &publication_failure {
-            clinker_lineage::Terminal::Fail {
-                error: error.clone(),
-            }
-        } else {
-            clinker_lineage::Terminal::Complete
-        };
-        let event_time = report
-            .finished_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        if let Err(err) = emitter.emit_terminal(&event_time, outcome, stats) {
-            tracing::warn!(error = %err, "failed to write terminal lineage event");
-        }
+    // Record the one authoritative terminal snapshot at the publication boundary.
+    let lifecycle_outcome = if report.interrupted {
+        RunTerminalOutcome::Abort
+    } else if let Some(code) = publication_failure_code {
+        RunTerminalOutcome::Fail(
+            FailureClassification::for_code(code)
+                .expect("publication failures use registered codes"),
+        )
+    } else {
+        RunTerminalOutcome::Complete
+    };
+    run_lifecycle
+        .record_terminal(
+            chrono::Utc::now(),
+            lifecycle_outcome,
+            Some(RunCountFacts {
+                records_read: counters.total_count,
+                records_written: counters.records_written,
+                records_dlq: counters.dlq_count,
+            }),
+        )
+        .map_err(lifecycle_error)?;
+    finish_otlp_delivery(
+        &mut otlp_worker,
+        telemetry_producer.as_ref(),
+        &run_lifecycle,
+        machine,
+    );
+    if let Some(output) = lineage_output.as_mut()
+        && let Err(err) = output.emit_terminal(&run_lifecycle.snapshot())
+    {
+        tracing::warn!(error = %err, "failed to write terminal lineage event");
     }
+    finish_live_lineage(&mut lineage_output);
 
     // Staging cleanup, keyed on a clean exit. A zero exit code is the
     // "exited cleanly" signal `cleanup = on_success` removes after; an
@@ -3094,6 +4868,31 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 exit_code = execution_metrics.exit_code,
                 "metrics spool write failed — emitting inline"
             );
+        }
+    }
+
+    if let Some(emitter) = machine {
+        let terminal_result = if let Some(code) = publication_failure_code {
+            let failure = FailureClassification::for_code(code)
+                .expect("publication failures use registered codes");
+            emitter.emit_failed_with_publication(exit_code, &failure, publication_outcome.as_ref())
+        } else {
+            emitter.emit_completed_with_publication(exit_code, publication_outcome.as_ref())
+        };
+        if let Err(error) = terminal_result {
+            if report.interrupted {
+                // Nothing was published, so the unwritable terminal does not
+                // change what happened to the data: the run is still the
+                // cancellation it already concluded it was.
+                tracing::warn!(error = %error, "machine terminal write failed for an unpublished run");
+            } else if publication_failure.is_none() {
+                // The run published. What failed is the report of it, so the
+                // failure it raises says exactly that and carries advice a
+                // supervisor can act on without re-running live outputs.
+                return Err(unreportable_outcome_error(error));
+            } else {
+                tracing::warn!(error = %error, "machine terminal write failed after publication failure");
+            }
         }
     }
 
@@ -6141,6 +7940,200 @@ fn diag_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A signal arriving mid-failure must not erase the failure.
+    ///
+    /// Only a source cancelled inside a transport read is normalized to a
+    /// cancellation. A run already unwinding a data or resource defect keeps
+    /// it, because reporting that as a clean stop would have an orchestrator
+    /// re-queue a batch that will fail again the same way.
+    #[test]
+    fn a_signal_racing_a_real_failure_does_not_rewrite_it() {
+        let transport = PipelineError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "peer reset",
+        ));
+        assert!(
+            is_cancelled_transport_error(&transport),
+            "a cancelled socket read unwinds as the transport's own error"
+        );
+
+        assert!(
+            !is_cancelled_transport_error(&PipelineError::Io(std::io::Error::other(
+                "spill run decode failed during k-way merge"
+            ))),
+            "the engine stamps Other on its own wrapped defects; a pending signal does not absolve them"
+        );
+
+        for defect in [
+            PipelineError::SortOrderViolation {
+                message: "sort order violation at node `by_date`: row 41 precedes row 40"
+                    .to_owned(),
+            },
+            PipelineError::Interrupted,
+            PipelineError::Io(std::io::Error::from(std::io::ErrorKind::StorageFull)),
+            PipelineError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        ] {
+            assert!(
+                !is_cancelled_transport_error(&defect),
+                "{defect} must keep its own identity when a signal races it"
+            );
+        }
+    }
+
+    /// The registered message is what leaves the host, so it must never be the
+    /// error's own text: two rounds of shape-matching sanitizers let a record
+    /// value and then a relative path through.
+    #[test]
+    fn an_exported_classification_never_carries_the_run_error_text() {
+        let leaky = PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+            "output destination collision: producer \"a\" resolves to out/data.json".to_owned(),
+        ));
+        let classification = classify_pipeline_error(&leaky);
+        assert!(
+            !classification.message().contains("out/data.json"),
+            "an internal path must not reach the machine terminal or the lineage facet"
+        );
+        assert_eq!(
+            classification.message(),
+            clinker_core_types::FailureClassification::for_code(classification.code())
+                .expect("the arm selected a registered code")
+                .message(),
+            "the exported message is the registry's, not the run's"
+        );
+    }
+
+    /// The retry advice and the printed correction have to agree.
+    #[test]
+    fn a_destination_that_will_refuse_every_retry_is_not_retryable() {
+        for permanent in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::ReadOnlyFilesystem,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::IsADirectory,
+        ] {
+            assert!(
+                is_permanent_sink_refusal(permanent),
+                "{permanent:?} refuses the identical retry"
+            );
+        }
+        for transient in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::Interrupted,
+            // A volume that filled up is usually emptied again; sending the
+            // operator to pick another destination is advice about the wrong
+            // thing.
+            std::io::ErrorKind::StorageFull,
+        ] {
+            assert!(
+                !is_permanent_sink_refusal(transient),
+                "{transient:?} may not recur, so a retry is not wasted work"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_dispatch_mismatch() {
+        use clinker_core_types::{FailureCategory, RetryAdvice};
+
+        let error = PipelineError::DispatchMismatch {
+            dispatcher: "dispatch_route",
+            expected_kind: "route",
+            actual_kind: "transform",
+            node: "normalize_orders".to_owned(),
+        };
+
+        let classification = classify_pipeline_error(&error);
+        assert_eq!(classification, error.failure_classification().unwrap());
+        assert_eq!(classification.code(), "runtime.invariant.dispatch_mismatch");
+        assert_eq!(
+            classification.category(),
+            FailureCategory::InternalInvariant
+        );
+        assert_eq!(classification.retry_advice(), RetryAdvice::PolicyRequired);
+    }
+
+    #[test]
+    fn runtime_failure_classification_distinguishes_policy_from_transience() {
+        use clinker_core_types::RetryAdvice;
+        use clinker_plan::runtime_error::{BudgetCategory, SpillError};
+
+        let cases = [
+            (
+                PipelineError::MemoryBudgetExceeded {
+                    node: "aggregate".to_owned(),
+                    used: 2,
+                    limit: 1,
+                    source: BudgetCategory::Arena,
+                    detail: None,
+                },
+                "runtime.resource.memory_budget_exceeded",
+                RetryAdvice::PolicyRequired,
+            ),
+            (
+                PipelineError::UnsatisfiableMemoryBudget {
+                    limit: 1,
+                    baseline_rss: 2,
+                },
+                "admission.configuration.memory_budget_unsatisfiable",
+                RetryAdvice::DoNotRetry,
+            ),
+            (
+                PipelineError::SpillCapExceeded {
+                    node: "sort".to_owned(),
+                    cap: 1,
+                    attempted: 2,
+                    current: 2,
+                },
+                "runtime.resource.spill_cap_exceeded",
+                RetryAdvice::PolicyRequired,
+            ),
+            (
+                PipelineError::Spill(SpillError::Io(std::io::Error::other("closed"))),
+                "runtime.resource.spill_failed",
+                RetryAdvice::RetryWithBackoff,
+            ),
+        ];
+
+        for (error, expected_code, expected_retry) in cases {
+            let classification = classify_pipeline_error(&error);
+            assert_eq!(classification.code(), expected_code);
+            assert_eq!(classification.retry_advice(), expected_retry);
+        }
+    }
+
+    #[test]
+    fn multiple_failure_classification_is_order_independent_and_fail_closed() {
+        let classify = |errors| classify_pipeline_error(&PipelineError::Multiple(errors));
+        let first = classify(vec![
+            PipelineError::Io(std::io::Error::other("temporary")),
+            PipelineError::SpillCapExceeded {
+                node: "sort".to_owned(),
+                cap: 1,
+                attempted: 2,
+                current: 2,
+            },
+            PipelineError::SortOrderViolation {
+                message: "out of order".to_owned(),
+            },
+        ]);
+        let reversed = classify(vec![
+            PipelineError::SortOrderViolation {
+                message: "out of order".to_owned(),
+            },
+            PipelineError::SpillCapExceeded {
+                node: "sort".to_owned(),
+                cap: 1,
+                attempted: 2,
+                current: 2,
+            },
+            PipelineError::Io(std::io::Error::other("temporary")),
+        ]);
+
+        assert_eq!(first.code(), "source.data.invalid");
+        assert_eq!(first, reversed);
+    }
 
     #[test]
     fn publication_failure_diagnostics_are_path_safe_and_actionable() {

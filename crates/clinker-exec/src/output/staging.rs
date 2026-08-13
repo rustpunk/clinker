@@ -136,10 +136,22 @@ impl PublicationOutcome {
     }
 }
 
+/// How durable a recorded promotion is for one final path.
+///
+/// A rename that landed without its parent-directory synchronization is
+/// observable now but is not guaranteed to survive host power loss, so the
+/// ledger keeps the two apart instead of calling both "committed".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CommittedVisibility {
+    Published,
+    VisibleUnsynchronized,
+}
+
 #[derive(Debug, Default)]
 struct RegistryState {
     pending: Vec<PendingOutput>,
-    committed: Vec<(String, PathBuf)>,
+    committed: Vec<(String, PathBuf, CommittedVisibility)>,
+    cleanup_debt: Vec<CleanupDebt>,
     claims: BTreeMap<String, (String, PathBuf)>,
 }
 
@@ -241,27 +253,82 @@ impl OutputStagingRegistry {
             IfExistsPolicy::Error if cli_force => PromotionDisposition::Replace,
             IfExistsPolicy::Error | IfExistsPolicy::UniqueSuffix => PromotionDisposition::NoReplace,
         };
-        let stage = |path: PathBuf| self.stage_attempt_candidate(kind, &name, disposition, path);
+        let stage = |path: PathBuf, base: Option<&Path>| {
+            self.stage_attempt_candidate(kind, &name, disposition, path, base)
+        };
         match policy {
-            IfExistsPolicy::Overwrite => stage(bare),
-            IfExistsPolicy::Error => match stage(bare.clone()) {
+            IfExistsPolicy::Overwrite => stage(bare, None),
+            IfExistsPolicy::Error => match stage(bare.clone(), None) {
                 Err(error) if !cli_force && attempt_is_already_exists(&error) => {
                     Err(attempt_existing_output_error(&bare))
                 }
                 result => result,
             },
             IfExistsPolicy::UniqueSuffix => {
-                match stage(bare.clone()) {
-                    Ok(output) => return Ok(output),
-                    Err(error) if attempt_is_already_exists(&error) => {}
-                    Err(error) => return Err(error),
+                // The same search the non-attempt path uses, and shared rather
+                // than copied: this is the path every CLI output takes, and it
+                // was left behind when the other one learned that Windows
+                // reports a contended name as a sharing violation. A test
+                // exercising only the other copy reported the policy fixed
+                // while the live path still failed the run.
+                let mut search = super::open::SuffixSearch::default();
+                // Once for the whole search, not once per candidate: the
+                // ledger lookup and the staging admission each resolved the
+                // same working directory, so a destination already holding a
+                // few thousand numbered files paid two `getcwd` calls per
+                // name before writing a byte.
+                let base = std::env::current_dir().map_err(PipelineError::Io)?;
+                // A name another output in this same run has already claimed
+                // is a taken candidate too. Asked of the ledger, because that
+                // is a fact the ledger holds -- not read back out of the
+                // wording of the diagnostic the collision would have produced,
+                // where rewording a message an author reads would silently
+                // change what this search does.
+                //
+                // Asked twice: once before staging, and once after a staging
+                // failure, because the claim can be recorded by another
+                // producer in between. The ledger is the authority either way,
+                // so the later answer is the same taken name arriving a moment
+                // late rather than a different kind of failure.
+                let mut try_candidate =
+                    |path: PathBuf| -> Result<Option<(PathBuf, File)>, PipelineError> {
+                        // A taken name is not a denial, so it is bounded only
+                        // by the counter itself -- as an already-existing name
+                        // is. Each one moves the search to a candidate that
+                        // may be free, which is progress; the denial bounds
+                        // exist for candidates that never can be.
+                        let key = destination_key_in(&path, &base);
+                        if self.claimant_for_key(&key).is_some() {
+                            search.advance_past_taken_name();
+                            return Ok(None);
+                        }
+                        match stage(path.clone(), Some(&base)) {
+                            Ok(output) => Ok(Some(output)),
+                            Err(error) => {
+                                if self.claimant_for_key(&key).is_some() {
+                                    search.advance_past_taken_name();
+                                    return Ok(None);
+                                }
+                                if search.advance(&error) {
+                                    Ok(None)
+                                } else {
+                                    // Under the authored name, for the same
+                                    // reason the other copy of this search
+                                    // gives it: a destination that refuses
+                                    // every candidate has not refused
+                                    // `out-64.csv`, which nobody wrote.
+                                    Err(super::open::suffix_search_failure(&bare, error, &search))
+                                }
+                            }
+                        }
+                    };
+                if let Some(output) = try_candidate(bare.clone())? {
+                    return Ok(output);
                 }
                 for n in 1_u64..=u64::MAX {
                     let candidate = path_for_n(Some(n)).map_err(PipelineError::Config)?;
-                    match stage(candidate) {
-                        Ok(output) => return Ok(output),
-                        Err(error) if attempt_is_already_exists(&error) => continue,
-                        Err(error) => return Err(error),
+                    if let Some(output) = try_candidate(candidate)? {
+                        return Ok(output);
                     }
                 }
                 Err(PipelineError::Io(std::io::Error::other(
@@ -277,6 +344,7 @@ impl OutputStagingRegistry {
         name: &str,
         disposition: PromotionDisposition,
         final_path: PathBuf,
+        base: Option<&Path>,
     ) -> Result<(PathBuf, File), PipelineError> {
         let attempt = self
             .attempt
@@ -286,9 +354,19 @@ impl OutputStagingRegistry {
                 node: name.to_owned(),
                 detail: "attempt-owned output registry has no run attempt".to_owned(),
             })?;
-        let base = std::env::current_dir().map_err(PipelineError::Io)?;
+        // Resolved by the caller when it is walking candidates, so a search
+        // over a directory already holding thousands of numbered files does
+        // not ask the kernel for the same answer once per name.
+        let owned;
+        let base = match base {
+            Some(base) => base,
+            None => {
+                owned = std::env::current_dir().map_err(PipelineError::Io)?;
+                &owned
+            }
+        };
         let destination =
-            validate_path(&final_path, &base, final_path.is_absolute()).map_err(|diagnostic| {
+            validate_path(&final_path, base, final_path.is_absolute()).map_err(|diagnostic| {
                 PipelineError::Config(ConfigError::Validation(format!(
                     "{}: {}",
                     diagnostic.code, diagnostic.message
@@ -408,15 +486,39 @@ impl OutputStagingRegistry {
         name: &str,
         final_path: &std::path::Path,
     ) -> Result<(), PipelineError> {
+        match self.claimant_of(final_path)? {
+            Some((first_name, first_path)) => {
+                Err(collision_error(name, final_path, &first_name, &first_path))
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// The producer that already claimed this destination in this run, if any.
+    ///
+    /// The unique-suffix search needs this as a fact, not as a diagnostic: it
+    /// used to recover it by matching the opening words of the formatted
+    /// collision message, so rewording a message an author reads would have
+    /// silently stopped the search recognising a claimed name -- with no
+    /// compiler or test failure at the rename.
+    pub(crate) fn claimant_of(
+        &self,
+        final_path: &std::path::Path,
+    ) -> Result<Option<(String, PathBuf)>, PipelineError> {
+        let key = destination_key(final_path)?;
+        Ok(self.claimant_for_key(&key))
+    }
+
+    /// The claimant of a destination whose key is already resolved.
+    pub(crate) fn claimant_for_key(&self, key: &str) -> Option<(String, PathBuf)> {
         let state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let key = destination_key(final_path)?;
-        if let Some((first_name, first_path)) = state.claims.get(&key) {
-            return Err(collision_error(name, final_path, first_name, first_path));
-        }
-        Ok(())
+        state
+            .claims
+            .get(key)
+            .map(|(first_name, first_path)| (first_name.clone(), first_path.clone()))
     }
 
     /// Snapshot all hidden files that remain pending. This is used to report
@@ -444,8 +546,8 @@ impl OutputStagingRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .committed
             .iter()
-            .filter(|(entry_name, _)| entry_name == name)
-            .map(|(_, path)| path.clone())
+            .filter(|(entry_name, _, _)| entry_name == name)
+            .map(|(_, path, _)| path.clone())
             .collect()
     }
 
@@ -460,6 +562,36 @@ impl OutputStagingRegistry {
             .filter(|entry| entry.name == name)
             .map(|entry| entry.final_path.clone())
             .collect()
+    }
+
+    /// How the publication ledger recorded this exact final path, if at all.
+    /// The attempt layer uses this only when publication itself errors before
+    /// it can return a normal [`PublicationOutcome`], so the failure still
+    /// carries truthful per-artifact visibility — including the difference
+    /// between a durable promotion and one whose parent-directory
+    /// synchronization never completed.
+    pub(crate) fn committed_visibility(&self, path: &Path) -> Option<CommittedVisibility> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .committed
+            .iter()
+            .find(|(_, committed, _)| committed == path)
+            .map(|(_, _, visibility)| *visibility)
+    }
+
+    /// Number of cleanup-debt entries this ledger observed during publication.
+    ///
+    /// A successful call returns its debt inside [`PublicationOutcome`]; this
+    /// accessor serves the attempt layer's error path, where the outcome never
+    /// reaches the caller and the debt would otherwise be reported as zero
+    /// while the orphaned staged files remain on disk.
+    pub(crate) fn recorded_cleanup_debt_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cleanup_debt
+            .len()
     }
 
     /// Publish every staged file after successful pipeline execution.
@@ -510,14 +642,24 @@ impl OutputStagingRegistry {
             {
                 remaining.push_front(entry);
                 self.restore_pending(remaining.into());
-                self.record_committed(&published, &visible_unsynchronized);
+                // This error path returns no outcome, so the ledger is the only
+                // surviving record of debt already owed by earlier promotions.
+                self.record_publication_progress(
+                    &published,
+                    &visible_unsynchronized,
+                    &cleanup_debt,
+                );
                 return Err(PipelineError::Io(error));
             }
             if fail_before_rename_at == Some(index) {
                 remaining.push_front(entry);
                 let unpublished = partials_from(remaining.iter());
                 self.restore_pending(remaining.into());
-                self.record_committed(&published, &visible_unsynchronized);
+                self.record_publication_progress(
+                    &published,
+                    &visible_unsynchronized,
+                    &cleanup_debt,
+                );
                 return Ok(PublicationOutcome::Incomplete {
                     published,
                     visible_unsynchronized,
@@ -555,7 +697,11 @@ impl OutputStagingRegistry {
                     visible_unsynchronized.push(identity);
                     let unpublished = partials_from(remaining.iter());
                     self.restore_pending(remaining.into());
-                    self.record_committed(&published, &visible_unsynchronized);
+                    self.record_publication_progress(
+                        &published,
+                        &visible_unsynchronized,
+                        &cleanup_debt,
+                    );
                     return Ok(PublicationOutcome::Incomplete {
                         published,
                         visible_unsynchronized,
@@ -568,7 +714,11 @@ impl OutputStagingRegistry {
                     remaining.push_front(entry);
                     let unpublished = partials_from(remaining.iter());
                     self.restore_pending(remaining.into());
-                    self.record_committed(&published, &visible_unsynchronized);
+                    self.record_publication_progress(
+                        &published,
+                        &visible_unsynchronized,
+                        &cleanup_debt,
+                    );
                     return Ok(PublicationOutcome::Incomplete {
                         published,
                         visible_unsynchronized,
@@ -580,7 +730,7 @@ impl OutputStagingRegistry {
             }
             index += 1;
         }
-        self.record_committed(&published, &[]);
+        self.record_publication_progress(&published, &[], &cleanup_debt);
         Ok(PublicationOutcome::Complete {
             published,
             cleanup_debt,
@@ -595,17 +745,31 @@ impl OutputStagingRegistry {
             .extend(pending);
     }
 
-    fn record_committed(
+    fn record_publication_progress(
         &self,
         published: &[(String, PathBuf)],
         visible_unsynchronized: &[(String, PathBuf)],
+        cleanup_debt: &[CleanupDebt],
     ) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.committed.extend_from_slice(published);
-        state.committed.extend_from_slice(visible_unsynchronized);
+        state.committed.extend(
+            published
+                .iter()
+                .map(|(name, path)| (name.clone(), path.clone(), CommittedVisibility::Published)),
+        );
+        state
+            .committed
+            .extend(visible_unsynchronized.iter().map(|(name, path)| {
+                (
+                    name.clone(),
+                    path.clone(),
+                    CommittedVisibility::VisibleUnsynchronized,
+                )
+            }));
+        state.cleanup_debt.extend_from_slice(cleanup_debt);
     }
 
     #[cfg(test)]
@@ -651,6 +815,10 @@ impl OutputStagingRegistry {
     }
 }
 
+/// The diagnostic for two producers in one run resolving to one destination.
+///
+/// Reported as a validation error rather than an I/O one because no file was
+/// involved: the second producer never reached the filesystem.
 fn collision_error(
     name: &str,
     final_path: &std::path::Path,
@@ -665,16 +833,26 @@ fn collision_error(
 }
 
 fn destination_key(path: &std::path::Path) -> Result<String, PipelineError> {
+    if path.is_absolute() {
+        return Ok(destination_key_in(path, std::path::Path::new("")));
+    }
+    let base = std::env::current_dir().map_err(PipelineError::Io)?;
+    Ok(destination_key_in(path, &base))
+}
+
+/// The collision key for a path already resolved against a known base.
+///
+/// A search that tries thousands of candidate names asks the kernel for the
+/// same working directory each time otherwise.
+fn destination_key_in(path: &std::path::Path, base: &std::path::Path) -> String {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map_err(PipelineError::Io)?
-            .join(path)
+        base.join(path)
     };
-    Ok(clinker_plan::config::collision_key(
-        &absolute.to_string_lossy(),
-    ))
+    // Already absolute here, because a search resolves its base once rather
+    // than per candidate; the identity would otherwise do it every time.
+    clinker_plan::config::destination_identity(&absolute)
 }
 
 fn attempt_error_to_pipeline(error: AttemptError) -> PipelineError {

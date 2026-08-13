@@ -16,9 +16,12 @@
 //! where `recursive_term.execute(partition, Arc::clone(&task_context))`
 //! re-enters the same execution loop with a different plan.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::sync::{Arc, LazyLock};
+#[cfg(feature = "test-utils")]
+use std::sync::{Mutex, OnceLock};
 
 use clinker_record::{FieldMetadata, GroupByKey, PipelineCounters, Record, SchemaBuilder, Value};
 use cxl::eval::{EvalContext, ProgramEvaluator, SkipReason, StableEvalContext};
@@ -29,10 +32,153 @@ use clinker_plan::config::{ErrorStrategy, OutputConfig, PipelineConfig};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::EntityRef;
 
+use crate::log_dispatch::{LogDispatcher, TransformSignalContext};
+
 /// Re-export of the correlation-buffer commit entry point, relocated to
 /// [`crate::executor::correlation_dispatch`]. The commit subtree reaches it
 /// through this module path, so the re-export preserves that surface.
 pub(crate) use crate::executor::correlation_dispatch::commit_correlation_buffers;
+
+#[cfg(feature = "test-utils")]
+const DISPATCH_FAULT_TARGET_MAX_BYTES: usize = 256;
+
+#[cfg(feature = "test-utils")]
+#[derive(Default)]
+struct DispatchFaultState {
+    next_id: u64,
+    armed: Option<ArmedDispatchFault>,
+}
+
+#[cfg(feature = "test-utils")]
+struct ArmedDispatchFault {
+    id: u64,
+    dispatcher: DispatchFaultKind,
+    target_node: String,
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Clone, Copy)]
+enum DispatchFaultKind {
+    Route,
+    Aggregation,
+    Source,
+    Transform,
+    Composition,
+    Combine,
+    Merge,
+    Sort,
+    Envelope,
+    Output,
+    Cull,
+    Reshape,
+}
+
+#[cfg(feature = "test-utils")]
+impl DispatchFaultKind {
+    fn from_dispatcher(dispatcher: &str) -> Option<Self> {
+        match dispatcher {
+            "dispatch_route" => Some(Self::Route),
+            "dispatch_aggregation" => Some(Self::Aggregation),
+            "dispatch_source" => Some(Self::Source),
+            "dispatch_transform" => Some(Self::Transform),
+            "dispatch_composition" => Some(Self::Composition),
+            "dispatch_combine" => Some(Self::Combine),
+            "dispatch_merge" => Some(Self::Merge),
+            "dispatch_sort" => Some(Self::Sort),
+            "dispatch_envelope" => Some(Self::Envelope),
+            "dispatch_output" => Some(Self::Output),
+            "dispatch_cull" => Some(Self::Cull),
+            "dispatch_reshape" => Some(Self::Reshape),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "test-utils")]
+static DISPATCH_FAULT: OnceLock<Mutex<DispatchFaultState>> = OnceLock::new();
+
+/// Run-scoped owner for one process-local dispatch mismatch fault.
+///
+/// This seam exists only with `test-utils`, rejects concurrent arms, and is
+/// consumed exactly once when the named logical node reaches the dispatcher.
+/// Dropping an unconsumed guard disarms only the generation it created.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub struct DispatchFaultGuard {
+    id: u64,
+}
+
+#[cfg(feature = "test-utils")]
+impl DispatchFaultGuard {
+    /// Route one matching node through a selected dispatcher guard.
+    pub fn dispatch_mismatch_once(
+        dispatcher: &str,
+        target_node: impl Into<String>,
+    ) -> Result<Self, &'static str> {
+        let dispatcher = DispatchFaultKind::from_dispatcher(dispatcher)
+            .ok_or("dispatch fault names an unsupported dispatcher")?;
+        let target_node = target_node.into();
+        if target_node.is_empty() || target_node.len() > DISPATCH_FAULT_TARGET_MAX_BYTES {
+            return Err("dispatch fault target is outside its byte bound");
+        }
+        let mut state = dispatch_fault_state();
+        if state.armed.is_some() {
+            return Err("a dispatch fault is already armed");
+        }
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or("dispatch fault generation is exhausted")?;
+        let id = state.next_id;
+        state.armed = Some(ArmedDispatchFault {
+            id,
+            dispatcher,
+            target_node,
+        });
+        Ok(Self { id })
+    }
+
+    /// Route one matching non-Route node through the Route dispatcher guard.
+    pub fn route_mismatch_once(target_node: impl Into<String>) -> Result<Self, &'static str> {
+        Self::dispatch_mismatch_once("dispatch_route", target_node)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl Drop for DispatchFaultGuard {
+    fn drop(&mut self) {
+        let mut state = dispatch_fault_state();
+        if state
+            .armed
+            .as_ref()
+            .is_some_and(|fault| fault.id == self.id)
+        {
+            state.armed = None;
+        }
+    }
+}
+
+#[cfg(feature = "test-utils")]
+fn dispatch_fault_state() -> std::sync::MutexGuard<'static, DispatchFaultState> {
+    DISPATCH_FAULT
+        .get_or_init(|| Mutex::new(DispatchFaultState::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(feature = "test-utils")]
+fn take_dispatch_mismatch_fault(node: &PlanNode) -> Option<DispatchFaultKind> {
+    let mut state = dispatch_fault_state();
+    let dispatcher = state
+        .armed
+        .as_ref()
+        .filter(|fault| fault.target_node == node.name())
+        .map(|fault| fault.dispatcher);
+    if dispatcher.is_some() {
+        state.armed = None;
+    }
+    dispatcher
+}
 
 /// Stand-in `$source.file` value for dispatch sites that have no
 /// originating source record (Combine/finalize/post-aggregate emits with
@@ -940,6 +1086,9 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) output_configs: &'a [OutputConfig],
     pub(crate) primary_output: &'a OutputConfig,
     pub(crate) stable: &'a StableEvalContext,
+    /// Run-scoped non-blocking telemetry handle. Cloned only when enabled;
+    /// `None` keeps dispatch on the zero-work signal path.
+    pub(crate) telemetry_producer: Option<crate::telemetry::TelemetryProducer>,
     /// Backing storage for `$source.batch` — per-pipeline-run UUID v7
     /// (per-source attribution is sub-issue #54). Distinct from
     /// `pipeline.batch_id`.
@@ -1115,6 +1264,16 @@ pub(crate) struct ExecutorContext<'a> {
     /// `None` at the top level — the existing config-walk path
     /// covers every top-level node.
     pub(crate) current_body_node_input_refs: Option<HashMap<String, Vec<String>>>,
+    /// Call-site node names of the composition bodies the walk is currently
+    /// inside, outermost first. Empty at the top level. Pushed and popped in
+    /// lockstep with `window_runtime.active_stack` by both body-entry paths —
+    /// the forward-pass body executor and the commit pass's re-entry.
+    ///
+    /// A body node's name is body-local and may legally repeat a name used at
+    /// the top level or in a sibling body, so it does not identify a node on
+    /// its own. This is the prefix that makes it identify one; see
+    /// [`ExecutorContext::qualified_node_name`].
+    pub(crate) composition_call_sites: Vec<String>,
     pub(crate) counters: PipelineCounters,
     pub(crate) dlq_entries: Vec<DlqEntry>,
     /// Per-source DLQ counters keyed by Source-node name. Incremented
@@ -1330,6 +1489,21 @@ pub(crate) struct ExecutorContext<'a> {
     /// design — one set of operator arms, two pass modes — is the whole
     /// architectural value of the deferred-region landing.
     pub(crate) in_deferred_dispatch: bool,
+
+    /// Signal state for transforms the cascading-retraction loop dispatches
+    /// more than once, keyed by the exported logical node identity
+    /// [`Self::qualified_node_name`] builds — the same identity the span
+    /// carries, so two call sites of one composition body keep their state
+    /// apart.
+    ///
+    /// A converge re-runs each deferred-region member once per iteration and
+    /// keeps only the converged result, so those passes are one execution of
+    /// the transform and have to report as one. An entry is taken out at the
+    /// start of a pass and put back at its end; the orchestrator closes
+    /// whatever remains once the loop stops, and whatever a loop that left by
+    /// an error, a signal, or a panic did not close is reported as an
+    /// interrupted execution rather than discarded.
+    pub(crate) transform_signal_carry: crate::log_dispatch::ParkedTransformSignals,
 
     /// Streaming-Output channel senders keyed by the upstream fused
     /// `Merge` node's `NodeIndex`. Present when the executor entry has
@@ -1576,6 +1750,31 @@ impl<'a> ExecutorContext<'a> {
     /// the pipeline-wide total once every per-source slot is `Some`.
     pub(crate) fn source_count_by_name(&self, name: &Arc<str>) -> Option<u64> {
         self.source_count_per_source.get(name).copied().flatten()
+    }
+
+    /// Name `name` the way an operator reading telemetry has to see it: bare at
+    /// the top level, and prefixed with the composition call sites it sits
+    /// under — `enrich_eu.normalize` — inside a body.
+    ///
+    /// One pipeline can invoke the same composition at several call sites, and
+    /// every one of them runs the same body node names through the same
+    /// producer. Exported bare, the span closed for `normalize` under
+    /// `enrich_eu` and the one closed under `enrich_us` are one indistinguishable
+    /// name, and a body name may also collide with an unrelated top-level node's.
+    /// `<call site>.<node>` is the spelling the lineage events already use for
+    /// the same reason, so the two subsystems name a body node alike.
+    pub(crate) fn qualified_node_name<'name>(&self, name: &'name str) -> Cow<'name, str> {
+        if self.composition_call_sites.is_empty() {
+            Cow::Borrowed(name)
+        } else {
+            let mut qualified = String::new();
+            for call_site in &self.composition_call_sites {
+                qualified.push_str(call_site);
+                qualified.push('.');
+            }
+            qualified.push_str(name);
+            Cow::Owned(qualified)
+        }
     }
 
     /// True when the Transform at `node_idx` should run via the
@@ -3571,6 +3770,17 @@ pub(crate) fn merge_fused_interleave(
 /// enforced upstream by `compute_transform_fused_sources` in
 /// `executor/mod.rs`; this helper trusts the predicate and panics on
 /// shape violations.
+///
+/// The per-record pieces the fused loop reads off a lowered
+/// `PlanNode::Transform`: the record evaluator, the authored log directives,
+/// and one compiled gate slot per directive. All three are absent together —
+/// a node that did not lower carries no program, no directives, and no gates.
+type FusedTransformParts<'a> = (
+    Option<ProgramEvaluator>,
+    &'a [clinker_plan::config::LogDirective],
+    &'a [Option<Arc<cxl::typecheck::TypedProgram>>],
+);
+
 pub(crate) fn transform_fused_consume(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
@@ -3624,7 +3834,13 @@ pub(crate) fn transform_fused_consume(
             resolved: Some(p),
             has_distinct,
             ..
-        } => Some((Arc::clone(&p.typed), p.max_expansion, *has_distinct)),
+        } => Some((
+            Arc::clone(&p.typed),
+            p.max_expansion,
+            *has_distinct,
+            p.log.as_slice(),
+            p.log_conditions.as_slice(),
+        )),
         _ => None,
     };
     let expected_input = current_dag.graph[node_idx]
@@ -3661,10 +3877,35 @@ pub(crate) fn transform_fused_consume(
         ctx.streaming_charge_handle(node_idx, name, spill_allowed)
     });
 
-    let mut evaluator_opt: Option<ProgramEvaluator> =
-        transform_payload.map(|(typed, max_expansion, has_distinct)| {
-            ProgramEvaluator::with_max_expansion(typed, has_distinct, max_expansion)
-        });
+    let (mut evaluator_opt, directives, log_conditions): FusedTransformParts<'_> =
+        match transform_payload {
+            Some((typed, max_expansion, has_distinct, directives, log_conditions)) => (
+                Some(ProgramEvaluator::with_max_expansion(
+                    typed,
+                    has_distinct,
+                    max_expansion,
+                )),
+                directives,
+                log_conditions,
+            ),
+            None => (None, &[], &[]),
+        };
+    // Fusion is gated to the top level, so this resolves to the bare name
+    // today; it goes through the same helper as the buffered arm so both name a
+    // node the one way if that gate ever moves.
+    let logical_node = ctx.qualified_node_name(name);
+    let mut signals = LogDispatcher::new(
+        ctx.telemetry_producer.clone(),
+        directives,
+        log_conditions,
+        TransformSignalContext {
+            execution_id: &ctx.stable.pipeline_execution_id,
+            batch_id: &ctx.stable.pipeline_batch_id,
+            pipeline_name: &ctx.stable.pipeline_name,
+            logical_node: &logical_node,
+        },
+    );
+    signals.fire_before_transform();
 
     let rx = ctx
         .source_records
@@ -3828,20 +4069,62 @@ pub(crate) fn transform_fused_consume(
             if let Some(exp) = expected_input.as_ref() {
                 check_input_schema(exp, rec.schema(), name, "transform", &source_name_owned)?;
             }
-
-            if let Some(evaluator) = evaluator_opt.as_mut() {
-                let source_file_arc = Arc::clone(&last_file);
-                let rec_source_name_arc = source_name_arc_of(&rec);
+            // One evaluation context per record, shared by the authored log
+            // gates and the transform program. It is built before dispatch
+            // because `fire_per_record` runs its gates against the input row,
+            // which is only in scope until the program below rewrites it.
+            //
+            // The document context is cloned rather than borrowed from `rec`
+            // so this context borrows locals only — the pass-through arm below
+            // moves `rec` into the batcher, which a borrow of it would forbid.
+            // Skipped entirely when nothing will read it: a pass-through node
+            // in a deployment that configures no observability runs neither a
+            // gate nor a program, and the reference-count bumps and source
+            // lookup below would be per-record work with no reader.
+            let eval_inputs =
+                (signals.wants_per_record_context() || evaluator_opt.is_some()).then(|| {
+                    let source_file_arc = Arc::clone(&last_file);
+                    let rec_source_name_arc = source_name_arc_of(&rec);
+                    let source_count = ctx.source_count_by_name(&rec_source_name_arc);
+                    let rec_doc_ctx = Arc::clone(rec.doc_ctx());
+                    (
+                        source_file_arc,
+                        rec_source_name_arc,
+                        rec_doc_ctx,
+                        source_count,
+                    )
+                });
+            if let Some((source_file_arc, rec_source_name_arc, rec_doc_ctx, source_count)) =
+                eval_inputs.as_ref()
+            {
                 let eval_ctx = EvalContext {
                     stable: ctx.stable,
-                    source_file: &source_file_arc,
+                    source_file: source_file_arc,
                     source_row: rn.ordinal(),
-                    source_path: &source_file_arc,
-                    source_count: ctx.source_count_by_name(&rec_source_name_arc),
+                    source_path: source_file_arc,
+                    source_count: *source_count,
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
-                    source_name: &rec_source_name_arc,
-                    doc_ctx: rec.doc_ctx(),
+                    source_name: rec_source_name_arc,
+                    doc_ctx: rec_doc_ctx,
+                };
+                signals.fire_per_record(&rec, &eval_ctx);
+            }
+
+            if let Some(evaluator) = evaluator_opt.as_mut() {
+                let (source_file_arc, rec_source_name_arc, rec_doc_ctx, source_count) = eval_inputs
+                    .as_ref()
+                    .expect("an evaluator always assembles its evaluation context");
+                let eval_ctx = EvalContext {
+                    stable: ctx.stable,
+                    source_file: source_file_arc,
+                    source_row: rn.ordinal(),
+                    source_path: source_file_arc,
+                    source_count: *source_count,
+                    source_batch: ctx.source_batch_arc,
+                    ingestion_timestamp: ctx.source_ingestion_timestamp,
+                    source_name: rec_source_name_arc,
+                    doc_ctx: rec_doc_ctx,
                 };
                 let target_schema = output_schema
                     .as_ref()
@@ -3881,6 +4164,7 @@ pub(crate) fn transform_fused_consume(
                         }
                     }
                     Err((transform_name, eval_err)) => {
+                        signals.fire_on_error(&rec);
                         dispatch_transform_eval_error(ctx, rec, rn, transform_name, eval_err)?;
                     }
                 }
@@ -3920,6 +4204,7 @@ pub(crate) fn transform_fused_consume(
     // to no deferred region (enforced by `certify_streaming_edge`), and
     // `output_records` is empty in this mode anyway.
     if streaming {
+        signals.finish();
         return Ok(());
     }
 
@@ -3934,6 +4219,7 @@ pub(crate) fn transform_fused_consume(
         forwarded_puncts,
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
+    signals.finish();
     Ok(())
 }
 
@@ -4125,6 +4411,71 @@ pub(crate) fn dispatch_plan_node(
         return Ok(());
     }
     let node = current_dag.graph[node_idx].clone();
+    #[cfg(feature = "test-utils")]
+    if let Some(dispatcher) = take_dispatch_mismatch_fault(&node) {
+        return match dispatcher {
+            DispatchFaultKind::Route => {
+                crate::executor::route_dispatch::dispatch_route(ctx, current_dag, node_idx, &node)
+            }
+            DispatchFaultKind::Aggregation => {
+                crate::executor::aggregate_dispatch::dispatch_aggregation(
+                    ctx,
+                    current_dag,
+                    node_idx,
+                    &node,
+                )
+            }
+            DispatchFaultKind::Source => {
+                crate::executor::source_dispatch::dispatch_source(ctx, current_dag, node_idx, &node)
+            }
+            DispatchFaultKind::Transform => {
+                crate::executor::transform_dispatch::dispatch_transform(
+                    ctx,
+                    current_dag,
+                    node_idx,
+                    &node,
+                )
+            }
+            DispatchFaultKind::Composition => {
+                crate::executor::composition_dispatch::dispatch_composition(
+                    ctx,
+                    current_dag,
+                    node_idx,
+                    &node,
+                )
+            }
+            DispatchFaultKind::Combine => crate::executor::combine_dispatch::dispatch_combine(
+                ctx,
+                current_dag,
+                node_idx,
+                &node,
+            ),
+            DispatchFaultKind::Merge => {
+                crate::executor::merge_dispatch::dispatch_merge(ctx, current_dag, node_idx, &node)
+            }
+            DispatchFaultKind::Sort => {
+                crate::executor::sort_dispatch::dispatch_sort(ctx, current_dag, node_idx, &node)
+            }
+            DispatchFaultKind::Envelope => crate::executor::envelope_dispatch::dispatch_envelope(
+                ctx,
+                current_dag,
+                node_idx,
+                &node,
+            ),
+            DispatchFaultKind::Output => {
+                crate::executor::output_dispatch::dispatch_output(ctx, current_dag, node_idx, &node)
+            }
+            DispatchFaultKind::Cull => {
+                crate::executor::cull_dispatch::dispatch_cull(ctx, current_dag, node_idx, &node)
+            }
+            DispatchFaultKind::Reshape => crate::executor::reshape_dispatch::dispatch_reshape(
+                ctx,
+                current_dag,
+                node_idx,
+                &node,
+            ),
+        };
+    }
     match node {
         PlanNode::Source { .. } => {
             crate::executor::source_dispatch::dispatch_source(ctx, current_dag, node_idx, &node)?;

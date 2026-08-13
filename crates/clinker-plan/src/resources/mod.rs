@@ -15,7 +15,7 @@ use crate::config::composition::{CompositionFile, CompositionSymbolTable};
 use crate::config::{CxlBearingField, CxlFieldScope, PipelineNode};
 use crate::yaml::Spanned;
 use clinker_core_types::span::FileId;
-use cxl::ast::Module;
+use cxl::ast::{BinOp, Expr, LiteralValue, Module, UnaryOp};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MAX_MODULE_BYTES: usize = 1_048_576;
@@ -337,6 +337,8 @@ pub struct CompiledCxlModule {
     pub module: Module,
     pub node_count: u32,
     pub imports: BTreeMap<String, LogicalResourceId>,
+    /// BLAKE3 of the canonical parsed module, excluding spans and node ids.
+    pub content_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, Default)]
@@ -370,6 +372,25 @@ impl CompiledModuleRegistry {
     /// Transitive dependencies remain private to their importing module.
     pub fn is_program_visible(&self, id: &str) -> bool {
         self.program_roots.iter().any(|root| root.as_str() == id)
+    }
+
+    /// Deterministic semantic identities for every module in the closure.
+    pub(crate) fn semantic_identities(&self) -> Vec<ModuleSemanticIdentity<'_>> {
+        let mut modules = self.modules.values().collect::<Vec<_>>();
+        modules.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        modules
+            .into_iter()
+            .map(|module| ModuleSemanticIdentity {
+                id: module.id.as_str(),
+                content_digest: module.content_digest,
+                imports: module
+                    .imports
+                    .iter()
+                    .map(|(alias, dependency)| (alias.as_str(), dependency.as_str()))
+                    .collect(),
+                program_visible: self.program_roots.contains(&module.id),
+            })
+            .collect()
     }
 
     /// Resolver-facing export table keyed by logical module identity.
@@ -412,6 +433,14 @@ impl CompiledModuleRegistry {
         }
         Arc::new(registry)
     }
+}
+
+/// Path-independent semantic identity of one admitted CXL module.
+pub(crate) struct ModuleSemanticIdentity<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) content_digest: [u8; 32],
+    pub(crate) imports: Vec<(&'a str, &'a str)>,
+    pub(crate) program_visible: bool,
 }
 
 /// Collect direct `use` declarations from typed executable CXL fields.
@@ -843,6 +872,7 @@ fn compile_one(
         compile_one(catalog, rules_root, &dependency, depth + 1, stack, state)?;
     }
     stack.pop();
+    let content_digest = semantic_module_digest(&parsed.module);
     state.registry.modules.insert(
         id.clone(),
         Arc::new(CompiledCxlModule {
@@ -850,7 +880,267 @@ fn compile_one(
             module: parsed.module,
             node_count: parsed.node_count,
             imports,
+            content_digest,
         }),
     );
     Ok(())
+}
+
+struct SemanticModuleHasher(blake3::Hasher);
+
+impl SemanticModuleHasher {
+    fn new() -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"clinker.cxl-module.semantic-content.v1\0");
+        Self(hasher)
+    }
+
+    fn tag(&mut self, tag: u8) {
+        self.0.update(&[tag]);
+    }
+
+    fn usize(&mut self, value: usize) {
+        self.0.update(&(value as u64).to_le_bytes());
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.usize(bytes.len());
+        self.0.update(bytes);
+    }
+
+    fn string(&mut self, value: &str) {
+        self.bytes(value.as_bytes());
+    }
+
+    fn expression_list(&mut self, expressions: &[Expr]) {
+        self.usize(expressions.len());
+        for expression in expressions {
+            self.expression(expression);
+        }
+    }
+
+    fn expression(&mut self, expression: &Expr) {
+        match expression {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                self.tag(0);
+                self.binary_operator(*op);
+                self.expression(lhs);
+                self.expression(rhs);
+            }
+            Expr::Unary { op, operand, .. } => {
+                self.tag(1);
+                self.unary_operator(*op);
+                self.expression(operand);
+            }
+            Expr::Literal { value, .. } => {
+                self.tag(2);
+                self.literal(value);
+            }
+            Expr::FieldRef { name, .. } => {
+                self.tag(3);
+                self.string(name);
+            }
+            Expr::QualifiedFieldRef { parts, .. } => {
+                self.tag(4);
+                self.usize(parts.len());
+                for part in parts {
+                    self.string(part);
+                }
+            }
+            Expr::MethodCall {
+                receiver,
+                method,
+                args,
+                ..
+            } => {
+                self.tag(5);
+                self.expression(receiver);
+                self.string(method);
+                self.expression_list(args);
+            }
+            Expr::Match { subject, arms, .. } => {
+                self.tag(6);
+                match subject {
+                    Some(subject) => {
+                        self.tag(1);
+                        self.expression(subject);
+                    }
+                    None => self.tag(0),
+                }
+                self.usize(arms.len());
+                for arm in arms {
+                    self.expression(&arm.pattern);
+                    self.expression(&arm.body);
+                }
+            }
+            Expr::IfThenElse {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.tag(7);
+                self.expression(condition);
+                self.expression(then_branch);
+                match else_branch {
+                    Some(branch) => {
+                        self.tag(1);
+                        self.expression(branch);
+                    }
+                    None => self.tag(0),
+                }
+            }
+            Expr::Coalesce { lhs, rhs, .. } => {
+                self.tag(8);
+                self.expression(lhs);
+                self.expression(rhs);
+            }
+            Expr::WindowCall { function, args, .. } => {
+                self.tag(9);
+                self.string(function);
+                self.expression_list(args);
+            }
+            Expr::PipelineAccess { field, .. } => {
+                self.tag(10);
+                self.string(field);
+            }
+            Expr::VarsAccess { key, .. } => {
+                self.tag(11);
+                self.string(key);
+            }
+            Expr::ConfigAccess { param, .. } => {
+                self.tag(12);
+                self.string(param);
+            }
+            Expr::SourceAccess { field, .. } => {
+                self.tag(13);
+                self.string(field);
+            }
+            Expr::RecordAccess { field, .. } => {
+                self.tag(14);
+                self.string(field);
+            }
+            Expr::QualifiedSourceAccess {
+                input_name, field, ..
+            } => {
+                self.tag(15);
+                self.string(input_name);
+                self.string(field);
+            }
+            Expr::DocAccess { section, field, .. } => {
+                self.tag(16);
+                self.string(section);
+                self.string(field);
+            }
+            Expr::Now { .. } => self.tag(17),
+            Expr::Wildcard { .. } => self.tag(18),
+            Expr::AggCall { name, args, .. } => {
+                self.tag(19);
+                self.string(name);
+                self.expression_list(args);
+            }
+            Expr::AggSlot { slot, .. } => {
+                self.tag(20);
+                self.0.update(&slot.to_le_bytes());
+            }
+            Expr::GroupKey { slot, .. } => {
+                self.tag(21);
+                self.0.update(&slot.to_le_bytes());
+            }
+            Expr::IndexAccess {
+                receiver, index, ..
+            } => {
+                self.tag(22);
+                self.expression(receiver);
+                self.expression(index);
+            }
+            Expr::Closure { param, body, .. } => {
+                self.tag(23);
+                self.string(param);
+                self.expression(body);
+            }
+        }
+    }
+
+    fn literal(&mut self, value: &LiteralValue) {
+        match value {
+            LiteralValue::Int(value) => {
+                self.tag(0);
+                self.0.update(&value.to_le_bytes());
+            }
+            LiteralValue::Float(value) => {
+                self.tag(1);
+                self.0.update(&value.to_bits().to_le_bytes());
+            }
+            LiteralValue::String(value) => {
+                self.tag(2);
+                self.string(value);
+            }
+            LiteralValue::Date(value) => {
+                self.tag(3);
+                self.string(&value.format("%Y-%m-%d").to_string());
+            }
+            LiteralValue::Bool(value) => self.tag(if *value { 5 } else { 4 }),
+            LiteralValue::Null => self.tag(6),
+        }
+    }
+
+    fn binary_operator(&mut self, operator: BinOp) {
+        self.tag(match operator {
+            BinOp::Add => 0,
+            BinOp::Sub => 1,
+            BinOp::Mul => 2,
+            BinOp::Div => 3,
+            BinOp::Mod => 4,
+            BinOp::Eq => 5,
+            BinOp::Neq => 6,
+            BinOp::Gt => 7,
+            BinOp::Lt => 8,
+            BinOp::Gte => 9,
+            BinOp::Lte => 10,
+            BinOp::And => 11,
+            BinOp::Or => 12,
+        });
+    }
+
+    fn unary_operator(&mut self, operator: UnaryOp) {
+        self.tag(match operator {
+            UnaryOp::Neg => 0,
+            UnaryOp::Not => 1,
+        });
+    }
+
+    fn finish(self) -> [u8; 32] {
+        *self.0.finalize().as_bytes()
+    }
+}
+
+fn semantic_module_digest(module: &Module) -> [u8; 32] {
+    let mut hasher = SemanticModuleHasher::new();
+
+    // Resolved logical imports are fingerprinted separately by
+    // `CompiledModuleRegistry::semantic_identities`. Excluding authored import
+    // declarations here makes implicit and explicit default aliases converge
+    // while still preserving every dependency edge and effective alias.
+    let mut functions = module.functions.iter().collect::<Vec<_>>();
+    functions.sort_by(|left, right| left.name.cmp(&right.name));
+    hasher.usize(functions.len());
+    for function in functions {
+        hasher.string(&function.name);
+        hasher.usize(function.params.len());
+        for parameter in &function.params {
+            hasher.string(parameter);
+        }
+        hasher.expression(&function.body);
+    }
+
+    let mut constants = module.constants.iter().collect::<Vec<_>>();
+    constants.sort_by(|left, right| left.name.cmp(&right.name));
+    hasher.usize(constants.len());
+    for constant in constants {
+        hasher.string(&constant.name);
+        hasher.expression(&constant.expr);
+    }
+
+    hasher.finish()
 }

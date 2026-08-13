@@ -5,6 +5,87 @@ use std::collections::BTreeMap;
 use clinker_core_types::FailureClassification;
 use serde::{Deserialize, Serialize};
 
+use crate::logical_identity::{DatasetSubset, DatasetSubsetDirection, SymlinkIdentifier};
+
+/// Standard OpenLineage location condition used by the subset facet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationSubsetCondition {
+    #[serde(rename = "type")]
+    condition_type: String,
+    pub locations: Vec<String>,
+}
+
+impl LocationSubsetCondition {
+    fn new(locations: Vec<String>) -> Self {
+        Self {
+            condition_type: "location".to_string(),
+            locations,
+        }
+    }
+}
+
+/// Standard OpenLineage input/output facet naming one concrete logical member
+/// of a stable collection dataset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatasetSubsetFacet {
+    #[serde(rename = "_producer")]
+    pub producer: String,
+    #[serde(rename = "_schemaURL")]
+    pub schema_url: String,
+    #[serde(rename = "inputCondition", skip_serializing_if = "Option::is_none")]
+    pub input_condition: Option<LocationSubsetCondition>,
+    #[serde(rename = "outputCondition", skip_serializing_if = "Option::is_none")]
+    pub output_condition: Option<LocationSubsetCondition>,
+}
+
+impl DatasetSubsetFacet {
+    /// Build one role-specific standard subset facet from authorized logical
+    /// locations. Subsets for the other dataset role are not serialized.
+    pub fn new(subsets: &[DatasetSubset], direction: DatasetSubsetDirection) -> Option<Self> {
+        let locations: Vec<String> = subsets
+            .iter()
+            .filter(|subset| subset.direction() == direction)
+            .map(|subset| subset.identifier().to_string())
+            .collect();
+        if locations.is_empty() {
+            return None;
+        }
+        let schema_url = match direction {
+            DatasetSubsetDirection::Input => super::INPUT_DATASET_SUBSET_FACET_SCHEMA_URL,
+            DatasetSubsetDirection::Output => super::OUTPUT_DATASET_SUBSET_FACET_SCHEMA_URL,
+        };
+        let condition = LocationSubsetCondition::new(locations);
+        Some(Self {
+            producer: super::PRODUCER.to_string(),
+            schema_url: schema_url.to_string(),
+            input_condition: (direction == DatasetSubsetDirection::Input)
+                .then_some(condition.clone()),
+            output_condition: (direction == DatasetSubsetDirection::Output).then_some(condition),
+        })
+    }
+}
+
+/// Standard OpenLineage dataset facet listing explicitly authorized alternate
+/// table or location identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymlinksDatasetFacet {
+    #[serde(rename = "_producer")]
+    pub producer: String,
+    #[serde(rename = "_schemaURL")]
+    pub schema_url: String,
+    pub identifiers: Vec<SymlinkIdentifier>,
+}
+
+impl SymlinksDatasetFacet {
+    pub fn new(identifiers: Vec<SymlinkIdentifier>) -> Self {
+        Self {
+            producer: super::PRODUCER.to_string(),
+            schema_url: super::SYMLINKS_DATASET_FACET_SCHEMA_URL.to_string(),
+            identifiers,
+        }
+    }
+}
+
 /// Column-level lineage for one dataset.
 ///
 /// DIRECT (value-derivation) lineage is keyed per output column in
@@ -119,6 +200,52 @@ impl PipelineJobFacet {
             producer: super::PRODUCER.to_string(),
             schema_url: super::CLINKER_PIPELINE_FACET_SCHEMA_URL.to_string(),
             source_hash,
+        }
+    }
+}
+
+/// Versioned effective semantic fingerprint carried by the lineage job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticPlanJobFacet {
+    #[serde(rename = "_producer")]
+    pub producer: String,
+    #[serde(rename = "_schemaURL")]
+    pub schema_url: String,
+    pub algorithm: String,
+    #[serde(rename = "semanticSchemaVersion")]
+    pub semantic_schema_version: u32,
+    pub digest: String,
+}
+
+impl SemanticPlanJobFacet {
+    pub fn new(algorithm: impl Into<String>, version: u32, digest: impl Into<String>) -> Self {
+        Self {
+            producer: super::PRODUCER.to_string(),
+            schema_url: super::CLINKER_SEMANTIC_PLAN_FACET_SCHEMA_URL.to_string(),
+            algorithm: algorithm.into(),
+            semantic_schema_version: version,
+            digest: digest.into(),
+        }
+    }
+}
+
+/// Caller-owned batch correlation carried unchanged on every run event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchRunFacet {
+    #[serde(rename = "_producer")]
+    pub producer: String,
+    #[serde(rename = "_schemaURL")]
+    pub schema_url: String,
+    #[serde(rename = "batchId")]
+    pub batch_id: String,
+}
+
+impl BatchRunFacet {
+    pub fn new(batch_id: impl Into<String>) -> Self {
+        Self {
+            producer: super::PRODUCER.to_string(),
+            schema_url: super::CLINKER_BATCH_FACET_SCHEMA_URL.to_string(),
+            batch_id: batch_id.into(),
         }
     }
 }

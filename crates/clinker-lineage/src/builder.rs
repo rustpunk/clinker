@@ -11,12 +11,15 @@
 //!   sorting (Sort), conditional reshaping (Reshape `when:`) — collected once in
 //!   [`ColumnLineageDatasetFacet::dataset`].
 //!
-//! Dataset identity comes from [`crate::dataset::dataset_identity`] (#660); value
-//! derivation and influence are read off each operator's retained typed/compiled
-//! program. A **multi-record** flat-file source splits per record type: each
-//! record type becomes its own logical dataset (`<file>#<id>`) carrying only its
-//! declared columns, so column lineage is attributed per record type rather than
-//! to the one flat superset dataset (see [`seed_multi_record_source`]).
+//! External dataset identity comes from an explicit
+//! [`LineageIdentityContext`](crate::logical_identity::LineageIdentityContext);
+//! the legacy path resolver is isolated to the local diagnostic entry point.
+//! Value derivation and influence are read off each operator's retained
+//! typed/compiled program. A **multi-record** flat-file source splits per record
+//! type: each record type declares its own columns, so each becomes its own
+//! logical dataset (`<base>#<id>`) inheriting the source's bound identity, and
+//! column lineage is attributed per record type rather than to the one flat
+//! superset dataset (see [`seed_multi_record_source`]).
 //!
 //! Because topo order processes every upstream node first, the working maps store
 //! terminals already resolved back to a Source dataset column — never an
@@ -68,6 +71,12 @@
 //!   in a Reshape rule — the planner rejects those outright (`bind_reshape`'s E200
 //!   guard, because Reshape re-runs its rules after a spill that drops envelope
 //!   context), so no Reshape envelope read ever reaches this builder.
+//! - A multi-record source **declared inside a composition body** is attributed
+//!   to its container dataset rather than split per record type. The split reads
+//!   the record types off [`CompiledPlan::bound_schemas`], which is built from
+//!   the top-level `nodes:` list; a body node's resolved `SourceSchema` is not
+//!   retained on the compiled plan, so there is nothing to split by. Top-level
+//!   multi-record sources are unaffected.
 //! - A `match: collect` combine (no projection body) is resolved coarsely.
 //! - INDIRECT influence covers the predicate / grouping / sort surfaces above (for
 //!   record columns, plus `$doc` terms in the Route / Cull / Combine predicates);
@@ -77,6 +86,7 @@
 //! - Engine-stamped columns (`$ck.*` / `$meta.*` / `$source.*` / `$widened`) are
 //!   skipped, mirroring the default-writer strip.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -88,7 +98,8 @@ use petgraph::visit::EdgeRef;
 use clinker_plan::config::pipeline_node::MatchMode;
 use clinker_plan::config::{RECORD_TYPE_COLUMN, RecordType, SourceSchema};
 use clinker_plan::plan::combine::encode_chain_column;
-use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::plan::composition_body::BoundBody;
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanEdge, PlanNode};
 use clinker_plan::plan::{
     CompiledPlan, JoinSide, PlanNodeId, PredicateSupport, QualifiedField, predicate_support,
 };
@@ -98,6 +109,9 @@ use cxl::ast::{EmitTarget, Expr, Program, Statement, for_each_field_emit, progra
 use cxl::plan::BindingArg;
 
 use crate::dataset::{DatasetId, dataset_identity};
+use crate::logical_identity::{
+    DatasetIdentityFacets, LineageIdentityContext, LineageIdentityError,
+};
 use crate::openlineage::{
     COLUMN_LINEAGE_FACET_SCHEMA_URL, ColumnLineageDatasetFacet, FieldLineage, InputField, PRODUCER,
     Transformation, TransformationSubtype, TransformationType,
@@ -108,6 +122,8 @@ use crate::openlineage::{
 pub struct PlanColumnLineage {
     /// Source (input) datasets, deduplicated, in first-seen order.
     pub inputs: Vec<DatasetId>,
+    /// Standard subset/symlink identity facets keyed by input identity.
+    pub input_identity_facets: BTreeMap<DatasetId, DatasetIdentityFacets>,
     /// Each Output (sink) dataset paired with its DIRECT column-lineage facet.
     pub outputs: Vec<OutputColumnLineage>,
 }
@@ -116,6 +132,8 @@ pub struct PlanColumnLineage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputColumnLineage {
     pub dataset: DatasetId,
+    /// Standard subset/symlink facts authorized for this output identity.
+    pub identity_facets: DatasetIdentityFacets,
     /// `facet.fields` carries per-column DIRECT (value-derivation) lineage;
     /// `facet.dataset` carries the whole-dataset INDIRECT influence lineage.
     pub facet: ColumnLineageDatasetFacet,
@@ -129,6 +147,7 @@ pub struct OutputColumnLineage {
 struct ScopeSink {
     inputs: Vec<DatasetId>,
     seen_inputs: HashSet<DatasetId>,
+    input_identity_facets: BTreeMap<DatasetId, DatasetIdentityFacets>,
     output_acc: Vec<OutputAcc>,
 }
 
@@ -143,37 +162,167 @@ struct ScopeSeed {
     doc_sources: HashMap<PlanNodeId, BTreeSet<DatasetId>>,
 }
 
-/// Build the DIRECT column lineage of `compiled`.
+/// Build local-only lineage whose dataset identities are derived from declared
+/// source and output paths.
 ///
-/// `base_dir` is the workspace root (the directory containing the pipeline YAML),
-/// threaded in by the caller exactly as [`dataset_identity`] requires — it is not
-/// retained on [`CompiledPlan`].
-pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLineage {
+/// This compatibility path is intentionally named at the API boundary so a
+/// caller cannot mistake path-derived identities for external delivery
+/// identities. External emission must use [`column_lineage_external`].
+pub fn column_lineage_local_diagnostic_paths(
+    compiled: &CompiledPlan,
+    base_dir: &Path,
+) -> PlanColumnLineage {
+    build_column_lineage(
+        compiled,
+        &|node, _| Ok(dataset_identity(node, base_dir)),
+        None,
+    )
+    .expect("local diagnostic path identity cannot fail")
+}
+
+/// Build lineage with an explicit, prevalidated external identity context.
+///
+/// Unlike [`column_lineage`], this production path never receives a base
+/// directory and cannot derive or hash a source/output path. Every emitted
+/// source and output must have one exact context binding, keyed by the node's
+/// [qualified name](qualified_node).
+pub fn column_lineage_external(
+    compiled: &CompiledPlan,
+    identities: &LineageIdentityContext,
+) -> Result<PlanColumnLineage, LineageIdentityError> {
+    // Enumerated over the same scopes the walk descends into, so a pipeline
+    // whose composition body declares its own source is refused here — naming a
+    // node the author can bind — rather than part-way through the walk, naming
+    // one they cannot.
+    let mut required = Vec::new();
+    for_each_dataset_node(compiled, &mut |key, _| required.push(key.to_string()));
+    identities.validate_required(required.iter().map(String::as_str))?;
+    build_column_lineage(
+        compiled,
+        &|node, key| match node {
+            PlanNode::Source { .. } | PlanNode::Output { .. } => {
+                Ok(Some(identities.require(key)?.dataset_id().clone()))
+            }
+            _ => Ok(None),
+        },
+        Some(identities),
+    )
+}
+
+/// Resolve one dataset node's identity. `key` is the node's
+/// [qualified name](qualified_node); the local diagnostic path ignores it and
+/// reads the declared path off the node instead.
+type DatasetResolver<'a> =
+    dyn Fn(&PlanNode, &str) -> Result<Option<DatasetId>, LineageIdentityError> + 'a;
+
+/// The identity key of one dataset node: its declared name, prefixed by the
+/// composition call sites it sits under and joined with `.` — `enrich.ref` for
+/// a source declared inside the body bound at node `enrich`.
+///
+/// A bare name cannot key a plan-wide identity table. Body node names live in
+/// their own scope by design (a body node may legally share a name with a
+/// top-level one), so two different datasets would answer to one binding and the
+/// column edges of one would be attributed to the other. `<call site>.<name>` is
+/// also the spelling a channel `sources:` patch already uses to reach a
+/// body-declared source, and it is per call site — which matters, because two
+/// call sites of one body can be patched to read different files.
+///
+/// The join is a key only if the separator cannot occur inside a component.
+/// Configuration reserves `.` in every node name, so today it cannot — but it
+/// once reserved the character in a Transform / Aggregate / Route name only,
+/// and a top-level output named `enrich.ref` then flattened onto the body
+/// source `ref` under composition `enrich`: one binding answered for both, and
+/// the run emitted a single dataset as both its input and its output, each
+/// carrying the other's column edges — silently, because nothing downstream can
+/// tell a collision from a node that genuinely is both.
+///
+/// Each component is escaped before it is joined regardless
+/// ([`escape_component`]), leaving a call-site join as the only unescaped `.` a
+/// key contains: distinct `(scope, name)` pairs render to distinct keys, so the
+/// mapping is injective on its own rather than by borrowing a naming rule
+/// enforced a layer away. The key is what an author types in
+/// `[[observability.lineage.dataset]]`, which is why this is escaping rather
+/// than the length-prefixed opaque form a purely internal key would use — the
+/// two nodes above would be `enrich.ref` and `enrich\.ref`, both writable by
+/// hand.
+fn qualified_node<'a>(scope: &str, name: &'a str) -> Cow<'a, str> {
+    let escaped = escape_component(name);
+    if scope.is_empty() {
+        escaped
+    } else {
+        Cow::Owned(format!("{scope}.{escaped}"))
+    }
+}
+
+/// One node name, escaped for the `.`-joined key: `\` becomes `\\` and `.`
+/// becomes `\.`.
+///
+/// `\` is escaped as well, or the escaping would not itself be injective: a node
+/// named `a\` under call site `x` and a node named `a` under a call site named
+/// `x\` would both render `x.a\`.
+fn escape_component(name: &str) -> Cow<'_, str> {
+    if !name.contains(['.', '\\']) {
+        return Cow::Borrowed(name);
+    }
+    let mut escaped = String::with_capacity(name.len() + 8);
+    for ch in name.chars() {
+        if matches!(ch, '.' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    Cow::Owned(escaped)
+}
+
+fn build_column_lineage(
+    compiled: &CompiledPlan,
+    resolve_dataset: &DatasetResolver<'_>,
+    identities: Option<&LineageIdentityContext>,
+) -> Result<PlanColumnLineage, LineageIdentityError> {
     let mut sink = ScopeSink::default();
     // Per-source declared envelope sections — the filter that keeps a `$doc`
     // read from attributing to a source whose document cannot carry the section.
-    let declared_sections = declared_doc_sections(compiled, base_dir);
+    let declared_sections = declared_doc_sections(compiled, resolve_dataset)?;
 
-    // Top-level scope: nothing pre-seeded.
-    walk_scope(
+    let ctx = WalkContext {
         compiled,
-        base_dir,
-        compiled.dag(),
-        ScopeSeed::default(),
-        &declared_sections,
-        &mut sink,
-    );
+        resolve_dataset,
+        identities,
+        declared_sections: &declared_sections,
+    };
+
+    // Top-level scope: unqualified, and nothing pre-seeded.
+    walk_scope(&ctx, compiled.dag(), "", ScopeSeed::default(), &mut sink)?;
 
     let outputs = sink
         .output_acc
         .into_iter()
         .map(OutputAcc::into_output)
         .collect();
-    PlanColumnLineage {
+    Ok(PlanColumnLineage {
         inputs: sink.inputs,
+        input_identity_facets: sink.input_identity_facets,
         outputs,
-    }
+    })
 }
+
+/// The read-only inputs one whole build shares, constant across every scope the
+/// walk descends into: the plan, how a dataset node's identity is resolved, the
+/// identity context those bindings came from (`None` on the local diagnostic
+/// path), and the per-run envelope-section index that gates `$doc` attribution.
+struct WalkContext<'a> {
+    compiled: &'a CompiledPlan,
+    resolve_dataset: &'a DatasetResolver<'a>,
+    identities: Option<&'a LineageIdentityContext>,
+    declared_sections: &'a HashMap<DatasetId, BTreeSet<String>>,
+}
+
+/// Per-node DIRECT terminal and INDIRECT influence maps produced by one scope
+/// walk. A caller harvesting a composition body's output ports needs both.
+type ScopeWalkMaps = (
+    HashMap<PlanNodeId, ColumnTerminals>,
+    HashMap<PlanNodeId, InfluenceMap>,
+);
 
 /// Walk one DAG scope — the top-level pipeline or a composition body — in
 /// topological order, accumulating each node's DIRECT terminals and INDIRECT
@@ -187,19 +336,18 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
 /// feeding the call site. Those nodes are skipped so their placeholder Source
 /// identity is never resolved (which would inject a phantom input). At the top
 /// level the seed is empty, so this is a behavior-preserving extraction of the
-/// original single-scope walk. `declared_sections` is the per-run envelope
-/// section index that gates `$doc` attribution.
+/// original single-scope walk.
+///
+/// `scope` is the call-site path this DAG sits under — empty at the top level,
+/// and the enclosing composition's [qualified name](qualified_node) inside a
+/// body. Every identity lookup in this scope is keyed by it.
 fn walk_scope(
-    compiled: &CompiledPlan,
-    base_dir: &Path,
+    ctx: &WalkContext<'_>,
     dag: &ExecutionPlanDag,
+    scope: &str,
     seed: ScopeSeed,
-    declared_sections: &HashMap<DatasetId, BTreeSet<String>>,
     sink: &mut ScopeSink,
-) -> (
-    HashMap<PlanNodeId, ColumnTerminals>,
-    HashMap<PlanNodeId, InfluenceMap>,
-) {
+) -> Result<ScopeWalkMaps, LineageIdentityError> {
     // Pre-seeded nodes keep their injected terminals/influence/doc-sources and are
     // not recomputed by the walk. Derived before the seeds move into the working
     // maps.
@@ -227,9 +375,12 @@ fn walk_scope(
             continue;
         }
 
+        let node_key = qualified_node(scope, node.name());
+
         // The Source datasets this node draws from, resolved before the per-node
         // match so the emit-walkers can attribute a `$doc` read to them.
-        let node_doc_srcs = node_doc_sources(node, dag, idx, base_dir, &doc_sources);
+        let node_doc_srcs =
+            node_doc_sources(node, dag, idx, &node_key, ctx.resolve_dataset, &doc_sources)?;
 
         // Set by the Composition arm to the body's output-port INDIRECT influence,
         // merged into this node's influence below.
@@ -242,15 +393,48 @@ fn walk_scope(
                 // recomputing the string-allocating `dataset_identity` a second
                 // time.
                 if let Some(base) = node_doc_srcs.iter().next() {
-                    // A multi-record flat file carries several record shapes in
-                    // one physical file; each record type is its own logical
-                    // dataset (`<file>#<id>`) declaring only its own columns.
-                    // Attribute each superset column to the record type(s) that
-                    // declare it, so column lineage is accurate per record type
-                    // rather than collapsed onto the one flat superset dataset.
-                    // Single-record / generated / file schemas keep the whole
-                    // schema on the base dataset (the `None` arm), unchanged.
-                    match compiled.bound_schemas().get(node.name()) {
+                    // Registered before the per-schema split so the base
+                    // collection leads `inputs`, ahead of any record-type
+                    // dataset seeded below.
+                    if sink.seen_inputs.insert(base.clone()) {
+                        sink.inputs.push(base.clone());
+                    }
+                    if let Some(binding) = ctx
+                        .identities
+                        .and_then(|context| context.require(&node_key).ok())
+                    {
+                        // Unioned, not assigned: two Source nodes may be bound to
+                        // one external dataset — two shards of one collection —
+                        // and `inputs` holds that dataset once, so the entry has
+                        // to carry every node's authorized facts rather than the
+                        // last one walked.
+                        sink.input_identity_facets
+                            .entry(base.clone())
+                            .or_default()
+                            .merge(binding.facets());
+                    }
+                    // A multi-record flat file holds several record types, each
+                    // with its own columns, in one physical container. Differing
+                    // column sets make them distinct logical datasets rather
+                    // than subsets of `base`.
+                    //
+                    // `bound_schemas` is built from the top-level `nodes:` list
+                    // alone and keyed by the declared name exactly as written,
+                    // so only a top-level source can be looked up in it. Keying
+                    // a body source by its bare name would hand it the schema of
+                    // a same-named top-level one and split it by record types
+                    // that are not its own — naming datasets no source in the
+                    // plan declares — and keying it by its escaped call-site
+                    // path would both miss here and, for a top-level name that
+                    // needed escaping, miss its own entry. A body-declared
+                    // source therefore takes the flat arm, which is also why its
+                    // own record types are not split (see the module's
+                    // documented limitations).
+                    let declared_schema = scope
+                        .is_empty()
+                        .then(|| ctx.compiled.bound_schemas().get(node.name()))
+                        .flatten();
+                    match declared_schema {
                         Some(SourceSchema::MultiRecord { record_types, .. }) => {
                             seed_multi_record_source(
                                 node,
@@ -274,9 +458,6 @@ fn walk_scope(
                                     Subtype::Identity,
                                 );
                                 cols.insert(col.to_string(), terms);
-                            }
-                            if sink.seen_inputs.insert(base.clone()) {
-                                sink.inputs.push(base.clone());
                             }
                         }
                     }
@@ -304,7 +485,7 @@ fn walk_scope(
                         &mut emitted,
                         &resolve_unbound,
                         &node_doc_srcs,
-                        declared_sections,
+                        ctx.declared_sections,
                     );
                 }
                 // Output schema = explicit emits + open-row passthrough of the rest.
@@ -349,7 +530,7 @@ fn walk_scope(
                             &residual_docs,
                             field_ref_subtype(&emit.residual),
                             &node_doc_srcs,
-                            declared_sections,
+                            ctx.declared_sections,
                         );
                         let mut agg_docs = Vec::new();
                         aggregate_binding_doc_paths(&emit.residual, compiled, &mut agg_docs);
@@ -358,7 +539,7 @@ fn walk_scope(
                             &agg_docs,
                             Subtype::Aggregation,
                             &node_doc_srcs,
-                            declared_sections,
+                            ctx.declared_sections,
                         );
                     }
                     cols.insert_nonempty(&emit.output_name, terms);
@@ -439,7 +620,7 @@ fn walk_scope(
                             &mut emitted,
                             &resolve_unbound,
                             &node_doc_srcs,
-                            declared_sections,
+                            ctx.declared_sections,
                         );
                         for (name, terms) in emitted {
                             cols.insert_nonempty(&name, terms);
@@ -523,7 +704,7 @@ fn walk_scope(
                 // negligible vs. record volume); nested compositions recurse
                 // through this same arm.
                 let mut cols = ColumnTerminals::new();
-                if let Some(b) = compiled.body_of(*body) {
+                if let Some(b) = ctx.compiled.body_of(*body) {
                     let body_dag = ExecutionPlanDag::from_body(b);
                     // Seed each bound input port's body Source from the parent
                     // producer feeding it (the composition's incoming port-tagged
@@ -531,15 +712,9 @@ fn walk_scope(
                     // body walk skips it rather than resolving its placeholder
                     // identity into a phantom `clinker:<port>` input.
                     let mut seed = ScopeSeed::default();
-                    for edge in dag.graph.edges_directed(idx, Direction::Incoming) {
-                        let Some(port) = edge.weight().port.as_deref() else {
-                            continue;
-                        };
-                        let Some(&body_src_idx) = b.port_name_to_node_idx.get(port) else {
-                            continue;
-                        };
+                    for (body_src_idx, parent_idx) in bound_port_sources(&dag.graph, idx, b) {
                         let body_src_id = b.graph[body_src_idx].id();
-                        let parent_id = dag.graph[edge.source()].id();
+                        let parent_id = dag.graph[parent_idx].id();
                         if let Some(terms) = lineage.get(&parent_id) {
                             seed.lineage.insert(body_src_id, terms.clone());
                         }
@@ -554,7 +729,7 @@ fn walk_scope(
                         }
                     }
                     let (body_lineage, mut body_influence) =
-                        walk_scope(compiled, base_dir, &body_dag, seed, declared_sections, sink);
+                        walk_scope(ctx, &body_dag, &node_key, seed, sink)?;
                     // Harvest the first declared output port — the records the
                     // composition surfaces, against the single `output_schema` the
                     // node carries — matching the runtime harvest.
@@ -625,7 +800,7 @@ fn walk_scope(
             &lineage,
             &influence,
             &node_doc_srcs,
-            declared_sections,
+            ctx.declared_sections,
         );
         // A composition's in-body INDIRECT influence (filters / joins / group-bys
         // inside the body), harvested at its output port, joins the inherited
@@ -638,9 +813,19 @@ fn walk_scope(
         }
 
         if let PlanNode::Output { .. } = node
-            && let Some(ds) = dataset_identity(node, base_dir)
+            && let Some(ds) = (ctx.resolve_dataset)(node, &node_key)?
         {
-            record_output(&mut sink.output_acc, ds, &cols, &node_influence);
+            let identity_facets = ctx
+                .identities
+                .and_then(|context| context.require(&node_key).ok())
+                .map_or_else(DatasetIdentityFacets::default, |binding| binding.facets());
+            record_output(
+                &mut sink.output_acc,
+                ds,
+                identity_facets,
+                &cols,
+                &node_influence,
+            );
         }
 
         lineage.insert(node_id, cols);
@@ -648,16 +833,21 @@ fn walk_scope(
         doc_sources.insert(node_id, node_doc_srcs);
     }
 
-    (lineage, influence)
+    Ok((lineage, influence))
 }
 
-/// Seed a multi-record flat-file source's DIRECT terminals per record type.
+/// Seed a multi-record flat-file source's DIRECT terminals, one logical dataset
+/// per record type.
 ///
-/// A multi-record file carries several record shapes over one discriminator-led
-/// superset schema. Rather than fold every superset column onto the single flat
-/// file dataset, each record type is modeled as its own logical dataset
-/// (`<file>#<id>`, via [`DatasetId::record_type`]) carrying only its declared
-/// columns:
+/// Record types differ in their *columns*, so each is its own logical dataset
+/// (`<base>#<id>`, via [`DatasetId::record_type`]) declaring only its own
+/// columns. They are not subsets of `base`: a subset condition selects rows from
+/// one fixed schema and cannot express a differing column set, which is why the
+/// standard subset facet cannot carry this attribution. Each record-type dataset
+/// inherits `base`'s identity, so an externally bound source keeps its canonical
+/// namespace and name and no worker path enters the identity.
+///
+/// The superset columns map as:
 ///
 /// - A column exactly one record type declares → an IDENTITY terminal on that
 ///   record type's dataset.
@@ -665,19 +855,19 @@ fn walk_scope(
 ///   one IDENTITY terminal per owning record-type dataset, so a downstream
 ///   derivation traces to every record type it could have come from.
 /// - A superset column no record type declares — the engine-stamped
-///   `record_type` discriminator lead, chiefly — stays on the base file
-///   dataset, preserving its pre-split identity (a `Route` on `record_type`
-///   still names `{file, <path>, record_type}`).
+///   `record_type` discriminator lead, chiefly — belongs to the container rather
+///   than to any one record type and stays on `base`, so a `Route` on
+///   `record_type` still names `{<base>, record_type}`.
 ///
-/// The base file dataset (carrying the discriminator) and every record-type
-/// dataset are registered as run inputs, mirroring the single-dataset source's
-/// unconditional input registration. Engine-stamped columns carrying field
-/// metadata are skipped, exactly as the single-record path skips them.
+/// Every record-type dataset is registered as a run input. That is load-bearing
+/// rather than cosmetic: a conformant consumer resolves a `columnLineage`
+/// input field only against datasets the run declared as inputs, so a
+/// record-type dataset absent from `inputs` would have its column edges dropped
+/// on ingest. `base` is registered by the caller, ahead of these.
 ///
 /// A record type's `parent` / `join_key` express an intra-file hierarchy across
-/// record types; that relationship is carried in the per-record-type dataset
-/// identities rather than synthesized as lineage edges (no plan node performs
-/// such a join, so emitting one would be invented provenance).
+/// record types; no plan node performs that join, so emitting one would be
+/// invented provenance.
 fn seed_multi_record_source(
     node: &PlanNode,
     dag: &ExecutionPlanDag,
@@ -721,8 +911,6 @@ fn seed_multi_record_source(
                     );
                 }
             }
-            // The `record_type` discriminator lead (declared by no record type)
-            // and any other file-level column stay on the base dataset.
             None => {
                 terms.insert(
                     Terminal::new(&base.namespace, &base.name, name),
@@ -733,13 +921,10 @@ fn seed_multi_record_source(
         cols.insert(name.to_string(), terms);
     }
 
-    if sink.seen_inputs.insert(base.clone()) {
-        sink.inputs.push(base.clone());
-    }
     for rt in record_types {
         let ds = DatasetId::record_type(base, &rt.id);
         if sink.seen_inputs.insert(ds.clone()) {
-            sink.inputs.push(ds.clone());
+            sink.inputs.push(ds);
         }
     }
 }
@@ -882,11 +1067,12 @@ fn node_doc_sources(
     node: &PlanNode,
     dag: &ExecutionPlanDag,
     idx: NodeIndex,
-    base_dir: &Path,
+    node_key: &str,
+    resolve_dataset: &DatasetResolver<'_>,
     doc_sources: &HashMap<PlanNodeId, BTreeSet<DatasetId>>,
-) -> BTreeSet<DatasetId> {
-    match node {
-        PlanNode::Source { .. } => dataset_identity(node, base_dir).into_iter().collect(),
+) -> Result<BTreeSet<DatasetId>, LineageIdentityError> {
+    Ok(match node {
+        PlanNode::Source { .. } => resolve_dataset(node, node_key)?.into_iter().collect(),
         PlanNode::Combine {
             driving_upstream, ..
         } => {
@@ -907,7 +1093,7 @@ fn node_doc_sources(
             }
         }
         _ => union_doc_sources(dag, idx, doc_sources),
-    }
+    })
 }
 
 /// Union of the Source datasets feeding every direct upstream of `idx`.
@@ -925,12 +1111,87 @@ fn union_doc_sources(
     out
 }
 
+/// The body input-port Sources a Composition call site seeds, each paired with
+/// the parent-scope producer feeding it.
+///
+/// An input port is a real `Source` node in the body DAG, synthesized at bind
+/// time and reached from the call site's port-tagged incoming edges. Both the
+/// walk (which seeds those nodes from the parent rather than resolving their
+/// placeholder identity into a phantom input) and the identity enumeration
+/// (which must skip exactly what the walk skips) read the pairing from here, so
+/// the two cannot drift apart.
+fn bound_port_sources<'a>(
+    graph: &'a petgraph::graph::DiGraph<PlanNode, PlanEdge>,
+    idx: NodeIndex,
+    body: &'a BoundBody,
+) -> impl Iterator<Item = (NodeIndex, NodeIndex)> + 'a {
+    graph
+        .edges_directed(idx, Direction::Incoming)
+        .filter_map(move |edge| {
+            let port = edge.weight().port.as_deref()?;
+            Some((*body.port_name_to_node_idx.get(port)?, edge.source()))
+        })
+}
+
+/// Visit every Source and Output node the lineage walk resolves an identity for,
+/// paired with its [qualified name](qualified_node): the top-level dataset nodes
+/// plus those declared inside every composition body, minus each body's
+/// input-port placeholders.
+///
+/// A composition body may declare its own `type: source` (the shape a channel
+/// `sources:` patch addresses as `<call site>.<source>`), so the plan's dataset
+/// nodes are not the top-level DAG's alone.
+fn for_each_dataset_node<'a>(
+    compiled: &'a CompiledPlan,
+    visit: &mut impl FnMut(&str, &'a PlanNode),
+) {
+    let dag = compiled.dag();
+    visit_scope_dataset_nodes(
+        compiled,
+        &dag.graph,
+        &dag.topo_order,
+        "",
+        &HashSet::new(),
+        visit,
+    );
+}
+
+fn visit_scope_dataset_nodes<'a>(
+    compiled: &'a CompiledPlan,
+    graph: &'a petgraph::graph::DiGraph<PlanNode, PlanEdge>,
+    topo: &'a [NodeIndex],
+    scope: &str,
+    skip: &HashSet<NodeIndex>,
+    visit: &mut impl FnMut(&str, &'a PlanNode),
+) {
+    for &idx in topo {
+        if skip.contains(&idx) {
+            continue;
+        }
+        let node = &graph[idx];
+        let key = qualified_node(scope, node.name());
+        match node {
+            PlanNode::Source { .. } | PlanNode::Output { .. } => visit(&key, node),
+            PlanNode::Composition { body, .. } => {
+                let Some(b) = compiled.body_of(*body) else {
+                    continue;
+                };
+                let seeded: HashSet<NodeIndex> = bound_port_sources(graph, idx, b)
+                    .map(|(port_src, _)| port_src)
+                    .collect();
+                visit_scope_dataset_nodes(compiled, &b.graph, &b.topo_order, &key, &seeded, visit);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Each Source dataset mapped to the envelope section names it declares — the
 /// sections a `$doc.<section>.<field>` read may legitimately resolve against.
-/// Built once from the top-level Source nodes (composition bodies are fed by
-/// synthetic ports, never their own file sources, so they hold no real Source).
-/// A source with no `envelope:` block maps to the empty set, so a `$doc` read is
-/// never attributed to a source whose document cannot carry the section.
+/// Covers every scope, because a composition body's own declared source is a
+/// real envelope-bearing source even though its input ports are not. A source
+/// with no `envelope:` block maps to the empty set, so a `$doc` read is never
+/// attributed to a source whose document cannot carry the section.
 ///
 /// This is the lineage-side counterpart to the planner's per-source E341/E348
 /// section-declaration check: that check rejects an undeclared read against a
@@ -938,15 +1199,20 @@ fn union_doc_sources(
 /// one (CSV / fixed-width / SWIFT), where this filter prevents the false edge.
 fn declared_doc_sections(
     compiled: &CompiledPlan,
-    base_dir: &Path,
-) -> HashMap<DatasetId, BTreeSet<String>> {
+    resolve_dataset: &DatasetResolver<'_>,
+) -> Result<HashMap<DatasetId, BTreeSet<String>>, LineageIdentityError> {
+    let mut dataset_nodes: Vec<(String, &PlanNode)> = Vec::new();
+    for_each_dataset_node(compiled, &mut |key, node| {
+        dataset_nodes.push((key.to_string(), node));
+    });
+
     let mut out: HashMap<DatasetId, BTreeSet<String>> = HashMap::new();
-    let dag = compiled.dag();
-    for &idx in &dag.topo_order {
-        let node = &dag.graph[idx];
-        if let PlanNode::Source { resolved, .. } = node
-            && let Some(ds) = dataset_identity(node, base_dir)
-        {
+    for (key, node) in dataset_nodes {
+        // Only a source carries an envelope; a sink declares no sections.
+        let PlanNode::Source { resolved, .. } = node else {
+            continue;
+        };
+        if let Some(ds) = resolve_dataset(node, &key)? {
             let sections: BTreeSet<String> = resolved
                 .as_ref()
                 .and_then(|payload| payload.source.envelope.as_ref())
@@ -955,7 +1221,7 @@ fn declared_doc_sections(
             out.entry(ds).or_default().extend(sections);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Visit each non-engine-stamped output column name of `node` in schema order.
@@ -1950,11 +2216,12 @@ fn add_doc_influence(
 // Output facet assembly
 // ---------------------------------------------------------------------------
 
-/// Accumulator for one sink dataset: its per-column DIRECT terminals and
-/// whole-dataset INDIRECT influences, merged across every Output node that
-/// resolves to the same dataset.
+/// Accumulator for one sink dataset: its authorized identity facts, per-column
+/// DIRECT terminals, and whole-dataset INDIRECT influences, merged across every
+/// Output node that resolves to the same dataset.
 struct OutputAcc {
     dataset: DatasetId,
+    identity_facets: DatasetIdentityFacets,
     fields: BTreeMap<String, TermMap>,
     influence: InfluenceMap,
 }
@@ -1976,6 +2243,7 @@ impl OutputAcc {
             .collect();
         OutputColumnLineage {
             dataset: self.dataset,
+            identity_facets: self.identity_facets,
             facet: ColumnLineageDatasetFacet {
                 producer: PRODUCER.to_string(),
                 schema_url: COLUMN_LINEAGE_FACET_SCHEMA_URL.to_string(),
@@ -1986,15 +2254,18 @@ impl OutputAcc {
     }
 }
 
-/// Accumulate one Output node's DIRECT columns and INDIRECT influences into the
-/// sink dataset's entry, unioning with any prior Output node naming it.
+/// Accumulate one Output node's DIRECT columns, INDIRECT influences, and
+/// authorized identity facts into the sink dataset's entry, unioning with any
+/// prior Output node naming it.
 fn record_output(
     acc: &mut Vec<OutputAcc>,
     dataset: DatasetId,
+    identity_facets: DatasetIdentityFacets,
     cols: &ColumnTerminals,
     influence: &InfluenceMap,
 ) {
     if let Some(existing) = acc.iter_mut().find(|o| o.dataset == dataset) {
+        existing.identity_facets.merge(identity_facets);
         for (col, terms) in &cols.0 {
             if terms.is_empty() {
                 continue;
@@ -2019,6 +2290,7 @@ fn record_output(
         .collect();
     acc.push(OutputAcc {
         dataset,
+        identity_facets,
         fields,
         influence: influence.clone(),
     });
@@ -2085,7 +2357,7 @@ mod tests {
     /// Build for a `/w` workspace root, so a source `path: data/x.csv` resolves
     /// to the deterministic terminal name `/w/data/x.csv`.
     fn lineage_of(yaml: &str) -> PlanColumnLineage {
-        column_lineage(&compile(yaml), Path::new("/w"))
+        column_lineage_local_diagnostic_paths(&compile(yaml), Path::new("/w"))
     }
 
     /// One DIRECT `file:`-namespaced input field.
@@ -2110,6 +2382,48 @@ mod tests {
             "expected exactly one output dataset"
         );
         &lineage.outputs[0]
+    }
+
+    /// The key the walk derives for a node reached through a chain of call
+    /// sites, built the way the walk builds it: each scope is itself a key.
+    fn key_of(path: &[&str]) -> String {
+        let mut key = String::new();
+        for name in path {
+            key = qualified_node(&key, name).into_owned();
+        }
+        key
+    }
+
+    /// A separator that can occur inside a component is not a separator.
+    /// Configuration reserves `.` in a transform, aggregate, and route name but
+    /// not in a source, output, or composition one, so a top-level node named
+    /// `enrich.ref` and a body source `ref` under composition `enrich` used to
+    /// flatten to one key — one binding for two datasets, and the column edges
+    /// of each attributed to the other with nothing to signal it.
+    #[test]
+    fn distinct_node_paths_get_distinct_identity_keys() {
+        let paths: [&[&str]; 7] = [
+            &["enrich.ref"],
+            &["enrich", "ref"],
+            &["a.b", "c"],
+            &["a", "b.c"],
+            &["a", "b", "c"],
+            &["a.b.c"],
+            &["a\\", "b"],
+        ];
+        let keys: Vec<String> = paths.iter().map(|path| key_of(path)).collect();
+        let distinct: BTreeSet<&String> = keys.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            keys.len(),
+            "every distinct node path keys a distinct binding: {keys:?}"
+        );
+
+        // The common spellings are unchanged: only a name carrying the
+        // separator, or the escape, is written differently.
+        assert_eq!(key_of(&["orders"]), "orders");
+        assert_eq!(key_of(&["enrich", "ref"]), "enrich.ref");
+        assert_eq!(key_of(&["enrich.ref"]), r"enrich\.ref");
     }
 
     fn assert_field(fields: &BTreeMap<String, FieldLineage>, col: &str, expected: &[InputField]) {
@@ -4092,9 +4406,9 @@ nodes:
     }
 
     /// A multi-record flat file splits into one dataset per record type: each
-    /// record type's columns are attributed to its own `<file>#<id>` dataset,
-    /// and the engine-stamped `record_type` discriminator lead stays on the base
-    /// file dataset.
+    /// record type's columns are attributed to its own `<base>#<id>` dataset,
+    /// and the engine-stamped `record_type` discriminator lead — owned by the
+    /// container rather than by any record type — stays on the base dataset.
     #[test]
     fn multi_record_source_splits_columns_per_record_type() {
         let yaml = r#"
@@ -4140,7 +4454,7 @@ nodes:
         let fields = &out.facet.fields;
 
         use TransformationSubtype::Identity;
-        // The discriminator lead stays on the base file dataset.
+        // The discriminator lead belongs to the container, not a record type.
         assert_field(fields, "kind", &[direct(base, "record_type", Identity)]);
         // Header column → the header record-type dataset.
         assert_field(fields, "batch_id", &[direct(&header, "batch_id", Identity)]);
@@ -4148,8 +4462,9 @@ nodes:
         assert_field(fields, "id", &[direct(&detail, "id", Identity)]);
         assert_field(fields, "amount", &[direct(&detail, "amount", Identity)]);
 
-        // Inputs are the base file dataset plus one dataset per record type, in
-        // record-type declaration order.
+        // Every record-type dataset is a declared input: a conformant consumer
+        // resolves column-lineage input fields only against declared inputs, so
+        // an undeclared one would have its column edges dropped on ingest.
         assert_eq!(
             lineage.inputs,
             vec![file_ds(base), file_ds(&header), file_ds(&detail)],
@@ -4216,12 +4531,13 @@ nodes:
                 direct(&beta, "seq", Identity),
             ],
         );
-        // Type-exclusive columns land only on their owning record type.
+        // Type-exclusive columns land only on their owning record type. These
+        // were never ambiguous, so collapsing them onto the base would discard
+        // attribution they had no reason to lose.
         assert_field(fields, "a_only", &[direct(&alpha, "a_only", Identity)]);
         assert_field(fields, "b_only", &[direct(&beta, "b_only", Identity)]);
 
-        // Inputs: base + both record-type datasets, no duplicate for the shared
-        // `seq` column.
+        // No duplicate input for the shared `seq` column.
         assert_eq!(
             lineage.inputs,
             vec![file_ds(base), file_ds(&alpha), file_ds(&beta)],
@@ -4351,7 +4667,8 @@ nodes:
         // The reserved discriminator lead stays on the base dataset even though a
         // record type declared a same-named column.
         assert_field(fields, "rt", &[direct(base, "record_type", Identity)]);
-        // A normal column still lands on its own record-type dataset.
+        // A normal column still lands on its own record type.
         assert_field(fields, "payload", &[direct(&only, "payload", Identity)]);
+        assert_eq!(lineage.inputs, vec![file_ds(base), file_ds(&only)]);
     }
 }

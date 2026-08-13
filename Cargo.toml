@@ -109,6 +109,21 @@ proptest = "1.11"
 # left off. Pure Rust, no C build step — satisfies the workspace pure-Rust
 # pillar.
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
+# Output-destination collision keys (clinker-plan `config::fs_type`). Two paths
+# name one file on a filesystem that folds case, normalizes, or both, so the
+# key deciding "same destination" has to fold and normalize the way the volume
+# does. `unicode-case-mapping::case_folded` is the **simple** (C+S) fold: one
+# scalar to one scalar, and `ß` folds to itself. That is the fold filesystems
+# implement, and it is why the obvious alternative — the `caseless` crate,
+# whose `canonical_caseless_match_str` is literally Unicode D145 — is wrong
+# here: its fold is *full*, so it would call `straße.csv` and `strasse.csv`
+# one file when no filesystem agrees. `unicode-normalization` supplies the NFD
+# half; the two axes are independent (NTFS folds without normalizing,
+# case-sensitive APFS normalizes without folding), so both crates are
+# load-bearing and neither substitutes for the other. Pure Rust, no C build
+# step; unicode-case-mapping has no dependencies at all.
+unicode-case-mapping = "1.0"
+unicode-normalization = "0.1"
 
 [workspace.metadata.release]
 shared-version = true

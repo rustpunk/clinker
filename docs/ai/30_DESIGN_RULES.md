@@ -1,6 +1,6 @@
 # AI Onboarding: Design Rules
 
-Verified against the working tree on 2026-07-29.
+Verified against the working tree on 2026-08-07.
 
 Purpose: Record the reviewed invariants that constrain Clinker changes. This
 page is intentionally narrower than [common patterns](40_COMMON_PATTERNS.md):
@@ -36,6 +36,30 @@ to [open questions](80_OPEN_QUESTIONS.md) rather than promoting it here.
 - **Verification:** Inspect source construction and run the relevant executor
   or transport tests from [the command guide](50_TESTING_AND_COMMANDS.md).
 
+### External supervision stays at the process edge
+
+- **Scope:** Optional machine mode, workflow adapters, scheduling, retry,
+  heartbeat, deadlines, cancellation escalation, and process-tree lifetime.
+- **Invariant:** Clinker may emit one opt-in bounded lifecycle stream for one
+  finite process, but it does not own a supervisor, worker, daemon, scheduler,
+  workflow SDK, POSIX process group, or Windows Job Object. An external parent
+  drains both pipes concurrently, heartbeats independently, enforces an overall
+  deadline, delivers the actual platform graceful signal, keeps draining for a
+  separate bounded grace interval, forces exactly once only after expiry,
+  reaps before joining drains, and launches a fresh process for every retry.
+- **Rationale:** Keeping durable workflow and platform job control external
+  preserves the finite synchronous execution model and prevents advisory
+  progress from becoming accidental resume or exactly-once state.
+- **Evidence:** `crates/clinker/src/machine.rs`,
+  `crates/clinker/tests/machine_protocol_cli.rs`,
+  `crates/clinker/tests/machine_supervision.rs`, and the
+  [supervision contract](../user/src/ops/orchestrator-contract.md).
+- **Exceptions:** None. A future shipped adapter or process-tree owner requires
+  an explicit architecture and dependency decision. The Linux evidence is a
+  direct-child proof; it does not claim process-group or descendant ownership.
+- **Verification:** Run both focused machine integration tests from the command
+  guide and confirm process-launching helper code remains under `tests/support`.
+
 ### Compiled topology is authoritative
 
 - **Scope:** Planning, executor entry points, topology, plan consumers, and
@@ -67,14 +91,19 @@ to [open questions](80_OPEN_QUESTIONS.md) rather than promoting it here.
 - **Invariant:** Record and core vocabulary remain below Clinker Expression
   Language (CXL), format, and planning; `clinker-exec` consumes compiled plans;
   CLI and integration crates remain at the edge. New back-edges require a
-  reviewed contract rather than local convenience.
+  reviewed contract rather than local convenience. The Phase 3 shared-failure
+  decision permits exactly `clinker-net -> clinker-core-types` and
+  `clinker-lineage -> clinker-core-types`, with consumers using only
+  `FailureClassification`, `FailureCategory`, and `RetryAdvice`.
 - **Rationale:** Lower layers must not acquire planner or runtime policy, and
   edge integrations must not become alternate admission authorities.
 - **Evidence:** Root and crate `Cargo.toml` files, crate responsibilities in
   [the crate map](20_CRATE_MAP.md), and current imports.
 - **Exceptions:** Only the bounded D-20 and D-21 edges recorded in the
   [extension-seam map](35_EXTENSION_SEAMS.md) are approved; their presence does
-  not authorize adjacent imports.
+  not authorize adjacent imports. The two Phase 3 failure edges add no
+  re-export, feature, serialization policy, package, identity, or other shared
+  type.
 - **Verification:** Review `cargo metadata --no-deps`, relevant `cargo tree`
   output, and source imports before and after a dependency change.
 
@@ -96,6 +125,28 @@ to [open questions](80_OPEN_QUESTIONS.md) rather than promoting it here.
   have separate typed paths; they are not pipeline-YAML bypasses.
 - **Verification:** Run boundary-specific parse, security, format, source, or
   executor tests and confirm public signatures retain the proof-bearing type.
+
+### Admit an OTLP endpoint exactly once
+
+- **Scope:** Workspace observability config, Collector endpoint admission,
+  request authentication, fixed signal routing, and CLI runtime setup.
+- **Invariant:** `clinker-plan` owns only strict secret-free raw endpoint/auth
+  intent and numeric telemetry/lineage bounds. `clinker-net` alone parses and
+  normalizes that text with `ureq::http::Uri`, returning the opaque
+  `AdmittedOtlpEndpoint` proof and deriving only `/v1/logs`, `/v1/metrics`, and
+  `/v1/traces`. The CLI composes that proof with the bounds before effects; it
+  does not add another URI parser, raw-string overload, admitted type, or route.
+- **Rationale:** One capability transition prevents divergent security checks,
+  credential-bearing origins, and route confusion while keeping raw config and
+  network authority in their owning crates.
+- **Evidence:** `crates/clinker-plan/src/config/observability.rs`,
+  `crates/clinker-net/src/otlp.rs`, `crates/clinker/src/observability.rs`, and
+  `crates/clinker-net/tests/otlp_http.rs`.
+- **Exceptions:** Credential-free HTTPS sends no headers. Referenced auth stays
+  secret-free until Phase 4 D-13/D-15 and AUTH-01 provide a borrowed run-local
+  applicator after endpoint admission; it may not change origin or route.
+- **Verification:** Run the endpoint admission and successful-post tests plus
+  the CLI pre-effect observability partition.
 
 ### Keep declared extension boundaries sealed
 
@@ -193,16 +244,47 @@ to [open questions](80_OPEN_QUESTIONS.md) rather than promoting it here.
   unreachable.
 - **Invariant:** Return the owning subsystem error, normally
   `PipelineError::Internal`, rather than panicking, silently falling back, or
-  reporting success.
+  reporting success. At all twelve production-reachable specialized dispatcher
+  boundaries, a wrong node kind returns bounded
+  `PipelineError::DispatchMismatch` with
+  `runtime.invariant.dispatch_mismatch`,
+  `FailureCategory::InternalInvariant`, and `RetryAdvice::PolicyRequired`
+  before mutable operator or publication effects.
 - **Rationale:** A malformed or mismatched compiled artifact must fail closed
   without aborting the host process or corrupting downstream output.
-- **Evidence:** `crates/clinker-plan/src/error.rs` and executor dispatch and
-  error-strategy handling under `crates/clinker-exec/src/executor/`.
-- **Exceptions:** Process aborts caused by unrecoverable platform behavior are
-  not converted by documentation; ordinary reachable invariant mismatches have
-  no exception.
-- **Verification:** Add a focused regression that reaches the mismatch through
-  a public boundary and asserts the structured error/result.
+- **Evidence:** `crates/clinker-plan/src/error.rs`, dispatcher entry guards
+  under `crates/clinker-exec/src/executor/`, and
+  `crates/clinker-exec/tests/invariant_errors.rs`.
+- **Exceptions:** This SECU-03 runtime-invariant rule is separate from the
+  numbered production contracts. Process aborts caused by unrecoverable
+  platform behavior are not converted by documentation, and locally proven
+  internal algorithm and Output assertions remain assertions.
+- **Verification:** Run the exhaustive twelve-dispatcher matrix and confirm
+  each row finishes, cleans up, leaves intended finals unchanged, and retains
+  bounded failed-attempt evidence.
+
+### Keep external lineage identity logical and stable
+
+- **Scope:** External OpenLineage dataset identity, concrete partitions,
+  aliases, CLI preflight, and local diagnostic compatibility.
+- **Invariant:** Every external dataset uses a canonical datasource or exact
+  catalog namespace/name. The collection name stays stable; authorized
+  concrete input/output subsets use the standard subset facet and authorized
+  aliases use the standard symlinks facet. No worker path, temporary path,
+  attempt, drive letter, process context, or path hash may supply external
+  identity. Path-derived identity is confined to exact
+  `local_diagnostic_paths` mode.
+- **Rationale:** Catalog identity must be independently reconstructible across
+  hosts and attempts without collapsing a collection into one physical subset.
+- **Evidence:** `crates/clinker-lineage/src/logical_identity.rs`,
+  `crates/clinker-lineage/src/openlineage/facet.rs`,
+  `crates/clinker-lineage/tests/logical_identity.rs`, and
+  `crates/clinker/tests/lineage_cli.rs`.
+- **Exceptions:** The current resolved config has no subset or symlink author
+  fields; absence remains absence. Local diagnostic mode is synchronous,
+  visibly labeled, and cannot enter external delivery.
+- **Verification:** Run the logical-identity and CLI lineage suites, including
+  relocation, missing-binding, facet-shape, and pre-effect rejection cases.
 
 ### Trusted paths use validated capabilities
 
@@ -222,6 +304,31 @@ to [open questions](80_OPEN_QUESTIONS.md) rather than promoting it here.
   supported native platform affected by the change.
 
 ## Bounded Resources
+
+### Share lifecycle facts, not optional-delivery authority
+
+- **Scope:** Machine events, OTLP logs/metrics/traces, OpenLineage, privacy,
+  queue capacity, deadlines, workers, terminal facts, and publication truth.
+- **Invariant:** One CLI-owned immutable lifecycle source records batch ID,
+  execution ID, semantic fingerprint, and terminal facts once. OTLP and
+  OpenLineage copy those facts and match machine correlation/terminal truth,
+  while retaining independent capacities, deadlines, workers, counters, and
+  typed outcomes. Privacy is enforced before telemetry queue admission, and no
+  optional delivery result can change ETL, DLQ, process, machine, publication,
+  visible-final, or retained-attempt truth.
+- **Rationale:** Shared correlation prevents identity drift; independent
+  bulkheads prevent one optional signal from stalling or redefining another or
+  the finite job.
+- **Evidence:** `crates/clinker/src/lifecycle.rs`,
+  `crates/clinker/src/observability.rs`,
+  `crates/clinker-lineage/src/delivery.rs`, and
+  `crates/clinker/tests/observability_isolation.rs`.
+- **Exceptions:** Guaranteed business or compliance events are ordinary
+  outputs, not best-effort observability. Metrics spool, human diagnostics, and
+  machine control remain separate paths.
+- **Verification:** Compare each injected optional-delivery outcome against the
+  no-fault authoritative artifact oracle and verify only its typed outcome and
+  bounded counters differ.
 
 ### Share one run-scoped memory authority
 

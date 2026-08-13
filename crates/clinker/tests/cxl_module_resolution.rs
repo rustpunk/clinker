@@ -607,9 +607,10 @@ nodes:
       validations:
         - { check: "use roots.validation", message: "ordinary message" }
       log:
-        - level: info
+        - name: transform.record_seen
+          level: info
           when: per_record
-          condition: "use roots.log"
+          every: 1
           message: "ordinary template"
   - type: aggregate
     name: aggregate
@@ -684,7 +685,6 @@ nodes:
         vec![
             "roots.transform",
             "roots.validation",
-            "roots.log",
             "roots.aggregate",
             "roots.route_first",
             "roots.route_second",
@@ -729,8 +729,10 @@ nodes:
         - check: "id > 0"
           message: "use ignored.message"
       log:
-        - level: info
+        - name: transform.ignored_template
+          level: info
           when: per_record
+          every: 1
           message: "use ignored.template"
   - type: composition
     name: nested
@@ -887,4 +889,80 @@ nodes:
         .expect("body import resolves under selected root");
 
     assert!(registry.get("selected.only").is_some());
+}
+
+/// A log directive's `condition` can call a module the transform imports.
+///
+/// The gate is compiled as its own program, so an alias the transform declared
+/// is not in scope for it unless the declarations are carried across. Module
+/// discovery already walks conditions for exactly this reason; without the
+/// declarations the alias resolved nowhere and the pipeline was rejected for a
+/// module it had already compiled.
+#[test]
+fn a_log_condition_resolves_a_module_the_transform_imports() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    write(
+        &workspace.path().join("rules/app/main.cxl"),
+        "fn is_large(value) = value > 100\n",
+    );
+    let catalog_config = ClinkerToml::parse("[catalog]\nrules_root = \"rules\"\n").unwrap();
+    let catalog = WorkspaceCatalog::load(workspace.path(), &catalog_config.catalog).unwrap();
+    let rules_root = catalog.select_rules_root(None, None).unwrap();
+    let registry = compile_module_closure(
+        &catalog,
+        &rules_root,
+        &[LogicalResourceId::parse("app.main").unwrap()],
+        ModuleLimits::default(),
+    )
+    .unwrap();
+
+    let config = parse_config(
+        r#"
+pipeline:
+  name: gate_uses_module
+nodes:
+  - type: source
+    name: input
+    config:
+      name: input
+      type: csv
+      path: input.csv
+      schema:
+        - { name: value, type: int }
+  - type: transform
+    name: transform
+    input: input
+    config:
+      cxl: |
+        use app.main as admitted
+        emit value = value
+      log:
+        - name: transform.large_value
+          level: info
+          when: per_record
+          every: 1
+          condition: "admitted.is_large(value)"
+          message: "large value"
+          fields: [value]
+  - type: output
+    name: output
+    input: transform
+    config:
+      name: output
+      type: csv
+      path: output.csv
+"#,
+    )
+    .unwrap();
+    let mut context = CompileContext::new(workspace.path());
+    context.cxl_modules = registry;
+    let compiled = config.compile(&context);
+    assert!(
+        compiled.is_ok(),
+        "a gate must reach a module the transform imports: {:?}",
+        compiled.err().map(|diagnostics| diagnostics
+            .into_iter()
+            .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+            .collect::<Vec<_>>())
+    );
 }

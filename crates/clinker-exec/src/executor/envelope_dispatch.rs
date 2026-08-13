@@ -74,6 +74,38 @@ use clinker_record::{DocumentContext, DocumentGrain, DocumentId, EnvelopeRecord,
 use cxl::plan::BindingArg;
 use indexmap::IndexMap;
 
+/// Context carrier kept lazy until the node-kind guard has succeeded. Normal
+/// dispatch passes the live executor context directly; the feature-gated
+/// mismatch matrix uses the inert carrier to prove rejection precedes body,
+/// framing, and buffer access.
+pub(crate) enum EnvelopeDispatchContext<'borrow, 'plan> {
+    Live(&'borrow mut ExecutorContext<'plan>),
+    #[cfg(feature = "test-utils")]
+    Inert,
+}
+
+impl<'borrow, 'plan> From<&'borrow mut ExecutorContext<'plan>>
+    for EnvelopeDispatchContext<'borrow, 'plan>
+{
+    fn from(ctx: &'borrow mut ExecutorContext<'plan>) -> Self {
+        Self::Live(ctx)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl crate::executor::dispatch::DispatchFaultGuard {
+    /// Execute the real envelope boundary with an inert context so tests can
+    /// prove a wrong node returns before framing state is touched.
+    #[doc(hidden)]
+    pub fn dispatch_envelope_mismatch_for_testing(
+        current_dag: &ExecutionPlanDag,
+        node_idx: NodeIndex,
+        node: &PlanNode,
+    ) -> Result<(), PipelineError> {
+        dispatch_envelope(EnvelopeDispatchContext::Inert, current_dag, node_idx, node)
+    }
+}
+
 /// Execute the `Envelope` arm for `node_idx`. Drains the body predecessor and
 /// re-parks the framed body into this node's own `node_buffers` slot.
 ///
@@ -98,12 +130,15 @@ use indexmap::IndexMap;
 /// Returns [`PipelineError::EnvelopeHeaderMultipleForGrain`] (E352) when the
 /// wired header stream carries two or more records for one body grain — exactly
 /// one header record per document grain is required.
-pub(crate) fn dispatch_envelope(
-    ctx: &mut ExecutorContext<'_>,
+pub(crate) fn dispatch_envelope<'borrow, 'plan>(
+    ctx: impl Into<EnvelopeDispatchContext<'borrow, 'plan>>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     node: &PlanNode,
-) -> Result<(), PipelineError> {
+) -> Result<(), PipelineError>
+where
+    'plan: 'borrow,
+{
     let PlanNode::Envelope {
         ref name,
         strategy,
@@ -113,8 +148,19 @@ pub(crate) fn dispatch_envelope(
         ..
     } = *node
     else {
-        unreachable!("dispatch_envelope called with non-Envelope node");
+        return Err(crate::executor::invariant::dispatch_mismatch(
+            "dispatch_envelope",
+            "envelope",
+            node.kind_name(),
+            node.name(),
+        ));
     };
+    #[cfg(feature = "test-utils")]
+    let EnvelopeDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("envelope dispatcher accessed inert context after accepting an envelope node")
+    };
+    #[cfg(not(feature = "test-utils"))]
+    let EnvelopeDispatchContext::Live(ctx) = ctx.into();
 
     // Resolve the body predecessor. With no wired header the Envelope has a
     // single incoming neighbor (the body). With a wired header it has two — the

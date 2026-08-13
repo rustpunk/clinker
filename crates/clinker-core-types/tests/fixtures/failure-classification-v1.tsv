@@ -17,6 +17,7 @@ admission.configuration.batch_id_missing	configuration	do_not_retry
 admission.configuration.policy_required	configuration	policy_required
 infrastructure.runtime.transient	infrastructure	retry_with_backoff
 infrastructure.runtime.source_unavailable	infrastructure	retry_with_backoff
+infrastructure.delivery.unreportable_outcome	infrastructure	policy_required
 attempt.publication.registration_failed	publication	policy_required
 attempt.publication.finalization_failed	publication	retry_with_backoff
 attempt.publication.manifest_failed	publication	retry_with_backoff
@@ -31,3 +32,13 @@ observability.configuration.invalid	observability	do_not_retry
 observability.configuration.policy_required	observability	policy_required
 observability.delivery.failed	observability	retry_with_backoff
 observability.delivery.rejected	observability	policy_required
+source.data.invalid	source_protocol	do_not_retry
+rest.http.client_error	source_protocol	do_not_retry
+source.endpoint.untrusted_tls	source_protocol	policy_required
+source.endpoint.unresolvable	source_protocol	policy_required
+source.endpoint.unreadable_material	source_protocol	policy_required
+runtime.resource.memory_budget_exceeded	infrastructure	policy_required
+admission.configuration.memory_budget_unsatisfiable	configuration	do_not_retry
+runtime.resource.spill_failed	infrastructure	retry_with_backoff
+runtime.resource.spill_cap_exceeded	infrastructure	policy_required
+rest.protocol.page_body_limit_reached	source_protocol	policy_required

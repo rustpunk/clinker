@@ -543,3 +543,151 @@ fn shutdown_request_stops_the_reader_at_the_next_page_boundary() {
         "only the first page's rows are emitted before the interrupt"
     );
 }
+
+/// A cancelled run whose in-flight page dies mid-body is a cancellation, not
+/// an outage. The peer answered, so the "did the peer answer?" rule does not
+/// apply; what applies is that the loop was going to retry the body read, and
+/// the signal took that retry away. Reporting it as a temporarily unavailable
+/// source told a supervisor to back off and try again, and it re-queued a
+/// batch an operator had just stopped.
+#[test]
+fn shutdown_during_a_body_read_surfaces_as_typed_interruption() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncating server");
+    let address = listener.local_addr().expect("truncating server address");
+    let token = ShutdownToken::detached();
+    let server_token = token.clone();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept first request");
+        read_request(&mut stream).expect("read first request");
+        // A complete response head promising more body than will arrive, so
+        // the peer has answered and the body read is what fails. The signal is
+        // requested before the socket closes, exactly as a cancellation
+        // arriving while a page is in flight.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 512\r\nConnection: close\r\n\r\n";
+        stream.write_all(head).expect("write response head");
+        stream
+            .write_all(b"[{\"id\":0,")
+            .expect("write partial body");
+        stream.flush().expect("flush partial body");
+        server_token.request();
+        drop(stream);
+    });
+    let url = format!("http://{address}/rows");
+    let mut reader = build_reader("", 1, &url);
+    reader.set_shutdown_token(token);
+
+    let error = reader
+        .next_record()
+        .expect_err("a truncated body under a pending shutdown must interrupt");
+    handle.join().expect("join truncating server");
+
+    assert!(
+        matches!(error, clinker_format::FormatError::Interrupted),
+        "a cancelled run must not report its own cancellation as a retryable \
+         source failure: got {error:?}"
+    );
+}
+
+#[test]
+fn shutdown_between_retries_surfaces_as_typed_interruption() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind retry server");
+    let address = listener.local_addr().expect("retry server address");
+    let token = ShutdownToken::detached();
+    let server_token = token.clone();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept first request");
+        read_request(&mut stream).expect("read first request");
+        server_token.request();
+        let response =
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        stream.write_all(response).expect("write retry response");
+        stream.flush().expect("flush retry response");
+    });
+    let url = format!("http://{address}/rows");
+    let mut reader = build_reader("", 1, &url);
+    reader.set_shutdown_token(token);
+
+    let error = reader
+        .next_record()
+        .expect_err("shutdown between retries must interrupt");
+    handle.join().expect("join retry server");
+
+    assert!(matches!(error, clinker_format::FormatError::Interrupted));
+}
+
+/// Serve three pages whose `Link` targets carry dot segments, one of them past
+/// an empty segment. `/rows` names `/rows//items/../p`, which resolves to
+/// `/rows//p`; that page names `/rows/items/../p`, which resolves to `/rows/p`.
+///
+/// Resolving those by discarding empty segments sent both requests to
+/// `/rows/p` — a resource the first of them does not name — and gave the two
+/// pages one identity, so the pull ended as a continuation cycle after the
+/// second.
+fn spawn_dot_segment_link_server() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let base = format!("http://{addr}/rows");
+    let base_thread = base.clone();
+    let handle = thread::spawn(move || {
+        for incoming in listener.incoming() {
+            if stop_thread.load(Ordering::SeqCst) {
+                break;
+            }
+            let Ok(mut stream) = incoming else { continue };
+            let Some(req) = read_request(&mut stream) else {
+                continue;
+            };
+            let (offset, next) = match req.path.as_str() {
+                "/rows" => (0, format!("{base_thread}//items/../p")),
+                "/rows//p" => (PAGE_SIZE, format!("{base_thread}/items/../p")),
+                "/rows/p" => (PAGE_SIZE * 2, String::new()),
+                // Any other path is a request this reader should never have
+                // built. Answering it with no rows and no continuation makes
+                // that visible as missing records rather than as a hang.
+                _ => (TOTAL_ROWS, String::new()),
+            };
+            let extra = if next.is_empty() {
+                String::new()
+            } else {
+                format!("Link: <{next}>; rel=\"next\"\r\n")
+            };
+            write_response(&mut stream, &extra, &page_body(offset));
+            if stop_thread.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+    });
+    (base, stop, handle)
+}
+
+#[test]
+fn dot_segments_in_a_link_target_resolve_to_the_page_the_reply_named() {
+    let (url, stop, handle) = spawn_dot_segment_link_server();
+    let pagination = "        pagination:\n          strategy: link_header";
+    let mut reader = build_reader(pagination, 100, &url);
+
+    let drained = {
+        let mut ids = Vec::new();
+        loop {
+            match reader.next_record() {
+                Ok(Some(record)) => {
+                    if let Some(clinker_record::Value::Integer(id)) = record.get("id") {
+                        ids.push(*id);
+                    }
+                }
+                Ok(None) => break Ok(ids),
+                Err(error) => break Err(error),
+            }
+        }
+    };
+    shutdown_server(&url, &stop, handle);
+
+    let ids = drained.expect("two distinct pages are not a continuation cycle");
+    assert_eq!(
+        ids,
+        (0..TOTAL_ROWS as i64).collect::<Vec<_>>(),
+        "each Link target must be fetched as the resource it names, exactly once"
+    );
+}

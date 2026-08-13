@@ -37,6 +37,7 @@ use crate::config::pipeline_node::{
     CombineBody, CopyFrom, CullBody, MatchMode, OnUnmapped, PipelineNode, PropagateCkSpec,
     ReshapeBody,
 };
+use crate::config::transform::LogDirective;
 use crate::plan::combine::{
     CombineInput, DecomposedPredicate, decompose_predicate, select_driving_input,
 };
@@ -117,6 +118,14 @@ pub struct CompileArtifacts {
     /// composition scopes from colliding.
     pub reshape_compiled:
         HashMap<PlanNodeId, Arc<Vec<crate::plan::execution::CompiledReshapeRule>>>,
+    /// Per-Transform typechecked log-directive gate predicates, keyed by the
+    /// Transform node's [`PlanNodeId`] — one entry per `config.log` directive,
+    /// in declaration order, `None` where the directive declared no
+    /// `condition`. Bind→lowering handoff: lowering zips these onto
+    /// `PlanTransformPayload.log_conditions`; the runtime reads only that
+    /// on-node copy. The entry is inserted only when every condition on the
+    /// node typechecked, so a short vec cannot reach lowering.
+    pub transform_log_conditions: HashMap<PlanNodeId, Vec<Option<Arc<TypedProgram>>>>,
     /// All bound composition bodies, keyed by `CompositionBodyId`. The
     /// top-level pipeline is NOT in this map — it lives on
     /// `CompiledPlan.dag()` directly. Only body scopes are here.
@@ -1265,21 +1274,22 @@ pub(crate) fn validate_dlq_per_source(
         .collect();
 
     // Track path collisions across the pipeline-wide + every per-source
-    // entry. Two paths collide when they name the *same physical file*, which
-    // on a case-insensitive output filesystem (macOS APFS / Windows NTFS
-    // default) includes paths differing only in case — `errors.csv` and
-    // `Errors.csv` resolve to one file there, so the per-source and
-    // pipeline-wide writers would silently overwrite each other. The
-    // collision key is therefore folded *conditionally*: only when the actual
-    // target filesystem folds case (probed via `case_sensitive_dir`), never
-    // unconditionally, so two legitimately-distinct files on case-sensitive
-    // Linux are not falsely flagged. First insertion wins; subsequent
-    // insertions onto the same key emit E318. The stored value keeps the raw
-    // path for the diagnostic message; the value's `.1` is the config label.
+    // entry. Two paths collide when they name the *same physical file*, and a
+    // filesystem decides that along two independent axes: case, and Unicode
+    // normalization. `errors.csv` and `Errors.csv` are one file wherever case
+    // is folded; `Ärger.csv` written composed and decomposed is one file
+    // wherever normalization is ignored, which includes case-*sensitive*
+    // APFS. Either way the per-source and pipeline-wide writers would
+    // silently overwrite each other. Each axis is therefore applied only when
+    // the actual target filesystem exercises it, probed independently, so two
+    // legitimately-distinct files are not falsely flagged. First insertion
+    // wins; subsequent insertions onto the same key emit E318. The stored
+    // value keeps the raw path for the diagnostic message; the value's `.1`
+    // is the config label.
     let mut paths: HashMap<String, (String, String)> = HashMap::new();
     if let Some(p) = dlq.path.as_deref() {
         paths.insert(
-            crate::config::collision_key(p),
+            crate::config::destination_identity(std::path::Path::new(p)),
             (p.to_string(), "error_handling.dlq.path".to_string()),
         );
     }
@@ -1309,7 +1319,7 @@ pub(crate) fn validate_dlq_per_source(
         }
         if let Some(p) = per.path.as_deref()
             && let Some((prev_path, prev_label)) = paths.insert(
-                crate::config::collision_key(p),
+                crate::config::destination_identity(std::path::Path::new(p)),
                 (
                     p.to_string(),
                     format!("error_handling.dlq.per_source.{src_name}.path"),
@@ -1323,7 +1333,10 @@ pub(crate) fn validate_dlq_per_source(
             } else {
                 format!(
                     "collides with {prev_label} ({prev_path:?}) — these paths name \
-                     the same file on a case-insensitive output filesystem"
+                     the same file: they may differ only in case on a \
+                     case-insensitive output filesystem, differ only in being \
+                     written relatively or absolutely, or reach one directory \
+                     through a symlink"
                 )
             };
             diags.push(Diagnostic::error(
@@ -1343,11 +1356,13 @@ pub(crate) fn validate_dlq_per_source(
 /// APFS / Windows NTFS) paths differing only in case (`out.csv` / `Out.csv`)
 /// name one file.
 ///
-/// Case is folded conditionally via [`crate::config::collision_key`] — the
-/// same primitive the DLQ collision check uses — so two legitimately-distinct
-/// files on case-sensitive Linux are not flagged. Paths are compared
-/// as-authored; collisions that only emerge after path-template token
-/// resolution are left to runtime. DLQ-vs-DLQ collisions stay owned by
+/// Keyed through [`crate::config::destination_identity`] — the same identity
+/// the runtime staging registry uses — so a collision the run would refuse is
+/// refused here instead, before any record is read. Case folding and Unicode
+/// normalization are each applied within it only when the target filesystem
+/// exercises that axis, so two legitimately-distinct files are not flagged.
+/// Collisions that only emerge after
+/// path-template token resolution are still left to runtime. DLQ-vs-DLQ collisions stay owned by
 /// [`validate_dlq_per_source`] (E318): this pass seeds the map with DLQ paths
 /// only to catch Output-vs-DLQ overlap, and never re-reports a DLQ-only
 /// collision.
@@ -1364,14 +1379,14 @@ pub(crate) fn validate_output_path_collisions(
     if let Some(dlq) = dlq {
         if let Some(p) = dlq.path.as_deref() {
             paths.insert(
-                crate::config::collision_key(p),
+                crate::config::destination_identity(std::path::Path::new(p)),
                 (p.to_string(), "error_handling.dlq.path".to_string()),
             );
         }
         for (src_name, per) in &dlq.per_source {
             if let Some(p) = per.path.as_deref() {
                 paths.insert(
-                    crate::config::collision_key(p),
+                    crate::config::destination_identity(std::path::Path::new(p)),
                     (
                         p.to_string(),
                         format!("error_handling.dlq.per_source.{src_name}.path"),
@@ -1391,7 +1406,7 @@ pub(crate) fn validate_output_path_collisions(
         }
         let name = config.output.name.as_str();
         if let Some((prev_path, prev_label)) = paths.insert(
-            crate::config::collision_key(p),
+            crate::config::destination_identity(std::path::Path::new(p)),
             (p.to_string(), format!("output {name:?}")),
         ) {
             let collide_note = if prev_path == p {
@@ -1399,7 +1414,9 @@ pub(crate) fn validate_output_path_collisions(
             } else {
                 format!(
                     "collides with {prev_label} ({prev_path:?}) — these paths name the \
-                     same file on a case-insensitive output filesystem"
+                     same file: they may differ only in case on a case-insensitive \
+                     output filesystem, differ only in being written relatively or \
+                     absolutely, or reach one directory through a symlink"
                 )
             };
             diags.push(Diagnostic::error(
@@ -1407,6 +1424,110 @@ pub(crate) fn validate_output_path_collisions(
                 format!("output {name:?} path {p:?} {collide_note}"),
                 LabeledSpan::primary(Span::SYNTHETIC, String::new()),
             ));
+        }
+    }
+}
+
+/// **E375** — one `log` event name carrying two different field sets anywhere
+/// in the plan.
+///
+/// A collector groups records by the event name and holds no node identity:
+/// the runtime dispatcher looks a directive up as `peek_log(&name, severity)`,
+/// so two shapes filed under one name arrive as records nothing downstream can
+/// separate. Several transforms emitting the *same* event with the *same*
+/// fields stay legal — that is how one event is reported from several places.
+///
+/// The rule is plan-wide because the identity it protects is plan-wide. Run
+/// per node slice it held within the top-level nodes and within each
+/// composition body, but a body transform and a top-level transform were never
+/// compared — so the one arrangement the collector cannot survive was the one
+/// arrangement that passed. This pass runs after composition expansion, where
+/// every transform is flattened and each instantiation is its own node, which
+/// is also what makes a shared registry sound here and not in the per-slice
+/// pass: a composition instantiated twice repeats its own events, and repeats
+/// agree with themselves, so only a genuine disagreement is reported.
+///
+/// Reported against a synthetic span: the two transforms may live in two
+/// files, and neither location alone is the offence. The message names both,
+/// each qualified by the composition it was expanded from.
+pub(crate) fn validate_log_event_shapes(
+    nodes: &[Spanned<PipelineNode>],
+    artifacts: &CompileArtifacts,
+    diags: &mut Vec<Diagnostic>,
+) {
+    // Compared as a set: `[a, b]` and `[b, a]` request the same fields, and an
+    // event is its fields rather than their order.
+    fn field_set(directive: &crate::config::LogDirective) -> Vec<&str> {
+        let mut fields: Vec<&str> = directive.fields.as_ref().map_or_else(Vec::new, |fields| {
+            fields.iter().map(String::as_str).collect()
+        });
+        fields.sort_unstable();
+        fields.dedup();
+        fields
+    }
+
+    // event name → (label of the transform that declared it first, field set).
+    // Owned rather than borrowed: the two halves of the plan are reached
+    // through two independent borrows, and one registry has to outlive both.
+    let mut shapes: std::collections::BTreeMap<String, (String, Vec<String>)> =
+        std::collections::BTreeMap::new();
+    let mut check = |label: String, directives: &[crate::config::LogDirective]| {
+        for directive in directives {
+            let fields: Vec<String> = field_set(directive)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            match shapes.get(directive.name.as_str()) {
+                Some((first, first_fields)) if *first_fields != fields => {
+                    diags.push(Diagnostic::error(
+                        "E375",
+                        format!(
+                            "[E375] {label}: `log` event {:?} is also declared by {first} with \
+                             different fields; one event name carries one set of fields — give \
+                             both declarations the same `fields`, or give one of them its own \
+                             event name",
+                            directive.name
+                        ),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    shapes.insert(directive.name.clone(), (label.clone(), fields));
+                }
+            }
+        }
+    };
+
+    for spanned in nodes {
+        if let PipelineNode::Transform {
+            header,
+            config: body,
+        } = &spanned.value
+            && let Some(directives) = &body.log
+        {
+            check(format!("transform {:?}", header.name), directives);
+        }
+    }
+    // Bodies in bind order, each walked in its own topological order, so which
+    // of two conflicting transforms is named first does not depend on hashing.
+    for body in artifacts.composition_bodies.values() {
+        for index in &body.topo_order {
+            let Some(crate::plan::execution::PlanNode::Transform {
+                name,
+                resolved: Some(payload),
+                ..
+            }) = body.graph.node_weight(*index)
+            else {
+                continue;
+            };
+            if payload.log.is_empty() {
+                continue;
+            }
+            check(
+                format!("transform {name:?} in composition {:?}", body.semantic_name),
+                &payload.log,
+            );
         }
     }
 }
@@ -2518,6 +2639,77 @@ fn bind_schema_inner(
                     }
                     Err(d) => diags.push(d),
                 }
+                // Log-directive gates typecheck against the INPUT row, not the
+                // projected output: dispatch fires before the transform's own
+                // program runs, so an authored condition sees the record as it
+                // arrived. Wrapping in `filter` reuses the row-predicate
+                // lowering Reshape's `when` uses, which is what makes a
+                // non-boolean gate a normal type error instead of a runtime
+                // surprise.
+                if let Some(directives) = &config.log {
+                    diags.extend(log_field_diagnostics(&name, directives, &upstream, span));
+                    // A gate is compiled as its own program, so a module alias
+                    // the transform declared is not in scope for it. Module-root
+                    // discovery already walks conditions, so the closure is
+                    // compiled and the alias is available — only the gate's own
+                    // program was missing the declaration that binds it.
+                    let use_prelude = module_use_prelude(&config.cxl.source);
+                    let mut compiled: Vec<Option<Arc<TypedProgram>>> =
+                        Vec::with_capacity(directives.len());
+                    let mut every_condition_bound = true;
+                    for (index, directive) in directives.iter().enumerate() {
+                        let Some(condition) = &directive.condition else {
+                            compiled.push(None);
+                            continue;
+                        };
+                        match typecheck_cxl(
+                            &format!("{name}:log[{index}]:condition"),
+                            &format!("{}filter {}", use_prelude.source, condition.source),
+                            &upstream,
+                            AggregateMode::Row,
+                            span,
+                            &bind_ctx.scoped_vars,
+                        ) {
+                            // The condition is spliced into `filter <source>`, so a
+                            // source carrying a statement separator compiles into
+                            // statements the author never wrote into a gate — including
+                            // ones the gate's evaluator is not allocated to run. A gate
+                            // is one predicate; anything else is refused here rather
+                            // than reaching the first record.
+                            Ok(typed)
+                                if authored_gate_statements(
+                                    &typed.program.statements,
+                                    &use_prelude,
+                                ) == 1 =>
+                            {
+                                compiled.push(Some(Arc::new(typed)));
+                            }
+                            Ok(typed) => {
+                                diags.push(Diagnostic::error(
+                                    "E373",
+                                    format!(
+                                        "transform `{name}` log[{index}].condition must be one predicate, but it parses as {} statements; write the gate as a single expression, for example `condition: \"amount > 1 and region == 'eu'\"`",
+                                        authored_gate_statements(
+                                            &typed.program.statements,
+                                            &use_prelude
+                                        )
+                                    ),
+                                    LabeledSpan::primary(span, "log condition".to_string()),
+                                ));
+                                every_condition_bound = false;
+                            }
+                            Err(d) => {
+                                diags.push(d);
+                                every_condition_bound = false;
+                            }
+                        }
+                    }
+                    // Insert only on a complete set, so lowering's length guard
+                    // can treat a missing entry as "bind rejected this node".
+                    if every_condition_bound {
+                        artifacts.transform_log_conditions.insert(node_id, compiled);
+                    }
+                }
             }
             PipelineNode::Aggregate { header, config } => {
                 let upstream = match upstream_schema(&header.input.value, schema_by_name) {
@@ -3404,6 +3596,26 @@ fn bind_composition(
         }
     }
 
+    // Reject a dotted body node name (E010) on the same grounds and with
+    // the same message as the top-level pass, which never sees body files.
+    // A body node's key is the call-site path joined to its name, so a `.`
+    // in the name is a second join the reader cannot tell from the first.
+    {
+        let mut has_dotted = false;
+        for spanned in &body_file.nodes {
+            if let Some(diag) = crate::config::pipeline::dotted_node_name_diagnostic(
+                spanned.value.name(),
+                LabeledSpan::primary(span_for_node(spanned), String::new()),
+            ) {
+                has_dotted = true;
+                diags.push(diag);
+            }
+        }
+        if has_dotted {
+            return;
+        }
+    }
+
     // Pre-mint a stable id per body node and per synthetic input-port
     // source BEFORE binding, so the bind walk can key this body's typed /
     // combine side-table entries by id — body node ids are not available
@@ -3814,6 +4026,12 @@ fn bind_composition(
     // scope-local runtime key.
     let mut bound_body = BoundBody::empty(resolved_path);
     bound_body.body_scope = body_id.into();
+    bound_body.semantic_name = body_file.signature.name.clone();
+    // Digested here rather than at parse: steps 7a and 7d rewrote the body's
+    // nodes with this call site's channel `sources:` patches and any external
+    // schema file they name, and the identity has to be of the body that
+    // binds, not the body the file spelled.
+    bound_body.semantic_digest = body_file.semantic_digest();
     bound_body.graph = body_graph;
     bound_body.topo_order = body_topo;
     bound_body.name_to_idx = body_name_to_idx;
@@ -4616,6 +4834,149 @@ struct CxlTypecheckCtx<'a> {
     mode: &'a AggregateMode,
     span: Span,
     scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
+}
+
+/// The engine-supplied opening of a gate's program: the transform's `use`
+/// declarations, plus how many statements they contribute.
+struct GatePrelude {
+    /// CXL source prepended to the authored predicate.
+    source: String,
+    /// Statements the prelude itself contributes, counted by parsing the
+    /// rendered prelude so the count cannot drift from what is prepended.
+    statements: usize,
+}
+
+/// The `use` declarations of a program, rendered back as CXL source.
+///
+/// Reconstructed from the parsed statements rather than sliced out of the
+/// authored text, so an alias reaches a gate in the one canonical spelling
+/// regardless of how it was written.
+fn module_use_prelude(source: &str) -> GatePrelude {
+    let parsed = cxl::parser::Parser::parse(source);
+    let mut prelude = String::new();
+    for statement in &parsed.ast.statements {
+        if let Statement::UseStmt { path, alias, .. } = statement {
+            prelude.push_str("use ");
+            let segments: Vec<&str> = path.iter().map(AsRef::as_ref).collect();
+            prelude.push_str(&segments.join("."));
+            if let Some(alias) = alias {
+                prelude.push_str(" as ");
+                prelude.push_str(alias);
+            }
+            prelude.push('\n');
+        }
+    }
+    let statements = cxl::parser::Parser::parse(&prelude).ast.statements.len();
+    GatePrelude {
+        source: prelude,
+        statements,
+    }
+}
+
+/// The statements a gate's author actually wrote.
+///
+/// The compiled program opens with the transform's `use` declarations, and
+/// those are the engine's doing, not the author's — counting them would reject
+/// every gate in a transform that imports a module. Only that leading prelude
+/// is discounted, by length: a `use` written into the gate itself lands past
+/// the predicate, is a statement the gate's evaluator was never allocated to
+/// run, and counting it is what lets the guard refuse it.
+fn authored_gate_statements(statements: &[Statement], prelude: &GatePrelude) -> usize {
+    statements.len().saturating_sub(prelude.statements)
+}
+
+/// Columns named in the E374 message before it stops listing them.
+///
+/// A wide row would otherwise put hundreds of names between the author and the
+/// correction at the end of the sentence.
+const LOG_FIELD_ROW_LISTING_LIMIT: usize = 12;
+
+/// Refuse a requested log field the transform's input record cannot carry.
+///
+/// `fields` is the only channel by which record data reaches an event, so a
+/// selector matching no column publishes an event with the attribute missing
+/// rather than the value the author asked for — which reads exactly like a run
+/// where nothing had that value. Dispatch fires before the transform's own
+/// program runs, for `per_record` and `on_error` alike, so the row a selector
+/// must name is the input row, not the projected output.
+///
+/// Only a closed row decides this. A row left open at a composition port
+/// carries columns the planner never sees, and a selector naming one of those
+/// is not decidable here — those stay with the runtime miss counter this check
+/// backs up.
+fn log_field_diagnostics(
+    node_name: &str,
+    directives: &[LogDirective],
+    upstream: &Row,
+    span: Span,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for (index, directive) in directives.iter().enumerate() {
+        let Some(fields) = &directive.fields else {
+            continue;
+        };
+        for field in fields {
+            if !matches!(upstream.lookup(field), ColumnLookup::Unknown) {
+                continue;
+            }
+            let mut names = upstream
+                .field_names()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let elided = names.len().saturating_sub(LOG_FIELD_ROW_LISTING_LIMIT);
+            names.truncate(LOG_FIELD_ROW_LISTING_LIMIT);
+            let mut listing = names
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if listing.is_empty() {
+                listing = "no columns at all".to_string();
+            } else if elided > 0 {
+                listing.push_str(&format!(" and {elided} more"));
+            }
+            let correction = match nearest_column(field, upstream) {
+                Some(suggestion) => format!("write `fields: [{suggestion}]`"),
+                None => "request a column the input row declares".to_string(),
+            };
+            diags.push(Diagnostic::error(
+                "E374",
+                format!(
+                    "transform `{node_name}` log[{index}].fields requests `{field}`, which the \
+                     input record does not carry; the upstream row has {listing} — {correction}"
+                ),
+                LabeledSpan::primary(span, "log fields".to_string()),
+            ));
+        }
+    }
+    diags
+}
+
+/// The declared column an unmatched selector most likely meant, if any.
+///
+/// Folding case and separators out before measuring is what lets `orderId`
+/// reach `order_id`: the two differ by an underscore and a capital, which is
+/// two edits on the raw spelling and none on the folded one.
+fn nearest_column(field: &str, upstream: &Row) -> Option<String> {
+    fn fold(value: &str) -> String {
+        value
+            .to_lowercase()
+            .chars()
+            .filter(|c| *c != '_' && *c != '-')
+            .collect()
+    }
+    let folded = fold(field);
+    let threshold = 1 + folded.len() / 8;
+    upstream
+        .field_names()
+        .filter_map(|column| {
+            let name = column.to_string();
+            let distance =
+                cxl::resolve::levenshtein::levenshtein_bounded(&folded, &fold(&name), threshold)?;
+            Some((distance, name))
+        })
+        .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+        .map(|(_, name)| name)
 }
 
 #[allow(clippy::result_large_err)]
@@ -6419,6 +6780,92 @@ fn combine_e309(combine_name: &str, span: Span) -> Diagnostic {
 mod tests {
     use super::*;
     use clinker_record::FieldMetadata;
+
+    /// Only the engine's own prelude is discounted from a gate's statement
+    /// count.
+    ///
+    /// The prelude is made of `use` declarations, so discounting `use`
+    /// statements by kind discounted an author's too — and a gate carrying a
+    /// second statement then counted as the one predicate the guard requires.
+    /// Counting the prelude by length refuses it, and still admits a gate in a
+    /// transform that imports a module.
+    #[test]
+    fn a_gate_discounts_the_prelude_and_nothing_else() {
+        let no_modules = module_use_prelude("emit amount = amount");
+        assert_eq!(no_modules.source, "");
+        assert_eq!(no_modules.statements, 0);
+
+        let one_module = module_use_prelude("use other.module as m\nemit amount = amount");
+        assert_eq!(one_module.source, "use other.module as m\n");
+        assert_eq!(one_module.statements, 1);
+
+        let statements = |source: &str| cxl::parser::Parser::parse(source).ast.statements;
+
+        // The prelude's own declaration is the engine's doing.
+        assert_eq!(
+            authored_gate_statements(
+                &statements("use other.module as m\nfilter amount > 1"),
+                &one_module
+            ),
+            1
+        );
+        // A declaration the prelude did not put there is a second statement.
+        assert_eq!(
+            authored_gate_statements(
+                &statements("use other.module as m\nfilter amount > 1"),
+                &no_modules
+            ),
+            2
+        );
+        assert_eq!(
+            authored_gate_statements(&statements("filter amount > 1\ndistinct"), &no_modules),
+            2
+        );
+    }
+
+    /// The field check decides what a declared schema can decide, and stops
+    /// there.
+    ///
+    /// A row left open at a composition port carries columns declared outside
+    /// this walk's view, so an undeclared selector against one is not a
+    /// mistake the planner has grounds to refuse. Refusing it anyway would
+    /// reject working pipelines; this is also the case that keeps the runtime
+    /// miss counter a backstop rather than dead surface.
+    #[test]
+    fn a_field_request_is_refused_against_a_closed_row_and_left_to_run_time_on_an_open_one() {
+        let directives = vec![LogDirective {
+            name: "transform.seen".to_string(),
+            level: crate::config::LogLevel::Info,
+            when: crate::config::LogTiming::PerRecord,
+            message: "seen".to_string(),
+            fields: Some(vec!["customerId".to_string()]),
+            every: Some(1),
+            condition: None,
+        }];
+        let columns: IndexMap<QualifiedField, Type> = [
+            (QualifiedField::bare("customer_id"), Type::String),
+            (QualifiedField::bare("amount"), Type::Int),
+        ]
+        .into_iter()
+        .collect();
+        let cxl_span = cxl::lexer::Span::new(0, 0);
+
+        let closed = Row::closed(columns.clone(), cxl_span);
+        let refused = log_field_diagnostics("observe", &directives, &closed, Span::line_only(1));
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].code, "E374");
+        assert!(
+            refused[0].message.contains("write `fields: [customer_id]`"),
+            "the near miss must be named: {}",
+            refused[0].message
+        );
+
+        let open = Row::open(columns, cxl_span, cxl::typecheck::row::TailVarId(0));
+        assert!(
+            log_field_diagnostics("observe", &directives, &open, Span::line_only(1)).is_empty(),
+            "a column arriving through an open port is not the planner's to refuse"
+        );
+    }
 
     /// `$ck.<field>` columns resolve to source-CK metadata; the
     /// suffix is the user-declared field name.

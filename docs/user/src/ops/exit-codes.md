@@ -7,10 +7,19 @@ Clinker uses structured exit codes to communicate the outcome of a pipeline run.
 | Code | Meaning | Description |
 |------|---------|-------------|
 | 0 | Success | Pipeline completed successfully, or an attempt operation completed without cleanup debt. A purge preview that safely selects nothing is also successful. |
-| 1 | Configuration or argument error | Invalid YAML, CXL syntax error, type mismatch, DAG wiring problem, invalid attempt selector, or invalid continuation. Fix the pipeline configuration or command arguments. |
+| 1 | Configuration or argument error | Invalid YAML, CXL syntax error, type mismatch, DAG wiring problem, invalid attempt selector, invalid continuation, a `--lineage` export rejected by the configured observability caps, a `--lineage` destination that will refuse every identical retry — one the process may not write, that does not exist, that is read-only, or that is not a file. Fix the pipeline configuration or command arguments. |
 | 2 | Partial success | Pipeline ran to completion, but some records were routed to the dead-letter queue. Check the DLQ file. |
 | 3 | Evaluation error | CXL runtime error during record processing (e.g., division by zero, type coercion failure). |
-| 4 | Infrastructure or retained cleanup debt | File/format failure, disk full, or an attempt operation stopped with bounded, ambiguous, live, or otherwise retryable cleanup debt. This status never means completed-with-DLQ. |
+| 4 | Infrastructure or retained cleanup debt | File/format failure, disk full, a `--lineage` export that failed in a way a retry may resolve — a reader that went away, a write that timed out, a volume that was out of space, or a flush that exceeded its deadline — an environment that refused the SIGINT/SIGTERM handler the run requires, in which case the run stops before reading or writing anything and the environment is what must change, or an attempt operation stopped with bounded, ambiguous, live, or otherwise retryable cleanup debt. This status never means completed-with-DLQ. |
+| 130 | Cancelled | Graceful SIGINT or SIGTERM cancellation won before publication, or a required `--machine` lifecycle record could not be written before publication. Final paths for the current attempt remain unchanged. |
+
+For an ordinary standalone run, these statuses are the complete process
+result. A `--machine ndjson-v1` consumer must additionally require exactly one
+supported terminal event whose result and embedded exit, where present, match
+the actual child status and current-attempt artifact evidence. EOF, malformed
+or unsupported output, a duplicate or missing terminal, forced termination,
+or any mismatch is an incomplete attempt even if an older final already
+exists. See [Running Clinker Directly or Under a Supervisor](orchestrator-contract.md).
 
 ## Understanding exit code 2
 
@@ -109,6 +118,37 @@ to delete a directory manually.
 **Action:** Fix file paths, permissions, or disk space for run failures. For
 attempt operations, inspect the named logical execution and resolve the stated
 debt before retrying or executing another bounded purge.
+
+### Exit code 130: Cancelled
+
+Exit 130 means the attempt stopped before publication and the current
+attempt's final paths are unchanged. Two things produce it:
+
+- A SIGINT or SIGTERM that won the cancellation gate before the first final
+  rename.
+- Under `--machine ndjson-v1`, a **required** lifecycle record that could not
+  be written. The run refuses to publish an outcome it cannot report, so a
+  broken control pipe stops the attempt rather than promoting silently.
+
+A **discardable** machine record — a periodic `progress` observation — is not
+in that set. Losing one is reported on stderr as `machine progress channel
+failed` and the run continues to its real outcome; it never converts a
+completed run into a cancellation or discards computed output. A supervisor
+should therefore read 130 as "nothing was published", never as "an advisory
+record went missing".
+
+Cancellation is also recorded as a cancellation everywhere else it is
+reported: the OpenLineage terminal is `ABORT` and the `--machine` terminal is
+`cancelled`, regardless of which source observed the signal first. A source
+that notices cancellation while a request is in flight — a REST page read, for
+instance — produces the same terminals as a file source that drains and stops
+at a chunk boundary.
+
+**Action:** Re-run the attempt from the beginning of the input with the same
+`--batch-id`. There is no resume or checkpoint state to recover; see
+[Retry and identity boundaries](orchestrator-contract.md#retry-and-identity-boundaries).
+If the run was not cancelled by an operator, check stderr for a machine
+control-channel write failure and confirm the consumer is draining stdout.
 
 ## Plan-time diagnostic codes
 

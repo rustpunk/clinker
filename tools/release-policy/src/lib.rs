@@ -14,4 +14,5 @@ pub mod evidence;
 pub mod filesystem;
 pub mod inventory;
 pub mod limits;
+pub mod recovery;
 pub mod release;

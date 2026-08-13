@@ -50,3 +50,8 @@ crates/clinker/out.csv
 .review-tmp/
 .review_scratch/
 .review_tmp/
+
+# Attempt-publication roots. One is created beside a run's configured
+# destination, so running the CLI with an output inside the repository leaves
+# one here. It is runtime state, never source.
+.clinker-attempts/

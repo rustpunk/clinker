@@ -18,6 +18,8 @@ Root `AGENTS.md` still applies. This file adds local guidance for the main `clin
 - Render run errors through miette and map `PipelineError` variants to process exit codes.
 - Spool execution metrics and collect metrics spool files into NDJSON.
 - Support diagnostic-code lookup and composition field provenance through `clinker explain`.
+- Own the opt-in machine lifecycle serializer at the CLI edge while leaving
+  child-process supervision, heartbeat, retry, and process-tree control external.
 
 ## Important public APIs
 
@@ -40,7 +42,8 @@ Important in-crate symbols:
 
 ## Internal module map
 
-`crates/clinker/src/main.rs` is the only source file.
+`crates/clinker/src/main.rs` owns command admission and runtime wiring;
+`crates/clinker/src/machine.rs` owns the optional machine stream.
 
 - CLI declarations and help text.
 - `main`: tracing setup, signal handler install, command dispatch, exit-code mapping.
@@ -49,7 +52,11 @@ Important in-crate symbols:
 - `run_metrics`: metrics spool collection.
 - `run_explain`: diagnostic-code lookup and field provenance.
 - Unit tests in `main.rs`: CLI parsing, compile-anchor behavior, cap-headroom rendering, staging-plan rendering.
-- Integration tests in `crates/clinker/tests`: atomic output, miette rendering, storage CLI behavior, explain provenance/code lookup.
+- `machine.rs`: one ordered bounded NDJSON writer, execution identity, advisory
+  progress, typed terminal mapping, stdout-conflict admission, and publication evidence.
+- Integration tests in `crates/clinker/tests`: atomic output, miette rendering,
+  storage CLI behavior, explain provenance/code lookup, machine protocol, and
+  direct child-process supervision.
 
 ## Dependency rules
 
@@ -79,6 +86,8 @@ Current dependencies are intentional unless a change is approved: workspace crat
 - DLQ output uses atomic temp-and-rename discipline.
 - Staging cleanup depends on run outcome; interrupted or DLQ-producing runs keep staged copies unless policy says otherwise.
 - CLI remains synchronous and calls the synchronous executor directly.
+- Machine mode is explicit and optional. It reserves stdout, keeps human
+  diagnostics on stderr, and does not make Clinker a supervisor or service.
 
 ## Common mistakes for AI agents to avoid
 

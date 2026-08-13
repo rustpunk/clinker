@@ -25,6 +25,18 @@ pub struct DeclaredTypeFailure {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum FormatError {
+    /// A failure already assigned an exact registered machine code by the
+    /// subsystem that detected it. The code remains structured across this
+    /// transport boundary; callers must not recover it from `Display` text.
+    Classified {
+        code: &'static str,
+        message: String,
+    },
+    /// The owning run requested cancellation while a blocking reader was
+    /// between bounded operations. This is control flow, not a source or
+    /// transport failure; the executor converts it to
+    /// `PipelineError::Interrupted` at the reader boundary.
+    Interrupted,
     Io(std::io::Error),
     Csv(csv::Error),
     Json(String),
@@ -257,6 +269,8 @@ pub enum FormatError {
 impl fmt::Display for FormatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Classified { code, message } => write!(f, "[{code}] {message}"),
+            Self::Interrupted => f.write_str("source read interrupted"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Csv(e) => write!(f, "CSV error: {e}"),
             Self::Json(msg) => write!(f, "JSON error: {msg}"),
@@ -359,6 +373,23 @@ impl fmt::Display for FormatError {
 }
 
 impl FormatError {
+    /// Carry an exact registered failure code without coupling this format
+    /// crate to the registry owner.
+    pub fn classified(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Classified {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// Return the exact structured failure code, if the producer assigned one.
+    pub const fn classification_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Classified { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
     /// Build a [`FormatError::StructuralCount`] for an X12 envelope
     /// count mismatch (`SE`/`GE`/`IEA`).
     pub fn x12_structural_count(message: impl Into<String>) -> Self {
