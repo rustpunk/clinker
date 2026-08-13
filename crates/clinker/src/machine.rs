@@ -11,6 +11,7 @@ use clinker_exec::pipeline::shutdown::ShutdownToken;
 #[cfg(debug_assertions)]
 use clinker_exec::progress::ProgressKind;
 use clinker_exec::progress::{BoundedProgress, ProgressSnapshot};
+use clinker_exec::telemetry::TelemetryProducer;
 
 use crate::observability::{AdmissionSummary, ObservabilitySummary};
 use crate::{MachineFormat, RunArgs};
@@ -147,6 +148,17 @@ struct MachineState {
     /// terminal written off the progress fallback still reports the run's
     /// telemetry loss rather than only what the exporter managed to ship.
     observability_admission: Option<AdmissionSummary>,
+    /// The arena itself, read when a terminal is written on a path that never
+    /// reached the flush that would have pushed a final accounting.
+    ///
+    /// The field's absence in the terminal means *no arena was reserved*, so a
+    /// run that reserved one and then left by an early return — a storage
+    /// validation failure, an unopenable lineage destination, a source that
+    /// does not resolve — must not report itself the same way. Reading the
+    /// arena here is the accounting a supervisor can still be given; it is
+    /// marked incomplete, exactly as a mid-drain flush sample is, because the
+    /// exporter has not been joined and the counters can still move.
+    observability_arena: Option<TelemetryProducer>,
     /// The publication the first terminal attempt carried.
     ///
     /// A refused inventory write leaves the terminal slot free, and the retry
@@ -258,7 +270,18 @@ impl Drop for MachineProgressWorker {
         // terminal write itself makes, so a stalled supervisor stalls the run
         // either way. Ordering the last record against the terminal is the
         // terminal reservation's job, not this one's.
-        let _ = self.stop_and_join();
+        //
+        // What the join returns is reported for the same reason the explicit
+        // `finish` reports it. The worker returns `Err` only for a record it
+        // can never encode, or for a reader that is gone or has refused for
+        // the whole patience window — and `emit_periodic` deliberately does
+        // not trip the shutdown token, so nothing else says so. Discarding it
+        // here meant a run leaving by an early return between the worker's
+        // start and `finish` lost the one condition this thread exists to
+        // report, with no line on stderr at all.
+        if let Some(Err(error)) = self.stop_and_join() {
+            tracing::warn!(error = %error, "machine progress worker failed before the run reached its explicit finish");
+        }
     }
 }
 
@@ -305,6 +328,7 @@ impl MachineEmitter {
                 observability: None,
                 observability_progress: None,
                 observability_admission: None,
+                observability_arena: None,
                 publication: None,
                 publication_chunks_sent: 0,
                 progress: BoundedProgress::default(),
@@ -342,6 +366,17 @@ impl MachineEmitter {
     /// a collector, and only the producer can say what never got that far.
     pub(crate) fn set_observability_admission(&self, admission: AdmissionSummary) {
         self.lock_state().observability_admission = Some(admission);
+    }
+
+    /// Attach the arena itself as the accounting a terminal falls back to.
+    ///
+    /// Handed over as soon as the producer exists, so no path between here and
+    /// the flush can reach a terminal that omits the field. Omitting it means
+    /// "no arena was reserved", and the run reserved one — a terminal written
+    /// on an early return said the opposite of what had happened, and there
+    /// was no call site to add that could not later be forgotten again.
+    pub(crate) fn attach_observability_arena(&self, producer: TelemetryProducer) {
+        self.lock_state().observability_arena = Some(producer);
     }
 
     pub(crate) fn emit_started(&self) -> io::Result<()> {
@@ -723,7 +758,18 @@ impl MachineState {
         if let Some(mut observability) = observability {
             // Producer-side, so it is attached to whichever export summary the
             // terminal ends up carrying rather than to one of them.
-            observability.admission = self.observability_admission;
+            //
+            // The pushed accounting when the flush completed, and otherwise
+            // the arena read as it stands. The read is marked incomplete: the
+            // export worker has not been joined, so `undecodable` is still
+            // being credited and these counters can still move. That is the
+            // same distinction a mid-drain flush sample carries, and it is the
+            // one thing an absent field could not say.
+            observability.admission = self.observability_admission.or_else(|| {
+                self.observability_arena
+                    .as_ref()
+                    .map(|producer| AdmissionSummary::from_arena(producer.snapshot(), false))
+            });
             fields.insert("observability".to_owned(), serde_json::json!(observability));
         }
 
@@ -1132,6 +1178,10 @@ fn injected_write_failure(
         // runs first -- so the branch the sink point exists to reach was
         // still unreachable and its test passed through the fatal path.
         "periodic" => event == "progress" && fields["progress"]["kind"] == "periodic",
+        // The required record every path emits once the plan is known, on the
+        // run path and on the plan-only export alike. One point, so a test can
+        // hold the two paths to the same answer for the same condition.
+        "plan_resolved" => event == "plan_resolved",
         "finalizing" => {
             event == "progress"
                 && fields["progress"]["kind"] == "transition"
@@ -1398,6 +1448,7 @@ mod tests {
             observability: None,
             observability_progress: None,
             observability_admission: None,
+            observability_arena: None,
             publication: None,
             publication_chunks_sent: 0,
             progress: BoundedProgress::default(),

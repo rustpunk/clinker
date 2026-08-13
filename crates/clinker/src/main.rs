@@ -3541,10 +3541,17 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 node: "pipeline".to_owned(),
                 detail: error.to_string(),
             })?;
-        if let Some(emitter) = machine {
-            emitter
-                .emit_plan_resolved(fingerprint)
-                .map_err(PipelineError::Io)?;
+        if let Some(emitter) = machine
+            && let Err(error) = emitter.emit_plan_resolved(fingerprint)
+        {
+            // The same required record, at the same point, as the run path's
+            // `plan_resolved`: the supervisor will never see this run's
+            // outcome and nothing has been written yet, so the run stops
+            // before it can produce one. Reporting infrastructure here
+            // instead would classify one condition two ways depending only on
+            // whether the invocation was asked for a document or a run.
+            tracing::warn!(error = %error, "machine lifecycle record failed before the plan-only export");
+            return Err(PipelineError::Interrupted);
         }
 
         let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
@@ -3605,10 +3612,17 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         // than leaving the terminal's inventory absent — an omission the
         // contract's success row reads as publication complete, and which the
         // reference adapter reads as a stream it cannot accept.
+        //
+        // The document is written and flushed above, so by here this
+        // invocation has published everything it was going to publish. A
+        // refused terminal is a fault on the reporting channel and is raised
+        // as one — the same failure the run path raises for a published
+        // attempt — rather than as a transient runtime fault whose advice
+        // would ask a supervisor to re-run an export that already exists.
         if let Some(emitter) = machine {
             emitter
                 .emit_completed_without_attempt()
-                .map_err(PipelineError::Io)?;
+                .map_err(unreportable_outcome_error)?;
         }
         return Ok(0);
     }
@@ -3808,6 +3822,16 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     // the ones an operator most needs to interpret — with no field at all.
     if let (Some(emitter), Some(worker)) = (machine, otlp_worker.as_ref()) {
         emitter.attach_observability_progress(worker.progress_handle());
+    }
+    // The arena, on the same terms and for the same reason. `finish_otlp_delivery`
+    // runs only on the paths that reach a recorded terminal, and every early
+    // return between here and the executor — storage validation, a lineage
+    // destination that will not open, a source that does not resolve — bypassed
+    // it. The terminal then omitted `observability.admission` entirely, which the
+    // field defines as "no arena was reserved" for a run that had reserved one.
+    // Handing the arena over here is what makes the accounting unskippable.
+    if let (Some(emitter), Some(producer)) = (machine, telemetry_producer.as_ref()) {
+        emitter.attach_observability_arena(producer.clone());
     }
     let mut lineage_output: Option<LiveLineageOutput> = None;
     if let Some(path) = &args.lineage_events {

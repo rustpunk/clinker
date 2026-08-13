@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clinker_core_types::{FailureCategory, RetryAdvice};
 use ureq::http::HeaderMap;
@@ -101,6 +101,8 @@ struct FixtureResponse {
     body: Vec<u8>,
     header_delay: Duration,
     body_delay: Duration,
+    /// Extra response header lines, each already CRLF-terminated.
+    extra_headers: String,
 }
 
 impl FixtureResponse {
@@ -110,6 +112,7 @@ impl FixtureResponse {
             body,
             header_delay: Duration::ZERO,
             body_delay: Duration::ZERO,
+            extra_headers: String::new(),
         }
     }
 
@@ -119,6 +122,7 @@ impl FixtureResponse {
             body: br#"{}"#.to_vec(),
             header_delay: delay,
             body_delay: Duration::ZERO,
+            extra_headers: String::new(),
         }
     }
 
@@ -128,7 +132,13 @@ impl FixtureResponse {
             body: br#"{}"#.to_vec(),
             header_delay: Duration::ZERO,
             body_delay: delay,
+            extra_headers: String::new(),
         }
+    }
+
+    fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.extra_headers.push_str(&format!("{name}: {value}\r\n"));
+        self
     }
 }
 
@@ -153,9 +163,10 @@ fn spawn_sequence_server(
                     "Fixture"
                 };
                 let headers = format!(
-                    "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
                     response.status,
-                    response.body.len()
+                    response.body.len(),
+                    response.extra_headers,
                 );
                 let _ = stream.write_all(headers.as_bytes());
                 let _ = stream.flush();
@@ -887,5 +898,159 @@ fn a_reply_of_exactly_the_response_cap_is_read() {
     assert!(
         failure.reached_collector(),
         "the collector answered 200 before its reply proved unreadable"
+    );
+}
+
+/// A throttled collector said how long to wait, so the next attempt waits that
+/// long. Ignoring the field sent the whole attempt budget inside the first
+/// fraction of a second of a wait the collector had asked to be measured in
+/// seconds — which is how a rate limit becomes a block.
+#[test]
+fn a_collector_that_asks_for_later_is_not_asked_again_sooner() {
+    let (address, handle) = spawn_sequence_server(vec![
+        FixtureResponse::immediate(429, br#"{}"#.to_vec()).with_header("Retry-After", "1"),
+        FixtureResponse::immediate(200, br#"{}"#.to_vec()),
+    ]);
+    let endpoint = admitted_loopback_endpoint(address);
+    let started = Instant::now();
+    let outcome = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &budget(2),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect("the attempt after the requested wait is accepted");
+    let waited = started.elapsed();
+    let requests = handle.join().expect("join retry-after fixture");
+
+    assert_eq!(requests.len(), 2);
+    assert_eq!(outcome.attempts(), 2);
+    assert!(
+        waited >= Duration::from_millis(950),
+        "the collector asked for a second and got asked again after {waited:?}"
+    );
+}
+
+/// A wait the delivery budget cannot contain is the throttle, reported as
+/// such. Sleeping it out would spend the whole deadline to report a timeout,
+/// and naming the timeout would hide the rate limit that caused it.
+#[test]
+fn a_requested_wait_longer_than_the_budget_is_reported_as_the_throttle() {
+    let (address, handle) = spawn_sequence_server(vec![
+        FixtureResponse::immediate(429, br#"{}"#.to_vec()).with_header("Retry-After", "3600"),
+    ]);
+    let endpoint = admitted_loopback_endpoint(address);
+    let started = Instant::now();
+    let failure = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &budget(3),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect_err("an hour is longer than this delivery has");
+    let elapsed = started.elapsed();
+    let requests = handle.join().expect("join long-wait fixture");
+
+    assert_eq!(
+        requests.len(),
+        1,
+        "the collector is not asked a second time"
+    );
+    assert_eq!(
+        failure.kind(),
+        OtlpDeliveryFailureKind::RetryExhausted(OtlpRetryCause::CollectorThrottled)
+    );
+    assert_eq!(failure.attempts(), 1);
+    assert_eq!(
+        failure
+            .classification()
+            .expect("classified throttle")
+            .retry_advice(),
+        RetryAdvice::RetryWithBackoff,
+        "the retry belongs to whoever supervises the run",
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "the budget was not spent sleeping: {elapsed:?}"
+    );
+}
+
+/// The date form of `Retry-After` needs calendar arithmetic this crate has no
+/// dependency for. A wait that cannot be read is not a wait that may be
+/// shortened to the configured backoff, so the delivery stops and says the
+/// collector is throttling it.
+#[test]
+fn a_requested_wait_this_client_cannot_read_is_never_shortened() {
+    let (address, handle) = spawn_sequence_server(vec![
+        FixtureResponse::immediate(503, br#"{}"#.to_vec())
+            .with_header("Retry-After", "Wed, 21 Oct 2015 07:28:00 GMT"),
+    ]);
+    let endpoint = admitted_loopback_endpoint(address);
+    let failure = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &budget(3),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect_err("an unreadable wait stops the delivery");
+    let requests = handle.join().expect("join unreadable-wait fixture");
+
+    assert_eq!(
+        requests.len(),
+        1,
+        "the collector is not asked a second time"
+    );
+    assert_eq!(
+        failure.kind(),
+        OtlpDeliveryFailureKind::RetryExhausted(OtlpRetryCause::CollectorUnavailable)
+    );
+    assert_eq!(failure.attempts(), 1);
+}
+
+/// The configured delay is the first one, and each retry after it waits
+/// longer. Waiting the same amount every time handed a collector recovering
+/// from load the entire attempt budget inside one of its recovery windows.
+#[test]
+fn the_wait_before_each_retry_grows_across_attempts() {
+    let (address, handle) = spawn_sequence_server(vec![
+        FixtureResponse::immediate(503, br#"{}"#.to_vec()),
+        FixtureResponse::immediate(503, br#"{}"#.to_vec()),
+        FixtureResponse::immediate(200, br#"{}"#.to_vec()),
+    ]);
+    let endpoint = admitted_loopback_endpoint(address);
+    let growing = OtlpDeliveryBudget::new(OtlpDeliveryBounds {
+        max_request_bytes: 64 * 1024,
+        max_response_bytes: 4 * 1024,
+        max_attempts: 3,
+        connect_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(2),
+        retry_backoff: Duration::from_millis(100),
+        total_timeout: Duration::from_secs(10),
+    })
+    .expect("valid growing-backoff fixture budget");
+    let started = Instant::now();
+    let outcome = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &growing,
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect("the third attempt is accepted");
+    let waited = started.elapsed();
+    let requests = handle.join().expect("join growing-backoff fixture");
+
+    assert_eq!(requests.len(), 3);
+    assert_eq!(outcome.attempts(), 3);
+    assert!(
+        waited >= Duration::from_millis(280),
+        "100ms then 200ms, not 100ms twice: {waited:?}"
     );
 }

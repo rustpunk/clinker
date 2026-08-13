@@ -567,7 +567,18 @@ impl RestRecordSource {
             {
                 return Err(FormatError::Interrupted);
             }
-            if !cancelled && attempt < self.cfg.retries {
+            // The budget is a ceiling on retries worth making, not a quota to
+            // spend. Asking only whether attempts remain re-ran a request whose
+            // answer is settled: a hostname that does not resolve, a
+            // certificate this client will not trust, and a URL it cannot
+            // route were each tried `retries` times over, so a typo in a
+            // pipeline's host spent the whole per-request deadline once per
+            // attempt before naming the typo — and named it at the last attempt
+            // number, as though something had been tried and had varied.
+            if !cancelled
+                && attempt < self.cfg.retries
+                && retry_failure.another_attempt_could_succeed()
+            {
                 attempt = attempt.saturating_add(1);
                 continue;
             }
@@ -612,13 +623,18 @@ enum RequestFailure {
 impl RequestFailure {
     /// Whether retrying this failure could produce a different answer.
     ///
-    /// The single place this crate decides a failure is transient. Both the
-    /// page loop, which acts on it, and the cancellation rule, which asks
-    /// whether a signal abandoned a retry worth having, read this one answer.
-    /// They used to keep a list each and disagreed about a body read dropped
-    /// mid-page: the loop retried it and the cancellation rule had never been
-    /// told, so a deliberately cancelled run reported an unavailable source
-    /// with advice to back off, and a supervisor re-queued the batch.
+    /// The single place this crate decides a failure is transient. The page
+    /// loop reads it whichever phase failed — the request that never got an
+    /// answer and the body read that lost one — and so does the cancellation
+    /// rule, which asks whether a signal abandoned a retry worth having.
+    ///
+    /// The two phases used to keep a list each and disagreed about a body read
+    /// dropped mid-page: the loop retried it and the cancellation rule had
+    /// never been told, so a deliberately cancelled run reported an
+    /// unavailable source with advice to back off, and a supervisor re-queued
+    /// the batch. The request phase then asked nothing at all and simply
+    /// counted attempts, which is how a settled failure was re-run until the
+    /// budget ran out.
     ///
     /// It cannot be read from the failure's classification code: a request
     /// this client could not route and a reply it could not parse deliberately

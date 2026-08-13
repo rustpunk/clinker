@@ -60,6 +60,12 @@ pub(crate) struct ObservabilitySummary {
     /// count what reached it. Without this a run that discarded most of its
     /// signals at admission reported a clean, complete-looking export of a
     /// silently truncated dataset. Absent only when no arena was reserved.
+    ///
+    /// A run that reserved one always reports it, including on a terminal
+    /// written before the flush that would have pushed a final accounting: the
+    /// arena is read as it stands and marked `counts_complete: false`. The
+    /// alternative was an absent field on exactly those runs, which says "no
+    /// arena was reserved" about a run that reserved one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) admission: Option<AdmissionSummary>,
 }

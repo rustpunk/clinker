@@ -760,3 +760,141 @@ nodes:
         .compile(&ctx)
         .expect("the body source's comp-relative external schema must resolve and the body bind");
 }
+
+/// A collector groups records by the event name and holds no node identity, so
+/// one event name must carry one set of fields *across the plan*. The rule ran
+/// per node slice, which held it within the top-level nodes and within each
+/// composition body but never compared the two — so a top-level transform and
+/// a body transform declaring one name with different fields both passed, and
+/// the collector received two attribute shapes under one identity, which is
+/// precisely what the rule exists to prevent.
+fn workspace_with_logging_body(
+    body_fields: &str,
+    top_fields: &str,
+) -> (tempfile::TempDir, PipelineConfig) {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let comp_dir = workspace.path().join("compositions");
+    std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
+    std::fs::write(
+        comp_dir.join("logging_body.comp.yaml"),
+        format!(
+            r#"_compose:
+  name: logging_body
+  inputs:
+    inp:
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: val, type: int }}
+  outputs:
+    out: shape
+  config_schema: {{}}
+
+nodes:
+  - type: transform
+    name: shape
+    input: inp
+    config:
+      log:
+        - name: transform.customer_seen
+          level: info
+          when: per_record
+          every: 1
+          message: customer processed
+          fields: [{body_fields}]
+      cxl: |
+        emit id = id
+        emit val = val
+"#
+        ),
+    )
+    .expect("write comp");
+
+    let pipelines_dir = workspace.path().join("pipelines");
+    std::fs::create_dir_all(&pipelines_dir).expect("mkdir pipelines");
+
+    let yaml = format!(
+        r#"
+pipeline:
+  name: cross_scope_log_events
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: src.csv
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: val, type: int }}
+  - type: transform
+    name: seen
+    input: src
+    config:
+      log:
+        - name: transform.customer_seen
+          level: info
+          when: per_record
+          every: 1
+          message: customer processed
+          fields: [{top_fields}]
+      cxl: |
+        emit id = id
+        emit val = val
+  - type: composition
+    name: body
+    input: seen
+    use: ../compositions/logging_body.comp.yaml
+    inputs:
+      inp: seen
+  - type: output
+    name: out_body
+    input: body
+    config:
+      name: out_body
+      type: csv
+      path: out_body.csv
+      include_unmapped: true
+"#
+    );
+
+    let config: PipelineConfig = parse_config(&yaml).expect("parse top-level pipeline");
+    (workspace, config)
+}
+
+#[test]
+fn one_event_name_declared_with_two_field_sets_across_scopes_is_refused() {
+    let (workspace, config) = workspace_with_logging_body("val", "id");
+
+    let ctx = CompileContext::with_pipeline_dir(workspace.path(), PathBuf::from("pipelines"));
+    let err = config
+        .compile(&ctx)
+        .expect_err("one event name with two field sets must fail to compile");
+
+    let diag = err.iter().find(|d| d.code == "E375").unwrap_or_else(|| {
+        panic!("expected an E375 diagnostic for the cross-scope event shape; got: {err:?}")
+    });
+    assert!(
+        diag.message.contains("transform.customer_seen")
+            && diag.message.contains("\"seen\"")
+            && diag.message.contains("logging_body"),
+        "the E375 message must name the event and both declaring transforms: {:?}",
+        diag.message
+    );
+}
+
+/// The rule is about disagreement, not about repetition. One event reported
+/// from a body and from the call-site pipeline under the same `fields` is how
+/// a single event is emitted from several places, and a composition
+/// instantiated twice repeats its own events by construction — so agreement
+/// across scopes must still compile.
+#[test]
+fn one_event_name_declared_with_one_field_set_across_scopes_compiles() {
+    let (workspace, config) = workspace_with_logging_body("id", "id");
+
+    let ctx = CompileContext::with_pipeline_dir(workspace.path(), PathBuf::from("pipelines"));
+    config
+        .compile(&ctx)
+        .expect("agreeing declarations of one event name must compile");
+}

@@ -148,14 +148,22 @@ const OWNED_TABLES: [&str; 5] = ["catalog", "storage", "observability", "channel
 /// caught outright and `observabilty` (one deletion, thirteen characters) is
 /// caught as the typo it is. The distance is the workspace's own bounded
 /// Levenshtein, the same one CXL's resolver suggests identifiers with.
+///
+/// Only a key that could have *been* one of these blocks is measured — a
+/// `[header]` table or a `[[header]]` array of tables. Every table this
+/// document owns is written one of those two ways, so a root scalar or a root
+/// array of anything else is not a near-miss spelling of one however close it
+/// lands, and refusing it would be telling an author to rewrite a key that was
+/// never meant to be a table at all. `groups = ["eu", "us"]` folds to one edit
+/// from `group` and must load.
 fn refuse_misspelled_table(text: &str) -> Result<(), StorageConfigError> {
     // A document that does not parse as a table has already been reported by
     // the caller; there is nothing here to add to it.
     let Ok(document) = text.parse::<toml::Table>() else {
         return Ok(());
     };
-    for name in document.keys() {
-        if OWNED_TABLES.contains(&name.as_str()) {
+    for (name, value) in &document {
+        if OWNED_TABLES.contains(&name.as_str()) || !is_table_header(value) {
             continue;
         }
         let folded: String = name
@@ -174,6 +182,21 @@ fn refuse_misspelled_table(text: &str) -> Result<(), StorageConfigError> {
         }
     }
     Ok(())
+}
+
+/// Whether a top-level value is written the way a block header is written:
+/// `[name]`, or `[[name]]` repeated.
+///
+/// An inline table (`name = { … }`) counts — TOML gives it the same value
+/// shape, and an author who inlined a misspelled block has made exactly the
+/// mistake this check exists for. An array counts only when it holds tables;
+/// an array of strings or numbers is data, not a header.
+fn is_table_header(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Table(_) => true,
+        toml::Value::Array(items) => !items.is_empty() && items.iter().all(|item| item.is_table()),
+        _ => false,
+    }
 }
 
 /// The `[storage]` block: spill and staging policy for a workspace.
@@ -1656,6 +1679,36 @@ mod tests {
             "[team]\nowner = \"data-platform\"\n",
         ] {
             ClinkerToml::parse(unrelated).expect("an unrelated table still passes through");
+        }
+    }
+
+    /// The near-miss rule is about a *table* an author meant to be one of
+    /// ours. It read every top-level key instead, so a root scalar or array
+    /// within the threshold hard-failed the whole workspace file — and the
+    /// diagnostic told its author to rewrite a key that is not a table and was
+    /// never meant to be one. `groups = [...]` folds to one edit from `group`.
+    #[test]
+    fn a_near_miss_that_is_not_a_table_still_loads() {
+        for tolerated in [
+            "groups = [\"eu\", \"us\"]\n",
+            "catalogs = 3\n",
+            "storag = \"s3\"\n",
+            "chanel = true\n",
+            "observabilty = \"off\"\n",
+        ] {
+            ClinkerToml::parse(tolerated)
+                .unwrap_or_else(|error| panic!("{tolerated:?} is not a table: {error}"));
+        }
+
+        // The same spelling written the way a block is written is still the
+        // typo the check exists for, inline form included.
+        for refused in [
+            "[groups]\nname = \"eu\"\n",
+            "[[groups]]\nname = \"eu\"\n",
+            "observabilty = { arena_bytes = \"4MB\" }\n",
+        ] {
+            ClinkerToml::parse(refused)
+                .expect_err(&format!("{refused:?} is a table clinker nearly owns"));
         }
     }
 

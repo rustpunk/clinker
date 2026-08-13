@@ -659,6 +659,72 @@ fn admission_counts_read_before_the_drain_finished_are_not_reported_as_final() {
     );
 }
 
+/// A run that reserved an arena says so, however early it stops.
+///
+/// The admission object's absence is defined as *no arena was reserved*. A run
+/// that reserved one and then left before the flush — here an unopenable
+/// lineage destination, but equally storage validation, staging, or a source
+/// that does not resolve — used to omit the field entirely, so a supervisor
+/// could not tell "no telemetry was configured" from "telemetry was configured
+/// and the accounting was lost". The honest report is the accounting itself,
+/// marked incomplete because the exporter was never joined.
+#[test]
+fn a_run_that_reserved_an_arena_reports_its_admission_however_early_it_stops() {
+    let root = fixture();
+    write_pipeline(root.path(), "./private/output/customers.csv");
+    write_observability_policy(
+        root.path(),
+        "https://collector.example.com",
+        "mode = \"none\"",
+    );
+    // A directory where the destination file belongs. The run fails after the
+    // arena is reserved and the exporter has started, and before the executor
+    // is called — one of the early returns that bypasses the flush.
+    std::fs::create_dir_all(root.path().join("lineage.ndjson")).expect("blocked destination");
+
+    let output = Command::new(clinker_bin())
+        .current_dir(root.path())
+        .env("CLINKER_TEST_OTLP_OUTCOME", "success")
+        .env("CLINKER_TEST_OTLP_CAPTURE", root.path().join("otlp.ndjson"))
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "telemetry-bulkhead",
+            "--lineage-events",
+            "lineage.ndjson",
+        ])
+        .output()
+        .expect("run clinker");
+
+    assert!(
+        !output.status.success(),
+        "an unopenable lineage destination stops the run: stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let terminal = machine_events(&output)
+        .last()
+        .cloned()
+        .expect("machine terminal");
+    assert!(
+        terminal["observability"]["admission"].is_object(),
+        "an absent admission object claims no arena was reserved, and this run \
+         reserved one: {terminal:#?}"
+    );
+    assert_eq!(
+        terminal["observability"]["admission"]["counts_complete"], false,
+        "the exporter was never joined, so the accounting is not final: {terminal:#?}"
+    );
+    assert!(
+        terminal["observability"]["admission"]["capacity_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "the reported arena is the one the run reserved: {terminal:#?}"
+    );
+}
+
 /// Four customers with varying amounts, and a per-record event gated on a
 /// field the directive never requests. The gate reads `amount`; only
 /// `customer_id` is exported.

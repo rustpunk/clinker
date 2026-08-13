@@ -227,7 +227,11 @@ pub struct OtlpDeliveryBounds {
     pub connect_timeout: Duration,
     /// Deadline for the request once connected.
     pub request_timeout: Duration,
-    /// Delay before the first retry.
+    /// Delay before the first retry, doubling before each retry after it.
+    ///
+    /// A collector that asks for longer with `Retry-After` gets what it asked
+    /// for instead. Either way `total_timeout` is the ceiling: a wait that
+    /// would outlast it costs the remaining attempts, never the deadline.
     pub retry_backoff: Duration,
     /// Ceiling across every attempt.
     pub total_timeout: Duration,
@@ -681,13 +685,54 @@ pub fn send_otlp_json(
                             attempts,
                         ));
                     }
-                    wait_for_retry(
-                        signal,
-                        attempts,
-                        budget.retry_backoff,
-                        deadline,
-                        shutdown_requested,
-                    )?;
+                    // A status in this set is the collector asking for later,
+                    // and `Retry-After` is it saying how much later. Ignoring
+                    // it answered "please wait" by asking again inside the
+                    // configured first delay — three POSTs in 200ms against a
+                    // collector that had asked for thirty seconds, which is
+                    // how a throttle becomes a ban. The REST source in this
+                    // crate declines to re-request a throttled endpoint at all
+                    // rather than hurry it, having no delay to offer; this
+                    // path has one, so it honours what was asked for.
+                    let delay = match retry_after_hint(response.headers()) {
+                        Some(RetryAfterHint::Delay(requested)) => {
+                            // No sooner than asked, and no sooner than the
+                            // growing backoff would have waited anyway.
+                            let delay =
+                                requested.max(backoff_after(budget.retry_backoff, attempts));
+                            // Sleeping out a wait the budget cannot contain
+                            // would spend the whole delivery deadline to
+                            // report a timeout. What is actually known is that
+                            // the collector asked for longer than this export
+                            // has, which is the throttle, said with the retry
+                            // advice a supervisor can act on.
+                            if Instant::now()
+                                .checked_add(delay)
+                                .is_none_or(|resume| resume > deadline)
+                            {
+                                return Err(OtlpDeliveryFailure::new(
+                                    signal,
+                                    OtlpDeliveryFailureKind::RetryExhausted(cause),
+                                    attempts,
+                                ));
+                            }
+                            delay
+                        }
+                        // A wait this client cannot compute is not a wait it
+                        // may shorten to zero. Re-requesting is the failure
+                        // being fixed here, so an unreadable hint stops the
+                        // delivery with the same throttle verdict and leaves
+                        // the retry to whoever supervises the run.
+                        Some(RetryAfterHint::Unreadable) => {
+                            return Err(OtlpDeliveryFailure::new(
+                                signal,
+                                OtlpDeliveryFailureKind::RetryExhausted(cause),
+                                attempts,
+                            ));
+                        }
+                        None => backoff_after(budget.retry_backoff, attempts),
+                    };
+                    wait_for_retry(signal, attempts, delay, deadline, shutdown_requested)?;
                     continue;
                 }
                 return Err(OtlpDeliveryFailure::new(
@@ -709,7 +754,7 @@ pub fn send_otlp_json(
                     wait_for_retry(
                         signal,
                         attempts,
-                        budget.retry_backoff,
+                        backoff_after(budget.retry_backoff, attempts),
                         deadline,
                         shutdown_requested,
                     )?;
@@ -830,9 +875,18 @@ fn retryable_status(status: u16) -> Option<OtlpRetryCause> {
 /// in common is that the peer was reached and the exchange then failed, which
 /// on an `https://` origin is the mismatch signature.
 ///
-/// So this excludes only the failures that describe never getting to the peer
-/// — refused, unresolved, or a deadline that expired before a connection
-/// existed — and treats the rest as the mismatch.
+/// What that narrows to is an I/O failure on a connection that existed, minus
+/// the kinds that describe never getting to the peer — refused, unresolved, or
+/// a deadline that expired before a connection existed. The host-specific
+/// spellings all live inside that set, so no arm is owed to a new one.
+///
+/// Everything that is not an I/O failure at all is excluded, whatever else it
+/// is. Taking "not a reachability failure" as the whole test drew the
+/// conclusion from the absence of evidence and reached it for errors raised
+/// well above the handshake: a reply that did not parse as HTTP, and a
+/// response header larger than this client will read, both arrive through a
+/// handshake that completed — and an operator was told no TLS handshake ever
+/// did.
 ///
 /// A connection dropped repeatedly in front of a healthy collector looks
 /// identical, and no predicate over error kinds separates the two. What
@@ -851,10 +905,12 @@ fn is_tls_endpoint_mismatch(error: &ureq::Error, https_only: bool) -> bool {
         // mismatch sends an operator to a certificate that was working and
         // buries the timeout that pointed at collector capacity.
         ureq::Error::Timeout(_) => false,
-        // A credential that could not be applied never reached the wire, so
-        // there was no exchange to draw a conclusion from.
-        ureq::Error::Other(other) if other.is::<OtlpCredentialApplicationError>() => false,
-        error => !is_reachability_failure(error),
+        error @ ureq::Error::Io(_) => !is_reachability_failure(error),
+        // Named layers, and this client's own limits. A credential that could
+        // not be applied never reached the wire; a status, a body cap, and an
+        // oversized response header are all things a completed exchange
+        // produced. None of them is evidence about TLS in either direction.
+        _ => false,
     }
 }
 
@@ -980,20 +1036,29 @@ fn map_transport_error(
     error: &ureq::Error,
 ) -> OtlpDeliveryFailure {
     let kind = match error {
-        ureq::Error::Tls(_) | ureq::Error::Rustls(_) | ureq::Error::TlsRequired => {
-            OtlpDeliveryFailureKind::Tls
-        }
-        // The named causes first. The mismatch check below concludes from the
-        // absence of a better explanation, so anything that carries its own
-        // has to be matched before it — a credential that never reached the
-        // wire, and a deadline that names the phase it expired in.
+        // Every failure this build can raise from the TLS layer itself,
+        // including certificate material that would not parse. The REST source
+        // in this crate names the same set.
+        ureq::Error::Tls(_)
+        | ureq::Error::Rustls(_)
+        | ureq::Error::TlsRequired
+        | ureq::Error::Pem(_) => OtlpDeliveryFailureKind::Tls,
+        // The named causes first. The mismatch check below reads a signature
+        // rather than a stated cause, so anything that states its own has to
+        // be matched before it — a credential that never reached the wire, and
+        // a deadline that names the phase it expired in.
         ureq::Error::Other(other) if other.is::<OtlpCredentialApplicationError>() => {
             OtlpDeliveryFailureKind::CredentialApplication
         }
         ureq::Error::Timeout(_) => OtlpDeliveryFailureKind::Timeout,
-        // Reachability failures stay Transport: those describe getting to the
-        // peer rather than what the peer turned out to be.
         error if is_tls_endpoint_mismatch(error, https_only) => OtlpDeliveryFailureKind::Tls,
+        // What is left is a delivery that failed for a reason this transport
+        // cannot attribute — reaching the collector, a reply that did not
+        // parse, a limit this client imposes. `Transport` says exactly that
+        // and no more. Reading it as a TLS mismatch instead told an operator
+        // that no handshake had completed about exchanges that had, and
+        // disagreed with the REST source, which calls an unparsable reply a
+        // retryable transport failure.
         _ => OtlpDeliveryFailureKind::Transport,
     };
     OtlpDeliveryFailure::new(signal, kind, attempts)
@@ -1013,6 +1078,59 @@ fn map_body_error(signal: OtlpSignal, attempts: u32, error: &ureq::Error) -> Otl
     let mut failure = OtlpDeliveryFailure::new(signal, kind, attempts);
     failure.reached_collector = true;
     failure
+}
+
+/// How long to wait after `attempts` failed attempts, before the next one.
+///
+/// `first` is the delay before the first retry and doubles for each one after
+/// it. The value is read from a deployment key named for the *first* delay, and
+/// waiting that same amount every time made a collector under load receive the
+/// whole attempt budget inside one of its own recovery windows.
+///
+/// Nothing here is a bound: the growth saturates rather than wrapping, and
+/// [`wait_for_retry`] is what stops the wait, cutting it at the delivery
+/// deadline the whole call is already bounded by. A doubling that outgrows the
+/// budget therefore costs the remaining attempts and never the deadline.
+fn backoff_after(first: Duration, attempts: u32) -> Duration {
+    // `attempts` counts the one that just failed, so the first retry doubles
+    // nothing. The exponent is capped where `u32` stops being able to hold the
+    // multiplier; the product saturates well before that on any real budget.
+    let doublings = attempts.saturating_sub(1).min(u32::BITS - 1);
+    first.saturating_mul(2_u32.saturating_pow(doublings))
+}
+
+/// What a `Retry-After` field said, when a collector sent one.
+enum RetryAfterHint {
+    /// A wait this client could read.
+    Delay(Duration),
+    /// A wait it could not. RFC 9110 §10.2.3 also spells the field as an
+    /// HTTP-date, and reading one needs calendar arithmetic this crate has no
+    /// dependency for. Guessing shorter is the very thing the field exists to
+    /// prevent, so an unread hint is treated as one that cannot be honoured
+    /// rather than one that can be ignored.
+    Unreadable,
+}
+
+/// Read the wait a collector asked for, if it asked for one.
+///
+/// Only the delay-seconds form is understood. A reply carrying several of
+/// these is answered by the longest of them, and by `Unreadable` if any one of
+/// them cannot be read — the shortest reading of a repeated field is the one
+/// that hurries a collector that asked to be left alone.
+fn retry_after_hint(headers: &ureq::http::HeaderMap) -> Option<RetryAfterHint> {
+    let mut longest: Option<Duration> = None;
+    for value in headers.get_all(ureq::http::header::RETRY_AFTER) {
+        let digits = value.as_bytes().trim_ascii();
+        let seconds = (!digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
+            .then(|| std::str::from_utf8(digits).ok()?.parse::<u64>().ok())
+            .flatten();
+        let Some(seconds) = seconds else {
+            return Some(RetryAfterHint::Unreadable);
+        };
+        let requested = Duration::from_secs(seconds);
+        longest = Some(longest.map_or(requested, |held: Duration| held.max(requested)));
+    }
+    longest.map(RetryAfterHint::Delay)
 }
 
 fn wait_for_retry(
@@ -1192,11 +1310,109 @@ pub(crate) fn admitted_loopback_endpoint(address: SocketAddr) -> AdmittedOtlpEnd
 
 #[cfg(test)]
 mod classification {
-    use super::{is_tls_endpoint_mismatch, peer_may_hold_batch, retryable_transport};
+    use super::{
+        RetryAfterHint, backoff_after, is_tls_endpoint_mismatch, peer_may_hold_batch,
+        retry_after_hint, retryable_transport,
+    };
     use std::io::{Error as IoError, ErrorKind};
+    use std::time::Duration;
 
     fn io(kind: ErrorKind) -> ureq::Error {
         ureq::Error::Io(IoError::from(kind))
+    }
+
+    fn retry_after(values: &[&str]) -> ureq::http::HeaderMap {
+        let mut headers = ureq::http::HeaderMap::new();
+        for value in values {
+            headers.append(
+                ureq::http::header::RETRY_AFTER,
+                value.parse().expect("a valid header value"),
+            );
+        }
+        headers
+    }
+
+    /// A failure that names a layer above the handshake is not evidence about
+    /// the handshake. Concluding a mismatch from "not a reachability failure"
+    /// reached it for every one of these, so an operator was told no TLS
+    /// handshake had completed about exchanges in which one had — the reply
+    /// that arrived and then failed to parse, and the header this client
+    /// refused to keep reading.
+    #[test]
+    fn a_failure_above_the_handshake_is_never_a_mismatch() {
+        for error in [
+            ureq::Error::LargeResponseHeader(64 * 1024, 8 * 1024),
+            ureq::Error::BodyExceedsLimit(1),
+            ureq::Error::StatusCode(503),
+            ureq::Error::BadUri("collector".to_owned()),
+            ureq::Error::RequireHttpsOnly("collector".to_owned()),
+            ureq::Error::TooManyRedirects,
+        ] {
+            assert!(
+                !is_tls_endpoint_mismatch(&error, true),
+                "{error:?} arrived through an exchange, or never started one"
+            );
+        }
+    }
+
+    /// The wait doubles, so a collector under load is not handed the whole
+    /// attempt budget inside one of its own recovery windows. The value is
+    /// read from a deployment key named for the first delay, which is what
+    /// the first retry gets.
+    #[test]
+    fn the_wait_before_each_retry_grows() {
+        let first = Duration::from_millis(50);
+        assert_eq!(backoff_after(first, 1), first);
+        assert_eq!(backoff_after(first, 2), Duration::from_millis(100));
+        assert_eq!(backoff_after(first, 3), Duration::from_millis(200));
+        // Growth never wraps back round to a short wait. Past any budget it
+        // saturates, and the delivery deadline is what actually stops it.
+        assert!(backoff_after(first, u32::MAX) > Duration::from_secs(86_400));
+        assert!(backoff_after(Duration::MAX, u32::MAX) == Duration::MAX);
+        assert_eq!(backoff_after(Duration::ZERO, 9), Duration::ZERO);
+    }
+
+    /// `Retry-After` is the collector saying how long "later" is. Only the
+    /// delay-seconds form is read; the date form needs calendar arithmetic
+    /// this crate has no dependency for, and guessing shorter is the one
+    /// answer the field exists to prevent.
+    #[test]
+    fn a_collector_that_says_how_long_is_read_or_not_guessed_at() {
+        assert!(retry_after_hint(&retry_after(&[])).is_none());
+
+        for (values, expected) in [
+            (vec!["30"], Duration::from_secs(30)),
+            (vec![" 30 "], Duration::from_secs(30)),
+            (vec!["0"], Duration::ZERO),
+            // A repeated field is answered by the longest wait in it: the
+            // shortest reading is the one that hurries a collector that asked
+            // to be left alone.
+            (vec!["5", "30"], Duration::from_secs(30)),
+            (vec!["30", "5"], Duration::from_secs(30)),
+        ] {
+            let hint = retry_after_hint(&retry_after(&values));
+            assert!(
+                matches!(hint, Some(RetryAfterHint::Delay(delay)) if delay == expected),
+                "{values:?} names a wait of {expected:?}"
+            );
+        }
+
+        for values in [
+            vec!["Wed, 21 Oct 2015 07:28:00 GMT"],
+            vec![""],
+            vec!["30s"],
+            vec!["-1"],
+            vec!["99999999999999999999999999"],
+            vec!["30", "Wed, 21 Oct 2015 07:28:00 GMT"],
+        ] {
+            assert!(
+                matches!(
+                    retry_after_hint(&retry_after(&values)),
+                    Some(RetryAfterHint::Unreadable)
+                ),
+                "{values:?} is a wait this client must not shorten to zero"
+            );
+        }
     }
 
     /// A reset, an abort, and a half-open socket are produced by a peer that

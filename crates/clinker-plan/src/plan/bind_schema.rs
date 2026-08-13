@@ -1428,6 +1428,110 @@ pub(crate) fn validate_output_path_collisions(
     }
 }
 
+/// **E375** — one `log` event name carrying two different field sets anywhere
+/// in the plan.
+///
+/// A collector groups records by the event name and holds no node identity:
+/// the runtime dispatcher looks a directive up as `peek_log(&name, severity)`,
+/// so two shapes filed under one name arrive as records nothing downstream can
+/// separate. Several transforms emitting the *same* event with the *same*
+/// fields stay legal — that is how one event is reported from several places.
+///
+/// The rule is plan-wide because the identity it protects is plan-wide. Run
+/// per node slice it held within the top-level nodes and within each
+/// composition body, but a body transform and a top-level transform were never
+/// compared — so the one arrangement the collector cannot survive was the one
+/// arrangement that passed. This pass runs after composition expansion, where
+/// every transform is flattened and each instantiation is its own node, which
+/// is also what makes a shared registry sound here and not in the per-slice
+/// pass: a composition instantiated twice repeats its own events, and repeats
+/// agree with themselves, so only a genuine disagreement is reported.
+///
+/// Reported against a synthetic span: the two transforms may live in two
+/// files, and neither location alone is the offence. The message names both,
+/// each qualified by the composition it was expanded from.
+pub(crate) fn validate_log_event_shapes(
+    nodes: &[Spanned<PipelineNode>],
+    artifacts: &CompileArtifacts,
+    diags: &mut Vec<Diagnostic>,
+) {
+    // Compared as a set: `[a, b]` and `[b, a]` request the same fields, and an
+    // event is its fields rather than their order.
+    fn field_set(directive: &crate::config::LogDirective) -> Vec<&str> {
+        let mut fields: Vec<&str> = directive.fields.as_ref().map_or_else(Vec::new, |fields| {
+            fields.iter().map(String::as_str).collect()
+        });
+        fields.sort_unstable();
+        fields.dedup();
+        fields
+    }
+
+    // event name → (label of the transform that declared it first, field set).
+    // Owned rather than borrowed: the two halves of the plan are reached
+    // through two independent borrows, and one registry has to outlive both.
+    let mut shapes: std::collections::BTreeMap<String, (String, Vec<String>)> =
+        std::collections::BTreeMap::new();
+    let mut check = |label: String, directives: &[crate::config::LogDirective]| {
+        for directive in directives {
+            let fields: Vec<String> = field_set(directive)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            match shapes.get(directive.name.as_str()) {
+                Some((first, first_fields)) if *first_fields != fields => {
+                    diags.push(Diagnostic::error(
+                        "E375",
+                        format!(
+                            "[E375] {label}: `log` event {:?} is also declared by {first} with \
+                             different fields; one event name carries one set of fields — give \
+                             both declarations the same `fields`, or give one of them its own \
+                             event name",
+                            directive.name
+                        ),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    shapes.insert(directive.name.clone(), (label.clone(), fields));
+                }
+            }
+        }
+    };
+
+    for spanned in nodes {
+        if let PipelineNode::Transform {
+            header,
+            config: body,
+        } = &spanned.value
+            && let Some(directives) = &body.log
+        {
+            check(format!("transform {:?}", header.name), directives);
+        }
+    }
+    // Bodies in bind order, each walked in its own topological order, so which
+    // of two conflicting transforms is named first does not depend on hashing.
+    for body in artifacts.composition_bodies.values() {
+        for index in &body.topo_order {
+            let Some(crate::plan::execution::PlanNode::Transform {
+                name,
+                resolved: Some(payload),
+                ..
+            }) = body.graph.node_weight(*index)
+            else {
+                continue;
+            };
+            if payload.log.is_empty() {
+                continue;
+            }
+            check(
+                format!("transform {name:?} in composition {:?}", body.semantic_name),
+                &payload.log,
+            );
+        }
+    }
+}
+
 /// The two schema-dependent `mapping:` gates on an Output node.
 ///
 /// **E365** — an entry reads a column the graph does not supply at that point.

@@ -79,9 +79,22 @@ correlatable with the invocation that produced it, and it closes with
 zero artifacts, every state count zero, no cleanup debt. An absent inventory
 would be read on that row as publication complete for a run that published
 nothing; an empty one says the same thing the reconciliation table already has
-vocabulary for. Modes that write their own document to standard output —
+vocabulary for. Its document is written and flushed before that terminal is
+attempted, so a terminal the pipe refuses there is reconciled exactly as a
+published run's is: exit `4` with
+`infrastructure.delivery.unreportable_outcome` and `policy_required`, never
+`retry_with_backoff`, because the export already exists on disk. Modes that
+write their own document to standard output —
 `--explain`, `--dry-run`, `-n`, `--lineage -`, `--lineage-events -` — are
 refused at admission with exit `1` before any record is written.
+
+A required lifecycle record that cannot be delivered while nothing has yet been
+read, written, or staged ends the run at exit `130` with a `cancelled`
+terminal, and the attempt's final paths are unchanged. That applies to
+`started`, to the `planning` transition, and to `plan_resolved`, on a run and
+on the plan-only `--lineage <FILE>` export alike: a supervisor that stops
+reading during plan compile learns the same thing about the same condition
+whichever it asked for.
 
 After plan resolution, Clinker starts the required machine-progress worker
 before source discovery, staging, attempt creation, sink writes, or lifecycle

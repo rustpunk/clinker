@@ -85,6 +85,51 @@ nodes:
     .expect("pipeline fixture");
 }
 
+/// A pipeline whose first source is large enough that discovery takes real
+/// time, and whose second source resolves to nothing — so the run leaves by an
+/// early return well after the liveness worker's first tick and long before
+/// the executor call that would reach the worker's explicit `finish`.
+fn write_unresolvable_second_source_pipeline(directory: &std::path::Path) {
+    let inputs = directory.join("inputs");
+    std::fs::create_dir(&inputs).expect("input directory");
+    for file in 0..1024 {
+        std::fs::write(inputs.join(format!("part-{file:04}.csv")), "id\n1\n")
+            .expect("input fixture");
+    }
+    std::fs::write(
+        directory.join("pipeline.yaml"),
+        r#"pipeline:
+  name: supervised_discovery_failure
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      glob: inputs/*.csv
+      type: csv
+      schema:
+        - { name: id, type: int }
+  - type: source
+    name: absent
+    config:
+      name: absent
+      glob: absent/*.csv
+      type: csv
+      schema:
+        - { name: id, type: int }
+  - type: output
+    name: out
+    input: src
+    config: { name: out, path: out.csv, type: csv }
+  - type: output
+    name: absent_out
+    input: absent
+    config: { name: absent_out, path: absent-out.csv, type: csv }
+"#,
+    )
+    .expect("discovery failure pipeline");
+}
+
 fn write_dlq_pipeline(directory: &std::path::Path) {
     std::fs::write(directory.join("input.csv"), "id,amount\n1,10\n2,0\n").expect("DLQ input");
     std::fs::write(
@@ -1090,6 +1135,43 @@ fn sigterm_inside_a_rest_read_records_an_abort_lineage_terminal() {
     assert_eq!(
         terminal["eventType"], "ABORT",
         "a cancelled REST read is an abort, not an engine invariant failure: {events:#?}"
+    );
+}
+
+/// The liveness worker's verdict survives a run that never reaches `finish`.
+///
+/// The worker returns `Err` only for a record it can never encode, or for a
+/// reader that is gone or has refused for the whole patience window — and
+/// `emit_periodic` deliberately does not trip the shutdown token, so nothing
+/// else on the run says so. The explicit `finish` after the executor reports
+/// that verdict, but every early return before the executor drops the worker
+/// instead, and a discarded verdict is the condition the thread exists to
+/// report going out with no line at all.
+#[test]
+fn a_liveness_verdict_is_reported_even_when_the_run_never_reaches_finish() {
+    let directory = fixture();
+    write_unresolvable_second_source_pipeline(directory.path());
+
+    // Wake the worker faster than the default cadence, so its first — and
+    // under this injection, fatal — observation is due well before discovery
+    // walks the 1024-file source and the second source fails to resolve.
+    let output = machine_command(directory.path(), "dropped-liveness-verdict")
+        .env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "periodic")
+        .env("CLINKER_TEST_MACHINE_PROGRESS_TICK_MS", "1")
+        .output()
+        .expect("run that fails before the executor");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "the run stops at the unresolvable source\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("machine progress worker failed"),
+        "a worker that failed on a run which never reached its explicit finish \
+         still says so\nstatus={:?}\nstderr:\n{stderr}",
+        output.status.code()
     );
 }
 

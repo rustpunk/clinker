@@ -356,6 +356,134 @@ fn protocol_allows_file_lineage_but_rejects_lineage_stdout() {
     assert!(String::from_utf8_lossy(&stdout_lineage.stderr).contains("--lineage -"));
 }
 
+/// A plan-only export has published by the time its terminal is written.
+///
+/// The document is on disk and flushed before the terminal is attempted, so a
+/// refused terminal here is the same condition the run path raises for a
+/// published attempt: the fault is on the reporting channel, not in what the
+/// invocation did. Advice to retry with backoff would send a supervisor to
+/// re-run an export whose file already exists, and would classify one
+/// condition two ways depending only on whether the invocation was asked for a
+/// document or a run.
+#[test]
+fn protocol_plan_only_export_that_cannot_report_never_advises_retry() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "never-run.csv");
+    write_local_lineage_policy(directory.path());
+    let output = Command::new(clinker_bin())
+        .current_dir(directory.path())
+        .env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "completed_terminal")
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "unreportable-export",
+            "--lineage",
+            "lineage.ndjson",
+        ])
+        .output()
+        .expect("run plan-only export with an unreportable terminal");
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(
+        directory.path().join("lineage.ndjson").exists(),
+        "the export was written and flushed before its terminal was refused"
+    );
+    let stream = events(&output);
+    assert_stream(&stream, "unreportable-export");
+    let recovered = stream.last().expect("terminal");
+    assert_eq!(recovered["event"], "failed");
+    assert_eq!(recovered["exit_code"], 4);
+    assert_ne!(
+        recovered["failure"]["retry"], "retry_with_backoff",
+        "an export that is already on disk must never be advised to re-run: {recovered}"
+    );
+    assert_eq!(recovered["failure"]["retry"], "policy_required");
+    assert_eq!(
+        recovered["failure"]["code"], "infrastructure.delivery.unreportable_outcome",
+        "the delivery fault is classified as itself, not as a transient \
+         runtime fault: {recovered}"
+    );
+}
+
+/// One condition, one classification, whatever the invocation was asked for.
+///
+/// `plan_resolved` is required on both paths and is written at the same point
+/// on both: the plan is known and nothing has been read, written, or staged.
+/// A supervisor that stops reading stdout during plan compile must not learn a
+/// different thing about the same failure depending on whether `--lineage` was
+/// on the command line.
+#[test]
+fn protocol_an_undeliverable_plan_resolved_ends_the_same_way_on_both_paths() {
+    let run_directory = fixture();
+    write_pipeline(run_directory.path(), "must-not-publish.csv");
+    let run = Command::new(clinker_bin())
+        .current_dir(run_directory.path())
+        .env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "plan_resolved")
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "plan-resolved-run",
+        ])
+        .output()
+        .expect("run with an undeliverable plan_resolved");
+
+    let export_directory = fixture();
+    write_pipeline(export_directory.path(), "must-not-publish.csv");
+    write_local_lineage_policy(export_directory.path());
+    let export = Command::new(clinker_bin())
+        .current_dir(export_directory.path())
+        .env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "plan_resolved")
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "plan-resolved-export",
+            "--lineage",
+            "lineage.ndjson",
+        ])
+        .output()
+        .expect("plan-only export with an undeliverable plan_resolved");
+
+    assert_eq!(
+        run.status.code(),
+        export.status.code(),
+        "the same undeliverable record must not exit two ways; run stderr: {} export stderr: {}",
+        String::from_utf8_lossy(&run.stderr),
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert_eq!(
+        run.status.code(),
+        Some(130),
+        "nothing had been written, so the run refuses to publish an outcome it \
+         cannot report"
+    );
+
+    let run_stream = events(&run);
+    let export_stream = events(&export);
+    assert_stream(&run_stream, "plan-resolved-run");
+    assert_stream(&export_stream, "plan-resolved-export");
+    assert_eq!(run_stream.last().expect("terminal")["event"], "cancelled");
+    assert_eq!(
+        export_stream.last().expect("terminal")["event"],
+        "cancelled",
+        "the plan-only path reports the same terminal family for the same \
+         condition: {export_stream:#?}"
+    );
+    assert!(!run_directory.path().join("must-not-publish.csv").exists());
+    assert!(
+        !export_directory.path().join("lineage.ndjson").exists(),
+        "the export stopped before it wrote or truncated its destination"
+    );
+}
+
 #[test]
 fn protocol_retry_restarts_with_a_fresh_execution_identity() {
     let directory = fixture();

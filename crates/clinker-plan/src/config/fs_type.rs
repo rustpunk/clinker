@@ -207,8 +207,7 @@ pub fn case_sensitive_dir(path: &Path) -> io::Result<bool> {
             "no existing ancestor directory to probe for case-sensitivity",
         )
     })?;
-    static REMEMBERED: VolumeAnswers = VolumeAnswers::new();
-    REMEMBERED.answer(&dir, probe_case_sensitive)
+    CASE_ANSWERS.answer(&dir, probe_case_sensitive)
 }
 
 /// Whether the filesystem that *would back a file at `path`* looks a name up
@@ -251,9 +250,14 @@ pub fn normalization_insensitive_dir(path: &Path) -> io::Result<bool> {
             "no existing ancestor directory to probe for normalization-insensitivity",
         )
     })?;
-    static REMEMBERED: VolumeAnswers = VolumeAnswers::new();
-    REMEMBERED.answer(&dir, probe_normalization_insensitive)
+    NORMALIZATION_ANSWERS.answer(&dir, probe_normalization_insensitive)
 }
+
+/// Remembered case-sensitivity verdicts, one per directory.
+static CASE_ANSWERS: VolumeAnswers = VolumeAnswers::new();
+
+/// Remembered normalization-insensitivity verdicts, one per directory.
+static NORMALIZATION_ANSWERS: VolumeAnswers = VolumeAnswers::new();
 
 /// One probe verdict per directory, asked of the filesystem once.
 ///
@@ -292,6 +296,23 @@ impl VolumeAnswers {
             remembered.insert(dir.to_path_buf(), answer);
         }
         Ok(answer)
+    }
+
+    /// Record a verdict for `dir` without asking the filesystem.
+    ///
+    /// The per-component rule can only be exercised against a path that
+    /// crosses volumes behaving differently, and no test can mount two. This
+    /// is where an injected verdict enters: the memo is already the single
+    /// place a verdict is read from, so seeding it is the same seam a real
+    /// probe fills, not a second one beside it.
+    #[cfg(test)]
+    fn remember(&self, dir: &Path, answer: bool) {
+        let seen = self
+            .seen
+            .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        if let Ok(mut remembered) = seen.lock() {
+            remembered.insert(dir.to_path_buf(), answer);
+        }
     }
 }
 
@@ -457,7 +478,7 @@ pub fn destination_identity(path: &Path) -> String {
         std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
     };
     let reduced = resolved_prefix(&without_cur_dir(&absolute));
-    identity_of(reduced.as_os_str(), &reduced)
+    identity_of(&reduced)
 }
 
 /// `path` with its `.` components dropped.
@@ -619,21 +640,131 @@ fn rebuild_past_prefix(resolved: std::path::PathBuf, tail: &[TailComponent]) -> 
 /// on this single function so their notions of "same file" cannot drift.
 #[must_use]
 pub fn collision_key(path: &str) -> String {
-    identity_of(std::ffi::OsStr::new(path), Path::new(path))
+    identity_of(Path::new(path))
 }
 
-/// Key `name` under the behaviour probed at `probe_at`.
+/// The two volume behaviours a key is folded under, as probed for one
+/// directory.
+#[derive(Clone, Copy)]
+struct FoldingVerdict {
+    folds_case: bool,
+    folds_normalization: bool,
+}
+
+/// Key `path` under the behaviour probed for each of its components.
 ///
 /// Kept apart from the two public entry points so [`collision_key`] and
 /// [`destination_identity`] land in one key space rather than two that merely
 /// look alike: the runtime ledger and the plan-time check compare their keys
 /// against each other.
-fn identity_of(name: &std::ffi::OsStr, probe_at: &Path) -> String {
-    let folds_case = !case_sensitive_dir(probe_at).unwrap_or(true);
-    let folds_normalization = normalization_insensitive_dir(probe_at).unwrap_or(false);
+///
+/// **Each component is folded under a probe of its own containing directory**,
+/// not under one probe applied to the whole path. A path crosses mount points,
+/// and each volume it crosses answers for the names directly inside it and for
+/// nothing else. One probe of the deepest directory said that `/srv/Reports/ci`
+/// and `/srv/reports/ci` fold to one key whenever the innermost volume happens
+/// to be case-insensitive — even where `/srv` is case-sensitive and the two are
+/// two genuinely different mounted volumes holding two genuinely different
+/// files, which the collision check then refused to run.
+///
+/// Where a component's own directory cannot be probed — an unwritable `/`, a
+/// component past the point the path exists — the whole-path verdict stands in.
+/// That is the answer this function gave everywhere before, so an unprobeable
+/// ancestor is never *worse* than it was; it is simply not improved. Probing
+/// per component and defaulting each unprobeable one to "folds nothing" would
+/// be worse, because it would stop folding `/Users/Foo` on the very macOS
+/// volume that folds it.
+///
+/// The key is built component-wise but written with the platform's own
+/// separators, so a path whose components all answer alike keys to exactly the
+/// string the whole-path fold produced.
+fn identity_of(path: &Path) -> String {
+    use std::path::Component;
+
+    // One probe of the nearest existing ancestor: the answer that stands in
+    // wherever a component's own directory has none to give.
+    let fallback = FoldingVerdict {
+        folds_case: !case_sensitive_dir(path).unwrap_or(true),
+        folds_normalization: normalization_insensitive_dir(path).unwrap_or(false),
+    };
+
     let mut key = String::new();
-    push_identity(name, folds_case, folds_normalization, &mut key);
+    let mut container = std::path::PathBuf::new();
+    let separator = std::path::MAIN_SEPARATOR;
+    let separate = |key: &mut String| {
+        if !key.is_empty() && !key.ends_with(separator) {
+            key.push(separator);
+        }
+    };
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                // A Windows drive or share root: no containing directory
+                // answers for it, so it keys the way the whole path does.
+                push_identity(
+                    prefix.as_os_str(),
+                    fallback.folds_case,
+                    fallback.folds_normalization,
+                    &mut key,
+                );
+                container.push(prefix.as_os_str());
+            }
+            Component::RootDir => {
+                key.push(separator);
+                container.push(std::path::MAIN_SEPARATOR_STR);
+            }
+            // Not names of anything, so nothing folds them. `Components`
+            // yields these only where they change which file is named.
+            Component::CurDir => {
+                separate(&mut key);
+                key.push('.');
+                container.push(".");
+            }
+            Component::ParentDir => {
+                separate(&mut key);
+                key.push_str("..");
+                container.push("..");
+            }
+            Component::Normal(name) => {
+                let verdict = verdict_for(&container, name, fallback);
+                separate(&mut key);
+                push_identity(
+                    name,
+                    verdict.folds_case,
+                    verdict.folds_normalization,
+                    &mut key,
+                );
+                container.push(name);
+            }
+        }
+    }
     key
+}
+
+/// The folding behaviour of the volume that backs `name` inside `container`.
+///
+/// Both probes resolve to the nearest existing directory at or above
+/// `container`, so a component past the end of what exists is answered by the
+/// deepest directory that does exist — the same directory the whole-path probe
+/// used. Each distinct directory is probed once per process and remembered, so
+/// the per-component rule costs one probe pair per directory a plan's outputs
+/// touch, not one per path.
+fn verdict_for(
+    container: &Path,
+    name: &std::ffi::OsStr,
+    fallback: FoldingVerdict,
+) -> FoldingVerdict {
+    let probe_at = if container.as_os_str().is_empty() {
+        std::path::PathBuf::from(name)
+    } else {
+        container.join(name)
+    };
+    FoldingVerdict {
+        folds_case: case_sensitive_dir(&probe_at)
+            .map_or(fallback.folds_case, |sensitive| !sensitive),
+        folds_normalization: normalization_insensitive_dir(&probe_at)
+            .unwrap_or(fallback.folds_normalization),
+    }
 }
 
 /// The Unicode reduction applied to one run of a path that *is* valid Unicode.
@@ -1670,5 +1801,46 @@ mod tests {
                 "`..` after a symlink goes up from where the link lands, not from `out`"
             );
         }
+    }
+
+    /// One probe is one volume's answer, not the whole path's.
+    ///
+    /// `identity_of` probed the deepest existing directory and applied that
+    /// verdict to every component above it. A path crosses mount points: with
+    /// `/srv` case-sensitive and `/srv/Reports` and `/srv/reports` two
+    /// separate case-insensitive volumes, both outputs folded to one key and
+    /// the collision check reported E317 for two genuinely different files,
+    /// refusing a valid pipeline. Each component now answers to the directory
+    /// that actually holds it.
+    #[test]
+    fn a_component_folds_under_its_own_directory_not_the_deepest_one() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root = root.path().canonicalize().expect("canonical tempdir");
+        for leaf in ["Reports/ci", "reports/ci"] {
+            std::fs::create_dir_all(root.join(leaf)).expect("mkdir");
+        }
+
+        // `root` keeps case, and the two directories inside it stand for two
+        // case-insensitive volumes mounted there.
+        CASE_ANSWERS.remember(&root, true);
+        for folding in [root.join("Reports"), root.join("reports")] {
+            CASE_ANSWERS.remember(&folding, false);
+            CASE_ANSWERS.remember(&folding.join("ci"), false);
+        }
+
+        let upper = destination_identity(&root.join("Reports/ci/out.csv"));
+        let lower = destination_identity(&root.join("reports/ci/out.csv"));
+        assert_ne!(
+            upper, lower,
+            "`Reports` and `reports` sit in a directory that keeps case, so they \
+             are two destinations however the volumes beneath them behave"
+        );
+
+        // The folding volumes still fold the names they actually hold.
+        assert_eq!(
+            destination_identity(&root.join("Reports/ci/Out.csv")),
+            destination_identity(&root.join("Reports/ci/out.csv")),
+            "a name inside a case-insensitive volume is still one destination"
+        );
     }
 }

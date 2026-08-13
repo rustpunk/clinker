@@ -263,6 +263,23 @@ struct QueueState {
     abandoned: bool,
 }
 
+impl QueueState {
+    /// Whether the worker may *begin* another record.
+    ///
+    /// Strictly about permission to start work, never about whether work
+    /// remains: an empty queue is not a spent budget, and a spent budget is not
+    /// an empty queue. Both conditions here are reasons to stop drawing from
+    /// the queue — the finisher has stopped listening, or the worker's share of
+    /// the flush deadline is gone — and neither says anything about what the
+    /// queue holds.
+    fn may_begin_record(&self, drain_budget: Duration) -> bool {
+        !self.abandoned
+            && self
+                .closed_at
+                .is_none_or(|closed_at| closed_at.elapsed() < drain_budget)
+    }
+}
+
 struct DeliveryQueue {
     capacity_bytes: usize,
     state: Mutex<QueueState>,
@@ -385,29 +402,43 @@ impl DeliveryQueue {
 
     /// Take the next record, or say why there is not one.
     ///
+    /// Two questions are asked here and they are not the same one. *Is there
+    /// work left?* is answered by the queue: a record is there, or the queue is
+    /// empty and admission is closed, or neither yet. *May another record be
+    /// begun?* is answered by [`QueueState::may_begin_record`], and only ever
+    /// about a record that exists. Asking the second question first is what
+    /// reported a worker that had already delivered everything as having run
+    /// out of time, and a complete export as a failed one.
+    ///
     /// `drain_budget` is the share of the flush deadline the worker may spend
-    /// starting records, measured from the instant admission closed. Checking
-    /// it here rather than after the write is the whole point: a record is
-    /// either begun inside the window and carried to its last byte, or never
-    /// begun at all, so the destination is only ever left between records.
+    /// starting records, measured from the instant admission closed. It is
+    /// consulted before a record is taken rather than after it is written,
+    /// which is the whole point: a record is either begun inside the window and
+    /// carried to its last byte, or never begun at all, so the destination is
+    /// only ever left between records.
     fn pop(&self, drain_budget: Duration) -> Popped {
         let mut state = self.lock_state();
         loop {
-            if state.abandoned {
-                return Popped::OutOfTime;
-            }
-            if state
-                .closed_at
-                .is_some_and(|closed_at| closed_at.elapsed() >= drain_budget)
-            {
-                return Popped::OutOfTime;
-            }
-            if let Some(record) = state.events.pop_front() {
+            if !state.events.is_empty() {
+                if !state.may_begin_record(drain_budget) {
+                    return Popped::OutOfTime;
+                }
+                let record = state
+                    .events
+                    .pop_front()
+                    .expect("the deque was just observed non-empty under this lock");
                 state.queued_bytes = state.queued_bytes.saturating_sub(record.charge);
                 return Popped::Record(record.bytes);
             }
             if state.closed {
                 return Popped::Drained;
+            }
+            // Nothing queued and admission still open. The finisher abandons
+            // only after closing, so this is reached with `abandoned` clear in
+            // every ordinary run; honouring it anyway keeps a worker from
+            // waiting on a producer no one is listening for.
+            if state.abandoned {
+                return Popped::OutOfTime;
             }
             state = match self.ready.wait(state) {
                 Ok(state) => state,
@@ -943,6 +974,74 @@ mod tests {
             outcome.accepted() >= 1,
             "the events the destination did take are still counted"
         );
+    }
+
+    /// An empty queue is not a spent budget. The drain budget was tested ahead
+    /// of the empty-and-closed test, so a worker asking for its next record
+    /// after its share of the deadline had passed was told it had run out of
+    /// time even though there was no work left to run out of time for.
+    #[test]
+    fn a_drained_queue_says_so_even_after_the_drain_budget_is_spent() {
+        let queue = DeliveryQueue::new(1_024, 1_024);
+        queue.close();
+
+        // Zero budget: the instant admission closed is already at or past it,
+        // so the question "may another record be begun?" answers no — which
+        // must not be mistaken for "a record is waiting and cannot be taken".
+        assert!(
+            matches!(queue.pop(Duration::ZERO), Popped::Drained),
+            "a worker that has delivered everything is drained, not out of time"
+        );
+    }
+
+    /// The same defect as it reaches an operator: a run whose events all
+    /// reached the destination inside the deadline reported
+    /// `DeadlineExceeded`, which fires the export-failure diagnostic and exits
+    /// the run non-zero over an export that is complete and flushed. Lineage is
+    /// an observation of a run and never a verdict on it.
+    #[test]
+    fn a_complete_export_delivered_late_in_the_deadline_is_a_clean_shutdown() {
+        let event = event_of_known_size();
+        let exact = serde_json::to_vec(&event).expect("the probe event serializes");
+
+        /// Takes the whole record, but slowly enough that the worker returns
+        /// for its next one past its share of the deadline — an ordinarily
+        /// loaded host, not a stuck destination.
+        struct SlowButComplete;
+
+        impl Write for SlowButComplete {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                thread::sleep(Duration::from_millis(260));
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // 400 ms deadline, so the drain share ends at 200 ms and the sole
+        // record is written and done at ~260 ms — late for *starting* work,
+        // early for *finishing* it.
+        let config = LineageDeliveryConfig::new(
+            (exact.len() + 1) * 4,
+            exact.len(),
+            Duration::from_millis(400),
+        )
+        .expect("legal delivery limits");
+        let delivery = LineageDelivery::start(config, SlowButComplete).expect("the worker starts");
+        assert_eq!(delivery.try_emit(&event), LineageAdmission::Accepted);
+
+        let outcome = delivery.finish();
+
+        assert_eq!(
+            outcome.terminal(),
+            LineageDeliveryTerminal::Shutdown,
+            "every accepted event reached the destination inside the deadline"
+        );
+        assert!(outcome.records_complete(), "and none was left half-written");
+        assert_eq!(outcome.accepted(), 1);
+        assert_eq!(outcome.dropped(), 0);
     }
 
     /// A destination that stops accepting bytes altogether cannot be waited

@@ -232,6 +232,7 @@ diagnostic_registry! {
     "E372", Error, "Attempt cleanup incomplete or budget exhausted";
     "E373", Error, "A transform log directive's `condition` is more than one predicate";
     "E374", Error, "A transform log directive requests a `fields` selector the input record does not carry";
+    "E375", Error, "One `log` event name is declared with two different field sets in the same plan";
     // ── Path security ───────────────────────────────────────────────────
     "E-SEC-001", Error, "Path security violation (escape, symlink, etc.)";
     // ── Warnings ────────────────────────────────────────────────────────

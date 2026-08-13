@@ -744,6 +744,9 @@ impl PipelineConfig {
             self.error_handling.dlq.as_ref(),
             &mut diags,
         );
+        // After composition expansion, so a body transform and a top-level one
+        // declaring one event name are finally compared against each other.
+        crate::plan::bind_schema::validate_log_event_shapes(&self.nodes, &artifacts, &mut diags);
 
         // Early-abort optimization: CXL compile errors (parse E202,
         // name-resolution E203, type E200), source-schema errors (E201),
@@ -5313,17 +5316,13 @@ pub(crate) fn validate_node_configs(nodes: &[Spanned<PipelineNode>]) -> Vec<Node
         }
     }
 
-    // Validate log directives on Transform nodes.
+    // Validate the log-directive set on each Transform node in isolation.
     //
-    // One event name carries one set of fields across every transform checked
-    // together, because a collector groups records by that name and holds no
-    // node identity: two transforms publishing different fields under one name
-    // hand it records nothing downstream can separate. Several transforms
-    // emitting the same event stay legal. The rule lives here rather than
-    // beside the top-level nodes so a transform inside a composition body is
-    // held to it too.
-    let mut event_shapes: std::collections::BTreeMap<&str, (&str, Vec<&str>)> =
-        std::collections::BTreeMap::new();
+    // What one directive says about itself, and what one node's directives say
+    // about each other, is answerable from this slice alone. Whether two
+    // transforms agree on what an event *name* means is not: they may sit in
+    // different scopes and only meet after composition expansion, so that rule
+    // lives in the plan-wide `validate_log_event_shapes` pass instead.
     for (node_index, spanned) in nodes.iter().enumerate() {
         if let PipelineNode::Transform {
             header,
@@ -5336,32 +5335,6 @@ pub(crate) fn validate_node_configs(nodes: &[Spanned<PipelineNode>]) -> Vec<Node
                     node_index,
                     message: format!("transform '{}': {error}", header.name),
                 });
-            }
-            for directive in directives {
-                // Compared as a set: `[a, b]` and `[b, a]` request the same
-                // fields, and an event is its fields rather than their order.
-                let mut fields: Vec<&str> =
-                    directive.fields.as_ref().map_or_else(Vec::new, |fields| {
-                        fields.iter().map(String::as_str).collect()
-                    });
-                fields.sort_unstable();
-                fields.dedup();
-                match event_shapes.get(directive.name.as_str()) {
-                    Some((first, first_fields)) if *first_fields != fields => {
-                        violations.push(NodeConfigViolation {
-                            node_index,
-                            message: format!(
-                                "transform '{}': `log` event '{}' is also declared by transform '{first}' with different fields; one event name carries one set of fields",
-                                header.name, directive.name
-                            ),
-                        });
-                    }
-                    Some(_) => {}
-                    None => {
-                        event_shapes
-                            .insert(directive.name.as_str(), (header.name.as_str(), fields));
-                    }
-                }
             }
         }
     }

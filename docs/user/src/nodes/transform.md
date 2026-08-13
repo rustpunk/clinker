@@ -214,6 +214,27 @@ the transform through an open composition port is not visible to it, and a
 selector naming one of those is still checked only at run time — counted in the
 run's admission accounting under the missing-field total.
 
+### One event name, one set of fields
+
+An event name is the identity a collector groups records by, and it carries no
+node identity of its own. Two transforms may emit the same event — that is how
+one thing that happens in several places is reported as one thing — but they
+have to declare the same `fields`, or the collector receives two record shapes
+under one name and nothing downstream can separate them.
+
+Clinker checks this across the whole pipeline, composition bodies included, and
+refuses a disagreement with E375:
+
+```
+[E375] transform "shape" in composition "customer_enrichment": `log` event
+"transform.customer_seen" is also declared by transform "seen" with different
+fields; one event name carries one set of fields — give both declarations the
+same `fields`, or give one of them its own event name
+```
+
+A composition used twice is not a conflict: both instances declare the same
+event with the same fields, and agreement is what the rule asks for.
+
 ### Logging only the records you care about
 
 `every` thins a per-record event by count. `condition` selects it by content —

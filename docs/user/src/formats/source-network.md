@@ -113,6 +113,14 @@ downgrades, malformed or conflicting `rel="next"` metadata, redirect or
 continuation cycles, and traversal beyond the configured bounds fail before a
 foreign or repeated request is sent.
 
+Normalization resolves `.` and `..` exactly as RFC 3986 does, and changes
+nothing else about the path. An empty segment is a segment: `/v1//items/../p`
+names `/v1//p`, not `/v1/p`, because a doubled slash is a different resource on
+any server that does not collapse it. A path ending in `..` resolves to the
+directory above, trailing slash included. Two targets that differ only in an
+empty segment therefore stay two pages, and a pull that visits both is not a
+continuation cycle.
+
 `Link` continuation metadata is parsed and authorized only when
 `pagination.strategy` is `link_header`. Other strategies ignore it because
 their continuation authority comes from the configured offset, cursor, or
@@ -180,7 +188,10 @@ one rule for the whole request, whichever phase observed the failure: a
 dropped, reset, or timed-out exchange is retried, and a failure that would
 arrive identically on every attempt is not. Body-size violations, TLS
 failures, an unroutable URL, a host that does not resolve, and local material
-this process cannot read are therefore fatal at once rather than retried.
+this process cannot read are therefore fatal at once rather than retried —
+reported against attempt 1, and without spending `timeout_secs` once per
+remaining attempt on a condition that cannot change. `retries` is a ceiling on
+attempts worth making, not a number of attempts every failure receives.
 
 A partial-page decode failure routes that page's offending rows to the
 DLQ per-row, exactly like a file source; it does not abort the pull.

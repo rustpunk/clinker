@@ -374,6 +374,22 @@ failed.
 A collector that habitually answers slowly needs a larger
 `otlp.request_timeout_ms`, not more attempts.
 
+A retryable status (`429`, `502`, `503`, `504`) waits before the next attempt.
+The wait starts at a fixed 100 ms and doubles before each retry after the
+first, so a collector recovering from load is not handed the whole attempt
+budget inside one of its recovery windows.
+
+A `Retry-After` on that answer overrides the backoff whenever it asks for
+longer: the collector said how long "later" is, and the export waits at least
+that. Only the delay-in-seconds spelling is read. If the field asks for longer
+than `otlp.retry_total_timeout_ms` leaves — or arrives in the HTTP-date
+spelling, which this exporter does not parse — the delivery stops there rather
+than re-sending sooner than the collector asked or sleeping out the whole
+deadline. It is counted under `failures` with the throttle as its cause and
+`retry_with_backoff` as its advice; retrying belongs to whatever supervises the
+run. `otlp.retry_total_timeout_ms` remains the ceiling on all of it, so no
+requested wait can extend an export.
+
 Delivery outcomes never change execution, publication, or the process exit
 status; the summary is an observation about the export, not about the run.
 

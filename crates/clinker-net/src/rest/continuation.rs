@@ -414,30 +414,74 @@ fn authorize_origin(
     Ok(candidate)
 }
 
+/// Resolve `.` and `..` out of a path, by the algorithm RFC 3986 §5.2.4
+/// specifies.
+///
+/// This output is both the URL that gets requested and the identity a page is
+/// recognised by, so a deviation from the specified algorithm costs twice
+/// over. Splitting on `/` and rebuilding from the segments that survived
+/// discarded the empty ones, which turned `/a//b/../c` into `/a/c`: a
+/// different resource on any server that does not collapse a doubled slash,
+/// and at the same time the identity `/a/b/../c` already had, so a reply
+/// naming both ended a valid pull as a continuation cycle. The same shorthand
+/// lost the trailing slash that a path ending in `..` resolves to, and it ran
+/// only when a dot segment was present, so one path normalized two ways
+/// depending on syntax elsewhere in it.
+///
+/// The specified algorithm moves whole segments between two buffers instead.
+/// An empty segment is carried like any other, and the trailing `/` is
+/// whatever the last move left rather than something reapplied afterwards.
 fn normalize_path(path: &str) -> String {
-    if !path.split('/').any(|segment| matches!(segment, "." | "..")) {
-        return if path.is_empty() {
-            "/".to_owned()
+    let mut input = path;
+    let mut output = String::with_capacity(path.len());
+    while !input.is_empty() {
+        // Steps B and C replace a leading `/./` or `/../` with `/`. That `/`
+        // belongs to the segment that follows, so it is left on the front of
+        // the input for the move below rather than written out here.
+        if let Some(rest) = input.strip_prefix("../") {
+            input = rest;
+        } else if let Some(rest) = input.strip_prefix("./") {
+            input = rest;
+        } else if input.starts_with("/./") {
+            input = &input["/.".len()..];
+        } else if input == "/." {
+            input = "/";
+        } else if input.starts_with("/../") {
+            input = &input["/..".len()..];
+            remove_last_segment(&mut output);
+        } else if input == "/.." {
+            input = "/";
+            remove_last_segment(&mut output);
+        } else if input == "." || input == ".." {
+            input = "";
         } else {
-            path.to_owned()
-        };
-    }
-    let trailing_slash = path.ends_with('/');
-    let mut segments = Vec::new();
-    for segment in path.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop();
-            }
-            segment => segments.push(segment),
+            // One segment: the leading `/`, if any, plus everything up to the
+            // next one. An empty segment is the two-slash case and moves as
+            // itself.
+            let after_leading_slash = usize::from(input.starts_with('/'));
+            let end = input[after_leading_slash..]
+                .find('/')
+                .map_or(input.len(), |offset| after_leading_slash + offset);
+            output.push_str(&input[..end]);
+            input = &input[end..];
         }
     }
-    let mut normalized = format!("/{}", segments.join("/"));
-    if trailing_slash && normalized != "/" {
-        normalized.push('/');
+    // A path that resolved to nothing is the origin's root, and the origin
+    // check downstream reads the authority out of `scheme://authority{path}`:
+    // a path that does not begin with `/` would move the authority's boundary.
+    if output.starts_with('/') {
+        output
+    } else {
+        format!("/{output}")
     }
-    normalized
+}
+
+/// Drop the last segment written to `output`, and the `/` that preceded it.
+fn remove_last_segment(output: &mut String) {
+    match output.rfind('/') {
+        Some(index) => output.truncate(index),
+        None => output.clear(),
+    }
 }
 
 /// What one `Link` field named, and the first reason a link-value in it could
@@ -997,6 +1041,127 @@ mod tests {
         let resolved =
             resolve_and_authorize(&base, "../next?page=2", &origin).expect("relative continuation");
         assert_eq!(resolved.as_str(), "http://api.example.test/v1/next?page=2");
+    }
+
+    /// The algorithm RFC 3986 §5.2.4 specifies, against the cases an ad-hoc
+    /// one gets wrong: an empty segment is a segment, and the trailing slash
+    /// a `..` resolves to is part of the path it names.
+    #[test]
+    fn dot_segments_resolve_the_way_the_specification_says() {
+        for (path, expected) in [
+            // The reviewer's case. Rebuilding from non-empty segments dropped
+            // the doubled slash and named a different resource.
+            ("/a//b/../c", "/a//c"),
+            ("/a//b/../", "/a//"),
+            // A `..` in final position resolves to a directory, so the path
+            // ends in the slash the algorithm's last move wrote.
+            ("/a/b/..", "/a/"),
+            ("/a/b/.", "/a/b/"),
+            ("/a/b/../..", "/"),
+            // Traversal cannot climb above the root.
+            ("/..", "/"),
+            ("/../..", "/"),
+            ("/a/../../b", "/b"),
+            // No dot segment at all: unchanged, including every empty
+            // segment. This used to be a separate early return, which is how
+            // one path normalized two ways depending on syntax elsewhere.
+            ("/a//b//c", "/a//b//c"),
+            ("//a", "//a"),
+            ("/a/", "/a/"),
+            ("/", "/"),
+            ("", "/"),
+            // RFC 3986 §5.2.4's own worked example.
+            ("/a/b/c/./../../g", "/a/g"),
+            ("/b/c/./../../g", "/g"),
+        ] {
+            assert_eq!(
+                normalize_path(path),
+                expected,
+                "{path:?} does not resolve the way §5.2.4 resolves it"
+            );
+        }
+    }
+
+    /// A page is recognised by its normalized URL, so two paths that name two
+    /// resources have to normalize to two strings. Collapsing empty segments
+    /// gave these one identity between them, and a reply naming the second
+    /// after the first ended a valid pull as a continuation cycle.
+    #[test]
+    fn two_distinct_pages_do_not_normalize_to_one_identity() {
+        let (origin, base) =
+            authorize_initial("https://api.example.test/v1/items").expect("initial URL");
+        let doubled = resolve_and_authorize(&base, "/v1//items/../page2", &origin)
+            .expect("a doubled slash is an ordinary path");
+        let single = resolve_and_authorize(&base, "/v1/items/../page2", &origin)
+            .expect("and so is the path without it");
+
+        assert_eq!(
+            doubled.as_str(),
+            "https://api.example.test/v1//page2",
+            "the request goes to the resource the reply named"
+        );
+        assert_eq!(single.as_str(), "https://api.example.test/v1/page2");
+        assert_ne!(
+            doubled.as_str(),
+            single.as_str(),
+            "two resources must not share one page identity"
+        );
+    }
+
+    /// Preserving empty segments means a path can now resolve to one that
+    /// begins with `//`, and the origin check reads the authority back out of
+    /// `scheme://authority{path}`. A leading empty segment must therefore stay
+    /// inside the path and never move where the authority ends.
+    ///
+    /// Each of these is an absolute-path reference — the authority is the
+    /// base's, and what follows is only a path — so each stays on the admitted
+    /// origin however its dot segments resolve. A reference that names an
+    /// authority of its own is a different thing and is still refused, whether
+    /// it writes the scheme out or arrives as a network-path reference.
+    #[test]
+    fn resolving_dot_segments_cannot_move_the_origin() {
+        let (origin, base) =
+            authorize_initial("https://api.example.test/v1/items").expect("initial URL");
+        for (reference, expected) in [
+            (
+                "/x/..//evil.example.test/data",
+                "https://api.example.test//evil.example.test/data",
+            ),
+            (
+                "/..//evil.example.test/data",
+                "https://api.example.test//evil.example.test/data",
+            ),
+            (
+                "/v1/../..//evil.example.test",
+                "https://api.example.test//evil.example.test",
+            ),
+        ] {
+            let resolved = resolve_and_authorize(&base, reference, &origin)
+                .unwrap_or_else(|error| panic!("{reference:?} is same-origin, got {error}"));
+            assert_eq!(
+                resolved.as_str(),
+                expected,
+                "{reference:?} names a path on the admitted origin"
+            );
+            assert_eq!(
+                origin_of(&resolved).expect("a resolved target has an origin"),
+                origin,
+                "{reference:?} must still read back as the admitted origin"
+            );
+        }
+
+        for foreign in [
+            "https://evil.example.test/data",
+            "//evil.example.test/../data",
+        ] {
+            let refused = resolve_and_authorize(&base, foreign, &origin)
+                .expect_err("a target naming its own authority is still refused");
+            assert_eq!(
+                refused.classification.code(),
+                "rest.security.cross_origin",
+                "{foreign:?} names another origin"
+            );
+        }
     }
 
     /// The bytes most likely to break a field walker: the delimiters it

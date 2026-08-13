@@ -614,3 +614,80 @@ fn shutdown_between_retries_surfaces_as_typed_interruption() {
 
     assert!(matches!(error, clinker_format::FormatError::Interrupted));
 }
+
+/// Serve three pages whose `Link` targets carry dot segments, one of them past
+/// an empty segment. `/rows` names `/rows//items/../p`, which resolves to
+/// `/rows//p`; that page names `/rows/items/../p`, which resolves to `/rows/p`.
+///
+/// Resolving those by discarding empty segments sent both requests to
+/// `/rows/p` — a resource the first of them does not name — and gave the two
+/// pages one identity, so the pull ended as a continuation cycle after the
+/// second.
+fn spawn_dot_segment_link_server() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let base = format!("http://{addr}/rows");
+    let base_thread = base.clone();
+    let handle = thread::spawn(move || {
+        for incoming in listener.incoming() {
+            if stop_thread.load(Ordering::SeqCst) {
+                break;
+            }
+            let Ok(mut stream) = incoming else { continue };
+            let Some(req) = read_request(&mut stream) else {
+                continue;
+            };
+            let (offset, next) = match req.path.as_str() {
+                "/rows" => (0, format!("{base_thread}//items/../p")),
+                "/rows//p" => (PAGE_SIZE, format!("{base_thread}/items/../p")),
+                "/rows/p" => (PAGE_SIZE * 2, String::new()),
+                // Any other path is a request this reader should never have
+                // built. Answering it with no rows and no continuation makes
+                // that visible as missing records rather than as a hang.
+                _ => (TOTAL_ROWS, String::new()),
+            };
+            let extra = if next.is_empty() {
+                String::new()
+            } else {
+                format!("Link: <{next}>; rel=\"next\"\r\n")
+            };
+            write_response(&mut stream, &extra, &page_body(offset));
+            if stop_thread.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+    });
+    (base, stop, handle)
+}
+
+#[test]
+fn dot_segments_in_a_link_target_resolve_to_the_page_the_reply_named() {
+    let (url, stop, handle) = spawn_dot_segment_link_server();
+    let pagination = "        pagination:\n          strategy: link_header";
+    let mut reader = build_reader(pagination, 100, &url);
+
+    let drained = {
+        let mut ids = Vec::new();
+        loop {
+            match reader.next_record() {
+                Ok(Some(record)) => {
+                    if let Some(clinker_record::Value::Integer(id)) = record.get("id") {
+                        ids.push(*id);
+                    }
+                }
+                Ok(None) => break Ok(ids),
+                Err(error) => break Err(error),
+            }
+        }
+    };
+    shutdown_server(&url, &stop, handle);
+
+    let ids = drained.expect("two distinct pages are not a continuation cycle");
+    assert_eq!(
+        ids,
+        (0..TOTAL_ROWS as i64).collect::<Vec<_>>(),
+        "each Link target must be fetched as the resource it names, exactly once"
+    );
+}

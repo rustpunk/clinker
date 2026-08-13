@@ -892,23 +892,24 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   -- to compute a digest most runs never read. Making the digest lazy needs a
   decision about where it is memoized, since the parsed value is discarded
   before the digest's consumers run.
-- **47 (filed 2026-08-09):** The `log` event-shape rule ("one event name, one
-  set of fields") is enforced per node slice, so it holds within the top-level
-  nodes and within each composition body, but a body transform and a top-level
-  transform declaring one event name with different fields are never compared.
-  Threading a shared registry through `validate_node_configs` is not the
-  answer: a composition instantiated twice legitimately repeats its own
-  events, so the same body's directives would collide with themselves. The
-  right place is after composition expansion, where every transform is
-  flattened and each instantiation is already distinct -- which is a different
-  pass from the one the rule lives in today.
-- **48 (filed 2026-08-09):** Every `validate_node_configs` violation -- the
-  per-transform `batch_size` rule, the `log` directive rules, and the new
-  event-shape rule -- surfaces at the top level as a bare
-  `ConfigError::Validation` carrying a message with no diagnostic code and no
-  span, while the same violation inside a composition body is reported as
-  E115 with a span. Giving the family codes and spans is a diagnostics change
-  across all of its members rather than a repair to one of them.
+- **47 (filed 2026-08-09, RESOLVED 2026-08-13):** The `log` event-shape rule
+  ("one event name, one set of fields") was enforced per node slice, so a body
+  transform and a top-level transform declaring one event name with different
+  fields were never compared. It now lives in
+  `bind_schema::validate_log_event_shapes`, a plan-wide pass that runs after
+  composition expansion over the top-level nodes and every bound body's lowered
+  transforms, and reports E375. The registry the earlier note ruled out is in
+  fact sound there: it compares *field sets*, so a composition instantiated
+  twice agrees with itself and only a genuine disagreement is reported.
+- **48 (filed 2026-08-09, narrowed 2026-08-13):** Every `validate_node_configs`
+  violation -- the per-transform `batch_size` rule and the `log` directive
+  rules -- surfaces at the top level as a bare `ConfigError::Validation`
+  carrying a message with no diagnostic code and no span, while the same
+  violation inside a composition body is reported as E115 with a span. Giving
+  the family codes and spans is a diagnostics change across all of its members
+  rather than a repair to one of them. (The event-shape rule left the family
+  with question 47 and now carries E375; its span is synthetic for a different
+  reason -- a cross-scope conflict has two locations and no single offence.)
 - **49 (filed 2026-08-09, needs a maintainer decision):** A dead-lettered
   record whose source has no `per_source` DLQ override, in a pipeline with no
   top-level `error_handling.dlq.path`, has no destination and is dropped.
@@ -995,3 +996,38 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   defects. The split wants its own change with its own review, and the natural
   seams are the four concerns already listed -- each of which currently shares
   only local variables with the others.
+- **56 (filed 2026-08-13):** `identity_of` now folds each path component under
+  a probe of that component's own containing directory, which is exact wherever
+  the directory can be probed. Where it cannot -- an unwritable `/` or
+  `/Users`, the common case for a non-root process -- the component falls back
+  to the whole-path verdict, which is the answer the function gave everywhere
+  before, so nothing regresses and the improvement simply does not reach those
+  components. Making it exact there needs a read-only way to ask a directory
+  how it folds names, which no platform exposes; the alternative of defaulting
+  an unprobeable component to "folds nothing" is worse, because it would stop
+  folding `/Users/Foo` on the very volume that folds it. This is a fourth axis
+  of imprecision beside the three already documented on `collision_key`.
+- **57 (filed 2026-08-13, needs a maintainer decision):** `Retry-After` is now
+  honoured on the OTLP export path, but only its delay-seconds spelling. The
+  HTTP-date spelling is read as "stop here": the delivery reports
+  `RetryExhausted` rather than retrying, because guessing a shorter wait is
+  exactly what the field exists to prevent. Reading a date needs calendar
+  arithmetic, which this crate has no dependency for and which the project
+  forbids hand-rolling. So the choice is a date dependency, or the current
+  behaviour of declining to retry a collector that answered in a spelling we
+  cannot read. Nothing is wrong today -- a throttled export is reported, not
+  hurried -- but a collector that only ever answers in dates gets no retries
+  at all.
+- **58 (filed 2026-08-13, needs a maintainer decision):** The two transports
+  disagree about `Io(InvalidData)`. `otlp.rs` treats it as a settled TLS
+  mismatch and does not retry; `rest.rs` deliberately excludes it from its
+  permanent set and calls it `source_unavailable`, retryable, on the stated
+  grounds that the same misconfiguration arrives as a reset on Windows and
+  naming it would give one deployment error two verdicts. Both arguments are
+  sound in isolation and they cannot both be right for the same byte sequence.
+  Related and probably the more useful half: ureq's rustls transport reports a
+  refused handshake as `Io(InvalidData)` rather than `Rustls(_)` -- confirmed
+  empirically by serving a well-formed fatal `handshake_failure` alert -- so
+  `rest.rs`'s `Tls` and `HostNotFound` classifications, and the
+  `source.endpoint.untrusted_tls` code they feed, may rarely fire for the case
+  they were written for.
