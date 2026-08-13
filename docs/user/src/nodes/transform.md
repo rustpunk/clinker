@@ -190,10 +190,29 @@ or underscore, followed by ASCII letters, digits, or underscores.
 
 `fields` is the only channel by which record data reaches an event — `message`
 is static text. A selector naming a field the incoming record does not carry
-contributes nothing, so a directive whose selectors all miss publishes an event
-with no attributes at all, which reads exactly like a run whose records were
-empty. Spell each selector as the upstream schema spells it. Misses are counted
-in the run's admission accounting under the missing-field total.
+contributes nothing, so a directive whose selectors all miss would publish an
+event with no attributes at all, which reads exactly like a run whose records
+were empty.
+
+Clinker refuses that when the pipeline compiles (E374). The rejection names the
+selector, lists the columns the input row does carry, and — when your spelling
+is close to one of them — gives you the corrected `fields:` line to paste:
+
+```
+[E374] transform `enrich` log[0].fields requests `orderId`, which the input
+record does not carry; the upstream row has `order_id`, `amount`, `region` —
+write `fields: [order_id]`
+```
+
+Selectors bind against the transform's **input** row, for `per_record` and
+`on_error` alike: dispatch fires before this transform's own `cxl:` block, so a
+column the transform produces cannot be requested. Request the columns it reads
+instead.
+
+The check decides what the declared schema can decide. A column that reaches
+the transform through an open composition port is not visible to it, and a
+selector naming one of those is still checked only at run time — counted in the
+run's admission accounting under the missing-field total.
 
 ### Logging only the records you care about
 

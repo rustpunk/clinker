@@ -37,6 +37,7 @@ use crate::config::pipeline_node::{
     CombineBody, CopyFrom, CullBody, MatchMode, OnUnmapped, PipelineNode, PropagateCkSpec,
     ReshapeBody,
 };
+use crate::config::transform::LogDirective;
 use crate::plan::combine::{
     CombineInput, DecomposedPredicate, decompose_predicate, select_driving_input,
 };
@@ -2542,6 +2543,7 @@ fn bind_schema_inner(
                 // non-boolean gate a normal type error instead of a runtime
                 // surprise.
                 if let Some(directives) = &config.log {
+                    diags.extend(log_field_diagnostics(&name, directives, &upstream, span));
                     // A gate is compiled as its own program, so a module alias
                     // the transform declared is not in scope for it. Module-root
                     // discovery already walks conditions, so the closure is
@@ -4755,6 +4757,100 @@ fn authored_gate_statements(statements: &[Statement], prelude: &GatePrelude) -> 
     statements.len().saturating_sub(prelude.statements)
 }
 
+/// Columns named in the E374 message before it stops listing them.
+///
+/// A wide row would otherwise put hundreds of names between the author and the
+/// correction at the end of the sentence.
+const LOG_FIELD_ROW_LISTING_LIMIT: usize = 12;
+
+/// Refuse a requested log field the transform's input record cannot carry.
+///
+/// `fields` is the only channel by which record data reaches an event, so a
+/// selector matching no column publishes an event with the attribute missing
+/// rather than the value the author asked for — which reads exactly like a run
+/// where nothing had that value. Dispatch fires before the transform's own
+/// program runs, for `per_record` and `on_error` alike, so the row a selector
+/// must name is the input row, not the projected output.
+///
+/// Only a closed row decides this. A row left open at a composition port
+/// carries columns the planner never sees, and a selector naming one of those
+/// is not decidable here — those stay with the runtime miss counter this check
+/// backs up.
+fn log_field_diagnostics(
+    node_name: &str,
+    directives: &[LogDirective],
+    upstream: &Row,
+    span: Span,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for (index, directive) in directives.iter().enumerate() {
+        let Some(fields) = &directive.fields else {
+            continue;
+        };
+        for field in fields {
+            if !matches!(upstream.lookup(field), ColumnLookup::Unknown) {
+                continue;
+            }
+            let mut names = upstream
+                .field_names()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let elided = names.len().saturating_sub(LOG_FIELD_ROW_LISTING_LIMIT);
+            names.truncate(LOG_FIELD_ROW_LISTING_LIMIT);
+            let mut listing = names
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if listing.is_empty() {
+                listing = "no columns at all".to_string();
+            } else if elided > 0 {
+                listing.push_str(&format!(" and {elided} more"));
+            }
+            let correction = match nearest_column(field, upstream) {
+                Some(suggestion) => format!("write `fields: [{suggestion}]`"),
+                None => "request a column the input row declares".to_string(),
+            };
+            diags.push(Diagnostic::error(
+                "E374",
+                format!(
+                    "transform `{node_name}` log[{index}].fields requests `{field}`, which the \
+                     input record does not carry; the upstream row has {listing} — {correction}"
+                ),
+                LabeledSpan::primary(span, "log fields".to_string()),
+            ));
+        }
+    }
+    diags
+}
+
+/// The declared column an unmatched selector most likely meant, if any.
+///
+/// Folding case and separators out before measuring is what lets `orderId`
+/// reach `order_id`: the two differ by an underscore and a capital, which is
+/// two edits on the raw spelling and none on the folded one.
+fn nearest_column(field: &str, upstream: &Row) -> Option<String> {
+    fn fold(value: &str) -> String {
+        value
+            .to_lowercase()
+            .chars()
+            .filter(|c| *c != '_' && *c != '-')
+            .collect()
+    }
+    let folded = fold(field);
+    let threshold = 1 + folded.len() / 8;
+    upstream
+        .field_names()
+        .filter_map(|column| {
+            let name = column.to_string();
+            let distance =
+                cxl::resolve::levenshtein::levenshtein_bounded(&folded, &fold(&name), threshold)?;
+            Some((distance, name))
+        })
+        .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+        .map(|(_, name)| name)
+}
+
 #[allow(clippy::result_large_err)]
 fn typecheck_cxl(
     node_name: &str,
@@ -6596,6 +6692,50 @@ mod tests {
         assert_eq!(
             authored_gate_statements(&statements("filter amount > 1\ndistinct"), &no_modules),
             2
+        );
+    }
+
+    /// The field check decides what a declared schema can decide, and stops
+    /// there.
+    ///
+    /// A row left open at a composition port carries columns declared outside
+    /// this walk's view, so an undeclared selector against one is not a
+    /// mistake the planner has grounds to refuse. Refusing it anyway would
+    /// reject working pipelines; this is also the case that keeps the runtime
+    /// miss counter a backstop rather than dead surface.
+    #[test]
+    fn a_field_request_is_refused_against_a_closed_row_and_left_to_run_time_on_an_open_one() {
+        let directives = vec![LogDirective {
+            name: "transform.seen".to_string(),
+            level: crate::config::LogLevel::Info,
+            when: crate::config::LogTiming::PerRecord,
+            message: "seen".to_string(),
+            fields: Some(vec!["customerId".to_string()]),
+            every: Some(1),
+            condition: None,
+        }];
+        let columns: IndexMap<QualifiedField, Type> = [
+            (QualifiedField::bare("customer_id"), Type::String),
+            (QualifiedField::bare("amount"), Type::Int),
+        ]
+        .into_iter()
+        .collect();
+        let cxl_span = cxl::lexer::Span::new(0, 0);
+
+        let closed = Row::closed(columns.clone(), cxl_span);
+        let refused = log_field_diagnostics("observe", &directives, &closed, Span::line_only(1));
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].code, "E374");
+        assert!(
+            refused[0].message.contains("write `fields: [customer_id]`"),
+            "the near miss must be named: {}",
+            refused[0].message
+        );
+
+        let open = Row::open(columns, cxl_span, cxl::typecheck::row::TailVarId(0));
+        assert!(
+            log_field_diagnostics("observe", &directives, &open, Span::line_only(1)).is_empty(),
+            "a column arriving through an open port is not the planner's to refuse"
         );
     }
 

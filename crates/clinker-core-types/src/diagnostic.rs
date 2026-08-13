@@ -231,6 +231,7 @@ diagnostic_registry! {
     "E371", Error, "Unsafe or invalid retained attempt refused";
     "E372", Error, "Attempt cleanup incomplete or budget exhausted";
     "E373", Error, "A transform log directive's `condition` is more than one predicate";
+    "E374", Error, "A transform log directive requests a `fields` selector the input record does not carry";
     // ── Path security ───────────────────────────────────────────────────
     "E-SEC-001", Error, "Path security violation (escape, symlink, etc.)";
     // ── Warnings ────────────────────────────────────────────────────────

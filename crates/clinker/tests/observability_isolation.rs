@@ -431,6 +431,7 @@ fn arena_admission_loss_reaches_the_machine_terminal_and_standard_error() {
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([
             "accepted",
+            "arena_recoveries",
             "capacity_bytes",
             "counts_complete",
             "dropped",
@@ -439,6 +440,19 @@ fn arena_admission_loss_reaches_the_machine_terminal_and_standard_error() {
             "peak_retained_bytes",
             "retained_bytes",
         ])
+    );
+    assert_eq!(
+        admission["arena_recoveries"], 0,
+        "telemetry did not panic under its own guard in this run"
+    );
+    let fields = admission["fields"].as_object().expect("field accounting");
+    assert_eq!(
+        fields.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        BTreeSet::from(["denied", "limit_dropped", "missing", "truncated"])
+    );
+    assert_eq!(
+        fields["missing"], 0,
+        "every directive in this pipeline requests a column its input row declares"
     );
     assert_eq!(
         admission["counts_complete"], true,
@@ -520,6 +534,8 @@ fn arena_admission_loss_reaches_the_machine_terminal_and_standard_error() {
         "ordinary_queue_full=",
         "high_sampled=",
         "high_queue_full=",
+        "missing_fields=",
+        "arena_recoveries=",
     ] {
         assert!(
             diagnostic.contains(counter),

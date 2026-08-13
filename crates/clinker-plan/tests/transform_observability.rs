@@ -502,6 +502,125 @@ nodes:
     );
 }
 
+/// A requested field the record cannot carry is refused before the run.
+///
+/// `fields` is the only channel by which record data reaches an event, so a
+/// selector that matches no column publishes the event with the attribute
+/// simply absent — which reads exactly like a run where no record had a value
+/// for it. The failure mode is a spelling slip, so the rejection names the
+/// column the author most likely meant.
+#[test]
+fn a_field_the_input_row_does_not_carry_is_refused_at_plan_time() {
+    let message = compile_error(&pipeline(
+        "",
+        "        - { name: transform.seen, level: info, when: per_record, every: 1, message: seen, fields: [customerId] }\n",
+    ));
+    assert!(
+        message.contains("E374"),
+        "an unmatched selector must be refused: {message}"
+    );
+    assert!(
+        message.contains("`customerId`"),
+        "the rejection must name the offending input: {message}"
+    );
+    assert!(
+        message.contains("`customer_id`, `amount`"),
+        "the rejection must state what the input row does carry: {message}"
+    );
+    assert!(
+        message.contains("write `fields: [customer_id]`"),
+        "the rejection must offer a pasteable correction: {message}"
+    );
+}
+
+/// `fields` is legal on `on_error` too, and the check covers it.
+///
+/// An error event fires on the record that failed — the same input record the
+/// per-record path reads — so the selector is decidable in exactly the same
+/// way, and leaving `on_error` unchecked would put the empty attribute on the
+/// events an operator reads first.
+#[test]
+fn an_on_error_field_the_input_row_does_not_carry_is_refused_at_plan_time() {
+    let message = compile_error(&pipeline(
+        "",
+        "        - { name: transform.failed, level: error, when: on_error, message: failed, fields: [customer_id, orderId] }\n",
+    ));
+    assert!(
+        message.contains("E374") && message.contains("`orderId`"),
+        "an unmatched selector on an error event must be refused: {message}"
+    );
+    assert_eq!(
+        message.matches("E374").count(),
+        1,
+        "the declared selector beside it must not be reported: {message}"
+    );
+}
+
+/// Pins WHICH row a selector binds against, exactly as the gate test pins the
+/// gate. Dispatch runs before the transform's own program, so a column the
+/// transform produces is not something a directive can request.
+#[test]
+fn fields_bind_against_the_input_row_not_the_output_row() {
+    let fixture = |field: &str| {
+        format!(
+            r#"
+pipeline:
+  name: field_scope
+nodes:
+  - type: source
+    name: input
+    config:
+      name: input
+      type: csv
+      path: input.csv
+      schema:
+        - {{ name: amount, type: int }}
+  - type: transform
+    name: observe
+    input: input
+    config:
+      cxl: |
+        emit doubled = amount * 2
+      log:
+        - {{ name: transform.seen, level: info, when: per_record, every: 1, message: seen, fields: [{field}] }}
+  - type: output
+    name: output
+    input: observe
+    config:
+      name: output
+      type: csv
+      path: output.csv
+"#
+        )
+    };
+
+    compile(&fixture("amount")).expect("an input-row column must resolve in a field request");
+
+    let output_only = compile_error(&fixture("doubled"));
+    assert!(
+        output_only.contains("E374") && output_only.contains("`doubled`"),
+        "a request must not resolve against the transform's output row: {output_only}"
+    );
+}
+
+/// A dotted selector is a flat column name, not a path into a nested value.
+///
+/// Dispatch reads it with one flat lookup, so `customer.id` resolves only if
+/// the input row declares a column spelled exactly that — which flattening
+/// readers do produce. A row without one is refused here rather than emitting
+/// a permanently empty attribute.
+#[test]
+fn a_dotted_selector_naming_no_column_is_refused_at_plan_time() {
+    let message = compile_error(&pipeline(
+        "",
+        "        - { name: transform.seen, level: info, when: per_record, every: 1, message: seen, fields: [customer.id] }\n",
+    ));
+    assert!(
+        message.contains("E374") && message.contains("`customer.id`"),
+        "a dotted selector matching no column must be refused: {message}"
+    );
+}
+
 /// A gate runs per record, so its source is bounded like `message` is.
 #[test]
 fn condition_bounds_are_enforced() {

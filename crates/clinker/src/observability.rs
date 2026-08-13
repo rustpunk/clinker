@@ -91,10 +91,19 @@ pub(crate) struct AdmissionSummary {
     pub(crate) accepted: u64,
     pub(crate) dropped: AdmissionDrops,
     pub(crate) lanes: AdmissionLanes,
-    /// Field-policy effects on records that *were* accepted. These reduce what
-    /// an accepted record says; they never discard one, so they are kept apart
-    /// from `dropped` and must not be added into a loss total.
+    /// What became of the fields of records that *were* accepted. These reduce
+    /// what an accepted record says; they never discard one, so they are kept
+    /// apart from `dropped` and must not be added into a loss total.
     pub(crate) fields: FieldPolicyCounts,
+    /// Times the arena resumed from a poisoned lock.
+    ///
+    /// Not a drop and not a quantity of anything lost — a condition. Telemetry
+    /// panicked while holding its own guard, and the arena chose to carry on
+    /// rather than take the run down with it. A non-zero value says the
+    /// counters beside it were produced by a subsystem that faulted mid-run,
+    /// which is a different claim from "this run dropped signals" and belongs
+    /// nowhere inside `dropped`.
+    pub(crate) arena_recoveries: u64,
     pub(crate) retained_bytes: u64,
     pub(crate) peak_retained_bytes: u64,
     pub(crate) capacity_bytes: u64,
@@ -149,12 +158,27 @@ pub(crate) struct AdmissionLaneSummary {
     pub(crate) capacity_bytes: u64,
 }
 
-/// What field policy did to the records that were accepted.
+/// What became of the fields of the records that were accepted.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub(crate) struct FieldPolicyCounts {
     pub(crate) denied: u64,
     pub(crate) truncated: u64,
     pub(crate) limit_dropped: u64,
+    /// Requested record values that were not on the record when the event
+    /// fired, so the attribute was never built.
+    ///
+    /// The three counters above are policy doing what an operator configured
+    /// it to do. This one is not configured by anyone: the event asked for a
+    /// column and the record did not have it. Most such requests are refused
+    /// when the pipeline compiles (E374); what survives to here is the case
+    /// the planner cannot decide, a selector naming a column that reaches the
+    /// transform through an open composition port.
+    ///
+    /// Counted only on events admission kept, because the record is read only
+    /// after the event has a slot — under a sampling policy this sees one miss
+    /// per sampled event, not one per record. It answers "is this happening"
+    /// rather than "how often".
+    pub(crate) missing: u64,
 }
 
 impl AdmissionSummary {
@@ -195,7 +219,9 @@ impl AdmissionSummary {
                 denied: snapshot.denied_fields,
                 truncated: snapshot.truncated_fields,
                 limit_dropped: snapshot.attribute_limit_drops,
+                missing: snapshot.missing_field_drops,
             },
+            arena_recoveries: snapshot.arena_recoveries,
             retained_bytes: snapshot.retained_bytes,
             peak_retained_bytes: snapshot.peak_retained_bytes,
             capacity_bytes: snapshot.owned_bytes,
@@ -1834,6 +1860,71 @@ mod tests {
     /// stored size, before any OTLP rewrapping.
     fn stored_bytes(record: &LogRecord) -> usize {
         serde_json::to_vec(record).expect("record serializes").len()
+    }
+
+    /// An arena reporting one missed field and one recovered panic, and
+    /// nothing else. Every other counter is zero so a mapping that routed
+    /// either value into the wrong group is visible as a non-zero it cannot
+    /// explain.
+    fn snapshot_reporting_a_miss_and_a_recovery() -> ArenaSnapshot {
+        ArenaSnapshot {
+            owned_bytes: 64_000,
+            ordinary_capacity_bytes: 32_000,
+            high_capacity_bytes: 32_000,
+            retained_bytes: 0,
+            ordinary_retained_bytes: 0,
+            high_retained_bytes: 0,
+            peak_retained_bytes: 0,
+            accepted: 7,
+            denied_fields: 0,
+            truncated_fields: 0,
+            attribute_limit_drops: 0,
+            sampled_drops: 0,
+            ordinary_sampled_drops: 0,
+            high_sampled_drops: 0,
+            rate_limited_drops: 0,
+            contention_drops: 0,
+            full_drops: 0,
+            ordinary_full_drops: 0,
+            high_full_drops: 0,
+            oversize_drops: 0,
+            invalid_drops: 0,
+            undecodable_drops: 0,
+            missing_field_drops: 3,
+            arena_recoveries: 1,
+        }
+    }
+
+    /// A missed field is not a lost signal, and a recovered panic is not a
+    /// count of anything lost.
+    ///
+    /// Both used to be produced by the arena and read by nobody. Adding either
+    /// into `dropped` would have made a run that discarded no telemetry report
+    /// that it had, which is the mistake `dropped_total` exists to prevent an
+    /// operator from making by hand.
+    #[test]
+    fn a_missed_field_and_an_arena_recovery_are_reported_outside_the_drop_total() {
+        let summary =
+            AdmissionSummary::from_arena(snapshot_reporting_a_miss_and_a_recovery(), true);
+        assert_eq!(summary.fields.missing, 3);
+        assert_eq!(summary.arena_recoveries, 1);
+        assert_eq!(
+            summary.dropped_total(),
+            0,
+            "this run lost no signal at admission: {summary:#?}"
+        );
+
+        let encoded = serde_json::to_value(summary).expect("the summary serializes");
+        assert_eq!(encoded["fields"]["missing"], 3);
+        assert_eq!(encoded["arena_recoveries"], 1);
+        assert!(
+            encoded["dropped"]
+                .as_object()
+                .expect("drop reasons")
+                .values()
+                .all(|count| count == 0),
+            "neither counter may appear under a drop reason: {encoded:#?}"
+        );
     }
 
     fn span(logical_node: &str, started: u64, ended: u64) -> TraceSpan {

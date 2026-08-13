@@ -502,6 +502,7 @@ pub const EXPLAIN_PAGES: &[(&str, &str)] = &[
     ("E371", include_str!("../../../../docs/explain/E371.md")),
     ("E372", include_str!("../../../../docs/explain/E372.md")),
     ("E373", include_str!("../../../../docs/explain/E373.md")),
+    ("E374", include_str!("../../../../docs/explain/E374.md")),
     ("E323", include_str!("../../../../docs/explain/E323.md")),
     ("E150b", include_str!("../../../../docs/explain/E150b.md")),
     ("E150c", include_str!("../../../../docs/explain/E150c.md")),

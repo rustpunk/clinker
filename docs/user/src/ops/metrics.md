@@ -388,7 +388,8 @@ beside them says what the arena took and what it refused, before any export:
     "ordinary":      { "sampled": 4, "queue_full": 0, "retained_bytes": 0, "capacity_bytes": 32000 },
     "high_severity": { "sampled": 4, "queue_full": 0, "retained_bytes": 0, "capacity_bytes": 32000 }
   },
-  "fields": { "denied": 0, "truncated": 0, "limit_dropped": 0 },
+  "fields": { "denied": 0, "truncated": 0, "limit_dropped": 0, "missing": 0 },
+  "arena_recoveries": 0,
   "retained_bytes": 0, "peak_retained_bytes": 2477, "capacity_bytes": 64000
 }
 ```
@@ -416,9 +417,27 @@ rename. `undecodable` is the one member of the set that is also counted in
 `accepted`: those signals were admitted, then could not be read back at drain.
 
 `fields` is a different kind of number and must not be added into a loss
-total. Those counts describe what field policy did to records that *were*
-accepted — values denied, values truncated, attributes dropped at the
-per-event cap. They reduce what a record says; they never discard one.
+total. Those counts describe what became of the fields of records that *were*
+accepted — values denied, values truncated, attributes dropped at the per-event
+cap, and values a directive requested that the record did not carry. They
+reduce what a record says; they never discard one.
+
+The first three are policy doing what you configured it to do. `missing` is
+not: a transform's `log` directive asked for a column and the record did not
+have one. Most such requests are refused when the pipeline compiles (E374).
+What reaches this counter is the case the planner cannot decide — a selector
+naming a column that arrives through an open composition port. It is credited
+where the signal is built, so under a sampling policy it sees one miss per
+sampled event rather than one per record: read it as "this is happening", not
+as how often.
+
+`arena_recoveries` is neither a drop nor a quantity of anything lost. It counts
+the times the arena resumed from a poisoned lock — telemetry panicked while
+holding its own guard, and the arena carried on rather than taking the run down
+with it. A non-zero value says every counter beside it was produced by a
+subsystem that faulted mid-run. Treat it as a defect report against Clinker,
+and read the run's other telemetry numbers with that in mind; the pipeline's
+own results are unaffected, because telemetry never changes them.
 
 #### Reconciling admission against export
 
@@ -471,13 +490,20 @@ A run without `--machine ndjson-v1` discards the terminal object entirely, so
 when anything was dropped Clinker writes one line to standard error:
 
 ```
-clinker: telemetry admission outcome: accepted=9 dropped=8 sampled=8 rate_limited=0 queue_full=0 contended=0 oversize=0 invalid_identity=0 undecodable=0 ordinary_sampled=4 ordinary_queue_full=0 high_sampled=4 high_queue_full=0 counts_complete=true
+clinker: telemetry admission outcome: accepted=9 dropped=8 sampled=8 rate_limited=0 queue_full=0 contended=0 oversize=0 invalid_identity=0 undecodable=0 ordinary_sampled=4 ordinary_queue_full=0 high_sampled=4 high_queue_full=0 missing_fields=0 arena_recoveries=0 counts_complete=true
 ```
 
 It mirrors the lineage delivery line, including its suppression rule: a run
 that dropped nothing prints nothing. A line that appeared on every run reading
 all zeroes is noise an operator learns to skip, and the one run that did lose
 signals would be skipped with it.
+
+`missing_fields` and `arena_recoveries` break that silence on their own. Both
+sit outside `dropped`, and neither is anything an operator asked for: an
+attribute the collector never received, and telemetry having panicked under its
+own guard. The `denied` and `truncated` field counters stay silent by contrast,
+because they are policy doing exactly what it was configured to do — and they
+are not on this line at all.
 
 The suppression is on the counters being final and clean, not on their reading
 zero. A run whose flush expired prints the line whatever the numbers say, with
