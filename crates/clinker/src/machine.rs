@@ -945,6 +945,22 @@ impl MachineState {
         }
     }
 
+    /// Whether any record belonging to the terminal has reached the sink.
+    ///
+    /// The inventory records and the terminal that counts them are one run of
+    /// lines: a reader reassembling chunk indices zero through
+    /// `chunk_count - 1` expects them adjacent, and the terminal is the last
+    /// line of the run. So the first inventory chunk the sink takes reserves
+    /// the stream exactly as the terminal itself does.
+    ///
+    /// The chunk count starts at zero and moves only when a chunk is
+    /// delivered; the one place it goes back to zero is a fresh inventory
+    /// replacing the one in hand, under the lock that then writes it. A
+    /// non-zero count therefore means a terminal is mid-flight.
+    fn terminal_run_started(&self) -> bool {
+        self.terminal_reserved || self.publication_chunks_sent > 0
+    }
+
     /// Record what the sink has taken.
     fn accept(&mut self, role: RecordRole) {
         self.sequence = self.sequence.saturating_add(1);
@@ -974,12 +990,18 @@ impl MachineState {
         if let Err(error) = self.resume_pending() {
             return ProgressWrite::Unsent(error);
         }
-        // The terminal record is the last record of a run. A progress writer
-        // runs on its own thread and can still be mid-tick when the run ends,
-        // so the reservation is what orders them rather than the shutdown
-        // handshake — a supervisor that stops reading at the terminal would
-        // otherwise be handed one more line it can never attribute.
-        if self.terminal_reserved {
+        // A terminal's records are a run of lines that belong together: its
+        // publication inventory, then the terminal that counts it, last record
+        // of the run. A progress writer runs on its own thread and can still
+        // be mid-tick when the run ends, so the reservation is what orders
+        // them rather than the shutdown handshake — a supervisor that stops
+        // reading at the terminal would otherwise be handed one more line it
+        // can never attribute. A liveness tick may not land *inside* that run
+        // either: a sink that refuses partway through the inventory leaves the
+        // terminal slot free by design, and the chunks the retry then sends
+        // must follow the ones already on the stream directly, not a progress
+        // record the gap let through.
+        if self.terminal_run_started() {
             return ProgressWrite::Skipped;
         }
         let kind = snapshot.kind();
@@ -1909,6 +1931,94 @@ mod tests {
                 .map(|event| event["seq"].as_u64().expect("sequence"))
                 .collect::<Vec<_>>(),
             [0, 1, 2, 3]
+        );
+    }
+
+    /// A liveness tick must not land between two chunks of one inventory.
+    ///
+    /// The terminal slot stays free across a refused inventory write so the
+    /// retry can still put a terminal on the stream, and the progress thread
+    /// keeps ticking in the meantime. Ordering the tick against the terminal
+    /// alone let it through in that window, splitting the run of
+    /// `publication_artifacts` records a consumer reassembles as one set.
+    #[test]
+    fn a_tick_between_a_refused_and_a_retried_inventory_writes_nothing() {
+        let sink = RefusingSink::new(1);
+        let mut state = state_writing_to(Box::new(sink.clone()));
+        let artifacts = (0..130)
+            .map(|index| {
+                serde_json::json!({
+                    "artifact_id": format!("artifact-{index:08x}"),
+                    "kind": "fan_out",
+                    "state": "published",
+                })
+            })
+            .collect::<Vec<_>>();
+        let (artifact_events, summary) = publication_payloads_from_artifacts(true, 0, artifacts);
+        assert_eq!(artifact_events.len(), 3);
+
+        assert!(
+            state
+                .write_terminal_for(
+                    "completed",
+                    serde_json::Map::from_iter([
+                        ("result".to_owned(), serde_json::json!("success")),
+                        ("exit_code".to_owned(), serde_json::json!(0)),
+                    ]),
+                    Some(TerminalPublication {
+                        artifact_events,
+                        summary,
+                    }),
+                )
+                .is_err(),
+            "the sink takes the first chunk and refuses the second"
+        );
+        assert_eq!(state.publication_chunks_sent, 1);
+        assert!(
+            !state.terminal_reserved,
+            "the terminal slot is what the retry needs, and it is still free"
+        );
+
+        // The tick the progress thread makes while `main` is on its way to the
+        // retry. The sink is allowed again first, so nothing but the ordering
+        // rule can stop the record.
+        sink.allow(16);
+        let snapshot = state.progress.transition("finalizing");
+        assert!(
+            matches!(
+                state.write_progress_staged(snapshot),
+                ProgressWrite::Skipped
+            ),
+            "a started inventory reserves the stream as the terminal does"
+        );
+
+        assert_eq!(
+            state
+                .write_terminal_for(
+                    "completed",
+                    serde_json::Map::from_iter([
+                        ("result".to_owned(), serde_json::json!("success")),
+                        ("exit_code".to_owned(), serde_json::json!(0)),
+                    ]),
+                    None,
+                )
+                .expect("the terminal slot is still free"),
+            TerminalOutcome::Written
+        );
+
+        let stream = events(&sink.accepted);
+        assert_eq!(
+            stream
+                .iter()
+                .map(|event| event["event"].as_str().expect("event name"))
+                .collect::<Vec<_>>(),
+            [
+                "publication_artifacts",
+                "publication_artifacts",
+                "publication_artifacts",
+                "completed",
+            ],
+            "the inventory is one unbroken run ending in its terminal: {stream:#?}"
         );
     }
 
