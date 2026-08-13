@@ -1098,16 +1098,26 @@ fn delivery_isolation() {
 
     let oracle = tempfile::tempdir().expect("delivery oracle workspace");
     prepare(oracle.path());
-    let (oracle_output, _) = run(oracle.path(), false);
+    let (oracle_output, oracle_elapsed) = run(oracle.path(), false);
     assert!(oracle_output.status.success());
 
     let hung = tempfile::tempdir().expect("hung delivery workspace");
     prepare(hung.path());
     let (hung_output, elapsed) = run(hung.path(), true);
     assert_eq!(hung_output.status.code(), oracle_output.status.code());
+    // What the sink may cost this run is its bounded flush deadline, not a
+    // wait of its own choosing. Measured against a wall clock alone that rule
+    // is two different claims depending on the host: a ceiling generous enough
+    // for a loaded runner to spawn a process and run a pipeline under is also
+    // generous enough for a sink to hold the run most of the way to it, and a
+    // ceiling tight enough to catch that fails wherever the host is slow. The
+    // run that did not hang prices everything the two have in common, so what
+    // is left over is what the sink cost, which is the thing being bounded.
+    let attributable = elapsed.saturating_sub(oracle_elapsed);
     assert!(
-        elapsed < Duration::from_secs(3),
-        "hung sink controlled CLI return"
+        attributable < Duration::from_secs(3),
+        "hung sink controlled CLI return: {attributable:?} beyond the {oracle_elapsed:?} \
+         the same run costs without it"
     );
     assert_eq!(terminal_truth(&hung_output), terminal_truth(&oracle_output));
     assert_eq!(
