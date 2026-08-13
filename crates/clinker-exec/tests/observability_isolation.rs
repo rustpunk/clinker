@@ -462,6 +462,64 @@ fn telemetry_arena_drop_newest_preserves_high_lane_and_exact_accounting() {
     assert!(producer.snapshot().retained_bytes <= producer.snapshot().owned_bytes);
 }
 
+/// A full lane is attributed to the lane that filled.
+///
+/// The lanes hold separate byte reservations, so "the ordinary lane is full"
+/// and "the high-severity lane is full" are different conditions with
+/// different corrections. A single total reports both as the same number and
+/// leaves an operator unable to tell whether any `error` was lost at all.
+#[test]
+fn a_full_lane_is_attributed_to_the_lane_that_filled() {
+    let policy = policy_with_lanes("1KB", "1KB", "2KB");
+    let (producer, _receiver) =
+        TelemetryArena::reserve(&policy).expect("enabled policy creates arena");
+    let ordinary = LogEvent {
+        event: "transform.customer_seen",
+        severity: Severity::Info,
+        message: "ordinary",
+        correlation: correlation(),
+        fields: &[SignalField::new("customer_id", "1")],
+    };
+    let high = LogEvent {
+        event: "transform.customer_failed",
+        severity: Severity::Error,
+        message: "static failure",
+        correlation: correlation(),
+        fields: &[SignalField::new("customer_id", "1")],
+    };
+
+    for _ in 0..64 {
+        let _ = producer.emit_log(ordinary);
+    }
+    let ordinary_only = producer.snapshot();
+    assert!(
+        ordinary_only.ordinary_full_drops > 0,
+        "the ordinary lane was filled: {ordinary_only:?}"
+    );
+    assert_eq!(
+        ordinary_only.high_full_drops, 0,
+        "ordinary volume must not be reported as high-severity loss"
+    );
+
+    for _ in 0..64 {
+        let _ = producer.emit_log(high);
+    }
+    let both = producer.snapshot();
+    assert!(
+        both.high_full_drops > 0,
+        "the high-severity lane was filled too: {both:?}"
+    );
+    assert_eq!(
+        both.ordinary_full_drops, ordinary_only.ordinary_full_drops,
+        "filling the high lane cannot change the ordinary lane's accounting"
+    );
+    assert_eq!(
+        both.full_drops,
+        both.ordinary_full_drops + both.high_full_drops,
+        "the total is exactly the two lanes"
+    );
+}
+
 #[test]
 fn telemetry_arena_bounds_typed_record_values_before_serialization() {
     let policy = policy_with_lanes("3KB", "1KB", "4KB");
@@ -697,6 +755,60 @@ fn sampling_counts_within_each_lane_so_ordinary_volume_cannot_discard_high_sever
         flooded, quiet,
         "the two lanes are disjoint so a flood of Info cannot change which \
          Warn/Error events survive sampling"
+    );
+}
+
+/// The documented sampling guarantee is checkable from a run's own counters.
+///
+/// `sampling_counts_within_each_lane_…` proves the behaviour by counting
+/// admissions from outside. An author cannot do that on their own pipeline —
+/// all they have is the run's reported accounting. Splitting `sampled_drops`
+/// per lane is what turns "a Transform's errors keep their one-in-ten share
+/// regardless of `info` volume" from a promise in the documentation into
+/// something the run itself demonstrates.
+#[test]
+fn per_lane_sampling_counters_show_the_error_share_holding_under_ordinary_volume() {
+    let policy = transform_policy("8KB", "4KB", "12KB", "64B", 10, 100_000, 100_000);
+    let (producer, receiver) =
+        TelemetryArena::reserve(&policy).expect("enabled policy creates arena");
+    let info = LogEvent {
+        event: "transform.customer_seen",
+        severity: Severity::Info,
+        message: "ordinary volume",
+        correlation: correlation(),
+        fields: &[],
+    };
+    let error = LogEvent {
+        event: "transform.customer_failed",
+        severity: Severity::Error,
+        message: "static failure",
+        correlation: correlation(),
+        fields: &[],
+    };
+
+    for _ in 0..20 {
+        for _ in 0..9 {
+            let _ = producer.emit_log(info);
+        }
+        let _ = producer.emit_log(error);
+        let _ = receiver.try_recv_batch();
+    }
+
+    let snapshot = producer.snapshot();
+    // Twenty errors at one in ten: two admitted, eighteen sampled away. The
+    // number does not move with the 180 Info events beside it.
+    assert_eq!(
+        snapshot.high_sampled_drops, 18,
+        "high-severity sampling is unaffected by ordinary volume: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.ordinary_sampled_drops, 162,
+        "180 Info events at one in ten: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.sampled_drops,
+        snapshot.ordinary_sampled_drops + snapshot.high_sampled_drops,
+        "the total is exactly the two lanes"
     );
 }
 

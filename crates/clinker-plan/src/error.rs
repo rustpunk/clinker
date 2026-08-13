@@ -413,24 +413,62 @@ impl PipelineError {
         }
     }
 
-    /// Bound and sanitize the sole authored value retained by a dispatch
-    /// mismatch. Reuse the stable failure sanitizer so path-, credential-,
-    /// record-, and Debug-shaped node names collapse to a fixed marker.
+    /// Bound the sole authored value retained by a dispatch mismatch, and
+    /// carry it as a name.
+    ///
+    /// The error tells an operator to report this operator's identity, so the
+    /// identity has to survive the rendering. Configuration applies no grammar
+    /// to a node name: `normalize  orders` and `orders{eu}` are both names a
+    /// planner admits. Passing them through the stable *message* sanitizer
+    /// renamed them — it whitespace-normalizes prose, and it reads a brace, a
+    /// `Some(`, or a leading `/` as a leaked Debug payload or path — so the
+    /// error named a node that is not in the plan, or none at all.
+    ///
+    /// The one thing that is not a node name is credential- or record-bearing
+    /// text, and that still collapses to a fixed marker. The verdict comes from
+    /// the shared sanitizer rather than a second copy of its vocabulary: the
+    /// probe below neutralizes only the punctuation the prose-shape heuristics
+    /// key on, so what remains to reject is exactly the sensitive-label rule.
     pub fn bounded_dispatch_node_name(node: &str) -> String {
         let mut end = node.len().min(DISPATCH_MISMATCH_NODE_MAX_BYTES);
         while !node.is_char_boundary(end) {
             end -= 1;
         }
-        let classification = clinker_core_types::FailureClassification::new(
-            "runtime.invariant.dispatch_mismatch",
-            &node[..end],
-        )
-        .expect("the append-only registry contains runtime.invariant.dispatch_mismatch");
-        if classification.message() == "runtime dispatch invariant failed" {
-            "<redacted-node>".to_owned()
-        } else {
-            classification.message().to_owned()
+        let bounded = &node[..end];
+        if !Self::node_name_is_reportable(bounded) {
+            return "<redacted-node>".to_owned();
         }
+        if end == node.len() {
+            bounded.to_owned()
+        } else {
+            // Mark the cut, so an operator reports a name they can tell is
+            // partial instead of a shorter name that may exist in the plan.
+            format!("{bounded}...")
+        }
+    }
+
+    /// Whether a bounded node name can be rendered as written.
+    ///
+    /// A control character is not part of any name and would let an authored
+    /// name forge a line in whatever consumes the rendered error.
+    fn node_name_is_reportable(name: &str) -> bool {
+        if name.trim().is_empty() || name.chars().any(char::is_control) {
+            return false;
+        }
+        let probe: String = name
+            .chars()
+            .map(|character| match character {
+                '{' | '}' | '(' | ')' | '[' | ']' | '/' | '\\' => '_',
+                other => other,
+            })
+            .collect();
+        clinker_core_types::FailureClassification::new(
+            "runtime.invariant.dispatch_mismatch",
+            &probe,
+        )
+        .expect("the append-only registry contains runtime.invariant.dispatch_mismatch")
+        .message()
+            != "runtime dispatch invariant failed"
     }
 }
 
@@ -870,6 +908,55 @@ mod tests {
             assert!(!sensitive.contains(forbidden), "{sensitive}");
         }
         assert!(sensitive.len() < 320, "{sensitive}");
+    }
+
+    /// The error asks for an operator identity, so it has to render one.
+    ///
+    /// Configuration applies no grammar to a node name, so a name with repeated
+    /// internal whitespace, a brace, or a leading `/` is one the planner
+    /// accepts. Rendering it through the prose sanitizer renamed it — or
+    /// dropped it entirely — and named a node that is not in the plan.
+    #[test]
+    fn dispatch_mismatch_reports_the_node_name_the_planner_admitted() {
+        for node in [
+            "normalize  orders",
+            "orders{eu}",
+            "Ok(orders)",
+            "/nightly",
+            "route to sink",
+        ] {
+            let rendered = PipelineError::DispatchMismatch {
+                dispatcher: "dispatch_route",
+                expected_kind: "route",
+                actual_kind: "transform",
+                node: node.to_owned(),
+            }
+            .to_string();
+            assert!(
+                rendered.contains(&format!("at node '{node}'")),
+                "the reported identity must be the authored one: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dispatch_node_name_stays_bounded_and_marks_its_cut() {
+        let long = "n".repeat(DISPATCH_MISMATCH_NODE_MAX_BYTES + 40);
+        let bounded = PipelineError::bounded_dispatch_node_name(&long);
+        assert_eq!(
+            bounded,
+            format!("{}...", "n".repeat(DISPATCH_MISMATCH_NODE_MAX_BYTES))
+        );
+
+        // A name with no reportable content is not an identity.
+        assert_eq!(
+            PipelineError::bounded_dispatch_node_name("   "),
+            "<redacted-node>"
+        );
+        assert_eq!(
+            PipelineError::bounded_dispatch_node_name("orders\nrouted"),
+            "<redacted-node>"
+        );
     }
 
     #[test]

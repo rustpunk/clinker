@@ -1,8 +1,9 @@
 //! Public admission contract for transform-authored observability events.
 
 use clinker_core_types::Diagnostic;
-use clinker_plan::config::{CompileContext, parse_config};
+use clinker_plan::config::{CompileContext, LogDirective, LogLevel, LogTiming, parse_config};
 use clinker_plan::plan::execution::PlanNode;
+use clinker_plan::yaml::CxlSource;
 
 fn pipeline(pipeline_extra: &str, directives: &str) -> String {
     format!(
@@ -639,4 +640,142 @@ fn a_condition_carrying_extra_statements_is_refused_at_plan_time() {
         message.contains("amount > 1 and region == 'eu'"),
         "the rejection must show a corrected form: {message}"
     );
+}
+
+/// A gate is one predicate, whatever the extra statement is.
+///
+/// A `use` an author writes into a gate is refused before the first record like
+/// any other spliced statement. It is refused by CXL's own ordering rule rather
+/// than by the one-predicate count — the gate is spliced after `filter`, so a
+/// declaration can only land somewhere the grammar already rejects — and the
+/// rejection still names the offending node and the rule it broke.
+#[test]
+fn a_condition_carrying_an_authored_use_is_refused_at_plan_time() {
+    for condition in [
+        "amount > 1\\nuse other.module as m",
+        "use other.module as m\\namount > 1",
+    ] {
+        let message = compile_error(&pipeline(
+            "",
+            &format!(
+                "        - {{ name: transform.seen, level: info, when: per_record, every: 1, message: seen, condition: \"{condition}\" }}\n"
+            ),
+        ));
+        assert!(
+            message.contains("observe:log[0]:condition"),
+            "the rejection must name the offending gate: {message}"
+        );
+        assert!(
+            message.contains("use must appear before") || message.contains("unexpected token Use"),
+            "the rejection must name the rule it broke: {message}"
+        );
+    }
+}
+
+/// A transform's own module aliases still reach its gate.
+///
+/// The prelude is engine-supplied, so discounting it is what keeps a gate in a
+/// module-importing transform legal — the guard counts statements past the
+/// prelude, not every non-`use` statement.
+#[test]
+fn a_gate_in_a_module_importing_transform_still_compiles() {
+    let yaml = pipeline("", "        - { name: transform.seen, level: info, when: per_record, every: 1, message: seen, condition: \"amount > 1\" }\n")
+        .replace(
+            "        emit customer_id = customer_id",
+            "        use other.module as m\n        emit customer_id = customer_id",
+        );
+    compile(&yaml).expect("a gate must survive the transform's module aliases");
+}
+
+/// An optional key written with no value is the absent key.
+///
+/// `fields:` with nothing after it is legal YAML for "absent", and it is what
+/// an author gets by commenting out the list's items. Binding the inner type
+/// asked serde for a sequence and rejected the null with a raw type error.
+#[test]
+fn optional_directive_keys_written_with_no_value_are_absent() {
+    let yaml = pipeline(
+        "",
+        r#"        - name: transform.completed
+          level: info
+          when: after_transform
+          message: "Transform completed"
+          fields:
+          every:
+          condition:
+"#,
+    );
+
+    let plan = compile(&yaml).expect("explicit nulls must read as absent keys");
+    let payload = plan
+        .dag()
+        .graph
+        .node_weights()
+        .find_map(|node| match node {
+            PlanNode::Transform {
+                resolved: Some(payload),
+                ..
+            } => Some(payload),
+            _ => None,
+        })
+        .expect("compiled plan must retain the transform payload");
+
+    assert_eq!(payload.log.len(), 1);
+    assert!(payload.log[0].fields.is_none());
+    assert!(payload.log[0].every.is_none());
+    assert!(payload.log[0].condition.is_none());
+}
+
+/// A repeated key is still a repeated key when it is written with no value.
+#[test]
+fn a_repeated_valueless_optional_key_is_still_rejected() {
+    let message = admission_error(&pipeline(
+        "",
+        r#"        - name: transform.completed
+          level: info
+          when: after_transform
+          message: "Transform completed"
+          fields:
+          fields:
+"#,
+    ));
+    assert!(message.contains("fields"), "{message}");
+}
+
+/// A serialized directive parses back through the admission that accepted it.
+#[test]
+fn a_log_directive_round_trips_through_yaml() {
+    for directive in [
+        LogDirective {
+            name: "transform.customer_seen".to_owned(),
+            level: LogLevel::Info,
+            when: LogTiming::PerRecord,
+            message: "customer processed".to_owned(),
+            fields: Some(vec!["customer_id".to_owned()]),
+            every: Some(2),
+            condition: Some(CxlSource::unspanned("amount > 1000")),
+        },
+        LogDirective {
+            name: "transform.completed".to_owned(),
+            level: LogLevel::Info,
+            when: LogTiming::AfterTransform,
+            message: "transform completed".to_owned(),
+            fields: None,
+            every: None,
+            condition: None,
+        },
+    ] {
+        let rendered = clinker_plan::yaml::to_string(&directive).expect("serialize directive");
+        let parsed: LogDirective =
+            clinker_plan::yaml::from_str(&rendered).unwrap_or_else(|error| {
+                panic!("a serialized directive must parse back: {error}\n{rendered}")
+            });
+        assert_eq!(parsed.name, directive.name);
+        assert_eq!(parsed.message, directive.message);
+        assert_eq!(parsed.when, directive.when);
+        assert_eq!(parsed.level, directive.level);
+        assert_eq!(parsed.fields, directive.fields);
+        assert_eq!(parsed.every, directive.every);
+        assert_eq!(parsed.condition, directive.condition);
+    }
 }

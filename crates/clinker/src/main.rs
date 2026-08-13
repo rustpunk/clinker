@@ -2299,6 +2299,41 @@ fn report_lineage_delivery(outcome: clinker_lineage::LineageDeliveryOutcome) {
     }
 }
 
+/// Say on standard error that telemetry was lost, and why.
+///
+/// The machine terminal carries this in full, but a run without
+/// `--machine ndjson-v1` discards that object entirely — so without this line
+/// a run whose arena refused most of its signals reported a clean export of a
+/// silently truncated dataset. Lineage already reports its losses this way;
+/// telemetry, the noisier of the two, said nothing.
+///
+/// Suppressed when every counter is zero, exactly as the lineage line is
+/// suppressed on a clean shutdown that dropped nothing: a run that lost no
+/// telemetry has nothing to report about losing telemetry.
+fn report_telemetry_admission(admission: observability::AdmissionSummary) {
+    if admission.dropped_total() == 0 {
+        return;
+    }
+    let dropped = admission.dropped;
+    let lanes = admission.lanes;
+    eprintln!(
+        "clinker: telemetry admission outcome: accepted={} dropped={} sampled={} rate_limited={} queue_full={} contended={} oversize={} invalid_identity={} undecodable={} ordinary_sampled={} ordinary_queue_full={} high_sampled={} high_queue_full={}",
+        admission.accepted,
+        admission.dropped_total(),
+        dropped.sampled,
+        dropped.rate_limited,
+        dropped.queue_full,
+        dropped.contended,
+        dropped.oversize,
+        dropped.invalid_identity,
+        dropped.undecodable,
+        lanes.ordinary.sampled,
+        lanes.ordinary.queue_full,
+        lanes.high_severity.sampled,
+        lanes.high_severity.queue_full,
+    );
+}
+
 /// Whether a sink that refused a write will refuse the identical retry.
 ///
 /// The distinction decides the retry advice a supervisor acts on. Permission,
@@ -2374,6 +2409,7 @@ fn finish_live_lineage(output: &mut Option<LiveLineageOutput>) {
 
 fn finish_otlp_delivery(
     worker: &mut Option<observability::OtlpWorker>,
+    producer: Option<&clinker_exec::telemetry::TelemetryProducer>,
     lifecycle: &RunLifecycleFacts,
     machine: Option<&MachineEmitter>,
 ) {
@@ -2384,6 +2420,17 @@ fn finish_otlp_delivery(
     if let Some(emitter) = machine {
         emitter.set_observability_summary(summary);
     }
+    // Read after the flush. `undecodable` is credited by the receiver as it
+    // drains, so an arena read before the worker finished would report a loss
+    // the run had not finished discovering.
+    let Some(producer) = producer else {
+        return;
+    };
+    let admission = observability::AdmissionSummary::from_arena(producer.snapshot());
+    if let Some(emitter) = machine {
+        emitter.set_observability_admission(admission);
+    }
+    report_telemetry_admission(admission);
 }
 
 struct ExternalLineageFileSink {
@@ -4118,7 +4165,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         static_vars: effective_runtime_variables.static_vars,
         source_vars: effective_runtime_variables.source_vars,
         record_vars: effective_runtime_variables.record_vars,
-        telemetry_producer,
+        telemetry_producer: telemetry_producer.clone(),
         shutdown_token: Some(shutdown_token.clone()),
         spill_root_dir: spill_root_dir.clone(),
         spill_disk_cap_bytes,
@@ -4210,7 +4257,12 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             {
                 tracing::warn!(error = %err, "failed to write FAIL lineage event");
             }
-            finish_otlp_delivery(&mut otlp_worker, &run_lifecycle, machine);
+            finish_otlp_delivery(
+                &mut otlp_worker,
+                telemetry_producer.as_ref(),
+                &run_lifecycle,
+                machine,
+            );
             finish_live_lineage(&mut lineage_output);
             return Err(terminal_error);
         }
@@ -4366,7 +4418,12 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         {
             tracing::warn!(error = %lineage_error, "failed to write FAIL lineage event");
         }
-        finish_otlp_delivery(&mut otlp_worker, &run_lifecycle, machine);
+        finish_otlp_delivery(
+            &mut otlp_worker,
+            telemetry_producer.as_ref(),
+            &run_lifecycle,
+            machine,
+        );
         finish_live_lineage(&mut lineage_output);
         return Err(terminal_error);
     }
@@ -4395,7 +4452,12 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             {
                 tracing::warn!(error = %lineage_error, "failed to write FAIL lineage event");
             }
-            finish_otlp_delivery(&mut otlp_worker, &run_lifecycle, machine);
+            finish_otlp_delivery(
+                &mut otlp_worker,
+                telemetry_producer.as_ref(),
+                &run_lifecycle,
+                machine,
+            );
             finish_live_lineage(&mut lineage_output);
             return Err(error);
         }
@@ -4541,7 +4603,12 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             }),
         )
         .map_err(lifecycle_error)?;
-    finish_otlp_delivery(&mut otlp_worker, &run_lifecycle, machine);
+    finish_otlp_delivery(
+        &mut otlp_worker,
+        telemetry_producer.as_ref(),
+        &run_lifecycle,
+        machine,
+    );
     if let Some(output) = lineage_output.as_mut()
         && let Err(err) = output.emit_terminal(&run_lifecycle.snapshot())
     {

@@ -17,9 +17,9 @@ use std::time::Duration;
 
 use clinker_exec::pipeline::shutdown::ShutdownToken;
 use clinker_exec::telemetry::{
-    LogRecord, MetricKey, MetricPoint, RunCorrelation, Severity, SpanName, SpanStatus,
-    TelemetryArena, TelemetryArenaError, TelemetryBatch, TelemetryProducer, TelemetryReceiver,
-    TraceSpan, unix_nanos_now,
+    ArenaSnapshot, LogRecord, MetricKey, MetricPoint, RunCorrelation, Severity, SpanName,
+    SpanStatus, TelemetryArena, TelemetryArenaError, TelemetryBatch, TelemetryProducer,
+    TelemetryReceiver, TraceSpan, unix_nanos_now,
 };
 use clinker_net::{
     AdmittedOtlpEndpoint, OtlpAuthentication, OtlpDeliveryBudget, OtlpDeliveryBudgetError,
@@ -48,6 +48,14 @@ pub(crate) struct ObservabilitySummary {
     /// collector rejected them" and "we stopped counting" — and only one of
     /// those is a collector problem.
     pub(crate) flush_complete: bool,
+    /// What the fixed arena admitted and refused, before any export.
+    ///
+    /// The per-signal groups above are export-side, and an exporter can only
+    /// count what reached it. Without this a run that discarded most of its
+    /// signals at admission reported a clean, complete-looking export of a
+    /// silently truncated dataset. Absent only when no arena was reserved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) admission: Option<AdmissionSummary>,
 }
 
 /// Aggregate-only visibility for one closed signal kind.
@@ -57,6 +65,129 @@ pub(crate) struct SignalSummary {
     pub(crate) rejected: u64,
     pub(crate) attempts: u64,
     pub(crate) failures: u64,
+}
+
+/// Exact arena-admission accounting for the machine terminal.
+///
+/// Drop reasons are named as OpenTelemetry `error.type` values on a
+/// processed-items counter — `queue_full` rather than the internal `full` —
+/// so a later mapping onto SDK self-observability metrics is a rename of
+/// nothing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct AdmissionSummary {
+    /// Logs and spans the arena took. Metric points are coalesced into fixed
+    /// counters rather than admitted as signals, so none are counted here.
+    pub(crate) accepted: u64,
+    pub(crate) dropped: AdmissionDrops,
+    pub(crate) lanes: AdmissionLanes,
+    /// Field-policy effects on records that *were* accepted. These reduce what
+    /// an accepted record says; they never discard one, so they are kept apart
+    /// from `dropped` and must not be added into a loss total.
+    pub(crate) fields: FieldPolicyCounts,
+    pub(crate) retained_bytes: u64,
+    pub(crate) peak_retained_bytes: u64,
+    pub(crate) capacity_bytes: u64,
+}
+
+/// One counter per reason a signal never became exportable.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct AdmissionDrops {
+    pub(crate) sampled: u64,
+    pub(crate) rate_limited: u64,
+    pub(crate) queue_full: u64,
+    pub(crate) contended: u64,
+    pub(crate) oversize: u64,
+    pub(crate) invalid_identity: u64,
+    /// Counted in `accepted`, but unreadable at drain and so never exported.
+    /// It is the one loss that is also a member of `accepted`.
+    pub(crate) undecodable: u64,
+}
+
+impl AdmissionDrops {
+    fn total(self) -> u64 {
+        [
+            self.sampled,
+            self.rate_limited,
+            self.queue_full,
+            self.contended,
+            self.oversize,
+            self.invalid_identity,
+            self.undecodable,
+        ]
+        .into_iter()
+        .fold(0, u64::saturating_add)
+    }
+}
+
+/// The two disjoint lanes, split for the drops that can bite an `error`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct AdmissionLanes {
+    pub(crate) ordinary: AdmissionLaneSummary,
+    pub(crate) high_severity: AdmissionLaneSummary,
+}
+
+/// Sampling and capacity refusals attributed to one lane.
+///
+/// Rate limiting and lock contention are properties of the shared arena rather
+/// than of a lane, so they have no per-lane spelling and stay in `dropped`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct AdmissionLaneSummary {
+    pub(crate) sampled: u64,
+    pub(crate) queue_full: u64,
+    pub(crate) retained_bytes: u64,
+    pub(crate) capacity_bytes: u64,
+}
+
+/// What field policy did to the records that were accepted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct FieldPolicyCounts {
+    pub(crate) denied: u64,
+    pub(crate) truncated: u64,
+    pub(crate) limit_dropped: u64,
+}
+
+impl AdmissionSummary {
+    pub(crate) fn from_arena(snapshot: ArenaSnapshot) -> Self {
+        Self {
+            accepted: snapshot.accepted,
+            dropped: AdmissionDrops {
+                sampled: snapshot.sampled_drops,
+                rate_limited: snapshot.rate_limited_drops,
+                queue_full: snapshot.full_drops,
+                contended: snapshot.contention_drops,
+                oversize: snapshot.oversize_drops,
+                invalid_identity: snapshot.invalid_drops,
+                undecodable: snapshot.undecodable_drops,
+            },
+            lanes: AdmissionLanes {
+                ordinary: AdmissionLaneSummary {
+                    sampled: snapshot.ordinary_sampled_drops,
+                    queue_full: snapshot.ordinary_full_drops,
+                    retained_bytes: snapshot.ordinary_retained_bytes,
+                    capacity_bytes: snapshot.ordinary_capacity_bytes,
+                },
+                high_severity: AdmissionLaneSummary {
+                    sampled: snapshot.high_sampled_drops,
+                    queue_full: snapshot.high_full_drops,
+                    retained_bytes: snapshot.high_retained_bytes,
+                    capacity_bytes: snapshot.high_capacity_bytes,
+                },
+            },
+            fields: FieldPolicyCounts {
+                denied: snapshot.denied_fields,
+                truncated: snapshot.truncated_fields,
+                limit_dropped: snapshot.attribute_limit_drops,
+            },
+            retained_bytes: snapshot.retained_bytes,
+            peak_retained_bytes: snapshot.peak_retained_bytes,
+            capacity_bytes: snapshot.owned_bytes,
+        }
+    }
+
+    /// Every signal this run lost, by any admission reason.
+    pub(crate) fn dropped_total(self) -> u64 {
+        self.dropped.total()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -298,6 +429,9 @@ impl OtlpDeliveryReport {
             metrics: self.metrics.summary,
             traces: self.traces.summary,
             flush_complete: true,
+            // Attached by the terminal writer, which reads the arena after this
+            // worker has drained it. The exporter never sees the producer.
+            admission: None,
         }
     }
 
@@ -514,6 +648,7 @@ impl OtlpWorker {
                     payload: &mut payload,
                     shutdown,
                     stop: worker_stop,
+                    final_flush: false,
                     report: OtlpDeliveryReport::default(),
                     progress: worker_progress,
                     correlation,
@@ -525,12 +660,14 @@ impl OtlpWorker {
                     state.drain_available();
                     match commands.recv_timeout(IDLE_POLL) {
                         Ok(WorkerCommand::Finish(snapshot)) => {
+                            state.enter_final_flush();
                             state.drain_available();
                             state.deliver_lifecycle(snapshot.as_ref());
                             let _ = done_sender.try_send(state.report);
                             return;
                         }
                         Ok(WorkerCommand::Drain) => {
+                            state.enter_final_flush();
                             state.drain_available();
                             let _ = done_sender.try_send(state.report);
                             return;
@@ -664,6 +801,9 @@ struct WorkerState<'a> {
     payload: &'a mut BoundedPayload,
     shutdown: ShutdownToken,
     stop: Arc<AtomicBool>,
+    /// Whether the worker is delivering its final flush rather than exporting
+    /// alongside a still-running execution.
+    final_flush: bool,
     report: OtlpDeliveryReport,
     /// The counters so far, readable by the parent.
     ///
@@ -688,6 +828,20 @@ struct WorkerState<'a> {
 }
 
 impl WorkerState<'_> {
+    /// Stop reading the run's shutdown token as an instruction to abandon.
+    ///
+    /// The token is raised for the whole run the moment a SIGINT or SIGTERM
+    /// arrives, so leaving it in the abandon predicate here made every
+    /// delivery of the final flush return before opening a connection: a
+    /// cancelled run exported nothing at all, terminal span included, which is
+    /// exactly the run whose telemetry is wanted. The flush command is itself
+    /// the instruction to wind up; from here only `stop` — raised by the
+    /// parent when its flush deadline expires — abandons a delivery, which is
+    /// what keeps the flush bounded.
+    fn enter_final_flush(&mut self) {
+        self.final_flush = true;
+    }
+
     fn drain_available(&mut self) {
         while let Some(batch) = self.receiver.try_recv_batch() {
             self.deliver_batch(&batch);
@@ -759,7 +913,10 @@ impl WorkerState<'_> {
                 signal,
                 self.payload.bytes(),
                 item_count,
-                &|| self.shutdown.is_requested() || self.stop.load(Ordering::Acquire),
+                &|| {
+                    (!self.final_flush && self.shutdown.is_requested())
+                        || self.stop.load(Ordering::Acquire)
+                },
             ),
             Err(_) => DeliveryResult::EncodingFailure,
         };
@@ -2051,6 +2208,112 @@ mode = "none"
         assert!(
             failure_line("metrics", &report.metrics).is_none(),
             "a signal that lost nothing reports nothing"
+        );
+    }
+
+    /// An aborted run's terminal snapshot, built the way the CLI builds one.
+    fn aborted_snapshot() -> RunLifecycleSnapshot {
+        let started_at = chrono::DateTime::parse_from_rfc3339("2026-08-06T12:00:00Z")
+            .expect("timestamp")
+            .with_timezone(&chrono::Utc);
+        let fingerprint = clinker_plan::config::parse_config(
+            "pipeline: { name: cancelled }\nnodes:\n  - type: source\n    name: src\n    config: { name: src, type: csv, path: in.csv, schema: [{ name: id, type: int }] }\n",
+        )
+        .expect("config")
+        .compile(&clinker_plan::config::CompileContext::default())
+        .expect("plan")
+        .semantic_fingerprint()
+        .expect("fingerprint");
+        let correlation = correlation();
+        let identity = crate::lifecycle::RunCorrelationIdentity::new(
+            correlation.batch_id.clone(),
+            correlation.execution_id.clone(),
+        )
+        .expect("identity");
+        let facts = crate::lifecycle::RunLifecycleFacts::new(identity, fingerprint, started_at);
+        facts
+            .record_terminal(started_at, RunTerminalOutcome::Abort, None)
+            .expect("terminal");
+        facts.snapshot()
+    }
+
+    #[test]
+    fn a_cancelled_run_still_exports_its_final_flush_and_terminal_span() {
+        let policy = exporting_policy();
+        let bundle = OtlpRuntimeBundle::admit(&policy)
+            .expect("the collector endpoint is admissible")
+            .expect("the policy configures a collector");
+        let (producer, receiver) = bundle.reserve_arena(&policy).expect("the arena reserves");
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let (started, _delivery_started) = mpsc::channel();
+        // Cancelled before the exporter starts, as a run interrupted during
+        // startup or early execution is.
+        let shutdown = ShutdownToken::detached();
+        shutdown.request();
+        let worker = OtlpWorker::start_with_backend(
+            bundle,
+            receiver,
+            shutdown,
+            correlation(),
+            DeliveryBackend::Recording(RecordingDelivery {
+                deliveries: Arc::clone(&deliveries),
+                started,
+                hold: Duration::ZERO,
+                held: false,
+            }),
+        )
+        .expect("the exporter starts");
+
+        emit_one_log(&producer);
+        let summary = worker.finish(aborted_snapshot());
+
+        let deliveries = deliveries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The lifecycle span exists only in the final flush, so it is the one
+        // delivery whose phase is not a race with the idle drain: a record
+        // emitted during execution may legitimately be abandoned by the
+        // cancellation, and this test does not assert which phase drained it.
+        let lifecycle = deliveries
+            .iter()
+            .filter(|delivery| delivery.signal == OtlpSignal::Traces)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lifecycle.len(),
+            1,
+            "the lifecycle span carrying the abort outcome is exported: \
+             {deliveries:?}"
+        );
+        assert!(
+            !lifecycle[0].abandoned,
+            "the run's shutdown token is not an instruction to abandon the \
+             final flush; reading it as one returns before opening a \
+             connection, so a cancelled run exports no terminal at all: \
+             {deliveries:?}"
+        );
+        assert_eq!(
+            deliveries
+                .iter()
+                .filter(|delivery| delivery.signal == OtlpSignal::Logs)
+                .map(|delivery| delivery.item_count)
+                .sum::<u64>(),
+            1,
+            "the records describing the cancelled run are exported: \
+             {deliveries:?}"
+        );
+        assert!(
+            summary.flush_complete,
+            "the flush ran to completion rather than expiring: {summary:?}"
+        );
+        assert_eq!(
+            (
+                summary.logs.accepted + summary.traces.accepted,
+                summary.logs.rejected + summary.traces.rejected,
+                summary.logs.failures + summary.traces.failures,
+            ),
+            (2, 0, 0),
+            "a delivery that was never attempted must not be reported as one \
+             the collector rejected: {summary:?}"
         );
     }
 

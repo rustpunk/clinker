@@ -466,10 +466,14 @@ impl TelemetryProducer {
             denied_fields: self.stats.denied_fields.load(Ordering::Relaxed),
             truncated_fields: self.stats.truncated_fields.load(Ordering::Relaxed),
             attribute_limit_drops: self.stats.attribute_limit_drops.load(Ordering::Relaxed),
-            sampled_drops: self.stats.sampled.load(Ordering::Relaxed),
+            sampled_drops: self.stats.sampled.total(),
+            ordinary_sampled_drops: self.stats.sampled.ordinary(),
+            high_sampled_drops: self.stats.sampled.high(),
             rate_limited_drops: self.stats.rate_limited.load(Ordering::Relaxed),
             contention_drops: self.stats.contended.load(Ordering::Relaxed),
-            full_drops: self.stats.full.load(Ordering::Relaxed),
+            full_drops: self.stats.full.total(),
+            ordinary_full_drops: self.stats.full.ordinary(),
+            high_full_drops: self.stats.full.high(),
             oversize_drops: self.stats.oversize.load(Ordering::Relaxed),
             invalid_drops: self.stats.invalid.load(Ordering::Relaxed),
             undecodable_drops: self.stats.undecodable.load(Ordering::Relaxed),
@@ -483,7 +487,7 @@ impl TelemetryProducer {
         // nine Info events per Error discard the same nine tenths of Errors.
         let sequence = self.sample_sequence.next(lane);
         if !sequence.is_multiple_of(u64::from(self.policy.sample_every())) {
-            self.stats.sampled.fetch_add(1, Ordering::Relaxed);
+            self.stats.sampled.increment(lane);
             return AdmissionOutcome::Dropped(DropReason::Sampled);
         }
 
@@ -517,7 +521,7 @@ impl TelemetryProducer {
             }
             Err(DropReason::Full) => {
                 shared.rate.refund();
-                self.stats.full.fetch_add(1, Ordering::Relaxed);
+                self.stats.full.increment(lane);
                 AdmissionOutcome::Dropped(DropReason::Full)
             }
             Err(DropReason::Oversize) => {
@@ -685,9 +689,19 @@ pub struct ArenaSnapshot {
     pub truncated_fields: u64,
     pub attribute_limit_drops: u64,
     pub sampled_drops: u64,
+    /// `sampled_drops` split across the two disjoint lanes. Sampling counts
+    /// within a lane, so only the split shows whether a run's `error` signals
+    /// kept their configured share while ordinary volume rose.
+    pub ordinary_sampled_drops: u64,
+    pub high_sampled_drops: u64,
     pub rate_limited_drops: u64,
     pub contention_drops: u64,
     pub full_drops: u64,
+    /// `full_drops` split across the two disjoint lanes. The lanes have
+    /// separate byte capacities, so a full ordinary lane and a full
+    /// high-severity lane are different conditions with different corrections.
+    pub ordinary_full_drops: u64,
+    pub high_full_drops: u64,
     pub oversize_drops: u64,
     pub invalid_drops: u64,
     /// Signals counted in `accepted` whose stored bytes could not be read back
@@ -1290,13 +1304,51 @@ struct ProducerCounters {
     denied_fields: AtomicU64,
     truncated_fields: AtomicU64,
     attribute_limit_drops: AtomicU64,
-    sampled: AtomicU64,
+    sampled: LaneCounter,
     rate_limited: AtomicU64,
     contended: AtomicU64,
-    full: AtomicU64,
+    full: LaneCounter,
     oversize: AtomicU64,
     invalid: AtomicU64,
     undecodable: AtomicU64,
+}
+
+/// One drop counter kept per disjoint lane.
+///
+/// Sampling and a full arena are the two refusals that can discard an `error`
+/// while the ordinary lane is the thing under pressure. A single total cannot
+/// tell those apart, so the lane split is what makes the documented guarantee —
+/// that ordinary volume does not thin out high-severity signals — checkable
+/// from a run's own accounting rather than only from the code.
+#[derive(Default)]
+struct LaneCounter {
+    ordinary: AtomicU64,
+    high: AtomicU64,
+}
+
+impl LaneCounter {
+    fn increment(&self, lane: AdmissionLane) {
+        self.lane(lane).fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn lane(&self, lane: AdmissionLane) -> &AtomicU64 {
+        match lane {
+            AdmissionLane::Ordinary => &self.ordinary,
+            AdmissionLane::HighSeverity => &self.high,
+        }
+    }
+
+    fn ordinary(&self) -> u64 {
+        self.ordinary.load(Ordering::Relaxed)
+    }
+
+    fn high(&self) -> u64 {
+        self.high.load(Ordering::Relaxed)
+    }
+
+    fn total(&self) -> u64 {
+        self.ordinary().saturating_add(self.high())
+    }
 }
 
 #[derive(Default)]

@@ -330,6 +330,106 @@ collector problem.
 Delivery outcomes never change execution, publication, or the process exit
 status; the summary is an observation about the export, not about the run.
 
+### What the machine terminal reports about admission
+
+The per-signal groups above are export-side, and an exporter can only count
+what reached it. A run that discarded most of its signals at the arena would
+otherwise report `accepted = N, rejected = 0, flush_complete = true` — a clean,
+complete-looking export of a silently truncated dataset. The `admission` object
+beside them says what the arena took and what it refused, before any export:
+
+```json
+"admission": {
+  "accepted": 9,
+  "dropped": {
+    "sampled": 8, "rate_limited": 0, "queue_full": 0, "contended": 0,
+    "oversize": 0, "invalid_identity": 0, "undecodable": 0
+  },
+  "lanes": {
+    "ordinary":      { "sampled": 4, "queue_full": 0, "retained_bytes": 0, "capacity_bytes": 32000 },
+    "high_severity": { "sampled": 4, "queue_full": 0, "retained_bytes": 0, "capacity_bytes": 32000 }
+  },
+  "fields": { "denied": 0, "truncated": 0, "limit_dropped": 0 },
+  "retained_bytes": 0, "peak_retained_bytes": 2477, "capacity_bytes": 64000
+}
+```
+
+`accepted` counts the logs and spans the arena took. Metric points are
+coalesced into fixed counters rather than admitted as signals, so none of them
+appear here.
+
+Each key under `dropped` is one reason a signal never became exportable. They
+are named as OpenTelemetry `error.type` values — a full arena is `queue_full`,
+not `full` — so these map onto SDK self-observability metrics without a
+rename. `undecodable` is the one member of the set that is also counted in
+`accepted`: those signals were admitted, then could not be read back at drain.
+
+`fields` is a different kind of number and must not be added into a loss
+total. Those counts describe what field policy did to records that *were*
+accepted — values denied, values truncated, attributes dropped at the
+per-event cap. They reduce what a record says; they never discard one.
+
+#### Reconciling admission against export
+
+Every signal counted under `dropped` is one the collector never saw. A
+delivery accounts for every item in its chunk — a chunk travels whole, so
+`accepted + rejected` equals the items handed to the exporter whatever the
+outcome was. That gives an exact identity for a run where `flush_complete` is
+`true`:
+
+```
+admission.accepted
+  = (logs.accepted   + logs.rejected)
+  + (traces.accepted + traces.rejected)
+  + admission.dropped.undecodable
+  - 1
+```
+
+The `- 1` is the run-lifecycle span, which the exporter synthesizes at the
+final flush rather than drawing from the arena. `metrics` has no term because
+metric points are not admitted signals. When `flush_complete` is `false` the
+export counters are a partial accounting by definition and the identity does
+not apply.
+
+Any shortfall against that is arena loss, and `dropped` says which kind.
+
+#### Why the lanes are split
+
+`sampled` and `queue_full` are the two refusals that can cost an `error` while
+the ordinary lane is the thing under pressure, so both are attributed per lane.
+That is what makes the sampling guarantee above checkable from a run's own
+accounting: with `sample_every = 10`, `lanes.high_severity.sampled` holds at
+one in ten of the high-severity signals produced however far
+`lanes.ordinary.sampled` climbs beside it. A single total cannot show that, and
+an author reading one would have no way to tell what share of their errors
+survived.
+
+`rate_limited` and `contended` have no per-lane spelling. The rate limiter and
+the arena lock are properties of the shared arena rather than of a lane.
+
+`retained_bytes` is what the lane still held when the run finished, and
+`capacity_bytes` is its reservation. Note that `max_batch_bytes` is the
+per-slot bound, so a lane holds `lane_bytes / max_batch_bytes` signals between
+drains — that ratio, not the byte size alone, is what `queue_full` is measured
+against.
+
+### Telemetry loss without `--machine`
+
+A run without `--machine ndjson-v1` discards the terminal object entirely, so
+when anything was dropped Clinker writes one line to standard error:
+
+```
+clinker: telemetry admission outcome: accepted=9 dropped=8 sampled=8 rate_limited=0 queue_full=0 contended=0 oversize=0 invalid_identity=0 undecodable=0 ordinary_sampled=4 ordinary_queue_full=0 high_sampled=4 high_queue_full=0
+```
+
+It mirrors the lineage delivery line, including its suppression rule: a run
+that dropped nothing prints nothing. A line that appeared on every run reading
+all zeroes is noise an operator learns to skip, and the one run that did lose
+signals would be skipped with it.
+
+Like the lineage line, this is an observation. Telemetry loss does not change
+execution, publication, the machine terminal result, or the exit status.
+
 ### Runtime ownership and failure isolation
 
 The deployment path keeps capability ownership narrow:

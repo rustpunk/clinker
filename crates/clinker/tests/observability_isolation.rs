@@ -190,7 +190,7 @@ fn otlp_bulkhead_drains_three_signals_and_shares_lifecycle_facts() {
         .expect("fixed observability summary");
     assert_eq!(
         summary.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-        BTreeSet::from(["flush_complete", "logs", "metrics", "traces"])
+        BTreeSet::from(["admission", "flush_complete", "logs", "metrics", "traces"])
     );
     // This run's exporter finished, so the counters beside it are a final
     // accounting rather than whatever had been recorded when a deadline cut
@@ -275,6 +275,278 @@ fn otlp_bulkhead_drains_three_signals_and_shares_lifecycle_facts() {
     assert_eq!(lineage_plan["digest"], plan["plan_identity"]["digest"]);
     assert_eq!(otlp["clinker.run.outcome"]["stringValue"], "complete");
     assert_eq!(lineage_terminal["eventType"], "COMPLETE");
+}
+
+/// Eight records, each producing one `info` event on the ordinary lane and one
+/// `error` event on the high-severity lane. Both lanes are therefore busy
+/// enough that a sampling policy discards from each of them.
+fn write_two_lane_pipeline(root: &Path, records: usize) {
+    std::fs::create_dir_all(root.join("private/source")).expect("source directory");
+    std::fs::create_dir_all(root.join("private/output")).expect("output directory");
+    let mut csv = String::from("customer_id\n");
+    for index in 0..records {
+        csv.push_str(&format!("customer-{index}\n"));
+    }
+    std::fs::write(root.join("private/source/customers.csv"), csv).expect("input fixture");
+    std::fs::write(
+        root.join("pipeline.yaml"),
+        r#"pipeline:
+  name: telemetry_admission
+nodes:
+  - type: source
+    name: customers
+    config:
+      name: customers
+      type: csv
+      path: ./private/source/customers.csv
+      options: { has_header: true }
+      schema: [{ name: customer_id, type: string }]
+  - type: transform
+    name: normalize
+    input: customers
+    config:
+      cxl: emit customer_id = customer_id
+      log:
+        - name: transform.customer_seen
+          level: info
+          when: per_record
+          message: customer processed
+          fields: [customer_id]
+          every: 1
+        - name: transform.customer_flagged
+          level: error
+          when: per_record
+          message: customer flagged
+          fields: [customer_id]
+          every: 1
+  - type: output
+    name: published_customers
+    input: normalize
+    config:
+      name: published_customers
+      type: csv
+      path: ./private/output/customers.csv
+"#,
+    )
+    .expect("pipeline fixture");
+}
+
+/// The bulkhead policy with sampling as its only variable. `sample_every = 1`
+/// keeps everything, so a run under it has nothing to report about loss.
+///
+/// `max_batch_bytes` is the per-slot bound, so it — not the lane byte size —
+/// decides how many signals a lane holds between drains. 1KB against a 32KB
+/// lane gives 32 slots, which is enough headroom that a small run reaches the
+/// exporter without the arena filling and turning a sampling test into a
+/// capacity test.
+fn write_sampling_policy(root: &Path, sample_every: u32) {
+    std::fs::write(
+        root.join("clinker.toml"),
+        format!(
+            r#"[observability]
+arena_bytes = "64KB"
+ordinary_lane_bytes = "32KB"
+high_severity_lane_bytes = "32KB"
+max_batch_bytes = "1KB"
+max_attributes_per_event = 4
+max_attribute_bytes = "256B"
+sample_every = {sample_every}
+rate_limit_per_second = 100000
+rate_limit_burst = 100000
+flush_timeout_ms = 500
+
+[observability.otlp]
+endpoint = "https://collector.example.com"
+connect_timeout_ms = 20
+request_timeout_ms = 50
+retry_max_attempts = 1
+retry_total_timeout_ms = 100
+max_response_bytes = "4KB"
+
+[observability.otlp.auth]
+mode = "none"
+
+[[observability.field_policy]]
+event = "transform.customer_seen"
+field = "customer_id"
+action = "allow"
+
+[[observability.field_policy]]
+event = "transform.customer_flagged"
+field = "customer_id"
+action = "allow"
+"#
+        ),
+    )
+    .expect("sampling policy");
+}
+
+fn invoke_sampled(root: &Path, capture: &Path, machine: bool) -> Output {
+    let mut command = Command::new(clinker_bin());
+    command
+        .current_dir(root)
+        .env("CLINKER_TEST_OTLP_OUTCOME", "success")
+        .env("CLINKER_TEST_OTLP_CAPTURE", capture)
+        .args(["run", "pipeline.yaml"]);
+    if machine {
+        command.args([
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "telemetry-admission",
+        ]);
+    }
+    command.output().expect("run clinker")
+}
+
+/// Telemetry lost at arena admission is reported, on both surfaces.
+///
+/// The per-signal groups beside it are export-side, and an exporter can only
+/// count what reached it — so a run that discarded most of its signals at
+/// admission reported `rejected = 0` and `flush_complete = true`: a clean,
+/// complete-looking export of a silently truncated dataset. Lineage already
+/// reports its losses on standard error; this is telemetry doing the same.
+#[test]
+fn arena_admission_loss_reaches_the_machine_terminal_and_standard_error() {
+    let root = fixture();
+    write_two_lane_pipeline(root.path(), 8);
+    write_sampling_policy(root.path(), 2);
+    let capture = root.path().join("otlp.ndjson");
+
+    let output = invoke_sampled(root.path(), &capture, true);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let machine = machine_events(&output);
+    let terminal = machine.last().expect("machine terminal");
+    let admission = terminal["observability"]["admission"]
+        .as_object()
+        .expect("arena admission accounting");
+    assert_eq!(
+        admission
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "accepted",
+            "capacity_bytes",
+            "dropped",
+            "fields",
+            "lanes",
+            "peak_retained_bytes",
+            "retained_bytes",
+        ])
+    );
+    let dropped = admission["dropped"].as_object().expect("drop reasons");
+    assert_eq!(
+        dropped.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "contended",
+            "invalid_identity",
+            "oversize",
+            "queue_full",
+            "rate_limited",
+            "sampled",
+            "undecodable",
+        ])
+    );
+    let sampled = dropped["sampled"].as_u64().expect("sampled count");
+    assert!(sampled > 0, "sample_every = 2 discards half of each lane");
+
+    // Both lanes were busy, and the split says so. A single total cannot
+    // distinguish an ordinary-lane loss from one that cost an `error`.
+    let lanes = &admission["lanes"];
+    let ordinary = lanes["ordinary"]["sampled"].as_u64().expect("ordinary");
+    let high = lanes["high_severity"]["sampled"].as_u64().expect("high");
+    assert!(ordinary > 0, "the ordinary lane lost signals");
+    assert_eq!(
+        sampled,
+        ordinary + high,
+        "the total is exactly the two lanes"
+    );
+    // Eight `error` events at one in two. The number is exact and independent
+    // of the ordinary lane beside it, which is the guarantee metrics.md makes
+    // and the reason the split exists: without it this run reports one sampling
+    // total and an author cannot tell what share of their errors survived.
+    assert_eq!(
+        high, 4,
+        "the high-severity lane keeps its own one-in-two share: {admission:#?}"
+    );
+    assert_eq!(
+        lanes["ordinary"]["capacity_bytes"], 32_000,
+        "loss is readable against the lane capacity it was measured in"
+    );
+    assert_eq!(lanes["high_severity"]["capacity_bytes"], 32_000);
+    assert_eq!(admission["capacity_bytes"], 64_000);
+
+    // The shortfall a supervisor reconciles against. The export side of this
+    // run is a test double that reports one accepted delivery per signal
+    // rather than per item, so the counting identity documented in
+    // docs/user/src/ops/metrics.md is not checkable here — but its premises
+    // are: the flush completed, and nothing was lost between admission and
+    // drain, so `accepted` is exactly what the exporter was handed.
+    let summary = &terminal["observability"];
+    assert_eq!(summary["flush_complete"], serde_json::json!(true));
+    assert_eq!(dropped["undecodable"], 0);
+    assert!(
+        admission["accepted"].as_u64().expect("accepted") > 0,
+        "a run that admitted nothing proves nothing about loss"
+    );
+
+    // The same run without --machine discards that object entirely, so the
+    // stderr line is the only place the loss is ever stated.
+    let plain = invoke_sampled(root.path(), &capture, false);
+    let diagnostic = String::from_utf8_lossy(&plain.stderr);
+    assert!(
+        diagnostic.contains("clinker: telemetry admission outcome: accepted="),
+        "{diagnostic}"
+    );
+    for counter in [
+        "sampled=",
+        "rate_limited=",
+        "queue_full=",
+        "contended=",
+        "oversize=",
+        "invalid_identity=",
+        "undecodable=",
+        "ordinary_sampled=",
+        "ordinary_queue_full=",
+        "high_sampled=",
+        "high_queue_full=",
+    ] {
+        assert!(
+            diagnostic.contains(counter),
+            "{counter} missing: {diagnostic}"
+        );
+    }
+}
+
+/// A run that lost no telemetry says nothing about losing telemetry.
+///
+/// Same suppression rule as the lineage line, which is silent on a clean
+/// shutdown that dropped nothing. A line that appears on every run reading
+/// all-zeroes is noise an operator learns to skip, which is how the one run
+/// that did lose signals gets skipped with it.
+#[test]
+fn a_run_that_dropped_nothing_prints_no_admission_line() {
+    let root = fixture();
+    write_two_lane_pipeline(root.path(), 2);
+    write_sampling_policy(root.path(), 1);
+    let capture = root.path().join("otlp.ndjson");
+
+    let output = invoke_sampled(root.path(), &capture, false);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !diagnostic.contains("telemetry admission outcome"),
+        "a run with no admission loss must stay silent: {diagnostic}"
+    );
 }
 
 /// Four customers with varying amounts, and a per-record event gated on a
@@ -888,6 +1160,91 @@ fn invoke_fault_matrix(
     }
 }
 
+/// The observability summary with its scheduling-dependent numbers removed,
+/// so the rest can be compared across runs for exact equality.
+///
+/// All four are one fact. A signal is refused with `contended` when the drain
+/// thread held the arena lock at the moment it was offered, and that single
+/// lost signal moves everything downstream of it: `accepted` counts one
+/// fewer, and `fields` counts one record's field-policy effects fewer,
+/// because a privacy scan is credited only once its record is admitted
+/// (`clinker-exec/src/telemetry.rs`, `emit_log`). `peak_retained_bytes` is a
+/// high-water mark over the same concurrently drained queue.
+///
+/// Measured, not assumed: over 20 runs the `accepted`/`contended` pair moved
+/// in 6, and over a further 30 with that pair excluded, `fields.denied` moved
+/// in 3. Asserting any of them equal across two process runs would be
+/// asserting something false. Every one of them is asserted exactly, on a
+/// single run, by `arena_admission_loss_reaches_the_machine_terminal_and_
+/// standard_error`; what is checked here is what this test is about, which is
+/// that a lineage fault changes none of it.
+fn without_scheduling_dependent_counters(observability: &Value) -> Value {
+    let mut observability = observability.clone();
+    if let Some(admission) = observability
+        .get_mut("admission")
+        .and_then(Value::as_object_mut)
+    {
+        admission.remove("peak_retained_bytes");
+        admission.remove("accepted");
+        admission.remove("fields");
+        if let Some(dropped) = admission.get_mut("dropped").and_then(Value::as_object_mut) {
+            dropped.remove("contended");
+        }
+    }
+    observability
+}
+
+/// Every signal the producer offered is either taken or refused, so the two
+/// counters the arena lock moves between sum to a constant the scheduler
+/// cannot change. That is a stronger claim than comparing either alone — it
+/// says the run produced the same telemetry, and only the timing of the drain
+/// differed.
+fn assert_offered_signal_count_is_unchanged(run: &Value, baseline: &Value, label: &str) {
+    let offered = |observability: &Value| {
+        observability["admission"]["accepted"]
+            .as_u64()
+            .expect("accepted")
+            + observability["admission"]["dropped"]["contended"]
+                .as_u64()
+                .expect("contended drops")
+    };
+    assert_eq!(
+        offered(run),
+        offered(baseline),
+        "{label} changed how many signals the run produced"
+    );
+}
+
+/// `peak_retained_bytes` is checked for the property that holds rather than
+/// for an equality that does not.
+///
+/// It is a high-water mark over a queue the exporter drains concurrently, so
+/// how high it climbs depends on how the producer and the drain thread
+/// interleave — it is nondeterministic by construction and two runs of the
+/// same pipeline need not agree. What is invariant is that the peak is at
+/// least what the arena still held at the end, and never more than the arena
+/// it was measured in.
+fn assert_peak_retained_is_bounded(observability: &Value, label: &str) {
+    let admission = &observability["admission"];
+    let peak = admission["peak_retained_bytes"]
+        .as_u64()
+        .expect("peak retained bytes");
+    let retained = admission["retained_bytes"]
+        .as_u64()
+        .expect("retained bytes");
+    let capacity = admission["capacity_bytes"]
+        .as_u64()
+        .expect("arena capacity bytes");
+    assert!(
+        peak >= retained,
+        "{label}: peak {peak} is below what the arena still holds ({retained})"
+    );
+    assert!(
+        peak <= capacity,
+        "{label}: peak {peak} exceeds the arena it was measured in ({capacity})"
+    );
+}
+
 fn assert_private_surfaces_are_clean(run: &MatrixRun) {
     for (name, bytes) in [
         ("collector", run.collector_bytes.as_slice()),
@@ -1107,10 +1464,18 @@ fn fault_matrix_lineage_outcomes_leave_otlp_and_authoritative_truth_unchanged() 
             run.oracle, baseline.oracle,
             "lineage {mode} changed authoritative truth"
         );
+        // Everything deterministic, which is every export counter and every
+        // admission counter the scheduler cannot move. The three it can move
+        // are excluded here and asserted just below for the properties that
+        // do hold, rather than for equalities that do not.
         assert_eq!(
-            run.observability, baseline.observability,
+            without_scheduling_dependent_counters(&run.observability),
+            without_scheduling_dependent_counters(&baseline.observability),
             "lineage {mode} changed OTLP counters"
         );
+        assert_offered_signal_count_is_unchanged(&run.observability, &baseline.observability, mode);
+        assert_peak_retained_is_bounded(&run.observability, mode);
+        assert_peak_retained_is_bounded(&baseline.observability, "baseline");
         assert_private_surfaces_are_clean(&run);
         let diagnostic = String::from_utf8_lossy(&run.output.stderr);
         assert!(

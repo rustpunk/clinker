@@ -2556,7 +2556,7 @@ fn bind_schema_inner(
                         };
                         match typecheck_cxl(
                             &format!("{name}:log[{index}]:condition"),
-                            &format!("{use_prelude}filter {}", condition.source),
+                            &format!("{}filter {}", use_prelude.source, condition.source),
                             &upstream,
                             AggregateMode::Row,
                             span,
@@ -2568,7 +2568,12 @@ fn bind_schema_inner(
                             // ones the gate's evaluator is not allocated to run. A gate
                             // is one predicate; anything else is refused here rather
                             // than reaching the first record.
-                            Ok(typed) if authored_gate_statements(&typed) == 1 => {
+                            Ok(typed)
+                                if authored_gate_statements(
+                                    &typed.program.statements,
+                                    &use_prelude,
+                                ) == 1 =>
+                            {
                                 compiled.push(Some(Arc::new(typed)));
                             }
                             Ok(typed) => {
@@ -2576,7 +2581,10 @@ fn bind_schema_inner(
                                     "E373",
                                     format!(
                                         "transform `{name}` log[{index}].condition must be one predicate, but it parses as {} statements; write the gate as a single expression, for example `condition: \"amount > 1 and region == 'eu'\"`",
-                                        authored_gate_statements(&typed)
+                                        authored_gate_statements(
+                                            &typed.program.statements,
+                                            &use_prelude
+                                        )
                                     ),
                                     LabeledSpan::primary(span, "log condition".to_string()),
                                 ));
@@ -4696,12 +4704,22 @@ struct CxlTypecheckCtx<'a> {
     scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
 }
 
+/// The engine-supplied opening of a gate's program: the transform's `use`
+/// declarations, plus how many statements they contribute.
+struct GatePrelude {
+    /// CXL source prepended to the authored predicate.
+    source: String,
+    /// Statements the prelude itself contributes, counted by parsing the
+    /// rendered prelude so the count cannot drift from what is prepended.
+    statements: usize,
+}
+
 /// The `use` declarations of a program, rendered back as CXL source.
 ///
 /// Reconstructed from the parsed statements rather than sliced out of the
 /// authored text, so an alias reaches a gate in the one canonical spelling
 /// regardless of how it was written.
-fn module_use_prelude(source: &str) -> String {
+fn module_use_prelude(source: &str) -> GatePrelude {
     let parsed = cxl::parser::Parser::parse(source);
     let mut prelude = String::new();
     for statement in &parsed.ast.statements {
@@ -4716,21 +4734,23 @@ fn module_use_prelude(source: &str) -> String {
             prelude.push('\n');
         }
     }
-    prelude
+    let statements = cxl::parser::Parser::parse(&prelude).ast.statements.len();
+    GatePrelude {
+        source: prelude,
+        statements,
+    }
 }
 
 /// The statements a gate's author actually wrote.
 ///
-/// The compiled program carries the transform's `use` declarations ahead of
-/// the predicate, and those are the engine's doing, not the author's — counting
-/// them would reject every gate in a transform that imports a module.
-fn authored_gate_statements(typed: &TypedProgram) -> usize {
-    typed
-        .program
-        .statements
-        .iter()
-        .filter(|statement| !matches!(statement, Statement::UseStmt { .. }))
-        .count()
+/// The compiled program opens with the transform's `use` declarations, and
+/// those are the engine's doing, not the author's — counting them would reject
+/// every gate in a transform that imports a module. Only that leading prelude
+/// is discounted, by length: a `use` written into the gate itself lands past
+/// the predicate, is a statement the gate's evaluator was never allocated to
+/// run, and counting it is what lets the guard refuse it.
+fn authored_gate_statements(statements: &[Statement], prelude: &GatePrelude) -> usize {
+    statements.len().saturating_sub(prelude.statements)
 }
 
 #[allow(clippy::result_large_err)]
@@ -6534,6 +6554,48 @@ fn combine_e309(combine_name: &str, span: Span) -> Diagnostic {
 mod tests {
     use super::*;
     use clinker_record::FieldMetadata;
+
+    /// Only the engine's own prelude is discounted from a gate's statement
+    /// count.
+    ///
+    /// The prelude is made of `use` declarations, so discounting `use`
+    /// statements by kind discounted an author's too — and a gate carrying a
+    /// second statement then counted as the one predicate the guard requires.
+    /// Counting the prelude by length refuses it, and still admits a gate in a
+    /// transform that imports a module.
+    #[test]
+    fn a_gate_discounts_the_prelude_and_nothing_else() {
+        let no_modules = module_use_prelude("emit amount = amount");
+        assert_eq!(no_modules.source, "");
+        assert_eq!(no_modules.statements, 0);
+
+        let one_module = module_use_prelude("use other.module as m\nemit amount = amount");
+        assert_eq!(one_module.source, "use other.module as m\n");
+        assert_eq!(one_module.statements, 1);
+
+        let statements = |source: &str| cxl::parser::Parser::parse(source).ast.statements;
+
+        // The prelude's own declaration is the engine's doing.
+        assert_eq!(
+            authored_gate_statements(
+                &statements("use other.module as m\nfilter amount > 1"),
+                &one_module
+            ),
+            1
+        );
+        // A declaration the prelude did not put there is a second statement.
+        assert_eq!(
+            authored_gate_statements(
+                &statements("use other.module as m\nfilter amount > 1"),
+                &no_modules
+            ),
+            2
+        );
+        assert_eq!(
+            authored_gate_statements(&statements("filter amount > 1\ndistinct"), &no_modules),
+            2
+        );
+    }
 
     /// `$ck.<field>` columns resolve to source-CK metadata; the
     /// suffix is the user-declared field name.

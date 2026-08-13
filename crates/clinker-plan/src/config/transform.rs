@@ -104,7 +104,12 @@ pub struct LogDirective {
     pub level: LogLevel,
     pub when: LogTiming,
     pub message: String,
+    // The optional keys are omitted rather than written as `null`, so a
+    // serialized directive parses back through the same admission that
+    // accepted it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fields: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub every: Option<u64>,
     /// CXL boolean expression gating a `per_record` event, evaluated against
     /// the transform's *input* record — dispatch fires before the transform's
@@ -115,6 +120,7 @@ pub struct LogDirective {
     /// observability boundary remain exactly the `fields` list, each still
     /// default-denied until deployment policy authorizes that event-field pair.
     /// Narrowing a condition therefore can never widen exposure.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub condition: Option<crate::yaml::CxlSource>,
 }
 
@@ -194,9 +200,31 @@ impl<'de> Deserialize<'de> for LogDirective {
                         "level" => bind_once(&mut level, "level", map.next_value()?)?,
                         "when" => bind_once(&mut when, "when", map.next_value()?)?,
                         "message" => bind_once(&mut message, "message", map.next_value()?)?,
-                        "fields" => bind_once(&mut fields, "fields", map.next_value()?)?,
-                        "every" => bind_once(&mut every, "every", map.next_value()?)?,
-                        "condition" => bind_once(&mut condition, "condition", map.next_value()?)?,
+                        // An optional key written with no value (`fields:`) is
+                        // legal YAML for "absent" — it is what an author gets
+                        // by commenting out a list's items — so these bind the
+                        // optional type and flatten below. Binding the inner
+                        // type instead asks serde for a sequence, an integer,
+                        // or a string and rejects the null with a raw type
+                        // error the author cannot act on.
+                        "fields" => bind_once(
+                            &mut fields,
+                            "fields",
+                            map.next_value::<Option<Vec<String>>>()?,
+                        )?,
+                        "every" => {
+                            bind_once(&mut every, "every", map.next_value::<Option<u64>>()?)?
+                        }
+                        // A null `condition` is the absent condition, not an
+                        // empty gate: nothing was written, so there is nothing
+                        // to correct. An authored-but-blank gate
+                        // (`condition: ""`) is a different mistake and keeps
+                        // its own crafted diagnostic in `validation_errors`.
+                        "condition" => bind_once(
+                            &mut condition,
+                            "condition",
+                            map.next_value::<Option<crate::yaml::CxlSource>>()?,
+                        )?,
                         "log_rule" => {
                             map.next_value::<de::IgnoredAny>()?;
                             return Err(de::Error::custom(
@@ -214,9 +242,9 @@ impl<'de> Deserialize<'de> for LogDirective {
                     level: level.ok_or_else(|| de::Error::missing_field("level"))?,
                     when: when.ok_or_else(|| de::Error::missing_field("when"))?,
                     message: message.ok_or_else(|| de::Error::missing_field("message"))?,
-                    fields,
-                    every,
-                    condition,
+                    fields: fields.flatten(),
+                    every: every.flatten(),
+                    condition: condition.flatten(),
                 };
                 if let Some(error) = directive.validation_errors().into_iter().next() {
                     return Err(de::Error::custom(error));

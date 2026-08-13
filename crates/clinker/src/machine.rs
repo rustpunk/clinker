@@ -12,7 +12,7 @@ use clinker_exec::pipeline::shutdown::ShutdownToken;
 use clinker_exec::progress::ProgressKind;
 use clinker_exec::progress::{BoundedProgress, ProgressSnapshot};
 
-use crate::observability::ObservabilitySummary;
+use crate::observability::{AdmissionSummary, ObservabilitySummary};
 use crate::{MachineFormat, RunArgs};
 
 const MAX_EVENT_BYTES: usize = 16 * 1024;
@@ -91,6 +91,14 @@ struct MachineState {
     execution_id: String,
     sequence: u64,
     plan_identity: serde_json::Value,
+    /// Whether a terminal record has been handed to the sink in full.
+    ///
+    /// Only that. It is deliberately not "a terminal emission is under way":
+    /// the state lock is held across an entire emission, so an in-flight
+    /// terminal has no duration another thread could observe and needs no bit
+    /// of its own. Spending the slot on the attempt instead of on the record
+    /// let one refused write suppress every later terminal while telling the
+    /// caller a terminal had been reported.
     terminal_reserved: bool,
     /// Whether the one-shot event-limit notice has already been re-offered
     /// after a record that did not go out. It is offered again at most once.
@@ -105,7 +113,29 @@ struct MachineState {
     /// carried no `observability` field at all, so one condition was reported
     /// two ways depending on how early the run failed.
     observability_progress: Option<Arc<Mutex<ObservabilitySummary>>>,
+    /// Arena-admission accounting, kept apart from the export summary because
+    /// it comes from the producer rather than from the exporter. It is merged
+    /// into whichever export summary the terminal ends up carrying, so a
+    /// terminal written off the progress fallback still reports the run's
+    /// telemetry loss rather than only what the exporter managed to ship.
+    observability_admission: Option<AdmissionSummary>,
+    /// The publication the first terminal attempt carried.
+    ///
+    /// A refused inventory write leaves the terminal slot free, and the retry
+    /// that follows is made from `main` with no publication in hand. Without
+    /// this the recovered terminal dropped a summary that had been available,
+    /// making the artifact evidence a supervisor reads depend on whether the
+    /// first write happened to succeed.
+    publication: Option<TerminalPublication>,
     progress: BoundedProgress,
+}
+
+/// One publication's inventory records and terminal summary, retained so a
+/// terminal retried after a refused write still carries them.
+#[derive(Clone)]
+struct TerminalPublication {
+    artifact_events: Vec<serde_json::Map<String, serde_json::Value>>,
+    summary: serde_json::Value,
 }
 
 pub(crate) struct MachineProgressWorker {
@@ -190,6 +220,8 @@ impl MachineEmitter {
                 attempted_failure: None,
                 observability: None,
                 observability_progress: None,
+                observability_admission: None,
+                publication: None,
                 progress: BoundedProgress::default(),
             })),
             shutdown: ShutdownToken::new(),
@@ -216,6 +248,15 @@ impl MachineEmitter {
     /// written before the flush that would have pushed a final summary.
     pub(crate) fn attach_observability_progress(&self, progress: Arc<Mutex<ObservabilitySummary>>) {
         self.lock_state().observability_progress = Some(progress);
+    }
+
+    /// Record what the telemetry arena admitted and refused.
+    ///
+    /// Separate from the export summary because the two have different
+    /// authors and different availability: the exporter reports what reached
+    /// a collector, and only the producer can say what never got that far.
+    pub(crate) fn set_observability_admission(&self, admission: AdmissionSummary) {
+        self.lock_state().observability_admission = Some(admission);
     }
 
     pub(crate) fn emit_started(&self) -> io::Result<()> {
@@ -346,7 +387,7 @@ impl MachineEmitter {
         })
     }
 
-    pub(crate) fn emit_completed(&self, exit_code: u8) -> io::Result<()> {
+    pub(crate) fn emit_completed(&self, exit_code: u8) -> io::Result<TerminalOutcome> {
         self.emit_completed_with_publication(exit_code, None)
     }
 
@@ -354,13 +395,22 @@ impl MachineEmitter {
         &self,
         exit_code: u8,
         publication: Option<&AttemptPublicationOutcome>,
-    ) -> io::Result<()> {
+    ) -> io::Result<TerminalOutcome> {
         self.with_state(|state| {
             let result = match exit_code {
                 0 => "success",
                 2 => "completed_with_dlq",
+                // Forwarded like every other arm. A cancelled run that did
+                // publish artifacts before the cancellation reports the same
+                // inventory a `completed` or `failed` run reports; dropping
+                // the argument here made one field's presence depend on which
+                // terminal family the exit code happened to fall in.
                 130 => {
-                    return state.write_terminal_event("cancelled", serde_json::Map::new(), None);
+                    return state.write_terminal_event(
+                        "cancelled",
+                        serde_json::Map::new(),
+                        publication,
+                    );
                 }
                 // No other exit code has a `completed` meaning. Reaching here
                 // means an earlier `failed` terminal could not be encoded and
@@ -383,7 +433,7 @@ impl MachineEmitter {
         &self,
         exit_code: u8,
         failure: &FailureClassification,
-    ) -> io::Result<()> {
+    ) -> io::Result<TerminalOutcome> {
         self.emit_failed_with_publication(exit_code, failure, None)
     }
 
@@ -392,7 +442,7 @@ impl MachineEmitter {
         exit_code: u8,
         failure: &FailureClassification,
         publication: Option<&AttemptPublicationOutcome>,
-    ) -> io::Result<()> {
+    ) -> io::Result<TerminalOutcome> {
         self.with_state(|state| {
             if state.plan_identity["status"] == "pending" {
                 state.plan_identity =
@@ -411,10 +461,10 @@ impl MachineEmitter {
         self.with_state(|state| state.write_event(event, fields))
     }
 
-    fn with_state(
+    fn with_state<T>(
         &self,
-        operation: impl FnOnce(&mut MachineState) -> io::Result<()>,
-    ) -> io::Result<()> {
+        operation: impl FnOnce(&mut MachineState) -> io::Result<T>,
+    ) -> io::Result<T> {
         let result = operation(&mut self.lock_state());
         if result.is_err() {
             self.shutdown.request();
@@ -430,15 +480,6 @@ impl MachineEmitter {
 }
 
 impl MachineState {
-    fn reserve_terminal(&mut self) -> bool {
-        if self.terminal_reserved {
-            false
-        } else {
-            self.terminal_reserved = true;
-            true
-        }
-    }
-
     fn write_event(
         &mut self,
         event: &'static str,
@@ -459,7 +500,7 @@ impl MachineState {
         &mut self,
         exit_code: u8,
         publication: Option<&AttemptPublicationOutcome>,
-    ) -> io::Result<()> {
+    ) -> io::Result<TerminalOutcome> {
         let failure = self.attempted_failure.clone().unwrap_or_else(|| {
             FailureClassification::unknown_internal("run exit code has no machine terminal family")
         });
@@ -469,20 +510,70 @@ impl MachineState {
     fn write_terminal_event(
         &mut self,
         event: &'static str,
-        mut fields: serde_json::Map<String, serde_json::Value>,
+        fields: serde_json::Map<String, serde_json::Value>,
         publication: Option<&AttemptPublicationOutcome>,
-    ) -> io::Result<()> {
-        if self.terminal_reserved {
-            return Ok(());
-        }
-        let mut events = Vec::new();
-        if let Some(publication) = publication {
+    ) -> io::Result<TerminalOutcome> {
+        let publication = publication.map(|publication| {
             let (artifact_events, summary) = publication_payloads(publication);
-            events.extend(
-                artifact_events
-                    .into_iter()
-                    .map(|fields| ("publication_artifacts", fields)),
-            );
+            TerminalPublication {
+                artifact_events,
+                summary,
+            }
+        });
+        self.write_terminal_for(event, fields, publication)
+    }
+
+    /// Write a terminal, remembering the publication it carried.
+    ///
+    /// A refused inventory write leaves the terminal slot free by design, and
+    /// the retry that follows is made from `main`, which has no publication in
+    /// hand — so without the memo the recovered terminal reported no artifact
+    /// evidence at all, and what a supervisor learned about the attempt
+    /// depended on whether the first write happened to succeed.
+    fn write_terminal_for(
+        &mut self,
+        event: &'static str,
+        fields: serde_json::Map<String, serde_json::Value>,
+        publication: Option<TerminalPublication>,
+    ) -> io::Result<TerminalOutcome> {
+        if publication.is_some() {
+            self.publication = publication;
+        }
+        let (artifact_events, summary) = match self.publication.clone() {
+            Some(publication) => (publication.artifact_events, Some(publication.summary)),
+            None => (Vec::new(), None),
+        };
+        self.write_terminal_records(event, fields, artifact_events, summary)
+    }
+
+    /// Write the terminal record, preceded by the publication inventory the
+    /// terminal's summary counts.
+    ///
+    /// The one terminal slot is spent by a terminal that reached the sink, not
+    /// by the intent to send one. Everything that can fail earlier — encoding
+    /// any record, and writing the inventory records that precede the terminal
+    /// — leaves the slot free, so a later attempt can still put a terminal on
+    /// the stream. The inventory matters here: a run can carry up to
+    /// `MANIFEST_MAX_ARTIFACTS` artifacts, and one refused write anywhere in
+    /// that window used to end the run with no terminal at all while telling
+    /// the caller the terminal had been written.
+    ///
+    /// A retry after such a failure re-emits the inventory records the first
+    /// attempt already sent. That is the intended trade: the inventory is
+    /// keyed by `artifact_id` and carries its own chunk index, so a repeated
+    /// chunk is reconcilable from the reading end, whereas a stream with no
+    /// terminal is not recoverable at all.
+    fn write_terminal_records(
+        &mut self,
+        event: &'static str,
+        mut fields: serde_json::Map<String, serde_json::Value>,
+        artifact_events: Vec<serde_json::Map<String, serde_json::Value>>,
+        publication_summary: Option<serde_json::Value>,
+    ) -> io::Result<TerminalOutcome> {
+        if self.terminal_reserved {
+            return Ok(TerminalOutcome::AlreadyWritten);
+        }
+        if let Some(summary) = publication_summary {
             fields.insert("publication".to_owned(), summary);
         }
         // The pushed summary when the flush completed, and otherwise whatever
@@ -500,28 +591,39 @@ impl MachineState {
                 }
             })
         });
-        if let Some(observability) = observability {
+        if let Some(mut observability) = observability {
+            // Producer-side, so it is attached to whichever export summary the
+            // terminal ends up carrying rather than to one of them.
+            observability.admission = self.observability_admission;
             fields.insert("observability".to_owned(), serde_json::json!(observability));
         }
-        events.push((event, fields));
 
-        // Encode and bound every record before reserving the one terminal slot.
-        // An encoding or size failure therefore cannot poison terminal state
-        // and suppress a later diagnostic terminal.
-        let encoded = events
+        // Encode and bound every record before any of them is written. An
+        // encoding or size failure therefore cannot put a partial inventory on
+        // the stream, and cannot suppress a later diagnostic terminal.
+        let inventory = artifact_events
             .into_iter()
             .enumerate()
-            .map(|(offset, (event, fields))| {
-                self.encode_event(event, fields, self.sequence.saturating_add(offset as u64))
+            .map(|(offset, fields)| {
+                self.encode_event(
+                    "publication_artifacts",
+                    fields,
+                    self.sequence.saturating_add(offset as u64),
+                )
             })
             .collect::<io::Result<Vec<_>>>()?;
-        if !self.reserve_terminal() {
-            return Ok(());
-        }
-        for record in encoded {
+        let terminal = self.encode_event(
+            event,
+            fields,
+            self.sequence.saturating_add(inventory.len() as u64),
+        )?;
+
+        for record in inventory {
             self.write_encoded_event(&record)?;
         }
-        Ok(())
+        self.write_encoded_event(&terminal)?;
+        self.terminal_reserved = true;
+        Ok(TerminalOutcome::Written)
     }
 
     fn encode_event(
@@ -639,6 +741,22 @@ impl MachineState {
             ProgressWrite::Unencodable(error) | ProgressWrite::Unsent(error) => Err(error),
         }
     }
+}
+
+/// What a terminal emission did to the one terminal slot.
+///
+/// `Ok(())` alone could not say this: it was returned both by the call that
+/// put a terminal on the stream and by a call that wrote nothing, and — before
+/// the slot was tied to a written record — by a call that wrote nothing
+/// because an earlier attempt had failed. A caller deciding what to tell its
+/// own supervisor needs the difference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalOutcome {
+    /// This call wrote the run's terminal record.
+    Written,
+    /// An earlier call already wrote it; this call wrote nothing, and the
+    /// stream is terminated either way.
+    AlreadyWritten,
 }
 
 /// How far a progress record got.
@@ -876,6 +994,56 @@ mod tests {
         }
     }
 
+    /// Sink that takes a fixed number of records and then refuses, standing in
+    /// for a supervisor pipe that stops accepting writes mid-stream.
+    ///
+    /// The budget is in records rather than bytes because the emitter flushes
+    /// each record as it writes it, so one refusal is one lost record.
+    #[derive(Clone)]
+    struct RefusingSink {
+        accepted: SharedSink,
+        budget: Arc<Mutex<usize>>,
+    }
+
+    impl RefusingSink {
+        fn new(records: usize) -> Self {
+            Self {
+                accepted: SharedSink(Arc::new(Mutex::new(Vec::new()))),
+                budget: Arc::new(Mutex::new(records)),
+            }
+        }
+
+        fn allow(&self, records: usize) {
+            *self
+                .budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = records;
+        }
+    }
+
+    impl Write for RefusingSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            {
+                let mut budget = self
+                    .budget
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if *budget == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "injected sink refusal",
+                    ));
+                }
+                *budget -= 1;
+            }
+            self.accepted.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.accepted.flush()
+        }
+    }
+
     fn events(sink: &SharedSink) -> Vec<serde_json::Value> {
         let bytes = sink
             .0
@@ -926,8 +1094,13 @@ mod tests {
 
     fn capturing_state() -> (MachineState, SharedSink) {
         let sink = SharedSink(Arc::new(Mutex::new(Vec::new())));
-        let state = MachineState {
-            writer: BufWriter::new(Box::new(sink.clone())),
+        let state = state_writing_to(Box::new(sink.clone()));
+        (state, sink)
+    }
+
+    fn state_writing_to(writer: Box<dyn Write + Send>) -> MachineState {
+        MachineState {
+            writer: BufWriter::new(writer),
             batch_id: "batch".to_owned(),
             execution_id: "018f47a2-9a41-7a27-b4d6-4f7137e3c159".to_owned(),
             sequence: 0,
@@ -937,9 +1110,10 @@ mod tests {
             attempted_failure: None,
             observability: None,
             observability_progress: None,
+            observability_admission: None,
+            publication: None,
             progress: BoundedProgress::default(),
-        };
-        (state, sink)
+        }
     }
 
     #[test]
@@ -999,6 +1173,180 @@ mod tests {
             .expect("later bounded terminal remains available");
         assert!(state.terminal_reserved);
         assert_eq!(state.sequence, 1);
+    }
+
+    /// The terminal slot must survive a sink refusal in the inventory window.
+    ///
+    /// A publication carries up to `MANIFEST_MAX_ARTIFACTS` artifacts, so a
+    /// terminal can be preceded by dozens of records. Spending the slot before
+    /// those writes meant one refused inventory record ended the run with no
+    /// terminal on the stream at all, while every later attempt — `main()`'s
+    /// retry and the unrepresentable-exit recovery — was told a terminal had
+    /// been reported.
+    #[test]
+    fn an_inventory_write_failure_leaves_a_later_terminal_writable() {
+        let sink = RefusingSink::new(1);
+        let mut state = state_writing_to(Box::new(sink.clone()));
+        let artifacts = (0..130)
+            .map(|index| {
+                serde_json::json!({
+                    "artifact_id": format!("artifact-{index:08x}"),
+                    "kind": "fan_out",
+                    "state": "published",
+                })
+            })
+            .collect::<Vec<_>>();
+        let (artifact_events, summary) = publication_payloads_from_artifacts(true, 0, artifacts);
+        assert_eq!(
+            artifact_events.len(),
+            3,
+            "the terminal must be preceded by more than one inventory record"
+        );
+        let failure = FailureClassification::for_code("attempt.publication.promotion_failed")
+            .expect("registered code");
+
+        assert!(
+            state
+                .write_terminal_records(
+                    "failed",
+                    failure_fields(&failure, 4),
+                    artifact_events,
+                    Some(summary),
+                )
+                .is_err()
+        );
+        let refused = events(&sink.accepted);
+        assert!(
+            refused
+                .iter()
+                .all(|event| event["event"] == "publication_artifacts"),
+            "the sink refused before the terminal: {refused:#?}"
+        );
+        assert!(
+            !state.terminal_reserved,
+            "an inventory record the sink refused must not spend the terminal slot"
+        );
+
+        // The attempt `main()` makes against the slot after the first one
+        // failed. Before the slot was tied to a written record this wrote
+        // nothing and returned success.
+        sink.allow(16);
+        assert_eq!(
+            state
+                .write_terminal_records("failed", failure_fields(&failure, 4), Vec::new(), None)
+                .expect("the terminal slot is still free"),
+            TerminalOutcome::Written
+        );
+        let stream = events(&sink.accepted);
+        let terminal = stream.last().expect("terminal record");
+        assert_eq!(terminal["event"], "failed");
+        assert_eq!(terminal["exit_code"], 4);
+        assert_eq!(
+            terminal["failure"]["code"],
+            "attempt.publication.promotion_failed"
+        );
+
+        // A terminal that did reach the stream is still written exactly once.
+        assert_eq!(
+            state
+                .write_terminal_records("completed", serde_json::Map::new(), Vec::new(), None)
+                .expect("a spent slot is not an error"),
+            TerminalOutcome::AlreadyWritten
+        );
+        let settled = events(&sink.accepted);
+        assert_eq!(settled.len(), stream.len());
+        assert_eq!(
+            settled
+                .iter()
+                .filter(|event| matches!(
+                    event["event"].as_str(),
+                    Some("completed" | "failed" | "cancelled")
+                ))
+                .count(),
+            1,
+            "exactly one terminal record: {settled:#?}"
+        );
+    }
+
+    /// A terminal recovered after a refused inventory write keeps its
+    /// publication.
+    ///
+    /// The retry is made from `main` with no publication argument, so the
+    /// recovered terminal used to drop a summary that had been available and
+    /// report no artifact evidence at all. A supervisor is told to infer
+    /// nothing about the visible set when `publication` is absent, which made
+    /// the attempt look unreconcilable for a reason that was purely an
+    /// accident of which write the sink refused.
+    #[test]
+    fn a_terminal_recovered_after_an_inventory_failure_keeps_its_publication() {
+        let sink = RefusingSink::new(1);
+        let mut state = state_writing_to(Box::new(sink.clone()));
+        let artifacts = (0..130)
+            .map(|index| {
+                serde_json::json!({
+                    "artifact_id": format!("artifact-{index:08x}"),
+                    "kind": "fan_out",
+                    "state": "published",
+                })
+            })
+            .collect::<Vec<_>>();
+        let (artifact_events, summary) = publication_payloads_from_artifacts(true, 0, artifacts);
+        let expected = summary.clone();
+
+        assert!(
+            state
+                .write_terminal_for(
+                    "completed",
+                    serde_json::Map::from_iter([
+                        ("result".to_owned(), serde_json::json!("success")),
+                        ("exit_code".to_owned(), serde_json::json!(0)),
+                    ]),
+                    Some(TerminalPublication {
+                        artifact_events,
+                        summary,
+                    }),
+                )
+                .is_err(),
+            "the sink refuses inside the inventory window"
+        );
+        assert!(!state.terminal_reserved);
+
+        // The retry `main` makes, which carries no publication of its own.
+        sink.allow(16);
+        assert_eq!(
+            state
+                .write_terminal_for(
+                    "completed",
+                    serde_json::Map::from_iter([
+                        ("result".to_owned(), serde_json::json!("success")),
+                        ("exit_code".to_owned(), serde_json::json!(0)),
+                    ]),
+                    None,
+                )
+                .expect("the terminal slot is still free"),
+            TerminalOutcome::Written
+        );
+
+        let stream = events(&sink.accepted);
+        let terminal = stream.last().expect("terminal record");
+        assert_eq!(terminal["event"], "completed");
+        assert_eq!(
+            terminal["publication"], expected,
+            "the recovered terminal reports the publication the first attempt carried: {stream:#?}"
+        );
+        assert_eq!(
+            stream[stream.len() - 4..]
+                .iter()
+                .map(|event| event["event"].as_str().expect("event name"))
+                .collect::<Vec<_>>(),
+            [
+                "publication_artifacts",
+                "publication_artifacts",
+                "publication_artifacts",
+                "completed",
+            ],
+            "the retry re-sends the whole inventory ahead of the terminal it counts: {stream:#?}"
+        );
     }
 
     #[test]
