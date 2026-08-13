@@ -193,11 +193,19 @@ only when the workspace table is absent; individual fields are never merged.
 The workspace loader validates this policy without opening a source, output,
 attempt directory, worker, credential provider, or network connection. It
 keeps the Collector endpoint as length-bounded raw text exactly as authored.
-The network admission boundary parses that text later, before any delivery
-effect; scheme, authority, credentials, paths, query strings, fragments,
-normalization, and the fixed OTLP signal routes are deliberately not decided
-by the workspace parser. Collector reachability is not a configuration
-admission check.
+The one shape it requires of that text is the shape it requires of every other
+authored string in the table: non-empty, within its byte cap, with no
+surrounding whitespace and no embedded control character. Padding and a
+carriage return are not part of an endpoint under any parse, and refusing them
+here names `observability.otlp.endpoint` and hands you a pasteable correction,
+where the later network boundary can only report that some endpoint was
+unusable.
+
+The network admission boundary parses the text itself later, before any
+delivery effect; scheme, authority, credentials, paths, query strings,
+fragments, normalization, and the fixed OTLP signal routes are deliberately
+not decided by the workspace parser. Collector reachability is not a
+configuration admission check.
 
 A complete fixed-capacity example is:
 
@@ -341,11 +349,12 @@ signal — `logs`, `metrics`, and `traces`, each with `accepted`, `rejected`,
 
 Read `flush_complete` before reading the counters. When it is `true` the
 counts are the run's final accounting. When it is `false` the exporter did not
-finish flushing within `flush_timeout_ms`: the counts are what had been
-recorded when that deadline expired, deliveries may still have been in flight,
-and a low `accepted` means "we stopped counting" rather than "the collector
-refused them". Those call for different responses, and only one of them is a
-collector problem.
+get to the end of the flush: either it ran past `flush_timeout_ms`, or it could
+not take the signal arena from the pipeline before giving up on it. Either way
+the counts are what had been recorded at that point, deliveries may still have
+been in flight, signals may remain that were never sent, and a low `accepted`
+means "we stopped counting" rather than "the collector refused them". Those call
+for different responses, and only one of them is a collector problem.
 
 Any `2xx` answer counts as delivered. A collector's own success status is
 `200`, and its body is where a partial success declares the records it refused
@@ -630,6 +639,13 @@ rather than restarting on each. So a transform inside a convergence reports the
 rows the run actually carried, and its counters stay summable alongside every
 other transform's.
 
+A convergence that does not finish — a failure in one of the re-run transforms,
+or an interrupting signal — still reports every transform it had passed over.
+Each gets one span with an `ERROR` status covering the interval it ran for, one
+`clinker.transform.started`, and the record and error counts the interrupted
+pass had reached. It gets no `clinker.transform.completed`: nothing completed,
+and that counter is what tells you whether everything did.
+
 **Logs.** Each emission of an authored `log:` directive becomes one OTLP log
 record: `severityText` from the directive's `level`, the directive's `message`
 as the body, the event name as the `clinker.event` attribute, the three
@@ -670,7 +686,10 @@ value, or physical path.
 Event fields are denied by default. Each `[[observability.field_policy]]`
 entry selects exactly one dotted event/field pair and one `allow`, `hash`, or
 `replace` action. `replacement` is required only for `replace`, and duplicate
-rules for the same pair are invalid.
+rules for the same pair are invalid. A `replacement` is written verbatim into
+the exported record, so it is held to the same shape as the other authored
+strings here: non-empty, bounded, with no surrounding whitespace and no
+embedded control character.
 
 Field policy governs **record fields** — values a Transform selected out of the
 data being processed. It does not govern run correlation. Every exported log

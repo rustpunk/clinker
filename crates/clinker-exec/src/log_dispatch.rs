@@ -73,6 +73,28 @@ pub(crate) struct TransformSignalCarry {
 }
 
 impl TransformSignalCarry {
+    /// Report an execution the converge never finished.
+    ///
+    /// The loop can leave by any `?` inside it — a recompute failure, a member
+    /// arm's error, an ordinary shutdown poll on SIGINT — and the pass that was
+    /// running is then the last thing that ran. What is reported is what
+    /// actually happened: the transform started, it carried the counts the
+    /// interrupted pass had reached, and its span ends with an error status.
+    ///
+    /// Deliberately no `after` event and no `completed` metric. The transform
+    /// did not complete, and `clinker.transform.completed` is exactly the
+    /// figure an operator sums to conclude that every transform in the run
+    /// did.
+    pub(crate) fn close_interrupted(self, producer: &TelemetryProducer) {
+        report_interrupted_execution(
+            producer,
+            &self.logical_node,
+            self.started_at_unix_nanos,
+            self.records,
+            self.errors,
+        );
+    }
+
     /// Report the converged execution: one start, the last pass's counts, one
     /// completion, and one span covering the whole converge.
     pub(crate) fn close(self, producer: &TelemetryProducer) {
@@ -106,6 +128,70 @@ impl TransformSignalCarry {
             started_at_unix_nanos: self.started_at_unix_nanos,
             ended_at_unix_nanos,
         });
+    }
+}
+
+/// Every converge lifecycle currently parked, and the guarantee that each one
+/// is reported exactly once.
+///
+/// A pass takes its transform's carry out at the start and puts it back at the
+/// end, so between the two the map holds the state of every OTHER
+/// deferred-region member the converge has passed over. Nothing in the loop
+/// says the loop will reach its close: the orchestrator's `?` exits are the
+/// runs an operator is most likely to be investigating, and a carry discarded
+/// on the way out took its transform's span, its `started`/`completed` pair and
+/// its counts with it — leaving `before_transform` events describing a
+/// transform that then appears never to have run.
+///
+/// So the reporting is not the orchestrator's to remember. Whatever is still
+/// parked when this is dropped is reported as an interrupted execution, which
+/// covers the ordinary error return, an interrupting signal, and an unwinding
+/// panic alike.
+pub(crate) struct ParkedTransformSignals {
+    /// `None` when telemetry is disabled, in which case no carry is ever
+    /// produced and the map stays empty for the run.
+    producer: Option<TelemetryProducer>,
+    parked: std::collections::HashMap<String, TransformSignalCarry>,
+}
+
+impl ParkedTransformSignals {
+    pub(crate) fn new(producer: Option<TelemetryProducer>) -> Self {
+        Self {
+            producer,
+            parked: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Take a transform's lifecycle out for the pass that is about to run it.
+    pub(crate) fn take(&mut self, logical_node: &str) -> Option<TransformSignalCarry> {
+        self.parked.remove(logical_node)
+    }
+
+    /// Park the pass's state until the converge stops or unwinds.
+    pub(crate) fn park(&mut self, logical_node: String, carry: TransformSignalCarry) {
+        self.parked.insert(logical_node, carry);
+    }
+
+    /// Report every parked execution as the one converged execution it was.
+    pub(crate) fn close_converged(&mut self) {
+        let Some(producer) = self.producer.clone() else {
+            self.parked.clear();
+            return;
+        };
+        for (_, carry) in self.parked.drain() {
+            carry.close(&producer);
+        }
+    }
+}
+
+impl Drop for ParkedTransformSignals {
+    fn drop(&mut self) {
+        let Some(producer) = self.producer.clone() else {
+            return;
+        };
+        for (_, carry) in self.parked.drain() {
+            carry.close_interrupted(&producer);
+        }
     }
 }
 
@@ -181,8 +267,14 @@ impl<'a> LogDispatcher<'a> {
     ) -> Self {
         // A carry from an earlier pass was built against the same plan node, so
         // its cadence is already the right length; a pass that is the first one
-        // starts every directive at zero.
-        let resumed = carry.filter(|carry| carry.cadence.len() == directives.len());
+        // starts every directive at zero. The length is reconciled rather than
+        // trusted, because the alternative to reconciling it is discarding the
+        // carry — and a discarded carry is a whole execution that reports
+        // nothing.
+        let resumed = carry.map(|mut carry| {
+            carry.cadence.resize(directives.len(), 0);
+            carry
+        });
         let enabled = producer.map(|producer| EnabledDispatcher {
             producer,
             directives,
@@ -415,8 +507,61 @@ impl EnabledDispatcher<'_> {
 
 impl Drop for EnabledDispatcher<'_> {
     fn drop(&mut self) {
+        // A converge pass that unwound holds the whole execution's state: the
+        // carry was taken out of `ParkedTransformSignals` to build this
+        // dispatcher and is not going back. Reporting it here, and only here,
+        // is what keeps the interrupted execution reported exactly once —
+        // `close` would give it a span with no `started` and no counts, and
+        // leaving it to the parked map would give it nothing at all.
+        //
+        // `into_carry` has already set `closed` on a pass that handed its state
+        // on, so a pass that ended well does not report here.
+        if !self.closed
+            && let Some(pass) = self.deferred.take()
+        {
+            self.closed = true;
+            report_interrupted_execution(
+                &self.producer,
+                &self.logical_node,
+                self.started_at_unix_nanos,
+                pass.records,
+                pass.errors,
+            );
+            return;
+        }
         self.close(SpanStatus::Error);
     }
+}
+
+/// Report a transform execution that ended without reaching its close.
+///
+/// Shared by the parked converge state and by a converge pass that unwound
+/// still holding it, so an operator reading an interrupted run sees the same
+/// shape whichever of the two got there first: the transform started, it
+/// carried the counts it had reached, and its span says the execution ended in
+/// error. A completion is reported by neither.
+fn report_interrupted_execution(
+    producer: &TelemetryProducer,
+    logical_node: &str,
+    started_at_unix_nanos: u64,
+    records: u64,
+    errors: u64,
+) {
+    producer.record_metric(MetricKey::TransformStarted, 1);
+    if records > 0 {
+        producer.record_metric(MetricKey::TransformRecords, records);
+    }
+    if errors > 0 {
+        producer.record_metric(MetricKey::TransformErrors, errors);
+    }
+    let ended_at_unix_nanos = unix_nanos_now().max(started_at_unix_nanos);
+    let _ = producer.emit_span(SpanFact {
+        name: SpanName::Transform,
+        status: SpanStatus::Error,
+        logical_node,
+        started_at_unix_nanos,
+        ended_at_unix_nanos,
+    });
 }
 
 #[cfg(test)]
@@ -962,6 +1107,152 @@ action = "allow"
             "the second pass continues the count the first left off at; \
              restarting it would have fired on 20"
         );
+    }
+
+    /// Everything a run reported about one transform.
+    #[derive(Default)]
+    struct Reported {
+        started: u64,
+        completed: u64,
+        records: u64,
+        errors: u64,
+        spans: Vec<crate::telemetry::SpanStatus>,
+    }
+
+    fn reported(receiver: &crate::telemetry::TelemetryReceiver) -> Reported {
+        use crate::telemetry::MetricKey;
+        let mut seen = Reported::default();
+        while let Some(batch) = receiver.try_recv_batch() {
+            seen.started += batch.metric(MetricKey::TransformStarted);
+            seen.completed += batch.metric(MetricKey::TransformCompleted);
+            seen.records += batch.metric(MetricKey::TransformRecords);
+            seen.errors += batch.metric(MetricKey::TransformErrors);
+            seen.spans
+                .extend(batch.traces().iter().map(|span| span.status));
+        }
+        seen
+    }
+
+    /// Run one converge pass that leaves by `?` partway through: the state is
+    /// never handed back, because the `?` is where `into_carry` would have
+    /// been.
+    fn converge_pass_that_unwinds(
+        producer: &crate::telemetry::TelemetryProducer,
+        directives: &[clinker_plan::config::LogDirective],
+        conditions: &[Option<Arc<cxl::typecheck::TypedProgram>>],
+        carry: Option<super::TransformSignalCarry>,
+        amounts: &[i64],
+    ) {
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let stable = StableEvalContext::test_default();
+        let eval_ctx = EvalContext::test_default_borrowed(&stable);
+        let mut dispatcher = LogDispatcher::deferred(
+            Some(producer.clone()),
+            directives,
+            conditions,
+            TransformSignalContext {
+                execution_id: "exec",
+                batch_id: "batch",
+                pipeline_name: "gate_runtime",
+                logical_node: "observe",
+            },
+            carry,
+        );
+        dispatcher.fire_before_transform();
+        for amount in amounts {
+            let record = Record::new(Arc::clone(&schema), vec![Value::Integer(*amount)]);
+            dispatcher.fire_per_record(&record, &eval_ctx);
+        }
+    }
+
+    /// A converge that does not reach its close still has to report.
+    ///
+    /// Nothing is emitted until the loop stops, because until then there is no
+    /// way to know which pass converged. But the loop can stop by unwinding —
+    /// a recompute failure, a member arm's error, a shutdown poll on SIGINT —
+    /// and the state was then discarded whole: the run reported the
+    /// `before_transform` events the passes had already emitted and nothing
+    /// else. No span, no started, no counts, on precisely the run an operator
+    /// is investigating.
+    #[test]
+    fn a_converge_that_fails_mid_pass_still_reports_the_execution() {
+        let (directives, conditions) = compiled_directives(None);
+        let (producer, receiver) =
+            TelemetryArena::reserve(&telemetry_policy()).expect("arena reserves");
+
+        let carry = converge_pass(&producer, &directives, &conditions, None, &[1, 2, 3, 4]);
+        converge_pass_that_unwinds(&producer, &directives, &conditions, Some(carry), &[1, 2]);
+
+        let seen = reported(&receiver);
+        assert_eq!(
+            seen.spans,
+            vec![crate::telemetry::SpanStatus::Error],
+            "one interrupted execution is one span, and it ended in error"
+        );
+        assert_eq!(seen.started, 1, "the transform did begin");
+        assert_eq!(
+            seen.records, 2,
+            "the counts are the interrupted pass's — what the run actually got through"
+        );
+        assert_eq!(
+            seen.completed, 0,
+            "a transform that unwound did not complete, and `completed` is what \
+             an operator sums to conclude every transform did"
+        );
+    }
+
+    /// The same failure seen from a transform the converge was not in the
+    /// middle of.
+    ///
+    /// A converge passes over every deferred-region member, so when one of them
+    /// fails, every other member's state is sitting parked. Those carries were
+    /// dropped with the map that held them.
+    #[test]
+    fn a_parked_execution_the_converge_never_closed_is_still_reported() {
+        let (directives, conditions) = compiled_directives(None);
+        let (producer, receiver) =
+            TelemetryArena::reserve(&telemetry_policy()).expect("arena reserves");
+
+        let mut parked = super::ParkedTransformSignals::new(Some(producer.clone()));
+        let carry = converge_pass(&producer, &directives, &conditions, None, &[1, 2, 3]);
+        parked.park("observe".to_string(), carry);
+        // The orchestrator left by `?` without reaching its close.
+        drop(parked);
+
+        let seen = reported(&receiver);
+        assert_eq!(
+            seen.spans,
+            vec![crate::telemetry::SpanStatus::Error],
+            "a parked execution that was never closed is reported as interrupted"
+        );
+        assert_eq!(seen.started, 1);
+        assert_eq!(seen.records, 3, "the last completed pass's counts");
+        assert_eq!(seen.completed, 0);
+    }
+
+    /// And the converge that did close reports once, not twice — the parked
+    /// map is dropped on the ordinary path too.
+    #[test]
+    fn a_closed_converge_is_not_reported_a_second_time_when_the_map_goes() {
+        let (directives, conditions) = compiled_directives(None);
+        let (producer, receiver) =
+            TelemetryArena::reserve(&telemetry_policy()).expect("arena reserves");
+
+        let mut parked = super::ParkedTransformSignals::new(Some(producer.clone()));
+        let carry = converge_pass(&producer, &directives, &conditions, None, &[1, 2, 3]);
+        parked.park("observe".to_string(), carry);
+        parked.close_converged();
+        drop(parked);
+
+        let seen = reported(&receiver);
+        assert_eq!(
+            seen.spans,
+            vec![crate::telemetry::SpanStatus::Ok],
+            "the converged execution is one span and it succeeded"
+        );
+        assert_eq!(seen.started, 1);
+        assert_eq!(seen.completed, 1);
+        assert_eq!(seen.records, 3);
     }
 
     /// A field name the upstream row does not carry publishes an event with

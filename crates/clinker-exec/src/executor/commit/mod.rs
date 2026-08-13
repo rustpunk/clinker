@@ -244,13 +244,7 @@ pub(crate) fn orchestrate(
 /// record and error counts an operator can sum across transforms without
 /// reading a four-iteration converge as four times the rows.
 fn close_converged_transform_signals(ctx: &mut ExecutorContext<'_>) {
-    let Some(producer) = ctx.telemetry_producer.clone() else {
-        ctx.transform_signal_carry.clear();
-        return;
-    };
-    for (_, carry) in ctx.transform_signal_carry.drain() {
-        carry.close(&producer);
-    }
+    ctx.transform_signal_carry.close_converged();
 }
 
 /// Capture every error_messages / error_rows entry from the live

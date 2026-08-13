@@ -1,8 +1,10 @@
 //! Strict workspace observability policy parsed from `clinker.toml`.
 //!
 //! This module owns only the secret-free author form and deterministic numeric
-//! validation. In particular, the OTLP endpoint remains bounded raw text. A
-//! later network boundary is solely responsible for parsing and admitting it.
+//! validation. In particular, the OTLP endpoint remains bounded raw text: this
+//! module holds it to the same shape every authored string here must have --
+//! non-empty, bounded, trimmed, free of control characters -- and a later
+//! network boundary is solely responsible for parsing and admitting it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU32, NonZeroU64};
@@ -1007,13 +1009,6 @@ impl OtlpConfig {
         &self,
         flush_timeout_ms: u64,
     ) -> Result<ResolvedOtlpPolicy, ObservabilityConfigError> {
-        if self.endpoint.trim().is_empty() {
-            return Err(ObservabilityConfigError::invalid(
-                "observability.otlp.endpoint",
-                "must contain bounded raw Collector endpoint text",
-                "set `endpoint = \"https://collector.example.com\"`",
-            ));
-        }
         if self.endpoint.len() > MAX_ENDPOINT_BYTES {
             return Err(ObservabilityConfigError::invalid(
                 "observability.otlp.endpoint",
@@ -1021,6 +1016,21 @@ impl OtlpConfig {
                 "set `endpoint = \"https://collector.example.com\"` to a shorter origin",
             ));
         }
+        // The rule every other authored string in this policy is held to.
+        // This layer still does not parse the endpoint -- the network
+        // boundary does -- but surrounding padding and embedded control
+        // characters are not endpoint text under any parse, and they are a
+        // defect this layer can name with the author's own key and a
+        // pasteable correction while the network crate can only report a
+        // generic endpoint failure. Run against the value that is stored, so
+        // the string that was checked and the string that is admitted are the
+        // same string.
+        validate_bounded_logical_text(
+            "observability.otlp.endpoint",
+            &self.endpoint,
+            MAX_ENDPOINT_BYTES,
+            "set `endpoint = \"https://collector.example.com\"` with no surrounding whitespace",
+        )?;
 
         let connect_timeout_ms = bounded_nonzero_u64(
             "observability.otlp.connect_timeout_ms",
@@ -1308,12 +1318,20 @@ fn resolve_field_policies(
         }
 
         let replacement = match (rule.action, rule.replacement.as_deref()) {
-            (FieldPolicyAction::Replace, Some(value))
-                if !value.is_empty() && value.len() <= MAX_REPLACEMENT_BYTES =>
-            {
+            (FieldPolicyAction::Replace, Some(value)) => {
+                // A replacement is written verbatim into an emitted event, so
+                // it is held to the same rule as every other authored string
+                // here: an embedded control character would be a line break
+                // this policy put into the telemetry it exists to bound.
+                validate_bounded_logical_text(
+                    "observability.field_policy.replacement",
+                    value,
+                    MAX_REPLACEMENT_BYTES,
+                    "add `replacement = \"[redacted]\"`",
+                )?;
                 Some(value.into())
             }
-            (FieldPolicyAction::Replace, _) => {
+            (FieldPolicyAction::Replace, None) => {
                 return Err(ObservabilityConfigError::invalid(
                     "observability.field_policy.replacement",
                     "is required and must fit the bounded replacement value",

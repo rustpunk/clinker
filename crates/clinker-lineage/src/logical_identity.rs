@@ -339,12 +339,28 @@ impl LineageIdentityContext {
     }
 
     /// Prove that all source/output nodes that will be emitted have identities.
+    ///
+    /// A required key outside the bound a binding key may carry is reported as
+    /// [`LineageIdentityError::UnbindableNode`] rather than as a missing one.
+    /// The key is derived from pipeline node names, which carry no length limit
+    /// of their own, so a long composition name over a long body node name can
+    /// compose past the cap; reporting that as `MissingNode` would tell the
+    /// author to add a binding that both [`Self::external`] and the
+    /// configuration boundary refuse, leaving them nothing they can do. Naming
+    /// the real constraint leaves them the correction that works: rename the
+    /// nodes.
     pub fn validate_required<'a>(
         &self,
         nodes: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), LineageIdentityError> {
         let required: BTreeSet<&str> = nodes.into_iter().collect();
         for node in required {
+            if !valid_node(node) {
+                return Err(LineageIdentityError::UnbindableNode {
+                    node: node.to_string(),
+                    bytes: node.len(),
+                });
+            }
             self.require(node)?;
         }
         Ok(())
@@ -398,6 +414,13 @@ pub enum LineageIdentityError {
     MissingNode {
         node: String,
     },
+    /// A node the walk must bind whose key is outside what a binding key may
+    /// carry, so no configuration can name it. `node` is the derived key and
+    /// `bytes` its length.
+    UnbindableNode {
+        node: String,
+        bytes: usize,
+    },
 }
 
 impl fmt::Display for LineageIdentityError {
@@ -415,7 +438,8 @@ impl fmt::Display for LineageIdentityError {
                  non-empty, carry no control characters, have no leading or trailing whitespace, \
                  and stay within {MAX_NODE_BYTES} bytes. Use the name the pipeline declares, \
                  with nothing added around it — `orders`, or \
-                 `<composition node>.<body source>` for a node declared inside a composition body"
+                 `<composition node>.<body source>` for a node declared inside a composition \
+                 body, writing a `.` that belongs to a node's own name as `\\.`"
             ),
             Self::InvalidSubset => f.write_str(
                 "dataset subset must be a logical partition/location identifier, not a worker or attempt path",
@@ -440,6 +464,16 @@ impl fmt::Display for LineageIdentityError {
             Self::MissingNode { node } => write!(
                 f,
                 "lineage node `{node}` is missing an external identity; add one canonical datasource or one complete catalog namespace/name pair"
+            ),
+            Self::UnbindableNode { node, bytes } => write!(
+                f,
+                "lineage node key {node:?} is {bytes} bytes and cannot be written as a binding \
+                 key: a key must be non-empty, carry no control characters, have no leading or \
+                 trailing whitespace, and stay within {MAX_NODE_BYTES} bytes. This key is derived \
+                 from names the pipeline chose — a composition call site contributes its own name \
+                 ahead of the node inside its body — so rename those pipeline nodes until the \
+                 joined key fits, rather than adding a binding the configuration boundary would \
+                 refuse"
             ),
         }
     }
@@ -499,7 +533,14 @@ const MAX_NODE_BYTES: usize = 128;
 /// [`LineageIdentityError::MissingNode`] or
 /// [`LineageIdentityError::DuplicateNode`] naming the key, rather than a blanket
 /// refusal the author cannot act on. `.` stays admissible because it joins a
-/// composition call site to a body node name.
+/// composition call site to a body node name, and `\` because it escapes a `.`
+/// that belongs to a node's own name rather than to the join.
+///
+/// The length bound is the one part of this a pipeline can outgrow: node names
+/// themselves are uncapped, so a composed key can exceed it. That case is
+/// reported by [`LineageIdentityContext::validate_required`] as
+/// [`LineageIdentityError::UnbindableNode`], which names the constraint instead
+/// of asking for a binding this function would reject.
 fn valid_node(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_NODE_BYTES

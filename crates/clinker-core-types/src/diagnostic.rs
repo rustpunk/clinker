@@ -73,7 +73,7 @@ diagnostic_registry! {
     "E002", Error, "Self-referential node input";
     "E003", Error, "Cycle detected between nodes";
     "E004", Error, "Node input references undeclared producer (unified pass; payload `InputRefUndeclared`)";
-    "E010", Error, "Dotted-name check (`.` reserved for branch refs)";
+    "E010", Error, "Dotted-name check, every node kind (`.` reserved for branch refs and call-site paths)";
     "E011", Error, "Log directive sanity (`every` must be valid)";
     // ── Composition binding and the channel/group overlay ───────────────
     "E101", Error, "Composition signature parse error (malformed `.comp.yaml`)";

@@ -57,6 +57,25 @@ name, so the key is `<composition node>.<body source>` rather than the bare
 name — two call sites of one body can be pointed at different files, and each
 gets its own identity.
 
+`.` joins a call site to a body node, and a key never has to disambiguate that
+join from a node's own name: a `.` in a node name is refused at plan time with
+`E010`, for every node kind and inside composition bodies too. `node =
+"enrich.ref"` therefore always addresses the source `ref` inside composition
+node `enrich`.
+
+A `\` that belongs to a node's own name is written `\\` in the key, so the key
+format stays unambiguous on its own rather than by relying on the naming rule.
+The same escape covers `.` — `node = "enrich\\.ref"` (in TOML, `\\` is a
+literal backslash; the literal string `'enrich\.ref'` says the same thing)
+would address a node whose own name is `enrich.ref` — but no pipeline the
+planner accepts can produce that key. Node names without `\` — nearly all of
+them — are unaffected.
+
+A node whose key cannot be written as a binding — over 128 bytes once the call
+site is joined to it — is refused by name, naming the limit. The correction is
+to rename the pipeline nodes the key is built from; there is no binding that
+can carry an over-long key.
+
 `#` is reserved in an authored dataset **name** (`catalog_name`, or the name
 half of a canonical datasource) because it separates a multi-record source's
 record types from their base dataset. Without the restriction a name like
@@ -208,7 +227,47 @@ One synchronous worker owns the selected file or stdout sink, and shutdown
 waits no longer than `lineage.flush_timeout_ms`. Its typed outcome distinguishes
 normal shutdown, write failure (including permission errors), flush failure,
 and deadline expiry, with accepted, dropped, and full counters reported
-separately. It has no access to the telemetry arena or Collector worker.
+separately.
+
+Within that deadline the worker stops taking **new** events off the queue
+halfway through, keeping the rest of the budget to finish the event it is
+already writing. A destination too slow to keep up therefore receives a file
+that is **short** — missing its last events — rather than one that ends inside
+a half-written record, which an NDJSON reader cannot parse. Nothing is added to
+the deadline: the whole flush still ends within `lineage.flush_timeout_ms`. A
+destination that stops accepting bytes altogether cannot be waited on, so in
+that one case the file may end mid-record, and the delivery outcome reports
+that separately from its counters. It has no access to the telemetry arena or Collector worker.
+
+#### What the run prints
+
+A delivery that lost events, ended on anything other than a normal shutdown, or
+left its destination inside a record prints one line on standard error:
+
+```text
+clinker: lineage delivery outcome: status=deadline-exceeded error_kind=none accepted=2 dropped=0 full=0 records_complete=false
+```
+
+`records_complete` is the completeness of the **file**, where the counters
+beside it are the completeness of the **export**. It is `true` on every normal
+shutdown and on the slow-destination path above — a short file is still valid
+NDJSON — and `false` only when the worker was abandoned inside a write. That is
+the one state a consumer cannot determine for itself: a truncated NDJSON file
+simply ends, with nothing in it to say more was coming, and the counters cannot
+tell you either, because a run that gave up on a slow destination reports the
+same accepted total whether or not the last record made it out whole.
+
+Being a condition rather than a count, it breaks the clean-run silence on its
+own: a run that dropped no events still prints this line if it left the
+destination unreadable. A normal shutdown that dropped nothing and ended on a
+record boundary prints nothing at all.
+
+The plan-only `--lineage` export, whose whole invocation *is* the export, says
+the same thing in prose when it misses its flush deadline, and its correction
+follows from it. A short export ends "on a record boundary, short by the events
+that never got out" and is simply re-run. An export that "ends inside a record
+and is not readable as NDJSON" must be discarded rather than published as this
+run's lineage, and only then re-run.
 
 This external worker is not a second identity mode and does not make local
 paths suitable as catalog identity. The explicit `local_diagnostic_paths`

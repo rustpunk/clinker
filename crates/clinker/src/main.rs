@@ -1974,8 +1974,26 @@ fn lineage_export_failure(
         // which layer noticed it. Retryable, with a correction that offers the
         // deadline as the fix if it keeps happening.
         clinker_lineage::LineageDeliveryTerminal::DeadlineExceeded => {
+            // This is the one verdict that keeps what it wrote, so the operator
+            // is left holding a file — and the two files this path can leave
+            // want opposite handling. One is short: valid NDJSON missing its
+            // tail, which a catalogue can still read and a diff can still
+            // compare. The other stops inside a record, and every conformant
+            // reader fails on it. Nothing about the destination distinguishes
+            // them from the outside, which is why the run has to say which.
+            let (state, correction) = if outcome.records_complete() {
+                (
+                    "the partial export it left ends on a record boundary, short by the events that never got out",
+                    "re-run the export",
+                )
+            } else {
+                (
+                    "the partial export it left ends inside a record and is not readable as NDJSON",
+                    "discard that partial export rather than publishing it as this run's lineage, then re-run",
+                )
+            };
             return Some(observability_delivery_error(format!(
-                "--lineage output {destination} did not finish writing within the configured lineage flush deadline. Correction: re-run the export; if it recurs, raise the deadline in clinker.toml:\n\n  [observability.lineage]\n  flush_timeout_ms = 30000"
+                "--lineage output {destination} did not finish writing within the configured lineage flush deadline; {state}. Correction: {correction}; if it recurs, raise the deadline in clinker.toml:\n\n  [observability.lineage]\n  flush_timeout_ms = 30000"
             )));
         }
         clinker_lineage::LineageDeliveryTerminal::Shutdown => {}
@@ -2320,9 +2338,24 @@ impl LiveLineageOutput {
     }
 }
 
+/// Say on standard error what the lineage export lost, and what state it left
+/// its destination in.
+///
+/// `records_complete` is the destination's own completeness, and it is the one
+/// fact a consumer cannot recover for itself: a file that stops inside a record
+/// simply ends, with nothing in it to say that more was coming. The counters
+/// beside it cannot answer that either — a run that gave up on a slow
+/// destination reports the same accepted total whether the last record made it
+/// out whole or not.
+///
+/// An incomplete destination breaks the clean-run silence on its own, exactly
+/// as incomplete counts do on the telemetry line. It is not a count of anything
+/// lost, so a run that dropped nothing would otherwise report nothing while
+/// leaving an unreadable file behind.
 fn report_lineage_delivery(outcome: clinker_lineage::LineageDeliveryOutcome) {
     if outcome.terminal() != clinker_lineage::LineageDeliveryTerminal::Shutdown
         || outcome.dropped() > 0
+        || !outcome.records_complete()
     {
         let error_kind = match outcome.terminal() {
             clinker_lineage::LineageDeliveryTerminal::WriteFailed(kind)
@@ -2333,12 +2366,13 @@ fn report_lineage_delivery(outcome: clinker_lineage::LineageDeliveryOutcome) {
             | clinker_lineage::LineageDeliveryTerminal::DeadlineExceeded => "none",
         };
         eprintln!(
-            "clinker: lineage delivery outcome: status={} error_kind={} accepted={} dropped={} full={}",
+            "clinker: lineage delivery outcome: status={} error_kind={} accepted={} dropped={} full={} records_complete={}",
             outcome.terminal().as_str(),
             error_kind,
             outcome.accepted(),
             outcome.dropped(),
-            outcome.full()
+            outcome.full(),
+            outcome.records_complete()
         );
     }
 }

@@ -469,6 +469,174 @@ o3,HR,30
     });
 }
 
+/// A converge that leaves without reaching its close still reports every
+/// transform it passed over.
+///
+/// The commit pass parks each deferred-region member's signal state and reports
+/// it once the loop stops, because until then there is no way to know which
+/// pass converged. A loop that stops by unwinding used to take all of it with
+/// it: the run reported the `before_transform` events the passes had already
+/// emitted and then nothing — no span, no `started`, no counts — on exactly the
+/// run an operator went to the telemetry to explain.
+///
+/// The cap panic is the one abnormal exit the crate can force deterministically
+/// from inside the loop; an ordinary `?` return leaves by the same path and the
+/// state is parked in the same place. `cap = 1` lets the first iteration run
+/// (which is what parks the state) and trips on the second.
+#[test]
+fn a_converge_that_never_closes_still_reports_the_transforms_it_ran() {
+    use crate::executor::commit::with_test_loop_cap;
+    use crate::telemetry::{MetricKey, SpanStatus, TelemetryArena};
+
+    let yaml = r#"
+pipeline:
+  name: interrupted_converge
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    correlation_key: order_id
+    type: csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: department, type: string }
+      - { name: amount, type: int }
+- type: aggregate
+  name: dept_totals
+  input: src
+  config:
+    group_by: [department]
+    cxl: |
+      emit department = department
+      emit total = sum(amount)
+- type: transform
+  name: ratio
+  input: dept_totals
+  config:
+    cxl: |
+      emit department = department
+      emit total = total
+      emit ratio = 1 / (total - 60)
+- type: output
+  name: out
+  input: ratio
+  config:
+    name: out
+    path: out.csv
+    type: csv
+    include_unmapped: true
+"#;
+    let csv = "\
+order_id,department,amount
+o1,HR,10
+o2,HR,20
+o3,HR,30
+";
+    let policy = clinker_plan::config::ClinkerToml::parse(
+        r#"
+[observability]
+arena_bytes = "768KB"
+ordinary_lane_bytes = "512KB"
+high_severity_lane_bytes = "256KB"
+max_batch_bytes = "8KB"
+max_attributes_per_event = 8
+max_attribute_bytes = "256B"
+drop_policy = "drop_newest"
+sample_every = 1
+rate_limit_per_second = 100000
+rate_limit_burst = 100000
+flush_timeout_ms = 1000
+
+[observability.otlp]
+endpoint = "https://collector.invalid"
+connect_timeout_ms = 100
+request_timeout_ms = 200
+retry_max_attempts = 1
+retry_total_timeout_ms = 500
+max_response_bytes = "1KB"
+
+[observability.otlp.auth]
+mode = "none"
+
+[observability.lineage]
+queue_bytes = "1KB"
+max_event_bytes = "512B"
+drop_policy = "drop_newest"
+flush_timeout_ms = 500
+identity_mode = "local_diagnostic_paths"
+"#,
+    )
+    .expect("the telemetry policy parses")
+    .resolve_observability(None)
+    .expect("the telemetry policy resolves");
+    let (producer, receiver) = TelemetryArena::reserve(&policy).expect("arena reserves");
+
+    let readers: crate::executor::SourceReaders = HashMap::from([(
+        "src".to_string(),
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "interrupted-exec".to_string(),
+        batch_id: "interrupted-batch".to_string(),
+        telemetry_producer: Some(producer),
+        ..Default::default()
+    };
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_test_loop_cap(1, || {
+            let _ = PipelineExecutor::run_with_readers_writers(
+                &config,
+                readers,
+                writers.into(),
+                &params,
+            );
+        });
+    }));
+    assert!(
+        unwound.is_err(),
+        "the fixture has to actually leave the loop"
+    );
+
+    let mut started = 0;
+    let mut completed = 0;
+    let mut spans = Vec::new();
+    while let Some(batch) = receiver.try_recv_batch() {
+        started += batch.metric(MetricKey::TransformStarted);
+        completed += batch.metric(MetricKey::TransformCompleted);
+        spans.extend(
+            batch
+                .traces()
+                .iter()
+                .filter(|span| span.logical_node == "ratio")
+                .map(|span| span.status),
+        );
+    }
+    assert_eq!(
+        spans,
+        vec![SpanStatus::Error],
+        "the transform the interrupted converge ran must report one span, \
+         and it did not end well"
+    );
+    assert_eq!(started, 1, "and it must report having begun");
+    assert_eq!(
+        completed, 0,
+        "a converge that never closed completed nothing"
+    );
+}
+
 /// Composition body containing a relaxed-CK Aggregate end-to-end:
 /// the body's Aggregate runs at body-executor entry, parks its narrow
 /// emit into the body-local `node_buffers[producer]`, and the

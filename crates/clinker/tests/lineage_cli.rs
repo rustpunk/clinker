@@ -1226,3 +1226,98 @@ fn lineage_export_sink_write_failure_is_reported() {
         "the diagnostic must name what the sink reported: {stderr}"
     );
 }
+
+fn set_lineage_flush_timeout(dir: &Path, millis: u64) {
+    let policy = std::fs::read_to_string(dir.join("clinker.toml"))
+        .expect("read external lineage policy")
+        .replace(
+            "[observability.lineage]\n",
+            &format!("[observability.lineage]\nflush_timeout_ms = {millis}\n"),
+        );
+    std::fs::write(dir.join("clinker.toml"), policy).expect("write lineage flush deadline");
+}
+
+/// The prose of a rendered diagnostic, with the frame the renderer drew around
+/// it removed: colour escapes dropped, gutter bars and hard wraps collapsed to
+/// single spaces. What is asserted is then the sentence the author wrote, not
+/// where the terminal width happened to break it.
+fn unwrap_diagnostic(stderr: &str) -> String {
+    let mut plain = String::with_capacity(stderr.len());
+    let mut characters = stderr.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\u{1b}' => {
+                for terminator in characters.by_ref() {
+                    if terminator.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            '│' => plain.push(' '),
+            _ => plain.push(character),
+        }
+    }
+    plain.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A kept partial export says whether it can be read.
+///
+/// The deadline path is the one verdict that leaves the destination in place,
+/// and the two files it can leave want opposite handling: a short one is valid
+/// NDJSON missing its tail, a truncated one ends inside a record and no
+/// conformant reader can finish it. Nothing about the file distinguishes them
+/// from the outside — a truncated NDJSON file simply ends — so an operator told
+/// only to "re-run the export" has no way to know whether the artifact beside
+/// them is publishable in the meantime.
+#[test]
+fn plan_only_lineage_deadline_says_whether_the_export_it_kept_is_readable() {
+    let workspace = tempfile::tempdir().expect("blocked export workspace");
+    write_pipeline(workspace.path(), "./out.csv");
+    external_lineage_policy(workspace.path(), true);
+    set_lineage_flush_timeout(workspace.path(), 50);
+
+    let output = Command::new(clinker_bin())
+        .current_dir(workspace.path())
+        // The sink takes a record's bytes and then never returns from the write
+        // call that took them, which is exactly the state the destination
+        // cannot report for itself.
+        .env("CLINKER_TEST_LINEAGE_SINK", "hang-after-first-write")
+        .args(["run", "pipeline.yaml", "--lineage", "lineage.ndjson"])
+        .output()
+        .expect("run blocked lineage export");
+
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "a delivery that did not finish is a delivery failure, not a configuration one"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("clinker: lineage delivery outcome:")
+            && stderr.contains("records_complete=false"),
+        "the delivery line must report the destination's own completeness: {stderr}"
+    );
+    let unwrapped = unwrap_diagnostic(&stderr);
+    assert!(
+        unwrapped.contains("did not finish writing within the configured lineage flush deadline"),
+        "{stderr}"
+    );
+    assert!(
+        unwrapped.contains("ends inside a record and is not readable as NDJSON"),
+        "the deadline diagnostic must say what state the file it kept is in: {stderr}"
+    );
+    assert!(
+        unwrapped.contains(
+            "discard that partial export rather than publishing it as this run's lineage"
+        ),
+        "an unreadable kept file needs a correction that is not just `re-run`: {stderr}"
+    );
+    assert!(
+        !unwrapped.contains("ends on a record boundary"),
+        "a truncated export must not be described as a short one: {stderr}"
+    );
+    assert!(
+        stderr.contains("flush_timeout_ms = 30000"),
+        "the pasteable deadline correction is still offered: {stderr}"
+    );
+}

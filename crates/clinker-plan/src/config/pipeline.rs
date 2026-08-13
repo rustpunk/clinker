@@ -547,25 +547,14 @@ impl PipelineConfig {
         ));
 
         // ── Stage 5: D3b — dotted-name check ────────────────────────
-        // `.` is reserved for branch references (e.g. "route.high").
-        // Enforced structurally here against the nodes: taxonomy.
+        // Every node in the taxonomy, with no per-variant filter: the
+        // reserved character is a property of a node name, not of the
+        // kind of node wearing it, so a variant added later is covered
+        // by walking `self.nodes` rather than by a match arm.
         for spanned in &self.nodes {
-            let name = spanned.value.name();
-            if matches!(
-                spanned.value,
-                PipelineNode::Transform { .. }
-                    | PipelineNode::Aggregate { .. }
-                    | PipelineNode::Route { .. }
-            ) && name.contains('.')
+            if let Some(diag) = dotted_node_name_diagnostic(spanned.value.name(), span_for(spanned))
             {
-                diags.push(Diagnostic::error(
-                    "E010",
-                    format!(
-                        "transform name {name:?} is invalid: '.' is reserved \
-                         for branch references (use underscores or hyphens)"
-                    ),
-                    span_for(spanned),
-                ));
+                diags.push(diag);
             }
         }
 
@@ -4538,6 +4527,36 @@ pub fn reserved_names_for(scope: pipeline_node::VarScope) -> &'static [&'static 
         pipeline_node::VarScope::Source => RESERVED_SOURCE_NAMES,
         pipeline_node::VarScope::Record => RESERVED_RECORD_NAMES,
     }
+}
+
+/// The E010 diagnostic for a node name carrying the reserved `.`, or
+/// `None` when the name is clean.
+///
+/// `.` addresses something other than a node: a branch of a route
+/// (`split.high`) and a node inside a composition call site
+/// (`enrich.ref`). A node whose own name carries one renders identically
+/// to one of those paths, so the key derived from it names two different
+/// things — a top-level output `enrich.ref` and the body node `ref` under
+/// call site `enrich` are indistinguishable downstream. The rule holds for
+/// every node kind, so callers pass a name and a span and never a variant.
+pub(crate) fn dotted_node_name_diagnostic(
+    name: &str,
+    span: clinker_core_types::LabeledSpan,
+) -> Option<clinker_core_types::Diagnostic> {
+    if !name.contains('.') {
+        return None;
+    }
+    let corrected = name.replace('.', "_");
+    Some(clinker_core_types::Diagnostic::error(
+        "E010",
+        format!(
+            "node name {name:?} is invalid: '.' is reserved for branch \
+             references and composition call-site paths; rename the node to \
+             {corrected:?} (use underscores or hyphens) and update every \
+             reference to it"
+        ),
+        span,
+    ))
 }
 
 /// Post-deserialization validation.

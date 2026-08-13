@@ -3492,6 +3492,26 @@ fn bind_composition(
         }
     }
 
+    // Reject a dotted body node name (E010) on the same grounds and with
+    // the same message as the top-level pass, which never sees body files.
+    // A body node's key is the call-site path joined to its name, so a `.`
+    // in the name is a second join the reader cannot tell from the first.
+    {
+        let mut has_dotted = false;
+        for spanned in &body_file.nodes {
+            if let Some(diag) = crate::config::pipeline::dotted_node_name_diagnostic(
+                spanned.value.name(),
+                LabeledSpan::primary(span_for_node(spanned), String::new()),
+            ) {
+                has_dotted = true;
+                diags.push(diag);
+            }
+        }
+        if has_dotted {
+            return;
+        }
+    }
+
     // Pre-mint a stable id per body node and per synthetic input-port
     // source BEFORE binding, so the bind walk can key this body's typed /
     // combine side-table entries by id — body node ids are not available

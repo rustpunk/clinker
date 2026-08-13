@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use clinker_exec::pipeline::shutdown::ShutdownToken;
 use clinker_exec::telemetry::{
-    ArenaSnapshot, LogRecord, MetricKey, MetricPoint, RunCorrelation, Severity, SpanName,
-    SpanStatus, TelemetryArena, TelemetryArenaError, TelemetryBatch, TelemetryProducer,
+    ArenaSnapshot, DrainOutcome, LogRecord, MetricKey, MetricPoint, RunCorrelation, Severity,
+    SpanName, SpanStatus, TelemetryArena, TelemetryArenaError, TelemetryBatch, TelemetryProducer,
     TelemetryReceiver, TraceSpan, unix_nanos_now,
 };
 use clinker_net::{
@@ -32,6 +32,12 @@ use serde::Serialize;
 use crate::lifecycle::{RunLifecycleSnapshot, RunTerminalOutcome};
 
 const IDLE_POLL: Duration = Duration::from_millis(2);
+
+/// How many times the final flush re-asks for an arena a producer is holding
+/// before it reports the flush as incomplete. Each refusal costs one
+/// `yield_now`, and the producers are quiescent by the time the final flush
+/// runs, so this is headroom over a straggler rather than a wait.
+const FINAL_DRAIN_REFUSALS: u32 = 64;
 
 /// Fixed aggregate counters suitable for the machine terminal.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -419,11 +425,25 @@ enum DeliveryFailureCause {
     Unencodable,
 }
 
-#[derive(Default)]
 struct OtlpDeliveryReport {
     logs: SignalDeliveryReport,
     metrics: SignalDeliveryReport,
     traces: SignalDeliveryReport,
+    /// Whether the final flush emptied the arena. False when a producer still
+    /// held it after the flush exhausted its attempts, in which case signals
+    /// may remain that no collector will ever be sent.
+    arena_drained: bool,
+}
+
+impl Default for OtlpDeliveryReport {
+    fn default() -> Self {
+        Self {
+            logs: SignalDeliveryReport::default(),
+            metrics: SignalDeliveryReport::default(),
+            traces: SignalDeliveryReport::default(),
+            arena_drained: true,
+        }
+    }
 }
 
 impl OtlpDeliveryReport {
@@ -472,7 +492,11 @@ impl OtlpDeliveryReport {
             logs: self.logs.summary,
             metrics: self.metrics.summary,
             traces: self.traces.summary,
-            flush_complete: true,
+            // A flush that never got the arena delivered whatever it held
+            // before that, and there is no way to tell from here how much it
+            // left behind — so it reports as an incomplete flush rather than as
+            // a clean one.
+            flush_complete: self.arena_drained,
             // Attached by the terminal writer, which reads the arena after this
             // worker has drained it. The exporter never sees the producer.
             admission: None,
@@ -725,14 +749,14 @@ impl OtlpWorker {
                             #[cfg(debug_assertions)]
                             injected_flush_hold();
                             state.enter_final_flush();
-                            state.drain_available();
+                            state.drain_final();
                             state.deliver_lifecycle(snapshot.as_ref());
                             let _ = done_sender.try_send(state.report);
                             return;
                         }
                         Ok(WorkerCommand::Drain) => {
                             state.enter_final_flush();
-                            state.drain_available();
+                            state.drain_final();
                             let _ = done_sender.try_send(state.report);
                             return;
                         }
@@ -906,9 +930,40 @@ impl WorkerState<'_> {
         self.final_flush = true;
     }
 
+    /// Deliver whatever the arena will give up right now.
+    ///
+    /// Refusals are ordinary here: a producer holding the arena on an idle poll
+    /// means the next poll, two milliseconds later, takes what this one left.
     fn drain_available(&mut self) {
-        while let Some(batch) = self.receiver.try_recv_batch() {
+        while let DrainOutcome::Batch(batch) = self.receiver.drain() {
             self.deliver_batch(&batch);
+        }
+    }
+
+    /// Deliver everything the arena holds, and record whether it was emptied.
+    ///
+    /// A refused drain took nothing and says nothing about what is still in
+    /// there, so the final flush retries rather than concluding from it. By
+    /// this point execution has ended and the producers are quiescent, so a
+    /// refusal is a straggler admission finishing — the length of one
+    /// serialization. What the attempts bound is a producer that never lets go,
+    /// which is reported as a flush that did not complete instead of as one
+    /// that did.
+    fn drain_final(&mut self) {
+        let mut refusals = 0_u32;
+        loop {
+            match self.receiver.drain() {
+                DrainOutcome::Batch(batch) => self.deliver_batch(&batch),
+                DrainOutcome::Empty => return,
+                DrainOutcome::Contended => {
+                    refusals += 1;
+                    if refusals > FINAL_DRAIN_REFUSALS {
+                        self.report.arena_drained = false;
+                        return;
+                    }
+                    thread::yield_now();
+                }
+            }
         }
     }
 

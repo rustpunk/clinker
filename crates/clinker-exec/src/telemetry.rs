@@ -668,7 +668,80 @@ pub struct TelemetryReceiver {
 impl TelemetryReceiver {
     /// Drain currently retained facts into one bounded transport-neutral batch.
     /// Returns immediately when the arena is busy or no signal is ready.
+    ///
+    /// A caller that has to distinguish "the arena is empty" from "a producer
+    /// held it" — a final flush deciding whether it flushed everything — has to
+    /// ask [`Self::drain`], which is the same drain reported without that
+    /// conflation.
     pub fn try_recv_batch(&self) -> Option<TelemetryBatch> {
+        match self.drain() {
+            DrainOutcome::Batch(batch) => Some(batch),
+            DrainOutcome::Empty | DrainOutcome::Contended => None,
+        }
+    }
+
+    /// Drain the arena, saying which of the three things happened.
+    pub fn drain(&self) -> DrainOutcome {
+        let Some(staged) = self.stage_queued() else {
+            return DrainOutcome::Contended;
+        };
+        // Decoding runs with the arena released. It is the expensive half of a
+        // drain — one `serde_json::from_slice` per slot, allocating a `String`
+        // per field — and holding the arena across it made a producer's
+        // `try_lock` fail for as long as the whole batch took to parse. A
+        // producer never waits, so those admissions were not delayed but
+        // discarded: at `when: per_record, every: 1` with the export worker
+        // polling every 2 ms, an author who asked for every record got an
+        // arbitrary subset of them, reported as momentary contention while the
+        // arena had free slots throughout.
+        let mut logs = Vec::with_capacity(staged.spans.len());
+        let mut traces = Vec::with_capacity(staged.spans.len());
+        let mut serialized_bytes = 0_u64;
+        for (start, len) in staged.spans {
+            match serde_json::from_slice::<StoredSignal>(&staged.bytes[start..start + len]) {
+                Ok(StoredSignal::Log(log)) => {
+                    logs.push(log);
+                    serialized_bytes = serialized_bytes.saturating_add(len as u64);
+                }
+                Ok(StoredSignal::Trace(trace)) => {
+                    traces.push(trace);
+                    serialized_bytes = serialized_bytes.saturating_add(len as u64);
+                }
+                // Admission already credited this signal to `accepted`, so
+                // leaving the failure uncounted would report a signal as
+                // exported that no collector ever received. Its slot was
+                // already reclaimed: telemetry is optional, and a signal that
+                // cannot be read back must not hold arena bytes or stop the
+                // rest of the batch from draining.
+                Err(_) => {
+                    self.stats.undecodable.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let metrics = self.metrics.drain();
+        if logs.is_empty() && traces.is_empty() && metrics.is_empty() {
+            return DrainOutcome::Empty;
+        }
+        DrainOutcome::Batch(TelemetryBatch {
+            logs,
+            metrics,
+            traces,
+            serialized_bytes,
+        })
+    }
+
+    /// Copy every queued signal out of the arena and free the slots it held.
+    ///
+    /// This is everything a drain genuinely needs the arena for. A slot is
+    /// handed back to producers the moment its bytes are copied, so the arena
+    /// is left emptier than the drain found it rather than held while the copy
+    /// is interpreted. `None` is a refused lock and nothing else — a drain that
+    /// found the arena empty returns an empty staging.
+    ///
+    /// The copy is bounded by what the arena can hold, which is fixed and
+    /// already reserved, and it lives only for the drain that made it.
+    fn stage_queued(&self) -> Option<StagedSignals> {
         let mut shared = match self.shared.try_lock() {
             Ok(shared) => shared,
             Err(TryLockError::WouldBlock) => return None,
@@ -680,45 +753,51 @@ impl TelemetryReceiver {
             ),
         };
 
-        let queued = shared.queue.len();
-        let mut logs = Vec::with_capacity(queued);
-        let mut traces = Vec::with_capacity(queued);
-        let mut serialized_bytes = 0_u64;
+        let state = &*shared;
+        let queued = state.queue.len();
+        let total: usize = state
+            .queue
+            .iter()
+            .copied()
+            .map(|token| state.slot_location(token).1)
+            .sum();
+        let mut staged = StagedSignals {
+            bytes: Vec::with_capacity(total),
+            spans: Vec::with_capacity(queued),
+        };
         while let Some(token) = shared.queue.pop_front() {
             let (offset, len) = shared.slot_location(token);
-            let parsed =
-                serde_json::from_slice::<StoredSignal>(&shared.bytes[offset..offset + len]);
-            if let Ok(signal) = parsed {
-                match signal {
-                    StoredSignal::Log(log) => logs.push(log),
-                    StoredSignal::Trace(trace) => traces.push(trace),
-                }
-                serialized_bytes = serialized_bytes.saturating_add(len as u64);
-            } else {
-                // Admission already credited this signal to `accepted`, so
-                // leaving the failure uncounted would report a signal as
-                // exported that no collector ever received. The slot is still
-                // reclaimed below: telemetry is optional, and a signal that
-                // cannot be read back must not hold arena bytes or stop the
-                // rest of the batch from draining.
-                self.stats.undecodable.fetch_add(1, Ordering::Relaxed);
-            }
+            let start = staged.bytes.len();
+            staged
+                .bytes
+                .extend_from_slice(&shared.bytes[offset..offset + len]);
+            staged.spans.push((start, len));
             shared.release(token);
             self.retained.subtract(token.lane, len as u64);
         }
-        drop(shared);
-
-        let metrics = self.metrics.drain();
-        if logs.is_empty() && traces.is_empty() && metrics.is_empty() {
-            return None;
-        }
-        Some(TelemetryBatch {
-            logs,
-            metrics,
-            traces,
-            serialized_bytes,
-        })
+        Some(staged)
     }
+}
+
+/// One drain's payload, copied out of the arena and no longer occupying it.
+struct StagedSignals {
+    bytes: Vec<u8>,
+    /// `(start, len)` per signal, in admission order.
+    spans: Vec<(usize, usize)>,
+}
+
+/// What one drain attempt found.
+#[derive(Debug)]
+pub enum DrainOutcome {
+    /// Signals were taken out of the arena.
+    Batch(TelemetryBatch),
+    /// The arena held nothing: everything admitted so far has been drained.
+    Empty,
+    /// A producer held the arena, so nothing was taken and nothing is known
+    /// about what is still in it. Distinct from [`Self::Empty`] because a
+    /// flush that treats the two alike reports a run as fully exported on
+    /// exactly the runs where it was not.
+    Contended,
 }
 
 /// Receiver-owned typed log record.
@@ -1589,9 +1668,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        AdmissionLane, AdmissionOutcome, DropReason, LogEvent, MAX_IDENTITY_BYTES, RunCorrelation,
-        Severity, SignalField, SpanFact, SpanName, SpanStatus, TRUNCATION_MARKER, TelemetryArena,
-        TelemetryProducer, TelemetryReceiver, bounded_utf8,
+        AdmissionLane, AdmissionOutcome, DrainOutcome, DropReason, LogEvent, MAX_IDENTITY_BYTES,
+        RunCorrelation, Severity, SignalField, SpanFact, SpanName, SpanStatus, TRUNCATION_MARKER,
+        TelemetryArena, TelemetryProducer, TelemetryReceiver, bounded_utf8,
     };
 
     /// A policy whose only variable is the attribute cap under test. Declares
@@ -1722,6 +1801,105 @@ replacement = "{replacement}"
             .get(field)
             .unwrap_or_else(|| panic!("field {field} is missing: {:?}", batch.logs()[0]))
             .clone()
+    }
+
+    /// A steady per-record pipeline must not lose authored events to the drain.
+    ///
+    /// The drain used to hold the arena across the whole batch, including a
+    /// `serde_json::from_slice` per slot. Producers never wait — a refused
+    /// `try_lock` discards the signal as `Contended` — so with the export
+    /// worker polling every two milliseconds, a `when: per_record, every: 1`
+    /// directive lost an arbitrary subset of its records to a parse that had
+    /// nothing to do with them, while the arena had free slots throughout.
+    ///
+    /// What the drain genuinely needs the arena for is copying the bytes out
+    /// and freeing the slots. Staging is exactly that half, so a producer
+    /// admitting between the staging and the decode is a producer admitting
+    /// while the old drain would have been holding the lock.
+    #[test]
+    fn a_producer_admits_while_the_drain_decodes() {
+        let (producer, receiver) = arena("256B");
+        for _ in 0..16 {
+            assert!(
+                producer
+                    .emit_log(LogEvent {
+                        event: "transform.seen",
+                        severity: Severity::Info,
+                        message: "seen",
+                        correlation: correlation(),
+                        fields: &[SignalField::new("amount", "1")],
+                    })
+                    .is_accepted()
+            );
+        }
+
+        let staged = receiver
+            .stage_queued()
+            .expect("an uncontended arena stages its queue");
+        assert_eq!(staged.spans.len(), 16, "every queued signal is staged");
+
+        // The decode has not run yet. Under the old drain this is the window
+        // that swallowed a per-record directive's events.
+        for amount in 0..16 {
+            let outcome = producer.emit_log(LogEvent {
+                event: "transform.seen",
+                severity: Severity::Info,
+                message: "seen",
+                correlation: correlation(),
+                fields: &[SignalField::new("amount", &amount.to_string())],
+            });
+            assert!(
+                outcome.is_accepted(),
+                "a record admitted while the drain decodes must not be lost: {outcome:?}"
+            );
+        }
+        assert_eq!(
+            producer.snapshot().contention_drops,
+            0,
+            "decoding a drained batch must not read as contention"
+        );
+    }
+
+    /// A refused drain is not an empty arena.
+    ///
+    /// `try_recv_batch` answers `None` to both, so a final flush that reads it
+    /// as "nothing left" reported `flush_complete: true` for a flush that was
+    /// merely refused the lock — claiming a run fully exported on exactly the
+    /// runs where signals were left behind.
+    #[test]
+    fn a_refused_drain_is_not_an_empty_arena() {
+        let (producer, receiver) = arena("256B");
+        assert!(
+            matches!(receiver.drain(), DrainOutcome::Empty),
+            "an arena nothing was admitted to is empty"
+        );
+        assert!(
+            producer
+                .emit_log(LogEvent {
+                    event: "transform.seen",
+                    severity: Severity::Info,
+                    message: "seen",
+                    correlation: correlation(),
+                    fields: &[SignalField::new("amount", "1")],
+                })
+                .is_accepted()
+        );
+
+        let held = receiver.shared.lock().expect("the arena lock is available");
+        assert!(
+            matches!(receiver.drain(), DrainOutcome::Contended),
+            "a drain that was refused the arena must say so"
+        );
+        drop(held);
+
+        match receiver.drain() {
+            DrainOutcome::Batch(batch) => assert_eq!(
+                batch.logs().len(),
+                1,
+                "the signal the refused drain could not see is still there"
+            ),
+            other => panic!("the arena still holds the admitted log: {other:?}"),
+        }
     }
 
     /// Configuration validates node names only for duplication, so every one of

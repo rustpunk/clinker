@@ -212,7 +212,7 @@ where
     };
     let deferred_pass = ctx.in_deferred_dispatch;
     let mut signals = if deferred_pass {
-        let carry = ctx.transform_signal_carry.remove(&logical_node);
+        let carry = ctx.transform_signal_carry.take(&logical_node);
         LogDispatcher::deferred(
             ctx.telemetry_producer.clone(),
             &payload.log,
@@ -442,7 +442,7 @@ where
     )?;
     signals.finish();
     if let Some(carry) = signals.into_carry() {
-        ctx.transform_signal_carry.insert(logical_node, carry);
+        ctx.transform_signal_carry.park(logical_node, carry);
     }
 
     Ok(())

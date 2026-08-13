@@ -107,7 +107,15 @@ Every pipeline has a flat `nodes:` list. Each entry is a node with a `type:` dis
 
 ## Node naming
 
-Every node must have a `name:` field. Names must be unique within the pipeline and **must not contain dots** -- the dot character is reserved for port syntax (see below). Names are used for wiring, logging, and diagnostics.
+Every node must have a `name:` field. Names must be unique within the pipeline and **must not contain dots** -- the dot addresses something other than a node: a route branch (`split.high`, see below) and a node inside a composition call site (`enrich.ref`). The rule covers every node kind, including sources, outputs, and composition call sites, and it covers nodes declared inside a `.comp.yaml` body. Names are used for wiring, logging, and diagnostics.
+
+A dotted name is refused at plan time with `E010`, which names the node and the name to use instead:
+
+```text
+node name "enrich.ref" is invalid: '.' is reserved for branch references and
+composition call-site paths; rename the node to "enrich_ref" (use underscores
+or hyphens) and update every reference to it
+```
 
 ## Wiring by node kind
 

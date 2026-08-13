@@ -555,6 +555,144 @@ nodes:
         );
     }
 
+    /// A top-level node named `enrich.ref` once compiled: `.` was reserved in a
+    /// transform, aggregate, and route name, but not in a source, output, or
+    /// composition one. Joining a call site to a body node with a bare `.`
+    /// therefore gave that node and the body source `ref` under composition
+    /// `enrich` one key. Nothing detected it — the required keys are collected
+    /// into a set, and the duplicate check guards bindings rather than nodes —
+    /// so one binding answered for both, and the run published a single dataset
+    /// as both an input and an output, each carrying the other's column edges.
+    ///
+    /// Two changes closed it, and this test pins the outer one: the key join
+    /// escapes a name's own `.`, which makes the collision unrepresentable, and
+    /// the planner now refuses a `.` in any node name, which makes it
+    /// unreachable. Lineage therefore never receives this pipeline at all. The
+    /// escape stays covered where it can still be exercised — directly, in
+    /// `builder`'s `distinct_node_paths_get_distinct_identity_keys` — so it
+    /// remains a safety net rather than the only thing standing between the
+    /// engine and a silently merged dataset. Should the naming rule ever be
+    /// relaxed, this test fails first and points at the escape.
+    #[test]
+    fn a_dotted_node_name_does_not_collide_with_a_call_site_path() {
+        const COLLIDING: &str = r#"
+pipeline: { name: dotted_output_name }
+nodes:
+  - type: source
+    name: drive
+    config:
+      name: drive
+      type: csv
+      path: data/top.csv
+      schema: [{ name: x, type: int }]
+  - type: composition
+    name: enrich
+    input: drive
+    use: ../compositions/own_source.comp.yaml
+    inputs:
+      driver: drive
+  - type: output
+    name: enrich.ref
+    input: enrich
+    config: { name: enrich.ref, type: csv, path: out/out.csv }
+"#;
+
+        let diags = parse_config(COLLIDING)
+            .expect("the colliding pipeline is well-formed YAML")
+            .compile(&CompileContext::with_pipeline_dir(
+                fixtures_root(),
+                "pipelines",
+            ))
+            .expect_err("a node named for a call-site path must not compile");
+
+        let refusal = diags
+            .iter()
+            .find(|d| d.code == "E010")
+            .unwrap_or_else(|| panic!("expected E010 for the dotted output; got: {diags:?}"));
+        assert!(
+            refusal.message.contains("enrich.ref") && refusal.message.contains("enrich_ref"),
+            "the refusal names the output and the name it should take instead: {:?}",
+            refusal.message
+        );
+    }
+
+    /// A binding key is capped at 128 bytes, and the cap is applied to a key
+    /// composed from names that carry no cap of their own. A long call-site
+    /// name over a body node name therefore produced a key no binding could
+    /// spell — and the run reported it as a *missing* binding, telling the
+    /// author to add one that both the identity context and the configuration
+    /// boundary refuse. The diagnostic asked for something the tool would not
+    /// accept.
+    ///
+    /// The cap stays, because it is the same bound the configuration boundary
+    /// applies and a binding key has to fit through both. What changes is the
+    /// diagnostic: it names the constraint and leaves the author the correction
+    /// that works — rename the pipeline nodes the key is composed from.
+    #[test]
+    fn a_composed_key_over_the_cap_names_a_correction_the_author_can_make() {
+        let call_site = "e".repeat(130);
+        let pipeline = format!(
+            r#"
+pipeline: {{ name: long_call_site }}
+nodes:
+  - type: source
+    name: drive
+    config:
+      name: drive
+      type: csv
+      path: data/top.csv
+      schema: [{{ name: x, type: int }}]
+  - type: composition
+    name: {call_site}
+    input: drive
+    use: ../compositions/own_source.comp.yaml
+    inputs:
+      driver: drive
+  - type: output
+    name: out
+    input: {call_site}
+    config: {{ name: out, type: csv, path: out/out.csv }}
+"#
+        );
+
+        let identities = LineageIdentityContext::external([
+            binding("drive", "driver_rows"),
+            binding("out", "published_report"),
+        ])
+        .expect("both bindable nodes are bound");
+
+        let err = column_lineage_external(&compile_fixture(&pipeline), &identities)
+            .expect_err("the body source's key cannot be bound");
+        let expected_key = format!("{call_site}.ref");
+        assert_eq!(
+            err,
+            LineageIdentityError::UnbindableNode {
+                node: expected_key.clone(),
+                bytes: expected_key.len(),
+            }
+        );
+
+        // The key the author would have to write is refused by the same bound,
+        // which is why asking for it would have been a dead end.
+        assert_eq!(
+            LineageIdentityContext::external([binding(&expected_key, "reference_codes")])
+                .expect_err("a key over the cap is not a binding key"),
+            LineageIdentityError::InvalidNode {
+                node: expected_key.clone()
+            }
+        );
+
+        let diagnostic = err.to_string();
+        assert!(
+            diagnostic.contains("rename those pipeline nodes"),
+            "the correction has to be one the author can carry out: {diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains("add one canonical datasource"),
+            "and must not be the one that asks for a refused binding: {diagnostic}"
+        );
+    }
+
     /// The same pipeline under local diagnostic paths — the mode that already
     /// walked body sources — resolves both to distinct path-derived datasets.
     /// External mode now reaches the same node set rather than aborting.

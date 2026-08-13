@@ -419,16 +419,27 @@ impl PipelineError {
     /// The error tells an operator to report this operator's identity, so the
     /// identity has to survive the rendering. Configuration applies no grammar
     /// to a node name: `normalize  orders` and `orders{eu}` are both names a
-    /// planner admits. Passing them through the stable *message* sanitizer
-    /// renamed them — it whitespace-normalizes prose, and it reads a brace, a
-    /// `Some(`, or a leading `/` as a leaked Debug payload or path — so the
-    /// error named a node that is not in the plan, or none at all.
+    /// planner admits, and `redact_secret_columns` is an apt name for a node
+    /// that redacts secret columns.
     ///
-    /// The one thing that is not a node name is credential- or record-bearing
-    /// text, and that still collapses to a fixed marker. The verdict comes from
-    /// the shared sanitizer rather than a second copy of its vocabulary: the
-    /// probe below neutralizes only the punctuation the prose-shape heuristics
-    /// key on, so what remains to reject is exactly the sensitive-label rule.
+    /// None of it goes through the stable *message* sanitizer. That sanitizer
+    /// decides what free-form prose may echo, where a quoted credential or a
+    /// dumped record is a value the tool found somewhere and the reader never
+    /// asked to see; it therefore whitespace-normalizes, reads a brace or a
+    /// leading `/` as a leaked Debug payload or path, and rejects a plain
+    /// substring `secret` or `authorization` anywhere in the text. A node name
+    /// is none of those things. The operator reading this line wrote the name,
+    /// in the pipeline file the line is sending them back to, so there is
+    /// nothing in it to withhold from them — and withholding it defeated the
+    /// message: the sentence asked for an identity it had just erased, and
+    /// every name the label rule caught rendered as the same fixed marker, so
+    /// two unrelated failures became one indistinguishable string.
+    ///
+    /// What a name still may not do is break the line that carries it. A
+    /// control character would let an authored name forge a record in whatever
+    /// consumes the rendered error, and a name with no printable content is no
+    /// identity to report; both collapse to a fixed marker instead. Length is
+    /// bounded here for the same reason it is bounded at the dispatcher.
     pub fn bounded_dispatch_node_name(node: &str) -> String {
         let mut end = node.len().min(DISPATCH_MISMATCH_NODE_MAX_BYTES);
         while !node.is_char_boundary(end) {
@@ -449,26 +460,13 @@ impl PipelineError {
 
     /// Whether a bounded node name can be rendered as written.
     ///
-    /// A control character is not part of any name and would let an authored
-    /// name forge a line in whatever consumes the rendered error.
+    /// Rendering integrity only. A control character is not part of any name
+    /// and would let an authored name forge a line in whatever consumes the
+    /// rendered error; a name with no printable content names nothing.
+    /// Everything else a planner admitted is the operator's own identifier and
+    /// is reported back to them unaltered.
     fn node_name_is_reportable(name: &str) -> bool {
-        if name.trim().is_empty() || name.chars().any(char::is_control) {
-            return false;
-        }
-        let probe: String = name
-            .chars()
-            .map(|character| match character {
-                '{' | '}' | '(' | ')' | '[' | ']' | '/' | '\\' => '_',
-                other => other,
-            })
-            .collect();
-        clinker_core_types::FailureClassification::new(
-            "runtime.invariant.dispatch_mismatch",
-            &probe,
-        )
-        .expect("the append-only registry contains runtime.invariant.dispatch_mismatch")
-        .message()
-            != "runtime dispatch invariant failed"
+        !name.trim().is_empty() && !name.chars().any(char::is_control)
     }
 }
 
@@ -896,18 +894,59 @@ mod tests {
             "internal dispatch mismatch in dispatch_route: expected route, got transform at node 'normalize_orders'; contact support with this operator identity"
         );
 
-        let sensitive = PipelineError::DispatchMismatch {
+        // Whatever the planner admitted as a name is the operator's own text,
+        // reported back to them as written. The rendering stays bounded.
+        let awkward = PipelineError::DispatchMismatch {
             dispatcher: "dispatch_route",
             expected_kind: "route",
             actual_kind: "transform",
             node: "/srv/private.csv record={token=secret}".to_owned(),
         }
         .to_string();
-        assert!(sensitive.contains("<redacted-node>"), "{sensitive}");
-        for forbidden in ["/srv/", "private.csv", "record=", "token=", "secret"] {
-            assert!(!sensitive.contains(forbidden), "{sensitive}");
-        }
-        assert!(sensitive.len() < 320, "{sensitive}");
+        assert!(
+            awkward.contains("at node '/srv/private.csv record={token=secret}'"),
+            "{awkward}"
+        );
+        assert!(awkward.len() < 320, "{awkward}");
+    }
+
+    /// A node whose name reads as a label is still a node with a name.
+    ///
+    /// `redact_secret_columns` is what an author calls a node that redacts
+    /// secret columns. Routing the name through the prose sanitizer's
+    /// plain-substring label rule erased it, so a sentence whose whole purpose
+    /// is to hand over an operator identity handed over none — and handed over
+    /// the *same* none for every such node, making two distinct failures one
+    /// string.
+    #[test]
+    fn dispatch_mismatch_reports_a_node_whose_name_reads_as_a_label() {
+        let renderings: Vec<String> = [
+            "redact_secret_columns",
+            "strip_authorization_header",
+            "mask_password_field",
+            "rotate_apikey_column",
+            "drop_credential_columns",
+        ]
+        .into_iter()
+        .map(|node| {
+            let rendered = PipelineError::DispatchMismatch {
+                dispatcher: "dispatch_route",
+                expected_kind: "route",
+                actual_kind: "transform",
+                node: node.to_owned(),
+            }
+            .to_string();
+            assert!(
+                rendered.contains(&format!("at node '{node}'")),
+                "the reported identity must be the authored one: {rendered}"
+            );
+            rendered
+        })
+        .collect();
+
+        // The point of naming the node is telling these failures apart.
+        let distinct: std::collections::BTreeSet<&String> = renderings.iter().collect();
+        assert_eq!(distinct.len(), renderings.len(), "{renderings:?}");
     }
 
     /// The error asks for an operator identity, so it has to render one.

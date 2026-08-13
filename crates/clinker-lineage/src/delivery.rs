@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -15,6 +15,26 @@ use crate::RunEvent;
 /// contention. Orders of magnitude above the hold time, which is one
 /// `VecDeque` operation, so it only matters when the scheduler is against us.
 const PRODUCER_LOCK_PATIENCE: Duration = Duration::from_millis(50);
+
+/// The share of the flush deadline the worker may spend *starting* records.
+///
+/// The deadline bounds the whole flush, and a worker that is still inside a
+/// record when the finisher gives up is detached mid-write: the bytes already
+/// accepted stay on the destination, so the published NDJSON ends in a record
+/// that never closes. A reader of a short file can stop at the last event; a
+/// reader of a truncated one hits an unparseable line.
+///
+/// Splitting the deadline is what keeps the two ends from meeting on the same
+/// instant. The worker stops taking new records off the queue once this share
+/// has passed, so the only record that can be in flight at the deadline is one
+/// begun before it, and the remaining share is time for that record to close
+/// while the finisher is still listening. The whole flush therefore stays
+/// inside exactly the deadline the operator configured — nothing is added to
+/// the run's worst case — and the ordinary cost is bounded by the queue's own
+/// depth: a run offers a START and one terminal event, so at most one record is
+/// given up, and only when the destination is already too slow to have finished
+/// in half the time it was given.
+const DRAIN_SHARE_OF_DEADLINE: u32 = 2;
 
 /// Fixed delivery limits copied from the admitted workspace policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,6 +165,7 @@ pub struct LineageDeliveryOutcome {
     dropped: u64,
     full: u64,
     terminal: LineageDeliveryTerminal,
+    records_complete: bool,
 }
 
 impl LineageDeliveryOutcome {
@@ -167,6 +188,25 @@ impl LineageDeliveryOutcome {
     pub const fn terminal(self) -> LineageDeliveryTerminal {
         self.terminal
     }
+
+    /// Whether the bytes the destination holds end on a record boundary.
+    ///
+    /// A short file and a truncated one are different artifacts: the first is
+    /// missing its tail, the second ends in a record that never closes and a
+    /// conformant NDJSON reader fails on it. The counters alone cannot tell
+    /// them apart — a run that gave up on a slow destination reports the same
+    /// accepted total either way — so the completeness of the *file* is
+    /// reported separately from the completeness of the *counts*.
+    ///
+    /// True on every normal shutdown. False only when a write was still
+    /// outstanding, or had already been partly accepted, when this outcome was
+    /// taken: the destination may then hold the opening bytes of a record whose
+    /// remainder was never written. Conservative in that one direction — a
+    /// write call that never returns is counted as incomplete, because a
+    /// blocked write may already have transferred part of its buffer.
+    pub const fn records_complete(self) -> bool {
+        self.records_complete
+    }
 }
 
 #[derive(Default)]
@@ -183,12 +223,17 @@ impl Counters {
         });
     }
 
-    fn outcome(&self, terminal: LineageDeliveryTerminal) -> LineageDeliveryOutcome {
+    fn outcome(
+        &self,
+        terminal: LineageDeliveryTerminal,
+        records_complete: bool,
+    ) -> LineageDeliveryOutcome {
         LineageDeliveryOutcome {
             accepted: self.accepted.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             full: self.full.load(Ordering::Relaxed),
             terminal,
+            records_complete,
         }
     }
 }
@@ -207,6 +252,15 @@ struct QueueState {
     events: VecDeque<QueuedRecord>,
     queued_bytes: usize,
     closed: bool,
+    /// When producer admission closed — the instant the flush deadline is
+    /// measured from, so the worker and the finisher bound the same window from
+    /// the same origin rather than from two clocks started at two moments.
+    closed_at: Option<Instant>,
+    /// Set when the finisher has stopped waiting. The worker takes no further
+    /// record: whatever it writes after that is not counted in the outcome the
+    /// run already reported, and every record it adds is one more chance for
+    /// the process to exit inside a write.
+    abandoned: bool,
 }
 
 struct DeliveryQueue {
@@ -236,6 +290,8 @@ impl DeliveryQueue {
                 events: VecDeque::with_capacity(reserved_events),
                 queued_bytes: 0,
                 closed: false,
+                closed_at: None,
+                abandoned: false,
             }),
             ready: Condvar::new(),
         }
@@ -327,15 +383,31 @@ impl DeliveryQueue {
         QueueAdmission::Accepted
     }
 
-    fn pop(&self) -> Option<Box<[u8]>> {
+    /// Take the next record, or say why there is not one.
+    ///
+    /// `drain_budget` is the share of the flush deadline the worker may spend
+    /// starting records, measured from the instant admission closed. Checking
+    /// it here rather than after the write is the whole point: a record is
+    /// either begun inside the window and carried to its last byte, or never
+    /// begun at all, so the destination is only ever left between records.
+    fn pop(&self, drain_budget: Duration) -> Popped {
         let mut state = self.lock_state();
         loop {
+            if state.abandoned {
+                return Popped::OutOfTime;
+            }
+            if state
+                .closed_at
+                .is_some_and(|closed_at| closed_at.elapsed() >= drain_budget)
+            {
+                return Popped::OutOfTime;
+            }
             if let Some(record) = state.events.pop_front() {
                 state.queued_bytes = state.queued_bytes.saturating_sub(record.charge);
-                return Some(record.bytes);
+                return Popped::Record(record.bytes);
             }
             if state.closed {
-                return None;
+                return Popped::Drained;
             }
             state = match self.ready.wait(state) {
                 Ok(state) => state,
@@ -347,9 +419,28 @@ impl DeliveryQueue {
     fn close(&self) {
         let mut state = self.lock_state();
         state.closed = true;
+        state.closed_at.get_or_insert_with(Instant::now);
         drop(state);
         self.ready.notify_all();
     }
+
+    /// Stop the worker from beginning any further record.
+    fn abandon(&self) {
+        let mut state = self.lock_state();
+        state.abandoned = true;
+        drop(state);
+        self.ready.notify_all();
+    }
+}
+
+/// What one drain attempt found.
+enum Popped {
+    Record(Box<[u8]>),
+    /// Admission is closed and every accepted record has been taken.
+    Drained,
+    /// The worker's share of the flush deadline is spent, or the finisher has
+    /// stopped waiting. Whatever is still queued is not delivered.
+    OutOfTime,
 }
 
 struct CappedEventBuffer {
@@ -425,13 +516,64 @@ fn serialize_event(event: &RunEvent, limit: usize) -> SerializedEvent {
     }
 }
 
-fn run_worker<W: Write>(queue: &DeliveryQueue, sink: &mut W) -> LineageDeliveryTerminal {
-    while let Some(event) = queue.pop() {
-        if let Err(error) = sink.write_all(&event) {
-            return LineageDeliveryTerminal::WriteFailed(error.kind());
+/// Write one framed record, tracking whether the destination is left inside it.
+///
+/// `mid_record` is set while a write call is outstanding and cleared only once
+/// the record's last byte has been accepted, so the finisher can report whether
+/// the bytes on the destination end on a record boundary. A call that returns an
+/// error transferred nothing, so the flag then reflects what earlier calls of
+/// this same record had already put there; a call that never returns is counted
+/// as mid-record, because a blocked write may already have transferred part of
+/// its buffer.
+///
+/// This is `write_all` with that accounting added — the loop cannot be avoided
+/// by writing the whole record in one call, since a destination is free to
+/// accept a record in pieces and a pipe with a slow reader routinely does.
+fn write_record<W: Write>(sink: &mut W, record: &[u8], mid_record: &AtomicBool) -> io::Result<()> {
+    let mut accepted = 0;
+    while accepted < record.len() {
+        mid_record.store(true, Ordering::Release);
+        match sink.write(&record[accepted..]) {
+            Ok(0) => {
+                mid_record.store(accepted > 0, Ordering::Release);
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
+            }
+            Ok(written) => accepted += written,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                mid_record.store(accepted > 0, Ordering::Release);
+                return Err(error);
+            }
         }
+        mid_record.store(accepted > 0 && accepted < record.len(), Ordering::Release);
     }
+    Ok(())
+}
+
+fn run_worker<W: Write>(
+    queue: &DeliveryQueue,
+    sink: &mut W,
+    drain_budget: Duration,
+    mid_record: &AtomicBool,
+) -> LineageDeliveryTerminal {
+    let out_of_time = loop {
+        match queue.pop(drain_budget) {
+            Popped::Record(event) => {
+                if let Err(error) = write_record(sink, &event, mid_record) {
+                    return LineageDeliveryTerminal::WriteFailed(error.kind());
+                }
+            }
+            Popped::Drained => break false,
+            Popped::OutOfTime => break true,
+        }
+    };
+    // Flushed on the out-of-time path too: everything buffered is a whole
+    // record, so getting it out is what turns "the file stops early" into "the
+    // file stops early at a record boundary". If the flush is what the slow
+    // destination is slow at, the finisher's remaining share expires and the
+    // file is short by exactly the buffered records, still never mid-record.
     match sink.flush() {
+        Ok(()) if out_of_time => LineageDeliveryTerminal::DeadlineExceeded,
         Ok(()) => LineageDeliveryTerminal::Shutdown,
         Err(error) => LineageDeliveryTerminal::FlushFailed(error.kind()),
     }
@@ -444,6 +586,9 @@ pub struct LineageDelivery {
     counters: Arc<Counters>,
     outcome_rx: mpsc::Receiver<LineageDeliveryTerminal>,
     worker: Option<JoinHandle<()>>,
+    /// Set by the worker while a record's bytes are only partly on the
+    /// destination. Read once, when the outcome is taken.
+    mid_record: Arc<AtomicBool>,
 }
 
 impl LineageDelivery {
@@ -469,11 +614,15 @@ impl LineageDelivery {
         ));
         let counters = Arc::new(Counters::default());
         let worker_queue = Arc::clone(&queue);
+        let mid_record = Arc::new(AtomicBool::new(false));
+        let worker_mid_record = Arc::clone(&mid_record);
+        let drain_budget = config.flush_deadline / DRAIN_SHARE_OF_DEADLINE;
         let (outcome_tx, outcome_rx) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("clinker-lineage-export".to_owned())
             .spawn(move || {
-                let terminal = run_worker(&worker_queue, &mut sink);
+                let terminal =
+                    run_worker(&worker_queue, &mut sink, drain_budget, &worker_mid_record);
                 worker_queue.close();
                 let _ = outcome_tx.send(terminal);
             })?;
@@ -483,6 +632,7 @@ impl LineageDelivery {
             counters,
             outcome_rx,
             worker: Some(worker),
+            mid_record,
         })
     }
 
@@ -536,6 +686,14 @@ impl LineageDelivery {
 
     /// Close producer admission and wait no longer than the exact resolved
     /// lineage deadline. A timed-out worker handle is detached on return.
+    ///
+    /// The wait is never extended: the worker gives up taking new records after
+    /// [`DRAIN_SHARE_OF_DEADLINE`], so on a destination that is merely slow it
+    /// reports back inside the deadline having stopped between records, and the
+    /// file this run publishes is short rather than truncated. A destination
+    /// that has stopped accepting bytes altogether cannot be waited on, so the
+    /// handle is detached and [`LineageDeliveryOutcome::records_complete`]
+    /// carries whether it was left inside a record.
     pub fn finish(mut self) -> LineageDeliveryOutcome {
         let started = Instant::now();
         self.queue.close();
@@ -551,7 +709,15 @@ impl LineageDelivery {
                 }
                 terminal
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => LineageDeliveryTerminal::DeadlineExceeded,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // The worker is inside a write that has not returned. It keeps
+                // the handle it owns, but it takes nothing further off the
+                // queue: a record begun after this point would be written by a
+                // thread the process is already free to exit underneath, and
+                // its opening bytes would be the last thing in the file.
+                self.queue.abandon();
+                LineageDeliveryTerminal::DeadlineExceeded
+            }
             // The worker sends its outcome before it returns, so a closed
             // channel means it did not return — it unwound. Calling that a
             // shutdown would report a dead exporter as a clean flush and leave
@@ -560,7 +726,8 @@ impl LineageDelivery {
                 LineageDeliveryTerminal::WriteFailed(io::ErrorKind::Other)
             }
         };
-        self.counters.outcome(terminal)
+        self.counters
+            .outcome(terminal, !self.mid_record.load(Ordering::Acquire))
     }
 }
 
@@ -615,7 +782,7 @@ mod tests {
                 "round {round}: a queue emptied of every record has room again"
             );
             assert!(
-                queue.pop().is_some(),
+                matches!(queue.pop(Duration::MAX), Popped::Record(_)),
                 "round {round}: the record comes back"
             );
             let queued = queue.state.lock().expect("uncontended").queued_bytes;
@@ -667,7 +834,164 @@ mod tests {
             charge,
             "the queue accounts for the record it holds and nothing besides"
         );
-        assert!(queue.pop().is_some(), "and the worker still drains it");
+        assert!(
+            matches!(queue.pop(Duration::MAX), Popped::Record(_)),
+            "and the worker still drains it"
+        );
+    }
+
+    /// A destination that takes a record in small pieces, slowly — a pipe with
+    /// a reader that is behind, which is exactly the case the flush deadline
+    /// exists for.
+    struct DribblingSink {
+        published: Arc<Mutex<Vec<u8>>>,
+        chunk: usize,
+        per_chunk: Duration,
+    }
+
+    impl Write for DribblingSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            thread::sleep(self.per_chunk);
+            let taken = bytes.len().min(self.chunk);
+            self.published
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(&bytes[..taken]);
+            Ok(taken)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A run that gives up on a slow destination publishes a file that is
+    /// short, not one that is corrupt.
+    ///
+    /// The deadline used to expire with the worker in the middle of a
+    /// `write_all`, and the handle was then detached rather than joined, so the
+    /// bytes the destination had already taken were the opening of a record
+    /// whose remainder no one would write. A consumer reading the published
+    /// NDJSON did not find fewer events; it found an unparseable last line. The
+    /// worker now stops taking records once its share of the deadline is spent,
+    /// so the only record it can be inside at the deadline is one begun before
+    /// it, and that one is carried to its last byte while the finisher is still
+    /// listening.
+    #[test]
+    fn a_file_cut_short_by_the_deadline_ends_on_a_record_boundary() {
+        let event = event_of_known_size();
+        let exact = serde_json::to_vec(&event).expect("the probe event serializes");
+        let published = Arc::new(Mutex::new(Vec::new()));
+        // Well under the drain share, so the record in flight when the share
+        // ends closes with the whole second half of the deadline to spare.
+        let per_record = Duration::from_millis(8);
+        let chunk = exact.len().div_ceil(16);
+        let config = LineageDeliveryConfig::new(
+            (exact.len() + 1) * 64,
+            exact.len(),
+            Duration::from_millis(400),
+        )
+        .expect("legal delivery limits");
+        let delivery = LineageDelivery::start(
+            config,
+            DribblingSink {
+                published: Arc::clone(&published),
+                chunk,
+                per_chunk: per_record / 16,
+            },
+        )
+        .expect("the worker starts");
+
+        // More events than the destination can take in the whole deadline, so
+        // the run is certain to give up on it.
+        for _ in 0..64 {
+            let _ = delivery.try_emit(&event);
+        }
+        let outcome = delivery.finish();
+
+        assert_eq!(
+            outcome.terminal(),
+            LineageDeliveryTerminal::DeadlineExceeded,
+            "the destination cannot take every event in the time it was given"
+        );
+        let published = published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            !published.is_empty(),
+            "the destination took what it could before the deadline"
+        );
+        assert_eq!(
+            published.last(),
+            Some(&b'\n'),
+            "the published bytes end where a record ends"
+        );
+        for (index, line) in published.split(|byte| *byte == b'\n').enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            serde_json::from_slice::<serde_json::Value>(line).unwrap_or_else(|error| {
+                panic!("record {index} is a complete JSON object: {error}")
+            });
+        }
+        assert!(
+            outcome.records_complete(),
+            "and the outcome says so, so a consumer can tell this from a truncated file"
+        );
+        assert!(
+            outcome.accepted() >= 1,
+            "the events the destination did take are still counted"
+        );
+    }
+
+    /// A destination that stops accepting bytes altogether cannot be waited
+    /// on, and the run must not hang for one. The file may then end inside a
+    /// record — and the outcome has to say so, because the counters cannot:
+    /// they report what entered the queue, not what reached the file whole.
+    #[test]
+    fn a_destination_that_stops_mid_record_is_reported_as_incomplete() {
+        let event = event_of_known_size();
+        let exact = serde_json::to_vec(&event).expect("the probe event serializes");
+        let config = LineageDeliveryConfig::new(
+            (exact.len() + 1) * 4,
+            exact.len(),
+            Duration::from_millis(60),
+        )
+        .expect("legal delivery limits");
+
+        struct StuckAfterFirstChunk {
+            taken: bool,
+        }
+
+        impl Write for StuckAfterFirstChunk {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.taken {
+                    thread::sleep(Duration::from_secs(30));
+                    return Ok(bytes.len());
+                }
+                self.taken = true;
+                Ok(bytes.len().min(8))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let delivery = LineageDelivery::start(config, StuckAfterFirstChunk { taken: false })
+            .expect("the worker starts");
+        assert_eq!(delivery.try_emit(&event), LineageAdmission::Accepted);
+        let outcome = delivery.finish();
+
+        assert_eq!(
+            outcome.terminal(),
+            LineageDeliveryTerminal::DeadlineExceeded
+        );
+        assert!(
+            !outcome.records_complete(),
+            "the destination holds the opening of a record nothing will finish"
+        );
     }
 
     /// The promise the validator makes to an author who sets `max_event_bytes`

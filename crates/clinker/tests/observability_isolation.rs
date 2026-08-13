@@ -1595,3 +1595,51 @@ fn fault_matrix_lineage_outcomes_leave_otlp_and_authoritative_truth_unchanged() 
         assert!(diagnostic.contains(expected), "{diagnostic}");
     }
 }
+
+/// The lineage delivery line separates a short export from a truncated one.
+///
+/// The counters cannot: a run that lost events to the caps and a run whose
+/// worker was still inside a write both report an accepted total lower than
+/// what was offered, and the file left behind looks the same either way — an
+/// NDJSON file that stops. One of the two is still readable and the other is
+/// not, and only the run knows which, so `records_complete` is reported beside
+/// the counters rather than inferred from them.
+#[test]
+fn the_lineage_delivery_line_says_whether_the_destination_ends_on_a_record() {
+    // Left inside a write that never returned: the destination may hold the
+    // opening bytes of a record whose remainder was never written.
+    let blocked = invoke_fault_matrix(
+        None,
+        "success",
+        Some("hang-after-first-write"),
+        false,
+        "4KB",
+    );
+    let diagnostic = String::from_utf8_lossy(&blocked.output.stderr);
+    assert!(
+        diagnostic.contains("clinker: lineage delivery outcome:"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("records_complete=false"),
+        "a destination abandoned mid-record is reported as such: {diagnostic}"
+    );
+
+    // Short for an entirely different reason: the event cap refused events
+    // before they were ever queued, so every byte that did reach the file is a
+    // whole record and the file is valid NDJSON missing its tail.
+    let capped = invoke_fault_matrix(None, "success", None, false, "1KB");
+    let diagnostic = String::from_utf8_lossy(&capped.output.stderr);
+    assert!(
+        diagnostic.contains("clinker: lineage delivery outcome:"),
+        "a run that dropped events reports them: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("dropped=") && !diagnostic.contains("dropped=0 "),
+        "this case is a short export, so it must actually have dropped: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("records_complete=true"),
+        "a short export must not be reported as a truncated one: {diagnostic}"
+    );
+}

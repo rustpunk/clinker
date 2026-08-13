@@ -226,12 +226,52 @@ type DatasetResolver<'a> =
 /// also the spelling a channel `sources:` patch already uses to reach a
 /// body-declared source, and it is per call site — which matters, because two
 /// call sites of one body can be patched to read different files.
+///
+/// The join is a key only if the separator cannot occur inside a component.
+/// Configuration reserves `.` in every node name, so today it cannot — but it
+/// once reserved the character in a Transform / Aggregate / Route name only,
+/// and a top-level output named `enrich.ref` then flattened onto the body
+/// source `ref` under composition `enrich`: one binding answered for both, and
+/// the run emitted a single dataset as both its input and its output, each
+/// carrying the other's column edges — silently, because nothing downstream can
+/// tell a collision from a node that genuinely is both.
+///
+/// Each component is escaped before it is joined regardless
+/// ([`escape_component`]), leaving a call-site join as the only unescaped `.` a
+/// key contains: distinct `(scope, name)` pairs render to distinct keys, so the
+/// mapping is injective on its own rather than by borrowing a naming rule
+/// enforced a layer away. The key is what an author types in
+/// `[[observability.lineage.dataset]]`, which is why this is escaping rather
+/// than the length-prefixed opaque form a purely internal key would use — the
+/// two nodes above would be `enrich.ref` and `enrich\.ref`, both writable by
+/// hand.
 fn qualified_node<'a>(scope: &str, name: &'a str) -> Cow<'a, str> {
+    let escaped = escape_component(name);
     if scope.is_empty() {
-        Cow::Borrowed(name)
+        escaped
     } else {
-        Cow::Owned(format!("{scope}.{name}"))
+        Cow::Owned(format!("{scope}.{escaped}"))
     }
+}
+
+/// One node name, escaped for the `.`-joined key: `\` becomes `\\` and `.`
+/// becomes `\.`.
+///
+/// `\` is escaped as well, or the escaping would not itself be injective: a node
+/// named `a\` under call site `x` and a node named `a` under a call site named
+/// `x\` would both render `x.a\`.
+fn escape_component(name: &str) -> Cow<'_, str> {
+    if !name.contains(['.', '\\']) {
+        return Cow::Borrowed(name);
+    }
+    let mut escaped = String::with_capacity(name.len() + 8);
+    for ch in name.chars() {
+        if matches!(ch, '.' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    Cow::Owned(escaped)
 }
 
 fn build_column_lineage(
@@ -378,16 +418,23 @@ fn walk_scope(
                     // column sets make them distinct logical datasets rather
                     // than subsets of `base`.
                     //
-                    // Keyed by the qualified name, like every identity lookup in
-                    // this walk. `bound_schemas` is built from the top-level
-                    // `nodes:` list alone, so a bare name would hand a body
-                    // source the schema of a same-named top-level one and split
-                    // it by record types that are not its own — naming datasets
-                    // no source in the plan declares. A body-declared source
-                    // misses instead and takes the flat arm, which is also why
-                    // its own record types are not split (see the module's
+                    // `bound_schemas` is built from the top-level `nodes:` list
+                    // alone and keyed by the declared name exactly as written,
+                    // so only a top-level source can be looked up in it. Keying
+                    // a body source by its bare name would hand it the schema of
+                    // a same-named top-level one and split it by record types
+                    // that are not its own — naming datasets no source in the
+                    // plan declares — and keying it by its escaped call-site
+                    // path would both miss here and, for a top-level name that
+                    // needed escaping, miss its own entry. A body-declared
+                    // source therefore takes the flat arm, which is also why its
+                    // own record types are not split (see the module's
                     // documented limitations).
-                    match ctx.compiled.bound_schemas().get(node_key.as_ref()) {
+                    let declared_schema = scope
+                        .is_empty()
+                        .then(|| ctx.compiled.bound_schemas().get(node.name()))
+                        .flatten();
+                    match declared_schema {
                         Some(SourceSchema::MultiRecord { record_types, .. }) => {
                             seed_multi_record_source(
                                 node,
@@ -2335,6 +2382,48 @@ mod tests {
             "expected exactly one output dataset"
         );
         &lineage.outputs[0]
+    }
+
+    /// The key the walk derives for a node reached through a chain of call
+    /// sites, built the way the walk builds it: each scope is itself a key.
+    fn key_of(path: &[&str]) -> String {
+        let mut key = String::new();
+        for name in path {
+            key = qualified_node(&key, name).into_owned();
+        }
+        key
+    }
+
+    /// A separator that can occur inside a component is not a separator.
+    /// Configuration reserves `.` in a transform, aggregate, and route name but
+    /// not in a source, output, or composition one, so a top-level node named
+    /// `enrich.ref` and a body source `ref` under composition `enrich` used to
+    /// flatten to one key — one binding for two datasets, and the column edges
+    /// of each attributed to the other with nothing to signal it.
+    #[test]
+    fn distinct_node_paths_get_distinct_identity_keys() {
+        let paths: [&[&str]; 7] = [
+            &["enrich.ref"],
+            &["enrich", "ref"],
+            &["a.b", "c"],
+            &["a", "b.c"],
+            &["a", "b", "c"],
+            &["a.b.c"],
+            &["a\\", "b"],
+        ];
+        let keys: Vec<String> = paths.iter().map(|path| key_of(path)).collect();
+        let distinct: BTreeSet<&String> = keys.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            keys.len(),
+            "every distinct node path keys a distinct binding: {keys:?}"
+        );
+
+        // The common spellings are unchanged: only a name carrying the
+        // separator, or the escape, is written differently.
+        assert_eq!(key_of(&["orders"]), "orders");
+        assert_eq!(key_of(&["enrich", "ref"]), "enrich.ref");
+        assert_eq!(key_of(&["enrich.ref"]), r"enrich\.ref");
     }
 
     fn assert_field(fields: &BTreeMap<String, FieldLineage>, col: &str, expected: &[InputField]) {

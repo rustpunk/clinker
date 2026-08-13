@@ -1500,8 +1500,10 @@ pub(crate) struct ExecutorContext<'a> {
     /// keeps only the converged result, so those passes are one execution of
     /// the transform and have to report as one. An entry is taken out at the
     /// start of a pass and put back at its end; the orchestrator closes
-    /// whatever remains once the loop stops.
-    pub(crate) transform_signal_carry: HashMap<String, crate::log_dispatch::TransformSignalCarry>,
+    /// whatever remains once the loop stops, and whatever a loop that left by
+    /// an error, a signal, or a panic did not close is reported as an
+    /// interrupted execution rather than discarded.
+    pub(crate) transform_signal_carry: crate::log_dispatch::ParkedTransformSignals,
 
     /// Streaming-Output channel senders keyed by the upstream fused
     /// `Merge` node's `NodeIndex`. Present when the executor entry has

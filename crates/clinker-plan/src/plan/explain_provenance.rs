@@ -422,6 +422,7 @@ fn parse_dotted_path(path: &str) -> Result<(&str, &str), ProvenanceExplainError>
 /// matching `docs/explain/<code>.md`; the section-coverage contract is
 /// enforced by `test_explain_docs_all_have_required_sections`.
 pub const EXPLAIN_PAGES: &[(&str, &str)] = &[
+    ("E010", include_str!("../../../../docs/explain/E010.md")),
     ("E200", include_str!("../../../../docs/explain/E200.md")),
     ("E202", include_str!("../../../../docs/explain/E202.md")),
     ("E203", include_str!("../../../../docs/explain/E203.md")),

@@ -38,7 +38,7 @@ rate_limit_burst = 240
 flush_timeout_ms = 8000
 
 [observability.otlp]
-endpoint = " HTTP://Collector.Example.invalid/root?opaque=yes "
+endpoint = "HTTP://Collector.Example.invalid/root?opaque=yes"
 connect_timeout_ms = 500
 request_timeout_ms = 2000
 retry_max_attempts = 3
@@ -111,7 +111,7 @@ fn resolves_complete_policy() {
     let otlp = policy.otlp().expect("OTLP policy is retained");
     assert_eq!(
         otlp.raw_endpoint(),
-        " HTTP://Collector.Example.invalid/root?opaque=yes "
+        "HTTP://Collector.Example.invalid/root?opaque=yes"
     );
     assert_eq!(otlp.auth(), &ObservabilityAuth::None);
     assert_eq!(otlp.connect_timeout(), Duration::from_millis(500));
@@ -580,4 +580,81 @@ catalog_name = "src"
     );
     assert!(local.lineage().unwrap().datasets().is_empty());
     assert_eq!(sentinel.path().read_dir().unwrap().count(), 0);
+}
+
+/// Padding and control characters in the endpoint are named here, by key.
+///
+/// The endpoint was validated with `trim().is_empty()` and a byte cap and then
+/// stored untrimmed, so the string that was checked and the string that was
+/// admitted were not the same string. The network boundary refuses every one
+/// of these spellings, but it can only say that some endpoint was unusable;
+/// this layer knows which key the author wrote and what to paste instead.
+#[test]
+fn padded_or_control_bearing_endpoint_is_refused_where_the_key_is_known() {
+    let valid = minimal_policy("mode = \"none\"", &canonical_dataset("src"));
+
+    for endpoint in [
+        // Surrounding padding, on either side or both.
+        "  https://collector.example.com",
+        "https://collector.example.com  ",
+        "\\thttps://collector.example.com\\t",
+        // A header the endpoint has no business carrying, and the padding that
+        // hid it: exactly the value the old emptiness check admitted.
+        "  https://collector.example.com\\r\\nX-Injected: 1  ",
+        // A control character with no padding at all.
+        "https://collector.example.com\\u0007",
+        // Whitespace only: non-empty text, no endpoint in it.
+        "   ",
+    ] {
+        let text = valid.replace("https://collector.example.com", endpoint);
+        assert_rejected(
+            &text,
+            "observability.otlp.endpoint",
+            "https://collector.example.com",
+        );
+    }
+
+    // The rule is padding and control characters, not opinion about the URL.
+    // Endpoint syntax stays the network boundary's to judge.
+    for endpoint in [
+        "opaque collector text with spaces",
+        "http://collector.example.com/path?token=private-token",
+    ] {
+        let text = valid.replace("https://collector.example.com", endpoint);
+        let policy = ClinkerToml::parse(&text)
+            .expect("raw endpoint text is not interpreted by clinker-plan")
+            .resolve_observability(None)
+            .expect("endpoint admission belongs to the network boundary");
+        assert_eq!(policy.otlp().unwrap().raw_endpoint(), endpoint);
+    }
+}
+
+/// A replacement literal is written into an emitted event, so it is held to
+/// the same rule as the other authored strings rather than to a bare length.
+#[test]
+fn padded_or_control_bearing_replacement_is_refused() {
+    let valid = minimal_policy("mode = \"none\"", &canonical_dataset("src"));
+
+    for replacement in ["  [redacted]  ", "[redacted]\\r\\nlevel=info", "\\t"] {
+        let text = format!(
+            "{valid}\n[[observability.field_policy]]\nevent = \"run.completed\"\nfield = \"customer_id\"\naction = \"replace\"\nreplacement = \"{replacement}\"\n"
+        );
+        assert_rejected(
+            &text,
+            "observability.field_policy.replacement",
+            "[redacted]",
+        );
+    }
+
+    let accepted = format!(
+        "{valid}\n[[observability.field_policy]]\nevent = \"run.completed\"\nfield = \"customer_id\"\naction = \"replace\"\nreplacement = \"[redacted]\"\n"
+    );
+    let accepted = ClinkerToml::parse(&accepted)
+        .expect("a bounded replacement parses")
+        .resolve_observability(None)
+        .expect("a bounded replacement resolves");
+    assert_eq!(
+        accepted.field_policies()[0].replacement(),
+        Some("[redacted]")
+    );
 }
