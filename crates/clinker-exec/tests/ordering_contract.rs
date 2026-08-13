@@ -1432,6 +1432,24 @@ fn a_descending_order_does_not_license_the_sort_merge_scan() {
         "IEJoin",
         "a descending range axis cannot license a forward two-cursor walk"
     );
+
+    // The input is one ordered sequence, so its scope reads global — and it
+    // still did not get the scan. Without the direction on the page, that
+    // pairing is unreadable: an author sees a globally ordered input next to
+    // the strategy for inputs that are not.
+    let explained = explain_of(&descending);
+    let drivers = explain_block(&explained, "source.drivers:");
+    assert!(
+        drivers.contains("ordering: val desc")
+            && drivers.contains("ordering_scope: global (one ordered sequence across the input)"),
+        "a descending single-file source is globally ordered AND descending; \
+         explain must say both:\n{drivers}"
+    );
+    let combine = explain_block(&explained, "Combine 'banded':");
+    assert!(
+        combine.contains("order val desc — global (one ordered sequence across the input))"),
+        "the Combine input line must show the direction that disqualified it:\n{combine}"
+    );
 }
 
 /// The other half of the same rule: an input that really is one ordered
@@ -1799,11 +1817,14 @@ fn explain_names_the_scope_an_order_was_proven_over() {
 
     let combine = explain_block(&per_file, "Combine 'banded':");
     assert!(
-        combine.contains(", order per partition on $source.file (not one ordered sequence))"),
-        "the Combine input line must carry the scope that decided its strategy:\n{combine}"
+        combine.contains(
+            ", order val asc — per partition on $source.file (not one ordered sequence))"
+        ),
+        "the Combine input line must carry both facts eligibility reads — what the \
+         order is and how wide it was proven:\n{combine}"
     );
     assert!(
-        combine.contains(", order global (one ordered sequence across the input))"),
+        combine.contains(", order threshold asc — global (one ordered sequence across the input))"),
         "and must distinguish the input whose order is global:\n{combine}"
     );
 

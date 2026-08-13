@@ -42,7 +42,7 @@ source.orders:
   arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 sort.__correlation_sort_orders:
-  ordering: order_id
+  ordering: order_id asc
   ordering_scope: global (one ordered sequence across the input)
   ordering_provenance: Preserved { from_node: "__correlation_sort_orders" }
   partitioning: Single

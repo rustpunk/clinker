@@ -61,6 +61,28 @@ fn transform_cxl_sources(config: &PipelineConfig) -> Vec<(String, String)> {
     out
 }
 
+/// A declared order written the way its author wrote it — field and
+/// direction, in key order.
+///
+/// Direction is part of the order, not decoration: a forward two-cursor scan
+/// needs an ascending key, so a descending declaration is disqualifying for
+/// the same consumers a per-partition scope disqualifies. Printing the fields
+/// alone left an author looking at a global, sorted input that did not get the
+/// scan, with nothing on the page to say why.
+fn order_fields_label(order: &[crate::config::SortField]) -> String {
+    order
+        .iter()
+        .map(|field| {
+            let direction = match field.order {
+                crate::config::SortOrder::Asc => "asc",
+                crate::config::SortOrder::Desc => "desc",
+            };
+            format!("{} {direction}", field.field)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The scope of a node's declared order, or `None` where it declares none.
 ///
 /// The one place this file decides whether there is an order to qualify.
@@ -533,8 +555,7 @@ impl ExecutionPlanDag {
                 out.push_str(&format!("{}:\n", node.id_slug()));
                 match &props.ordering.sort_order {
                     Some(order) => {
-                        let fields: Vec<String> = order.iter().map(|s| s.field.clone()).collect();
-                        out.push_str(&format!("  ordering: {}\n", fields.join(", ")));
+                        out.push_str(&format!("  ordering: {}\n", order_fields_label(order)));
                         // How wide the order above was proven, which is what
                         // decides whether a consumer needing one sequence may
                         // rely on it. Printed next to the order rather than
@@ -1026,17 +1047,29 @@ impl ExecutionPlanDag {
         // one ordered sequence per input, so an input reading "per
         // partition" here is the reason a range join it would otherwise
         // have qualified for is running another strategy instead.
-        let input_order_scope = |input_name: &str| -> Option<String> {
-            self.graph
+        let order_note = |input_name: &str| -> String {
+            let Some(props) = self
+                .graph
                 .neighbors_directed(idx, petgraph::Direction::Incoming)
                 .find(|&pred| self.graph[pred].name() == input_name)
                 .and_then(|pred| self.node_properties.get(&pred))
-                .and_then(declared_order_scope)
-        };
-        let order_note = |input_name: &str| -> String {
-            input_order_scope(input_name)
-                .map(|scope| format!(", order {scope}"))
-                .unwrap_or_default()
+            else {
+                return String::new();
+            };
+            let Some(scope) = declared_order_scope(props) else {
+                return String::new();
+            };
+            // Both facts eligibility reads, side by side: what the order is,
+            // and how wide it was proven. Reported, not judged — the rule that
+            // turns them into a strategy lives in the planner, and a second
+            // copy of it here would be free to disagree with the first.
+            let fields = props
+                .ordering
+                .sort_order
+                .as_ref()
+                .map(|order| order_fields_label(order))
+                .unwrap_or_default();
+            format!(", order {fields} — {scope}")
         };
 
         let drive_label = if driving_input.is_empty() {
