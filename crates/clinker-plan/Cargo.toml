@@ -30,6 +30,12 @@ lz4_flex = "0.11"
 # `exclude:` list uses (clinker-exec), so a `clinker.toml` pattern and a
 # pipeline `exclude:` pattern share one grammar.
 glob = "0.3"
+# Output-destination collision keys (`config::fs_type`): simple (C+S) case
+# folding and NFD, each applied only when the target volume is probed to fold
+# or to normalize. See the workspace manifest for why the fold must be simple
+# rather than full.
+unicode-case-mapping = { workspace = true }
+unicode-normalization = { workspace = true }
 
 # statfs(2) backs the filesystem-type detection facade (fs_type.rs) on
 # Linux/macOS: `f_type` magic numbers on Linux, `f_fstypename` strings on

@@ -393,26 +393,79 @@ impl LaneSampling {
     }
 }
 
+/// One signal's sampling decision, already taken and already counted.
+///
+/// Returned by [`TelemetryProducer::peek_log`] and spent by
+/// [`TelemetryProducer::commit_log`]. It carries the lane whose sampling budget
+/// was charged, so the commit cannot route the signal to a lane other than the
+/// one the decision was made for, and the decision is never taken twice: the
+/// lane counter advanced when the ticket was issued, and a commit that looked
+/// again would charge one signal against two positions in the sequence.
+///
+/// The type is deliberately neither `Copy` nor `Clone` — one ticket is one
+/// signal.
+#[must_use = "a ticket that is never committed has already spent its place in the sampling sequence, and the signal it stood for is lost"]
+pub struct AdmissionTicket {
+    lane: AdmissionLane,
+}
+
 impl TelemetryProducer {
     /// Apply exact field policy and admit one log record without blocking.
     pub fn emit_log(&self, event: LogEvent<'_>) -> AdmissionOutcome {
-        if !valid_logical_identity(event.event) {
-            self.stats.invalid.fetch_add(1, Ordering::Relaxed);
-            return AdmissionOutcome::Dropped(DropReason::InvalidLogicalIdentity);
+        match self.peek_log(event.event, event.severity) {
+            Ok(ticket) => self.commit_log(ticket, event),
+            Err(outcome) => outcome,
         }
+    }
 
-        // The scan runs before admission, because the policy decides what a
-        // record may say regardless of whether this one is kept. Its totals
-        // are credited only once the record is admitted: they tell an operator
-        // what the field policy did to the telemetry that was exported, and
-        // counting the records that sampling, rate limiting, or a full arena
-        // threw away inflated them by the whole sampling factor.
+    /// Take every admission decision that does not need the signal's fields.
+    ///
+    /// A caller that has to read a record to build those fields can ask this
+    /// first and skip the read entirely for signals sampling was going to
+    /// discard anyway — at `sample_every = 100`, ninety-nine records in every
+    /// hundred. What is decidable here is the event's own identity and the
+    /// sampling sequence for the lane its severity routes to; the rate limiter
+    /// and the arena both need the shared lock, and oversize is only knowable
+    /// by serializing, so those stay in [`Self::commit_log`].
+    ///
+    /// A refusal is already counted under exactly the reason and lane
+    /// [`Self::emit_log`] would have counted it under, so a caller that drops
+    /// the signal here has nothing further to report.
+    pub fn peek_log(
+        &self,
+        event: &str,
+        severity: Severity,
+    ) -> Result<AdmissionTicket, AdmissionOutcome> {
+        if !valid_logical_identity(event) {
+            self.stats.invalid.fetch_add(1, Ordering::Relaxed);
+            return Err(AdmissionOutcome::Dropped(
+                DropReason::InvalidLogicalIdentity,
+            ));
+        }
+        self.peek(severity.lane())
+    }
+
+    /// Apply exact field policy and admit one signal whose ticket is already in
+    /// hand, without blocking.
+    pub fn commit_log(&self, ticket: AdmissionTicket, event: LogEvent<'_>) -> AdmissionOutcome {
+        debug_assert_eq!(
+            ticket.lane,
+            event.severity.lane(),
+            "a ticket must be committed in the lane it was peeked for"
+        );
+
+        // The scan runs before the signal is retained, because the policy
+        // decides what a record may say regardless of whether this one lands in
+        // the arena. Its totals are credited only once the record is admitted:
+        // they tell an operator what the field policy did to the telemetry that
+        // was exported, and counting the records that rate limiting or a full
+        // arena threw away inflated them by the whole sampling factor.
         let privacy = PrivacyScan::new(&self.policy, event.event, event.fields);
         let filtered = FilteredLog {
             event,
             policy: &self.policy,
         };
-        let outcome = self.admit(event.severity.lane(), &QueuedSignal::Log(filtered));
+        let outcome = self.admit_sampled(ticket, &QueuedSignal::Log(filtered));
         if matches!(outcome, AdmissionOutcome::Accepted { .. }) {
             self.stats
                 .denied_fields
@@ -481,6 +534,16 @@ impl TelemetryProducer {
     }
 
     fn admit<T: Serialize>(&self, lane: AdmissionLane, signal: &T) -> AdmissionOutcome {
+        match self.peek(lane) {
+            Ok(ticket) => self.admit_sampled(ticket, signal),
+            Err(outcome) => outcome,
+        }
+    }
+
+    /// Advance one lane's sampling sequence and report whether this position
+    /// admits. This is the single decision point: nothing downstream samples
+    /// again, so one signal occupies exactly one position.
+    fn peek(&self, lane: AdmissionLane) -> Result<AdmissionTicket, AdmissionOutcome> {
         // Sampling counts within the destination lane, never across lanes. The
         // two lanes exist so ordinary volume cannot starve high severity; one
         // shared counter would have reintroduced exactly that coupling, letting
@@ -488,9 +551,13 @@ impl TelemetryProducer {
         let sequence = self.sample_sequence.next(lane);
         if !sequence.is_multiple_of(u64::from(self.policy.sample_every())) {
             self.stats.sampled.increment(lane);
-            return AdmissionOutcome::Dropped(DropReason::Sampled);
+            return Err(AdmissionOutcome::Dropped(DropReason::Sampled));
         }
+        Ok(AdmissionTicket { lane })
+    }
 
+    fn admit_sampled<T: Serialize>(&self, ticket: AdmissionTicket, signal: &T) -> AdmissionOutcome {
+        let lane = ticket.lane;
         let mut shared = match self.shared.try_lock() {
             Ok(shared) => shared,
             Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => {
@@ -1405,6 +1472,16 @@ mod tests {
     /// one `allow` field and one `replace` field so both rendering paths are
     /// reachable from the same event.
     fn policy(max_attribute_bytes: &str, replacement: &str) -> ResolvedObservabilityPolicy {
+        policy_sampling(max_attribute_bytes, replacement, 1)
+    }
+
+    /// The same policy with a sampling factor, for the tests that exercise the
+    /// admission sequence rather than attribute rendering.
+    fn policy_sampling(
+        max_attribute_bytes: &str,
+        replacement: &str,
+        sample_every: u32,
+    ) -> ResolvedObservabilityPolicy {
         let text = format!(
             r#"
 [observability]
@@ -1415,7 +1492,7 @@ max_batch_bytes = "8KB"
 max_attributes_per_event = 8
 max_attribute_bytes = "{max_attribute_bytes}"
 drop_policy = "drop_newest"
-sample_every = 1
+sample_every = {sample_every}
 rate_limit_per_second = 100000
 rate_limit_burst = 100000
 flush_timeout_ms = 1000
@@ -1627,6 +1704,137 @@ replacement = "{replacement}"
         assert_eq!(
             snapshot.retained_bytes, 0,
             "the slot must be reclaimed like any other drained signal"
+        );
+    }
+
+    /// The exact sequence both admission paths are driven through.
+    ///
+    /// It mixes both lanes, an event name the grammar refuses, a field no rule
+    /// declares, a replacement the byte cap cuts short, and one event carrying
+    /// more attributes than the policy retains — so every counter the split
+    /// could have disturbed actually moves.
+    fn admission_sequence() -> Vec<(&'static str, Severity, Vec<SignalField<'static>>)> {
+        let mut events: Vec<(&'static str, Severity, Vec<SignalField<'static>>)> = (0..12)
+            .map(|index| {
+                let severity = if index % 4 == 0 {
+                    Severity::Error
+                } else {
+                    Severity::Info
+                };
+                (
+                    "transform.seen",
+                    severity,
+                    vec![
+                        SignalField::new("amount", "123456789"),
+                        SignalField::new("secret", "classified"),
+                    ],
+                )
+            })
+            .collect();
+        events.push(("transform seen", Severity::Info, Vec::new()));
+        events.push((
+            "transform.seen",
+            Severity::Warn,
+            vec![SignalField::new("region", "north")],
+        ));
+        events.push((
+            "transform.seen",
+            Severity::Info,
+            vec![SignalField::new("amount", "1"); 10],
+        ));
+        events
+    }
+
+    /// Drive one producer through [`admission_sequence`], either as the single
+    /// `emit_log` call or as the peek/commit pair a caller uses to avoid
+    /// building fields for a signal sampling will refuse.
+    fn drive_admission(producer: &TelemetryProducer, split: bool) {
+        for (event, severity, fields) in &admission_sequence() {
+            let log = LogEvent {
+                event,
+                severity: *severity,
+                message: "seen",
+                correlation: correlation(),
+                fields,
+            };
+            if split {
+                match producer.peek_log(event, *severity) {
+                    Ok(ticket) => {
+                        let _ = producer.commit_log(ticket, log);
+                    }
+                    Err(_) => continue,
+                }
+            } else {
+                let _ = producer.emit_log(log);
+            }
+        }
+    }
+
+    /// Deciding sampling before the fields exist must not change what a run
+    /// reports. Every admission counter is operator-facing — the machine
+    /// terminal and the stderr summary name each reason and lane — so a split
+    /// that moved one signal from `sampled` to `accepted`, counted it twice, or
+    /// dropped it silently would misreport the run even though nothing about
+    /// the exported telemetry changed.
+    #[test]
+    fn peeking_before_committing_leaves_every_counter_where_it_was() {
+        let whole = TelemetryArena::reserve(&policy_sampling("6B", "[redacted-by-policy]", 3))
+            .expect("arena reserves")
+            .0;
+        let split = TelemetryArena::reserve(&policy_sampling("6B", "[redacted-by-policy]", 3))
+            .expect("arena reserves")
+            .0;
+
+        drive_admission(&whole, false);
+        drive_admission(&split, true);
+
+        let expected = whole.snapshot();
+        assert_eq!(
+            split.snapshot(),
+            expected,
+            "the peek/commit pair must account for a run exactly as one call did"
+        );
+
+        // Without this the equality above would pass on two producers that
+        // counted nothing at all.
+        assert!(expected.accepted > 0, "{expected:?}");
+        assert!(expected.sampled_drops > 0, "{expected:?}");
+        assert!(expected.ordinary_sampled_drops > 0, "{expected:?}");
+        assert!(expected.high_sampled_drops > 0, "{expected:?}");
+        assert!(expected.denied_fields > 0, "{expected:?}");
+        assert!(expected.truncated_fields > 0, "{expected:?}");
+        assert!(expected.attribute_limit_drops > 0, "{expected:?}");
+        assert_eq!(expected.invalid_drops, 1, "{expected:?}");
+    }
+
+    /// A peek routes on severity like the admission it stands in for. Sampling
+    /// counts within a lane, and the peek is now where that count happens, so
+    /// six ordinary signals must leave the high-severity lane's share of its
+    /// own three exactly where it was.
+    #[test]
+    fn a_peek_counts_in_the_lane_its_signal_would_land_in() {
+        let (producer, _receiver) = TelemetryArena::reserve(&policy_sampling("64B", "[region]", 3))
+            .expect("arena reserves");
+
+        for _ in 0..6 {
+            let _ = producer.peek_log("transform.seen", Severity::Info);
+        }
+        for _ in 0..3 {
+            let _ = producer.peek_log("transform.seen", Severity::Error);
+        }
+
+        let snapshot = producer.snapshot();
+        assert_eq!(
+            snapshot.ordinary_sampled_drops, 4,
+            "six ordinary signals at one in three keep two"
+        );
+        assert_eq!(
+            snapshot.high_sampled_drops, 2,
+            "three high-severity signals keep one regardless of ordinary volume"
+        );
+        assert_eq!(
+            snapshot.accepted, 0,
+            "a peek decides admission and retains nothing"
         );
     }
 

@@ -207,31 +207,92 @@ pub fn case_sensitive_dir(path: &Path) -> io::Result<bool> {
             "no existing ancestor directory to probe for case-sensitivity",
         )
     })?;
-    remembered_case_sensitivity(&dir)
+    static REMEMBERED: VolumeAnswers = VolumeAnswers::new();
+    REMEMBERED.answer(&dir, probe_case_sensitive)
 }
 
-/// The probe result for a directory, asked of the filesystem once.
+/// Whether the filesystem that *would back a file at `path`* looks a name up
+/// under any of its canonically-equivalent spellings (`true`) or only under
+/// the exact scalars given (`false`).
 ///
-/// The probe creates and removes a file, and the answer is a property of the
-/// volume rather than of the moment. A search over numbered candidate names in
-/// one directory asks for a key per candidate, which without this writes and
-/// unlinks a file per candidate in the directory it is about to write into.
-fn remembered_case_sensitivity(dir: &Path) -> io::Result<bool> {
-    static REMEMBERED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, bool>>,
-    > = std::sync::OnceLock::new();
-    let remembered =
-        REMEMBERED.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
-    if let Ok(seen) = remembered.lock()
-        && let Some(answer) = seen.get(dir)
-    {
-        return Ok(*answer);
+/// This is the **second, independent** axis of output-path collision
+/// detection, and it is orthogonal to [`case_sensitive_dir`] — neither implies
+/// the other, and each closes a silent double-write the other leaves open:
+///
+/// - **APFS** is normalization-*insensitive* in **both** its case-sensitive
+///   and case-insensitive variants: lookup hashes the NFD-normalized name (and
+///   case-folds it too, on the ci variant). So a *case-sensitive* APFS volume
+///   — the default on iOS, and an option on macOS — still resolves `caf\u{e9}`
+///   and `cafe\u{301}` to one file while keeping `Caf\u{e9}` distinct. Folding
+///   alone would miss that entirely.
+/// - **HFS+** stores a variant of NFD outright, so the same holds there.
+/// - **NTFS** does the opposite: it upper-cases on lookup but never
+///   normalizes, so the two NFC/NFD spellings are two genuinely different
+///   files. Normalizing alone would falsely merge them.
+///
+/// As with case-sensitivity, no platform exposes a capability bit for this, so
+/// the answer is obtained by **active probe** in the nearest existing ancestor
+/// directory: a file is created under its composed (NFC) name and the
+/// decomposed (NFD) spelling of that same name is re-statted. The probe file
+/// shares the `clinker-case-probe-` prefix with the case probe and is removed
+/// through the same [`ProbeFile`] guard, so it leaves no residue on any exit
+/// path.
+///
+/// # Errors
+///
+/// Returns the underlying [`io::Error`] when no existing ancestor directory
+/// can be found or the probe file cannot be created in it. Callers treat a
+/// probe failure as "assume the volume normalizes nothing" (do not merge), the
+/// same safe default [`case_sensitive_dir`] failures take.
+pub fn normalization_insensitive_dir(path: &Path) -> io::Result<bool> {
+    let dir = nearest_existing_dir(path).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no existing ancestor directory to probe for normalization-insensitivity",
+        )
+    })?;
+    static REMEMBERED: VolumeAnswers = VolumeAnswers::new();
+    REMEMBERED.answer(&dir, probe_normalization_insensitive)
+}
+
+/// One probe verdict per directory, asked of the filesystem once.
+///
+/// A probe creates and removes a file, and what it measures is a property of
+/// the volume rather than of the moment. A search over numbered candidate
+/// names in one directory asks for a key per candidate, which without this
+/// writes and unlinks a file per candidate in the directory it is about to
+/// write into.
+struct VolumeAnswers {
+    seen:
+        std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, bool>>>,
+}
+
+impl VolumeAnswers {
+    const fn new() -> Self {
+        Self {
+            seen: std::sync::OnceLock::new(),
+        }
     }
-    let answer = probe_case_sensitive(dir)?;
-    if let Ok(mut seen) = remembered.lock() {
-        seen.insert(dir.to_path_buf(), answer);
+
+    fn answer(
+        &self,
+        dir: &Path,
+        probe: impl FnOnce(&Path) -> io::Result<bool>,
+    ) -> io::Result<bool> {
+        let seen = self
+            .seen
+            .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        if let Ok(remembered) = seen.lock()
+            && let Some(answer) = remembered.get(dir)
+        {
+            return Ok(*answer);
+        }
+        let answer = probe(dir)?;
+        if let Ok(mut remembered) = seen.lock() {
+            remembered.insert(dir.to_path_buf(), answer);
+        }
+        Ok(answer)
     }
-    Ok(answer)
 }
 
 /// Walk up from `path`'s parent to the first directory that exists. Returns
@@ -256,19 +317,19 @@ fn nearest_existing_dir(path: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
-/// Removes a probe file when it goes out of scope, so the case-sensitivity
-/// probe leaves no residue on **any** return path — the normal one, an early
-/// `?` bubble, or an unwinding panic between creating the file and reading the
+/// Removes a probe file when it goes out of scope, so a volume-behavior probe
+/// leaves no residue on **any** return path — the normal one, an early `?`
+/// bubble, or an unwinding panic between creating the file and reading the
 /// result.
 ///
-/// The probe cannot be relocated to an OS temp dir to sidestep the residue
+/// A probe cannot be relocated to an OS temp dir to sidestep the residue
 /// concern: it must be created in the very directory being classified, because
-/// case-sensitivity is a per-*filesystem* (and, on Windows, a per-*directory*)
-/// property that only a file created on that exact target reveals. Since the
-/// target is frequently a tracked directory (the collision-detection path
-/// probes the current working directory for a bare output filename), guaranteed
-/// cleanup is the mechanism that keeps a probe from ever littering the working
-/// tree.
+/// case-sensitivity and normalization-insensitivity are per-*filesystem* (and,
+/// on Windows, per-*directory*) properties that only a file created on that
+/// exact target reveals. Since the target is frequently a tracked directory
+/// (the collision-detection path probes the current working directory for a
+/// bare output filename), guaranteed cleanup is the mechanism that keeps a
+/// probe from ever littering the working tree.
 struct ProbeFile {
     path: std::path::PathBuf,
 }
@@ -291,14 +352,7 @@ fn probe_case_sensitive(dir: &Path) -> io::Result<bool> {
     // A lowercase, process+time-unique stem so two concurrent probes in one
     // directory never clash. The extension stays lowercase; only the stem case
     // is toggled for the re-stat.
-    let stem = format!(
-        "clinker-case-probe-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
+    let stem = unique_probe_stem();
     let lower = dir.join(format!("{stem}.tmp"));
     // Create exclusively so a stale same-named file can never make the probe
     // read a foreign filesystem state as our own.
@@ -319,6 +373,46 @@ fn probe_case_sensitive(dir: &Path) -> io::Result<bool> {
     let insensitive = upper.exists();
 
     Ok(!insensitive)
+}
+
+/// Create a probe file under the **composed** (NFC) spelling of a name and
+/// report whether its **decomposed** (NFD) spelling resolves to the same file.
+/// Mirrors [`probe_case_sensitive`] exactly — same stem, same exclusive
+/// creation, same RAII cleanup — because the question has the same shape: what
+/// the volume does with a name is only answerable by asking the volume.
+///
+/// The distinguishing character is `é`: `U+00E9` composed, `e` + `U+0301`
+/// decomposed. Canonically equivalent, so a normalization-insensitive volume
+/// (APFS in either variant, HFS+) finds the probe file under the decomposed
+/// spelling; a normalizing-nothing volume (ext4, NTFS) does not.
+fn probe_normalization_insensitive(dir: &Path) -> io::Result<bool> {
+    let stem = unique_probe_stem();
+    let composed = dir.join(format!("{stem}-\u{00e9}.tmp"));
+    // Exclusive creation, as in the case probe: a stale same-named file must
+    // never let the probe read a foreign filesystem state as its own.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&composed)?;
+    let _probe = ProbeFile { path: composed };
+    drop(file);
+
+    let decomposed = dir.join(format!("{stem}-e\u{0301}.tmp"));
+    Ok(decomposed.exists())
+}
+
+/// A probe stem unique to this process and instant, so two concurrent probes
+/// in one directory never clash. Shared by both probes, and by the
+/// `clinker-case-probe-` prefix the residue tests scan for.
+fn unique_probe_stem() -> String {
+    format!(
+        "clinker-case-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
 }
 
 /// The identity of a destination path: one physical location, one key.
@@ -342,6 +436,17 @@ fn probe_case_sensitive(dir: &Path) -> io::Result<bool> {
 /// identity. Leaving that to callers is what let the plan-time check and the
 /// runtime ledger key one destination two ways and report a pipeline clean
 /// that the run then refused.
+///
+/// The reduced path is then keyed through [`collision_key`]'s rules over its
+/// **native** representation — the OS's own bytes on Unix, its own UTF-16 code
+/// units on Windows — never over a lossy string. A path that is not valid
+/// Unicode has no lossy rendering that is also injective: every invalid
+/// sequence renders as `U+FFFD`, so `\xff` and `\xfe` in one directory come
+/// out as the same text and two genuinely *different* destinations collapse
+/// into one identity. That is the opposite failure from a missed collision and
+/// a worse one: a missed collision writes one file twice, whereas a merged
+/// identity refuses, or silently reroutes, a destination that was never in
+/// conflict.
 #[must_use]
 pub fn destination_identity(path: &Path) -> String {
     let absolute = if path.is_absolute() {
@@ -349,7 +454,8 @@ pub fn destination_identity(path: &Path) -> String {
     } else {
         std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
     };
-    collision_key(&resolved_prefix(&without_cur_dir(&absolute)).to_string_lossy())
+    let reduced = resolved_prefix(&without_cur_dir(&absolute));
+    identity_of(reduced.as_os_str(), &reduced)
 }
 
 /// `path` with its `.` components dropped.
@@ -394,22 +500,274 @@ fn resolved_prefix(path: &Path) -> std::path::PathBuf {
 /// Canonical collision key for an output path: the key under which two paths
 /// are considered to name the *same physical file*.
 ///
-/// On a case-insensitive output filesystem (macOS APFS / Windows NTFS default)
-/// paths differing only in case resolve to one file, so their keys must
-/// coincide; on a case-sensitive one they are distinct files and must not. Case
-/// is folded *conditionally* — only when [`case_sensitive_dir`] reports the
-/// target filesystem folds it — so two legitimately-distinct files on
-/// case-sensitive Linux are never falsely merged. A probe failure falls back to
-/// the raw (case-sensitive) key, the safe default that never merges two paths
-/// the filesystem might keep distinct.
+/// Two **orthogonal** volume behaviours can make different spellings name one
+/// file, and each is probed separately because neither implies the other:
+///
+/// | [`case_sensitive_dir`] | [`normalization_insensitive_dir`] | key | volume |
+/// |---|---|---|---|
+/// | insensitive | insensitive | `nfd(fold(nfd(s)))` | APFS (ci), HFS+ |
+/// | insensitive | normalizing | `fold(s)` | NTFS |
+/// | sensitive | insensitive | `nfd(s)` | APFS (cs), iOS |
+/// | sensitive | normalizing | `s` | ext4, xfs, btrfs |
+///
+/// The both-fire composition is Unicode D145 *canonical caseless match*,
+/// outer NFD included. That outer pass is conformance and forward-insurance
+/// rather than a live correction today, and the distinction is worth being
+/// exact about: a rule advertised as tighter than it is would be worse than a
+/// stated gap. Canonical ordering only reorders adjacent *non-starters*, so a
+/// fold can only break NFD by turning a starter into one — and on Unicode
+/// 16.0 no simple fold does. The single fold that moves a combining class at
+/// all, `U+0345 -> U+03B9`, moves it 240 -> 0, the harmless direction. (Under
+/// *full* folding the outer pass does real work, which is where its reputation
+/// comes from.) `no_simple_fold_raises_a_canonical_combining_class` pins that
+/// premise, so a later Unicode table cannot quietly make the outer NFD
+/// load-bearing without the tests saying so.
+///
+/// The fold is Unicode **simple** (C+S) folding, not default/full folding. The
+/// distinction is not a nicety: full folding maps `ß` to `ss`, so it declares
+/// `straße.csv` and `strasse.csv` one file — which no filesystem does. This is
+/// also why the `caseless` crate is not used here despite exposing D145
+/// directly: its fold is full.
+///
+/// A probe failure falls back to leaving that axis alone, the safe default
+/// that never merges two paths the filesystem might keep distinct.
+///
+/// # Residual gap
+///
+/// This rule is close, not exact, and it is wrong in both directions — stated
+/// separately because the two directions have very different consequences.
+///
+/// **Over-detection (safe).** The key may merge two names a real volume keeps
+/// apart: simple folding covers non-BMP scalars that NTFS's `$UpCase` table
+/// and HFS+'s BMP-only case table cannot fold; `$UpCase` is written at
+/// format time and frozen, so an older volume folds less than the table this
+/// crate ships; and HFS+ leaves certain ranges undecomposed that NFD
+/// decomposes. The cost is refusing a run that would have worked, with a
+/// diagnostic naming both paths — visible, and correctable by renaming.
+///
+/// **Under-detection (the real gap, and irreducible).** NTFS does not fold the
+/// way Unicode does. It *upper-cases*, 1:1 only, through a per-volume table
+/// that has carried Turkish linguistic mappings since NT 4.0 and Azeri since
+/// NT 5.01 — so it folds locale-sensitively where Unicode's simple fold is
+/// deliberately locale-independent. `İ.csv` and `i.csv` may therefore be one
+/// file on such a volume while this key still reports two, and the run writes
+/// that file twice. No table fixes this, which is precisely why the empirical
+/// probe is primary and the Unicode tables are only the fallback behaviour
+/// applied once a probe has said which axes are live.
 ///
 /// Both the config-time DLQ-collision check and the runtime DLQ partitioner key
 /// on this single function so their notions of "same file" cannot drift.
+#[must_use]
 pub fn collision_key(path: &str) -> String {
-    if case_sensitive_dir(Path::new(path)).unwrap_or(true) {
-        path.to_string()
-    } else {
-        path.to_ascii_lowercase()
+    identity_of(std::ffi::OsStr::new(path), Path::new(path))
+}
+
+/// Key `name` under the behaviour probed at `probe_at`.
+///
+/// Kept apart from the two public entry points so [`collision_key`] and
+/// [`destination_identity`] land in one key space rather than two that merely
+/// look alike: the runtime ledger and the plan-time check compare their keys
+/// against each other.
+fn identity_of(name: &std::ffi::OsStr, probe_at: &Path) -> String {
+    let folds_case = !case_sensitive_dir(probe_at).unwrap_or(true);
+    let folds_normalization = normalization_insensitive_dir(probe_at).unwrap_or(false);
+    let mut key = String::new();
+    push_identity(name, folds_case, folds_normalization, &mut key);
+    key
+}
+
+/// The Unicode reduction applied to one run of a path that *is* valid Unicode.
+/// Split out from the segmenting so the composition rule can be tested against
+/// injected probe verdicts on every platform, not only on a host whose disk
+/// happens to behave the right way.
+fn fold_run(run: &str, folds_case: bool, folds_normalization: bool) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    match (folds_case, folds_normalization) {
+        (false, false) => run.to_string(),
+        (true, false) => simple_case_fold(run),
+        (false, true) => run.nfd().collect(),
+        (true, true) => simple_case_fold(&run.nfd().collect::<String>())
+            .nfd()
+            .collect(),
+    }
+}
+
+/// Unicode **simple** case folding (the `C` and `S` rows of `CaseFolding.txt`):
+/// one scalar in, one scalar out. `case_folded` returns `None` for a scalar
+/// that folds to itself, `ß` among them — the property that keeps `straße` and
+/// `strasse` two files.
+fn simple_case_fold(run: &str) -> String {
+    run.chars()
+        .map(|scalar| {
+            unicode_case_mapping::case_folded(scalar)
+                .and_then(|folded| char::from_u32(folded.get()))
+                .unwrap_or(scalar)
+        })
+        .collect()
+}
+
+/// Append `name`'s key to `out`, in the OS's own representation.
+///
+/// Folding is defined over Unicode scalar values; a native path may hold
+/// sequences that are not scalar values at all (any byte string on Unix, any
+/// UTF-16 unit sequence including unpaired surrogates on Windows). The
+/// composition rule is therefore: **split the name at the boundaries of what
+/// can be interpreted as Unicode, fold each maximal valid run, and escape each
+/// uninterpretable unit verbatim.** A fully-valid path — every realistic one —
+/// is a single run and keys exactly as if the name were a `&str`; an invalid
+/// unit stops the fold at its edges instead of stopping it for the whole path.
+///
+/// A name that is valid Unicode throughout — which is every realistic path —
+/// is one run, and its key is that run folded, written verbatim. Only a name
+/// carrying at least one uninterpretable unit needs the segmented form, and it
+/// is tagged with a leading NUL to keep the two forms in disjoint key spaces.
+/// NUL is available for that because it is the one unit no path can carry: it
+/// terminates a path string on every supported platform, so a name holding one
+/// can never be opened and is never a destination.
+///
+/// The segmented form is injective because each segment is self-delimiting: a
+/// folded run is written length-prefixed as `u<byte-len>:<run>` and an
+/// uninterpretable unit as `x<4 hex digits>`, so segment boundaries are
+/// recoverable and no two distinct names produce one key. That injectivity is
+/// the whole point — it is what keeps two paths differing *only* in their
+/// invalid units from collapsing into one destination.
+///
+/// The key is opaque: callers use it as a map key and carry the raw path
+/// separately for diagnostics.
+fn push_identity(
+    name: &std::ffi::OsStr,
+    folds_case: bool,
+    folds_normalization: bool,
+    out: &mut String,
+) {
+    if let Some(whole) = name.to_str() {
+        out.push_str(&fold_run(whole, folds_case, folds_normalization));
+        return;
+    }
+    out.push(UNINTERPRETABLE_TAG);
+    push_uninterpretable_identity(name, folds_case, folds_normalization, out);
+}
+
+/// Marks the segmented key space. See [`push_identity`] for why NUL is the
+/// unit that can carry this without ever colliding with a real path.
+const UNINTERPRETABLE_TAG: char = '\0';
+
+#[cfg(unix)]
+fn push_uninterpretable_identity(
+    name: &std::ffi::OsStr,
+    folds_case: bool,
+    folds_normalization: bool,
+    out: &mut String,
+) {
+    use std::os::unix::ffi::OsStrExt;
+    push_identity_bytes(name.as_bytes(), folds_case, folds_normalization, out);
+}
+
+#[cfg(windows)]
+fn push_uninterpretable_identity(
+    name: &std::ffi::OsStr,
+    folds_case: bool,
+    folds_normalization: bool,
+    out: &mut String,
+) {
+    use std::os::windows::ffi::OsStrExt;
+    // Windows paths are UTF-16 code units, which `decode_utf16` splits into
+    // exactly the two cases the rule distinguishes: a scalar value, or an
+    // unpaired surrogate that is not one.
+    let mut run = String::new();
+    for unit in char::decode_utf16(name.encode_wide()) {
+        match unit {
+            Ok(scalar) => run.push(scalar),
+            Err(unpaired) => {
+                if !run.is_empty() {
+                    push_run(out, &fold_run(&run, folds_case, folds_normalization));
+                    run.clear();
+                }
+                push_escape(out, u32::from(unpaired.unpaired_surrogate()));
+            }
+        }
+    }
+    if !run.is_empty() {
+        push_run(out, &fold_run(&run, folds_case, folds_normalization));
+    }
+}
+
+/// Neither Unix nor Windows: `as_encoded_bytes` is the only lossless view of an
+/// `OsStr` the standard library offers portably. Its exact encoding is
+/// unspecified, which is acceptable here because these keys never leave the
+/// process — they are compared against other keys built the same way in the
+/// same run, never persisted.
+#[cfg(not(any(unix, windows)))]
+fn push_uninterpretable_identity(
+    name: &std::ffi::OsStr,
+    folds_case: bool,
+    folds_normalization: bool,
+    out: &mut String,
+) {
+    push_identity_bytes(
+        name.as_encoded_bytes(),
+        folds_case,
+        folds_normalization,
+        out,
+    );
+}
+
+/// Segment a byte-oriented native name into maximal valid-UTF-8 runs and the
+/// individual bytes that cannot begin or continue one.
+#[cfg(not(windows))]
+fn push_identity_bytes(name: &[u8], folds_case: bool, folds_normalization: bool, out: &mut String) {
+    let mut rest = name;
+    while !rest.is_empty() {
+        let error = match std::str::from_utf8(rest) {
+            Ok(run) => {
+                push_run(out, &fold_run(run, folds_case, folds_normalization));
+                return;
+            }
+            Err(error) => error,
+        };
+        let valid = error.valid_up_to();
+        match std::str::from_utf8(&rest[..valid]) {
+            Ok(run) if !run.is_empty() => {
+                push_run(out, &fold_run(run, folds_case, folds_normalization));
+            }
+            // Unreachable by `valid_up_to`'s contract. Escaping the bytes
+            // rather than dropping them keeps the key lossless even if that
+            // contract were ever to change under us.
+            Ok(_) => {}
+            Err(_) => {
+                for byte in &rest[..valid] {
+                    push_escape(out, u32::from(*byte));
+                }
+            }
+        }
+        // `error_len() == None` means the name ends mid-sequence: everything
+        // left is an incomplete tail and none of it is interpretable.
+        let bad = error.error_len().unwrap_or(rest.len() - valid);
+        for byte in &rest[valid..valid + bad] {
+            push_escape(out, u32::from(*byte));
+        }
+        rest = &rest[valid + bad..];
+    }
+}
+
+/// A folded run, length-prefixed so the run's own bytes can never be mistaken
+/// for the start of the next segment.
+fn push_run(out: &mut String, folded: &str) {
+    out.push('u');
+    out.push_str(&folded.len().to_string());
+    out.push(':');
+    out.push_str(folded);
+}
+
+/// One uninterpretable native unit, as a fixed-width hex escape. Fixed width is
+/// what makes it self-delimiting without a length prefix; four digits covers a
+/// Unix byte and a Windows unpaired surrogate alike, so the encoding reads the
+/// same on every platform.
+fn push_escape(out: &mut String, unit: u32) {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    out.push('x');
+    for shift in [12u32, 8, 4, 0] {
+        out.push(HEX[((unit >> shift) & 0xf) as usize] as char);
     }
 }
 
@@ -642,6 +1000,340 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Ärger.csv` and `ärger.csv` name one file on a case-insensitive volume.
+    /// ASCII-only folding reports two, so that volume gets written twice under
+    /// two identities the engine believes are distinct destinations.
+    #[test]
+    fn case_folding_reaches_beyond_ascii() {
+        assert_eq!(
+            fold_run("Ärger.csv", true, false),
+            fold_run("ärger.csv", true, false),
+            "a case-folding volume names one file here"
+        );
+        assert_eq!(
+            fold_run("ΣΊΣΥΦΟΣ.csv", true, false),
+            fold_run("σίσυφος.csv", true, false),
+            "and it is the Unicode fold, not a Latin-1 approximation"
+        );
+    }
+
+    /// The residual **under-detection** gap, asserted rather than described,
+    /// so it stays a known quantity instead of drifting into a surprise.
+    ///
+    /// NTFS has folded `İ` (`U+0130`) linguistically since NT 4.0 through its
+    /// per-volume `$UpCase` table. Unicode's simple fold is deliberately
+    /// locale-independent and gives `U+0130` no `C`/`S` mapping at all, so
+    /// `İ.csv` and `i.csv` key as two destinations here while such a volume
+    /// may hold one file. No table closes this — it is why the empirical probe
+    /// is primary. Over-detection is the safe direction and this is the unsafe
+    /// one, so it is written down.
+    #[test]
+    fn locale_sensitive_folds_are_a_known_under_detection_gap() {
+        assert_ne!(
+            fold_run("İ.csv", true, true),
+            fold_run("i.csv", true, true),
+            "if this now merges, the fold stopped being locale-independent \
+             and the documented residual gap needs rewriting"
+        );
+    }
+
+    /// The fold is Unicode **simple** (C+S), not default/full. Full folding
+    /// maps `ß` to `ss` and would merge two paths that every real filesystem
+    /// keeps apart — the reason `caseless`, whose D145 helper is otherwise
+    /// exactly this rule, cannot be used.
+    #[test]
+    fn case_folding_is_simple_not_full() {
+        for axes in [(true, false), (true, true)] {
+            assert_ne!(
+                fold_run("straße.csv", axes.0, axes.1),
+                fold_run("strasse.csv", axes.0, axes.1),
+                "no filesystem folds ß to ss; {axes:?} must not either"
+            );
+        }
+    }
+
+    /// Composed and decomposed spellings of one name are one file on a
+    /// normalization-insensitive volume — including a **case-sensitive** APFS
+    /// volume, where folding alone detects nothing.
+    #[test]
+    fn normalization_reconciles_composed_and_decomposed() {
+        let composed = "caf\u{e9}.csv";
+        let decomposed = "cafe\u{301}.csv";
+        assert_eq!(
+            fold_run(composed, false, true),
+            fold_run(decomposed, false, true),
+            "a normalization-insensitive volume names one file here"
+        );
+        assert_eq!(
+            fold_run(composed, true, true),
+            fold_run(decomposed, true, true),
+            "and so does one that folds case as well"
+        );
+    }
+
+    /// The two axes are orthogonal: each probe closes a gap the other leaves
+    /// wide open, so a key composed from only one of them is wrong on real
+    /// hardware. Asserting all four cells is what pins that.
+    #[test]
+    fn the_two_axes_are_independent() {
+        let (upper_composed, lower_composed) = ("Caf\u{e9}.csv", "caf\u{e9}.csv");
+        let lower_decomposed = "cafe\u{301}.csv";
+
+        // ext4 / xfs / NTFS-with-per-directory-case-sensitivity: nothing merges.
+        assert_ne!(
+            fold_run(upper_composed, false, false),
+            fold_run(lower_composed, false, false)
+        );
+        assert_ne!(
+            fold_run(lower_composed, false, false),
+            fold_run(lower_decomposed, false, false)
+        );
+
+        // NTFS: folds, never normalizes.
+        assert_eq!(
+            fold_run(upper_composed, true, false),
+            fold_run(lower_composed, true, false)
+        );
+        assert_ne!(
+            fold_run(lower_composed, true, false),
+            fold_run(lower_decomposed, true, false),
+            "NTFS keeps the two normal forms apart"
+        );
+
+        // Case-sensitive APFS / iOS: normalizes, never folds.
+        assert_ne!(
+            fold_run(upper_composed, false, true),
+            fold_run(lower_composed, false, true),
+            "a case-sensitive volume keeps the two cases apart"
+        );
+        assert_eq!(
+            fold_run(lower_composed, false, true),
+            fold_run(lower_decomposed, false, true)
+        );
+
+        // Case-insensitive APFS / HFS+: both, which is Unicode D145.
+        assert_eq!(
+            fold_run(upper_composed, true, true),
+            fold_run(lower_decomposed, true, true)
+        );
+    }
+
+    /// The premise that lets the outer NFD in the both-axes composition be
+    /// correct-but-currently-inert, pinned so a Unicode data bump cannot
+    /// silently invalidate it.
+    ///
+    /// Canonical ordering only reorders *adjacent non-starters*. A simple fold
+    /// can therefore only put a string out of canonical order by turning a
+    /// starter (ccc 0) into a non-starter. On Unicode 16.0 no scalar does
+    /// that — the only fold that moves a combining class at all is
+    /// `U+0345 -> U+03B9`, which goes the harmless direction (240 -> 0). If a
+    /// later table adds a raising fold, this fires, and the outer NFD stops
+    /// being insurance and starts being load-bearing.
+    #[test]
+    fn no_simple_fold_raises_a_canonical_combining_class() {
+        use unicode_normalization::char::canonical_combining_class as combining_class;
+        let raising: Vec<u32> = (0u32..=0x10_FFFF)
+            .filter_map(char::from_u32)
+            .filter(|scalar| {
+                unicode_case_mapping::case_folded(*scalar)
+                    .and_then(|folded| char::from_u32(folded.get()))
+                    .is_some_and(|folded| {
+                        combining_class(*scalar) == 0 && combining_class(folded) != 0
+                    })
+            })
+            .map(u32::from)
+            .collect();
+        assert!(
+            raising.is_empty(),
+            "these folds raise a combining class, so the outer NFD in \
+             `fold_run` is now load-bearing rather than insurance: {raising:04X?}"
+        );
+    }
+
+    /// Defect: routing a path through `to_string_lossy` turns *every* invalid
+    /// sequence into `U+FFFD`, so two genuinely different destinations that
+    /// differ only in their invalid bytes come out as one identity. That is
+    /// the opposite of a missed collision and worse: two distinct files are
+    /// treated as one.
+    #[test]
+    fn distinct_uninterpretable_paths_keep_distinct_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = uninterpretable_child(dir.path(), 0);
+        let second = uninterpretable_child(dir.path(), 1);
+        assert_ne!(
+            first, second,
+            "the two test paths must differ to begin with"
+        );
+        assert_ne!(
+            destination_identity(&first),
+            destination_identity(&second),
+            "two destinations differing only in uninterpretable units are two files"
+        );
+    }
+
+    /// And an uninterpretable unit must not key as the replacement character
+    /// either — otherwise a path a user really did spell with `U+FFFD` would
+    /// merge with an unrelated one carrying invalid bytes.
+    #[test]
+    fn an_uninterpretable_unit_is_not_the_replacement_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid = uninterpretable_child(dir.path(), 0);
+        let spelled = dir.path().join("\u{FFFD}.csv");
+        assert_ne!(
+            destination_identity(&invalid),
+            destination_identity(&spelled),
+            "an invalid unit is not the same destination as a literal U+FFFD"
+        );
+    }
+
+    /// An uninterpretable unit stops the fold at its own edges, not for the
+    /// whole path: the valid runs around it still fold. Folding is defined
+    /// over scalar values, so the composition rule is to segment first and
+    /// fold each maximal valid run.
+    #[test]
+    fn an_uninterpretable_unit_does_not_stop_the_fold_around_it() {
+        let upper = uninterpretable_between("ÄRGER", "MÜNCHEN.csv");
+        let lower = uninterpretable_between("ärger", "münchen.csv");
+        let key = |name: &std::ffi::OsString| {
+            let mut out = String::new();
+            push_identity(name.as_os_str(), true, false, &mut out);
+            out
+        };
+        assert_ne!(upper, lower);
+        assert_eq!(
+            key(&upper),
+            key(&lower),
+            "the runs either side of an uninterpretable unit still fold"
+        );
+    }
+
+    /// A path holding an uninterpretable unit at index `nth` of a small set of
+    /// distinct ones, built in the platform's own representation.
+    #[cfg(unix)]
+    fn uninterpretable_child(dir: &Path, nth: usize) -> std::path::PathBuf {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let mut bytes = dir.as_os_str().as_bytes().to_vec();
+        bytes.extend_from_slice(b"/");
+        bytes.push([0xff, 0xfe][nth]);
+        bytes.extend_from_slice(b".csv");
+        std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes))
+    }
+
+    #[cfg(windows)]
+    fn uninterpretable_child(dir: &Path, nth: usize) -> std::path::PathBuf {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut units: Vec<u16> = dir.as_os_str().encode_wide().collect();
+        units.push(u16::from(b'\\'));
+        // Lone high surrogates: valid UTF-16 code units, not scalar values.
+        units.push([0xd800, 0xd801][nth]);
+        units.extend(".csv".encode_utf16());
+        std::path::PathBuf::from(std::ffi::OsString::from_wide(&units))
+    }
+
+    /// `before` and `after` joined by one uninterpretable unit.
+    #[cfg(unix)]
+    fn uninterpretable_between(before: &str, after: &str) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        let mut bytes = before.as_bytes().to_vec();
+        bytes.push(0xff);
+        bytes.extend_from_slice(after.as_bytes());
+        std::ffi::OsString::from_vec(bytes)
+    }
+
+    #[cfg(windows)]
+    fn uninterpretable_between(before: &str, after: &str) -> std::ffi::OsString {
+        use std::os::windows::ffi::OsStringExt;
+        let mut units: Vec<u16> = before.encode_utf16().collect();
+        units.push(0xd800);
+        units.extend(after.encode_utf16());
+        std::ffi::OsString::from_wide(&units)
+    }
+
+    /// Two real destinations differing only in non-ASCII case are one file
+    /// exactly when the volume under them folds case. Both branches assert, so
+    /// this is a live check on every CI platform rather than a test that
+    /// quietly does nothing off macOS/Windows.
+    #[test]
+    fn case_variant_destinations_collide_exactly_when_the_volume_folds() {
+        let dir = tempfile::tempdir().unwrap();
+        let upper = dir.path().join("Ärger.csv");
+        let lower = dir.path().join("ärger.csv");
+        let folds = !case_sensitive_dir(&upper).unwrap();
+        eprintln!("volume under {:?} folds case: {folds}", dir.path());
+        assert_eq!(
+            destination_identity(&upper) == destination_identity(&lower),
+            folds,
+            "non-ASCII case variants must collide iff the volume folds case"
+        );
+    }
+
+    /// The same, for the normalization axis.
+    #[test]
+    fn normalization_variant_destinations_collide_exactly_when_the_volume_normalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let composed = dir.path().join("caf\u{e9}.csv");
+        let decomposed = dir.path().join("cafe\u{301}.csv");
+        let normalizes = normalization_insensitive_dir(&composed).unwrap();
+        eprintln!(
+            "volume under {:?} is normalization-insensitive: {normalizes}",
+            dir.path()
+        );
+        assert_eq!(
+            destination_identity(&composed) == destination_identity(&decomposed),
+            normalizes,
+            "NFC/NFD variants must collide iff the volume normalizes lookups"
+        );
+    }
+
+    /// Unconditional on every volume, because no filesystem expands `ß`: this
+    /// one holds whatever the probes say, which is exactly why it guards
+    /// against a future switch to full folding.
+    #[test]
+    fn sharp_s_destinations_never_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_ne!(
+            destination_identity(&dir.path().join("straße.csv")),
+            destination_identity(&dir.path().join("strasse.csv")),
+            "no filesystem folds ß to ss, so these are always two destinations"
+        );
+    }
+
+    /// The normalization probe is cross-checked against the ground truth on
+    /// whatever filesystem the host provides, exactly as the case probe is:
+    /// create a composed name, ask whether its decomposed spelling resolves to
+    /// it, and require the probe to have said the same thing.
+    #[test]
+    fn normalization_probe_agrees_with_a_direct_re_spelling_stat() {
+        let dir = tempfile::tempdir().unwrap();
+        let composed = dir.path().join("caf\u{e9}.csv");
+        std::fs::write(&composed, b"x").unwrap();
+        let decomposed_twin = dir.path().join("cafe\u{301}.csv");
+        let resolved = decomposed_twin.exists();
+
+        let verdict = normalization_insensitive_dir(&dir.path().join("out.csv")).unwrap();
+        assert_eq!(
+            verdict, resolved,
+            "the probe must report what the filesystem actually does"
+        );
+    }
+
+    /// The normalization probe leaves no residue either — it shares the
+    /// `clinker-case-probe-` prefix and the same RAII guard.
+    #[test]
+    fn normalization_probe_leaves_no_probe_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("errors.csv");
+        let _ = normalization_insensitive_dir(&target).unwrap();
+        assert!(!target.exists(), "the probe must not create the real path");
+        let residue: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().starts_with("clinker-case-probe-"))
+            .collect();
+        assert!(residue.is_empty(), "probe residue left behind: {residue:?}");
+    }
 
     #[test]
     fn tempdir_is_probeable() {

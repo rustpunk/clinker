@@ -118,6 +118,15 @@ foreign or repeated request is sent.
 their continuation authority comes from the configured offset, cursor, or
 single-request contract.
 
+A `Link` header is read as bytes, so a parameter this reader never consults —
+a `title` or a `type` carrying an accented character, an emoji, or anything
+else outside ASCII — does not affect the pull. Only the target inside `<…>` is
+decoded, because only the target has to become a URL: a target that is not
+valid UTF-8 is reported as malformed metadata. When a header carries several
+comma-separated links and one of them cannot be parsed, the rest are still
+read, so a reply naming two different next pages is reported as the conflict
+it is rather than as unreadable metadata.
+
 ### Authentication
 
 `auth.scheme` selects the credential sent on every request:

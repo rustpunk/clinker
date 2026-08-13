@@ -781,6 +781,16 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   of the grammar is a pagination failure against a real server, and this file
   has now been repaired twice for exactly that class of defect. No behavior
   change is proposed here; the decision is which way to close it.
+  Updated 2026-08-12: a search of the ecosystem found no crate that parses
+  RFC 8288 over bytes -- the `&str` interfaces of the candidates carry the
+  exact defect question 53 describes -- so the parser was ported to bytes and
+  kept. What changed in its favour is that the adversary is now automated
+  rather than imagined: `no_byte_sequence_panics_or_yields_an_unusable_target`
+  runs the parser over a fixed corpus built from exhaustive delimiter
+  sequences, every single-byte mutation and truncation of a well-formed field,
+  and a seeded random sweep of the full byte range. The dependency-versus-
+  exception decision is still a maintainer's; the evidence for the exception
+  is stronger than it was.
 - **35 (filed 2026-08-09, needs a maintainer decision):** When the machine
   protocol's liveness worker gives up on a sink that has refused records for
   the whole patience window, the only report is a `tracing` warning on stderr.
@@ -939,18 +949,24 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   The clean answer is probably a surface rule -- an admitted destination may
   not use `..` beyond a directory that exists -- which is a user-facing
   decision rather than a repair.
-- **53 (filed 2026-08-09, needs a maintainer decision):** `Link` and
-  `Location` headers are refused when they carry any byte outside visible
-  ASCII, because `HeaderValue::to_str` refuses those bytes -- not only invalid
-  UTF-8. A server that puts a non-ASCII character in a link's `title`, or in
-  a redirect target, therefore ends the pull and discards every record already
+- **53 (filed 2026-08-09; the `Link` half was closed 2026-08-12, the
+  `Location` half still needs a maintainer decision):** `Link` and `Location`
+  headers were refused when they carried any byte outside visible ASCII,
+  because `HeaderValue::to_str` refuses those bytes -- not only invalid UTF-8.
+  A server that puts a non-ASCII character in a link's `title`, or in a
+  redirect target, therefore ended the pull and discarded every record already
   extracted. Reading the header lossily instead was tried and reverted: the
   lossy string cannot distinguish "a parameter nothing reads lost bytes" from
   "the target lost bytes", and both attempts at that distinction produced
   worse failures -- one silently ending pagination as though the server had
-  finished, one refusing well-formed UTF-8 redirects outright. Doing it
-  correctly means parsing the field from bytes and decoding only the target,
-  which is the hand-rolled-parser decision already open as question 34.
+  finished, one refusing well-formed UTF-8 redirects outright. `Link` is now
+  parsed from `HeaderValue::as_bytes` with only the target inside `<...>`
+  decoded, which makes that distinction structural rather than guessed at.
+  `Location` still goes through `to_str`, where the same split buys nothing --
+  the whole value is the target and must be decoded either way. What is left
+  open there is only a classification: a redirect target that is valid UTF-8
+  outside ASCII is refused as an unreadable header rather than reaching URL
+  parsing and being refused as the unresolvable target it is.
 - **54 (filed 2026-08-09, needs a maintainer decision):** When a dispatch
   failure ends a run, `execute_dag` joins every ingest thread before returning
   the diagnostic, so no reader or spill handle outlives the run. The comment

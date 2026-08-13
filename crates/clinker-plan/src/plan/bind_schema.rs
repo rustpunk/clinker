@@ -1273,17 +1273,18 @@ pub(crate) fn validate_dlq_per_source(
         .collect();
 
     // Track path collisions across the pipeline-wide + every per-source
-    // entry. Two paths collide when they name the *same physical file*, which
-    // on a case-insensitive output filesystem (macOS APFS / Windows NTFS
-    // default) includes paths differing only in case — `errors.csv` and
-    // `Errors.csv` resolve to one file there, so the per-source and
-    // pipeline-wide writers would silently overwrite each other. The
-    // collision key is therefore folded *conditionally*: only when the actual
-    // target filesystem folds case (probed via `case_sensitive_dir`), never
-    // unconditionally, so two legitimately-distinct files on case-sensitive
-    // Linux are not falsely flagged. First insertion wins; subsequent
-    // insertions onto the same key emit E318. The stored value keeps the raw
-    // path for the diagnostic message; the value's `.1` is the config label.
+    // entry. Two paths collide when they name the *same physical file*, and a
+    // filesystem decides that along two independent axes: case, and Unicode
+    // normalization. `errors.csv` and `Errors.csv` are one file wherever case
+    // is folded; `Ärger.csv` written composed and decomposed is one file
+    // wherever normalization is ignored, which includes case-*sensitive*
+    // APFS. Either way the per-source and pipeline-wide writers would
+    // silently overwrite each other. Each axis is therefore applied only when
+    // the actual target filesystem exercises it, probed independently, so two
+    // legitimately-distinct files are not falsely flagged. First insertion
+    // wins; subsequent insertions onto the same key emit E318. The stored
+    // value keeps the raw path for the diagnostic message; the value's `.1`
+    // is the config label.
     let mut paths: HashMap<String, (String, String)> = HashMap::new();
     if let Some(p) = dlq.path.as_deref() {
         paths.insert(
@@ -1356,9 +1357,10 @@ pub(crate) fn validate_dlq_per_source(
 ///
 /// Keyed through [`crate::config::destination_identity`] — the same identity
 /// the runtime staging registry uses — so a collision the run would refuse is
-/// refused here instead, before any record is read. Case is folded
-/// conditionally within it, so two legitimately-distinct files on
-/// case-sensitive Linux are not flagged. Collisions that only emerge after
+/// refused here instead, before any record is read. Case folding and Unicode
+/// normalization are each applied within it only when the target filesystem
+/// exercises that axis, so two legitimately-distinct files are not flagged.
+/// Collisions that only emerge after
 /// path-template token resolution are still left to runtime. DLQ-vs-DLQ collisions stay owned by
 /// [`validate_dlq_per_source`] (E318): this pass seeds the map with DLQ paths
 /// only to catch Output-vs-DLQ overlap, and never re-reports a DLQ-only

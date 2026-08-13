@@ -201,31 +201,27 @@ pub(crate) fn next_link(
     // it resolves to -- and comparing the raw text called those two different
     // pages, which is the same false conflict as the duplicate itself.
     //
-    // A header this client cannot read, or cannot parse, is held rather than
-    // returned on. It is not offered as a target either: an unreadable field
-    // may have named no next page, one, or several, and calling it one
-    // invented a page a readable `rel=next` beside it then conflicted with.
-    // Holding it keeps the count honest -- a reply that genuinely names two
-    // different pages is still reported as the conflict it is -- while a
-    // reply whose continuation cannot be established is still refused.
+    // A link-value this client cannot parse is held rather than returned on.
+    // It is not offered as a target either: an unreadable link-value may have
+    // named no next page, one, or several, and calling it one invented a page
+    // a readable `rel=next` beside it then conflicted with. Holding it keeps
+    // the count honest -- a reply that genuinely names two different pages is
+    // still reported as the conflict it is -- while a reply whose continuation
+    // cannot be established is still refused.
+    //
+    // The field is read as bytes. A field value is opaque data, not text, and
+    // decoding the whole of it made a `title` carrying one non-ASCII byte end
+    // the pull; only the target has to become a URL, so only the target is
+    // decoded.
     let mut targets = TargetSet::default();
     let mut unreadable: Option<ContinuationError> = None;
     for value in headers.get_all(ureq::http::header::LINK) {
-        let Ok(value) = value.to_str() else {
-            unreadable.get_or_insert_with(|| {
-                ContinuationError::for_code("rest.protocol.malformed_continuation")
-            });
-            continue;
-        };
-        match parse_link_field(value) {
-            Ok(parsed) => {
-                for target in parsed {
-                    targets.offer(&target, effective_url, admitted_origin);
-                }
-            }
-            Err(error) => {
-                unreadable.get_or_insert(error);
-            }
+        let parsed = parse_link_field(value.as_bytes());
+        for target in parsed.next_targets {
+            targets.offer(&target, effective_url, admitted_origin);
+        }
+        if let Some(error) = parsed.refusal {
+            unreadable.get_or_insert(error);
         }
     }
     let resolved = targets.into_one()?;
@@ -444,79 +440,138 @@ fn normalize_path(path: &str) -> String {
     normalized
 }
 
-fn parse_link_field(field: &str) -> Result<Vec<String>, ContinuationError> {
-    let entries = split_link_values(field)?;
-    let mut next_targets = Vec::new();
-    for entry in entries {
-        let entry = entry.trim();
-        let Some(after_open) = entry.strip_prefix('<') else {
-            return Err(ContinuationError::for_code(
-                "rest.protocol.malformed_continuation",
-            ));
-        };
-        let Some(close) = after_open.find('>') else {
-            return Err(ContinuationError::for_code(
-                "rest.protocol.malformed_continuation",
-            ));
-        };
-        let target = &after_open[..close];
-        if target.is_empty() {
-            return Err(ContinuationError::for_code(
-                "rest.protocol.malformed_continuation",
-            ));
-        }
-        let mut rel = None;
-        let parameters = after_open[close + 1..].trim();
-        if !parameters.is_empty() {
-            if !parameters.starts_with(';') {
-                return Err(ContinuationError::for_code(
-                    "rest.protocol.malformed_continuation",
-                ));
-            }
-            for parameter in split_parameters(parameters)? {
-                let parameter = parameter.trim();
-                if parameter.is_empty() {
-                    continue;
-                }
-                let Some((name, value)) = parameter.split_once('=') else {
-                    continue;
-                };
-                // The first `rel` wins and later ones are ignored, which is
-                // what RFC 8288 says to do with a repeated parameter. A
-                // gateway that appends a canonical `rel` to a link that
-                // already carried one produces this, and refusing it ended
-                // the pull and discarded every record already extracted.
-                if name.trim().eq_ignore_ascii_case("rel") && rel.is_none() {
-                    rel = Some(unquote(value.trim())?);
-                }
-            }
-        }
-        if rel.as_deref().is_some_and(|relations| {
-            relations
-                .split_ascii_whitespace()
-                .any(|rel| rel.eq_ignore_ascii_case("next"))
-        }) {
-            next_targets.push(target.to_owned());
-        }
-    }
-    Ok(next_targets)
+/// What one `Link` field named, and the first reason a link-value in it could
+/// not be read.
+///
+/// Both halves are returned because either alone loses a reply the other
+/// answers. RFC 8288 Appendix B says to carry on with the remaining
+/// link-values when one cannot be parsed, so the readable ones are still
+/// counted -- without which a reply naming two different next pages beside one
+/// piece of junk was reported as junk rather than as the conflict it is. The
+/// refusal is still carried out, because a link-value nobody can read may have
+/// named a page the readable ones did not, and treating it as silence ended
+/// pagination as though the server had said there was no next page.
+#[derive(Default)]
+struct ParsedLinkField {
+    next_targets: Vec<String>,
+    refusal: Option<ContinuationError>,
 }
 
-fn split_link_values(field: &str) -> Result<Vec<&str>, ContinuationError> {
+/// Read a `Link` field's bytes and collect the targets it marks `rel=next`.
+///
+/// The field is bytes, not text. RFC 9110 makes bytes 0x80-0xFF in a field
+/// value opaque data rather than an error, and RFC 8187 makes ignoring a
+/// parameter that cannot be decoded the correct response to one -- so every
+/// parameter here is compared and discarded as bytes, and never decoded. Only
+/// the target inside `<...>` is decoded, because only the target has to become
+/// a URL.
+fn parse_link_field(field: &[u8]) -> ParsedLinkField {
+    let mut parsed = ParsedLinkField::default();
+    let entries = match split_link_values(field) {
+        Ok(entries) => entries,
+        Err(error) => {
+            parsed.refusal = Some(error);
+            return parsed;
+        }
+    };
+    for entry in entries {
+        match parse_link_value(entry) {
+            Ok(Some(target)) => parsed.next_targets.push(target),
+            Ok(None) => {}
+            Err(error) => {
+                parsed.refusal.get_or_insert(error);
+            }
+        }
+    }
+    parsed
+}
+
+/// Read one link-value, returning its target when it names the `next`
+/// relation.
+fn parse_link_value(entry: &[u8]) -> Result<Option<String>, ContinuationError> {
+    let entry = entry.trim_ascii();
+    let Some(after_open) = entry.strip_prefix(b"<") else {
+        return Err(ContinuationError::for_code(
+            "rest.protocol.malformed_continuation",
+        ));
+    };
+    let Some(close) = after_open.iter().position(|byte| *byte == b'>') else {
+        return Err(ContinuationError::for_code(
+            "rest.protocol.malformed_continuation",
+        ));
+    };
+    let target = &after_open[..close];
+    if target.is_empty() {
+        return Err(ContinuationError::for_code(
+            "rest.protocol.malformed_continuation",
+        ));
+    }
+    let mut rel: Option<Vec<u8>> = None;
+    let parameters = after_open[close + 1..].trim_ascii();
+    if !parameters.is_empty() {
+        if !parameters.starts_with(b";") {
+            return Err(ContinuationError::for_code(
+                "rest.protocol.malformed_continuation",
+            ));
+        }
+        for parameter in split_parameters(parameters)? {
+            let parameter = parameter.trim_ascii();
+            if parameter.is_empty() {
+                continue;
+            }
+            let Some(equals) = parameter.iter().position(|byte| *byte == b'=') else {
+                continue;
+            };
+            let (name, value) = parameter.split_at(equals);
+            // The first `rel` wins and later ones are ignored, which is what
+            // RFC 8288 says to do with a repeated parameter. A gateway that
+            // appends a canonical `rel` to a link that already carried one
+            // produces this, and refusing it ended the pull and discarded
+            // every record already extracted.
+            if name.trim_ascii().eq_ignore_ascii_case(b"rel") && rel.is_none() {
+                rel = Some(unquote(value[1..].trim_ascii())?);
+            }
+        }
+    }
+    let names_next = rel.as_deref().is_some_and(|relations| {
+        relations
+            .split(u8::is_ascii_whitespace)
+            .any(|rel| rel.eq_ignore_ascii_case(b"next"))
+    });
+    if !names_next {
+        return Ok(None);
+    }
+    // The one place decoding is owed: a target that is not UTF-8 cannot be a
+    // URL, so this is a link the reader could not follow however it were
+    // spelled, and refusing it is the honest answer rather than a decoding
+    // limitation showing through.
+    let Ok(target) = std::str::from_utf8(target) else {
+        return Err(ContinuationError::for_code(
+            "rest.protocol.malformed_continuation",
+        ));
+    };
+    Ok(Some(target.to_owned()))
+}
+
+fn split_link_values(field: &[u8]) -> Result<Vec<&[u8]>, ContinuationError> {
     let mut entries = Vec::new();
     let mut start = 0;
     let mut in_angle = false;
     let mut in_quote = false;
     let mut escaped = false;
-    for (index, character) in field.char_indices() {
+    // Splitting on bytes rather than characters is safe here and everywhere
+    // below: every byte of a multi-byte UTF-8 sequence is 0x80 or above, so
+    // none of them can be mistaken for one of the ASCII delimiters this
+    // walks, and a byte that is not part of any character cannot be either.
+    for (index, byte) in field.iter().enumerate() {
         if escaped {
             escaped = false;
             continue;
         }
-        match character {
-            '\\' if in_quote => escaped = true,
-            '"' if !in_angle => in_quote = !in_quote,
-            '<' if !in_quote => {
+        match *byte {
+            b'\\' if in_quote => escaped = true,
+            b'"' if !in_angle => in_quote = !in_quote,
+            b'<' if !in_quote => {
                 if in_angle {
                     return Err(ContinuationError::for_code(
                         "rest.protocol.malformed_continuation",
@@ -524,7 +579,7 @@ fn split_link_values(field: &str) -> Result<Vec<&str>, ContinuationError> {
                 }
                 in_angle = true;
             }
-            '>' if !in_quote => {
+            b'>' if !in_quote => {
                 if !in_angle {
                     return Err(ContinuationError::for_code(
                         "rest.protocol.malformed_continuation",
@@ -532,9 +587,9 @@ fn split_link_values(field: &str) -> Result<Vec<&str>, ContinuationError> {
                 }
                 in_angle = false;
             }
-            ',' if !in_angle && !in_quote => {
+            b',' if !in_angle && !in_quote => {
                 entries.push(&field[start..index]);
-                start = index + character.len_utf8();
+                start = index + 1;
             }
             _ => {}
         }
@@ -549,7 +604,7 @@ fn split_link_values(field: &str) -> Result<Vec<&str>, ContinuationError> {
     // and a trailing comma both produce one, and both are gateways saying
     // there is no next page. Refusing the whole field ended the pull with a
     // protocol error and threw away every record already pulled.
-    entries.retain(|entry| !entry.trim().is_empty());
+    entries.retain(|entry| !entry.trim_ascii().is_empty());
     Ok(entries)
 }
 
@@ -560,19 +615,19 @@ fn split_link_values(field: &str) -> Result<Vec<&str>, ContinuationError> {
 /// on the character alone read one such value as a second `rel`, and a reply
 /// carrying a title or type that happened to contain a semicolon aborted the
 /// pull and discarded everything already extracted.
-fn split_parameters(parameters: &str) -> Result<Vec<&str>, ContinuationError> {
+fn split_parameters(parameters: &[u8]) -> Result<Vec<&[u8]>, ContinuationError> {
     let mut parts = Vec::new();
     let mut start = 0_usize;
     let mut in_quote = false;
     let mut escaped = false;
-    for (index, character) in parameters.char_indices() {
-        match character {
+    for (index, byte) in parameters.iter().enumerate() {
+        match *byte {
             _ if escaped => escaped = false,
-            '\\' if in_quote => escaped = true,
-            '"' => in_quote = !in_quote,
-            ';' if !in_quote => {
+            b'\\' if in_quote => escaped = true,
+            b'"' => in_quote = !in_quote,
+            b';' if !in_quote => {
                 parts.push(&parameters[start..index]);
-                start = index + character.len_utf8();
+                start = index + 1;
             }
             _ => {}
         }
@@ -588,23 +643,28 @@ fn split_parameters(parameters: &str) -> Result<Vec<&str>, ContinuationError> {
     Ok(parts.split_off(1))
 }
 
-fn unquote(value: &str) -> Result<String, ContinuationError> {
-    if let Some(quoted) = value.strip_prefix('"') {
-        let Some(quoted) = quoted.strip_suffix('"') else {
+/// Undo quoted-string quoting, keeping the value as bytes.
+///
+/// The result is never decoded. A `rel` is a list of ASCII tokens compared
+/// case-insensitively, which bytes answer exactly; anything else the value
+/// carries is data this reader has no business interpreting.
+fn unquote(value: &[u8]) -> Result<Vec<u8>, ContinuationError> {
+    if let Some(quoted) = value.strip_prefix(b"\"") {
+        let Some(quoted) = quoted.strip_suffix(b"\"") else {
             return Err(ContinuationError::for_code(
                 "rest.protocol.malformed_continuation",
             ));
         };
-        let mut output = String::with_capacity(quoted.len());
+        let mut output = Vec::with_capacity(quoted.len());
         let mut escaped = false;
-        for character in quoted.chars() {
+        for byte in quoted {
             if escaped {
-                output.push(character);
+                output.push(*byte);
                 escaped = false;
-            } else if character == '\\' {
+            } else if *byte == b'\\' {
                 escaped = true;
             } else {
-                output.push(character);
+                output.push(*byte);
             }
         }
         if escaped {
@@ -613,12 +673,12 @@ fn unquote(value: &str) -> Result<String, ContinuationError> {
             ));
         }
         Ok(output)
-    } else if value.contains('"') {
+    } else if value.contains(&b'"') {
         Err(ContinuationError::for_code(
             "rest.protocol.malformed_continuation",
         ))
     } else {
-        Ok(value.to_owned())
+        Ok(value.to_vec())
     }
 }
 
@@ -659,8 +719,7 @@ mod tests {
         }
 
         // A repeated `rel` leaves the target perfectly readable; the format
-        // says to take the first. A title carrying bytes outside visible
-        // ASCII is refused instead -- see open question 53.
+        // says to take the first.
         let repeated_rel = "<https://api.example.test/v1/items?page=2>; rel=\"next\"; rel=\"next\"";
         let read = next_link(
             &headers_of(ureq::http::header::LINK, &[repeated_rel]),
@@ -689,6 +748,12 @@ mod tests {
     /// then conflicted with -- so a reply naming exactly one page was refused
     /// as naming two, under the wrong rule. The refusal is still made, after
     /// the readable targets have been counted.
+    ///
+    /// The unreadable header here is one whose target is not UTF-8, which is
+    /// now the whole of what "cannot read" means: a target that cannot become
+    /// a URL. A parameter carrying the same bytes used to land here too, and
+    /// [`a_parameter_this_reader_never_decodes_cannot_end_the_pull`] is the
+    /// same header proving it no longer does.
     #[test]
     fn an_unreadable_header_is_not_a_page_the_reply_named() {
         let (origin, base) =
@@ -699,8 +764,10 @@ mod tests {
         );
         headers.append(
             ureq::http::header::LINK,
-            ureq::http::HeaderValue::from_bytes(b"</v1/prev>; rel=\"prev\"; title=\"\xff\"")
-                .expect("a header carrying a byte outside visible ASCII"),
+            ureq::http::HeaderValue::from_bytes(
+                b"<https://api.example.test/v1/\xff>; rel=\"next\"",
+            )
+            .expect("a header carrying a byte outside visible ASCII"),
         );
 
         let refused = next_link(&headers, &base, &origin)
@@ -709,6 +776,115 @@ mod tests {
             refused.classification_code(),
             "rest.protocol.malformed_continuation",
             "and it is named as unreadable, not as a conflict between two pages"
+        );
+    }
+
+    /// A field value is opaque bytes, and a parameter this reader never looks
+    /// at may carry any of them. Decoding the whole field as visible ASCII
+    /// made one accented character in a `title` end the pull and discard every
+    /// record already extracted -- the header below is the one the sibling
+    /// test above used to be built on.
+    #[test]
+    fn a_parameter_this_reader_never_decodes_cannot_end_the_pull() {
+        let (origin, base) =
+            authorize_initial("https://api.example.test/v1/items").expect("initial URL");
+        let mut headers = ureq::http::HeaderMap::new();
+        headers.append(
+            ureq::http::header::LINK,
+            ureq::http::HeaderValue::from_bytes(
+                b"<https://api.example.test/v1/items?page=2>; rel=\"next\"; title=\"caf\xc3\xa9\"",
+            )
+            .expect("a header carrying valid UTF-8 outside ASCII"),
+        );
+        headers.append(
+            ureq::http::header::LINK,
+            ureq::http::HeaderValue::from_bytes(b"</v1/prev>; rel=\"prev\"; title=\"\xff\"")
+                .expect("a header carrying a byte that is not UTF-8 at all"),
+        );
+
+        let read = next_link(&headers, &base, &origin)
+            .expect("neither parameter has to be decoded to find the next page")
+            .expect("there is a next page");
+        assert_eq!(read.as_str(), "https://api.example.test/v1/items?page=2");
+    }
+
+    /// Only the target is decoded, and it is decoded as UTF-8 rather than as
+    /// visible ASCII: a target outside ASCII still has to become a URL, and a
+    /// target that is not UTF-8 cannot become one however it is spelled.
+    #[test]
+    fn only_the_target_is_decoded_and_it_is_decoded_as_utf8() {
+        let parsed = parse_link_field("<https://api.example.test/caf\u{e9}>; rel=next".as_bytes());
+        assert_eq!(parsed.next_targets, ["https://api.example.test/café"]);
+        assert!(parsed.refusal.is_none(), "a UTF-8 target is readable");
+        // And it is then judged as a target rather than discarded as an
+        // unreadable header: the URL parser takes the byte in a path, and the
+        // origin rules still decide whether the page may be fetched. Nothing
+        // outside the path is loosened -- an ASCII control byte, which is what
+        // a request could be split on, is still refused before this point.
+        let (origin, base) =
+            authorize_initial("https://api.example.test/v1/items").expect("initial URL");
+        let resolved = resolve_and_authorize(&base, &parsed.next_targets[0], &origin)
+            .expect("a page on the admitted origin");
+        assert_eq!(resolved.as_str(), "https://api.example.test/café");
+        let foreign = resolve_and_authorize(&base, "https://elsewhere.test/café", &origin)
+            .expect_err("the origin rules do not care what the path spells");
+        assert_eq!(foreign.classification_code(), "rest.security.cross_origin");
+
+        let parsed = parse_link_field(b"<https://api.example.test/\xff>; rel=next");
+        assert!(
+            parsed.next_targets.is_empty(),
+            "a target that cannot become a URL is not offered as one"
+        );
+        assert_eq!(
+            parsed
+                .refusal
+                .as_ref()
+                .map(ContinuationError::classification_code),
+            Some("rest.protocol.malformed_continuation")
+        );
+    }
+
+    /// RFC 8288 Appendix B: a link-value that cannot be parsed is skipped and
+    /// the rest of the field is still read. Discarding the whole field instead
+    /// reported a reply that genuinely named two different next pages as
+    /// malformed, telling the operator about the wrong rule -- and the refusal
+    /// the junk earns is still made, so nothing is read past silently.
+    #[test]
+    fn one_unparseable_link_value_does_not_discard_the_others() {
+        let junk = "notalink; rel=\"next\"";
+        let second = "<https://api.example.test/v1/items?page=2>; rel=\"next\"";
+
+        let parsed = parse_link_field(format!("{junk}, {second}").as_bytes());
+        assert_eq!(
+            parsed.next_targets,
+            ["https://api.example.test/v1/items?page=2"],
+            "the readable link-value is still read"
+        );
+        assert_eq!(
+            parsed
+                .refusal
+                .as_ref()
+                .map(ContinuationError::classification_code),
+            Some("rest.protocol.malformed_continuation"),
+            "and the unreadable one is still refused"
+        );
+
+        let (origin, base) =
+            authorize_initial("https://api.example.test/v1/items").expect("initial URL");
+        let third = "<https://api.example.test/v1/items?page=9>; rel=\"next\"";
+        let conflicting = next_link(
+            &headers_of(
+                ureq::http::header::LINK,
+                &[&format!("{junk}, {second}, {third}")],
+            ),
+            &base,
+            &origin,
+        )
+        .expect_err("two different next pages are unresolvable");
+        assert_eq!(
+            conflicting.classification_code(),
+            "rest.protocol.conflicting_continuation",
+            "reported as the conflict it is, not as the junk beside it"
         );
     }
 
@@ -821,6 +997,178 @@ mod tests {
         let resolved =
             resolve_and_authorize(&base, "../next?page=2", &origin).expect("relative continuation");
         assert_eq!(resolved.as_str(), "http://api.example.test/v1/next?page=2");
+    }
+
+    /// The bytes most likely to break a field walker: the delimiters it
+    /// splits on, the escape it honours, obs-text on both sides of the UTF-8
+    /// boundary, a lone continuation byte belonging to no character, and NUL.
+    const INTERESTING: [u8; 16] = [
+        b'<', b'>', b'"', b'\\', b';', b',', b'=', b' ', b'\t', b'r', b'n', 0x00, 0x7f, 0x80, 0xc3,
+        0xff,
+    ];
+
+    /// A deterministic pseudorandom source. A fixed seed is the point: a
+    /// corpus that differs between runs turns a reproducible failure into a
+    /// flake, and there is no fuzzing harness in this workspace to replay a
+    /// crashing input from.
+    fn scramble(state: &mut u64) -> u64 {
+        let mut bits = *state;
+        bits ^= bits << 13;
+        bits ^= bits >> 7;
+        bits ^= bits << 17;
+        *state = bits;
+        bits
+    }
+
+    /// Every byte sequence the parser is asked to survive, built the same way
+    /// on every run.
+    fn adversarial_corpus() -> Vec<Vec<u8>> {
+        let mut corpus: Vec<Vec<u8>> = Vec::new();
+
+        // Exhaustive over the delimiter alphabet up to three bytes: every
+        // ordering of an angle bracket, a quote, an escape, and a separator
+        // against each other, including the unbalanced ones.
+        corpus.push(Vec::new());
+        let mut previous: Vec<Vec<u8>> = vec![Vec::new()];
+        for _ in 0..3 {
+            let mut grown = Vec::new();
+            for prefix in &previous {
+                for byte in INTERESTING {
+                    let mut candidate = prefix.clone();
+                    candidate.push(byte);
+                    grown.push(candidate);
+                }
+            }
+            corpus.extend(grown.iter().cloned());
+            previous = grown;
+        }
+
+        // Every single-byte mutation of a well-formed field, plus every
+        // truncation of it: the boundaries a walker reaches only when a
+        // structure it was part-way through ends early.
+        let base = b"<https://h/a?p=1>; rel=\"next\"; title=\"t\"".to_vec();
+        for index in 0..=base.len() {
+            corpus.push(base[..index].to_vec());
+            for byte in INTERESTING {
+                let mut inserted = base.clone();
+                inserted.insert(index, byte);
+                corpus.push(inserted);
+                if index < base.len() {
+                    let mut replaced = base.clone();
+                    replaced[index] = byte;
+                    corpus.push(replaced);
+                }
+            }
+        }
+
+        // Hand-written cases the generators above are unlikely to reach.
+        for case in [
+            &b"<>"[..],
+            b"<>; rel=next",
+            b"<a>; rel=\"",
+            b"<a>; rel=\"next",
+            b"<a>; rel=\"\\\"",
+            b"<a>; rel=\"ne\\\"xt\"",
+            b"<a>; rel=next; rel=prev",
+            b"<a>; rel=\"NEXT\"",
+            b"<a>; rel=\"first next last\"",
+            b"<a>; rel=\"next\", <b>; rel=\"next\"",
+            b"<a>,,,<b>; rel=next",
+            b"<a\xff>; rel=next",
+            b"<a\xc3\xa9>; rel=next",
+            b"<a>; title=\"\xff\"; rel=next",
+            b"<a>; title=\"\x00\"; rel=next",
+            b"<a\x00b>; rel=next",
+            b"<a>; rel\xff=next",
+            b"<a>; =next",
+            b"<a>; rel=",
+            b"<<a>>; rel=next",
+            b"<a>>; rel=next",
+            b"a>; rel=next",
+            b"\\",
+            b"\"\\\"",
+        ] {
+            corpus.push(case.to_vec());
+        }
+
+        // Unbounded-looking inputs: proof the walkers are linear and hold no
+        // recursion, and that a long quoted run does not blow the stack.
+        for pattern in [&b"<a>; rel=next, "[..], b"\\", b"\"", b"<", b"\xff"] {
+            corpus.push(pattern.repeat(20_000));
+        }
+
+        // Random bytes over the full range, so nothing above is load-bearing.
+        let mut state = 0x5eed_1eaf_c0ff_ee01_u64;
+        for _ in 0..20_000 {
+            let length = usize::try_from(scramble(&mut state) % 48).expect("a small length");
+            let mut case = Vec::with_capacity(length);
+            for _ in 0..length {
+                let bits = scramble(&mut state);
+                // Half drawn from the delimiter alphabet so structure appears
+                // often enough to reach the deeper states, half from anywhere.
+                let byte = if bits & 1 == 0 {
+                    INTERESTING[usize::try_from(bits >> 8).expect("a usize") % INTERESTING.len()]
+                } else {
+                    u8::try_from((bits >> 8) & 0xff).expect("one byte")
+                };
+                case.push(byte);
+            }
+            corpus.push(case);
+        }
+
+        corpus
+    }
+
+    /// The parser is hand-written against a grammar it is fed by strangers, so
+    /// the adversary is automated rather than imagined. Every case runs to
+    /// completion -- the test hanging or aborting is the failure -- and what
+    /// it returns has to be usable: a target is a URL reference this reader
+    /// can go on to resolve, never a fragment of the syntax around it, and a
+    /// refusal is one of the registered continuation codes rather than a
+    /// panic wearing a different name.
+    #[test]
+    fn no_byte_sequence_panics_or_yields_an_unusable_target() {
+        for case in adversarial_corpus() {
+            let parsed = parse_link_field(&case);
+
+            for target in &parsed.next_targets {
+                assert!(
+                    !target.is_empty(),
+                    "an empty target is not a page: {case:?}"
+                );
+                assert!(
+                    !target.contains(['<', '>']),
+                    "a target is what was inside the brackets, not the brackets: \
+                     {target:?} from {case:?}"
+                );
+            }
+            assert!(
+                parsed.next_targets.len() <= case.iter().filter(|byte| **byte == b',').count() + 1,
+                "no more targets than the field has link-values: {case:?}"
+            );
+            if let Some(refusal) = &parsed.refusal {
+                assert_eq!(
+                    refusal.classification_code(),
+                    "rest.protocol.malformed_continuation",
+                    "an unreadable field has exactly one name: {case:?}"
+                );
+            }
+
+            // A reply's meaning may not depend on how many times it is read.
+            let again = parse_link_field(&case);
+            assert_eq!(again.next_targets, parsed.next_targets, "{case:?}");
+            assert_eq!(
+                again
+                    .refusal
+                    .as_ref()
+                    .map(ContinuationError::classification_code),
+                parsed
+                    .refusal
+                    .as_ref()
+                    .map(ContinuationError::classification_code),
+                "{case:?}"
+            );
+        }
     }
 
     #[test]

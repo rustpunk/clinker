@@ -198,26 +198,31 @@ impl EnabledDispatcher<'_> {
     }
 
     fn emit(&self, directive: &LogDirective, record: Option<&Record>) {
-        let requested = directive.fields.as_deref().unwrap_or_default();
-        let mut fields = Vec::with_capacity(requested.len());
-        if let Some(record) = record {
-            for field in requested {
-                if let Some(value) = record.get(field) {
-                    fields.push(SignalField::from_record(field, value));
-                }
-            }
-        }
-        let _ = self.producer.emit_log(LogEvent {
-            event: &directive.name,
-            severity: severity(directive.level),
-            message: &directive.message,
-            correlation: RunCorrelation {
-                execution_id: &self.execution_id,
-                batch_id: &self.batch_id,
-                pipeline_name: &self.pipeline_name,
+        // Ask before reading the record. Sampling is decided from the event's
+        // identity and its lane alone, so at `every: 1` under a policy sampling
+        // one record in a hundred, this is what keeps the other ninety-nine
+        // from being read field by field to build a signal with nowhere to go.
+        // The producer has already counted a refusal under its own reason and
+        // lane, so there is nothing to report here.
+        let severity = severity(directive.level);
+        let Ok(ticket) = self.producer.peek_log(&directive.name, severity) else {
+            return;
+        };
+        let fields = gather_fields(directive.fields.as_deref().unwrap_or_default(), record);
+        let _ = self.producer.commit_log(
+            ticket,
+            LogEvent {
+                event: &directive.name,
+                severity,
+                message: &directive.message,
+                correlation: RunCorrelation {
+                    execution_id: &self.execution_id,
+                    batch_id: &self.batch_id,
+                    pipeline_name: &self.pipeline_name,
+                },
+                fields: &fields,
             },
-            fields: &fields,
-        });
+        );
     }
 
     fn close(&mut self, status: SpanStatus) {
@@ -242,6 +247,36 @@ impl Drop for EnabledDispatcher<'_> {
     fn drop(&mut self) {
         self.close(SpanStatus::Error);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Count of record field reads performed on this thread.
+    ///
+    /// Field gathering is the work the admission peek exists to avoid, and
+    /// whether it was avoided is invisible in the telemetry a run reports: a
+    /// sampled signal is counted the same either way. Thread-local, so one test
+    /// observes only its own dispatcher.
+    static FIELD_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Read the values a directive asked for out of the record it fired on.
+///
+/// Timing directives fire without a record and request nothing from one, so
+/// they gather no fields.
+fn gather_fields<'a>(requested: &'a [String], record: Option<&'a Record>) -> Vec<SignalField<'a>> {
+    let Some(record) = record else {
+        return Vec::new();
+    };
+    let mut fields = Vec::with_capacity(requested.len());
+    for field in requested {
+        #[cfg(test)]
+        FIELD_LOOKUPS.with(|count| count.set(count.get().saturating_add(1)));
+        if let Some(value) = record.get(field) {
+            fields.push(SignalField::from_record(field, value));
+        }
+    }
+    fields
 }
 
 /// Run one directive's authored gate against the transform's input record.
@@ -286,7 +321,7 @@ mod tests {
     use clinker_record::{Record, Schema, Value};
     use cxl::eval::{EvalContext, StableEvalContext};
 
-    use super::{LogDispatcher, TransformSignalContext};
+    use super::{FIELD_LOOKUPS, LogDispatcher, TransformSignalContext};
     use crate::telemetry::TelemetryArena;
 
     /// Compile a one-transform pipeline and hand back its directives paired
@@ -443,7 +478,11 @@ nodes:
     }
 
     fn telemetry_policy() -> clinker_plan::config::ResolvedObservabilityPolicy {
-        ClinkerToml::parse(
+        sampling_policy(1)
+    }
+
+    fn sampling_policy(sample_every: u32) -> clinker_plan::config::ResolvedObservabilityPolicy {
+        ClinkerToml::parse(&format!(
             r#"
 [observability]
 arena_bytes = "768KB"
@@ -453,7 +492,7 @@ max_batch_bytes = "8KB"
 max_attributes_per_event = 8
 max_attribute_bytes = "256B"
 drop_policy = "drop_newest"
-sample_every = 1
+sample_every = {sample_every}
 rate_limit_per_second = 100000
 rate_limit_burst = 100000
 flush_timeout_ms = 1000
@@ -480,8 +519,8 @@ identity_mode = "local_diagnostic_paths"
 event = "transform.seen"
 field = "amount"
 action = "allow"
-"#,
-        )
+"#
+        ))
         .expect("policy parses")
         .resolve_observability(None)
         .expect("policy resolves")
@@ -524,6 +563,69 @@ action = "allow"
             }
         }
         seen
+    }
+
+    /// A record sampling is going to discard must not be read.
+    ///
+    /// The directive asks for `amount`, so a dispatcher that builds the signal
+    /// and lets admission judge it afterwards reads all twelve records to
+    /// export three. Nothing in a run's own accounting distinguishes the two —
+    /// the nine are counted as sampled either way — so the read count is the
+    /// only evidence, and it is counted rather than timed.
+    #[test]
+    fn a_record_sampling_will_discard_is_never_read() {
+        let (directives, conditions) = compiled_directives(None);
+        let (producer, receiver) =
+            TelemetryArena::reserve(&sampling_policy(4)).expect("arena reserves");
+        let observer = producer.clone();
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let stable = StableEvalContext::test_default();
+        let eval_ctx = EvalContext::test_default_borrowed(&stable);
+        FIELD_LOOKUPS.with(|count| count.set(0));
+
+        let snapshot = {
+            let mut dispatcher = LogDispatcher::new(
+                Some(producer),
+                &directives,
+                &conditions,
+                TransformSignalContext {
+                    execution_id: "exec",
+                    batch_id: "batch",
+                    pipeline_name: "gate_runtime",
+                    logical_node: "observe",
+                },
+            );
+            for amount in 0..12_i64 {
+                let record = Record::new(Arc::clone(&schema), vec![Value::Integer(amount)]);
+                dispatcher.fire_per_record(&record, &eval_ctx);
+            }
+            // Taken before the dispatcher closes its span, which is an
+            // admission of its own in the same lane.
+            observer.snapshot()
+        };
+
+        assert_eq!(
+            FIELD_LOOKUPS.with(std::cell::Cell::get),
+            3,
+            "one in four records is admitted, so one in four is read"
+        );
+        assert_eq!(snapshot.accepted, 3);
+        assert_eq!(snapshot.ordinary_sampled_drops, 9);
+        assert_eq!(snapshot.high_sampled_drops, 0);
+
+        let mut seen = Vec::new();
+        while let Some(batch) = receiver.try_recv_batch() {
+            for log in batch.logs() {
+                if let Some(amount) = log.fields.get("amount") {
+                    seen.push(amount.clone());
+                }
+            }
+        }
+        assert_eq!(
+            seen,
+            vec!["0".to_string(), "4".to_string(), "8".to_string()],
+            "the records that were read are the ones sampling chose"
+        );
     }
 
     /// The capability itself: an authored gate must actually suppress the
