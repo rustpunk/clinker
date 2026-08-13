@@ -1769,12 +1769,32 @@ mod tests {
         // A `..` that runs out of prefix stays where it is, as it does for the
         // kernel. Asserted on the reduction itself: keying it would probe the
         // filesystem root, which a test has no business writing to.
+        //
+        // A root is not one component everywhere: on Windows an absolute path
+        // opens with a prefix (`\\?\C:`, `C:`, `\\server\share`) *and* a root
+        // separator, and taking only the first yields `\\?\C:`, which names
+        // the current directory of drive C: rather than the drive's root. Take
+        // the whole run of leading prefix/root components, and hold the result
+        // to `has_root` so a path that is merely drive-relative cannot pass
+        // for a rooted one.
         let root_of = |path: &Path| {
-            path.components()
-                .next()
-                .map(|first| std::path::PathBuf::from(first.as_os_str()))
-                .expect("an absolute path has a root")
+            let mut root = std::path::PathBuf::new();
+            for component in path.components() {
+                match component {
+                    std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                        root.push(component.as_os_str());
+                    }
+                    _ => break,
+                }
+            }
+            assert!(root.has_root(), "an absolute path has a root: {root:?}");
+            root
         };
+        // `resolved_prefix` reaches the root through `canonicalize`, so the
+        // expectation has to start from the same canonical spelling of it --
+        // on Windows that is the verbatim `\\?\C:\`, not the `C:\` the
+        // temporary directory was named with.
+        let canonical_out = out.canonicalize().expect("the existing prefix resolves");
         let deep = out.join("nope").join("..").join("..");
         let mut escaping = deep.clone();
         for _ in 0..out.components().count() {
@@ -1782,7 +1802,7 @@ mod tests {
         }
         assert_eq!(
             resolved_prefix(&escaping.join("data.csv")),
-            root_of(&out).join("data.csv"),
+            root_of(&canonical_out).join("data.csv"),
             "`..` past the root stays at the root"
         );
 
