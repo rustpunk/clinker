@@ -61,6 +61,45 @@ bench, socket, and file-descriptor caveats.
 - Never push to main directly; push only feature branches created for an explicitly requested task.
 - If a term, architecture rule, or behavior is unclear, record it in [docs/ai/80_OPEN_QUESTIONS.md](docs/ai/80_OPEN_QUESTIONS.md) instead of guessing.
 
+## Correctness Posture
+
+The project is greenfield and has no deployed users, so the cost of getting a design right is a rewrite and the cost of getting it wrong is permanent. That asymmetry decides the calls below.
+
+- Prefer the breaking change. A compatibility shim preserves a shape nobody depends on at the price of carrying it forever.
+- Complexity and effort are not reasons to defer a correct refactor. "Large" is an estimate, not an objection.
+- When the choice is between a correct hard option and an expedient easy one, take the correct one. This holds at implementation time as strongly as at planning time: a correctness deferral invented while coding is the same defect as one written into the plan, and it arrives without the review a plan gets.
+- Every surface named in an agreed design is a requirement of that landing, not a candidate for a follow-up. Dropping one needs the maintainer's explicit agreement, not a note in the PR.
+- A component must not report a state it has not established. Prefer arrangements where the wrong report is unrepresentable — one shared function, one derived count — over two places that agree today and are documented to stay in step.
+
+## Domain Facts
+
+Recurring ground truths. Each has been got wrong more than once; treat a design that contradicts one as wrong until the contradiction is explained.
+
+- **CXL is not SQL.** It is an expression language for record-at-a-time ETL. Boolean operators are `and` / `or` / `not`. When researching prior art, weight non-SQL ETL tools (Vector, Benthos, Embulk, NiFi, Logstash, Jolt, Singer) at least as heavily as query engines — a design imported from a SQL planner usually assumes a set-at-a-time model this engine does not have.
+- **Clinker is row-based, not columnar.** Record-at-a-time, bounded memory. Columnar-engine techniques rarely transfer, and the ones that do need their assumptions restated first.
+- **System namespaces carry a `$` sigil** — `$pipeline.*`, `$window.*`, `$meta.*`, `$doc.*`, `$source.*`.
+- **Engine-stamped columns never reach author vocabulary.** Frozen-identity shadow columns (`$ck.*`) and other `$`-namespaced schema columns are stripped from writer output by default and surface only on an explicit Output-node opt-in. The engine routes identity through joins and aggregates without the author ever naming a shadow column.
+- **`$doc.*` section names are author-defined** in pipeline YAML. `head`, `foot`, `header`, `footer` are examples, never built-ins — do not hardcode them in plans, designs, examples, or docs.
+- **Never infer workload frequency from fixture data.** Example and test corpora are written to exercise a path, not to describe production. Optimize for every shape the surface admits rather than the shape a fixture happens to have.
+
+## Verification
+
+A gate that was not run, or whose result was read from the wrong place, is a gate that did not happen.
+
+- `--explain` proves a pipeline compiles. It never proves the output is right. Execute examples against real data and compare bytes before claiming a behavior works.
+- Run the full check-job gauntlet before pushing — `cargo fmt --all --check` included. A targeted `-p` clippy pass is not the gate; formatting and cross-crate lints fail independently of it.
+- Before declaring a sprint done, run `cargo test --benches -p clinker-benchmarks`, not just `cargo check --benches`. The bench targets run end-to-end pipeline pre-flights that a compile check cannot fail on.
+- Read a gate's status from the gate. A command piped into another reports the last command's exit status, so a failing suite can return success; redirect output to a file and read the file.
+- Merge only when the review is resolved, rebases have settled, and CI is green on every platform including Windows and macOS.
+
+## Repository Hygiene
+
+- The git identity for this repository is `rustpunk`, which is not the machine default. Check it before the first commit of a session.
+- Stage by explicit path. `git add -A` sweeps scratch and probe files that tooling leaves in the tree; review `git status` and `git show --stat` before pushing.
+- Never use `git add -f`. Ignored paths — `docs/internal/`, `notes/`, local settings — are ignored deliberately.
+- Local progress and tracking files stay out of git.
+- Do not name specific prior-art tools or vendors in issues, PRs, or comments. Make the argument on its merits; the comparison belongs in internal notes.
+
 ## User-Facing Surface
 
 Anything a pipeline author writes by hand — a YAML key, a CXL construct, a CLI flag, an option value — is a user interface. Changing it is a design decision, not an implementation detail.
@@ -80,6 +119,7 @@ Anything a pipeline author writes by hand — a YAML key, a CXL construct, a CLI
 - Keep user-facing config strict where `deny_unknown_fields` is established.
 - Use subsystem error enums and `PipelineError::Internal` for invariant violations; avoid panic-based runtime behavior.
 - Add focused tests at the boundary touched: plan/config in `clinker-plan`, runtime in `clinker-exec`, format in `clinker-format`, language in `cxl`, channel in `clinker-channel`, CLI in `clinker`.
+- Doc comments on public items state what the signature cannot: whether the item streams or blocks, what it holds live, and which invariant its caller must already have established.
 
 ## Dependencies And Approval
 
@@ -93,6 +133,7 @@ Approval is gated on the capability, not on the manifest diff. It covers develop
 - Hand-rolling what a vetted crate provides is a dependency decision taken without review. Raise it rather than growing it, and treat an implementation that needs repeated adversarial repair as evidence the decision was wrong rather than as a reason to keep patching.
 - Adding a non-Rust language to the build, test, or release path is an approval-gated architectural decision in its own right. Committed tooling is Rust; the only committed non-Rust sources are the vendored mdBook theme assets under `docs/theme/`.
 - Not asking is not approval. The absence of a request is not evidence that a dependency was considered and rejected.
+- Check that a crate is still maintained before proposing it. Assistants reliably reach for names that were popular years ago and are now archived or superseded; recency, release cadence, and advisories are part of the proposal, not a detail to confirm afterwards.
 - If approval is refused or deferred, reduce scope or record the gap in [docs/ai/80_OPEN_QUESTIONS.md](docs/ai/80_OPEN_QUESTIONS.md); do not ship a hand-rolled substitute instead.
 
 ## Documentation Rules
