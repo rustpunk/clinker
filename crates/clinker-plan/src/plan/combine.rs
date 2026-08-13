@@ -1340,10 +1340,30 @@ fn pure_range_inputs_presorted(
         let Some(props) = node_properties.get(&upstream_idx) else {
             return false;
         };
+        // A sort-merge scan advances two cursors over two sequences, so
+        // the proof it needs is about the sequence it will read. A
+        // declared `sort_order` on a partitioned input is proven inside
+        // each partition instead: a Source matching two files verifies
+        // each file separately, and files whose key ranges descend across
+        // the match are individually sorted and jointly not. Reading the
+        // declaration without its scope accepted exactly that input and
+        // advanced the cursors past matching rows.
+        if !props.partitioning.kind.carries_global_order() {
+            return false;
+        }
         let Some(sort_order) = props.ordering.sort_order.as_ref() else {
             return false;
         };
-        sort_order.first().is_some_and(|sf| sf.field == field)
+        // Ascending specifically, not merely sorted. The kernel is handed
+        // `presorted: true` and walks two cursors forward, and it verifies
+        // that certification before emitting: a descending declaration on
+        // the range axis is the same broken promise as an unsorted one and
+        // ends the run naming the planner. A descending input is still a
+        // correct range join, so it routes to the strategy that sorts for
+        // itself rather than being refused.
+        sort_order
+            .first()
+            .is_some_and(|sf| sf.field == field && sf.order == crate::config::SortOrder::Asc)
     };
 
     // For each side, find the predecessor whose name matches the

@@ -17,6 +17,12 @@
 //! streaming-probe tests are the load-bearing ones — they exercise the
 //! forwarded-boundary path that previously dropped punctuations; the
 //! materialized-strategy tests are regression guards proving no break.
+//!
+//! The sort-merge guard is the one exception to the multi-document driver
+//! shape: SortMerge requires an unpartitioned — hence single-file — input,
+//! and a source that may declare `sort_order` at all contributes at most one
+//! record-bearing document per file, so its case is single-document by
+//! construction. See the comment on that test.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -511,11 +517,12 @@ fn grace_hash_combine_preserves_document_boundaries() {
     );
 }
 
-/// Single-range join with `sort_order` on both inputs' range key, forcing
-/// SortMerge over IEJoin.
-const SORT_MERGE_RANGE_YAML: &str = r#"
+/// Single-range join whose driver is a multi-file glob declaring
+/// `sort_order` on the range key, and whose lookup is a single sorted file.
+/// The declaration is per-file, so it does not license SortMerge.
+const FILE_PARTITIONED_SORTED_RANGE_YAML: &str = r#"
 pipeline:
-  name: sort_merge_combine_per_doc
+  name: file_partitioned_sorted_range_combine_per_doc
 nodes:
   - type: source
     name: driver
@@ -574,18 +581,31 @@ nodes:
 "#;
 
 #[test]
-fn sort_merge_combine_preserves_document_boundaries() {
-    assert_combine_strategy(SORT_MERGE_RANGE_YAML, "sort_merge");
+fn file_partitioned_sort_order_does_not_license_sort_merge() {
+    // A sort proof is exactly as wide as the stream it was proven over. A
+    // Source matching several files verifies its `sort_order` inside each
+    // file, so the promise is "each file ascends", never "the concatenation
+    // ascends" — the fixture below is two individually ascending files whose
+    // ranges descend across the match, which satisfies the declaration and
+    // violates the joint order. SortMerge's kernel is handed
+    // `presorted: true` and walks two cursors forward in place, so a stream
+    // that only ascends within each file breaks the promise it was handed.
+    // The kernel re-checks that certification before emitting and ends the
+    // run naming the planner, so the cost of accepting the declaration here
+    // is a valid pipeline that cannot run rather than a wrong answer. The
+    // declaration is not sufficient on a partitioned input, and the join
+    // routes to IEJoin, which sorts what it reads.
+    assert_combine_strategy(FILE_PARTITIONED_SORTED_RANGE_YAML, "iejoin");
 
-    // Each file is pre-sorted on v (ascending). The lookup cap=100 matches
-    // every driver record. The materialized SortMerge arm forwards reconciled
-    // boundaries → per-document flush.
+    // a.csv holds the HIGH range and b.csv the LOW one, each ascending. The
+    // lookup cap=100 matches every driver record, so a correct join emits all
+    // six rows and the per-document flush splits them by driver document.
     let (body, dlq) = run_combine(
-        SORT_MERGE_RANGE_YAML,
+        FILE_PARTITIONED_SORTED_RANGE_YAML,
         "driver",
         &[
-            ("a.csv", "category,v\nx,1\nx,2\ny,3\n"),
-            ("b.csv", "category,v\nx,4\nx,5\nx,6\n"),
+            ("a.csv", "category,v\nx,4\nx,5\ny,6\n"),
+            ("b.csv", "category,v\nx,1\nx,2\nx,3\n"),
         ],
         "lookup",
         ("lookup.csv", "cap,label\n100,hi\n"),
@@ -594,8 +614,105 @@ fn sort_merge_combine_preserves_document_boundaries() {
     assert_eq!(
         body,
         vec!["x,2".to_string(), "x,3".to_string(), "y,1".to_string()],
-        "a SortMerge Combine must preserve document boundaries → per-document \
-         flush (x=2,y=1; x=3)"
+        "a per-file `sort_order` must route to IEJoin and still preserve \
+         document boundaries → per-document flush (x=2,y=1; x=3)"
+    );
+}
+
+/// Single-range join whose two inputs are each a literal `path:` — the only
+/// source shape that is unpartitioned, so its `sort_order` orders the whole
+/// edge and SortMerge's two-cursor scan applies.
+const SORT_MERGE_RANGE_YAML: &str = r#"
+pipeline:
+  name: sort_merge_combine_per_doc
+nodes:
+  - type: source
+    name: driver
+    config:
+      name: driver
+      type: csv
+      path: ./driver.csv
+      sort_order:
+        - field: v
+      schema:
+        - { name: category, type: string }
+        - { name: v, type: int }
+  - type: source
+    name: lookup
+    config:
+      name: lookup
+      type: csv
+      path: ./lookup.csv
+      sort_order:
+        - field: cap
+      schema:
+        - { name: cap, type: int }
+        - { name: label, type: string }
+  - type: combine
+    name: j
+    input:
+      driver: driver
+      lookup: lookup
+    config:
+      where: "driver.v < lookup.cap"
+      match: first
+      on_miss: skip
+      propagate_ck: driver
+      cxl: |
+        emit category = driver.category
+        emit v = driver.v
+  - type: aggregate
+    name: by_category
+    input: j
+    config:
+      group_by:
+        - category
+      cxl: |
+        emit category = category
+        emit n = count(*)
+  - type: output
+    name: out
+    input: by_category
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+
+#[test]
+fn sort_merge_combine_preserves_document_boundaries() {
+    assert_combine_strategy(SORT_MERGE_RANGE_YAML, "sort_merge");
+
+    // SortMerge is reachable only from unpartitioned inputs, and an
+    // unpartitioned input is one physical file, so this case carries one
+    // driver document rather than several. That is a real limit of the
+    // configuration space, not of the fixture: a source may declare
+    // `sort_order` only when its format's `SortableEventShape` is `Flat` or
+    // `SingleFramePerPhysicalFile` — both of which contribute at most one
+    // record-bearing document per file — and the formats that do emit
+    // sibling document frames inside one file are refused the declaration
+    // outright. So "orders one whole sequence" and "carries several
+    // documents in one file" cannot hold together, and the multi-document
+    // SortMerge flush has no expressible pipeline to test.
+    //
+    // What this case still proves: the SortMerge arm's boundary
+    // reconciliation forwards a single driver document's close intact, so
+    // its one group set flushes exactly once and is neither dropped nor
+    // doubled.
+    let (body, dlq) = run_combine(
+        SORT_MERGE_RANGE_YAML,
+        "driver",
+        &[("driver.csv", "category,v\nx,1\nx,2\nx,3\ny,4\n")],
+        "lookup",
+        ("lookup.csv", "cap,label\n100,hi\n"),
+    );
+    assert_eq!(dlq, 0);
+    assert_eq!(
+        body,
+        vec!["x,3".to_string(), "y,1".to_string()],
+        "a SortMerge Combine must forward its driver document's close so the \
+         per-document Aggregate flushes it exactly once (x=3, y=1)"
     );
 }
 

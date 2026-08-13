@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1301,6 +1301,530 @@ nodes:
     assert_eq!(requirement.scope, OrderScope::PerPhysicalFile);
     assert_eq!(requirement.fields, source_order.fields);
     assert_eq!(requirement.verified_sources, vec![source_order.source_id]);
+}
+
+/// A single-inequality range join whose two sides each declare a sort on
+/// the range axis, with each side's file matcher chosen by the caller.
+///
+/// `path:` resolves to one file and carries a global order; `paths:`
+/// resolves to several and orders each of them independently.
+fn range_join_over(driver_matcher: &str, build_matcher: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: range_scope
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      {driver_matcher}
+      sort_order:
+        - field: val
+      schema:
+        - {{ name: did, type: int }}
+        - {{ name: val, type: int }}
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      {build_matcher}
+      sort_order:
+        - field: threshold
+      schema:
+        - {{ name: tid, type: int }}
+        - {{ name: threshold, type: int }}
+  - type: combine
+    name: banded
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "drivers.val < builds.threshold"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit did = drivers.did
+        emit tid = builds.tid
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: banded
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+    )
+}
+
+/// The strategy the planner picked for the single combine in `yaml`,
+/// as its `Debug` discriminant — `CombineStrategy` carries no `PartialEq`,
+/// so the sibling routing tests compare it this way too.
+fn combine_strategy_of(yaml: &str) -> String {
+    compile(yaml)
+        .dag()
+        .graph
+        .node_weights()
+        .find_map(|node| match node {
+            PlanNode::Combine { strategy, .. } => Some(format!("{strategy:?}")),
+            _ => None,
+        })
+        .expect("fixture contains one combine")
+}
+
+/// A sort-merge scan walks each input as one sequence, so a sort proven
+/// only inside each file cannot license it. Two files that each ascend
+/// may still descend across the boundary between them — `100,101,102`
+/// followed by `1,2,3` satisfies every per-file check and is not one
+/// ordered run. Reading the declaration without its scope took the
+/// in-place fast path over exactly that input.
+#[test]
+fn a_per_file_order_does_not_license_the_sort_merge_scan() {
+    for (case, driver, build) in [
+        (
+            "driver side matches several files",
+            "paths: [drivers-a.csv, drivers-b.csv]",
+            "path: builds.csv",
+        ),
+        (
+            "build side matches several files",
+            "path: drivers.csv",
+            "paths: [builds-a.csv, builds-b.csv]",
+        ),
+        (
+            "both sides match several files",
+            "paths: [drivers-a.csv, drivers-b.csv]",
+            "paths: [builds-a.csv, builds-b.csv]",
+        ),
+        (
+            "a glob resolves at runtime and is per-file for the same reason",
+            "glob: ./drivers-*.csv",
+            "path: builds.csv",
+        ),
+    ] {
+        assert_eq!(
+            combine_strategy_of(&range_join_over(driver, build)),
+            "IEJoin",
+            "{case}: a per-file order must not satisfy a scan that reads one sequence"
+        );
+    }
+}
+
+/// The scan is handed `presorted: true` and walks both cursors forward,
+/// so what licenses it is an ascending order — not merely a sorted one.
+/// A descending declaration on the range axis is the same broken promise
+/// as an unsorted input: the kernel checks the certification it was given
+/// and ends the run naming the planner. Such a join is still perfectly
+/// valid, so it belongs to the strategy that sorts for itself.
+#[test]
+fn a_descending_order_does_not_license_the_sort_merge_scan() {
+    let descending = runnable_range_join(
+        "path: drivers.csv",
+        "{ field: val, order: desc, null_order: last }",
+        "path: builds.csv",
+        "{ field: threshold, order: asc, null_order: last }",
+    );
+    assert_eq!(
+        combine_strategy_of(&descending),
+        "IEJoin",
+        "a descending range axis cannot license a forward two-cursor walk"
+    );
+}
+
+/// The other half of the same rule: an input that really is one ordered
+/// sequence still takes the fast path. A fix that refused every declared
+/// order would pass the test above and cost every correct pipeline its
+/// strategy.
+#[test]
+fn a_global_order_still_licenses_the_sort_merge_scan() {
+    assert_eq!(
+        combine_strategy_of(&range_join_over("path: drivers.csv", "path: builds.csv")),
+        "SortMerge",
+        "one file per side is one ordered sequence per side"
+    );
+}
+
+/// One record of a range-join fixture: its id and its range-axis key.
+/// `None` writes an empty cell, which reads back as NULL and — under CXL
+/// ternary comparison — matches nothing.
+type RangeRow = (i64, Option<i64>);
+
+fn range_csv(key_column: &str, rows: &[RangeRow]) -> Vec<u8> {
+    let mut out = format!("id,{key_column}\n");
+    for (id, key) in rows {
+        match key {
+            Some(key) => out.push_str(&format!("{id},{key}\n")),
+            None => out.push_str(&format!("{id},\n")),
+        }
+    }
+    out.into_bytes()
+}
+
+/// A runnable `drivers.val < builds.threshold` join, with each side's file
+/// matcher and declared sort supplied by the caller.
+///
+/// `match: all` so every satisfying pair reaches the output: the failure
+/// this fixture exists to catch is a scan that stops finding matches, and
+/// `first` would hide a lost pair behind a surviving one.
+///
+/// Both range keys are declared `{ nullable: int }` so a fixture may place a
+/// NULL on the axis; that makes the comparison itself nullable, which is why
+/// the `where:` carries the `?? false` an author has to write.
+fn runnable_range_join(
+    driver_matcher: &str,
+    driver_sort: &str,
+    build_matcher: &str,
+    build_sort: &str,
+) -> String {
+    format!(
+        r#"
+pipeline:
+  name: range_scope_runtime
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      {driver_matcher}
+      sort_order:
+        - {driver_sort}
+      schema:
+        - {{ name: id, type: int }}
+        - {{ name: val, type: {{ nullable: int }} }}
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      {build_matcher}
+      sort_order:
+        - {build_sort}
+      schema:
+        - {{ name: id, type: int }}
+        - {{ name: threshold, type: {{ nullable: int }} }}
+  - type: combine
+    name: banded
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "(drivers.val < builds.threshold) ?? false"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit did = drivers.id
+        emit tid = builds.id
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: banded
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+    )
+}
+
+/// Run the fixture and return its emitted `did,tid` pairs, sorted.
+///
+/// Sorted because the assertion is about which pairs the join found, not
+/// the sequence it emitted them in: the emit order is a function of the
+/// arrival order, which differs between the strategies under comparison.
+fn run_range_join(
+    yaml: &str,
+    driver_files: &[(&str, &[RangeRow])],
+    build_files: &[(&str, &[RangeRow])],
+) -> Vec<String> {
+    let plan = compile(yaml);
+    let slots = |files: &[(&str, &[RangeRow])], key_column: &str| {
+        SourceInput::Files(
+            files
+                .iter()
+                .map(|(path, rows)| {
+                    FileSlot::new(
+                        PathBuf::from(path),
+                        Box::new(Cursor::new(range_csv(key_column, rows))) as Box<dyn Read + Send>,
+                    )
+                })
+                .collect(),
+        )
+    };
+    let readers: SourceReaders = HashMap::from([
+        ("drivers".to_string(), slots(driver_files, "val")),
+        ("builds".to_string(), slots(build_files, "threshold")),
+    ]);
+    let out = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(out.clone()) as Box<dyn Write + Send>,
+    )]);
+
+    PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        writers,
+        &PipelineRunParams::default(),
+    )
+    .expect("range-join fixture must run");
+
+    let text = out.as_string();
+    let mut rows: Vec<String> = text
+        .lines()
+        .skip(1)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Every `did,tid` pair satisfying `val < threshold`, by nested loop over
+/// the union of each side's files — an independent answer that owes
+/// nothing to the join strategy, the declared sorts, or the file split.
+fn nested_loop_oracle(
+    driver_files: &[(&str, &[RangeRow])],
+    build_files: &[(&str, &[RangeRow])],
+) -> Vec<String> {
+    let flatten = |files: &[(&str, &[RangeRow])]| -> Vec<RangeRow> {
+        files
+            .iter()
+            .flat_map(|(_, rows)| rows.iter().copied())
+            .collect()
+    };
+    let mut pairs = Vec::new();
+    for (did, val) in flatten(driver_files) {
+        for (tid, threshold) in flatten(build_files) {
+            // A NULL on either side of the comparison is neither true nor
+            // false, and `on_miss: skip` drops the driver that produced it.
+            let (Some(val), Some(threshold)) = (val, threshold) else {
+                continue;
+            };
+            if val < threshold {
+                pairs.push(format!("{did},{tid}"));
+            }
+        }
+    }
+    pairs.sort();
+    pairs
+}
+
+/// Two files whose key ranges descend across the match: the first holds
+/// the high range, the second the low one.
+///
+/// Each file ascends internally, so per-file verification passes on both;
+/// the sequence a scan reads runs `100,101,102` then `1,2,3` and is not
+/// ordered. This is the input the planner rule exists to keep away from a
+/// two-cursor scan. Running it, rather than only inspecting the plan,
+/// is what proves the rule matters to a result: the scan's kernel
+/// re-checks the ascending certification it was handed, so routing this
+/// input to it ends the run instead of finishing it.
+const REVERSED_RANGE_HIGH_FILE: &[RangeRow] = &[(1, Some(100)), (2, Some(101)), (3, Some(102))];
+const REVERSED_RANGE_LOW_FILE: &[RangeRow] = &[(4, Some(1)), (5, Some(2)), (6, Some(3))];
+
+#[test]
+fn a_range_join_over_two_files_finds_every_pair_a_nested_loop_finds() {
+    let drivers: &[(&str, &[RangeRow])] = &[
+        ("drivers-a.csv", REVERSED_RANGE_HIGH_FILE),
+        ("drivers-b.csv", REVERSED_RANGE_LOW_FILE),
+    ];
+    let builds: &[(&str, &[RangeRow])] = &[(
+        "builds.csv",
+        &[
+            (10, Some(2)),
+            (11, Some(3)),
+            (12, Some(4)),
+            (13, Some(101)),
+            (14, Some(102)),
+            (15, Some(103)),
+        ],
+    )];
+
+    // Hand-counted: every driver matches every build above it, which is
+    // 3+2+1 for the high-range file and 6+5+4 for the low-range one. An
+    // oracle that silently went empty would agree with any broken run.
+    let oracle = nested_loop_oracle(drivers, builds);
+    assert_eq!(oracle.len(), 21);
+
+    let yaml = runnable_range_join(
+        "paths: [drivers-a.csv, drivers-b.csv]",
+        "{ field: val }",
+        "path: builds.csv",
+        "{ field: threshold }",
+    );
+    assert_eq!(
+        run_range_join(&yaml, drivers, builds),
+        oracle,
+        "a join over files that are individually sorted must still find every pair"
+    );
+}
+
+#[test]
+fn a_range_join_finds_every_pair_across_sort_directions_and_null_placement() {
+    // Descending files reverse which one has to come first for the
+    // concatenation to break: the low range descends before the high one
+    // does. Nulls sit at the end the declaration puts them at, so each
+    // file satisfies its own declaration.
+    let desc_high: &[RangeRow] = &[(1, Some(102)), (2, Some(101)), (3, Some(100))];
+    let desc_low: &[RangeRow] = &[(4, Some(3)), (5, Some(2)), (6, Some(1)), (7, None)];
+    let asc_nulls_first: &[RangeRow] = &[(1, None), (2, Some(100)), (3, Some(101))];
+    let asc_low: &[RangeRow] = &[(4, Some(1)), (5, Some(2))];
+    // Duplicate boundary keys on both sides: several drivers sit exactly
+    // at a threshold, where a strict `<` must exclude the equal build and
+    // admit the next one, once per duplicate.
+    let dup_builds: &[RangeRow] = &[
+        (10, Some(2)),
+        (11, Some(2)),
+        (12, Some(3)),
+        (13, Some(100)),
+        (14, Some(100)),
+        (15, Some(101)),
+    ];
+
+    for (case, driver_files, driver_sort, build_files, build_sort) in [
+        (
+            "descending files, nulls last, duplicate boundary keys",
+            vec![("drivers-a.csv", desc_low), ("drivers-b.csv", desc_high)],
+            "{ field: val, order: desc, null_order: last }",
+            vec![("builds.csv", dup_builds)],
+            "{ field: threshold }",
+        ),
+        (
+            "ascending files, nulls first, duplicate boundary keys",
+            vec![
+                ("drivers-a.csv", asc_nulls_first),
+                ("drivers-b.csv", asc_low),
+            ],
+            "{ field: val, order: asc, null_order: first }",
+            vec![("builds.csv", dup_builds)],
+            "{ field: threshold }",
+        ),
+        (
+            "the multi-file side is the build side",
+            vec![("drivers.csv", asc_low)],
+            "{ field: val }",
+            vec![
+                ("builds-a.csv", REVERSED_RANGE_HIGH_FILE),
+                ("builds-b.csv", REVERSED_RANGE_LOW_FILE),
+            ],
+            "{ field: threshold }",
+        ),
+    ] {
+        let driver_matcher = if driver_files.len() == 1 {
+            format!("path: {}", driver_files[0].0)
+        } else {
+            format!(
+                "paths: [{}]",
+                driver_files
+                    .iter()
+                    .map(|(path, _)| *path)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let build_matcher = if build_files.len() == 1 {
+            format!("path: {}", build_files[0].0)
+        } else {
+            format!(
+                "paths: [{}]",
+                build_files
+                    .iter()
+                    .map(|(path, _)| *path)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let yaml = runnable_range_join(&driver_matcher, driver_sort, &build_matcher, build_sort);
+        assert_eq!(
+            run_range_join(&yaml, &driver_files, &build_files),
+            nested_loop_oracle(&driver_files, &build_files),
+            "{case}: every satisfying pair must reach the output"
+        );
+    }
+}
+
+/// The `--explain` block for one node, from its header line to the blank
+/// line that closes it.
+fn explain_block<'a>(text: &'a str, header: &str) -> &'a str {
+    let start = text
+        .find(&format!("\n{header}\n"))
+        .unwrap_or_else(|| panic!("explain output has no '{header}' block:\n{text}"))
+        + 1;
+    let rest = &text[start..];
+    let end = rest.find("\n\n").map(|at| start + at).unwrap_or(text.len());
+    &text[start..end]
+}
+
+/// Rendered with the statistics catalog, because the Combine detail block
+/// — where the per-input order scope appears — renders only when the
+/// catalog is threaded through.
+fn explain_of(yaml: &str) -> String {
+    let plan = compile(yaml);
+    plan.dag()
+        .explain_text_with_statistics(plan.config(), plan.statistics())
+}
+
+/// An author reading `--explain` has to be able to tell the two apart:
+/// "sorted" that holds across the whole input and "sorted" that holds
+/// only inside each file read the same in a pipeline's YAML, and only the
+/// first licenses a consumer that walks one sequence. So the scope is
+/// named where the order is named — on the node's properties, and again
+/// on each Combine input, where it is the reason a strategy was or was
+/// not available.
+#[test]
+fn explain_names_the_scope_an_order_was_proven_over() {
+    let per_file = explain_of(&runnable_range_join(
+        "paths: [drivers-a.csv, drivers-b.csv]",
+        "{ field: val }",
+        "path: builds.csv",
+        "{ field: threshold }",
+    ));
+    let drivers = explain_block(&per_file, "source.drivers:");
+    assert!(
+        drivers.contains("ordering: val")
+            && drivers.contains(
+                "ordering_scope: per partition on $source.file (not one ordered sequence)"
+            ),
+        "a multi-file source must name the key its order is proven inside:\n{drivers}"
+    );
+    let builds = explain_block(&per_file, "source.builds:");
+    assert!(
+        builds.contains("ordering_scope: global (one ordered sequence across the input)"),
+        "the single-file side of the same plan must still read as global:\n{builds}"
+    );
+
+    let combine = explain_block(&per_file, "Combine 'banded':");
+    assert!(
+        combine.contains(", order per partition on $source.file (not one ordered sequence))"),
+        "the Combine input line must carry the scope that decided its strategy:\n{combine}"
+    );
+    assert!(
+        combine.contains(", order global (one ordered sequence across the input))"),
+        "and must distinguish the input whose order is global:\n{combine}"
+    );
+
+    // The same pipeline with one file per side: the scope changes, and it
+    // is the only thing about the declared order that changed.
+    let global = explain_of(&runnable_range_join(
+        "path: drivers.csv",
+        "{ field: val }",
+        "path: builds.csv",
+        "{ field: threshold }",
+    ));
+    let drivers = explain_block(&global, "source.drivers:");
+    assert!(
+        drivers.contains("ordering: val")
+            && drivers.contains("ordering_scope: global (one ordered sequence across the input)"),
+        "a single-file source declares an order over the whole input:\n{drivers}"
+    );
+    assert!(
+        !global.contains("per partition"),
+        "no input in this plan is partitioned:\n{global}"
+    );
 }
 
 #[test]

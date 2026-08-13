@@ -61,6 +61,25 @@ fn transform_cxl_sources(config: &PipelineConfig) -> Vec<(String, String)> {
     out
 }
 
+/// How wide an ordering fact holds on a stream with this partitioning.
+///
+/// Names the partition keys when there are any, because "per file" is
+/// only useful to an author who can see which key splits the stream.
+fn order_scope_label(kind: &crate::plan::properties::PartitioningKind) -> String {
+    if kind.carries_global_order() {
+        return "global (one ordered sequence across the input)".to_string();
+    }
+    let keys = kind.partition_keys();
+    if keys.is_empty() {
+        "per partition (not one ordered sequence)".to_string()
+    } else {
+        format!(
+            "per partition on {} (not one ordered sequence)",
+            keys.join(", ")
+        )
+    }
+}
+
 /// Human-readable strategy label for the multi-line `--explain` block.
 /// `GraceHash` appends its `1 << partition_bits` partition count, since it
 /// really does hash-partition its build side into that many on-disk buckets.
@@ -491,6 +510,19 @@ impl ExecutionPlanDag {
                     Some(order) => {
                         let fields: Vec<String> = order.iter().map(|s| s.field.clone()).collect();
                         out.push_str(&format!("  ordering: {}\n", fields.join(", ")));
+                        // How wide the order above was proven, which is what
+                        // decides whether a consumer needing one sequence may
+                        // rely on it. Printed next to the order rather than
+                        // left to be inferred from the partitioning line
+                        // below it — and only where something is actually
+                        // ordered, since a scope for an empty order names the
+                        // width of nothing.
+                        if !order.is_empty() {
+                            out.push_str(&format!(
+                                "  ordering_scope: {}\n",
+                                order_scope_label(&props.partitioning.kind)
+                            ));
+                        }
                     }
                     None => out.push_str("  ordering: <none>\n"),
                 }
@@ -969,6 +1001,25 @@ impl ExecutionPlanDag {
             combine_strategy_display(strategy)
         ));
 
+        // The scope of each input's declared order, reported from the same
+        // property the strategy choice consulted. A sort-merge scan needs
+        // one ordered sequence per input, so an input reading "per
+        // partition" here is the reason a range join it would otherwise
+        // have qualified for is running another strategy instead.
+        let input_order_scope = |input_name: &str| -> Option<String> {
+            self.graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .find(|&pred| self.graph[pred].name() == input_name)
+                .and_then(|pred| self.node_properties.get(&pred))
+                .filter(|props| props.ordering.sort_order.is_some())
+                .map(|props| order_scope_label(&props.partitioning.kind))
+        };
+        let order_note = |input_name: &str| -> String {
+            input_order_scope(input_name)
+                .map(|scope| format!(", order {scope}"))
+                .unwrap_or_default()
+        };
+
         let drive_label = if driving_input.is_empty() {
             "<unselected>"
         } else {
@@ -977,7 +1028,8 @@ impl ExecutionPlanDag {
         let drive_rows =
             format_estimated_rows(inputs_for_node.and_then(|m| m.get(drive_label)), statistics);
         out.push_str(&format!(
-            "  Driving input: {drive_label} (probe, est. {drive_rows} rows)\n",
+            "  Driving input: {drive_label} (probe, est. {drive_rows} rows{})\n",
+            order_note(drive_label),
         ));
 
         for build_name in build_inputs {
@@ -987,7 +1039,8 @@ impl ExecutionPlanDag {
                 statistics,
             );
             out.push_str(&format!(
-                "  Build input: {build_name} ({role}, est. {rows} rows)\n",
+                "  Build input: {build_name} ({role}, est. {rows} rows{})\n",
+                order_note(build_name.as_str()),
             ));
         }
 

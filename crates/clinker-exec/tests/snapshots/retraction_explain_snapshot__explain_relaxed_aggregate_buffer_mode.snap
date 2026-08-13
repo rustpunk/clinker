@@ -43,6 +43,7 @@ source.orders:
 
 sort.__correlation_sort_orders:
   ordering: order_id
+  ordering_scope: global (one ordered sequence across the input)
   ordering_provenance: Preserved { from_node: "__correlation_sort_orders" }
   partitioning: Single
   partitioning_provenance: SingleStream
