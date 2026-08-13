@@ -1032,6 +1032,16 @@ fn a_requested_wait_this_client_cannot_read_is_waited_out_as_backoff() {
     );
 }
 
+/// A delivery whose first retry wait is the whole budget.
+///
+/// What outgrows the ladder is the wait and the budget being equal, not either
+/// one's size: a wait as long as the whole delivery cannot fit whatever the
+/// exchange before it already cost, however fast or slow the host ran it. The
+/// size is chosen only so that reaching the collector's answer is never itself
+/// in question — a budget spent getting there ends the delivery on the
+/// deadline, which is a different ending that proves nothing about the ladder.
+const OUTGROWN_LADDER: Duration = Duration::from_secs(5);
+
 /// A backoff that outgrows the budget is the retry running out, not the
 /// collector running slow. Checking the deadline only where a `Retry-After`
 /// had been read left the computed ladder to be slept out to the deadline and
@@ -1048,10 +1058,8 @@ fn a_backoff_the_budget_cannot_contain_names_the_throttle_not_the_deadline() {
         max_attempts: 6,
         connect_timeout: Duration::from_secs(2),
         request_timeout: Duration::from_secs(2),
-        // The first wait already fills the whole delivery, so the ladder is
-        // outgrown at the first retry rather than several doublings in.
-        retry_backoff: Duration::from_millis(300),
-        total_timeout: Duration::from_millis(300),
+        retry_backoff: OUTGROWN_LADDER,
+        total_timeout: OUTGROWN_LADDER,
     })
     .expect("valid outgrown-ladder fixture budget");
     let started = Instant::now();
@@ -1079,9 +1087,13 @@ fn a_backoff_the_budget_cannot_contain_names_the_throttle_not_the_deadline() {
          collector's 503 asked for"
     );
     assert_eq!(failure.attempts(), 1);
+    // Declining the wait is the behaviour; returning before it could have been
+    // taken is how that shows from outside. Measured against the wait itself
+    // rather than a duration, so a host slow enough to make the exchange cost
+    // real time still fails this only by actually sleeping.
     assert!(
-        elapsed < Duration::from_millis(300),
-        "the budget was not spent sleeping: {elapsed:?}"
+        elapsed < OUTGROWN_LADDER,
+        "the budget was not spent sleeping the {OUTGROWN_LADDER:?} wait it declined: {elapsed:?}"
     );
 }
 
@@ -1099,10 +1111,13 @@ fn a_transport_retry_the_budget_cannot_hold_names_the_connection() {
         max_request_bytes: 64 * 1024,
         max_response_bytes: 4 * 1024,
         max_attempts: 4,
-        connect_timeout: Duration::from_millis(300),
-        request_timeout: Duration::from_millis(300),
-        retry_backoff: Duration::from_millis(300),
-        total_timeout: Duration::from_millis(300),
+        // Bounded well inside the delivery, so a refusal that takes real time
+        // to come back is still a refusal reached before the deadline rather
+        // than a connection the budget gave up waiting on.
+        connect_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(2),
+        retry_backoff: OUTGROWN_LADDER,
+        total_timeout: OUTGROWN_LADDER,
     })
     .expect("valid transport-ladder fixture budget");
     let failure = send_otlp_json(
