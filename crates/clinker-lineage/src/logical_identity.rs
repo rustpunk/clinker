@@ -218,6 +218,39 @@ impl DatasetIdentityFacets {
     pub fn symlinks(&self) -> &[SymlinkIdentifier] {
         &self.symlinks
     }
+
+    /// Absorb a second node's authorized facts about the same dataset.
+    ///
+    /// Two source or output nodes may name one external dataset — a binding is
+    /// per node, and nothing requires two nodes to carry different identities —
+    /// and the emitted document carries one entry per dataset. That entry has to
+    /// describe what the whole run did, so each facet combines by what it
+    /// asserts:
+    ///
+    /// - A symlink is an alternate name for the dataset itself, true wherever
+    ///   the dataset appears and regardless of which node referenced it. Two
+    ///   nodes naming different aliases are both right, so the aliases union.
+    /// - A subset names the concrete members this run read or wrote. Within one
+    ///   binding the facet is already a list of locations, i.e. a disjunction;
+    ///   combining two bindings is that same disjunction over a larger set. Union
+    ///   therefore emits exactly the locations some node authorized and invents
+    ///   none, whereas keeping one contribution and discarding the other would
+    ///   claim the run touched fewer members than it did. A merge is not a
+    ///   contradiction to refuse: no subset form can assert "these members and no
+    ///   others", and refusing here would let an optional observation decide
+    ///   whether a run reports at all.
+    ///
+    /// Both lists stay sorted and deduplicated, as [`LineageIdentityContext::external`]
+    /// leaves each individual binding, so the emitted arrays do not depend on the
+    /// order the walk happened to visit nodes in.
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.subsets.extend(other.subsets);
+        self.subsets.sort();
+        self.subsets.dedup();
+        self.symlinks.extend(other.symlinks);
+        self.symlinks.sort();
+        self.symlinks.dedup();
+    }
 }
 
 impl LineageNodeBinding {

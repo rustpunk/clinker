@@ -195,6 +195,88 @@ fn resolves_complete_policy() {
     }
 }
 
+/// Every partial spelling of the arena resolves, and the defaults are the
+/// quantities their own documented spellings parse to.
+///
+/// The arena and its two lanes carry one equality between them. While each
+/// defaulted independently, writing any one of them left the other two holding
+/// a sum that no longer matched -- so `arena_bytes = "4MB"`, which is exactly
+/// the default, was refused, and the diagnostic's own correction was that same
+/// line.
+#[test]
+fn a_partial_arena_override_resolves() {
+    let resolve = |table: &str| {
+        ClinkerToml::parse(&format!("[observability]\n{table}"))
+            .expect("the table parses")
+            .resolve_observability(None)
+    };
+    let lanes = |table: &str| {
+        let policy = resolve(table).expect("a partial arena override resolves");
+        (
+            policy.arena_bytes(),
+            policy.ordinary_lane_bytes(),
+            policy.high_severity_lane_bytes(),
+        )
+    };
+
+    assert_eq!(
+        lanes(""),
+        (4_000_000, 3_000_000, 1_000_000),
+        "the documented defaults"
+    );
+    assert_eq!(
+        lanes("arena_bytes = \"4MB\"\n"),
+        lanes(""),
+        "and writing the default out in full is the same policy"
+    );
+    assert_eq!(
+        lanes("arena_bytes = \"8MB\"\n"),
+        (8_000_000, 6_000_000, 2_000_000),
+        "an arena alone is split in the default proportion, whatever its size"
+    );
+    assert_eq!(
+        lanes("ordinary_lane_bytes = \"3MB\"\n"),
+        (4_000_000, 3_000_000, 1_000_000),
+        "one lane alone leaves the arena at its default and takes the rest for the other"
+    );
+    assert_eq!(
+        lanes("high_severity_lane_bytes = \"2MB\"\n"),
+        (4_000_000, 2_000_000, 2_000_000),
+        "either lane"
+    );
+    assert_eq!(
+        lanes("ordinary_lane_bytes = \"6MB\"\nhigh_severity_lane_bytes = \"2MB\"\n"),
+        (8_000_000, 6_000_000, 2_000_000),
+        "two lanes name the arena between them"
+    );
+    assert_eq!(
+        lanes("arena_bytes = \"8MB\"\nordinary_lane_bytes = \"5MB\"\n"),
+        (8_000_000, 5_000_000, 3_000_000),
+        "an arena and one lane leave the other lane the remainder"
+    );
+
+    // All three written and disagreeing is still refused -- and the correction
+    // is a line the author can act on and have the file resolve.
+    let disagreeing = "arena_bytes = \"9MB\"\nordinary_lane_bytes = \"3MB\"\nhigh_severity_lane_bytes = \"1MB\"\n";
+    let error = resolve(disagreeing).expect_err("a stated arena is checked, not adjusted");
+    assert_eq!(error.field(), "observability.arena_bytes");
+    assert!(
+        error.correction().contains("remove `arena_bytes`"),
+        "got correction: {}",
+        error.correction()
+    );
+    assert_eq!(
+        lanes("ordinary_lane_bytes = \"3MB\"\nhigh_severity_lane_bytes = \"1MB\"\n"),
+        (4_000_000, 3_000_000, 1_000_000),
+        "and applying that correction resolves the file"
+    );
+
+    // A lane that cannot fit in the arena is a genuine conflict, named as one.
+    let over = resolve("arena_bytes = \"1MB\"\nordinary_lane_bytes = \"2MB\"\n")
+        .expect_err("a lane never grows the arena");
+    assert_eq!(over.field(), "observability.ordinary_lane_bytes");
+}
+
 fn minimal_policy(auth: &str, datasets: &str) -> String {
     format!(
         r#"

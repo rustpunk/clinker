@@ -649,12 +649,16 @@ fn logs_metrics_traces_and_fault_matrix() {
     assert_eq!(failure.attempts(), 0);
     assert!(failure.classification().is_none());
 
-    let (address, handle) = spawn_sequence_server(vec![
-        FixtureResponse::delayed_headers(Duration::from_millis(120)),
-        FixtureResponse::immediate(200, br#"{}"#.to_vec()),
-    ]);
+    // A reply that never starts arriving comes after the request was fully
+    // written, so the collector may already hold this batch and be slow to say
+    // so. That is the same situation as the delayed body below with less
+    // information, and re-sending against a collector whose replies are slower
+    // than `request_timeout` would export every batch once per attempt.
+    let (address, handle) = spawn_sequence_server(vec![FixtureResponse::delayed_headers(
+        Duration::from_millis(120),
+    )]);
     let endpoint = admitted_loopback_endpoint(address);
-    let outcome = send_otlp_json(
+    let failure = send_otlp_json(
         &endpoint,
         OtlpSignal::Traces,
         &traces_payload(),
@@ -662,9 +666,14 @@ fn logs_metrics_traces_and_fault_matrix() {
         &|| false,
         OtlpAuthentication::None,
     )
-    .expect("response-header timeout must consume one bounded retry");
-    assert_eq!(outcome.attempts(), 2);
-    assert_eq!(handle.join().expect("join header-timeout fixture").len(), 2);
+    .expect_err("a batch the collector may already hold is not sent a second time");
+    assert_eq!(failure.kind(), OtlpDeliveryFailureKind::Timeout);
+    assert_eq!(
+        failure.attempts(),
+        1,
+        "a request that was fully written must not be written again"
+    );
+    assert_eq!(handle.join().expect("join header-timeout fixture").len(), 1);
 
     // A body that never arrives comes after a 200, and a 200 means the
     // collector already has the batch. Re-sending it would ingest the same
@@ -713,4 +722,78 @@ fn logs_metrics_traces_and_fault_matrix() {
     handle.join().expect("join TLS fixture");
     assert_eq!(failure.kind(), OtlpDeliveryFailureKind::Tls);
     assert_eq!(failure.attempts(), 1);
+}
+
+/// The specification names one success status, and a rejection is something a
+/// 4xx or a 5xx says. An ingest gateway in front of a collector answers
+/// `202 Accepted` with the batch taken, and reading that as a permanent refusal
+/// reported a delivered export as one no retry could ever fix.
+#[test]
+fn a_two_hundred_class_answer_is_a_delivery_rather_than_a_refusal() {
+    for (status, body) in [
+        (202_u16, br#"{}"#.to_vec()),
+        (202, Vec::new()),
+        // Nothing defines an export-service response for these statuses, so a
+        // body that is not one must not be held against the delivery.
+        (202, b"queued for ingestion".to_vec()),
+        (204, Vec::new()),
+    ] {
+        let payload = logs_payload();
+        let (address, handle) = spawn_server(status, body);
+        let endpoint = admitted_loopback_endpoint(address);
+        let outcome = send_otlp_json(
+            &endpoint,
+            OtlpSignal::Logs,
+            &payload,
+            &budget(1),
+            &|| false,
+            OtlpAuthentication::None,
+        )
+        .unwrap_or_else(|error| {
+            panic!("{status} accepted the batch, but delivery failed: {error}")
+        });
+        let captured = handle.join().expect("join accepted-status fixture");
+        assert_eq!(captured.body, payload);
+        assert_eq!(outcome.accepted(), 2, "{status} took the whole chunk");
+        assert_eq!(outcome.rejected(), 0, "{status} reported no rejection");
+        assert_eq!(outcome.attempts(), 1);
+    }
+}
+
+/// A cap an author writes is the largest reply they expect a collector to
+/// send, so a reply of exactly that size has to be readable. The request side
+/// already admits a payload sitting exactly at its cap.
+#[test]
+fn a_reply_of_exactly_the_response_cap_is_read() {
+    let (address, handle) = spawn_server(200, br#"{}"#.to_vec());
+    let endpoint = admitted_loopback_endpoint(address);
+    let outcome = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &response_budget(1, 2),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect("a reply of exactly the cap is within the cap");
+    handle.join().expect("join at-cap response fixture");
+    assert_eq!(outcome.accepted(), 2);
+
+    let (address, handle) = spawn_server(200, br#"{} "#.to_vec());
+    let endpoint = admitted_loopback_endpoint(address);
+    let failure = send_otlp_json(
+        &endpoint,
+        OtlpSignal::Logs,
+        &logs_payload(),
+        &response_budget(1, 2),
+        &|| false,
+        OtlpAuthentication::None,
+    )
+    .expect_err("one byte past the cap is over it");
+    handle.join().expect("join over-cap response fixture");
+    assert_eq!(failure.kind(), OtlpDeliveryFailureKind::ResponseTooLarge);
+    assert!(
+        failure.reached_collector(),
+        "the collector answered 200 before its reply proved unreadable"
+    );
 }

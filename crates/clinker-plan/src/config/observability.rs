@@ -13,12 +13,19 @@ use serde::{Deserialize, Serialize};
 
 use super::utils::ByteSize;
 
-const DEFAULT_ARENA_BYTES: u64 = 4 * 1024 * 1024;
-const DEFAULT_ORDINARY_LANE_BYTES: u64 = 3 * 1024 * 1024;
-const DEFAULT_HIGH_SEVERITY_LANE_BYTES: u64 = 1024 * 1024;
-const DEFAULT_MAX_BATCH_BYTES: u64 = 256 * 1024;
+// Every byte default and ceiling here is written in the grammar `ByteSize`
+// parses, where `KB`/`MB`/`GB` are powers of a thousand. A default spelled in
+// binary would be a quantity no author can write: `arena_bytes = "4MB"` is
+// 4_000_000, so a 4 MiB default is a number the documented spelling of that
+// same default does not produce.
+const DEFAULT_ARENA_BYTES: u64 = 4_000_000;
+/// The share of the arena the high-severity lane takes when the lanes are not
+/// spelled out. The rest is the ordinary lane, so the two partition the arena
+/// exactly whatever `arena_bytes` is.
+const DEFAULT_HIGH_SEVERITY_LANE_DIVISOR: u64 = 4;
+const DEFAULT_MAX_BATCH_BYTES: u64 = 256_000;
 const DEFAULT_MAX_ATTRIBUTES_PER_EVENT: u32 = 32;
-const DEFAULT_MAX_ATTRIBUTE_BYTES: u64 = 4 * 1024;
+const DEFAULT_MAX_ATTRIBUTE_BYTES: u64 = 4_000;
 const DEFAULT_SAMPLE_EVERY: u32 = 1;
 const DEFAULT_RATE_LIMIT_PER_SECOND: u32 = 1_000;
 const DEFAULT_RATE_LIMIT_BURST: u32 = 1_000;
@@ -28,9 +35,9 @@ const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_RETRY_TOTAL_TIMEOUT_MS: u64 = 10_000;
 const RETRY_INITIAL_BACKOFF_MS: u64 = 100;
-const DEFAULT_MAX_RESPONSE_BYTES: u64 = 64 * 1024;
-const DEFAULT_LINEAGE_QUEUE_BYTES: u64 = 1024 * 1024;
-const DEFAULT_LINEAGE_MAX_EVENT_BYTES: u64 = 64 * 1024;
+const DEFAULT_MAX_RESPONSE_BYTES: u64 = 64_000;
+const DEFAULT_LINEAGE_QUEUE_BYTES: u64 = 1_000_000;
+const DEFAULT_LINEAGE_MAX_EVENT_BYTES: u64 = 64_000;
 const DEFAULT_LINEAGE_FLUSH_TIMEOUT_MS: u64 = 5_000;
 
 const MAX_ENDPOINT_BYTES: usize = 2_048;
@@ -40,29 +47,17 @@ const MAX_DATASET_IDENTITY_BYTES: usize = 1_024;
 const MAX_REPLACEMENT_BYTES: usize = 1_024;
 const MAX_FIELD_POLICIES: usize = 256;
 const MAX_DATASET_BINDINGS: usize = 1_024;
-const MAX_ARENA_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_BATCH_BYTES: u64 = 1024 * 1024;
+const MAX_ARENA_BYTES: u64 = 64_000_000;
+const MAX_BATCH_BYTES: u64 = 1_000_000;
 const MAX_ATTRIBUTES_PER_EVENT: u32 = 256;
-const MAX_ATTRIBUTE_BYTES: u64 = 64 * 1024;
+const MAX_ATTRIBUTE_BYTES: u64 = 64_000;
 const MAX_SAMPLE_EVERY: u32 = 1_000_000;
 const MAX_RATE_LIMIT: u32 = 1_000_000;
 const MAX_TIMEOUT_MS: u64 = 60_000;
 const MAX_RETRY_ATTEMPTS: u32 = 10;
-const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
-const MAX_LINEAGE_QUEUE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_LINEAGE_EVENT_BYTES: u64 = 1024 * 1024;
-
-fn default_arena_bytes() -> ByteSize {
-    ByteSize(DEFAULT_ARENA_BYTES)
-}
-
-fn default_ordinary_lane_bytes() -> ByteSize {
-    ByteSize(DEFAULT_ORDINARY_LANE_BYTES)
-}
-
-fn default_high_severity_lane_bytes() -> ByteSize {
-    ByteSize(DEFAULT_HIGH_SEVERITY_LANE_BYTES)
-}
+const MAX_RESPONSE_BYTES: u64 = 1_000_000;
+const MAX_LINEAGE_QUEUE_BYTES: u64 = 64_000_000;
+const MAX_LINEAGE_EVENT_BYTES: u64 = 1_000_000;
 
 fn default_max_batch_bytes() -> ByteSize {
     ByteSize(DEFAULT_MAX_BATCH_BYTES)
@@ -128,12 +123,17 @@ fn default_lineage_flush_timeout_ms() -> u64 {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservabilityConfig {
-    #[serde(default = "default_arena_bytes")]
-    arena_bytes: ByteSize,
-    #[serde(default = "default_ordinary_lane_bytes")]
-    ordinary_lane_bytes: ByteSize,
-    #[serde(default = "default_high_severity_lane_bytes")]
-    high_severity_lane_bytes: ByteSize,
+    // The arena and its two lanes carry one equality between them -- the lanes
+    // partition the arena exactly -- so each is optional and what is left out
+    // is derived from what is written. Three independent defaults could not do
+    // that: any single override broke an equality the other two still held,
+    // and the run was refused for a file that named one quantity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    arena_bytes: Option<ByteSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ordinary_lane_bytes: Option<ByteSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    high_severity_lane_bytes: Option<ByteSize>,
     #[serde(default = "default_max_batch_bytes")]
     max_batch_bytes: ByteSize,
     #[serde(default = "default_max_attributes_per_event")]
@@ -785,42 +785,139 @@ fn is_observability_table(path: &[String]) -> bool {
         .is_some_and(|segment| segment == "observability")
 }
 
+/// The telemetry arena and the two disjoint lanes that partition it exactly.
+struct TelemetryArena {
+    arena_bytes: u64,
+    ordinary_lane_bytes: u64,
+    high_severity_lane_bytes: u64,
+}
+
 impl ObservabilityConfig {
-    pub(crate) fn resolve(&self) -> Result<ResolvedObservabilityPolicy, ObservabilityConfigError> {
-        let arena_bytes = bounded_nonzero_u64(
-            "observability.arena_bytes",
-            self.arena_bytes.0,
-            MAX_ARENA_BYTES,
-            "set `arena_bytes = \"4MB\"`",
-        )?;
-        let ordinary_lane_bytes = bounded_nonzero_u64(
-            "observability.ordinary_lane_bytes",
-            self.ordinary_lane_bytes.0,
-            MAX_ARENA_BYTES,
-            "set `ordinary_lane_bytes = \"3MB\"`",
-        )?;
-        let high_severity_lane_bytes = bounded_nonzero_u64(
-            "observability.high_severity_lane_bytes",
-            self.high_severity_lane_bytes.0,
-            MAX_ARENA_BYTES,
-            "set `high_severity_lane_bytes = \"1MB\"`",
-        )?;
-        let lane_sum = ordinary_lane_bytes
-            .checked_add(high_severity_lane_bytes)
-            .ok_or_else(|| {
-                ObservabilityConfigError::invalid(
-                    "observability.arena_bytes",
-                    "cannot represent the sum of the two telemetry lanes",
-                    "set the two lane byte caps so their exact sum equals `arena_bytes`",
+    /// Resolve the arena and its two lanes from whichever of the three the
+    /// author wrote.
+    ///
+    /// One equality holds over the three -- the lanes partition the arena, so
+    /// no telemetry byte is charged twice and none is unreachable. That leaves
+    /// two free quantities, and the author may write any of them:
+    ///
+    /// - all three: the equality is checked, not assumed;
+    /// - the arena alone, or nothing at all: the lanes split it, the
+    ///   high-severity lane taking one part in
+    ///   [`DEFAULT_HIGH_SEVERITY_LANE_DIVISOR`] and the ordinary lane taking
+    ///   the remainder, so the split is exact for every arena size rather than
+    ///   only for the default one;
+    /// - the arena and one lane: the other lane is what is left of the arena;
+    /// - both lanes: the arena is their sum;
+    /// - one lane alone: the arena keeps its default and the other lane is
+    ///   what is left of it.
+    ///
+    /// The arena is the budget in every case; a lane is never allowed to grow
+    /// it. Deriving rather than defaulting is what makes a partial override
+    /// work at all: three independently defaulted quantities cannot satisfy an
+    /// equality between them unless the author restates all three.
+    fn resolve_arena(&self) -> Result<TelemetryArena, ObservabilityConfigError> {
+        let ordinary = self
+            .ordinary_lane_bytes
+            .map(|value| {
+                bounded_nonzero_u64(
+                    "observability.ordinary_lane_bytes",
+                    value.0,
+                    MAX_ARENA_BYTES,
+                    "set `ordinary_lane_bytes = \"3MB\"`",
                 )
-            })?;
-        if lane_sum != arena_bytes {
-            return Err(ObservabilityConfigError::invalid(
+            })
+            .transpose()?;
+        let high_severity = self
+            .high_severity_lane_bytes
+            .map(|value| {
+                bounded_nonzero_u64(
+                    "observability.high_severity_lane_bytes",
+                    value.0,
+                    MAX_ARENA_BYTES,
+                    "set `high_severity_lane_bytes = \"1MB\"`",
+                )
+            })
+            .transpose()?;
+
+        let arena_bytes = match (self.arena_bytes, ordinary, high_severity) {
+            (Some(arena), _, _) => bounded_nonzero_u64(
                 "observability.arena_bytes",
-                "must equal the exact sum of `ordinary_lane_bytes` and `high_severity_lane_bytes`",
-                "set `arena_bytes` to the exact sum of the two disjoint lane caps",
-            ));
-        }
+                arena.0,
+                MAX_ARENA_BYTES,
+                "set `arena_bytes = \"4MB\"`",
+            )?,
+            // Two lanes and no arena name the arena between them.
+            (None, Some(ordinary), Some(high_severity)) => bounded_nonzero_u64(
+                "observability.arena_bytes",
+                ordinary.checked_add(high_severity).ok_or_else(|| {
+                    ObservabilityConfigError::invalid(
+                        "observability.arena_bytes",
+                        "cannot represent the sum of the two telemetry lanes",
+                        "set the two lane byte caps so their sum is within the documented arena ceiling",
+                    )
+                })?,
+                MAX_ARENA_BYTES,
+                "lower the two lane byte caps so their sum is within the documented arena ceiling",
+            )?,
+            (None, _, _) => DEFAULT_ARENA_BYTES,
+        };
+
+        let (ordinary_lane_bytes, high_severity_lane_bytes) = match (ordinary, high_severity) {
+            (Some(ordinary), Some(high_severity)) => {
+                if ordinary.checked_add(high_severity) != Some(arena_bytes) {
+                    return Err(ObservabilityConfigError::invalid(
+                        "observability.arena_bytes",
+                        "must equal the exact sum of `ordinary_lane_bytes` and `high_severity_lane_bytes`",
+                        "remove `arena_bytes` to take it from the two lane caps, or set it to their exact sum",
+                    ));
+                }
+                (ordinary, high_severity)
+            }
+            (Some(ordinary), None) => (
+                ordinary,
+                remainder_of_arena(
+                    arena_bytes,
+                    ordinary,
+                    "observability.ordinary_lane_bytes",
+                    "raise `arena_bytes` above `ordinary_lane_bytes`, or lower `ordinary_lane_bytes` below it",
+                )?,
+            ),
+            (None, Some(high_severity)) => (
+                remainder_of_arena(
+                    arena_bytes,
+                    high_severity,
+                    "observability.high_severity_lane_bytes",
+                    "raise `arena_bytes` above `high_severity_lane_bytes`, or lower `high_severity_lane_bytes` below it",
+                )?,
+                high_severity,
+            ),
+            (None, None) => {
+                let high_severity = (arena_bytes / DEFAULT_HIGH_SEVERITY_LANE_DIVISOR).max(1);
+                (
+                    remainder_of_arena(
+                        arena_bytes,
+                        high_severity,
+                        "observability.arena_bytes",
+                        "set `arena_bytes = \"4MB\"`",
+                    )?,
+                    high_severity,
+                )
+            }
+        };
+
+        Ok(TelemetryArena {
+            arena_bytes,
+            ordinary_lane_bytes,
+            high_severity_lane_bytes,
+        })
+    }
+
+    pub(crate) fn resolve(&self) -> Result<ResolvedObservabilityPolicy, ObservabilityConfigError> {
+        let TelemetryArena {
+            arena_bytes,
+            ordinary_lane_bytes,
+            high_severity_lane_bytes,
+        } = self.resolve_arena()?;
 
         let max_batch_bytes = bounded_nonzero_u64(
             "observability.max_batch_bytes",
@@ -1301,6 +1398,29 @@ fn validate_bounded_logical_text(
         "must be non-empty bounded logical text without control characters",
         correction,
     ))
+}
+
+/// What is left of the arena once one lane has taken `lane_bytes`.
+///
+/// The other lane gets it, so it has to be positive: a zero-byte lane is one
+/// severity of telemetry that can never be admitted, which is a silent loss
+/// rather than a bounded one.
+fn remainder_of_arena(
+    arena_bytes: u64,
+    lane_bytes: u64,
+    field: &'static str,
+    correction: &'static str,
+) -> Result<u64, ObservabilityConfigError> {
+    arena_bytes
+        .checked_sub(lane_bytes)
+        .filter(|remainder| *remainder > 0)
+        .ok_or_else(|| {
+            ObservabilityConfigError::invalid(
+                field,
+                "must leave a positive remainder of `arena_bytes` for the other telemetry lane",
+                correction,
+            )
+        })
 }
 
 fn bounded_nonzero_u64(

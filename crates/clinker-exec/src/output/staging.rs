@@ -312,7 +312,12 @@ impl OutputStagingRegistry {
                                 if search.advance(&error) {
                                     Ok(None)
                                 } else {
-                                    Err(error)
+                                    // Under the authored name, for the same
+                                    // reason the other copy of this search
+                                    // gives it: a destination that refuses
+                                    // every candidate has not refused
+                                    // `out-64.csv`, which nobody wrote.
+                                    Err(super::open::suffix_search_failure(&bare, error, &search))
                                 }
                             }
                         }

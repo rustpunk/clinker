@@ -427,10 +427,12 @@ fn unique_probe_stem() -> String {
 /// makes a symlinked parent and its target one destination; what does not
 /// exist yet cannot be resolved and is kept as written.
 ///
-/// `..` is left to that resolution rather than applied to the text. The two
-/// are not the same: when the component before it is a symlink, the kernel
-/// follows the link and then goes up from where it lands, so cancelling the
-/// pair lexically names a different file than the one that will be opened.
+/// A `..` inside the existing prefix is left to that resolution rather than
+/// applied to the text. The two are not the same: when the component before it
+/// is a symlink, the kernel follows the link and then goes up from where it
+/// lands, so cancelling the pair lexically names a different file than the one
+/// that will be opened. Past the existing prefix the text *is* what the kernel
+/// will see, and the pair is cancelled — see [`resolved_prefix`].
 /// A relative path is resolved against the working directory first, so the
 /// same file named relatively in one place and absolutely in another has one
 /// identity. Leaving that to callers is what let the plan-time check and the
@@ -466,25 +468,47 @@ fn without_cur_dir(path: &Path) -> std::path::PathBuf {
         .collect()
 }
 
-/// `path` with its longest existing prefix canonicalized.
+/// One component of the tail that sits past the longest existing prefix,
+/// together with what the walk was told about it.
+struct TailComponent {
+    name: std::ffi::OsString,
+    /// The filesystem was asked for this exact path and answered that nothing
+    /// is there. A canonicalize failure alone does not establish that -- it is
+    /// also how a permission denial, a symlink loop, and an over-long name
+    /// come back -- and only genuine absence licenses cancelling a following
+    /// `..` against this name.
+    absent: bool,
+}
+
+/// `path` with its longest existing prefix canonicalized and the `..`
+/// components past that prefix cancelled.
 ///
 /// The walk steps over a `..` rather than stopping at it -- `file_name` is
 /// `None` for such a component, and treating that as the end of the road left
-/// the existing prefix in front of it unresolved too. The `..` itself is kept
-/// as written: what it names depends on what the components around it turn
-/// out to be, and reducing it against a name that does not exist yet is only
-/// sound while the reduction stays outside the part that does. See open
-/// question 52.
+/// the existing prefix in front of it unresolved too.
+///
+/// A `..` is then cancelled only against a component the filesystem said does
+/// not exist, which is what makes the cancellation kernel-equivalent rather
+/// than merely lexical: the danger in reducing `a/../b` textually is that `a`
+/// may be a symlink, in which case the kernel goes up from where the link
+/// lands and not from `a`'s own parent -- and a name that does not exist is
+/// not a symlink. Nothing can be created under it either, so the parent
+/// directories a run makes on its way to the destination are made along this
+/// same reduced route, as real directories. Absence is checked with
+/// `symlink_metadata` rather than inferred from the canonicalize failure,
+/// because that failure covers cases (`EACCES`, `ELOOP`) where a symlink is
+/// exactly what may be sitting there; those keep the `..` as written.
+///
+/// A `..` that cancels the whole tail lands on the resolved prefix, and the
+/// prefix is popped: it came out of `canonicalize`, so it holds no symlinks
+/// and going up from it textually is going up from it truthfully. At the root
+/// the pop is a no-op, which is what the kernel does with `/..` as well.
 fn resolved_prefix(path: &Path) -> std::path::PathBuf {
-    let mut unresolved: Vec<std::ffi::OsString> = Vec::new();
+    let mut unresolved: Vec<TailComponent> = Vec::new();
     let mut cursor = path;
     loop {
         if let Ok(resolved) = cursor.canonicalize() {
-            let mut rebuilt = resolved;
-            for name in unresolved.iter().rev() {
-                rebuilt.push(name);
-            }
-            return rebuilt;
+            return rebuild_past_prefix(resolved, &unresolved);
         }
         let Some(parent) = cursor.parent() else {
             return path.to_path_buf();
@@ -492,9 +516,45 @@ fn resolved_prefix(path: &Path) -> std::path::PathBuf {
         let Some(last) = cursor.components().next_back() else {
             return path.to_path_buf();
         };
-        unresolved.push(last.as_os_str().to_owned());
+        unresolved.push(TailComponent {
+            name: last.as_os_str().to_owned(),
+            absent: matches!(
+                cursor.symlink_metadata(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            ),
+        });
         cursor = parent;
     }
+}
+
+/// Join the tail -- innermost component last in `tail` -- onto the resolved
+/// prefix, cancelling the `..` components that are sound to cancel.
+fn rebuild_past_prefix(resolved: std::path::PathBuf, tail: &[TailComponent]) -> std::path::PathBuf {
+    let mut prefix = resolved;
+    let mut kept: Vec<&TailComponent> = Vec::new();
+    for component in tail.iter().rev() {
+        if component.name != ".." {
+            kept.push(component);
+            continue;
+        }
+        match kept.last() {
+            Some(previous) if previous.absent && previous.name != ".." => {
+                kept.pop();
+            }
+            // Every tail component the `..` could have cancelled is gone, so
+            // it goes up from the resolved prefix itself.
+            None => {
+                prefix.pop();
+            }
+            // The component in front of it may exist, and may therefore be a
+            // symlink. What that pair names is the kernel's to say.
+            Some(_) => kept.push(component),
+        }
+    }
+    for component in kept {
+        prefix.push(&component.name);
+    }
+    prefix
 }
 
 /// Canonical collision key for an output path: the key under which two paths
@@ -1510,8 +1570,7 @@ mod tests {
             // A `..` further along must not cost the prefix in front of it its
             // resolution. Asserted through the link, because comparing two
             // spellings that reduce to the same text proves nothing: what is
-            // being checked is that the prefix was resolved at all. What the
-            // `..` itself names is left as written -- see open question 52.
+            // being checked is that the prefix was resolved at all.
             let through_link = link.join("later").join("..").join("out.csv");
             assert!(
                 destination_identity(&through_link).starts_with(
@@ -1534,6 +1593,81 @@ mod tests {
                 destination_identity(&link.join("..").join("out.csv")),
                 destination_identity(&root.path().join("out.csv")),
                 "`..` after a symlink goes up from where the link lands"
+            );
+        }
+    }
+
+    /// A `..` past the end of what exists names the same file as the spelling
+    /// without it. Two producers writing `out/data.csv` and
+    /// `out/pending/../data.csv` write one file, so they must key as one --
+    /// keeping the `..` as text gave them two keys, and the collision check
+    /// admitted both.
+    #[test]
+    fn a_dot_dot_past_the_existing_prefix_is_cancelled() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let out = root.path().join("out");
+        std::fs::create_dir(&out).expect("create the existing prefix");
+
+        assert_eq!(
+            destination_identity(&out.join("pending").join("..").join("data.csv")),
+            destination_identity(&out.join("data.csv")),
+            "`pending` does not exist, so it cannot be a symlink, and the pair cancels"
+        );
+
+        assert_eq!(
+            destination_identity(
+                &out.join("a")
+                    .join("b")
+                    .join("..")
+                    .join("..")
+                    .join("data.csv")
+            ),
+            destination_identity(&out.join("data.csv")),
+            "and so does a run of them"
+        );
+
+        // Cancelling the whole tail lands on the resolved prefix, which holds
+        // no symlinks -- so going up from it textually is going up from it
+        // truthfully.
+        assert_eq!(
+            destination_identity(&out.join("pending").join("..").join("..").join("data.csv")),
+            destination_identity(&root.path().join("data.csv")),
+            "a `..` with nothing left to cancel goes up from the resolved prefix"
+        );
+
+        // A `..` that runs out of prefix stays where it is, as it does for the
+        // kernel. Asserted on the reduction itself: keying it would probe the
+        // filesystem root, which a test has no business writing to.
+        let root_of = |path: &Path| {
+            path.components()
+                .next()
+                .map(|first| std::path::PathBuf::from(first.as_os_str()))
+                .expect("an absolute path has a root")
+        };
+        let deep = out.join("nope").join("..").join("..");
+        let mut escaping = deep.clone();
+        for _ in 0..out.components().count() {
+            escaping.push("..");
+        }
+        assert_eq!(
+            resolved_prefix(&escaping.join("data.csv")),
+            root_of(&out).join("data.csv"),
+            "`..` past the root stays at the root"
+        );
+
+        #[cfg(unix)]
+        {
+            // The reduction stops where certainty does: `later` exists and is
+            // a symlink, so what `later/..` names is the kernel's to say and
+            // the resolution -- not the text -- decides it.
+            let elsewhere = root.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).expect("create the link target");
+            let later = out.join("later");
+            std::os::unix::fs::symlink(&elsewhere, &later).expect("link into it");
+            assert_eq!(
+                destination_identity(&later.join("..").join("data.csv")),
+                destination_identity(&root.path().join("data.csv")),
+                "`..` after a symlink goes up from where the link lands, not from `out`"
             );
         }
     }

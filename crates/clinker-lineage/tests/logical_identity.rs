@@ -621,3 +621,182 @@ nodes:
         "a name without the separator is unaffected"
     );
 }
+
+/// Two nodes may name one external dataset — a binding is per node, and nothing
+/// in configuration or in [`LineageIdentityContext::external`] requires two nodes
+/// to carry different identities. The emitted document has one entry per dataset,
+/// so that entry has to carry what every contributing node authorized: two
+/// writers each producing one partition of a table produced both, and two shards
+/// read from one collection were both read. Keeping the first contribution and
+/// discarding the rest silently narrowed the run's claim to one node's members.
+#[test]
+fn nodes_sharing_one_dataset_contribute_every_authorized_fact() {
+    let shard_a = LineageNodeBinding::new(
+        "orders_eu",
+        ExternalDatasetIdentity::catalog("analytics", "orders").unwrap(),
+    )
+    .with_subset(DatasetSubset::input("region=eu").unwrap())
+    .with_symlink(
+        SymlinkIdentifier::new("hive://cluster", "db.orders", DatasetIdentifierType::Table)
+            .unwrap(),
+    );
+    // Deliberately overlapping: `db.orders` is authorized by both shards, and a
+    // repeated identifier in the emitted facet would be a malformed document.
+    let shard_b = LineageNodeBinding::new(
+        "orders_us",
+        ExternalDatasetIdentity::catalog("analytics", "orders").unwrap(),
+    )
+    .with_subset(DatasetSubset::input("region=us").unwrap())
+    .with_symlink(
+        SymlinkIdentifier::new("hive://cluster", "db.orders", DatasetIdentifierType::Table)
+            .unwrap(),
+    )
+    .with_symlink(
+        SymlinkIdentifier::new("s3://lake", "orders/", DatasetIdentifierType::Location).unwrap(),
+    );
+    let write_a = LineageNodeBinding::new(
+        "daily_eu",
+        ExternalDatasetIdentity::catalog("analytics", "orders_daily").unwrap(),
+    )
+    .with_subset(DatasetSubset::output("dt=2026-08-12/region=eu").unwrap())
+    .with_symlink(
+        SymlinkIdentifier::new(
+            "hive://cluster",
+            "db.orders_daily",
+            DatasetIdentifierType::Table,
+        )
+        .unwrap(),
+    );
+    let write_b = LineageNodeBinding::new(
+        "daily_us",
+        ExternalDatasetIdentity::catalog("analytics", "orders_daily").unwrap(),
+    )
+    .with_subset(DatasetSubset::output("dt=2026-08-12/region=us").unwrap());
+
+    let identities =
+        LineageIdentityContext::external([shard_a, shard_b, write_a, write_b]).unwrap();
+
+    let compiled = parse_config(
+        r#"
+pipeline: { name: shared_dataset_identity }
+nodes:
+  - type: source
+    name: orders_eu
+    config:
+      name: orders_eu
+      type: csv
+      glob: incoming/eu/*.csv
+      schema: [{ name: id, type: int }]
+  - type: source
+    name: orders_us
+    config:
+      name: orders_us
+      type: csv
+      glob: incoming/us/*.csv
+      schema: [{ name: id, type: int }]
+  - type: output
+    name: daily_eu
+    input: orders_eu
+    config: { name: daily_eu, type: csv, path: out/eu.csv }
+  - type: output
+    name: daily_us
+    input: orders_us
+    config: { name: daily_us, type: csv, path: out/us.csv }
+"#,
+    )
+    .unwrap()
+    .compile(&CompileContext::default())
+    .unwrap();
+
+    let lineage = column_lineage_external(&compiled, &identities).unwrap();
+
+    // One collection dataset, one sink dataset — the merge is what is under test,
+    // not a second entry appearing.
+    assert_eq!(lineage.inputs.len(), 1, "{:?}", lineage.inputs);
+    assert_eq!(lineage.outputs.len(), 1);
+
+    let input_facets = lineage
+        .input_identity_facets
+        .get(&lineage.inputs[0])
+        .expect("the shared collection carries both shards' facts");
+    assert_eq!(
+        input_facets
+            .subsets()
+            .iter()
+            .map(DatasetSubset::identifier)
+            .collect::<Vec<_>>(),
+        ["region=eu", "region=us"],
+        "both shards were read, and the sorted order is the walk-independent one"
+    );
+    assert_eq!(
+        input_facets
+            .symlinks()
+            .iter()
+            .map(|alias| (alias.namespace(), alias.name()))
+            .collect::<Vec<_>>(),
+        [("hive://cluster", "db.orders"), ("s3://lake", "orders/")],
+        "an alias both shards authorize appears once"
+    );
+
+    let output_facets = &lineage.outputs[0].identity_facets;
+    assert_eq!(
+        output_facets
+            .subsets()
+            .iter()
+            .map(DatasetSubset::identifier)
+            .collect::<Vec<_>>(),
+        ["dt=2026-08-12/region=eu", "dt=2026-08-12/region=us"],
+        "the table was written by both writers, so both partitions were produced"
+    );
+    assert_eq!(
+        output_facets
+            .symlinks()
+            .iter()
+            .map(SymlinkIdentifier::name)
+            .collect::<Vec<_>>(),
+        ["db.orders_daily"],
+        "an alias only one writer authorized is still true of the dataset"
+    );
+
+    // The facets reach the wire in both positions, and only the role-matching
+    // direction is serialized.
+    let events = run_events(
+        &lineage,
+        Job {
+            namespace: "clinker".to_owned(),
+            name: "shared_dataset_identity".to_owned(),
+            facets: None,
+        },
+        &lifecycle_facts(),
+    );
+    let complete = serde_json::to_value(&events[1]).expect("serialize COMPLETE event");
+    assert_eq!(
+        complete["inputs"][0]["inputFacets"]["subset"]["inputCondition"]["locations"],
+        serde_json::json!(["region=eu", "region=us"])
+    );
+    assert_eq!(
+        complete["outputs"][0]["outputFacets"]["subset"]["outputCondition"]["locations"],
+        serde_json::json!(["dt=2026-08-12/region=eu", "dt=2026-08-12/region=us"])
+    );
+
+    // Byte-stability: the merged collections are sorted, so neither the walk
+    // order nor a hash seed can reorder what is emitted.
+    let bytes = serde_json::to_vec(&events).expect("serialize events");
+    for _ in 0..4 {
+        let rebuilt = column_lineage_external(&compiled, &identities).unwrap();
+        let again = run_events(
+            &rebuilt,
+            Job {
+                namespace: "clinker".to_owned(),
+                name: "shared_dataset_identity".to_owned(),
+                facets: None,
+            },
+            &lifecycle_facts(),
+        );
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&again).expect("serialize events"),
+            "the emitted document must be byte-identical across builds"
+        );
+    }
+}

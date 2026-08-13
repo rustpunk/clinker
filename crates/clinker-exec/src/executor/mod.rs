@@ -1410,6 +1410,7 @@ impl PipelineExecutor {
             commit_step_path: dispatch::CommitStepPath::NotSelected,
             region_input_buffers: HashMap::new(),
             in_deferred_dispatch: false,
+            transform_signal_carry: HashMap::new(),
             streaming_output_senders,
             streaming_output_nodes,
             streaming_aggregate_ingest_edges,

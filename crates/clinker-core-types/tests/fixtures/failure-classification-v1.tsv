@@ -17,6 +17,7 @@ admission.configuration.batch_id_missing	configuration	do_not_retry
 admission.configuration.policy_required	configuration	policy_required
 infrastructure.runtime.transient	infrastructure	retry_with_backoff
 infrastructure.runtime.source_unavailable	infrastructure	retry_with_backoff
+infrastructure.delivery.unreportable_outcome	infrastructure	policy_required
 attempt.publication.registration_failed	publication	policy_required
 attempt.publication.finalization_failed	publication	retry_with_backoff
 attempt.publication.manifest_failed	publication	retry_with_backoff

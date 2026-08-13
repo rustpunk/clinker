@@ -33,6 +33,26 @@ The whole block is optional. With no `clinker.toml`, or a `clinker.toml` that
 omits `[storage]`, Clinker spills to the OS temp directory exactly as it
 always has.
 
+## Table names are checked
+
+Clinker reads five top-level tables — `[catalog]`, `[storage]`,
+`[observability]`, `[channel]`, and `[group]` — and passes over any other
+top-level table, so a `clinker.toml` may carry tables meant for other tooling.
+
+A table name that is a *misspelling* of one of those five is refused instead,
+naming the table you wrote and the one it was mistaken for. Absence is how a
+workspace says "off" — omitting `[observability]` disables telemetry — so a
+name that misses by a letter would otherwise turn a policy off silently:
+
+```text
+clinker.toml table [observabilty] is not a table clinker reads, and is a
+misspelling of [observability]; nothing under it would have been applied —
+write `[observability]`, or rename the table so it is not mistakable for one
+```
+
+Keys *inside* a recognized table are strict already: an unknown key there is
+refused outright.
+
 ## Output publication and retained attempts
 
 `[storage.publication]` is the only author-facing block for output publication,

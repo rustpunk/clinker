@@ -264,12 +264,12 @@ Byte-size strings use decimal units (`1KB = 1,000` bytes and
 
 | Key | Default | Hard ceiling or relationship |
 |-----|---------|------------------------------|
-| `arena_bytes` | 4 MiB | 64 MiB; equals the exact sum of both lane caps |
-| `ordinary_lane_bytes` | 3 MiB | 64 MiB and disjoint from the high-severity lane |
-| `high_severity_lane_bytes` | 1 MiB | 64 MiB and disjoint from the ordinary lane |
-| `max_batch_bytes` | 256 KiB | 1 MiB and no larger than either lane |
+| `arena_bytes` | `"4MB"` | `"64MB"`; equals the exact sum of both lane caps |
+| `ordinary_lane_bytes` | three quarters of the arena | `"64MB"` and disjoint from the high-severity lane |
+| `high_severity_lane_bytes` | one quarter of the arena | `"64MB"` and disjoint from the ordinary lane |
+| `max_batch_bytes` | `"256KB"` | `"1MB"` and no larger than either lane |
 | `max_attributes_per_event` | 32 | 256 |
-| `max_attribute_bytes` | 4 KiB | 64 KiB |
+| `max_attribute_bytes` | `"4KB"` | `"64KB"` |
 | `sample_every` | 1 | 1,000,000 |
 | `rate_limit_per_second` | 1,000 | 1,000,000 |
 | `rate_limit_burst` | 1,000 | 1,000,000 |
@@ -278,10 +278,30 @@ Byte-size strings use decimal units (`1KB = 1,000` bytes and
 | `otlp.request_timeout_ms` | 5,000 | 60,000 and no greater than retry total |
 | `otlp.retry_max_attempts` | 3 | 10 |
 | `otlp.retry_total_timeout_ms` | 10,000 | 60,000 and no greater than flush timeout |
-| `otlp.max_response_bytes` | 64 KiB | 1 MiB |
-| `lineage.queue_bytes` | 1 MiB | 64 MiB, reserved independently of the telemetry arena |
-| `lineage.max_event_bytes` | 64 KiB | 1 MiB and no larger than its lineage queue |
+| `otlp.max_response_bytes` | `"64KB"` | `"1MB"` |
+| `lineage.queue_bytes` | `"1MB"` | `"64MB"`, reserved independently of the telemetry arena |
+| `lineage.max_event_bytes` | `"64KB"` | `"1MB"` and no larger than its lineage queue |
 | `lineage.flush_timeout_ms` | 5,000 | 60,000 |
+
+Every byte default above is the quantity its own spelling parses to, so
+writing a default out in full changes nothing.
+
+### Sizing the arena
+
+The two lanes partition the arena exactly: no telemetry byte is charged twice,
+and none of the arena is unreachable. You may write any of the three and leave
+the rest to be worked out from what you wrote:
+
+- **`arena_bytes` alone** — the lanes split it three-to-one, whatever its size.
+  `arena_bytes = "8MB"` gives a 6 MB ordinary lane and a 2 MB high-severity one.
+- **One lane alone** — the arena stays at its default and the other lane takes
+  the remainder.
+- **Both lanes** — the arena is their sum.
+- **All three** — the equality is checked rather than adjusted, and a
+  disagreement is refused before the run starts.
+
+The arena is the budget in every case: a lane is never allowed to grow it. A
+lane that does not fit inside the arena is refused, naming both keys.
 
 An exported attribute longer than `max_attribute_bytes` is cut to fit and
 marked with a trailing `…`, and the marker is charged against the same cap, so
@@ -327,6 +347,24 @@ and a low `accepted` means "we stopped counting" rather than "the collector
 refused them". Those call for different responses, and only one of them is a
 collector problem.
 
+Any `2xx` answer counts as delivered. A collector's own success status is
+`200`, and its body is where a partial success declares the records it refused
+— those are what `rejected` counts. A gateway in front of a collector may
+answer `202 Accepted` or `204 No Content` instead, and there is no such body to
+read: the whole chunk counts under `accepted`, because the answer says it was
+taken. A rejection is a `4xx` or a `5xx`.
+
+A delivery cut short after its request was fully sent is not sent again, even
+with attempts left in the budget. The collector may already hold that batch —
+a reply that is only slow cannot be told apart from one that was lost — and
+repeating it would ingest the same log records twice and count the same
+monotonic sums twice, which is wrong rather than merely unconfirmed. Such a
+batch is counted under `failures`, having spent fewer attempts than
+`retry_max_attempts` allowed: its delivery is unconfirmed, not known to have
+failed.
+A collector that habitually answers slowly needs a larger
+`otlp.request_timeout_ms`, not more attempts.
+
 Delivery outcomes never change execution, publication, or the process exit
 status; the summary is an observation about the export, not about the run.
 
@@ -340,6 +378,7 @@ beside them says what the arena took and what it refused, before any export:
 
 ```json
 "admission": {
+  "counts_complete": true,
   "accepted": 9,
   "dropped": {
     "sampled": 8, "rate_limited": 0, "queue_full": 0, "contended": 0,
@@ -353,6 +392,18 @@ beside them says what the arena took and what it refused, before any export:
   "retained_bytes": 0, "peak_retained_bytes": 2477, "capacity_bytes": 64000
 }
 ```
+
+`counts_complete` says whether the rest of the object is a final accounting.
+These counters are read from the producer's arena, and the arena keeps changing
+while the exporter drains it — `undecodable` is credited at drain. A flush that
+ran to completion joined the exporter first, so nothing was left to credit and
+`counts_complete` is `true`. A flush that expired on `flush_timeout_ms`
+detached an exporter that is still draining, so the read landed mid-drain and
+`counts_complete` is `false`: every number below it is whatever had been
+reached, and a low one means "we could not finish counting" rather than
+"nothing was lost". The flush stays bounded either way — a finishing run does
+not wait on an unresponsive collector — so this flag, not a longer wait, is
+what keeps a truncated view from looking complete.
 
 `accepted` counts the logs and spans the arena took. Metric points are
 coalesced into fixed counters rather than admitted as signals, so none of them
@@ -389,7 +440,8 @@ The `- 1` is the run-lifecycle span, which the exporter synthesizes at the
 final flush rather than drawing from the arena. `metrics` has no term because
 metric points are not admitted signals. When `flush_complete` is `false` the
 export counters are a partial accounting by definition and the identity does
-not apply.
+not apply; `admission.counts_complete` is `false` on that same run, because the
+arena side was read while the detached exporter was still draining it.
 
 Any shortfall against that is arena loss, and `dropped` says which kind.
 
@@ -419,13 +471,19 @@ A run without `--machine ndjson-v1` discards the terminal object entirely, so
 when anything was dropped Clinker writes one line to standard error:
 
 ```
-clinker: telemetry admission outcome: accepted=9 dropped=8 sampled=8 rate_limited=0 queue_full=0 contended=0 oversize=0 invalid_identity=0 undecodable=0 ordinary_sampled=4 ordinary_queue_full=0 high_sampled=4 high_queue_full=0
+clinker: telemetry admission outcome: accepted=9 dropped=8 sampled=8 rate_limited=0 queue_full=0 contended=0 oversize=0 invalid_identity=0 undecodable=0 ordinary_sampled=4 ordinary_queue_full=0 high_sampled=4 high_queue_full=0 counts_complete=true
 ```
 
 It mirrors the lineage delivery line, including its suppression rule: a run
 that dropped nothing prints nothing. A line that appeared on every run reading
 all zeroes is noise an operator learns to skip, and the one run that did lose
 signals would be skipped with it.
+
+The suppression is on the counters being final and clean, not on their reading
+zero. A run whose flush expired prints the line whatever the numbers say, with
+`counts_complete=false`: all-zero counts taken mid-drain are not evidence of a
+clean run, and staying silent on them would report a run that may well have
+lost signals as one that certainly did not.
 
 Like the lineage line, this is an observation. Telemetry loss does not change
 execution, publication, the machine terminal result, or the exit status.
@@ -525,6 +583,18 @@ previous export, not a running total, and carries the `startTimeUnixNano` and
 `timeUnixNano` bounding that interval. Sum the deltas to get the run total;
 reading any single point as an absolute value will understate the run, often by
 a large factor on a long one.
+
+**Transforms that a correlated commit re-runs.** A pipeline with a relaxed
+correlation-key aggregate converges at commit time: the engine re-runs the
+transforms downstream of that aggregate, retracting the rows that turned out to
+fail, until the result stops changing. Only the converged result is published,
+and the exported signals describe it the same way — one span covering the whole
+convergence, one `clinker.transform.started`, one `clinker.transform.completed`,
+and record and error counts taken from the converged pass rather than added up
+across the discarded ones. An `every:` cadence continues across the passes
+rather than restarting on each. So a transform inside a convergence reports the
+rows the run actually carried, and its counters stay summable alongside every
+other transform's.
 
 **Logs.** Each emission of an authored `log:` directive becomes one OTLP log
 record: `severityText` from the directive's `level`, the directive's `message`

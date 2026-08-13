@@ -391,6 +391,40 @@ impl MachineEmitter {
         self.emit_completed_with_publication(exit_code, None)
     }
 
+    /// Terminal for an invocation that succeeded without running an attempt.
+    ///
+    /// The plan-only `--lineage` export is the case: it preflights the
+    /// identity policy, writes its document, and returns before any data is
+    /// read, sharing this stream's `execution_id` and `batch_id` so the
+    /// exported document is correlatable with the invocation that produced it.
+    ///
+    /// It carries an explicit empty inventory rather than no `publication`
+    /// field. A `completed` / `success` / exit `0` terminal is read by the
+    /// published contract as *publication is complete*, and a consumer that
+    /// reconciles artifact evidence — the reference adapter among them — reads
+    /// an absent inventory on that row as a stream it cannot accept. Zero
+    /// artifacts, every state count zero, and no cleanup debt is the same
+    /// statement in the vocabulary the reconciliation table already defines:
+    /// nothing was published, and that is the whole of it.
+    pub(crate) fn emit_completed_without_attempt(&self) -> io::Result<TerminalOutcome> {
+        self.with_state(|state| {
+            let fields = serde_json::Map::from_iter([
+                ("result".to_owned(), serde_json::json!("success")),
+                ("exit_code".to_owned(), serde_json::json!(0)),
+            ]);
+            let (artifact_events, summary) =
+                publication_payloads_from_artifacts(true, 0, Vec::new());
+            state.write_terminal_for(
+                "completed",
+                fields,
+                Some(TerminalPublication {
+                    artifact_events,
+                    summary,
+                }),
+            )
+        })
+    }
+
     pub(crate) fn emit_completed_with_publication(
         &self,
         exit_code: u8,
@@ -941,6 +975,10 @@ fn injected_write_failure(
                 && fields["progress"]["phase"] == "finalizing"
         }
         "failed_terminal" => event == "failed",
+        // The first terminal of a published run, and only that one. The retry
+        // `main` makes still reaches the stream, which is where a supervisor
+        // reads what a run whose report could not be delivered actually did.
+        "completed_terminal" => event == "completed",
         "terminal" => matches!(event, "completed" | "failed" | "cancelled"),
         _ => false,
     }

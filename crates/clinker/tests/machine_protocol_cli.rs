@@ -278,6 +278,16 @@ fn protocol_plain_run_does_not_emit_machine_records() {
     assert!(directory.path().join("plain.csv").exists());
 }
 
+/// A plan-only export closes its stream by saying it published nothing.
+///
+/// `--lineage <FILE>` returns before any data is read, and its terminal is
+/// `completed` / `success` / exit `0` — the row the published contract reads
+/// as *publication is complete; every reported artifact is individually
+/// complete*. With no `publication` field at all a consumer reconciling
+/// artifact evidence has nothing to reconcile against on the one row that
+/// promises it, and the contract's own reference adapter rejects the stream.
+/// An explicit empty inventory is the same truth in the vocabulary the
+/// reconciliation table already defines.
 #[test]
 fn protocol_allows_file_lineage_but_rejects_lineage_stdout() {
     let directory = fixture();
@@ -304,6 +314,32 @@ fn protocol_allows_file_lineage_but_rejects_lineage_stdout() {
     assert!(stream.iter().any(|event| event["event"] == "plan_resolved"));
     assert!(directory.path().join("lineage.ndjson").exists());
     assert!(!directory.path().join("lineage-only.csv").exists());
+
+    let terminal = stream.last().expect("terminal");
+    assert_eq!(terminal["event"], "completed");
+    assert_eq!(terminal["result"], "success");
+    let publication = &terminal["publication"];
+    assert_eq!(
+        publication["artifact_count"], 0,
+        "an invocation that ran no attempt published nothing: {terminal}"
+    );
+    assert_eq!(
+        publication["complete"], true,
+        "the empty inventory is complete — there was nothing else to publish: {terminal}"
+    );
+    assert_eq!(publication["cleanup_debt_count"], 0);
+    assert!(
+        publication["state_counts"]
+            .as_object()
+            .expect("state counts")
+            .values()
+            .all(|count| count == 0),
+        "{terminal}"
+    );
+    assert!(
+        publication_artifacts(&stream).is_empty(),
+        "an empty inventory sends no artifact chunks: {stream:#?}"
+    );
 
     let stdout_lineage = invoke(
         directory.path(),
@@ -597,4 +633,63 @@ fn machine_protocol_terminal_write_failure_does_not_undo_published_artifacts() {
     let stream = events(&output);
     assert!(stream.iter().all(|event| !terminal(event)));
     assert!(directory.path().join("published.csv").exists());
+}
+
+/// A run whose outputs are live never advises re-running it.
+///
+/// The first terminal is refused the way a supervisor's pipe refuses one
+/// momentarily — `WouldBlock`, `EINTR`, a full pipe — and the retry gets
+/// through. What that retry says is the only thing the supervisor will ever
+/// read about this run, and the run published: every final is visible, and the
+/// lineage and OTLP terminals for the same run recorded a completion. Advice
+/// to retry with backoff here duplicates published data, because a delivery
+/// fault on the reporting channel would be deciding what the supervisor
+/// believes about execution.
+#[test]
+fn machine_protocol_a_published_run_that_cannot_report_never_advises_retry() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "already-published.csv");
+    let output = Command::new(clinker_bin())
+        .current_dir(directory.path())
+        .env("CLINKER_TEST_MACHINE_WRITE_FAILURE", "completed_terminal")
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "unreportable-outcome",
+        ])
+        .output()
+        .expect("run unreportable terminal");
+    assert_eq!(output.status.code(), Some(4));
+    assert!(
+        directory.path().join("already-published.csv").exists(),
+        "the run published before its terminal was refused"
+    );
+    let stream = events(&output);
+    assert_stream(&stream, "unreportable-outcome");
+    let recovered = stream.last().expect("terminal");
+    assert_eq!(recovered["event"], "failed");
+    assert_eq!(recovered["exit_code"], 4);
+    assert_ne!(
+        recovered["failure"]["retry"], "retry_with_backoff",
+        "a run whose outputs are live must never advise re-running it: {recovered}"
+    );
+    assert_eq!(recovered["failure"]["retry"], "policy_required");
+    assert_eq!(
+        recovered["failure"]["code"], "infrastructure.delivery.unreportable_outcome",
+        "the delivery fault is classified as itself, not as a transient \
+         runtime fault: {recovered}"
+    );
+    // The publication the refused terminal carried is still reported, so the
+    // advice and the artifact evidence agree: the outputs are complete and
+    // this attempt must not be repeated.
+    assert_eq!(recovered["publication"]["complete"], true);
+    assert!(
+        publication_artifacts(&stream)
+            .iter()
+            .all(|artifact| artifact["state"] == "published"),
+        "{stream:#?}"
+    );
 }

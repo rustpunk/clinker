@@ -39,10 +39,93 @@ pub(crate) struct LogDispatcher<'a> {
     enabled: Option<EnabledDispatcher<'a>>,
 }
 
+/// The signal state of one transform, held across the passes the cascading
+/// retract loop makes over it.
+///
+/// A converge re-dispatches every deferred-region member once per iteration,
+/// and each iteration's records supersede the last — the loop restores the
+/// forward-pass baseline before it goes round again. One converge is therefore
+/// one execution of that transform, which is also the shape the reference
+/// documents for the exported signals: a Transform is one span, covering the
+/// interval it ran for. A dispatcher built fresh per pass instead opened a span
+/// and a `started`/`completed` pair per iteration and restarted every `every:`
+/// cadence at one, so an operator summing `clinker.transform.records` over a
+/// four-iteration converge read four times the rows the run actually carried.
+///
+/// The counts here are replaced per pass rather than added to, so what is
+/// finally reported is the converged pass — the one whose records the run
+/// published. Nothing is emitted until [`Self::close`], because until the loop
+/// stops widening there is no way to know which pass that is.
+pub(crate) struct TransformSignalCarry {
+    /// Cloned from the plan so the close can emit `after` directives without
+    /// borrowing a payload the executor has moved on from. One clone per
+    /// transform per converge, of a list an author wrote by hand.
+    directives: Vec<LogDirective>,
+    cadence: Vec<u64>,
+    execution_id: Box<str>,
+    batch_id: Box<str>,
+    pipeline_name: Box<str>,
+    logical_node: Box<str>,
+    started_at_unix_nanos: u64,
+    records: u64,
+    errors: u64,
+    saw_error: bool,
+}
+
+impl TransformSignalCarry {
+    /// Report the converged execution: one start, the last pass's counts, one
+    /// completion, and one span covering the whole converge.
+    pub(crate) fn close(self, producer: &TelemetryProducer) {
+        let correlation = RunCorrelation {
+            execution_id: &*self.execution_id,
+            batch_id: &*self.batch_id,
+            pipeline_name: &*self.pipeline_name,
+        };
+        producer.record_metric(MetricKey::TransformStarted, 1);
+        if self.records > 0 {
+            producer.record_metric(MetricKey::TransformRecords, self.records);
+        }
+        if self.errors > 0 {
+            producer.record_metric(MetricKey::TransformErrors, self.errors);
+        }
+        for directive in &self.directives {
+            if directive.when == LogTiming::AfterTransform {
+                emit_directive(producer, directive, correlation, None);
+            }
+        }
+        producer.record_metric(MetricKey::TransformCompleted, 1);
+        let ended_at_unix_nanos = unix_nanos_now().max(self.started_at_unix_nanos);
+        let _ = producer.emit_span(SpanFact {
+            name: SpanName::Transform,
+            status: if self.saw_error {
+                SpanStatus::Error
+            } else {
+                SpanStatus::Ok
+            },
+            logical_node: &self.logical_node,
+            started_at_unix_nanos: self.started_at_unix_nanos,
+            ended_at_unix_nanos,
+        });
+    }
+}
+
+/// Counts a converge pass accumulates instead of reporting.
+struct DeferredPass {
+    records: u64,
+    errors: u64,
+    /// Whether this is the converge's first pass over the transform. The
+    /// `before` directive and the span's start belong to that one.
+    first_pass: bool,
+}
+
 struct EnabledDispatcher<'a> {
     producer: TelemetryProducer,
     directives: &'a [LogDirective],
     cadence: Vec<u64>,
+    /// `Some` while this dispatch is one pass of a cascading-retract converge,
+    /// which may run again. Its counts are carried rather than reported, and
+    /// the span stays open until the converge stops.
+    deferred: Option<DeferredPass>,
     /// Compiled `condition` gate per directive, parallel to `directives` and
     /// `cadence`. `None` where the directive declared no condition.
     gates: Vec<Option<ProgramEvaluator>>,
@@ -67,10 +150,55 @@ impl<'a> LogDispatcher<'a> {
         conditions: &[Option<Arc<TypedProgram>>],
         context: TransformSignalContext<'_>,
     ) -> Self {
+        Self::build(producer, directives, conditions, context, None, false)
+    }
+
+    /// A dispatcher for one pass of a cascading-retract converge, resuming
+    /// `carry` when the converge has already passed over this transform.
+    ///
+    /// Everything that describes the execution as a whole — the span, the
+    /// `started`/`completed` pair, the record and error counts, and each
+    /// directive's `every:` cadence — belongs to the converge rather than to
+    /// the pass, so it is carried out again by [`Self::into_carry`] and
+    /// reported once the loop stops.
+    pub(crate) fn deferred(
+        producer: Option<TelemetryProducer>,
+        directives: &'a [LogDirective],
+        conditions: &[Option<Arc<TypedProgram>>],
+        context: TransformSignalContext<'_>,
+        carry: Option<TransformSignalCarry>,
+    ) -> Self {
+        Self::build(producer, directives, conditions, context, carry, true)
+    }
+
+    fn build(
+        producer: Option<TelemetryProducer>,
+        directives: &'a [LogDirective],
+        conditions: &[Option<Arc<TypedProgram>>],
+        context: TransformSignalContext<'_>,
+        carry: Option<TransformSignalCarry>,
+        defer: bool,
+    ) -> Self {
+        // A carry from an earlier pass was built against the same plan node, so
+        // its cadence is already the right length; a pass that is the first one
+        // starts every directive at zero.
+        let resumed = carry.filter(|carry| carry.cadence.len() == directives.len());
         let enabled = producer.map(|producer| EnabledDispatcher {
             producer,
             directives,
-            cadence: vec![0; directives.len()],
+            // Counts start at zero on every pass: a pass replaces the one
+            // before it rather than adding to it, which is what keeps the
+            // reported figure the converged execution's and not a multiple of
+            // it. `saw_error` is the exception and latches, because a record
+            // that failed on any pass is a fact about the execution.
+            deferred: defer.then(|| DeferredPass {
+                records: 0,
+                errors: 0,
+                first_pass: resumed.is_none(),
+            }),
+            cadence: resumed
+                .as_ref()
+                .map_or_else(|| vec![0; directives.len()], |carry| carry.cadence.clone()),
             // Indexed by directive position, so it is built to that length
             // rather than from `conditions` directly. Lowering already refuses
             // to emit a node whose gate set is short, so a missing slot cannot
@@ -93,17 +221,57 @@ impl<'a> LogDispatcher<'a> {
             batch_id: bounded_correlation(context.batch_id),
             pipeline_name: bounded_correlation(context.pipeline_name),
             logical_node: bounded_correlation(context.logical_node),
-            started_at_unix_nanos: unix_nanos_now(),
-            saw_error: false,
+            started_at_unix_nanos: resumed
+                .as_ref()
+                .map_or_else(unix_nanos_now, |carry| carry.started_at_unix_nanos),
+            saw_error: resumed.as_ref().is_some_and(|carry| carry.saw_error),
             closed: false,
         });
         Self { enabled }
+    }
+
+    /// Hand this pass's state back to the converge, leaving the span open.
+    ///
+    /// Returns `None` when telemetry is disabled or this dispatch was not a
+    /// converge pass, in which case the dispatcher has already reported
+    /// everything it had.
+    pub(crate) fn into_carry(mut self) -> Option<TransformSignalCarry> {
+        let enabled = self.enabled.as_mut()?;
+        let pass = enabled.deferred.take()?;
+        // The span belongs to the converge, so this dispatcher must not close
+        // one on the way out. `Drop` closes an unclosed span with an error
+        // status, which is right for a dispatch that unwound and wrong for one
+        // that is being handed on.
+        enabled.closed = true;
+        Some(TransformSignalCarry {
+            directives: enabled.directives.to_vec(),
+            cadence: enabled.cadence.clone(),
+            execution_id: enabled.execution_id.clone(),
+            batch_id: enabled.batch_id.clone(),
+            pipeline_name: enabled.pipeline_name.clone(),
+            logical_node: enabled.logical_node.clone(),
+            started_at_unix_nanos: enabled.started_at_unix_nanos,
+            records: pass.records,
+            errors: pass.errors,
+            saw_error: enabled.saw_error,
+        })
     }
 
     pub(crate) fn fire_before_transform(&mut self) {
         let Some(enabled) = self.enabled.as_mut() else {
             return;
         };
+        match enabled.deferred.as_ref() {
+            // A converge that has already passed over this transform has begun
+            // once and started once; a second `before` event and a second
+            // `started` would describe a beginning that never happened.
+            Some(pass) if !pass.first_pass => return,
+            Some(_) => {
+                enabled.emit_timing(LogTiming::BeforeTransform, None);
+                return;
+            }
+            None => {}
+        }
         enabled
             .producer
             .record_metric(MetricKey::TransformStarted, 1);
@@ -133,9 +301,12 @@ impl<'a> LogDispatcher<'a> {
         let Some(enabled) = self.enabled.as_mut() else {
             return;
         };
-        enabled
-            .producer
-            .record_metric(MetricKey::TransformRecords, 1);
+        match enabled.deferred.as_mut() {
+            Some(pass) => pass.records = pass.records.saturating_add(1),
+            None => enabled
+                .producer
+                .record_metric(MetricKey::TransformRecords, 1),
+        }
         for (index, directive) in enabled.directives.iter().enumerate() {
             if directive.when != LogTiming::PerRecord {
                 continue;
@@ -163,9 +334,16 @@ impl<'a> LogDispatcher<'a> {
             return;
         };
         enabled.saw_error = true;
-        enabled
-            .producer
-            .record_metric(MetricKey::TransformErrors, 1);
+        match enabled.deferred.as_mut() {
+            Some(pass) => pass.errors = pass.errors.saturating_add(1),
+            None => enabled
+                .producer
+                .record_metric(MetricKey::TransformErrors, 1),
+        }
+        // Fired on the pass that saw it, on every pass that sees it. An error
+        // event is an observation of a record rather than a summary of the
+        // execution, and a converge that keeps failing the same record is
+        // reporting a condition that keeps holding.
         enabled.emit_timing(LogTiming::OnError, Some(record));
     }
 
@@ -176,6 +354,13 @@ impl<'a> LogDispatcher<'a> {
         let Some(enabled) = self.enabled.as_mut() else {
             return;
         };
+        // A converge pass finishing is not the transform finishing: the loop
+        // may restore the baseline and run it again. What this pass has is
+        // carried out by `into_carry` and reported once, by
+        // `TransformSignalCarry::close`.
+        if enabled.deferred.is_some() {
+            return;
+        }
         enabled.emit_timing(LogTiming::AfterTransform, None);
         enabled
             .producer
@@ -198,30 +383,15 @@ impl EnabledDispatcher<'_> {
     }
 
     fn emit(&self, directive: &LogDirective, record: Option<&Record>) {
-        // Ask before reading the record. Sampling is decided from the event's
-        // identity and its lane alone, so at `every: 1` under a policy sampling
-        // one record in a hundred, this is what keeps the other ninety-nine
-        // from being read field by field to build a signal with nowhere to go.
-        // The producer has already counted a refusal under its own reason and
-        // lane, so there is nothing to report here.
-        let severity = severity(directive.level);
-        let Ok(ticket) = self.producer.peek_log(&directive.name, severity) else {
-            return;
-        };
-        let fields = gather_fields(directive.fields.as_deref().unwrap_or_default(), record);
-        let _ = self.producer.commit_log(
-            ticket,
-            LogEvent {
-                event: &directive.name,
-                severity,
-                message: &directive.message,
-                correlation: RunCorrelation {
-                    execution_id: &self.execution_id,
-                    batch_id: &self.batch_id,
-                    pipeline_name: &self.pipeline_name,
-                },
-                fields: &fields,
+        emit_directive(
+            &self.producer,
+            directive,
+            RunCorrelation {
+                execution_id: &self.execution_id,
+                batch_id: &self.batch_id,
+                pipeline_name: &self.pipeline_name,
             },
+            record,
         );
     }
 
@@ -260,11 +430,59 @@ thread_local! {
     static FIELD_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Publish one authored directive as a log signal.
+///
+/// Shared by the live dispatcher and by the converge's deferred close, so an
+/// `after` event reads the same whichever of the two emitted it.
+fn emit_directive(
+    producer: &TelemetryProducer,
+    directive: &LogDirective,
+    correlation: RunCorrelation<&str>,
+    record: Option<&Record>,
+) {
+    // Ask before reading the record. Sampling is decided from the event's
+    // identity and its lane alone, so at `every: 1` under a policy sampling
+    // one record in a hundred, this is what keeps the other ninety-nine
+    // from being read field by field to build a signal with nowhere to go.
+    // The producer has already counted a refusal under its own reason and
+    // lane, so there is nothing to report here.
+    let severity = severity(directive.level);
+    let Ok(ticket) = producer.peek_log(&directive.name, severity) else {
+        return;
+    };
+    let fields = gather_fields(
+        producer,
+        directive.fields.as_deref().unwrap_or_default(),
+        record,
+    );
+    let _ = producer.commit_log(
+        ticket,
+        LogEvent {
+            event: &directive.name,
+            severity,
+            message: &directive.message,
+            correlation,
+            fields: &fields,
+        },
+    );
+}
+
 /// Read the values a directive asked for out of the record it fired on.
 ///
 /// Timing directives fire without a record and request nothing from one, so
 /// they gather no fields.
-fn gather_fields<'a>(requested: &'a [String], record: Option<&'a Record>) -> Vec<SignalField<'a>> {
+///
+/// A field the record does not carry is counted rather than passed over.
+/// `fields` is the only channel by which record data reaches an event, so a
+/// selector that matches nothing publishes an event with no attributes at all —
+/// which reads exactly like a run where the condition never held. The count is
+/// a backstop for a mistake that is decidable when the pipeline compiles; see
+/// [`TelemetryProducer::record_missing_field`].
+fn gather_fields<'a>(
+    producer: &TelemetryProducer,
+    requested: &'a [String],
+    record: Option<&'a Record>,
+) -> Vec<SignalField<'a>> {
     let Some(record) = record else {
         return Vec::new();
     };
@@ -272,8 +490,9 @@ fn gather_fields<'a>(requested: &'a [String], record: Option<&'a Record>) -> Vec
     for field in requested {
         #[cfg(test)]
         FIELD_LOOKUPS.with(|count| count.set(count.get().saturating_add(1)));
-        if let Some(value) = record.get(field) {
-            fields.push(SignalField::from_record(field, value));
+        match record.get(field) {
+            Some(value) => fields.push(SignalField::from_record(field, value)),
+            None => producer.record_missing_field(),
         }
     }
     fields
@@ -626,6 +845,202 @@ action = "allow"
             vec!["0".to_string(), "4".to_string(), "8".to_string()],
             "the records that were read are the ones sampling chose"
         );
+    }
+
+    /// Run one converge pass over `amounts`, resuming `carry`, and hand the
+    /// converge's state back.
+    fn converge_pass(
+        producer: &crate::telemetry::TelemetryProducer,
+        directives: &[clinker_plan::config::LogDirective],
+        conditions: &[Option<Arc<cxl::typecheck::TypedProgram>>],
+        carry: Option<super::TransformSignalCarry>,
+        amounts: &[i64],
+    ) -> super::TransformSignalCarry {
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let stable = StableEvalContext::test_default();
+        let eval_ctx = EvalContext::test_default_borrowed(&stable);
+        let mut dispatcher = LogDispatcher::deferred(
+            Some(producer.clone()),
+            directives,
+            conditions,
+            TransformSignalContext {
+                execution_id: "exec",
+                batch_id: "batch",
+                pipeline_name: "gate_runtime",
+                logical_node: "observe",
+            },
+            carry,
+        );
+        dispatcher.fire_before_transform();
+        for amount in amounts {
+            let record = Record::new(Arc::clone(&schema), vec![Value::Integer(*amount)]);
+            dispatcher.fire_per_record(&record, &eval_ctx);
+        }
+        dispatcher.finish();
+        dispatcher
+            .into_carry()
+            .expect("a converge pass hands its state back")
+    }
+
+    /// A converge is one execution of the transform, and has to report as one.
+    ///
+    /// The cascading-retract loop re-dispatches every deferred-region member
+    /// once per iteration and keeps only the converged result. A dispatcher
+    /// built fresh per pass opened a span and a `started`/`completed` pair per
+    /// iteration and counted every pass's records, so an operator summing
+    /// `clinker.transform.records` over a three-iteration converge read three
+    /// times the rows the run carried — and the counters are monotonic sums, so
+    /// there is nothing downstream that could have told the difference.
+    #[test]
+    fn a_converge_reports_one_execution_with_counts_an_operator_can_sum() {
+        let (directives, conditions) = compiled_directives(None);
+        let (producer, receiver) =
+            TelemetryArena::reserve(&telemetry_policy()).expect("arena reserves");
+
+        // Three passes over a shrinking record set: the retract loop takes rows
+        // out as it converges, and the last pass is the one whose records the
+        // run published.
+        let mut carry = converge_pass(&producer, &directives, &conditions, None, &[1, 2, 3, 4]);
+        carry = converge_pass(&producer, &directives, &conditions, Some(carry), &[1, 2, 3]);
+        carry = converge_pass(&producer, &directives, &conditions, Some(carry), &[1, 2]);
+        carry.close(&producer);
+
+        let mut started = 0;
+        let mut completed = 0;
+        let mut records = 0;
+        let mut spans = 0;
+        while let Some(batch) = receiver.try_recv_batch() {
+            started += batch.metric(crate::telemetry::MetricKey::TransformStarted);
+            completed += batch.metric(crate::telemetry::MetricKey::TransformCompleted);
+            records += batch.metric(crate::telemetry::MetricKey::TransformRecords);
+            spans += batch.traces().len();
+        }
+
+        assert_eq!(started, 1, "a converge begins once");
+        assert_eq!(completed, 1, "and finishes once");
+        assert_eq!(spans, 1, "one Transform is one span, as the reference says");
+        assert_eq!(
+            records, 2,
+            "the reported rows are the converged pass's, not every pass's added together"
+        );
+    }
+
+    /// The `every:` cadence belongs to the converge, not to the pass.
+    ///
+    /// Rebuilding the dispatcher per iteration restarted it at one, so a
+    /// directive throttled to one record in three fired on the first record of
+    /// every pass — the cadence an author configured silently became denser the
+    /// more the loop had to converge.
+    #[test]
+    fn a_cadence_does_not_restart_when_the_converge_goes_round_again() {
+        let (mut directives, conditions) = compiled_directives(None);
+        directives[0].every = Some(3);
+        let (producer, receiver) =
+            TelemetryArena::reserve(&telemetry_policy()).expect("arena reserves");
+
+        let carry = converge_pass(&producer, &directives, &conditions, None, &[10, 11, 12, 13]);
+        let carry = converge_pass(
+            &producer,
+            &directives,
+            &conditions,
+            Some(carry),
+            &[20, 21, 22],
+        );
+        carry.close(&producer);
+
+        let mut seen = Vec::new();
+        while let Some(batch) = receiver.try_recv_batch() {
+            for log in batch.logs() {
+                if let Some(amount) = log.fields.get("amount") {
+                    seen.push(amount.clone());
+                }
+            }
+        }
+        assert_eq!(
+            seen,
+            vec!["10".to_string(), "13".to_string(), "22".to_string()],
+            "the second pass continues the count the first left off at; \
+             restarting it would have fired on 20"
+        );
+    }
+
+    /// A field name the upstream row does not carry publishes an event with
+    /// nothing in it. `fields` is the only channel by which record data reaches
+    /// an event, so a misspelling is the difference between an observation and
+    /// an empty one — and it looked exactly like a run where the condition
+    /// never held.
+    #[test]
+    fn a_requested_field_the_record_does_not_carry_is_counted() {
+        let (directives, conditions) = compiled_directives(None);
+        let (producer, receiver) =
+            TelemetryArena::reserve(&telemetry_policy()).expect("arena reserves");
+        let observer = producer.clone();
+        // The directive asks for `amount`; this row spells it `amount_total`.
+        let schema = Arc::new(Schema::new(vec!["amount_total".into()]));
+        let stable = StableEvalContext::test_default();
+        let eval_ctx = EvalContext::test_default_borrowed(&stable);
+
+        {
+            let mut dispatcher = LogDispatcher::new(
+                Some(producer),
+                &directives,
+                &conditions,
+                TransformSignalContext {
+                    execution_id: "exec",
+                    batch_id: "batch",
+                    pipeline_name: "gate_runtime",
+                    logical_node: "observe",
+                },
+            );
+            let record = Record::new(Arc::clone(&schema), vec![Value::Integer(7)]);
+            dispatcher.fire_per_record(&record, &eval_ctx);
+        }
+
+        assert_eq!(
+            observer.snapshot().missing_field_drops,
+            1,
+            "a selector that matches nothing must not pass unremarked"
+        );
+        let batch = receiver
+            .try_recv_batch()
+            .expect("the event itself is still admitted");
+        assert!(
+            batch.logs()[0].fields.is_empty(),
+            "which is the whole problem: {:?}",
+            batch.logs()[0]
+        );
+    }
+
+    /// The other half of the distinction: a field the record does carry is not
+    /// counted as missing. Without this the test above would pass on a
+    /// dispatcher that counted every requested field.
+    #[test]
+    fn a_requested_field_the_record_carries_is_not_counted_as_missing() {
+        let (directives, conditions) = compiled_directives(None);
+        let (producer, _receiver) =
+            TelemetryArena::reserve(&telemetry_policy()).expect("arena reserves");
+        let observer = producer.clone();
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let stable = StableEvalContext::test_default();
+        let eval_ctx = EvalContext::test_default_borrowed(&stable);
+
+        {
+            let mut dispatcher = LogDispatcher::new(
+                Some(producer),
+                &directives,
+                &conditions,
+                TransformSignalContext {
+                    execution_id: "exec",
+                    batch_id: "batch",
+                    pipeline_name: "gate_runtime",
+                    logical_node: "observe",
+                },
+            );
+            let record = Record::new(Arc::clone(&schema), vec![Value::Integer(7)]);
+            dispatcher.fire_per_record(&record, &eval_ctx);
+        }
+
+        assert_eq!(observer.snapshot().missing_field_drops, 0);
     }
 
     /// The capability itself: an authored gate must actually suppress the

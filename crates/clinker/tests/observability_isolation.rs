@@ -432,12 +432,17 @@ fn arena_admission_loss_reaches_the_machine_terminal_and_standard_error() {
         BTreeSet::from([
             "accepted",
             "capacity_bytes",
+            "counts_complete",
             "dropped",
             "fields",
             "lanes",
             "peak_retained_bytes",
             "retained_bytes",
         ])
+    );
+    assert_eq!(
+        admission["counts_complete"], true,
+        "this run's flush completed, so its counters are a final accounting"
     );
     let dropped = admission["dropped"].as_object().expect("drop reasons");
     assert_eq!(
@@ -546,6 +551,95 @@ fn a_run_that_dropped_nothing_prints_no_admission_line() {
     assert!(
         !diagnostic.contains("telemetry admission outcome"),
         "a run with no admission loss must stay silent: {diagnostic}"
+    );
+}
+
+/// Counts read while the exporter is still draining are marked as such.
+///
+/// A collector slower than `flush_timeout_ms` makes `finish` expire on its
+/// deadline and detach the worker rather than join it — the bound on a
+/// finishing run is not negotiable against an unresponsive collector. The
+/// arena read that follows therefore lands mid-drain, and `undecodable` is
+/// credited by the receiver as it drains, so the numbers vary run to run. The
+/// admission counters exist so a truncated view stops looking complete, which
+/// a partial read reporting itself as final would defeat: a supervisor must be
+/// able to tell "nothing was lost" from "we could not finish counting".
+#[test]
+fn admission_counts_read_before_the_drain_finished_are_not_reported_as_final() {
+    let root = fixture();
+    write_pipeline(root.path(), "./private/output/customers.csv");
+    write_observability_policy(
+        root.path(),
+        "https://collector.example.com",
+        "mode = \"none\"",
+    );
+    let capture = root.path().join("otlp.ndjson");
+
+    // The complete case first, so the flag below is read against a run that
+    // does report a final accounting.
+    let complete = invoke(root.path(), &capture, false);
+    assert!(
+        complete.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&complete.stderr)
+    );
+    let terminal = machine_events(&complete)
+        .last()
+        .cloned()
+        .expect("machine terminal");
+    assert_eq!(terminal["observability"]["flush_complete"], true);
+    assert_eq!(
+        terminal["observability"]["admission"]["counts_complete"], true,
+        "a joined worker leaves nothing to credit: {terminal:#?}"
+    );
+
+    let held = Command::new(clinker_bin())
+        .current_dir(root.path())
+        .env("CLINKER_TEST_OTLP_OUTCOME", "success")
+        .env("CLINKER_TEST_OTLP_CAPTURE", &capture)
+        // Longer than the policy's 500 ms flush timeout, so the deadline
+        // expires and the worker is detached mid-drain.
+        .env("CLINKER_TEST_OTLP_FLUSH_HOLD_MS", "5000")
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "telemetry-bulkhead",
+        ])
+        .output()
+        .expect("run clinker");
+    assert!(
+        held.status.success(),
+        "an unresponsive collector never fails the run: stderr: {}",
+        String::from_utf8_lossy(&held.stderr)
+    );
+    let terminal = machine_events(&held)
+        .last()
+        .cloned()
+        .expect("machine terminal");
+    assert_eq!(
+        terminal["observability"]["flush_complete"], false,
+        "{terminal:#?}"
+    );
+    assert_eq!(
+        terminal["observability"]["admission"]["counts_complete"], false,
+        "counts sampled from an arena a detached worker is still draining are \
+         not a final accounting: {terminal:#?}"
+    );
+
+    // And the stderr line, which is the only place a run without --machine
+    // ever hears about this, is not suppressed by counters that happen to read
+    // as all-zero because the counting stopped early.
+    let diagnostic = String::from_utf8_lossy(&held.stderr);
+    assert!(
+        diagnostic.contains("clinker: telemetry admission outcome: accepted="),
+        "an incomplete count is reported however it reads: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("counts_complete=false"),
+        "the line says which of the two it is: {diagnostic}"
     );
 }
 

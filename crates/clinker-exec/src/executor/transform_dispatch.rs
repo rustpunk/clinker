@@ -199,18 +199,35 @@ where
     // Inside a composition body `name` is body-local: two call sites of one
     // composition run the same names through the same telemetry producer, so
     // the exported identity is the call-site path, not the bare name.
-    let logical_node = ctx.qualified_node_name(name);
-    let mut signals = LogDispatcher::new(
-        ctx.telemetry_producer.clone(),
-        &payload.log,
-        &payload.log_conditions,
-        TransformSignalContext {
-            execution_id: &ctx.stable.pipeline_execution_id,
-            batch_id: &ctx.stable.pipeline_batch_id,
-            pipeline_name: &ctx.stable.pipeline_name,
-            logical_node: &logical_node,
-        },
-    );
+    let logical_node = ctx.qualified_node_name(name).into_owned();
+    // A commit-pass dispatch is one pass of a converge that may run this
+    // transform again, so its signals belong to the converge rather than to the
+    // pass. The state is taken out here and handed back below; the orchestrator
+    // reports it once, after the loop stops.
+    let signal_context = TransformSignalContext {
+        execution_id: &ctx.stable.pipeline_execution_id,
+        batch_id: &ctx.stable.pipeline_batch_id,
+        pipeline_name: &ctx.stable.pipeline_name,
+        logical_node: &logical_node,
+    };
+    let deferred_pass = ctx.in_deferred_dispatch;
+    let mut signals = if deferred_pass {
+        let carry = ctx.transform_signal_carry.remove(&logical_node);
+        LogDispatcher::deferred(
+            ctx.telemetry_producer.clone(),
+            &payload.log,
+            &payload.log_conditions,
+            signal_context,
+            carry,
+        )
+    } else {
+        LogDispatcher::new(
+            ctx.telemetry_producer.clone(),
+            &payload.log,
+            &payload.log_conditions,
+            signal_context,
+        )
+    };
     signals.fire_before_transform();
 
     let expected_input = current_dag.graph[node_idx]
@@ -424,6 +441,9 @@ where
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
     signals.finish();
+    if let Some(carry) = signals.into_carry() {
+        ctx.transform_signal_carry.insert(logical_node, carry);
+    }
 
     Ok(())
 }

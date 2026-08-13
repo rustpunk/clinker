@@ -60,6 +60,19 @@ artifact count, and counts by artifact state. Every NDJSON record, including a
 maximum-cardinality inventory chunk and its terminal summary, is at most 16
 KiB.
 
+One invocation that reaches a terminal without running an attempt is
+supported: the plan-only `--lineage <FILE>` export, which preflights the
+identity policy, writes its document, and returns before any data is read. It
+shares this stream's `execution_id` and `batch_id`, so the exported document is
+correlatable with the invocation that produced it, and it closes with
+`completed` / `success` / exit `0` carrying an explicit *empty* publication —
+zero artifacts, every state count zero, no cleanup debt. An absent inventory
+would be read on that row as publication complete for a run that published
+nothing; an empty one says the same thing the reconciliation table already has
+vocabulary for. Modes that write their own document to standard output —
+`--explain`, `--dry-run`, `-n`, `--lineage -`, `--lineage-events -` — are
+refused at admission with exit `1` before any record is written.
+
 After plan resolution, Clinker starts the required machine-progress worker
 before source discovery, staging, attempt creation, sink writes, or lifecycle
 START. If that worker cannot be created, the stream ends with exactly one
@@ -92,6 +105,19 @@ advice without requiring the parent to parse rendered diagnostics. EOF alone
 never proves success. A control-pipe failure can prevent terminal delivery, so
 even an otherwise plausible exit remains incomplete without matching terminal
 evidence.
+
+That is also why a failed terminal delivery is never reported as a transient
+runtime fault. When a run has published and only the terminal saying so cannot
+be written, a retried terminal that does get through reports exit `4` with
+`infrastructure.delivery.unreportable_outcome` and `policy_required` — never
+`retry_with_backoff` — and carries the publication the refused terminal
+carried. The failure is on the reporting channel, not in execution: the finals
+are visible, the lineage and OTLP terminals for the same run recorded its
+completion, and re-running the batch would duplicate published data. A
+supervisor reconciles it as a failure whose artifact evidence is complete and
+whose repetition is a policy decision, not an automatic one. When neither
+terminal reaches the stream the attempt is incomplete by the table above, which
+is the same reconciliation it always was.
 
 The terminal family follows the exit code, and the `completed` family covers
 only exit `0` and exit `2`. Any other non-cancellation exit is written as a

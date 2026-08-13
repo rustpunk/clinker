@@ -84,6 +84,13 @@ period and only when the lock is acquirable, proving that no live publisher owns
 it. If reservation cleanup fails after successful publication, Clinker exits
 `4` and names both the visible final and stale reservation as cleanup debt.
 
+When `unique_suffix` can find no name at all because the destination itself
+refuses every candidate — the directory is not writable by this run — the
+diagnostic names the path you wrote, not the numbered candidate the search
+happened to stop on, and says that the destination rather than the name is what
+refused. Fix the directory's permissions, or point `path:` somewhere this run
+may write.
+
 Rendered fan-out paths are validated as new output paths. Directory traversal,
 an absolute result produced from a relative template, symbolic-link/reparse
 ancestors, and cross-filesystem promotion fail before a final is touched. Create

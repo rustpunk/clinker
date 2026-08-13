@@ -193,6 +193,7 @@ failure_registry! {
     "admission.configuration.policy_required", Configuration, PolicyRequired, "deployment policy is required before execution";
     "infrastructure.runtime.transient", Infrastructure, RetryWithBackoff, "temporary runtime infrastructure failure";
     "infrastructure.runtime.source_unavailable", Infrastructure, RetryWithBackoff, "source infrastructure is temporarily unavailable";
+    "infrastructure.delivery.unreportable_outcome", Infrastructure, PolicyRequired, "run outcome could not be reported after publication";
     "attempt.publication.registration_failed", Publication, PolicyRequired, "attempt artifact registration failed";
     "attempt.publication.finalization_failed", Publication, RetryWithBackoff, "attempt artifact finalization failed";
     "attempt.publication.manifest_failed", Publication, RetryWithBackoff, "attempt manifest persistence failed";

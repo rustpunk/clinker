@@ -75,6 +75,17 @@ pub(crate) struct SignalSummary {
 /// nothing.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub(crate) struct AdmissionSummary {
+    /// Whether the counters below are a final accounting.
+    ///
+    /// They are read from the producer's arena, and the arena keeps changing
+    /// while the export worker drains it — `undecodable` is credited at drain.
+    /// A flush that expired on its deadline detaches that worker rather than
+    /// joining it, so the read that follows lands mid-drain and varies run to
+    /// run. These counters exist so a truncated view stops looking complete,
+    /// which a partial read reporting itself as final would defeat: a
+    /// supervisor must be able to tell "nothing was lost" from "we could not
+    /// finish counting".
+    pub(crate) counts_complete: bool,
     /// Logs and spans the arena took. Metric points are coalesced into fixed
     /// counters rather than admitted as signals, so none are counted here.
     pub(crate) accepted: u64,
@@ -147,8 +158,15 @@ pub(crate) struct FieldPolicyCounts {
 }
 
 impl AdmissionSummary {
-    pub(crate) fn from_arena(snapshot: ArenaSnapshot) -> Self {
+    /// Read the arena's accounting, marked with whether it can still change.
+    ///
+    /// `counts_complete` is the flush's own completeness: a flush that ran to
+    /// completion joined the worker, so nothing is left to credit and the
+    /// numbers are final. One that expired abandoned a worker that is still
+    /// draining, and every counter below is whatever it had reached.
+    pub(crate) fn from_arena(snapshot: ArenaSnapshot, counts_complete: bool) -> Self {
         Self {
+            counts_complete,
             accepted: snapshot.accepted,
             dropped: AdmissionDrops {
                 sampled: snapshot.sampled_drops,
@@ -594,6 +612,24 @@ enum WorkerCommand {
     Drain,
 }
 
+/// Hold the final flush past its deadline, standing in for a collector slower
+/// than `flush_timeout_ms`.
+///
+/// The real condition needs a collector that accepts a connection and then
+/// does not answer, which no offline test has. Holding the worker here reaches
+/// the same branch — the flush deadline expires, `finish` detaches the worker,
+/// and the arena is read while that worker is still draining it.
+#[cfg(debug_assertions)]
+fn injected_flush_hold() {
+    let Some(millis) = std::env::var_os("CLINKER_TEST_OTLP_FLUSH_HOLD_MS") else {
+        return;
+    };
+    let Ok(millis) = millis.to_string_lossy().parse::<u64>() else {
+        return;
+    };
+    thread::sleep(Duration::from_millis(millis));
+}
+
 /// One finite run's sole telemetry receiver and blocking exporter worker.
 pub(crate) struct OtlpWorker {
     command: mpsc::SyncSender<WorkerCommand>,
@@ -660,6 +696,8 @@ impl OtlpWorker {
                     state.drain_available();
                     match commands.recv_timeout(IDLE_POLL) {
                         Ok(WorkerCommand::Finish(snapshot)) => {
+                            #[cfg(debug_assertions)]
+                            injected_flush_hold();
                             state.enter_final_flush();
                             state.drain_available();
                             state.deliver_lifecycle(snapshot.as_ref());

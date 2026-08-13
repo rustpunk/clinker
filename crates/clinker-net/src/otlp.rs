@@ -216,7 +216,10 @@ pub struct OtlpDeliveryBudget {
 pub struct OtlpDeliveryBounds {
     /// Largest request body the transport will send.
     pub max_request_bytes: usize,
-    /// Largest response body the transport will read.
+    /// Largest response body the transport will read, inclusive.
+    ///
+    /// A reply of exactly this many bytes is read; one byte more is refused.
+    /// The request cap is inclusive in the same way.
     pub max_response_bytes: u64,
     /// Total attempts, including the first.
     pub max_attempts: u32,
@@ -604,7 +607,15 @@ pub fn send_otlp_json(
                     let body = match response
                         .body_mut()
                         .with_config()
-                        .limit(budget.max_response_bytes)
+                        // One over the cap, so that a reply of exactly the cap
+                        // is admitted. The reader refuses to delegate once its
+                        // allowance is spent and a full read needs one more
+                        // call to see the end of the body, so a limit of N
+                        // rejects N bytes and admits only N-1 — an author who
+                        // sizes this to the largest reply a collector sends
+                        // would have every one of them refused. The request
+                        // side already admits a payload of exactly its cap.
+                        .limit(budget.max_response_bytes.saturating_add(1))
                         .read_to_vec()
                     {
                         Ok(body) => body,
@@ -639,6 +650,28 @@ pub fn send_otlp_json(
                         attempts,
                     });
                 }
+                // The specification defines exactly one success status. 200 is
+                // where a full success and a partial success both arrive, and
+                // its export-service response body is the only place a rejected
+                // count is reported; the other 2xx have no such body to read.
+                //
+                // They are not rejections either. The rule that a status must
+                // not be retried is written about 4xx and 5xx, and the ordinary
+                // HTTP meaning of a 2xx is that the request succeeded — an
+                // ingest gateway fronting a collector answers 202 Accepted with
+                // the batch already taken. Reading that as a permanent refusal
+                // reported every delivered batch as rejected and told a
+                // supervisor a policy change was needed to fix a working
+                // export. With no partial-success body, the whole chunk is
+                // accounted as accepted, which is what the answer says.
+                if (201..300).contains(&status) {
+                    return Ok(OtlpDeliveryOutcome {
+                        signal,
+                        accepted: item_count,
+                        rejected: 0,
+                        attempts,
+                    });
+                }
                 let retry_cause = retryable_status(status);
                 if let Some(cause) = retry_cause {
                     if attempts >= budget.max_attempts {
@@ -661,6 +694,14 @@ pub fn send_otlp_json(
                     signal,
                     OtlpDeliveryFailureKind::CollectorRejected,
                     attempts,
+                ));
+            }
+            Err(error) if peer_may_hold_batch(&error) => {
+                return Err(map_transport_error(
+                    signal,
+                    attempts,
+                    endpoint.https_only,
+                    &error,
                 ));
             }
             Err(error) => match retryable_transport(&error) {
@@ -838,6 +879,53 @@ fn is_reachability_failure(error: &ureq::Error) -> bool {
                 | std::io::ErrorKind::HostUnreachable
                 | std::io::ErrorKind::NetworkDown
                 | std::io::ErrorKind::AddrNotAvailable
+        ),
+        _ => false,
+    }
+}
+
+/// Whether the collector may already hold this batch after `error`.
+///
+/// A 200 whose reply cannot be read is not retried, because the collector has
+/// the batch and a second send would ingest the same log records twice and
+/// count the same monotonic sums twice — wrong rather than merely unconfirmed.
+/// A deadline that expires while the reply is awaited is the same situation
+/// with less information: the request was fully written before anything was
+/// awaited, so the collector may have taken the batch and simply been slow to
+/// say so. Retrying that against a collector whose reply is slower than
+/// `request_timeout` exports every batch once per attempt.
+///
+/// So the question is how far the attempt got, and the answer has to be read
+/// from what a deadline can prove rather than from the phase it is named
+/// after. A deadline outlives its phase: the send limit goes on being checked
+/// while the reply is awaited, and having started earlier it is the one that
+/// runs out first, so a collector that simply never answers is reported as a
+/// send-phase deadline. The name says which limit was reached, not where the
+/// exchange had got to.
+///
+/// What the transport does guarantee is which limits it consults where. The
+/// resolve and connect deadlines are consulted only up to the point where the
+/// request begins to be written and never again once a reply is awaited, and
+/// the await-continue deadline sits between them and the body. Those three can
+/// only expire with the request incomplete, so nothing was delivered. Every
+/// other deadline — both send limits and the whole-attempt one — is still
+/// being consulted during the reply wait, and is treated as possibly
+/// delivered.
+///
+/// That costs a retry to a write that stalled, which was safe to repeat. It is
+/// the direction to be wrong in: an unsent batch reported as a timeout is a
+/// number a supervisor can see, and a batch sent twice is a wrong number
+/// nobody can see.
+///
+/// This is a deadline question only. An I/O failure carries no phase at all:
+/// the same end-of-stream is a collector closing an idle pooled connection
+/// before the request was written, which must stay retryable or one keep-alive
+/// timeout discards a batch.
+fn peer_may_hold_batch(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::Timeout(limit) => !matches!(
+            limit,
+            ureq::Timeout::Resolve | ureq::Timeout::Connect | ureq::Timeout::Await100
         ),
         _ => false,
     }
@@ -1093,7 +1181,7 @@ pub(crate) fn admitted_loopback_endpoint(address: SocketAddr) -> AdmittedOtlpEnd
 
 #[cfg(test)]
 mod classification {
-    use super::{is_tls_endpoint_mismatch, retryable_transport};
+    use super::{is_tls_endpoint_mismatch, peer_may_hold_batch, retryable_transport};
     use std::io::{Error as IoError, ErrorKind};
 
     fn io(kind: ErrorKind) -> ureq::Error {
@@ -1208,6 +1296,69 @@ mod classification {
             assert!(
                 !is_tls_endpoint_mismatch(&io(kind), true),
                 "{kind:?} describes reaching the peer, not what it is"
+            );
+        }
+    }
+
+    /// The connection deadlines stop being consulted once the request starts
+    /// going out, so reaching one proves the request was never finished and
+    /// nothing was delivered. A collector slow to accept a connection must not
+    /// cost the batch its remaining attempts.
+    #[test]
+    fn a_deadline_that_can_only_expire_before_the_request_leaves_nothing_behind() {
+        for limit in [
+            ureq::Timeout::Resolve,
+            ureq::Timeout::Connect,
+            ureq::Timeout::Await100,
+        ] {
+            let error = ureq::Error::Timeout(limit);
+            assert!(
+                !peer_may_hold_batch(&error),
+                "{limit:?} is not consulted once a reply is awaited"
+            );
+            assert!(
+                retryable_transport(&error).is_some(),
+                "{limit:?} delivered nothing, so another attempt is free to try"
+            );
+        }
+    }
+
+    /// The send deadlines go on being consulted while the reply is awaited, and
+    /// having started earlier they are what a collector that never answers
+    /// reports — the same spelling as a write that stalled. Neither they nor
+    /// the whole-attempt deadline can show the request was unfinished, so a
+    /// second send might ingest the same records twice.
+    #[test]
+    fn a_deadline_the_reply_wait_can_reach_may_leave_the_batch_behind() {
+        for limit in [
+            ureq::Timeout::SendRequest,
+            ureq::Timeout::SendBody,
+            ureq::Timeout::RecvResponse,
+            ureq::Timeout::RecvBody,
+            ureq::Timeout::Global,
+            ureq::Timeout::PerCall,
+        ] {
+            assert!(
+                peer_may_hold_batch(&ureq::Error::Timeout(limit)),
+                "{limit:?} cannot rule out a collector that already has the batch"
+            );
+        }
+    }
+
+    /// An I/O failure names no phase, and the same end-of-stream is a pooled
+    /// connection closed while idle — before anything was written. Judging
+    /// those as possibly-delivered would discard batches a retry recovers.
+    #[test]
+    fn an_io_failure_names_no_phase_and_is_left_to_the_retry_budget() {
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionRefused,
+        ] {
+            assert!(
+                !peer_may_hold_batch(&io(kind)),
+                "{kind:?} carries no evidence about how far the exchange got"
             );
         }
     }

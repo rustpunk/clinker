@@ -363,8 +363,15 @@ fn walk_scope(
                         .identities
                         .and_then(|context| context.require(&node_key).ok())
                     {
+                        // Unioned, not assigned: two Source nodes may be bound to
+                        // one external dataset — two shards of one collection —
+                        // and `inputs` holds that dataset once, so the entry has
+                        // to carry every node's authorized facts rather than the
+                        // last one walked.
                         sink.input_identity_facets
-                            .insert(base.clone(), binding.facets());
+                            .entry(base.clone())
+                            .or_default()
+                            .merge(binding.facets());
                     }
                     // A multi-record flat file holds several record types, each
                     // with its own columns, in one physical container. Differing
@@ -2162,9 +2169,9 @@ fn add_doc_influence(
 // Output facet assembly
 // ---------------------------------------------------------------------------
 
-/// Accumulator for one sink dataset: its per-column DIRECT terminals and
-/// whole-dataset INDIRECT influences, merged across every Output node that
-/// resolves to the same dataset.
+/// Accumulator for one sink dataset: its authorized identity facts, per-column
+/// DIRECT terminals, and whole-dataset INDIRECT influences, merged across every
+/// Output node that resolves to the same dataset.
 struct OutputAcc {
     dataset: DatasetId,
     identity_facets: DatasetIdentityFacets,
@@ -2200,8 +2207,9 @@ impl OutputAcc {
     }
 }
 
-/// Accumulate one Output node's DIRECT columns and INDIRECT influences into the
-/// sink dataset's entry, unioning with any prior Output node naming it.
+/// Accumulate one Output node's DIRECT columns, INDIRECT influences, and
+/// authorized identity facts into the sink dataset's entry, unioning with any
+/// prior Output node naming it.
 fn record_output(
     acc: &mut Vec<OutputAcc>,
     dataset: DatasetId,
@@ -2210,6 +2218,7 @@ fn record_output(
     influence: &InfluenceMap,
 ) {
     if let Some(existing) = acc.iter_mut().find(|o| o.dataset == dataset) {
+        existing.identity_facets.merge(identity_facets);
         for (col, terms) in &cols.0 {
             if terms.is_empty() {
                 continue;

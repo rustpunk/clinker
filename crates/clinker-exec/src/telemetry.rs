@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::Instant;
 
 use clinker_plan::config::{FieldPolicyAction, ResolvedFieldPolicy, ResolvedObservabilityPolicy};
@@ -530,7 +530,21 @@ impl TelemetryProducer {
             oversize_drops: self.stats.oversize.load(Ordering::Relaxed),
             invalid_drops: self.stats.invalid.load(Ordering::Relaxed),
             undecodable_drops: self.stats.undecodable.load(Ordering::Relaxed),
+            missing_field_drops: self.stats.missing_fields.load(Ordering::Relaxed),
+            arena_recoveries: self.stats.arena_recoveries.load(Ordering::Relaxed),
         }
+    }
+
+    /// Count one field a directive asked for that the record did not carry.
+    ///
+    /// Counted where the signal is built, so it covers only the signals
+    /// admission kept — under sampling, one miss in `sample_every`. That makes
+    /// it a backstop and not the answer: a field name that matches nothing in
+    /// the upstream row is decidable when the pipeline compiles, and the
+    /// diagnostic an author needs is the one that names the offending selector
+    /// before the run starts.
+    pub(crate) fn record_missing_field(&self) {
+        self.stats.missing_fields.fetch_add(1, Ordering::Relaxed);
     }
 
     fn admit<T: Serialize>(&self, lane: AdmissionLane, signal: &T) -> AdmissionOutcome {
@@ -560,10 +574,16 @@ impl TelemetryProducer {
         let lane = ticket.lane;
         let mut shared = match self.shared.try_lock() {
             Ok(shared) => shared,
-            Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => {
+            Err(TryLockError::WouldBlock) => {
                 self.stats.contended.fetch_add(1, Ordering::Relaxed);
                 return AdmissionOutcome::Dropped(DropReason::Contended);
             }
+            Err(TryLockError::Poisoned(poisoned)) => recover_arena(
+                &self.shared,
+                poisoned.into_inner(),
+                &self.retained,
+                &self.stats,
+            ),
         };
         if !shared.rate.allow() {
             self.stats.rate_limited.fetch_add(1, Ordering::Relaxed);
@@ -600,6 +620,43 @@ impl TelemetryProducer {
     }
 }
 
+/// Take back an arena lock a panic left poisoned, restore the accounting that
+/// panic can have made inconsistent, and clear the flag.
+///
+/// `Mutex::try_lock` reports `Poisoned` permanently, so treating it as
+/// contention ended a run's telemetry the first time anything panicked under
+/// the arena guard — a field value's `Display`, reached from field filtering,
+/// is enough — and attributed the whole loss to a transient timing collision.
+/// Every other lock in this crate recovers; this one now does too, and there is
+/// no lasting condition left to report under a reason of its own.
+///
+/// What recovery has to re-establish is not a running byte total: the arena
+/// keeps no such number under the lock. Each slot carries its own length and
+/// the queue names the slots that hold a signal, so the state under the guard
+/// is self-describing and cannot be left half-updated by a panic — the only
+/// site that can unwind is the serialization inside
+/// [`ArenaState::admit`], which happens before the slot is marked or queued.
+/// What can drift is the retained-byte accounting, which lives in atomics
+/// outside the lock and is read by the operator-facing snapshot. It is
+/// re-derived from the queue rather than adjusted, so the figure is the arena's
+/// true occupancy and not an estimate of it; the occupancy flags are reconciled
+/// against the same queue so a slot cannot be leaked. The peak is a high-water
+/// mark of the whole run and is deliberately not rewound.
+fn recover_arena<'arena>(
+    shared: &'arena Mutex<ArenaState>,
+    mut state: MutexGuard<'arena, ArenaState>,
+    retained: &RetainedAccounting,
+    stats: &ProducerCounters,
+) -> MutexGuard<'arena, ArenaState> {
+    let (ordinary, high) = state.reconcile_queued_slots();
+    retained.reset(ordinary, high);
+    stats.arena_recoveries.fetch_add(1, Ordering::Relaxed);
+    // Cleared last, and only once the invariant holds: leaving it set would
+    // re-derive on every lock for the rest of the run.
+    shared.clear_poison();
+    state
+}
+
 /// Sole bounded receiver for structured telemetry facts.
 pub struct TelemetryReceiver {
     shared: Arc<Mutex<ArenaState>>,
@@ -614,7 +671,13 @@ impl TelemetryReceiver {
     pub fn try_recv_batch(&self) -> Option<TelemetryBatch> {
         let mut shared = match self.shared.try_lock() {
             Ok(shared) => shared,
-            Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => return None,
+            Err(TryLockError::WouldBlock) => return None,
+            Err(TryLockError::Poisoned(poisoned)) => recover_arena(
+                &self.shared,
+                poisoned.into_inner(),
+                &self.retained,
+                &self.stats,
+            ),
         };
 
         let queued = shared.queue.len();
@@ -774,6 +837,17 @@ pub struct ArenaSnapshot {
     /// Signals counted in `accepted` whose stored bytes could not be read back
     /// at drain, and so were never exported.
     pub undecodable_drops: u64,
+    /// Fields an authored directive requested that the record did not carry, on
+    /// signals that were otherwise admitted. A misspelled selector publishes an
+    /// event with nothing in it, and this is the only figure that says so at
+    /// run time.
+    pub missing_field_drops: u64,
+    /// Times a panic under the arena lock was recovered from rather than left
+    /// to end the run's telemetry. Distinct from `contention_drops`, which
+    /// counts a momentary lock collision and nothing else: this condition is
+    /// permanent until it is repaired, and no signal is charged to contention
+    /// for it.
+    pub arena_recoveries: u64,
 }
 
 #[derive(Serialize)]
@@ -1218,6 +1292,43 @@ impl ArenaState {
         Ok(len)
     }
 
+    /// Make the slot occupancy agree with the queue and return the bytes each
+    /// lane actually holds.
+    ///
+    /// The queue is the authority: a slot holds a signal exactly while a token
+    /// naming it is waiting to be drained. A slot marked occupied that no token
+    /// names would never be handed out again, which is capacity lost for the
+    /// rest of the run.
+    fn reconcile_queued_slots(&mut self) -> (u64, u64) {
+        for slot in self
+            .ordinary
+            .slots
+            .iter_mut()
+            .chain(self.high.slots.iter_mut())
+        {
+            slot.occupied = false;
+        }
+        let mut ordinary = 0_u64;
+        let mut high = 0_u64;
+        // By index rather than by iterator: the queue and the slots it names
+        // are both owned here, and the slot flags are written while walking it.
+        for position in 0..self.queue.len() {
+            let token = self.queue[position];
+            let lane = match token.lane {
+                AdmissionLane::Ordinary => &mut self.ordinary,
+                AdmissionLane::HighSeverity => &mut self.high,
+            };
+            let slot = &mut lane.slots[token.index];
+            slot.occupied = true;
+            let len = u64::try_from(slot.len).unwrap_or(u64::MAX);
+            match token.lane {
+                AdmissionLane::Ordinary => ordinary = ordinary.saturating_add(len),
+                AdmissionLane::HighSeverity => high = high.saturating_add(len),
+            }
+        }
+        (ordinary, high)
+    }
+
     fn slot_location(&self, token: SlotToken) -> (usize, usize) {
         let lane = match token.lane {
             AdmissionLane::Ordinary => &self.ordinary,
@@ -1378,6 +1489,8 @@ struct ProducerCounters {
     oversize: AtomicU64,
     invalid: AtomicU64,
     undecodable: AtomicU64,
+    missing_fields: AtomicU64,
+    arena_recoveries: AtomicU64,
 }
 
 /// One drop counter kept per disjoint lane.
@@ -1444,6 +1557,17 @@ impl RetainedAccounting {
             });
     }
 
+    /// Replace the live accounting with a figure re-derived from the arena.
+    ///
+    /// The peak is left alone: it is the high-water mark of the whole run, and
+    /// a run that really did retain that many bytes still did.
+    fn reset(&self, ordinary: u64, high: u64) {
+        self.ordinary.store(ordinary, Ordering::Release);
+        self.high.store(high, Ordering::Release);
+        self.total
+            .store(ordinary.saturating_add(high), Ordering::Release);
+    }
+
     fn subtract(&self, lane: AdmissionLane, bytes: u64) {
         self.total.fetch_sub(bytes, Ordering::AcqRel);
         match lane {
@@ -1462,9 +1586,11 @@ mod tests {
     use clinker_plan::config::{ClinkerToml, ResolvedObservabilityPolicy};
     use clinker_record::Value;
 
+    use std::sync::Arc;
+
     use super::{
-        AdmissionOutcome, DropReason, LogEvent, MAX_IDENTITY_BYTES, RunCorrelation, Severity,
-        SignalField, SpanFact, SpanName, SpanStatus, TRUNCATION_MARKER, TelemetryArena,
+        AdmissionLane, AdmissionOutcome, DropReason, LogEvent, MAX_IDENTITY_BYTES, RunCorrelation,
+        Severity, SignalField, SpanFact, SpanName, SpanStatus, TRUNCATION_MARKER, TelemetryArena,
         TelemetryProducer, TelemetryReceiver, bounded_utf8,
     };
 
@@ -1704,6 +1830,96 @@ replacement = "{replacement}"
         assert_eq!(
             snapshot.retained_bytes, 0,
             "the slot must be reclaimed like any other drained signal"
+        );
+    }
+
+    /// A panic under the arena lock is permanent; contention is momentary.
+    ///
+    /// `Mutex::try_lock` reports `Poisoned` for the rest of the process, so
+    /// treating it as `WouldBlock` ended every signal for the rest of the run
+    /// the first time anything panicked under the guard — a field value's
+    /// `Display`, reached from field filtering, is enough — and charged the
+    /// whole loss to `contention_drops`, a reason that clears by itself. The
+    /// arena is recovered instead, so nothing is charged to contention and the
+    /// accounting a panic can have disturbed is re-derived rather than trusted.
+    #[test]
+    fn a_panic_under_the_arena_lock_neither_ends_telemetry_nor_reads_as_contention() {
+        let (producer, receiver) = arena("256B");
+        let before = LogEvent {
+            event: "transform.seen",
+            severity: Severity::Info,
+            message: "seen",
+            correlation: correlation(),
+            fields: &[SignalField::new("amount", "1")],
+        };
+        assert!(producer.emit_log(before).is_accepted());
+
+        let poisoner = Arc::clone(&producer.shared);
+        let retained = Arc::clone(&producer.retained);
+        let unwound = std::thread::spawn(move || {
+            let mut shared = poisoner.lock().expect("the first lock is clean");
+            // The two inconsistencies an unwind between taking a slot and
+            // queueing it can leave: a slot nothing will ever hand out again,
+            // and retained bytes charged for a signal that never arrived.
+            shared.ordinary.slots[5].occupied = true;
+            shared.ordinary.slots[5].len = 4096;
+            retained.add(AdmissionLane::Ordinary, 4096);
+            panic!("a producer panics while holding the arena lock");
+        })
+        .join();
+        assert!(unwound.is_err(), "the producer panicked under the lock");
+        assert!(
+            producer.shared.is_poisoned(),
+            "which poisons the arena lock"
+        );
+
+        let after = producer.emit_log(LogEvent {
+            event: "transform.seen",
+            severity: Severity::Info,
+            message: "seen",
+            correlation: correlation(),
+            fields: &[SignalField::new("amount", "2")],
+        });
+        assert!(
+            after.is_accepted(),
+            "a later signal still reaches the arena: {after:?}"
+        );
+        assert!(
+            !producer.shared.is_poisoned(),
+            "and the lock is usable again"
+        );
+
+        let snapshot = producer.snapshot();
+        assert_eq!(
+            snapshot.contention_drops, 0,
+            "a permanent failure must not be reported as a momentary lock collision"
+        );
+        assert_eq!(
+            snapshot.arena_recoveries, 1,
+            "and it must be visible as the distinct condition it is"
+        );
+
+        {
+            let shared = producer.shared.lock().expect("uncontended");
+            assert!(
+                !shared.ordinary.slots[5].occupied,
+                "a slot no queued signal names must go back into circulation"
+            );
+        }
+
+        let batch = receiver
+            .try_recv_batch()
+            .expect("both admitted signals are drainable");
+        assert_eq!(batch.logs().len(), 2, "neither signal was lost");
+        assert_eq!(
+            snapshot.retained_bytes,
+            batch.serialized_bytes(),
+            "the recovered accounting is the arena's true occupancy, not an estimate"
+        );
+        assert_eq!(
+            producer.snapshot().retained_bytes,
+            0,
+            "and it still returns to zero once the queue drains"
         );
     }
 

@@ -188,6 +188,13 @@ aggregate across them. Event names and field selectors use the same grammar as
 deployment field policy: dot-separated segments beginning with an ASCII letter
 or underscore, followed by ASCII letters, digits, or underscores.
 
+`fields` is the only channel by which record data reaches an event — `message`
+is static text. A selector naming a field the incoming record does not carry
+contributes nothing, so a directive whose selectors all miss publishes an event
+with no attributes at all, which reads exactly like a run whose records were
+empty. Spell each selector as the upstream schema spells it. Misses are counted
+in the run's admission accounting under the missing-field total.
+
 ### Logging only the records you care about
 
 `every` thins a per-record event by count. `condition` selects it by content —

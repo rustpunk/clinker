@@ -937,18 +937,25 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   deciding when a run's destination identities are fixed -- most likely a
   resolution pass at admission whose results every later question is answered
   from, rather than a memo inside the function.
-- **52 (filed 2026-08-09, needs a maintainer decision):** Two destinations
-  spelled `out/data.csv` and `out/pending/../data.csv`, where `pending` does
-  not exist yet, get two identities and both producers are admitted for one
-  file. Reducing the `..` was tried and reverted: the reduction pops back into
-  the already-canonicalized prefix, after which further components are joined
-  as raw text and never resolved, so a symlinked directory reached past the
-  `..` produced a second identity for one file and, in the other direction,
-  merged two files into one. What a `..` names genuinely cannot be decided
-  without the filesystem, and the components it crosses may not exist yet.
-  The clean answer is probably a surface rule -- an admitted destination may
-  not use `..` beyond a directory that exists -- which is a user-facing
-  decision rather than a repair.
+- **52 (filed 2026-08-09; closed 2026-08-12):** Two destinations spelled
+  `out/data.csv` and `out/pending/../data.csv`, where `pending` does not exist
+  yet, got two identities, so both producers were admitted for one file.
+  `resolved_prefix` now cancels a `..` against the component in front of it
+  when the filesystem has answered that that component does not exist, and
+  leaves it as written otherwise. That is the line the earlier attempt was
+  missing: the danger in reducing `a/../b` textually is that `a` may be a
+  symlink, whose `..` goes up from where the link lands rather than from `a`'s
+  parent -- and a name that does not exist is not a symlink. Absence is
+  established with `symlink_metadata`, not inferred from the canonicalize
+  failure, which also covers `EACCES` and `ELOOP` -- cases where a symlink is
+  exactly what may be there. A `..` that cancels the whole tail pops the
+  resolved prefix, which came out of `canonicalize` and so holds no symlinks;
+  at the root the pop is a no-op, as `/..` is for the kernel. No surface rule
+  was needed. Note that the pipeline surface refuses a `..` in an authored
+  path outright (`E-SEC-001`) before the identity is ever asked for, so the
+  fix is what keeps the identity truthful for callers that key paths the
+  traversal check never saw -- the staging registry, the attempt ledger, and
+  the DLQ partitioner.
 - **53 (filed 2026-08-09; the `Link` half was closed 2026-08-12, the
   `Location` half still needs a maintainer decision):** `Link` and `Location`
   headers were refused when they carried any byte outside visible ASCII,

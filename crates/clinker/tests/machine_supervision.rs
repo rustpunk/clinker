@@ -318,6 +318,44 @@ fn concurrent_bounded_drains_prevent_high_output_deadlock() {
     assert!(directory.path().join("out.csv").exists());
 }
 
+/// The supervised plan-only export reconciles, like every other stream a
+/// supervisor is told it may run.
+///
+/// `--lineage <FILE>` is a plan-only export that returns before any data is
+/// read, and it is supervisable so its document carries the invocation's own
+/// `execution_id` and `batch_id`. Its terminal is the success row, on which
+/// the contract promises complete artifact evidence — so with no `publication`
+/// field the adapter here, which is the contract expressed as code, called the
+/// attempt incomplete while the CLI called it a success. The two now agree on
+/// the same stream: an empty inventory, which is what an invocation that ran
+/// no attempt published.
+#[test]
+fn a_supervised_plan_only_export_reconciles_as_success() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "must-not-exist.csv", 1, false);
+    write_local_lineage_policy(directory.path());
+    let mut command = machine_command(directory.path(), "plan-only-export");
+    command.args(["--lineage", "plan.ndjson"]);
+    let result = run_child(command, ProcessConfig::new(PROCESS_DEADLINE)).expect("supervised run");
+
+    assert_eq!(
+        result.outcome(),
+        ControlledOutcome::Success,
+        "events: {:?}\nstderr: {}",
+        result.stdout.events(),
+        String::from_utf8_lossy(result.stderr.retained_tail())
+    );
+    assert_eq!(result.status_code(), Some(0));
+    assert!(directory.path().join("plan.ndjson").exists());
+    assert!(
+        !directory.path().join("must-not-exist.csv").exists(),
+        "a plan-only export reads no data and publishes nothing"
+    );
+    let terminal = result.stdout.events().last().expect("terminal");
+    assert_eq!(terminal["publication"]["artifact_count"], 0);
+    assert_eq!(terminal["publication"]["complete"], true);
+}
+
 #[test]
 fn terminal_and_process_status_must_reconcile_fail_closed() {
     let directory = fixture();

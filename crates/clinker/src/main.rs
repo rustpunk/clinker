@@ -822,6 +822,12 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
         PipelineError::Io(error) if is_observability_delivery_failure(error) => {
             registered("observability.delivery.failed")
         }
+        // Ordered before the general I/O arm: the outcome of a published run
+        // is not a transient runtime fault, and the advice a supervisor acts
+        // on turns on that difference.
+        PipelineError::Io(error) if is_unreportable_outcome(error) => {
+            registered("infrastructure.delivery.unreportable_outcome")
+        }
         PipelineError::Config(clinker_plan::config::ConfigError::Validation(message))
             if split_leading_code(message)
                 .is_some_and(|(code, _)| code == "observability.configuration.invalid") =>
@@ -1801,6 +1807,44 @@ fn is_observability_delivery_failure(error: &std::io::Error) -> bool {
         .is_some_and(|source| source.is::<ObservabilityDeliveryFailure>())
 }
 
+/// A machine terminal that could not be delivered for a run that had already
+/// published.
+#[derive(Debug)]
+struct UnreportableOutcome {
+    message: String,
+}
+
+impl std::fmt::Display for UnreportableOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UnreportableOutcome {}
+
+/// The failure a run raises when its outputs are live and the terminal saying
+/// so could not be written.
+///
+/// It is deliberately not a plain I/O failure. A plain one classifies as
+/// `infrastructure.runtime.transient`, whose advice is `retry_with_backoff` —
+/// so a momentary `WouldBlock` on the supervisor's own pipe, at the one moment
+/// the terminal is written, asked the supervisor to re-run a batch whose
+/// finals were already visible. The delivery of a report is not evidence about
+/// what the run did, and it must not be allowed to become the loudest
+/// evidence: the artifacts stay published, the terminal still carries them,
+/// and the advice becomes one no supervisor can act on unattended.
+fn unreportable_outcome_error(error: std::io::Error) -> PipelineError {
+    PipelineError::Io(std::io::Error::other(UnreportableOutcome {
+        message: error.to_string(),
+    }))
+}
+
+fn is_unreportable_outcome(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<UnreportableOutcome>())
+}
+
 fn lineage_worker_start_error(_error: std::io::Error) -> PipelineError {
     observability_delivery_error(
         "the bounded lineage exporter could not start before execution. Correction: reduce host resource pressure or disable external lineage delivery",
@@ -2310,14 +2354,19 @@ fn report_lineage_delivery(outcome: clinker_lineage::LineageDeliveryOutcome) {
 /// Suppressed when every counter is zero, exactly as the lineage line is
 /// suppressed on a clean shutdown that dropped nothing: a run that lost no
 /// telemetry has nothing to report about losing telemetry.
+///
+/// Counters that are not a final accounting are never suppressed, whatever
+/// they say. All-zero mid-drain numbers are not evidence of a clean run, and
+/// staying silent on them reports a run that may well have lost signals as one
+/// that certainly did not.
 fn report_telemetry_admission(admission: observability::AdmissionSummary) {
-    if admission.dropped_total() == 0 {
+    if admission.dropped_total() == 0 && admission.counts_complete {
         return;
     }
     let dropped = admission.dropped;
     let lanes = admission.lanes;
     eprintln!(
-        "clinker: telemetry admission outcome: accepted={} dropped={} sampled={} rate_limited={} queue_full={} contended={} oversize={} invalid_identity={} undecodable={} ordinary_sampled={} ordinary_queue_full={} high_sampled={} high_queue_full={}",
+        "clinker: telemetry admission outcome: accepted={} dropped={} sampled={} rate_limited={} queue_full={} contended={} oversize={} invalid_identity={} undecodable={} ordinary_sampled={} ordinary_queue_full={} high_sampled={} high_queue_full={} counts_complete={}",
         admission.accepted,
         admission.dropped_total(),
         dropped.sampled,
@@ -2331,6 +2380,7 @@ fn report_telemetry_admission(admission: observability::AdmissionSummary) {
         lanes.ordinary.queue_full,
         lanes.high_severity.sampled,
         lanes.high_severity.queue_full,
+        admission.counts_complete,
     );
 }
 
@@ -2423,10 +2473,19 @@ fn finish_otlp_delivery(
     // Read after the flush. `undecodable` is credited by the receiver as it
     // drains, so an arena read before the worker finished would report a loss
     // the run had not finished discovering.
+    //
+    // A flush that expired on its deadline detaches its worker instead of
+    // joining it — the bound on a cancelled or finishing run is not negotiable
+    // against an unresponsive collector — so on that path the worker is still
+    // draining while this reads, and the counts are a mid-drain sample. They
+    // are reported as one: marked incomplete rather than silently partial,
+    // which is the difference between "nothing was lost" and "we could not
+    // finish counting".
     let Some(producer) = producer else {
         return;
     };
-    let admission = observability::AdmissionSummary::from_arena(producer.snapshot());
+    let admission =
+        observability::AdmissionSummary::from_arena(producer.snapshot(), summary.flush_complete);
     if let Some(emitter) = machine {
         emitter.set_observability_admission(admission);
     }
@@ -3414,6 +3473,15 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 )
             };
             clinker_lineage::write_ndjson(&events, writer).map_err(PipelineError::Io)?;
+        }
+        // A plan-only export runs no attempt, so it says so explicitly rather
+        // than leaving the terminal's inventory absent — an omission the
+        // contract's success row reads as publication complete, and which the
+        // reference adapter reads as a stream it cannot accept.
+        if let Some(emitter) = machine {
+            emitter
+                .emit_completed_without_attempt()
+                .map_err(PipelineError::Io)?;
         }
         return Ok(0);
     }
@@ -4699,7 +4767,10 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 // cancellation it already concluded it was.
                 tracing::warn!(error = %error, "machine terminal write failed for an unpublished run");
             } else if publication_failure.is_none() {
-                return Err(PipelineError::Io(error));
+                // The run published. What failed is the report of it, so the
+                // failure it raises says exactly that and carries advice a
+                // supervisor can act on without re-running live outputs.
+                return Err(unreportable_outcome_error(error));
             } else {
                 tracing::warn!(error = %error, "machine terminal write failed after publication failure");
             }

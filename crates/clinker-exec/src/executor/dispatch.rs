@@ -1490,6 +1490,19 @@ pub(crate) struct ExecutorContext<'a> {
     /// architectural value of the deferred-region landing.
     pub(crate) in_deferred_dispatch: bool,
 
+    /// Signal state for transforms the cascading-retraction loop dispatches
+    /// more than once, keyed by the exported logical node identity
+    /// [`Self::qualified_node_name`] builds — the same identity the span
+    /// carries, so two call sites of one composition body keep their state
+    /// apart.
+    ///
+    /// A converge re-runs each deferred-region member once per iteration and
+    /// keeps only the converged result, so those passes are one execution of
+    /// the transform and have to report as one. An entry is taken out at the
+    /// start of a pass and put back at its end; the orchestrator closes
+    /// whatever remains once the loop stops.
+    pub(crate) transform_signal_carry: HashMap<String, crate::log_dispatch::TransformSignalCarry>,
+
     /// Streaming-Output channel senders keyed by the upstream fused
     /// `Merge` node's `NodeIndex`. Present when the executor entry has
     /// matched a `Merge.interleave → single Output` chain against

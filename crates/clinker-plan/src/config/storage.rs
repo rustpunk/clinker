@@ -26,7 +26,13 @@ use std::path::{Path, PathBuf};
 /// The `[storage]`, `[observability]`, `[channel]`, and `[group]` tables are
 /// modeled. Any other top-level table is tolerated rather than rejected — this
 /// type is consulted for workspace deployment policy and layout roots, so
-/// unknown top-level tables (future workspace-discovery keys) pass through.
+/// unknown top-level tables (future workspace-discovery keys) pass through —
+/// with one exception: a name that is a *misspelling* of a table this type
+/// does own is refused, by [`refuse_misspelled_table`]. Tolerance and a table
+/// whose whole job is to switch a subsystem on are a bad pairing. Everything
+/// inside `[observability]` is strict, but the name of the table itself was
+/// not, so `[observabilty]` turned telemetry, lineage export, and the
+/// field-privacy redaction table off together and said nothing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClinkerToml {
     /// Typed workspace resource catalog. Logical names are scoped by kind,
@@ -58,9 +64,11 @@ impl ClinkerToml {
     /// # Errors
     ///
     /// Returns [`StorageConfigError::Parse`] when the text is not valid TOML
-    /// or contains a key whose type does not match the schema.
+    /// or contains a key whose type does not match the schema, or
+    /// [`StorageConfigError::MisspelledTable`] when a top-level table is a
+    /// misspelling of one this document owns.
     pub fn parse(text: &str) -> Result<Self, StorageConfigError> {
-        toml::from_str(text).map_err(|error| {
+        let document: Self = toml::from_str(text).map_err(|error| {
             if super::observability::is_observability_toml_error(text, &error) {
                 StorageConfigError::Observability(
                     super::observability::ObservabilityConfigError::from_toml_parse(text, &error),
@@ -68,7 +76,9 @@ impl ClinkerToml {
             } else {
                 StorageConfigError::Parse(error.to_string())
             }
-        })
+        })?;
+        refuse_misspelled_table(text)?;
+        Ok(document)
     }
 
     /// Resolve an absent policy as disabled or one present policy atomically.
@@ -118,6 +128,52 @@ impl ClinkerToml {
             }),
         }
     }
+}
+
+/// The top-level tables this document owns, in the spelling an author writes.
+const OWNED_TABLES: [&str; 5] = ["catalog", "storage", "observability", "channel", "group"];
+
+/// Refuse a top-level table that is a misspelling of one this document owns.
+///
+/// An unrecognized name is otherwise passed over, which is what a name meant
+/// for another reader needs and what a name meant for *this* one cannot
+/// afford: the tables here switch subsystems on, so a name that misses is a
+/// policy that silently does not apply. Refusing every unrecognized name would
+/// close that hole and take forward tolerance with it, so what is refused is
+/// the near miss — a name close enough to an owned one that no other reader
+/// plausibly owns it.
+///
+/// "Close enough" is one edit per eight characters, over the name folded to
+/// lowercase with `_` and `-` removed, so a case or separator variant is
+/// caught outright and `observabilty` (one deletion, thirteen characters) is
+/// caught as the typo it is. The distance is the workspace's own bounded
+/// Levenshtein, the same one CXL's resolver suggests identifiers with.
+fn refuse_misspelled_table(text: &str) -> Result<(), StorageConfigError> {
+    // A document that does not parse as a table has already been reported by
+    // the caller; there is nothing here to add to it.
+    let Ok(document) = text.parse::<toml::Table>() else {
+        return Ok(());
+    };
+    for name in document.keys() {
+        if OWNED_TABLES.contains(&name.as_str()) {
+            continue;
+        }
+        let folded: String = name
+            .to_lowercase()
+            .chars()
+            .filter(|c| *c != '_' && *c != '-')
+            .collect();
+        for owned in OWNED_TABLES {
+            let threshold = 1 + owned.len() / 8;
+            if cxl::resolve::levenshtein::levenshtein_bounded(&folded, owned, threshold).is_some() {
+                return Err(StorageConfigError::MisspelledTable {
+                    found: name.clone(),
+                    owned,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The `[storage]` block: spill and staging policy for a workspace.
@@ -1319,6 +1375,9 @@ pub enum StorageConfigError {
     /// The strict observability subtree is malformed or fails deterministic
     /// policy validation. Its diagnostic never includes rejected values.
     Observability(super::observability::ObservabilityConfigError),
+    /// A top-level table is a misspelling of one this document owns, so the
+    /// policy it holds would never have been applied.
+    MisspelledTable { found: String, owned: &'static str },
     /// `storage.spill.dir` points at a path that does not exist.
     SpillDirMissing { path: PathBuf },
     /// `storage.spill.dir` exists but is a file, not a directory.
@@ -1403,6 +1462,12 @@ impl std::fmt::Display for StorageConfigError {
             }
             Self::Parse(msg) => write!(f, "invalid clinker.toml: {msg}"),
             Self::Observability(error) => write!(f, "invalid clinker.toml: {error}"),
+            Self::MisspelledTable { found, owned } => write!(
+                f,
+                "clinker.toml table [{found}] is not a table clinker reads, and is a \
+                 misspelling of [{owned}]; nothing under it would have been applied — \
+                 write `[{owned}]`, or rename the table so it is not mistakable for one"
+            ),
             Self::SpillDirMissing { path } => write!(
                 f,
                 "storage.spill.dir {} does not exist; create it or point at an existing volume",
@@ -1549,6 +1614,49 @@ mod tests {
         let doc = ClinkerToml::parse("").unwrap();
         assert!(doc.storage.spill.dir.is_none());
         assert!(!doc.storage.staging.enabled);
+    }
+
+    /// A misspelled table name is the one way a `clinker.toml` could turn a
+    /// policy off without saying so: every key *inside* `[observability]` is
+    /// strict, so a complete, correct policy under `[observabilty]` parsed
+    /// clean and ran with telemetry, lineage export, and the field-privacy
+    /// redaction table all off.
+    #[test]
+    fn a_misspelled_table_is_refused_rather_than_ignored() {
+        let error = ClinkerToml::parse(
+            "[observabilty]\n\
+             arena_bytes = \"4MB\"\n\
+             \n\
+             [[observabilty.field_policy]]\n\
+             event = \"transform.customer_seen\"\n\
+             field = \"email\"\n\
+             action = \"replace\"\n\
+             replacement = \"[redacted]\"\n",
+        )
+        .expect_err("a policy under a misspelled table would never have applied");
+        let rendered = error.to_string();
+        assert!(rendered.contains("observabilty"), "{rendered}");
+        assert!(rendered.contains("[observability]"), "{rendered}");
+
+        for near_miss in [
+            "[Observability]\n",
+            "[storag]\n",
+            "[chanel]\n",
+            "[groups]\n",
+        ] {
+            ClinkerToml::parse(near_miss).expect_err(&format!(
+                "{near_miss:?} is mistakable for a table clinker reads"
+            ));
+        }
+
+        // Tolerance for names that belong to another reader is what the
+        // absence of `deny_unknown_fields` here buys, and it is kept.
+        for unrelated in [
+            "[deployment]\nregion = \"eu-west-1\"\n",
+            "[team]\nowner = \"data-platform\"\n",
+        ] {
+            ClinkerToml::parse(unrelated).expect("an unrelated table still passes through");
+        }
     }
 
     #[test]
