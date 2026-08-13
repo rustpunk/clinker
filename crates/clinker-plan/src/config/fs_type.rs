@@ -259,13 +259,13 @@ static CASE_ANSWERS: VolumeAnswers = VolumeAnswers::new();
 /// Remembered normalization-insensitivity verdicts, one per directory.
 static NORMALIZATION_ANSWERS: VolumeAnswers = VolumeAnswers::new();
 
-/// One probe verdict per directory, asked of the filesystem once.
+/// One verdict per directory, asked of the filesystem once.
 ///
-/// A probe creates and removes a file, and what it measures is a property of
-/// the volume rather than of the moment. A search over numbered candidate
-/// names in one directory asks for a key per candidate, which without this
-/// writes and unlinks a file per candidate in the directory it is about to
-/// write into.
+/// What a verdict measures is a property of the volume rather than of the
+/// moment, and obtaining one costs at least a stat and at most a created and
+/// unlinked file. A search over numbered candidate names in one directory asks
+/// for a key per candidate, which without this repeats that work per candidate
+/// in the directory it is about to write into.
 struct VolumeAnswers {
     seen:
         std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, bool>>>,
@@ -283,29 +283,25 @@ impl VolumeAnswers {
         dir: &Path,
         probe: impl FnOnce(&Path) -> io::Result<bool>,
     ) -> io::Result<bool> {
-        let seen = self
-            .seen
-            .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
-        if let Ok(remembered) = seen.lock()
-            && let Some(answer) = remembered.get(dir)
-        {
-            return Ok(*answer);
+        if let Some(answer) = self.remembered(dir) {
+            return Ok(answer);
         }
         let answer = probe(dir)?;
-        if let Ok(mut remembered) = seen.lock() {
-            remembered.insert(dir.to_path_buf(), answer);
-        }
+        self.remember(dir, answer);
         Ok(answer)
+    }
+
+    /// The verdict already held for `dir`, if one is.
+    fn remembered(&self, dir: &Path) -> Option<bool> {
+        self.seen.get()?.lock().ok()?.get(dir).copied()
     }
 
     /// Record a verdict for `dir` without asking the filesystem.
     ///
-    /// The per-component rule can only be exercised against a path that
-    /// crosses volumes behaving differently, and no test can mount two. This
-    /// is where an injected verdict enters: the memo is already the single
-    /// place a verdict is read from, so seeding it is the same seam a real
-    /// probe fills, not a second one beside it.
-    #[cfg(test)]
+    /// The memo is the single place a verdict is read from, so it is also
+    /// where a verdict obtained some other way than by probing enters: the
+    /// read-only answer taken off a name the directory already holds, and, in
+    /// tests, an injected verdict standing in for a volume no test can mount.
     fn remember(&self, dir: &Path, answer: bool) {
         let seen = self
             .seen
@@ -667,13 +663,17 @@ struct FoldingVerdict {
 /// two genuinely different mounted volumes holding two genuinely different
 /// files, which the collision check then refused to run.
 ///
-/// Where a component's own directory cannot be probed — an unwritable `/`, a
-/// component past the point the path exists — the whole-path verdict stands in.
-/// That is the answer this function gave everywhere before, so an unprobeable
-/// ancestor is never *worse* than it was; it is simply not improved. Probing
-/// per component and defaulting each unprobeable one to "folds nothing" would
-/// be worse, because it would stop folding `/Users/Foo` on the very macOS
-/// volume that folds it.
+/// An ancestor answers for the component it holds without being written to:
+/// the component already exists, so its own spelling can be varied and
+/// re-statted. Only the component past the end of what exists is answered by a
+/// probe file, in the deepest existing directory — see [`verdict_for`].
+///
+/// Where a component's own directory cannot answer at all — an unwritable `/`
+/// holding a name with nothing to respell — the whole-path verdict stands in.
+/// That is the answer this function gave everywhere before, so an unanswerable
+/// ancestor is never *worse* than it was; it is simply not improved. Defaulting
+/// each unanswerable one to "folds nothing" would be worse, because it would
+/// stop folding `/Users/Foo` on the very macOS volume that folds it.
 ///
 /// The key is built component-wise but written with the platform's own
 /// separators, so a path whose components all answer alike keys to exactly the
@@ -743,28 +743,166 @@ fn identity_of(path: &Path) -> String {
 
 /// The folding behaviour of the volume that backs `name` inside `container`.
 ///
-/// Both probes resolve to the nearest existing directory at or above
-/// `container`, so a component past the end of what exists is answered by the
-/// deepest directory that does exist — the same directory the whole-path probe
-/// used. Each distinct directory is probed once per process and remembered, so
-/// the per-component rule costs one probe pair per directory a plan's outputs
-/// touch, not one per path.
+/// A component that **already exists** is answered without writing anything:
+/// its own spelling is respelled and the respelling re-statted, and the
+/// directory folds exactly when the respelling names the same file. Only the
+/// component past the end of what exists needs a file created, and its
+/// container is the deepest existing directory — the one directory the
+/// whole-path probe wrote in before there was a per-component rule. Probing
+/// every ancestor instead would create and unlink a file in every directory
+/// above an output, up to the filesystem root, which is churn on directories
+/// the pipeline never named and residue there if the process is killed between
+/// the create and the unlink.
+///
+/// Where the respelling cannot answer — a name with nothing to respell, one
+/// that is not valid Unicode, a directory that cannot be read — the create
+/// probe answers for that axis, because returning the whole-path verdict
+/// instead would make a destination's identity depend on whether a directory
+/// happened to be named in digits.
+///
+/// Each distinct directory is answered once per process and remembered either
+/// way, so the per-component rule costs one answer per directory a plan's
+/// outputs touch, not one per path.
 fn verdict_for(
     container: &Path,
     name: &std::ffi::OsStr,
     fallback: FoldingVerdict,
 ) -> FoldingVerdict {
-    let probe_at = if container.as_os_str().is_empty() {
-        std::path::PathBuf::from(name)
+    // A bare filename is held by the working directory, which always exists.
+    let dir = if container.as_os_str().is_empty() {
+        Path::new(".")
     } else {
-        container.join(name)
+        container
     };
     FoldingVerdict {
-        folds_case: case_sensitive_dir(&probe_at)
-            .map_or(fallback.folds_case, |sensitive| !sensitive),
-        folds_normalization: normalization_insensitive_dir(&probe_at)
-            .unwrap_or(fallback.folds_normalization),
+        folds_case: folds_case_in(dir, name, fallback.folds_case),
+        folds_normalization: folds_normalization_in(dir, name, fallback.folds_normalization),
     }
+}
+
+/// Whether `dir` resolves two case-variant spellings of one name to one file.
+fn folds_case_in(dir: &Path, name: &std::ffi::OsStr, fallback: bool) -> bool {
+    if let Some(sensitive) = CASE_ANSWERS.remembered(dir) {
+        return !sensitive;
+    }
+    if let Some(folds) = read_off_existing(dir, name, case_variant) {
+        CASE_ANSWERS.remember(dir, !folds);
+        return folds;
+    }
+    case_sensitive_dir(&dir.join(name)).map_or(fallback, |sensitive| !sensitive)
+}
+
+/// Whether `dir` resolves two canonically-equivalent spellings of one name to
+/// one file.
+fn folds_normalization_in(dir: &Path, name: &std::ffi::OsStr, fallback: bool) -> bool {
+    if let Some(folds) = NORMALIZATION_ANSWERS.remembered(dir) {
+        return folds;
+    }
+    if let Some(folds) = read_off_existing(dir, name, normalization_variant) {
+        NORMALIZATION_ANSWERS.remember(dir, folds);
+        return folds;
+    }
+    normalization_insensitive_dir(&dir.join(name)).unwrap_or(fallback)
+}
+
+/// Whether `dir` folds, read off the entry `name` it already holds.
+///
+/// `None` where this name cannot answer: it has no respelling on this axis, or
+/// the filesystem would not say what either spelling names. The caller then
+/// falls back to creating a probe file, which asks the same question of a name
+/// chosen to be answerable.
+fn read_off_existing(
+    dir: &Path,
+    name: &std::ffi::OsStr,
+    variant: fn(&std::ffi::OsStr) -> Option<std::ffi::OsString>,
+) -> Option<bool> {
+    let variant = variant(name)?;
+    resolves_to_same_file(&dir.join(name), &dir.join(variant))
+}
+
+/// Whether `variant` names the very file `original` does.
+///
+/// `None` where the filesystem did not answer — `original` is gone or
+/// unreadable, or `variant` failed for some reason other than not being there.
+/// A variant that is simply absent *is* an answer: the directory did not fold
+/// the respelling back onto the file.
+fn resolves_to_same_file(original: &Path, variant: &Path) -> Option<bool> {
+    let original = file_identity(original).ok()?;
+    match file_identity(variant) {
+        Ok(found) => Some(found == original),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// What the kernel uses to decide that two names are one file.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// What the kernel uses to decide that two names are one file.
+///
+/// Windows exposes no stable device/inode pair through `Metadata`, but
+/// `canonicalize` goes through `GetFinalPathNameByHandle`, which answers from
+/// the opened file rather than from the caller's spelling: a case-insensitive
+/// directory hands back the one on-disk spelling for either of two case
+/// variants, and a case-sensitive one hands back two different paths.
+#[cfg(not(unix))]
+fn file_identity(path: &Path) -> io::Result<std::path::PathBuf> {
+    std::fs::canonicalize(path)
+}
+
+/// `name` with the case of its ASCII letters flipped, or `None` when it holds
+/// no letter to flip.
+///
+/// ASCII only, deliberately. Every case-folding filesystem folds ASCII, while
+/// the full Unicode mappings are not all one scalar in, one scalar out — `ß`
+/// uppercases to `SS` — and a respelling of a different length asks the volume
+/// a question about something other than case. A name with no ASCII letter
+/// (all digits, CJK) has no respelling here and is answered by a probe.
+fn case_variant(name: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    let name = name.to_str()?;
+    if !name.chars().any(|scalar| scalar.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(
+        name.chars()
+            .map(|scalar| {
+                if scalar.is_ascii_lowercase() {
+                    scalar.to_ascii_uppercase()
+                } else if scalar.is_ascii_uppercase() {
+                    scalar.to_ascii_lowercase()
+                } else {
+                    scalar
+                }
+            })
+            .collect::<String>()
+            .into(),
+    )
+}
+
+/// `name` respelled into the other of the two canonically-equivalent forms, or
+/// `None` when both forms are the spelling it already has.
+///
+/// The decomposed form first, since a name written composed is the common one;
+/// a name already decomposed is respelled composed instead. A name whose
+/// scalars compose and decompose to themselves — anything wholly ASCII among
+/// them — has no respelling here and is answered by a probe.
+fn normalization_variant(name: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    use unicode_normalization::UnicodeNormalization;
+    let name = name.to_str()?;
+    let decomposed: String = name.nfd().collect();
+    if decomposed != name {
+        return Some(decomposed.into());
+    }
+    let composed: String = name.nfc().collect();
+    if composed != name {
+        return Some(composed.into());
+    }
+    None
 }
 
 /// The Unicode reduction applied to one run of a path that *is* valid Unicode.
@@ -1821,6 +1959,128 @@ mod tests {
                 "`..` after a symlink goes up from where the link lands, not from `out`"
             );
         }
+    }
+
+    /// The read-only answer and the create-probe answer are the same answer.
+    ///
+    /// The whole point of respelling a name that already exists is that it
+    /// asks the volume the question the probe file asks, without writing
+    /// anything. If the two could disagree, an ancestor and the directory
+    /// below it would key under different rules on one volume.
+    #[test]
+    fn reading_an_existing_name_agrees_with_probing_its_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("Reports")).expect("a cased entry to read");
+        let read = read_off_existing(dir.path(), std::ffi::OsStr::new("Reports"), case_variant)
+            .expect("a name with ASCII letters answers");
+        let probed = probe_case_sensitive(dir.path()).expect("the directory is writable");
+        assert_eq!(
+            read, !probed,
+            "respelling an existing name reports the fold the probe file measures"
+        );
+
+        std::fs::write(dir.path().join("caf\u{e9}.csv"), b"x").expect("a composed entry to read");
+        let read = read_off_existing(
+            dir.path(),
+            std::ffi::OsStr::new("caf\u{e9}.csv"),
+            normalization_variant,
+        )
+        .expect("a name with a decomposable scalar answers");
+        let probed =
+            probe_normalization_insensitive(dir.path()).expect("the directory is writable");
+        assert_eq!(read, probed, "and the same holds on the normalization axis");
+    }
+
+    /// A spelling that varies to itself is not an answer.
+    ///
+    /// Returning the whole-path fallback for one of these would make a
+    /// destination's identity depend on whether a directory happened to be
+    /// named in digits, so they have to be distinguishable from a real verdict.
+    #[test]
+    fn a_name_with_nothing_to_respell_yields_no_read_only_answer() {
+        assert_eq!(
+            case_variant(std::ffi::OsStr::new("Reports")).as_deref(),
+            Some(std::ffi::OsStr::new("rEPORTS"))
+        );
+        assert_eq!(case_variant(std::ffi::OsStr::new("2024")), None);
+        assert_eq!(case_variant(std::ffi::OsStr::new("\u{4ea4}\u{6613}")), None);
+
+        assert_eq!(
+            normalization_variant(std::ffi::OsStr::new("caf\u{e9}")).as_deref(),
+            Some(std::ffi::OsStr::new("cafe\u{301}"))
+        );
+        assert_eq!(
+            normalization_variant(std::ffi::OsStr::new("cafe\u{301}")).as_deref(),
+            Some(std::ffi::OsStr::new("caf\u{e9}"))
+        );
+        assert_eq!(normalization_variant(std::ffi::OsStr::new("reports")), None);
+    }
+
+    /// An ancestor is read, not written to.
+    ///
+    /// Probing every component's own directory once meant creating and
+    /// unlinking a file in every directory above an output, up to the
+    /// filesystem root — churn on directories the pipeline never named, and
+    /// residue in them if the process is killed between the create and the
+    /// unlink. The directory here is made unwritable, so a create probe cannot
+    /// run in it at all, and it must still answer for the component it holds.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_component_is_answered_without_writing_to_its_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let root = root.path().canonicalize().expect("canonical tempdir");
+        let holder = root.join("holder");
+        std::fs::create_dir(&holder).expect("mkdir");
+        std::fs::create_dir(holder.join("Reports")).expect("mkdir");
+
+        // Ground truth for `holder`, taken while it is still writable.
+        std::fs::write(holder.join("groundtruth"), b"x").expect("write");
+        let folds = resolves_to_same_file(&holder.join("groundtruth"), &holder.join("GROUNDTRUTH"))
+            .expect("the host filesystem answers");
+        std::fs::remove_file(holder.join("groundtruth")).expect("clean up");
+
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o555))
+            .expect("make the ancestor unwritable");
+        let key = destination_identity(&holder.join("Reports").join("out.csv"));
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755))
+            .expect("restore so the tempdir can be removed");
+
+        let separator = std::path::MAIN_SEPARATOR;
+        let expected = if folds { "reports" } else { "Reports" };
+        assert!(
+            key.ends_with(&format!("{expected}{separator}out.csv")),
+            "an unwritable directory still answers for the name it holds: {key}"
+        );
+        assert_eq!(
+            CASE_ANSWERS.remembered(&holder),
+            Some(!folds),
+            "and the answer it gave is its own, not the deepest directory's"
+        );
+    }
+
+    /// A name that cannot be respelled still gets its directory's real answer.
+    ///
+    /// The read-only test is an optimisation over the probe, not a replacement
+    /// for it: where the name has no case variant, the probe has to run, or the
+    /// component silently keys under a verdict measured somewhere else.
+    #[test]
+    fn an_uncased_component_falls_back_to_probing_its_directory() {
+        let holder = tempfile::tempdir().expect("tempdir");
+        let holder = holder.path().canonicalize().expect("canonical tempdir");
+        std::fs::create_dir(holder.join("2024")).expect("mkdir");
+
+        let _ = destination_identity(&holder.join("2024").join("out.csv"));
+
+        std::fs::write(holder.join("groundtruth"), b"x").expect("write");
+        let folds = resolves_to_same_file(&holder.join("groundtruth"), &holder.join("GROUNDTRUTH"))
+            .expect("the host filesystem answers");
+        assert_eq!(
+            CASE_ANSWERS.remembered(&holder),
+            Some(!folds),
+            "`2024` cannot answer for its directory, so the directory was probed"
+        );
     }
 
     /// One probe is one volume's answer, not the whole path's.
