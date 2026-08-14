@@ -89,6 +89,12 @@ fn execute(cli: Cli) -> Result<String, GateError> {
             decision::validate(&request)?;
             Ok("release decision validation passed\n".to_owned())
         }
+        Domain::Decision(DecisionDomain {
+            operation: DecisionOperation::VerifyPhase4Capabilities(arguments),
+        }) => {
+            decision::verify_phase4_capabilities(&arguments.workspace_root)?;
+            Ok("Phase 4 dependency capabilities verified\n".to_owned())
+        }
         Domain::Evidence(EvidenceDomain {
             operation: EvidenceOperation::Validate(arguments),
         }) => {
@@ -1155,6 +1161,15 @@ struct DecisionDomain {
 enum DecisionOperation {
     /// Validate strict decision and candidate-authorization records.
     Validate(DecisionValidateArgs),
+    /// Verify the fixed Phase 4 dependency capability contract.
+    VerifyPhase4Capabilities(DecisionPhase4CapabilityArgs),
+}
+
+#[derive(Debug, Args)]
+struct DecisionPhase4CapabilityArgs {
+    /// Root of the Clinker Cargo workspace.
+    #[arg(long)]
+    workspace_root: PathBuf,
 }
 
 #[derive(Debug, Args)]

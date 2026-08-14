@@ -33,8 +33,150 @@ pub struct RegistryEntry {
     pub code: &'static str,
     /// Severity the emitting site uses for this code.
     pub severity: Severity,
+    /// Whether the identifier describes an active condition or is permanently
+    /// reserved for a retired authoring surface.
+    pub lifecycle: DiagnosticLifecycle,
+    /// Stable subsystem-oriented category used by diagnostic discovery.
+    pub category: DiagnosticCategory,
+    /// Whether repeating the same admitted operation can correct the failure.
+    pub retry_advice: RetryAdvice,
     /// One-line statement of the condition the code reports.
     pub meaning: &'static str,
+    /// Fixed safe correction guidance. Producer-specific diagnostics may add
+    /// more source-located help, but this registry text is always available.
+    pub correction: &'static str,
+}
+
+/// Lifecycle of a registered diagnostic identifier.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum DiagnosticLifecycle {
+    /// The identifier describes a condition in the current authoring surface.
+    Active,
+    /// The identifier is permanently reserved for a retired authoring shape.
+    RetiredReserved,
+}
+
+impl DiagnosticLifecycle {
+    /// Return the stable CLI/filter spelling for this lifecycle.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::RetiredReserved => "retired-reserved",
+        }
+    }
+
+    /// Parse an exact lifecycle filter. Unknown or empty spellings are
+    /// rejected instead of falling back to the active set.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "retired-reserved" => Some(Self::RetiredReserved),
+            _ => None,
+        }
+    }
+}
+
+/// Closed diagnostic categories used by registry-derived discovery views.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum DiagnosticCategory {
+    /// Pipeline topology, naming, and general configuration.
+    Configuration,
+    /// Composition, channel, overlay, window, and scoped binding.
+    Composition,
+    /// CXL, source declarations, schema, and source patches.
+    SourceAndExpression,
+    /// Execution policy, formats, envelopes, and multi-value behavior.
+    ExecutionAndFormat,
+    /// A retired or current terminal-destination authoring spelling.
+    TerminalAuthoring,
+    /// Path and trust-boundary rejection.
+    Security,
+    /// Non-fatal planning or runtime advice.
+    Advisory,
+}
+
+impl DiagnosticCategory {
+    /// Return the stable CLI/filter spelling for this category.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Configuration => "configuration",
+            Self::Composition => "composition",
+            Self::SourceAndExpression => "source-and-expression",
+            Self::ExecutionAndFormat => "execution-and-format",
+            Self::TerminalAuthoring => "terminal-authoring",
+            Self::Security => "security",
+            Self::Advisory => "advisory",
+        }
+    }
+
+    /// Parse an exact category filter. Unknown or empty spellings are
+    /// rejected instead of selecting an accidental catch-all category.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "configuration" => Some(Self::Configuration),
+            "composition" => Some(Self::Composition),
+            "source-and-expression" => Some(Self::SourceAndExpression),
+            "execution-and-format" => Some(Self::ExecutionAndFormat),
+            "terminal-authoring" => Some(Self::TerminalAuthoring),
+            "security" => Some(Self::Security),
+            "advisory" => Some(Self::Advisory),
+            _ => None,
+        }
+    }
+}
+
+const fn is_retired_terminal_code(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    bytes.len() == 4 && bytes[0] == b'E' && bytes[1] == b'3' && bytes[2] == b'7' && bytes[3] == b'6'
+}
+
+const fn lifecycle_for_code(code: &str) -> DiagnosticLifecycle {
+    if is_retired_terminal_code(code) {
+        DiagnosticLifecycle::RetiredReserved
+    } else {
+        DiagnosticLifecycle::Active
+    }
+}
+
+const fn category_for_code(code: &str) -> DiagnosticCategory {
+    let bytes = code.as_bytes();
+    if is_retired_terminal_code(code) {
+        DiagnosticCategory::TerminalAuthoring
+    } else if bytes.is_empty() {
+        DiagnosticCategory::Configuration
+    } else if bytes[0] == b'W' {
+        DiagnosticCategory::Advisory
+    } else if bytes.len() > 1 && bytes[1] == b'-' {
+        DiagnosticCategory::Security
+    } else if bytes.len() > 1 && bytes[1] == b'1' {
+        DiagnosticCategory::Composition
+    } else if bytes.len() > 1 && bytes[1] == b'2' {
+        DiagnosticCategory::SourceAndExpression
+    } else if bytes.len() > 1 && bytes[1] == b'3' {
+        DiagnosticCategory::ExecutionAndFormat
+    } else {
+        DiagnosticCategory::Configuration
+    }
+}
+
+const fn correction_for_code(code: &str) -> &'static str {
+    match category_for_code(code) {
+        DiagnosticCategory::Configuration => "Correct the source-located pipeline configuration.",
+        DiagnosticCategory::Composition => {
+            "Correct the source-located composition or overlay declaration."
+        }
+        DiagnosticCategory::SourceAndExpression => {
+            "Correct the source-located expression, source, or schema declaration."
+        }
+        DiagnosticCategory::ExecutionAndFormat => {
+            "Correct the source-located execution, format, or document declaration."
+        }
+        DiagnosticCategory::TerminalAuthoring => "type: sink",
+        DiagnosticCategory::Security => "Use a path contained by the admitted workspace roots.",
+        DiagnosticCategory::Advisory => {
+            "Review the source-located warning and adjust the declaration when appropriate."
+        }
+    }
 }
 
 /// Declare the diagnostic-code registry once, as data, and render its
@@ -60,7 +202,11 @@ macro_rules! diagnostic_registry {
             $(RegistryEntry {
                 code: $code,
                 severity: Severity::$severity,
+                lifecycle: lifecycle_for_code($code),
+                category: category_for_code($code),
+                retry_advice: RetryAdvice::DoNotRetry,
                 meaning: $meaning,
+                correction: correction_for_code($code),
             },)+
         ];
     };
@@ -186,10 +332,14 @@ diagnostic_registry! {
     "E309", Error, "Combine output schema is empty";
     "E310", Error, "Memory-budget surface exceeded the configured hard limit";
     "E311", Error, "Combine `match: collect` has a non-empty `cxl:` body";
+    "E312", Error, "Configured `memory.limit` is below the process baseline RSS";
     "E313", Error, "Combine `where:` has neither an equality nor a range conjunct";
     "E314", Error, "Schema mismatch at operator entry (column list divergence)";
     "E319", Error, "Combine `on_miss: error` had no matching build row";
+    "E320", Error, "Spill bytes exceeded `storage.spill.disk_cap_bytes`";
+    "E321", Error, "Spill volume ran out of space";
     "E325", Error, "Combine output exceeded the opt-in `max_output_rows` cap";
+    "E326", Error, "Combine decimal range key is outside the exact fixed-point representation";
     "E327", Error, "Combine range conjunct operands don't reduce to a supported range axis (ambiguous `numeric`, or non-orderable)";
     // ── DLQ thresholds and per-source routing ───────────────────────────
     "E315", Error, "Pipeline-wide DLQ rate exceeded `error_handling.dlq.max_rate`";
@@ -198,6 +348,15 @@ diagnostic_registry! {
     "E318", Error, "`error_handling.dlq.*.max_rate` out of `[0.0, 1.0]` or DLQ path collides";
     "E322", Error, "Two output destinations (Output nodes, or an Output node and a DLQ path) resolve to the same file";
     "E324", Error, "`pipeline.memory.resume_threshold` does not sit below the soft/spill threshold, so the two form no hysteresis band";
+    // ── Storage admission and staging ───────────────────────────────────
+    "E330", Error, "Spill directory is on an in-memory filesystem";
+    "E331", Error, "Spill directory is on a network filesystem";
+    "E332", Error, "Staging directory is on a network filesystem";
+    "E333", Error, "Staging directory shares a device with a staged source";
+    "E334", Error, "Spill and staging directories resolve to the same path";
+    "E335", Error, "Staged copy failed content verification";
+    "E336", Error, "Staging bytes exceeded `storage.staging.disk_cap_bytes`";
+    "E337", Error, "Staged copy already exists under `on_existing: error`";
     // ── Output splitting, document context, and envelopes ───────────────
     "E323", Error, "`edifact` output combined with byte-limit `split` (an interchange is one indivisible UNB..UNZ envelope)";
     "E338", Error, "`x12` output combined with byte-limit `split` (an interchange is one indivisible ISA..IEA envelope)";
@@ -206,6 +365,7 @@ diagnostic_registry! {
     "E341", Error, "A `$doc.<section>.<field>` access names an envelope section or field a feeding closed-schema source (XML / JSON) does not declare";
     "E342", Error, "`swift` output combined with byte-limit `split` (a SWIFT MT message is one indivisible brace-balanced `{1:..}..{5:..}` envelope)";
     "E343", Error, "A per-source-file output template (`{source_file}` / `{source_path}`) combined with a source declaring `dlq_granularity: document` (a buffered-and-flushed document is incompatible with per-record file fan-out)";
+    "E345", Error, "Multi-record source encountered an unknown record-type discriminator";
     "E348", Error, "A `$doc.<section>.<field>` access against a segment/positional source (X12 / EDIFACT / HL7) names a section the format does not synthesize, or a positional element outside the `e`/`f`-prefix pattern or beyond the configured `max_elements` / `max_fields`";
     "E349", Error, "A `$doc.<section>.<field>` access is attributed to a `rest` source (or a `rest` source declares an `envelope:` block) — a REST pull buffers no document, so the access can never resolve";
     "E344", Error, "A source declares `dlq_granularity: document` together with `error_handling.strategy: fail_fast`, which contradict each other";
@@ -216,6 +376,9 @@ diagnostic_registry! {
     "E355", Error, "A single-document-envelope output can be fed more than one document with no consolidating node on the path, which would silently merge distinct messages into one envelope";
     "E357", Error, "An envelope section on a segment/positional source names a tier other than the one file-level header segment the reader resolves from its bounded pre-scan";
     "E356", Error, "A plain single-schema CSV / fixed-width source declares an `envelope:` block — a plain flat file carries no header/trailer structure to extract, so the declared sections are inert (a multi-record source declaring `discriminator:` + `records:` is unaffected)";
+    "E350", Error, "Envelope concat would collapse distinct headers into one document";
+    "E351", Error, "Wired envelope header grain matches no body document";
+    "E352", Error, "Wired envelope header stream carries multiple headers for one body document";
     // ── Multi-value declarations (fan-out, split, join) ──────────────────
     "E358", Error, "Malformed `split_to_rows:` / `split_values:` source declaration (duplicate, nested, undeclared column, or a format whose reader is never handed it)";
     "E359", Error, "A `multiple:` column reaches an output whose format has no encoding for a field holding more than one value";
@@ -234,6 +397,7 @@ diagnostic_registry! {
     "E373", Error, "A transform log directive's `condition` is more than one predicate";
     "E374", Error, "A transform log directive requests a `fields` selector the input record does not carry";
     "E375", Error, "One `log` event name is declared with two different field sets in the same plan";
+    "E376", Error, "Terminal node uses the retired `type: output` spelling";
     // ── Path security ───────────────────────────────────────────────────
     "E-SEC-001", Error, "Path security violation (escape, symlink, etc.)";
     // ── Warnings ────────────────────────────────────────────────────────
@@ -245,6 +409,8 @@ diagnostic_registry! {
     "W305", Warning, "Combine where-clause has no equality conjuncts";
     "W306", Warning, "Combine planner cannot determine optimal driving input";
     "W307", Warning, "A physical source file violated its declared record order and was repaired before release";
+    "W365", Warning, "An Output `mapping:` column was present on no record";
+    "W366", Warning, "An upstream column was displaced by an Output `mapping:` name";
 }
 
 /// Whether `code` is listed in [`REGISTRY`].
@@ -252,15 +418,35 @@ diagnostic_registry! {
 /// The orphan-code test and the constructors' `debug_assert!` both resolve
 /// membership through here, so there is one definition of "registered".
 pub fn is_registered(code: &str) -> bool {
-    registered_severity(code).is_some()
+    registry_entry(code).is_some()
+}
+
+/// Return the immutable descriptor for `code`, if it is registered.
+pub fn registry_entry(code: &str) -> Option<&'static RegistryEntry> {
+    REGISTRY.iter().find(|entry| entry.code == code)
+}
+
+/// Iterate over descriptors with the requested lifecycle in registry order.
+pub fn registry_entries_with_lifecycle(
+    lifecycle: DiagnosticLifecycle,
+) -> impl Iterator<Item = &'static RegistryEntry> {
+    REGISTRY
+        .iter()
+        .filter(move |entry| entry.lifecycle == lifecycle)
+}
+
+/// Iterate over descriptors in one category in registry order.
+pub fn registry_entries_with_category(
+    category: DiagnosticCategory,
+) -> impl Iterator<Item = &'static RegistryEntry> {
+    REGISTRY
+        .iter()
+        .filter(move |entry| entry.category == category)
 }
 
 /// Registered severity for `code`, or `None` when the code is not listed.
 pub fn registered_severity(code: &str) -> Option<Severity> {
-    REGISTRY
-        .iter()
-        .find(|entry| entry.code == code)
-        .map(|entry| entry.severity)
+    registry_entry(code).map(|entry| entry.severity)
 }
 
 /// Severity level for a [`Diagnostic`].
@@ -883,6 +1069,52 @@ mod diagnostic_tests {
         assert_eq!(registered_severity("E001"), Some(Severity::Error));
         assert_eq!(registered_severity("W002"), Some(Severity::Warning));
         assert_eq!(registered_severity("E999"), None);
+    }
+
+    #[test]
+    fn registry_filters_are_typed_exact_and_stable() {
+        for lifecycle in [
+            DiagnosticLifecycle::Active,
+            DiagnosticLifecycle::RetiredReserved,
+        ] {
+            assert_eq!(
+                DiagnosticLifecycle::parse(lifecycle.as_str()),
+                Some(lifecycle)
+            );
+            assert!(
+                registry_entries_with_lifecycle(lifecycle)
+                    .all(|entry| entry.lifecycle == lifecycle)
+            );
+        }
+        assert_eq!(DiagnosticLifecycle::parse(""), None);
+        assert_eq!(DiagnosticLifecycle::parse("retired"), None);
+
+        let categories = [
+            DiagnosticCategory::Configuration,
+            DiagnosticCategory::Composition,
+            DiagnosticCategory::SourceAndExpression,
+            DiagnosticCategory::ExecutionAndFormat,
+            DiagnosticCategory::TerminalAuthoring,
+            DiagnosticCategory::Security,
+            DiagnosticCategory::Advisory,
+        ];
+        for category in categories {
+            assert_eq!(DiagnosticCategory::parse(category.as_str()), Some(category));
+            assert!(
+                registry_entries_with_category(category).all(|entry| entry.category == category)
+            );
+        }
+        assert_eq!(DiagnosticCategory::parse(""), None);
+        assert_eq!(DiagnosticCategory::parse("terminal"), None);
+    }
+
+    #[test]
+    fn registry_lookup_returns_the_authoritative_descriptor() {
+        let entry = registry_entry("E376").expect("retired Sink migration code is reserved");
+        assert_eq!(entry.lifecycle, DiagnosticLifecycle::RetiredReserved);
+        assert_eq!(entry.category, DiagnosticCategory::TerminalAuthoring);
+        assert_eq!(entry.correction, "type: sink");
+        assert!(registry_entry("E999").is_none());
     }
 
     #[cfg(debug_assertions)]

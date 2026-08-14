@@ -41,7 +41,55 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use clinker_core_types::diagnostic::is_registered;
+use clinker_core_types::RetryAdvice;
+use clinker_core_types::diagnostic::{
+    DiagnosticCategory, DiagnosticLifecycle, REGISTRY, Severity, is_registered,
+};
+
+#[test]
+fn retired_terminal_spelling_has_one_reserved_descriptor() {
+    let rows: Vec<_> = REGISTRY
+        .iter()
+        .filter(|entry| entry.lifecycle == DiagnosticLifecycle::RetiredReserved)
+        .collect();
+
+    assert_eq!(rows.len(), 1, "a retired code cannot be silently reused");
+    let entry = rows[0];
+    assert_eq!(entry.code, "E376");
+    assert_eq!(entry.severity, Severity::Error);
+    assert_eq!(entry.category, DiagnosticCategory::TerminalAuthoring);
+    assert_eq!(entry.retry_advice, RetryAdvice::DoNotRetry);
+    assert_eq!(
+        entry.meaning,
+        "Terminal node uses the retired `type: output` spelling"
+    );
+    assert_eq!(entry.correction, "type: sink");
+}
+
+#[test]
+fn registry_descriptors_are_complete_and_unique() {
+    let mut codes = std::collections::BTreeSet::new();
+    for entry in REGISTRY {
+        assert!(
+            codes.insert(entry.code),
+            "duplicate diagnostic code {}",
+            entry.code
+        );
+        assert!(
+            !entry.meaning.trim().is_empty(),
+            "{} has no meaning",
+            entry.code
+        );
+        assert!(
+            !entry.correction.trim().is_empty(),
+            "{} has no correction",
+            entry.code
+        );
+        assert!(!entry.lifecycle.as_str().is_empty());
+        assert!(!entry.category.as_str().is_empty());
+        assert!(!entry.retry_advice.as_str().is_empty());
+    }
+}
 
 #[test]
 fn attempt_diagnostic_codes_are_registered_once_with_stable_meanings() {
@@ -342,5 +390,54 @@ fn every_emitted_diagnostic_code_is_registered() {
         "orphan diagnostic code literals — each needs a row in the \
          `diagnostic_registry!` invocation in \
          crates/clinker-core-types/src/diagnostic.rs:\n{orphans}"
+    );
+}
+
+#[test]
+fn every_detail_page_is_unique_registered_and_addressable() {
+    let root = workspace_root();
+    let page_table_path = root.join("crates/clinker-plan/src/plan/explain_provenance.rs");
+    let page_table = std::fs::read_to_string(&page_table_path).expect("read detail-page table");
+    let marker = "include_str!(\"../../../../docs/explain/";
+    let mut table_codes = std::collections::BTreeSet::new();
+
+    for line in page_table.lines().filter(|line| line.contains(marker)) {
+        let code = line
+            .trim()
+            .strip_prefix("(\"")
+            .and_then(|rest| rest.split_once("\""))
+            .map(|(code, _)| code)
+            .expect("detail-page row starts with a code literal");
+        assert!(
+            table_codes.insert(code.to_owned()),
+            "duplicate detail-page registration for {code}"
+        );
+        assert!(
+            is_registered(code),
+            "detail page {code} has no leaf registry descriptor"
+        );
+
+        let page_path = root.join("docs/explain").join(format!("{code}.md"));
+        let page = std::fs::read_to_string(&page_path).expect("registered detail page exists");
+        let heading = page.lines().next().unwrap_or_default();
+        assert!(
+            heading.contains(code),
+            "detail page {code} does not name its own code in the heading"
+        );
+    }
+
+    assert!(!table_codes.is_empty(), "detail-page scan matched nothing");
+    let disk_codes: std::collections::BTreeSet<_> = std::fs::read_dir(root.join("docs/explain"))
+        .expect("read detail-page directory")
+        .map(|entry| entry.expect("detail-page directory entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .filter_map(|path| {
+            let stem = path.file_stem()?.to_str()?;
+            (stem != "README").then(|| stem.to_owned())
+        })
+        .collect();
+    assert_eq!(
+        table_codes, disk_codes,
+        "every detail page on disk must be joined exactly once"
     );
 }

@@ -10,7 +10,24 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::model::{FieldDescriptor, SchemaMetadata, SourceSchema};
+use crate::model::{FieldDescriptor, FieldType, SchemaMetadata, SourceFormat, SourceSchema};
+use crate::report::{
+    CoverageFacet, CoverageStatus, MAX_ADVISORY_FIELD_DEPTH, MAX_ADVISORY_FIELDS, ReportSubject,
+    SchemaCoverageReport,
+};
+
+/// Parsed advisory schema together with an explicit coverage report.
+#[derive(Debug, Clone)]
+pub struct SchemaAnalysis {
+    /// Present only when the advisory metadata document parsed successfully.
+    pub schema: Option<SourceSchema>,
+    /// Bounded statement of what the advisory pass inspected or declined.
+    pub report: SchemaCoverageReport,
+    /// Original parse or I/O failure when the advisory document could not be
+    /// represented. A planner-owned external schema shape can still produce a
+    /// `Partial` report while retaining this detail.
+    pub parse_error: Option<SchemaParseError>,
+}
 
 /// Intermediate deserialization target matching the `.schema.yaml` file layout.
 #[derive(Deserialize)]
@@ -40,6 +57,171 @@ pub fn parse_schema(yaml: &str, path: &Path) -> Result<SourceSchema, SchemaParse
 pub fn parse_schema_file(path: &Path) -> Result<SourceSchema, SchemaParseError> {
     let content = std::fs::read_to_string(path).map_err(|e| SchemaParseError::Io(e.to_string()))?;
     parse_schema(&content, path)
+}
+
+/// Analyze schema YAML without making an execution-admission claim.
+pub fn analyze_schema(yaml: &str, path: &Path) -> SchemaAnalysis {
+    if yaml.trim().is_empty() {
+        let mut report = SchemaCoverageReport::new(ReportSubject::Schema, path);
+        report.status = CoverageStatus::Skipped;
+        report.reason("empty-document", None, "schema document is empty");
+        report.sort_stably();
+        return SchemaAnalysis {
+            schema: None,
+            report,
+            parse_error: None,
+        };
+    }
+
+    match parse_schema(yaml, path) {
+        Ok(schema) => {
+            let mut report = report_for_schema(&schema);
+            report.sort_stably();
+            SchemaAnalysis {
+                schema: Some(schema),
+                report,
+                parse_error: None,
+            }
+        }
+        Err(error) => {
+            let mut report = SchemaCoverageReport::new(ReportSubject::Schema, path);
+            report.status = CoverageStatus::Failed;
+            report.reason("parse-failed", None, error.to_string());
+            report.sort_stably();
+            SchemaAnalysis {
+                schema: None,
+                report,
+                parse_error: Some(error),
+            }
+        }
+    }
+}
+
+/// Analyze a schema file through the advisory model and distinguish a
+/// planner-owned external schema shape from malformed input.
+pub fn analyze_schema_file(path: &Path) -> SchemaAnalysis {
+    let yaml = match std::fs::read_to_string(path) {
+        Ok(yaml) => yaml,
+        Err(error) => {
+            let error = SchemaParseError::Io(error.to_string());
+            let mut report = SchemaCoverageReport::new(ReportSubject::Schema, path);
+            report.status = CoverageStatus::Failed;
+            report.reason("read-failed", None, error.to_string());
+            report.sort_stably();
+            return SchemaAnalysis {
+                schema: None,
+                report,
+                parse_error: Some(error),
+            };
+        }
+    };
+
+    let mut analysis = analyze_schema(&yaml, path);
+    if analysis.report.status == CoverageStatus::Failed
+        && clinker_plan::schema::source_schema_facts(path).is_ok()
+    {
+        analysis.report.status = CoverageStatus::Partial;
+        analysis.report.unsupported_facets.clear();
+        analysis.report.reasons.clear();
+        analysis.report.decline(
+            CoverageFacet::PlannerSchemaShape,
+            "planner-schema-shape",
+            "planner-owned external schema syntax is outside the advisory metadata model",
+        );
+        analysis.report.sort_stably();
+    }
+    analysis
+}
+
+fn report_for_schema(schema: &SourceSchema) -> SchemaCoverageReport {
+    let mut report = SchemaCoverageReport::new(ReportSubject::Schema, &schema.path);
+    report.support(CoverageFacet::Metadata);
+    report.support(CoverageFacet::FieldNames);
+    report.support(CoverageFacet::FieldTypes);
+    report.support(CoverageFacet::Nullability);
+
+    if schema.fields.is_empty() {
+        report.status = CoverageStatus::Skipped;
+        report.reason("empty-fields", None, "schema declares no fields to inspect");
+        return report;
+    }
+
+    if schema.metadata.format == SourceFormat::Parquet {
+        report.decline(
+            CoverageFacet::FormatCompatibility,
+            "unsupported-format",
+            "the advisory format model includes parquet, but pipeline source configuration does not",
+        );
+    } else {
+        report.support(CoverageFacet::FormatCompatibility);
+    }
+
+    let mut stack: Vec<(&FieldDescriptor, usize)> =
+        schema.fields.iter().rev().map(|field| (field, 1)).collect();
+    let mut visited = 0usize;
+    let mut saw_nested = false;
+    let mut saw_enum = false;
+
+    while let Some((field, depth)) = stack.pop() {
+        if visited == MAX_ADVISORY_FIELDS {
+            report.decline(
+                CoverageFacet::NestedFields,
+                "field-limit",
+                format!("field count exceeds the advisory limit of {MAX_ADVISORY_FIELDS}"),
+            );
+            break;
+        }
+        visited += 1;
+
+        if field.enum_values.is_some() {
+            saw_enum = true;
+        }
+        if field.field_type == FieldType::Array {
+            report.decline(
+                CoverageFacet::ArrayElementTypes,
+                "array-element-type-unmodeled",
+                format!(
+                    "array field '{}' has no advisory element-type declaration",
+                    field.name
+                ),
+            );
+        }
+
+        if let Some(children) = &field.fields {
+            saw_nested = true;
+            if depth >= MAX_ADVISORY_FIELD_DEPTH {
+                report.decline(
+                    CoverageFacet::NestedFields,
+                    "field-depth-limit",
+                    format!(
+                        "field '{}' reaches the advisory depth limit of {MAX_ADVISORY_FIELD_DEPTH}",
+                        field.name
+                    ),
+                );
+                continue;
+            }
+            stack.extend(children.iter().rev().map(|child| (child, depth + 1)));
+        } else if field.field_type == FieldType::Object {
+            report.decline(
+                CoverageFacet::NestedFields,
+                "object-shape-unmodeled",
+                format!("object field '{}' declares no child fields", field.name),
+            );
+        }
+    }
+
+    if saw_nested
+        && !report
+            .unsupported_facets
+            .contains(&CoverageFacet::NestedFields)
+    {
+        report.support(CoverageFacet::NestedFields);
+    }
+    if saw_enum {
+        report.support(CoverageFacet::EnumConstraints);
+    }
+
+    report
 }
 
 /// Errors during schema parsing.

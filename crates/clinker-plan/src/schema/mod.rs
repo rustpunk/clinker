@@ -10,6 +10,26 @@ use std::path::Path;
 
 use clinker_format::SourceSchema;
 
+/// Structural form observed by the planner's external-schema parser.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalSchemaShape {
+    Columns,
+    MultiRecord,
+    Generated,
+}
+
+/// Narrow, read-only facts from the planner-owned external-schema parser.
+///
+/// These facts let authoring tools compare their advisory reach with the real
+/// parser without reimplementing its schema vocabulary. They do not replace
+/// pipeline compilation or carry an execution-admission result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalSchemaFacts {
+    pub shape: ExternalSchemaShape,
+    pub declared_columns: usize,
+    pub record_types: usize,
+}
+
 /// Schema subsystem errors.
 #[derive(Debug)]
 pub enum SchemaError {
@@ -62,6 +82,42 @@ pub fn load_source_schema(path: &Path) -> Result<SourceSchema, SchemaError> {
         )));
     }
     Ok(schema)
+}
+
+/// Parse one external schema through the planner-owned path and return only
+/// bounded structural facts for advisory comparison.
+pub fn source_schema_facts(path: &Path) -> Result<ExternalSchemaFacts, SchemaError> {
+    let schema = load_source_schema(path)?;
+    match schema {
+        SourceSchema::Columns(columns) => Ok(ExternalSchemaFacts {
+            shape: ExternalSchemaShape::Columns,
+            declared_columns: columns.len(),
+            record_types: 0,
+        }),
+        SourceSchema::MultiRecord { record_types, .. } => {
+            let declared_columns = record_types.iter().try_fold(0usize, |total, record| {
+                total.checked_add(record.columns.len())
+            });
+            let Some(declared_columns) = declared_columns else {
+                return Err(SchemaError::Validation(
+                    "schema declared-column count overflowed".to_string(),
+                ));
+            };
+            Ok(ExternalSchemaFacts {
+                shape: ExternalSchemaShape::MultiRecord,
+                declared_columns,
+                record_types: record_types.len(),
+            })
+        }
+        SourceSchema::Generated(_) => Ok(ExternalSchemaFacts {
+            shape: ExternalSchemaShape::Generated,
+            declared_columns: 0,
+            record_types: 0,
+        }),
+        SourceSchema::File(_) => Err(SchemaError::Validation(
+            "external schema remained a nested file reference".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]

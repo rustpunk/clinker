@@ -1,11 +1,15 @@
 //! Strict typed release decision and authorization validation.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::DateTime;
 
 use crate::canonical::{self, CanonicalValue};
+use crate::child::{self, ChildSpec, Termination};
 use crate::digest;
 use crate::error::GateError;
 use crate::limits::{MAX_DECISION_RECORDS, MAX_INPUT_BYTES, MAX_SCHEMA_BYTES, read_bounded};
@@ -47,6 +51,606 @@ const AUTHORIZATION_IDENTITY_FIELDS: [&str; 9] = [
     "inventory_ref",
     "authorized_release_maintainer_ref",
 ];
+const PHASE4_METADATA_LIMIT: u64 = 4 * 1024 * 1024;
+const PHASE4_STDERR_LIMIT: usize = 64 * 1024;
+const SERDE_JSON_VERSION: &str = "1.0.149";
+const FS4_VERSION: &str = "1.1.0";
+const SERDE_JSON_ID: &str =
+    "registry+https://github.com/rust-lang/crates.io-index#serde_json@1.0.149";
+const FS4_ID: &str = "registry+https://github.com/rust-lang/crates.io-index#fs4@1.1.0";
+const RUSTIX_ID: &str = "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.4";
+const BITFLAGS_ID: &str = "registry+https://github.com/rust-lang/crates.io-index#bitflags@2.11.0";
+const ERRNO_ID: &str = "registry+https://github.com/rust-lang/crates.io-index#errno@0.3.14";
+const LIBC_ID: &str = "registry+https://github.com/rust-lang/crates.io-index#libc@0.2.183";
+const LINUX_RAW_SYS_ID: &str =
+    "registry+https://github.com/rust-lang/crates.io-index#linux-raw-sys@0.12.1";
+const WINDOWS_SYS_ID: &str =
+    "registry+https://github.com/rust-lang/crates.io-index#windows-sys@0.61.2";
+const WINDOWS_LINK_ID: &str =
+    "registry+https://github.com/rust-lang/crates.io-index#windows-link@0.2.1";
+
+/// Verify the fixed Phase 4 dependency contract from Cargo's own structured
+/// manifest and lockfile resolution.
+pub fn verify_phase4_capabilities(workspace_root: &Path) -> Result<(), GateError> {
+    let workspace_root = workspace_root
+        .canonicalize()
+        .map_err(|error| GateError::io("resolve Phase 4 workspace root", &error))?;
+    let manifest = workspace_root.join("Cargo.toml");
+    if !manifest.is_file() {
+        return Err(GateError::usage("--workspace-root must contain Cargo.toml"));
+    }
+
+    let mut environment = BTreeMap::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        environment.insert(OsString::from("PATH"), path);
+    }
+    let mut output = tempfile::tempfile()
+        .map_err(|error| GateError::io("create Cargo metadata capture", &error))?;
+    let capture = output
+        .try_clone()
+        .map_err(|error| GateError::io("clone Cargo metadata capture", &error))?;
+    let result = child::run_stdout_to_file(
+        ChildSpec {
+            program: PathBuf::from("cargo"),
+            arguments: vec![
+                OsString::from("metadata"),
+                OsString::from("--format-version"),
+                OsString::from("1"),
+                OsString::from("--locked"),
+                OsString::from("--offline"),
+                OsString::from("--manifest-path"),
+                manifest.into_os_string(),
+            ],
+            environment,
+            timeout: Duration::from_secs(60),
+            output_limit: PHASE4_STDERR_LIMIT,
+        },
+        capture,
+        PHASE4_METADATA_LIMIT,
+    )?;
+    if result.termination != Termination::Exited(Some(0))
+        || result.stdout_truncated
+        || result.stderr_truncated
+    {
+        return Err(GateError::internal(
+            "decision.phase4_metadata",
+            "locked offline Cargo metadata did not complete within fixed bounds",
+        ));
+    }
+    output
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| GateError::io("rewind Cargo metadata capture", &error))?;
+    let mut bytes = Vec::with_capacity(PHASE4_METADATA_LIMIT as usize);
+    output
+        .take(PHASE4_METADATA_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| GateError::io("read Cargo metadata capture", &error))?;
+    if bytes.len() > PHASE4_METADATA_LIMIT as usize {
+        return Err(policy("Cargo metadata exceeded its fixed byte limit"));
+    }
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| policy("Cargo metadata was not valid JSON"))?;
+    verify_phase4_capability_metadata(&workspace_root, &metadata)
+}
+
+/// Verify a captured Cargo metadata document.
+///
+/// This is public so contract tests can exercise adversarial metadata without
+/// adding a second manifest parser or invoking mutable approval state.
+pub fn verify_phase4_capability_metadata(
+    workspace_root: &Path,
+    metadata: &serde_json::Value,
+) -> Result<(), GateError> {
+    let document = metadata_object(metadata, "metadata")?;
+    let reported_root = metadata_string(
+        document
+            .get("workspace_root")
+            .ok_or_else(|| policy("metadata.workspace_root is missing"))?,
+        "metadata.workspace_root",
+    )?;
+    if Path::new(reported_root) != workspace_root {
+        return Err(policy(
+            "metadata.workspace_root does not match --workspace-root",
+        ));
+    }
+    let packages = metadata_array(
+        document
+            .get("packages")
+            .ok_or_else(|| policy("metadata.packages is missing"))?,
+        "metadata.packages",
+    )?;
+    let resolve = metadata_object(
+        document
+            .get("resolve")
+            .ok_or_else(|| policy("metadata.resolve is missing"))?,
+        "metadata.resolve",
+    )?;
+    let nodes = metadata_array(
+        resolve
+            .get("nodes")
+            .ok_or_else(|| policy("metadata.resolve.nodes is missing"))?,
+        "metadata.resolve.nodes",
+    )?;
+
+    reject_duplicate_packages(packages)?;
+    verify_serde_json_contract(workspace_root, packages, nodes)?;
+    verify_fs4_owner_contract(workspace_root, packages)?;
+    verify_fs4_package_contract(packages, nodes)?;
+    Ok(())
+}
+
+fn reject_duplicate_packages(packages: &[serde_json::Value]) -> Result<(), GateError> {
+    let mut ids = BTreeSet::new();
+    let mut exact_names = BTreeSet::new();
+    for package in packages {
+        let package = metadata_object(package, "metadata package")?;
+        let id = metadata_string_field(package, "id", "metadata package")?;
+        let name = metadata_string_field(package, "name", "metadata package")?;
+        let version = metadata_string_field(package, "version", "metadata package")?;
+        if !ids.insert(id) || !exact_names.insert((name, version)) {
+            return Err(policy(format!(
+                "metadata contains a duplicate package {name} {version}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_serde_json_contract(
+    workspace_root: &Path,
+    packages: &[serde_json::Value],
+    nodes: &[serde_json::Value],
+) -> Result<(), GateError> {
+    let serde_package = exact_package(packages, "serde_json", SERDE_JSON_VERSION)?;
+    let serde_id = metadata_string_field(serde_package, "id", "serde_json package")?;
+    if serde_id != SERDE_JSON_ID {
+        return Err(policy(
+            "serde_json 1.0.149 resolved from an unapproved source",
+        ));
+    }
+    let serde_node = exact_node(nodes, serde_id)?;
+    require_string_set(
+        serde_node,
+        "features",
+        &["default", "indexmap", "preserve_order", "std"],
+        "resolved serde_json features",
+    )?;
+
+    let mut consumers = 0_usize;
+    for package in packages {
+        let package = metadata_object(package, "metadata package")?;
+        let Some(manifest_path) = package
+            .get("manifest_path")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if !Path::new(manifest_path).starts_with(workspace_root) {
+            continue;
+        }
+        for dependency in metadata_array_field(package, "dependencies", "workspace package")? {
+            let dependency = metadata_object(dependency, "workspace dependency")?;
+            if metadata_string_field(dependency, "name", "workspace dependency")? != "serde_json" {
+                continue;
+            }
+            consumers += 1;
+            require_dependency_shape(
+                dependency,
+                "serde_json",
+                "^1",
+                true,
+                &["preserve_order"],
+                None,
+                "workspace serde_json declaration",
+            )?;
+        }
+    }
+    if consumers == 0 {
+        return Err(policy(
+            "Cargo.toml exposes no workspace serde_json dependency declaration",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_fs4_owner_contract(
+    workspace_root: &Path,
+    packages: &[serde_json::Value],
+) -> Result<(), GateError> {
+    for (name, relative_manifest, expects_fs4) in [
+        ("clinker", "crates/clinker/Cargo.toml", true),
+        ("clinker-plan", "crates/clinker-plan/Cargo.toml", false),
+        ("clinker-format", "crates/clinker-format/Cargo.toml", false),
+        ("clinker-record", "crates/clinker-record/Cargo.toml", false),
+        (
+            "clinker-core-types",
+            "crates/clinker-core-types/Cargo.toml",
+            false,
+        ),
+        ("cxl", "crates/cxl/Cargo.toml", false),
+    ] {
+        let package = exact_package_by_name(packages, name)?;
+        let manifest = metadata_string_field(package, "manifest_path", "workspace package")?;
+        if Path::new(manifest) != workspace_root.join(relative_manifest) {
+            return Err(policy(format!(
+                "{relative_manifest} resolved through an unexpected manifest"
+            )));
+        }
+        let dependencies = metadata_array_field(package, "dependencies", "workspace package")?;
+        let fs4: Vec<_> = dependencies
+            .iter()
+            .filter_map(serde_json::Value::as_object)
+            .filter(|dependency| {
+                dependency.get("name").and_then(serde_json::Value::as_str) == Some("fs4")
+            })
+            .collect();
+        if expects_fs4 {
+            if fs4.len() != 1 {
+                return Err(policy(
+                    "crates/clinker/Cargo.toml must own exactly one direct fs4 edge",
+                ));
+            }
+            require_dependency_shape(
+                fs4[0],
+                "fs4",
+                "^1",
+                false,
+                &["sync"],
+                None,
+                "crates/clinker/Cargo.toml fs4 dependency",
+            )?;
+        } else if !fs4.is_empty() {
+            return Err(policy(format!("{relative_manifest} must not declare fs4")));
+        }
+    }
+    Ok(())
+}
+
+fn verify_fs4_package_contract(
+    packages: &[serde_json::Value],
+    nodes: &[serde_json::Value],
+) -> Result<(), GateError> {
+    let fs4 = exact_package(packages, "fs4", FS4_VERSION)?;
+    if metadata_string_field(fs4, "id", "fs4 package")? != FS4_ID {
+        return Err(policy("fs4 1.1.0 resolved from an unapproved source"));
+    }
+    if !fs4.get("links").is_some_and(serde_json::Value::is_null) {
+        return Err(policy("fs4 1.1.0 must not declare links"));
+    }
+    let targets = metadata_array_field(fs4, "targets", "fs4 package")?;
+    if targets.len() != 1 {
+        return Err(policy("fs4 1.1.0 must expose one unambiguous lib target"));
+    }
+    let target = metadata_object(&targets[0], "fs4 target")?;
+    require_string_set(target, "kind", &["lib"], "fs4 target kind")?;
+    require_string_set(target, "crate_types", &["lib"], "fs4 crate type")?;
+
+    let declarations = metadata_array_field(fs4, "dependencies", "fs4 package")?;
+    for declaration in declarations {
+        let declaration = metadata_object(declaration, "fs4 dependency")?;
+        if declaration.get("kind").and_then(serde_json::Value::as_str) == Some("build") {
+            return Err(policy("fs4 1.1.0 must not declare a build dependency"));
+        }
+    }
+    let rustix = exact_dependency(declarations, "rustix")?;
+    require_dependency_shape(
+        rustix,
+        "rustix",
+        "^1",
+        true,
+        &["fs"],
+        Some("cfg(not(windows))"),
+        "fs4 Unix dependency",
+    )?;
+    let windows = exact_dependency(declarations, "windows-sys")?;
+    require_dependency_shape(
+        windows,
+        "windows-sys",
+        "^0.61",
+        true,
+        &[
+            "Win32_Foundation",
+            "Win32_Storage_FileSystem",
+            "Win32_System_IO",
+        ],
+        Some("cfg(windows)"),
+        "fs4 Windows dependency",
+    )?;
+
+    let fs4_node = exact_node(nodes, FS4_ID)?;
+    require_string_set(fs4_node, "features", &["sync"], "resolved fs4 features")?;
+    require_resolved_deps(
+        fs4_node,
+        &[
+            ("rustix", RUSTIX_ID, "cfg(not(windows))"),
+            ("windows_sys", WINDOWS_SYS_ID, "cfg(windows)"),
+        ],
+        "resolved fs4 dependencies",
+    )?;
+
+    for (name, version, id) in [
+        ("rustix", "1.1.4", RUSTIX_ID),
+        ("bitflags", "2.11.0", BITFLAGS_ID),
+        ("errno", "0.3.14", ERRNO_ID),
+        ("libc", "0.2.183", LIBC_ID),
+        ("linux-raw-sys", "0.12.1", LINUX_RAW_SYS_ID),
+        ("windows-sys", "0.61.2", WINDOWS_SYS_ID),
+        ("windows-link", "0.2.1", WINDOWS_LINK_ID),
+    ] {
+        let package = exact_package(packages, name, version)?;
+        if metadata_string_field(package, "id", "fs4 support package")? != id {
+            return Err(policy(format!(
+                "fs4 support package {name} {version} resolved from an unapproved source"
+            )));
+        }
+    }
+    let rustix_node = exact_node(nodes, RUSTIX_ID)?;
+    require_resolved_dep_packages(
+        rustix_node,
+        &[
+            ("bitflags", BITFLAGS_ID),
+            ("libc_errno", ERRNO_ID),
+            ("libc", LIBC_ID),
+            ("linux_raw_sys", LINUX_RAW_SYS_ID),
+            ("windows_sys", WINDOWS_SYS_ID),
+        ],
+        "resolved rustix support graph",
+    )?;
+    require_resolved_dep_packages(
+        exact_node(nodes, WINDOWS_SYS_ID)?,
+        &[("windows_link", WINDOWS_LINK_ID)],
+        "resolved windows-sys support graph",
+    )?;
+    Ok(())
+}
+
+fn exact_package<'a>(
+    packages: &'a [serde_json::Value],
+    name: &str,
+    version: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, GateError> {
+    let matches: Vec<_> = packages
+        .iter()
+        .filter_map(serde_json::Value::as_object)
+        .filter(|package| {
+            package.get("name").and_then(serde_json::Value::as_str) == Some(name)
+                && package.get("version").and_then(serde_json::Value::as_str) == Some(version)
+        })
+        .collect();
+    if matches.len() != 1 {
+        return Err(policy(format!(
+            "metadata must contain exactly one {name} {version} package"
+        )));
+    }
+    Ok(matches[0])
+}
+
+fn exact_package_by_name<'a>(
+    packages: &'a [serde_json::Value],
+    name: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, GateError> {
+    let matches: Vec<_> = packages
+        .iter()
+        .filter_map(serde_json::Value::as_object)
+        .filter(|package| package.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        .collect();
+    if matches.len() != 1 {
+        return Err(policy(format!(
+            "metadata must contain exactly one workspace package {name}"
+        )));
+    }
+    Ok(matches[0])
+}
+
+fn exact_node<'a>(
+    nodes: &'a [serde_json::Value],
+    id: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, GateError> {
+    let matches: Vec<_> = nodes
+        .iter()
+        .filter_map(serde_json::Value::as_object)
+        .filter(|node| node.get("id").and_then(serde_json::Value::as_str) == Some(id))
+        .collect();
+    if matches.len() != 1 {
+        return Err(policy(format!(
+            "metadata must contain exactly one resolved node for {id}"
+        )));
+    }
+    Ok(matches[0])
+}
+
+fn exact_dependency<'a>(
+    dependencies: &'a [serde_json::Value],
+    name: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, GateError> {
+    let matches: Vec<_> = dependencies
+        .iter()
+        .filter_map(serde_json::Value::as_object)
+        .filter(|dependency| {
+            dependency.get("name").and_then(serde_json::Value::as_str) == Some(name)
+        })
+        .collect();
+    if matches.len() != 1 {
+        return Err(policy(format!(
+            "fs4 package must declare exactly one {name} dependency"
+        )));
+    }
+    Ok(matches[0])
+}
+
+fn require_dependency_shape(
+    dependency: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    requirement: &str,
+    default_features: bool,
+    features: &[&str],
+    target: Option<&str>,
+    context: &str,
+) -> Result<(), GateError> {
+    if metadata_string_field(dependency, "name", context)? != name
+        || metadata_string_field(dependency, "req", context)? != requirement
+        || dependency.get("kind").is_none_or(|value| !value.is_null())
+        || dependency
+            .get("rename")
+            .is_none_or(|value| !value.is_null())
+        || dependency
+            .get("optional")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || dependency
+            .get("uses_default_features")
+            .and_then(serde_json::Value::as_bool)
+            != Some(default_features)
+    {
+        return Err(policy(format!("{context} has an unapproved shape")));
+    }
+    match (target, dependency.get("target")) {
+        (None, Some(value)) if value.is_null() => {}
+        (Some(expected), Some(value)) if value.as_str() == Some(expected) => {}
+        _ => return Err(policy(format!("{context} has an unapproved target"))),
+    }
+    require_string_set(dependency, "features", features, context)
+}
+
+fn require_resolved_deps(
+    node: &serde_json::Map<String, serde_json::Value>,
+    expected: &[(&str, &str, &str)],
+    context: &str,
+) -> Result<(), GateError> {
+    let deps = metadata_array_field(node, "deps", context)?;
+    if deps.len() != expected.len() {
+        return Err(policy(format!("{context} changed")));
+    }
+    for (name, package_id, target) in expected {
+        let matches: Vec<_> = deps
+            .iter()
+            .filter_map(serde_json::Value::as_object)
+            .filter(|dependency| {
+                dependency.get("name").and_then(serde_json::Value::as_str) == Some(*name)
+            })
+            .collect();
+        if matches.len() != 1 {
+            return Err(policy(format!("{context} changed at {name}")));
+        }
+        if matches[0].get("pkg").and_then(serde_json::Value::as_str) != Some(*package_id) {
+            return Err(policy(format!(
+                "{context} resolved {name} to an unapproved package"
+            )));
+        }
+        let kinds = metadata_array_field(matches[0], "dep_kinds", context)?;
+        if kinds.len() != 1 {
+            return Err(policy(format!("{context} has ambiguous kinds for {name}")));
+        }
+        let kind = metadata_object(&kinds[0], "resolved dependency kind")?;
+        if kind.get("kind").is_none_or(|value| !value.is_null())
+            || kind.get("target").and_then(serde_json::Value::as_str) != Some(*target)
+        {
+            return Err(policy(format!("{context} changed at {name}")));
+        }
+    }
+    Ok(())
+}
+
+fn require_resolved_dep_packages(
+    node: &serde_json::Map<String, serde_json::Value>,
+    expected: &[(&str, &str)],
+    context: &str,
+) -> Result<(), GateError> {
+    let deps = metadata_array_field(node, "deps", context)?;
+    let actual: BTreeMap<_, _> = deps
+        .iter()
+        .filter_map(serde_json::Value::as_object)
+        .filter_map(|dependency| {
+            Some((
+                dependency.get("name")?.as_str()?,
+                dependency.get("pkg")?.as_str()?,
+            ))
+        })
+        .collect();
+    let expected: BTreeMap<_, _> = expected.iter().copied().collect();
+    if actual != expected || deps.len() != actual.len() {
+        return Err(policy(format!("{context} changed")));
+    }
+    for dependency in deps {
+        let dependency = metadata_object(dependency, context)?;
+        for kind in metadata_array_field(dependency, "dep_kinds", context)? {
+            let kind = metadata_object(kind, context)?;
+            if kind.get("kind").is_none_or(|value| !value.is_null()) {
+                return Err(policy(format!("{context} gained a non-normal edge")));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_string_set(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    expected: &[&str],
+    context: &str,
+) -> Result<(), GateError> {
+    let values = metadata_array_field(object, field, context)?;
+    let actual: BTreeSet<_> = values
+        .iter()
+        .map(|value| metadata_string(value, context))
+        .collect::<Result<_, _>>()?;
+    let expected: BTreeSet<_> = expected.iter().copied().collect();
+    if actual != expected || values.len() != actual.len() {
+        return Err(policy(format!("{context} changed")));
+    }
+    Ok(())
+}
+
+fn metadata_object<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, GateError> {
+    value
+        .as_object()
+        .ok_or_else(|| policy(format!("{field} must be an object")))
+}
+
+fn metadata_array<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a [serde_json::Value], GateError> {
+    value
+        .as_array()
+        .map(Vec::as_slice)
+        .ok_or_else(|| policy(format!("{field} must be an array")))
+}
+
+fn metadata_array_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    context: &str,
+) -> Result<&'a [serde_json::Value], GateError> {
+    metadata_array(
+        object
+            .get(field)
+            .ok_or_else(|| policy(format!("{context}.{field} is missing")))?,
+        &format!("{context}.{field}"),
+    )
+}
+
+fn metadata_string<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str, GateError> {
+    value
+        .as_str()
+        .ok_or_else(|| policy(format!("{field} must be a string")))
+}
+
+fn metadata_string_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    context: &str,
+) -> Result<&'a str, GateError> {
+    metadata_string(
+        object
+            .get(field)
+            .ok_or_else(|| policy(format!("{context}.{field} is missing")))?,
+        &format!("{context}.{field}"),
+    )
+}
 
 /// Fully preflighted decision-validation request.
 #[derive(Debug, Clone)]

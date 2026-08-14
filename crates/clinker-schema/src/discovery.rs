@@ -10,10 +10,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::model::{SchemaIndex, SourceSchema};
-use crate::parse::{SchemaParseError, parse_schema};
+use crate::parse::{SchemaParseError, analyze_schema_file, parse_schema};
+use crate::report::{
+    CoverageFacet, CoverageStatus, ReportLocation, ReportSubject, SchemaCoverageReport,
+    SchemaReference,
+};
 
 /// Default schema directory name relative to workspace root.
 pub const DEFAULT_SCHEMA_DIR: &str = "schemas";
+
+/// Complete bounded advisory result for one workspace scan.
+#[derive(Debug)]
+pub struct WorkspaceSchemaAnalysis {
+    pub index: SchemaIndex,
+    pub reports: Vec<SchemaCoverageReport>,
+    pub parse_errors: Vec<(PathBuf, SchemaParseError)>,
+}
 
 /// Returns whether the path's extension is a YAML extension, ignoring case.
 ///
@@ -95,7 +107,7 @@ pub fn discover_pipelines(
     let schema_path = workspace_root.join(schema_dir);
     let templates_path = workspace_root.join("templates");
 
-    entries
+    let mut paths: Vec<_> = entries
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
             let path = entry.path();
@@ -118,7 +130,9 @@ pub fn discover_pipelines(
             true
         })
         .map(|entry| entry.path())
-        .collect()
+        .collect();
+    paths.sort();
+    paths
 }
 
 /// Discover pipelines using include/exclude glob patterns.
@@ -211,32 +225,105 @@ fn wildcard_match_ascii_case_insensitive(pattern: &str, candidate: &str) -> bool
     p == pattern.len()
 }
 
-/// Extract `schema:` references from a pipeline YAML file.
+/// Extract external schema references through the canonical typed pipeline parser.
 ///
-/// Parses the YAML as raw text (fast regex scan) rather than full deserialization,
-/// because we only need the schema paths — not the full pipeline model.
-/// Returns schema paths as they appear in the YAML (may be relative).
+/// Malformed or retired pipeline syntax produces no references here; callers
+/// that need the reason use [`analyze_pipeline_file`].
 pub fn extract_schema_refs(pipeline_path: &Path) -> Vec<String> {
-    let Ok(content) = fs::read_to_string(pipeline_path) else {
-        return Vec::new();
-    };
-    extract_schema_refs_from_str(&content)
+    let workspace_root = pipeline_path.parent().unwrap_or_else(|| Path::new("."));
+    analyze_pipeline_file(pipeline_path, workspace_root)
+        .references
+        .into_iter()
+        .filter_map(|reference| reference.schema_path.into_os_string().into_string().ok())
+        .collect()
 }
 
-/// Extract `schema:` references from YAML text.
+/// Structured in-memory reference extraction used by focused parser tests.
+#[cfg(test)]
 fn extract_schema_refs_from_str(yaml: &str) -> Vec<String> {
-    let mut refs = Vec::new();
-    for line in yaml.lines() {
-        let trimmed = line.trim();
-        // Match "schema: path/to/file.schema.yaml" (not schema_overrides, schema_inline)
-        if let Some(value) = trimmed.strip_prefix("schema:") {
-            let value = value.trim().trim_matches('"').trim_matches('\'');
-            if !value.is_empty() && !value.starts_with('{') && !value.starts_with('[') {
-                refs.push(value.to_string());
+    let Ok(config) = clinker_plan::config::parse_config(yaml) else {
+        return Vec::new();
+    };
+    let mut references: Vec<String> = config
+        .source_bodies()
+        .filter_map(|body| match &body.schema {
+            clinker_plan::config::SourceSchema::File(path) => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    references.sort();
+    references.dedup();
+    references
+}
+
+/// Analyze a pipeline's external schema references without compiling it.
+pub fn analyze_pipeline_file(pipeline_path: &Path, workspace_root: &Path) -> SchemaCoverageReport {
+    let mut report = SchemaCoverageReport::new(ReportSubject::Pipeline, pipeline_path);
+    let yaml = match fs::read_to_string(pipeline_path) {
+        Ok(yaml) => yaml,
+        Err(error) => {
+            report.status = CoverageStatus::Failed;
+            report.reason(
+                "read-failed",
+                None,
+                format!("pipeline read failed: {error}"),
+            );
+            report.sort_stably();
+            return report;
+        }
+    };
+
+    if yaml.trim().is_empty() {
+        report.status = CoverageStatus::Skipped;
+        report.reason("empty-document", None, "pipeline document is empty");
+        report.sort_stably();
+        return report;
+    }
+
+    let config = match clinker_plan::config::parse_config(&yaml) {
+        Ok(config) => config,
+        Err(error) => {
+            report.status = CoverageStatus::Failed;
+            report.reason(
+                "pipeline-parse-failed",
+                None,
+                format!("pipeline structure could not be inspected: {error}"),
+            );
+            report.sort_stably();
+            return report;
+        }
+    };
+
+    for body in config.source_bodies() {
+        if let clinker_plan::config::SourceSchema::File(path) = &body.schema {
+            let schema_path = PathBuf::from(path);
+            report.reference(SchemaReference {
+                schema_path: schema_path.clone(),
+                location: ReportLocation::file(pipeline_path),
+            });
+            if !workspace_root.join(&schema_path).is_file() {
+                report.status = CoverageStatus::Failed;
+                report.reason(
+                    "unresolved-reference",
+                    Some(CoverageFacet::PipelineReferences),
+                    format!("schema reference '{}' does not resolve to a file", path),
+                );
             }
         }
     }
-    refs
+
+    if report.references.is_empty() {
+        report.status = CoverageStatus::Skipped;
+        report.reason(
+            "no-external-schema",
+            Some(CoverageFacet::PipelineReferences),
+            "pipeline declares no external schema references",
+        );
+    } else if report.status == CoverageStatus::Analyzed {
+        report.support(CoverageFacet::PipelineReferences);
+    }
+    report.sort_stably();
+    report
 }
 
 /// Resolve `schema:` references from pipelines to populate `referencing_pipelines`
@@ -281,38 +368,74 @@ pub fn build_workspace_schema_index(
     include_globs: &[String],
     exclude_globs: &[String],
 ) -> (SchemaIndex, Vec<(PathBuf, SchemaParseError)>) {
+    let analysis =
+        analyze_workspace_schemas(workspace_root, schema_dir, include_globs, exclude_globs);
+    (analysis.index, analysis.parse_errors)
+}
+
+/// Discover schemas and pipelines through typed parsing and retain explicit
+/// advisory coverage for every inspected artifact.
+pub fn analyze_workspace_schemas(
+    workspace_root: &Path,
+    schema_dir: &str,
+    include_globs: &[String],
+    exclude_globs: &[String],
+) -> WorkspaceSchemaAnalysis {
     let schema_path = workspace_root.join(schema_dir);
 
-    // 1. Discover and parse schemas
-    let results = discover_schemas(&schema_path);
+    // 1. Discover and analyze schemas in deterministic path order.
+    let mut schema_files = Vec::new();
+    if let Ok(entries) = fs::read_dir(&schema_path) {
+        schema_files.extend(entries.filter_map(|entry| entry.ok()).filter_map(|entry| {
+            let path = entry.path();
+            (has_yaml_extension(&path) && has_schema_stem(&path)).then_some(path)
+        }));
+    }
+    schema_files.sort();
+
     let mut schemas = Vec::new();
     let mut errors = Vec::new();
-    for result in results {
-        match result {
-            Ok(schema) => schemas.push(schema),
-            Err(e) => errors.push(e),
+    let mut reports = Vec::new();
+    for path in schema_files {
+        let analysis = analyze_schema_file(&path);
+        if let Some(schema) = analysis.schema {
+            schemas.push(schema);
         }
+        if let Some(error) = analysis.parse_error {
+            errors.push((path, error));
+        }
+        reports.push(analysis.report);
     }
 
     // 2. Discover pipeline files
     let pipelines = discover_pipelines(workspace_root, schema_dir, include_globs, exclude_globs);
 
-    // 3. Extract schema references from pipelines
+    // 3. Extract schema references from pipelines through the typed parser.
     let mut pipeline_refs: HashMap<PathBuf, Vec<String>> = HashMap::new();
     for pipeline_path in &pipelines {
-        let refs = extract_schema_refs(pipeline_path);
+        let report = analyze_pipeline_file(pipeline_path, workspace_root);
+        let refs: Vec<String> = report
+            .references
+            .iter()
+            .filter_map(|reference| reference.schema_path.to_str().map(str::to_owned))
+            .collect();
         if !refs.is_empty() {
             pipeline_refs.insert(pipeline_path.clone(), refs);
         }
+        reports.push(report);
     }
 
     // 4. Resolve references
     resolve_schema_references(&mut schemas, workspace_root, &pipeline_refs);
 
     // 5. Build index
-    let index = SchemaIndex::build(schemas);
+    reports.sort_by(|left, right| left.location.path.cmp(&right.location.path));
 
-    (index, errors)
+    WorkspaceSchemaAnalysis {
+        index: SchemaIndex::build(schemas),
+        reports,
+        parse_errors: errors,
+    }
 }
 
 #[cfg(test)]
@@ -379,39 +502,43 @@ fields:
 pipeline:
   name: test
 
-inputs:
-  - name: source
-    type: csv
-    path: ./data/customers.csv
-    schema: schemas/customers.schema.yaml
-
-transformations:
-  - name: enrich
-    cxl: "emit x = a"
-
-outputs:
-  - name: dest
-    type: csv
-    path: ./output.csv
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: ./data/customers.csv
+      schema: schemas/customers.schema.yaml
 "#;
         let refs = extract_schema_refs_from_str(yaml);
         assert_eq!(refs, vec!["schemas/customers.schema.yaml"]);
     }
 
     #[test]
-    fn test_extract_schema_refs_ignores_inline_and_overrides() {
+    fn test_extract_schema_refs_ignores_inline_schemas() {
         let yaml = r#"
-inputs:
-  - name: source
-    type: csv
-    path: ./data/input.csv
-    schema: schemas/main.schema.yaml
-    schema_overrides:
-      - name: id
-        type: int
+pipeline:
+  name: test
+nodes:
+  - type: source
+    name: external
+    config:
+      name: external
+      type: csv
+      path: ./data/input.csv
+      schema: schemas/main.schema.yaml
+  - type: source
+    name: inline
+    config:
+      name: inline
+      type: csv
+      path: ./data/inline.csv
+      schema:
+        - { name: id, type: int }
 "#;
         let refs = extract_schema_refs_from_str(yaml);
-        // Should only get the schema: reference, not schema_overrides
+        // Only the external file form is a discovery reference.
         assert_eq!(refs, vec!["schemas/main.schema.yaml"]);
     }
 
@@ -448,20 +575,14 @@ fields:
 pipeline:
   name: test
 
-inputs:
-  - name: source
-    type: csv
-    path: ./data/customers.csv
-    schema: schemas/customers.schema.yaml
-
-transformations:
-  - name: t1
-    cxl: "emit x = id"
-
-outputs:
-  - name: dest
-    type: csv
-    path: ./output.csv
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: ./data/customers.csv
+      schema: schemas/customers.schema.yaml
 "#,
         );
 
@@ -701,20 +822,14 @@ fields:
 pipeline:
   name: test
 
-inputs:
-  - name: source
-    type: csv
-    path: ./data/customers.csv
-    schema: schemas/customers.schema.YAML
-
-transformations:
-  - name: t1
-    cxl: "emit x = id"
-
-outputs:
-  - name: dest
-    type: csv
-    path: ./output.csv
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: ./data/customers.csv
+      schema: schemas/customers.schema.YAML
 "#,
         );
 

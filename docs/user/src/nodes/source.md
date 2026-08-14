@@ -51,6 +51,28 @@ schema:
 | `any` | Unknown type -- field used in type-agnostic contexts |
 | `nullable(T)` | Nullable wrapper around any inner type (e.g. `nullable(int)`) |
 
+### Check the schema through the planner
+
+The schema that governs execution is the one accepted by `clinker-plan` while
+compiling the complete pipeline. Run this after changing a source schema:
+
+```bash
+clinker run pipeline.yaml --explain text
+```
+
+Exit code `0` means the planner parsed the canonical YAML, resolved schema
+references and overlays, bound the pipeline, type-checked CXL, and produced a
+compiled plan. It does not prove that input bytes satisfy the declarations or
+that the resulting output is correct; execute representative input against an
+isolated destination and compare the result before a production run.
+
+Workspace tooling may also present advisory schema analysis. That analysis can
+help find likely authoring mistakes, but it cannot admit or reject a pipeline.
+Its `analyzed`, `partial`, `skipped`, and `failed` statuses describe only how
+much the advisory model inspected. See [Validation and
+Admission](../ops/validation.md#advisory-workspace-schema-analysis) for the
+status meanings and known limits.
+
 Without a column `format:`, `date_time` accepts the default offset-free forms
 and RFC 3339 timestamps with `Z` or an explicit numeric offset, such as
 `2026-01-31T08:27:00Z` and `2026-01-31T10:57:00+02:30`. Zoned timestamps are

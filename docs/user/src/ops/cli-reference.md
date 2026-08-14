@@ -81,6 +81,41 @@ with a new execution ID for every retry.
 
 ---
 
+## clinker explain
+
+Inspect one compiled field's provenance or discover registry-owned diagnostic
+descriptors.
+
+```text
+clinker explain <CONFIG> --field <PATH> [OPTIONS]
+clinker explain --list [--status <STATUS>] [--category <CATEGORY>]
+clinker explain --code <CODE>
+```
+
+Exactly one of `--field`, `--list`, or `--code` is required. A pipeline path is
+required only for `--field` and is rejected for the two static discovery modes.
+
+| Flag | Description |
+|------|-------------|
+| `--field <PATH>` | Explain one exact or unambiguous shorthand field address in the compiled pipeline. |
+| `--list` | Print every registered descriptor in stable code order. |
+| `--status <STATUS>` | With `--list`, require `active` or `retired-reserved`. |
+| `--category <CATEGORY>` | With `--list`, require one of `configuration`, `composition`, `source-and-expression`, `execution-and-format`, `terminal-authoring`, `security`, or `advisory`. |
+| `--code <CODE>` | Print one registered descriptor and its optional longer detail page. |
+| `--channel <ID>` | With `--field`, apply the selected channel before compiling provenance. |
+| `--group <NAME>` | With `--field`, force-include a group overlay (repeatable). |
+| `--no-auto-groups` | With `--field`, suppress selector-derived groups. |
+| `--base-dir <DIR>` | Workspace root used by the field-provenance compile path; defaults to `.`. |
+
+All seven descriptor fields—code, severity, status, category, retryability,
+meaning, and correction—come from the same leaf registry in both discovery
+views. A detail page can add examples but cannot define whether a code exists.
+Unknown or empty filters, no-match combinations, unknown codes, and conflicting
+modes exit nonzero. See [Explain Plans](explain.md) for examples and for the
+separate `clinker run --explain` plan display.
+
+---
+
 ## clinker metrics collect
 
 Sweep per-execution metrics files from a spool directory into a single NDJSON archive.

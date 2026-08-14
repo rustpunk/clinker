@@ -140,7 +140,10 @@ Use --code to look up the documentation for a diagnostic code (composition codes
 E101–E108, combine codes E300-E319/E325/E326/E327 and W302/W305/W306, memory codes E310-E312, \
 spill codes E320/E321, EDI output-split codes E323/E338, storage-validation \
 codes E330-E334, staging-copy codes E335-E337, the multi-record discriminator \
-code E345, and W101).",
+code E345, and W101). \
+Use --list to enumerate every registered diagnostic descriptor, optionally \
+filtered by exact lifecycle status or category. Use --code to render one \
+registry descriptor and its optional longer detail page.",
         after_long_help = "\
 EXAMPLES:
   # Show provenance for a composition config field
@@ -153,7 +156,10 @@ EXAMPLES:
   clinker explain pipeline.yaml --field orders.amount.scale --channel acme_prod
 
   # Look up error code documentation
-  clinker explain --code E103"
+  clinker explain --code E103
+
+  # List retired diagnostic identifiers that remain reserved
+  clinker explain --list --status retired-reserved"
     )]
     Explain(ExplainArgs),
     /// Channel/group overlay tooling: resolve one effective plan, or lint the
@@ -748,6 +754,18 @@ pub struct ExplainArgs {
     /// Error/warning code to look up (e.g. "E103")
     #[arg(long)]
     pub code: Option<String>,
+
+    /// List every registered diagnostic descriptor.
+    #[arg(long)]
+    pub list: bool,
+
+    /// Limit --list to one exact lifecycle status.
+    #[arg(long, value_name = "STATUS")]
+    pub status: Option<String>,
+
+    /// Limit --list to one exact diagnostic category.
+    #[arg(long, value_name = "CATEGORY")]
+    pub category: Option<String>,
 
     /// Base directory for relative path resolution
     #[arg(long, default_value = ".")]
@@ -6125,34 +6143,97 @@ fn run_config(args: &ConfigArgs) -> Result<u8, Box<dyn std::error::Error>> {
 }
 
 fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // Mode 1: --code — look up error/warning code documentation.
-    if let Some(ref code) = args.code {
-        match clinker_plan::plan::explain_provenance::explain_code(code) {
-            Some(doc) => {
-                print!("{doc}");
-                return Ok(());
-            }
-            None => {
-                // Derived from the same table `explain_code` answers from --
-                // a retyped range goes stale the first time a code is added,
-                // and then contradicts the `See: clinker explain --code <CODE>`
-                // hint the run path now prints.
-                let valid = clinker_plan::plan::explain_provenance::explain_codes().join(", ");
-                return Err(
-                    format!("unknown diagnostic code '{code}'. Valid codes: {valid}").into(),
-                );
-            }
-        }
+    use clinker_core_types::diagnostic::{
+        DiagnosticCategory, DiagnosticLifecycle, REGISTRY, RegistryEntry, registry_entry,
+    };
+
+    let selected_modes = usize::from(args.list)
+        + usize::from(args.code.is_some())
+        + usize::from(args.field.is_some());
+    if selected_modes != 1 {
+        return Err(
+            "select exactly one explain mode: --list, --code <CODE>, or <PIPELINE> --field <PATH>"
+                .into(),
+        );
     }
 
-    // Mode 2: --field — field provenance chain.
+    if args.list {
+        if args.config.is_some() {
+            return Err("a pipeline path cannot be combined with --list".into());
+        }
+        let lifecycle = args
+            .status
+            .as_deref()
+            .map(|value| {
+                DiagnosticLifecycle::parse(value).ok_or_else(|| {
+                    format!(
+                        "unknown diagnostic status '{value}'. Valid statuses: active, retired-reserved"
+                    )
+                })
+            })
+            .transpose()?;
+        let category = args
+            .category
+            .as_deref()
+            .map(|value| {
+                DiagnosticCategory::parse(value).ok_or_else(|| {
+                    format!(
+                        "unknown diagnostic category '{value}'. Valid categories: advisory, composition, configuration, execution-and-format, security, source-and-expression, terminal-authoring"
+                    )
+                })
+            })
+            .transpose()?;
+
+        let mut entries: Vec<&RegistryEntry> = REGISTRY
+            .iter()
+            .filter(|entry| lifecycle.is_none_or(|value| entry.lifecycle == value))
+            .filter(|entry| category.is_none_or(|value| entry.category == value))
+            .collect();
+        entries.sort_unstable_by_key(|entry| entry.code);
+        if entries.is_empty() {
+            return Err("diagnostic filters matched no registered codes".into());
+        }
+        for (index, entry) in entries.iter().enumerate() {
+            if index > 0 {
+                println!();
+            }
+            print!("{}", render_diagnostic_descriptor(entry));
+        }
+        return Ok(());
+    }
+
+    if args.status.is_some() || args.category.is_some() {
+        return Err("--status and --category require --list".into());
+    }
+
+    // Mode 2: --code — render the leaf descriptor, then join optional detail.
+    if let Some(ref code) = args.code {
+        if args.config.is_some() {
+            return Err("a pipeline path cannot be combined with --code".into());
+        }
+        let Some(entry) = registry_entry(code) else {
+            let mut valid: Vec<_> = REGISTRY.iter().map(|entry| entry.code).collect();
+            valid.sort_unstable();
+            return Err(format!(
+                "unknown diagnostic code '{code}'. Valid codes: {}",
+                valid.join(", ")
+            )
+            .into());
+        };
+        print!("{}", render_diagnostic_descriptor(entry));
+        match clinker_plan::plan::explain_provenance::explain_code(code) {
+            Some(doc) => print!("\nDetail page:\n\n{doc}"),
+            None => println!("\nDetail page: none; the descriptor above is authoritative."),
+        }
+        return Ok(());
+    }
+
+    // Mode 3: --field — field provenance chain.
     let config_path = args.config.as_ref().ok_or(
         "a pipeline config path is required when using --field (usage: clinker explain pipeline.yaml --field node.param)",
     )?;
 
-    let field = args.field.as_ref().ok_or(
-        "either --field or --code is required (usage: clinker explain pipeline.yaml --field node.param)",
-    )?;
+    let field = args.field.as_ref().expect("one explain mode was selected");
 
     let yaml = std::fs::read_to_string(config_path)?;
     let interpolated = clinker_plan::config::interpolate_env_vars(&yaml, &[])
@@ -6245,6 +6326,26 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     print!("{output}");
     Ok(())
+}
+
+/// Render the registry-owned portion shared byte-for-byte by list and code
+/// views. Only static descriptor fields are emitted here; producer values and
+/// runtime records never enter diagnostic discovery.
+fn render_diagnostic_descriptor(entry: &clinker_core_types::diagnostic::RegistryEntry) -> String {
+    let severity = match entry.severity {
+        clinker_core_types::Severity::Error => "error",
+        clinker_core_types::Severity::Warning => "warning",
+        clinker_core_types::Severity::Note => "note",
+    };
+    format!(
+        "Code: {}\nSeverity: {severity}\nStatus: {}\nCategory: {}\nRetryability: {}\nMeaning: {}\nCorrection: {}\n",
+        entry.code,
+        entry.lifecycle.as_str(),
+        entry.category.as_str(),
+        entry.retry_advice.as_str(),
+        entry.meaning,
+        entry.correction,
+    )
 }
 
 /// One-line summary of an applied overlay resolution for run/explain output.

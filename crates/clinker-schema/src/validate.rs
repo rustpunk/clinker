@@ -9,7 +9,18 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::model::{SchemaIndex, SourceSchema};
+use crate::report::{
+    CoverageFacet, CoverageStatus, ReportLocation, ReportSubject, SchemaCoverageReport,
+    SchemaReference,
+};
 use clinker_plan::config::{InputFormat, PipelineConfig, PipelineNode, SourceConfig};
+
+/// Advisory warnings plus an explicit statement of analysis reach.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PipelineSchemaAnalysis {
+    pub warnings: Vec<SchemaWarning>,
+    pub report: SchemaCoverageReport,
+}
 
 /// A schema validation warning.
 #[derive(Clone, Debug, PartialEq)]
@@ -48,9 +59,28 @@ pub fn validate_pipeline(
     index: &SchemaIndex,
     workspace_root: &Path,
 ) -> Vec<SchemaWarning> {
+    analyze_pipeline(config, index, workspace_root, Path::new("<pipeline>")).warnings
+}
+
+/// Analyze one parsed pipeline without replacing planner compilation.
+pub fn analyze_pipeline(
+    config: &PipelineConfig,
+    index: &SchemaIndex,
+    workspace_root: &Path,
+    pipeline_path: &Path,
+) -> PipelineSchemaAnalysis {
     let mut warnings = Vec::new();
+    let mut report = SchemaCoverageReport::new(ReportSubject::Pipeline, pipeline_path);
+    let mut external_reference_count = 0usize;
 
     for body in config.source_bodies() {
+        if let Some(schema_file) = linked_schema_file(&body.schema) {
+            external_reference_count += 1;
+            report.reference(SchemaReference {
+                schema_path: schema_file.into(),
+                location: ReportLocation::file(pipeline_path),
+            });
+        }
         validate_input(
             &body.source,
             linked_schema_file(&body.schema),
@@ -88,7 +118,55 @@ pub fn validate_pipeline(
         }
     }
 
-    warnings
+    if external_reference_count == 0 {
+        report.status = CoverageStatus::Skipped;
+        report.reason(
+            "no-external-schema",
+            Some(CoverageFacet::PipelineReferences),
+            "pipeline declares no external schema references",
+        );
+    } else {
+        report.support(CoverageFacet::PipelineReferences);
+    }
+
+    if config
+        .nodes
+        .iter()
+        .any(|node| matches!(node.value, PipelineNode::Transform { .. }))
+    {
+        report.decline(
+            CoverageFacet::TransformFieldScan,
+            "heuristic-transform-scan",
+            "transform field scanning is advisory and does not replace CXL compilation",
+        );
+    }
+
+    for warning in &warnings {
+        let (code, facet) = match warning.kind {
+            WarningKind::SchemaMissing => {
+                report.status = CoverageStatus::Failed;
+                ("unresolved-reference", CoverageFacet::PipelineReferences)
+            }
+            WarningKind::FormatMismatch => {
+                if report.status == CoverageStatus::Analyzed {
+                    report.status = CoverageStatus::Partial;
+                }
+                ("format-mismatch", CoverageFacet::FormatCompatibility)
+            }
+            WarningKind::FieldNotFound
+            | WarningKind::JoinKeyMissing
+            | WarningKind::JoinKeyTypeMismatch => {
+                if report.status == CoverageStatus::Analyzed {
+                    report.status = CoverageStatus::Partial;
+                }
+                ("field-analysis-warning", CoverageFacet::TransformFieldScan)
+            }
+        };
+        report.reason(code, Some(facet), warning.message.clone());
+    }
+
+    report.sort_stably();
+    PipelineSchemaAnalysis { warnings, report }
 }
 
 /// The external `.schema.yaml` path a source's unified `schema:` links to, or
