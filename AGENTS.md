@@ -66,7 +66,8 @@ bench, socket, and file-descriptor caveats.
 The project is greenfield and has no deployed users, so the cost of getting a design right is a rewrite and the cost of getting it wrong is permanent. That asymmetry decides the calls below.
 
 - Prefer the breaking change. A compatibility shim preserves a shape nobody depends on at the price of carrying it forever.
-- Complexity and effort are not reasons to defer a correct refactor. "Large" is an estimate, not an objection.
+- Complexity and effort are not reasons to defer a correct refactor. "Large" is an estimate, not an objection. This is a rule about not flinching from the refactor the task requires; it is not a licence to widen the task. A correct refactor that was not asked for is still scope the maintainer did not agree to.
+- When a fix introduces a regression, revert it and reconsider the approach rather than patching forward. Two consecutive fixes to defects your own previous fix introduced means the approach is wrong, not that a third fix is missing. Stop, restore the last known-good state, and say what the failed approach assumed — a fix chain is the most expensive way to discover a bad premise.
 - When the choice is between a correct hard option and an expedient easy one, take the correct one. This holds at implementation time as strongly as at planning time: a correctness deferral invented while coding is the same defect as one written into the plan, and it arrives without the review a plan gets.
 - Every surface named in an agreed design is a requirement of that landing, not a candidate for a follow-up. Dropping one needs the maintainer's explicit agreement, not a note in the PR.
 - A component must not report a state it has not established. Prefer arrangements where the wrong report is unrepresentable — one shared function, one derived count — over two places that agree today and are documented to stay in step.
@@ -86,7 +87,9 @@ Recurring ground truths. Each has been got wrong more than once; treat a design 
 
 OpenLineage lineage, OTLP telemetry, and the memory budget are part of a node's contract, not instrumentation fitted afterwards. Every new node, new feature, and refactor answers all three trigger tests below. "Where appropriate" is decided by the trigger, and an exemption is claimed out loud in the PR rather than left silent — an unstated exemption is indistinguishable from an oversight.
 
-Backfill is in scope. When a change touches a node type that predates these obligations, bring that node type up to them in the same PR; leaving a touched node at the old standard is what keeps the gaps permanent.
+Backfill is in scope for the node types whose contract the change actually alters — where the change adds, removes, or redefines a node's lineage edges, its execution work, or what it retains. Bring those up to the obligations in the same PR; leaving them at the old standard is what keeps the gaps permanent.
+
+Merely editing a file that a node type happens to live in does not trigger backfill. When a change reveals an unmet obligation on a node it does not otherwise alter, file a follow-up issue naming the node and the unmet obligation rather than widening the PR. This bound is deliberate: an unbounded "touched" trigger makes every fix reachable from every other node, and the resulting edits introduce defects whose fixes trigger further backfill.
 
 Deployment configuration for both delivery paths is the workspace `ObservabilityConfig` in `crates/clinker-plan/src/config/observability.rs`, whose `otlp` and `lineage` tables are independently optional, and delivery is wired at the CLI edge in `crates/clinker/src/observability.rs`. Neither path may become a dependency of the engine core.
 
