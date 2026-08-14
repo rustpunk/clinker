@@ -142,6 +142,7 @@ A gate that was not run, or whose result was read from the wrong place, is a gat
 - Stage by explicit path. `git add -A` sweeps scratch and probe files that tooling leaves in the tree; review `git status` and `git show --stat` before pushing.
 - Never use `git add -f`. Ignored paths — `docs/internal/`, `notes/`, local settings — are ignored deliberately.
 - Local progress and tracking files stay out of git.
+- Delete a local branch once its pull request merges. Only squash merges are enabled, so a landed branch shares no commit with `main` and `git branch --merged` never lists it — run `scripts/prune-landed-branches.sh` (dry run; `--apply` to delete) instead of judging by ancestry.
 - Do not name specific prior-art tools or vendors in issues, PRs, or comments. Make the argument on its merits; the comparison belongs in internal notes.
 
 ## User-Facing Surface
