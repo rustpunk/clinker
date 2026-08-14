@@ -59,9 +59,12 @@ The provider is installed per agent in `crates/clinker-net/src/tls.rs`, never th
 once — a property a library has no right to spend on behalf of its embedder.
 
 `ureq` is configured with `rustls-no-provider` plus `rustls-webpki-roots`, which is
-ureq's `rustls` feature minus its ring dependency. Naming the two halves keeps the
-Mozilla root store byte-identical while dropping ring; `rustls-no-provider` does not
-drop the webpki roots, so no separate roots crate is needed.
+ureq's `rustls` feature minus its ring dependency: `rustls` expands to
+`rustls-no-provider` plus `_ring` plus `rustls-webpki-roots`, and only the middle
+third is dropped. The roots come from `rustls-webpki-roots`, which pulls the
+`webpki-roots` crate exactly as ureq's own `rustls` feature would, so the Mozilla
+root store is byte-identical to what these transports verified against before —
+nothing had to be added or substituted to replace it.
 
 **Cross-cutting finding for the SQL driver work.** The maintained synchronous MySQL
 client's TLS features all terminate in C-compiling crates whatever provider is

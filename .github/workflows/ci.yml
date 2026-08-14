@@ -73,14 +73,38 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # Job-level rather than per-step. Two step-level copies would be two places
+    # that must agree, and the dangerous drift is removal: drop a variable from
+    # the build step but leave it in the negative control, and the control still
+    # fails in `cc` — a green tick — while the workspace build can now reach a
+    # real compiler through the un-neutralized variable. The one step that needs
+    # a working compiler unsets them explicitly with `env -u`, which fails loudly
+    # if a name here is renamed and the two lists stop matching.
+    env:
+      CC: /bin/false
+      CXX: /bin/false
+      AR: /bin/false
+      CC_x86_64_unknown_linux_gnu: /bin/false
+      CXX_x86_64_unknown_linux_gnu: /bin/false
+      AR_x86_64_unknown_linux_gnu: /bin/false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      # This job now builds every workspace target, a second `clinker`
+      # resolution, the fixture twice, and every capability-feature combination,
+      # all into one `target/`. That is the pattern that has exhausted the hosted
+      # runner's root volume mid-link elsewhere in this file.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: "1.91"
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
@@ -89,14 +113,10 @@ jobs:
       # no network capability at all, which is a different graph rather than a
       # subset — it confirms the smaller resolution did not acquire a toolchain
       # requirement of its own.
+      #
+      # `CC` and friends are consumed by build scripts, not by rustc's choice of
+      # linker driver, so linking still works here through the real `cc` on PATH.
       - name: Build with no working C compiler
-        env:
-          CC: /bin/false
-          CXX: /bin/false
-          AR: /bin/false
-          CC_x86_64_unknown_linux_gnu: /bin/false
-          CXX_x86_64_unknown_linux_gnu: /bin/false
-          AR_x86_64_unknown_linux_gnu: /bin/false
         run: |
           cargo build --locked --workspace --all-targets
           cargo build --locked -p clinker --no-default-features
@@ -113,30 +133,45 @@ jobs:
       # lockfile would satisfy it while proving nothing, which is the same defect as
       # the `grep` this job used to run against `cargo tree`.
       #
-      # The fixture is excluded from the root workspace, so nothing else builds it.
-      # The environment is repeated rather than shared because GitHub Actions'
-      # workflow parser does not resolve YAML anchors, and a silently-empty `env`
-      # here would let the fixture find the runner's real compiler and pass.
+      # The fixture is excluded from the root workspace, so nothing else builds it,
+      # and nothing else lints it either — hence the format and lint passes here.
       - name: Prove the no-C gate bites
         run: |
-          # Direction 1: with the runner's own toolchain the fixture must build. A
-          # fixture that can never build would fail the next check for its own
-          # reasons and report a working gate regardless of the gate.
-          if ! cargo build --locked \
-                 --manifest-path tools/no-c-gate-fixture/Cargo.toml \
-                 >"${RUNNER_TEMP}/fixture-ok.log" 2>&1; then
+          # The control has to exercise the same `cc` the workspace's build scripts
+          # do. A newer `cc` reads environment variables an older one does not, so
+          # a control on a different version certifies coverage of a variable set
+          # that is not the one under test.
+          fixture_cc=$(sed -n '/^name = "cc"$/{n;s/^version = "\(.*\)"$/\1/p;}' \
+            tools/no-c-gate-fixture/Cargo.lock)
+          workspace_cc=$(sed -n '/^name = "cc"$/{n;s/^version = "\(.*\)"$/\1/p;}' \
+            Cargo.lock)
+          if [ "$fixture_cc" != "$workspace_cc" ]; then
+            echo "the negative control uses cc $fixture_cc but the workspace"
+            echo "resolves cc $workspace_cc, so it proves coverage of a different"
+            echo "set of environment variables. Re-pin tools/no-c-gate-fixture."
+            exit 1
+          fi
+          echo "control and workspace agree on cc $workspace_cc"
+
+          # Direction 1: with a working toolchain the fixture must build. A fixture
+          # that can never build would fail the next check for its own reasons and
+          # report a working gate regardless of the gate. `env -u` rather than a
+          # second literal list, so there is one place the variable names live.
+          if ! env -u CC -u CXX -u AR \
+                 -u CC_x86_64_unknown_linux_gnu \
+                 -u CXX_x86_64_unknown_linux_gnu \
+                 -u AR_x86_64_unknown_linux_gnu \
+                 cargo build --locked \
+                   --manifest-path tools/no-c-gate-fixture/Cargo.toml \
+                   >"${RUNNER_TEMP}/fixture-ok.log" 2>&1; then
             echo "the negative control is broken: it does not build even with a"
             echo "working C compiler, so it cannot demonstrate anything."
             tail -30 "${RUNNER_TEMP}/fixture-ok.log"
             exit 1
           fi
 
-          # Direction 2: under the gate's environment it must fail, and fail in cc.
-          if CC=/bin/false CXX=/bin/false AR=/bin/false \
-             CC_x86_64_unknown_linux_gnu=/bin/false \
-             CXX_x86_64_unknown_linux_gnu=/bin/false \
-             AR_x86_64_unknown_linux_gnu=/bin/false \
-             cargo build --locked \
+          # Direction 2: under the job's environment it must fail, and fail in cc.
+          if cargo build --locked \
                --manifest-path tools/no-c-gate-fixture/Cargo.toml \
                --target-dir "${RUNNER_TEMP}/fixture-no-cc" \
                >"${RUNNER_TEMP}/red-gate.log" 2>&1; then
@@ -153,16 +188,45 @@ jobs:
           echo "gate bit as required; the fixture failed in cc:"
           grep "error occurred in cc-rs" "${RUNNER_TEMP}/red-gate.log" | head -1
 
-      # `cargo tree --invert` exits 0 whether or not it finds anything, writing
-      # `warning: nothing to print.` to stderr when the package is absent. So the
-      # signal is an empty stdout, and the command's own status has to be checked
-      # on its own: piping into `grep` reports grep's status, which turns a broken
-      # `cargo tree` into a silent pass. `--target all` because a ring edge reachable
-      # only from the Windows or macOS resolution is still a ring edge.
+      - name: Check the negative control's own source
+        run: |
+          cargo fmt --manifest-path tools/no-c-gate-fixture/Cargo.toml --all -- --check
+          env -u CC -u CXX -u AR \
+            -u CC_x86_64_unknown_linux_gnu \
+            -u CXX_x86_64_unknown_linux_gnu \
+            -u AR_x86_64_unknown_linux_gnu \
+            cargo clippy --manifest-path tools/no-c-gate-fixture/Cargo.toml \
+              --all-targets --locked -- -D warnings
+
+      # This check has three outcomes, not two, and conflating any pair of them
+      # gets it wrong.
+      #
+      #   - `ring` is in the lockfile but reaches nothing: exit 0, empty stdout,
+      #     `warning: nothing to print.` on stderr. This is today's state — it is
+      #     locked as `rustls-webpki`'s inactive optional dependency. PASS.
+      #   - `ring` is absent from the lockfile entirely: exit 101, `package ID
+      #     specification 'ring' did not match any packages`. This is the *best*
+      #     state this guarantee can be in, so it must PASS — treating a non-zero
+      #     exit as "the check did not run" would turn a `rustls-webpki` bump that
+      #     drops the optional edge into a red build.
+      #   - anything else non-zero: the check genuinely did not run. FAIL, rather
+      #     than reporting on a resolution that never happened.
+      #
+      # Which is why the status is read from the command and not from a `grep`
+      # downstream of a pipe: a pipe reports grep's status, and a `cargo tree`
+      # that failed then produces no output, no match, and a green step.
+      # `--target all` because a ring edge reachable only from the Windows or
+      # macOS resolution is still a ring edge.
       - name: Refuse a ring edge in any resolution
         run: |
-          if ! cargo tree --workspace --all-features --target all --invert ring \
+          if ! cargo tree --locked --workspace --all-features --target all \
+                 --invert ring \
                  >"${RUNNER_TEMP}/ring.txt" 2>"${RUNNER_TEMP}/ring.err"; then
+            if grep -q "did not match any packages" "${RUNNER_TEMP}/ring.err"; then
+              echo "ring is not in the lockfile at all — the strongest form of this"
+              echo "guarantee."
+              exit 0
+            fi
             echo "cargo tree failed, so the ring check did not run:"
             cat "${RUNNER_TEMP}/ring.err"
             exit 1

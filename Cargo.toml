@@ -115,8 +115,10 @@ http = "1"
 # workspace, contradicting the pure-Rust pillar. Naming the other two halves
 # directly keeps the Mozilla webpki root store exactly as it was and leaves
 # the crypto provider unset, so `clinker-net` installs graviola on the agent
-# it builds. ureq only falls back to ring when no provider is configured, and
-# with `_ring` off that fallback is a compile-time-absent path.
+# it builds. ureq only falls back to ring when no provider is configured; with
+# `_ring` off that fallback is still compiled, as a function whose body is a
+# panic, so a future agent built without naming a provider fails loudly at the
+# first request rather than quietly acquiring one.
 ureq = { version = "3", default-features = false, features = [
     "rustls-no-provider",
     "rustls-webpki-roots",

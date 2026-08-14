@@ -17,4 +17,11 @@ publish = false
 # The real `cc` crate rather than a hand-rolled `Command`. What is under test is
 # whether the CI job's environment covers the variables a genuine C-compiling
 # build script consults, and only `cc` itself knows the full set.
-cc = "1"
+#
+# Pinned exactly to the version the root `Cargo.lock` resolves, because "the
+# variables `cc` consults" is version-specific — newer releases read overrides
+# older ones ignore. A control on a different version would certify coverage of
+# a set that is not the one the workspace's build scripts actually read. The
+# `Build portability` job compares the two lockfiles and fails if they diverge,
+# so this pin cannot silently drift out of step with the workspace.
+cc = "=1.2.58"
