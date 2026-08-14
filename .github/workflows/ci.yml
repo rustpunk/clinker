@@ -153,10 +153,13 @@ jobs:
           # between two tools, a `||` bound to the wrong end of a pipe, substring
           # matches reporting `scc` as a resolution of `cc`, and an `x in a`
           # guarding an assignment to `a[x]`, which gawk and mawk disagree about.
-          # `cc` is the crate that decides the variable set; `find-msvc-tools`
-          # governs MSVC discovery, which this Linux job never reaches. Both stay
-          # pinned in the fixture manifest so neither drifts unnoticed, but only
-          # the one this job can actually exercise is asserted here.
+          # `cc` alone is asserted, and that is the whole of what this proves.
+          # `find-msvc-tools`, which `cc` delegates MSVC discovery to, is not
+          # checked and is not pinned: this job runs on Linux and neutralizes the
+          # Linux compiler variables, so it never reaches that path, and a pin
+          # nothing exercises is a claim of protection that does not exist —
+          # while blocking the remedy below the moment a newer `cc` requires a
+          # newer `find-msvc-tools`.
           #
           # awk emits data and the shell decides. No arrays, no ternaries, and no
           # exit-status sentinels: awk exits 2 of its own accord when it cannot
@@ -172,6 +175,23 @@ jobs:
                    p = 0
                  }' "$1"
           }
+          line_count() {
+            if [ -z "$1" ]; then echo 0; else printf '%s\n' "$1" | wc -l; fi
+          }
+
+          # Establish that the parser understood each file before reading anything
+          # into its silence. "No cc found" is a pass, so a lockfile in a format
+          # this parser does not recognise would otherwise report "nothing to
+          # reconcile" and switch the check off without saying so — the one
+          # remaining way this step could go green while proving nothing.
+          for lock in Cargo.lock tools/no-c-gate-fixture/Cargo.lock; do
+            if [ "$(grep -c '^\[\[package\]\]' "$lock")" -eq 0 ]; then
+              echo "no [[package]] entries were parsed from $lock, so this check"
+              echo "cannot tell an absent cc from a lockfile it cannot read."
+              exit 1
+            fi
+          done
+
           control_cc=$(cc_versions tools/no-c-gate-fixture/Cargo.lock)
           workspace_cc=$(cc_versions Cargo.lock)
 
@@ -179,12 +199,19 @@ jobs:
             echo "the negative control no longer depends on cc, so it cannot"
             echo "compile C and cannot demonstrate anything."
             exit 1
+          elif [ "$(line_count "$control_cc")" -gt 1 ]; then
+            echo "the negative control locks more than one cc:"
+            printf '%s\n' "$control_cc" | sed 's/^/  /'
+            echo "It can only compile C through one of them, so which version it"
+            echo "certifies is undefined. Resolve the duplicate in"
+            echo "tools/no-c-gate-fixture/Cargo.lock."
+            exit 1
           elif [ -z "$workspace_cc" ]; then
             # The end state this whole guarantee points at. There is nothing left
             # to reconcile against, and that is a success, not a break.
             echo "cc has left the workspace lockfile entirely; nothing to"
             echo "reconcile, and the control still compiles C on its own."
-          elif [ "$(printf '%s\n' "$workspace_cc" | wc -l)" -gt 1 ]; then
+          elif [ "$(line_count "$workspace_cc")" -gt 1 ]; then
             echo "the workspace locks more than one cc:"
             printf '%s\n' "$workspace_cc" | sed 's/^/  /'
             echo "The control can exercise only one of them, so which variables"

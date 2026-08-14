@@ -24,18 +24,15 @@ publish = false
 # a set that is not the one the workspace's build scripts actually read. The
 # `Build portability` job compares the two lockfiles and fails if they diverge,
 # so this pin cannot silently drift out of step with the workspace.
-cc = "=1.2.58"
-
-# Not called from here. Pinned because `cc` delegates MSVC toolchain and
-# environment discovery to it, so it is part of the variable set this control
-# would certify on Windows — and `cc` requires it through a caret range, so
-# without an exact requirement stated here any `cargo update` drifts it away from
-# the workspace's resolution. A direct entry is the only place Cargo lets a
-# transitive version be fixed.
+# Exactly the version the root `Cargo.lock` resolves, and the `Build portability`
+# job fails if the two ever diverge. Which environment variables a build script
+# consults is version-specific, so a control on a different `cc` would certify
+# coverage of a set the workspace's build scripts never read.
 #
-# CI asserts parity on `cc` only: the `Build portability` job runs on Linux and
-# neutralizes the Linux compiler variables, so it never exercises the MSVC
-# discovery this crate governs. Asserting a version the job cannot exercise was
-# how the parity check grew the machinery that kept breaking it. The pin stays so
-# the divergence cannot happen silently; it is simply not what the gate proves.
-find-msvc-tools = "=0.1.9"
+# `cc`'s own transitives are deliberately left to float within its requirements.
+# `find-msvc-tools` was pinned here once, on the reasoning that `cc` delegates
+# MSVC discovery to it — but that path belongs to Windows, and the job that would
+# exercise it runs on Linux. Nothing asserted the pin, so it protected nothing
+# while promising it did, and it would have blocked this file's own upgrade path
+# the moment a newer `cc` required a newer `find-msvc-tools`.
+cc = "=1.2.58"
