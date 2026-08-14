@@ -176,20 +176,25 @@ jobs:
           # lockfiles here are separate files regenerated at different times, so
           # the root can move to a new format while the fixture's lags, and any
           # parse that silently yields nothing would be read as an absence.
-          # Every entry either reduces to a name and a version of the shape those
-          # fields should have, or emits `!unreduced`. Nothing is dropped
-          # quietly, and that is the whole point: an entry this parser skips
-          # silently is indistinguishable downstream from a crate the lockfile
-          # does not contain, and "cc is absent" is a success here. Rejecting a
-          # malformed entry without saying so would therefore *produce* the
-          # wrong-and-green outcome rather than prevent it — a count of surviving
-          # lines only notices when every entry is lost, so a single malformed
-          # `cc` beside healthy neighbours would sail through.
+          # Every `[[package]]` block leaves exactly one line behind: a name and
+          # version, or `!unreduced`. Nothing is dropped quietly, and that is the
+          # whole point — an entry this parser skips silently is indistinguishable
+          # downstream from a crate the lockfile does not contain, and "cc is
+          # absent" is a success here. A count of surviving lines only notices
+          # when every entry is lost, so one malformed `cc` beside healthy
+          # neighbours would otherwise sail through.
+          #
+          # The block ends at the next section header, not at a version line.
+          # Ending it at the version line meant a block that never reached one
+          # produced neither a row nor a marker, so a reshaped *key* — as opposed
+          # to a reshaped value — evaporated; and the parser stayed inside the
+          # unclosed block, reading the following section's fields as that
+          # package's, which let a `[[patch.unused]]` entry surface as a live
+          # dependency.
           #
           # Stripping double quotes handles the spelling cargo emits today and
-          # nothing else. A lockfile using TOML literal strings yields `'cc'`,
-          # and a future revision could reshape either field; both land on the
-          # marker rather than on a silent skip.
+          # nothing else. Literal strings, a respelled key, a reshaped value, and
+          # a truncated block all land on the marker.
           #
           # Written as if/else, which is a style choice here and not a fix. The
           # portability defect this step actually hit was narrower: `x in a` on
@@ -199,17 +204,27 @@ jobs:
           # all three. Avoiding the wrong construct would leave the real one
           # available to the next revision that needs an array.
           lock_packages() {
-            awk '/^\[\[package\]\]/ { p = 1; n = ""; next }
-                 p && /^name = / { gsub(/"/, ""); n = $3; next }
-                 p && /^version = / {
+            awk 'function close_block() {
+                   if (open) { print "!unreduced" }
+                   open = 0; n = ""
+                 }
+                 /^\[/ {
+                   close_block()
+                   if ($0 ~ /^\[\[package\]\]/) { open = 1 }
+                   next
+                 }
+                 open && /^name = / { gsub(/"/, ""); n = $3; next }
+                 open && /^version = / {
                    gsub(/"/, "")
                    if (n ~ /^[A-Za-z0-9_.+-]+$/ && $3 ~ /^[A-Za-z0-9_.+-]+$/) {
                      print n, $3
                    } else {
                      print "!unreduced"
                    }
-                   p = 0
-                 }' "$1"
+                   open = 0; n = ""
+                   next
+                 }
+                 END { close_block() }' "$1"
           }
           versions_of() { awk -v want="$1" '$1 == want { print $2 }'; }
           line_count() {
