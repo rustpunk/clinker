@@ -167,50 +167,55 @@ jobs:
           # a confident wrong verdict. Only `[[package]]` blocks are read, so a
           # lockfile's top-level `version` field and any `[[patch.unused]]` entry
           # are skipped.
-          cc_versions() {
+          # One extraction, and everything below is derived from it. An earlier
+          # revision had a second parser counting packages for the guard while
+          # this one selected `cc`, and the counting one accepted any name. Two
+          # parsers that agree today can disagree later, and the way they would
+          # disagree is the dangerous one: the guard would certify a parse it had
+          # not performed, so a lockfile revision that respelled the name value
+          # would clear the count, extract no `cc`, and report "cc has left the
+          # workspace" — green, with the workspace still depending on `cc`.
+          lock_packages() {
             awk '/^\[\[package\]\]/ { p = 1; n = ""; next }
                  p && /^name = / { gsub(/"/, ""); n = $3; next }
                  p && /^version = / {
-                   if (n == "cc") { gsub(/"/, ""); print $3 }
+                   if (n != "") { gsub(/"/, ""); print n, $3 }
                    p = 0
                  }' "$1"
           }
+          versions_of() { awk -v want="$1" '$1 == want { print $2 }'; }
           line_count() {
             if [ -z "$1" ]; then echo 0; else printf '%s\n' "$1" | wc -l; fi
           }
 
-          # Establish that the parser understood each file before reading anything
-          # into its silence. "No cc found" is a pass, so a lockfile this parser
-          # cannot read would otherwise report "nothing to reconcile" and switch
-          # the check off without saying so.
+          # Establish that the parse produced something before reading meaning
+          # into what it did not produce. "No cc found" is a pass, so a lockfile
+          # this parser cannot read would otherwise report "nothing to reconcile"
+          # and switch the check off without saying so.
           #
-          # Counted from the parser's own output, not from the `[[package]]`
-          # delimiter: a format that kept the delimiter but moved the name or
-          # version line would clear a delimiter count while extracting nothing.
-          # Readability is tested separately, because `grep`-style counting of a
-          # missing file yields an empty string, and `[ "" -eq 0 ]` is a bash
-          # error whose non-zero status an `if` condition silently reads as false
-          # — the guard would then never fire and never say why.
-          parsed_packages() {
-            awk '/^\[\[package\]\]/ { p = 1; n = ""; next }
-                 p && /^name = / { gsub(/"/, ""); n = $3; next }
-                 p && /^version = / { if (n != "") { c++ } ; p = 0 }
-                 END { print c + 0 }' "$1"
-          }
+          # Readability is tested separately, because counting a missing file
+          # yields an empty string, and `[ "" -eq 0 ]` is a bash error whose
+          # non-zero status an `if` condition silently reads as false — the guard
+          # would then never fire and never say why.
           for lock in Cargo.lock tools/no-c-gate-fixture/Cargo.lock; do
             if [ ! -r "$lock" ]; then
               echo "$lock is missing or unreadable, so this check cannot run."
               exit 1
             fi
-            if [ "$(parsed_packages "$lock")" -eq 0 ]; then
-              echo "no packages were parsed out of $lock, so this check cannot"
-              echo "tell an absent cc from a lockfile it does not understand."
+          done
+          workspace_packages=$(lock_packages Cargo.lock)
+          control_packages=$(lock_packages tools/no-c-gate-fixture/Cargo.lock)
+          for side in "workspace:$workspace_packages" "control:$control_packages"; do
+            if [ "$(line_count "${side#*:}")" -eq 0 ]; then
+              echo "no packages were parsed out of the ${side%%:*} lockfile, so"
+              echo "this check cannot tell an absent cc from a lockfile it does"
+              echo "not understand."
               exit 1
             fi
           done
 
-          control_cc=$(cc_versions tools/no-c-gate-fixture/Cargo.lock)
-          workspace_cc=$(cc_versions Cargo.lock)
+          control_cc=$(printf '%s\n' "$control_packages" | versions_of cc)
+          workspace_cc=$(printf '%s\n' "$workspace_packages" | versions_of cc)
 
           if [ -z "$control_cc" ]; then
             echo "the negative control no longer depends on cc, so it cannot"
