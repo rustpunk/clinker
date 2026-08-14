@@ -167,17 +167,34 @@ jobs:
           # a confident wrong verdict. Only `[[package]]` blocks are read, so a
           # lockfile's top-level `version` field and any `[[patch.unused]]` entry
           # are skipped.
-          # One extraction, and everything below is derived from it. An earlier
-          # revision had a second parser counting packages for the guard while
-          # this one selected `cc`, and the counting one accepted any name. Two
-          # parsers that agree today can disagree later, and the way they would
-          # disagree is the dangerous one: the guard would certify a parse it had
-          # not performed, so a lockfile revision that respelled the name value
-          # would clear the count, extract no `cc`, and report "cc has left the
-          # workspace" — green, with the workspace still depending on `cc`.
+          # One extraction, and everything below is derived from it, so the guard
+          # counts the same lines the decision reads rather than restating the
+          # parse in a second function that has to be kept in step.
+          #
+          # What makes the "cc has left the workspace" branch safe to treat as a
+          # success is not the deduplication but the validation above it: the two
+          # lockfiles here are separate files regenerated at different times, so
+          # the root can move to a new format while the fixture's lags, and any
+          # parse that silently yields nothing would be read as an absence.
+          # A name is only accepted once it reduces to something shaped like a
+          # crate name. Stripping double quotes handles the spelling cargo emits
+          # today and nothing else — a lockfile using TOML literal strings would
+          # yield `'cc'`, which is non-empty, so it would satisfy a bare
+          # emptiness test, fail to match `cc`, and report the workspace as no
+          # longer depending on it. Rejecting the unreduced value instead makes
+          # that a parse failure, and because a spelling change is uniform across
+          # every entry, it empties the whole parse and trips the guard below
+          # rather than quietly losing one crate.
+          #
+          # Written as if/else rather than a ternary: assigning from a ternary is
+          # what gawk and mawk disagreed about earlier in this file's history.
           lock_packages() {
             awk '/^\[\[package\]\]/ { p = 1; n = ""; next }
-                 p && /^name = / { gsub(/"/, ""); n = $3; next }
+                 p && /^name = / {
+                   gsub(/"/, "")
+                   if ($3 ~ /^[A-Za-z0-9_.+-]+$/) { n = $3 } else { n = "" }
+                   next
+                 }
                  p && /^version = / {
                    if (n != "") { gsub(/"/, ""); print n, $3 }
                    p = 0
