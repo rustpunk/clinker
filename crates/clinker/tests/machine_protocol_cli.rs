@@ -619,6 +619,82 @@ fn protocol_page_body_limit_requires_policy_before_retry() {
     assert_eq!(terminal["failure"]["retry"], "policy_required");
 }
 
+/// A supervisor's whole use for a progress record is deciding whether the run
+/// is moving, so the count must rise, never fall, and land on the number of
+/// records the run actually read.
+#[test]
+fn machine_progress_counts_rise_to_the_records_the_run_read() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "counted.csv");
+    let output = invoke(
+        directory.path(),
+        &["--machine", "ndjson-v1", "--batch-id", "counted"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stream = events(&output);
+    assert_stream(&stream, "counted");
+
+    let progress: Vec<&Value> = stream
+        .iter()
+        .filter(|event| event["event"] == "progress")
+        .collect();
+    assert!(!progress.is_empty(), "no progress records: {stream:?}");
+
+    let mut previous = 0_u64;
+    for event in &progress {
+        let read = event["progress"]["records_read"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("records_read is a number: {event}"));
+        assert!(
+            read >= previous,
+            "records_read fell from {previous} to {read}: {event}"
+        );
+        previous = read;
+        // No total accompanies the record count, and no percentage is
+        // asserted: a streaming source establishes neither.
+        assert!(event["progress"]["records_total"].is_null());
+        assert!(event["progress"]["percent"].is_null());
+    }
+    // `write_pipeline` writes a two-row input.
+    assert_eq!(previous, 2, "final count: {progress:?}");
+
+    let last = progress.last().expect("a progress record");
+    assert_eq!(last["progress"]["files_done"], 1);
+    assert_eq!(
+        last["progress"]["files_total"], 1,
+        "a file-backed source establishes its file denominator"
+    );
+}
+
+/// The file denominator is either absent or covers the whole run. A source
+/// that is not an enumerated file set withdraws it rather than letting it
+/// describe only the file-backed part.
+#[test]
+fn machine_progress_reports_no_file_total_before_discovery_completes() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "early.csv");
+    let output = invoke(
+        directory.path(),
+        &["--machine", "ndjson-v1", "--batch-id", "early"],
+    );
+    assert!(output.status.success());
+    let stream = events(&output);
+    let planning = stream
+        .iter()
+        .find(|event| event["event"] == "progress" && event["progress"]["phase"] == "planning")
+        .expect("a planning transition");
+    // Absent, never a fabricated zero: nothing has been discovered yet.
+    assert!(
+        planning["progress"]["files_total"].is_null(),
+        "a total not yet established is null, not 0: {planning}"
+    );
+    assert_eq!(planning["progress"]["files_done"], 0);
+}
+
 #[test]
 fn machine_protocol_zero_record_run_has_full_lifecycle_and_artifact_truth() {
     let directory = fixture();

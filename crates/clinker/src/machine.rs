@@ -10,7 +10,7 @@ use clinker_exec::output::attempt::{ArtifactKind, ArtifactState, AttemptPublicat
 use clinker_exec::pipeline::shutdown::ShutdownToken;
 #[cfg(debug_assertions)]
 use clinker_exec::progress::ProgressKind;
-use clinker_exec::progress::{BoundedProgress, ProgressSnapshot};
+use clinker_exec::progress::{BoundedProgress, ProgressSample, ProgressSnapshot, RunProgress};
 use clinker_exec::telemetry::TelemetryProducer;
 
 use crate::observability::{AdmissionSummary, ObservabilitySummary};
@@ -179,6 +179,21 @@ struct MachineState {
     /// content is correct as an incomplete attempt.
     publication_chunks_sent: usize,
     progress: BoundedProgress,
+    /// The run's live counters, when a run is under way. Sampled fresh for
+    /// every record rather than cached, so a record carries what was true
+    /// when it was built. `None` before the executor starts and on
+    /// invocations that never run one, where every counter reads zero and
+    /// both denominators read unestablished.
+    run_progress: Option<RunProgress>,
+}
+
+impl MachineState {
+    /// Read the run's counters, or an all-zero sample when no run is attached.
+    fn progress_sample(&self) -> ProgressSample {
+        self.run_progress
+            .as_ref()
+            .map_or_else(ProgressSample::default, RunProgress::sample)
+    }
 }
 
 /// One publication's inventory records and terminal summary, retained so a
@@ -332,6 +347,7 @@ impl MachineEmitter {
                 publication: None,
                 publication_chunks_sent: 0,
                 progress: BoundedProgress::default(),
+                run_progress: None,
             })),
             shutdown: ShutdownToken::new(),
         }
@@ -357,6 +373,15 @@ impl MachineEmitter {
     /// written before the flush that would have pushed a final summary.
     pub(crate) fn attach_observability_progress(&self, progress: Arc<Mutex<ObservabilitySummary>>) {
         self.lock_state().observability_progress = Some(progress);
+    }
+
+    /// Attach the run's live counters so progress records can carry them.
+    ///
+    /// The handle is shared with the executor, which advances it from the
+    /// dispatch thread while the periodic worker samples it from its own. The
+    /// emitter only ever reads.
+    pub(crate) fn attach_run_progress(&self, progress: RunProgress) {
+        self.lock_state().run_progress = Some(progress);
     }
 
     /// Record what the telemetry arena admitted and refused.
@@ -400,7 +425,8 @@ impl MachineEmitter {
 
     pub(crate) fn emit_progress_transition(&self, phase: &str) -> io::Result<()> {
         self.with_state(|state| {
-            let snapshot = state.progress.transition(phase);
+            let sample = state.progress_sample();
+            let snapshot = state.progress.transition(phase, sample);
             state.write_progress(snapshot)
         })
     }
@@ -415,7 +441,8 @@ impl MachineEmitter {
     /// finalizing transition or the terminal.
     fn emit_periodic(&self) -> ProgressWrite {
         let mut state = self.lock_state();
-        let Some(snapshot) = state.progress.periodic("executing") else {
+        let sample = state.progress_sample();
+        let Some(snapshot) = state.progress.periodic("executing", sample) else {
             return ProgressWrite::Skipped;
         };
         let notice = snapshot.event_limit_reached();
@@ -1008,10 +1035,21 @@ impl MachineState {
             return ProgressWrite::Skipped;
         }
         let kind = snapshot.kind();
+        let sample = snapshot.sample();
+        // `records_read` carries no companion total. A streaming source does
+        // not establish its own cardinality until its last row is read, so
+        // there is no honest denominator to pair it with. `files_total` is
+        // the one this engine does establish ahead of the read, and is `null`
+        // on a run whose sources are not enumerated file sets. No percentage
+        // is computed here: a ratio built on an absent total is the one value
+        // a supervisor must never be handed.
         let progress = serde_json::json!({
             "phase": snapshot.phase(),
             "kind": kind.as_str(),
             "elapsed_ms": snapshot.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            "records_read": sample.records_read,
+            "files_done": sample.files_done,
+            "files_total": sample.files_total,
         });
         let fields = serde_json::Map::from_iter([
             ("progress".to_owned(), progress),
@@ -1513,6 +1551,7 @@ mod tests {
             publication: None,
             publication_chunks_sent: 0,
             progress: BoundedProgress::default(),
+            run_progress: None,
         }
     }
 
@@ -1986,7 +2025,8 @@ mod tests {
         // retry. The sink is allowed again first, so nothing but the ordering
         // rule can stop the record.
         sink.allow(16);
-        let snapshot = state.progress.transition("finalizing");
+        let sample = state.progress_sample();
+        let snapshot = state.progress.transition("finalizing", sample);
         assert!(
             matches!(
                 state.write_progress_staged(snapshot),

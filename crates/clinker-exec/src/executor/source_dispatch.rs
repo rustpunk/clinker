@@ -233,6 +233,11 @@ where
                         // idles via `observe`. Idempotent on
                         // repeat timeouts.
                         ctx.watermarks.mark_idle(name.as_str(), &last_file);
+                        // A source this quiet will not reach the 1024-record
+                        // boundary soon, and a count that stops moving while
+                        // the run is merely slow reads as a stall. Publishing
+                        // here costs one atomic per idle period.
+                        crate::executor::dispatch::publish_record_progress(ctx);
                         continue;
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
@@ -256,6 +261,7 @@ where
                     records_since_check += 1;
                     if records_since_check >= 1024 {
                         records_since_check = 0;
+                        crate::executor::dispatch::publish_record_progress(ctx);
                         ctx.check_shutdown()?;
                     }
                     drained.push((rec, rn));
@@ -265,6 +271,7 @@ where
                     records_since_check += 1;
                     if records_since_check >= 1024 {
                         records_since_check = 0;
+                        crate::executor::dispatch::publish_record_progress(ctx);
                         ctx.check_shutdown()?;
                     }
                 }

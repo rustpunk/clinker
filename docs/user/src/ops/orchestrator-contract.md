@@ -55,12 +55,13 @@ is comparable only with another digest of the same version: when the schema
 changes, the same pipeline yields a different digest, and the version is how
 a consumer holding a pinned value tells that apart from a changed plan.
 
-Progress events add a bounded logical phase, kind, elapsed time, and
+Progress events add a bounded logical phase, kind, elapsed time, counts, and
 truncation flags. They never contain records, secrets, source URLs, or
 physical paths. Periodic records follow Clinker's own clock rather than
 internal engine activity, so a run inside one long operation keeps producing
 them; they stay advisory and bounded and never replace the parent's own
-heartbeat. Failed terminals add a stable failure code,
+heartbeat. [Progress records](#progress-records) below specifies the counts
+and what a consumer may conclude from them. Failed terminals add a stable failure code,
 broad category, sanitized message, and `retry_with_backoff`, `do_not_retry`, or
 `policy_required` advice. Before a publication-aware terminal, bounded
 `publication_artifacts` records carry the path-free inventory in ordered
@@ -199,6 +200,82 @@ The heartbeat interval must be below the scheduler's heartbeat timeout. The
 overall attempt deadline must cover ordinary execution and publication; the
 grace period is a separate bounded interval for cooperative cancellation before
 forced termination.
+
+## Progress records
+
+A `progress` event carries a `progress` object and a `truncation` object:
+
+```json
+{"event":"progress","seq":7,
+ "progress":{"phase":"executing","kind":"periodic","elapsed_ms":1031,
+             "records_read":200000,"files_done":5,"files_total":5},
+ "truncation":{"detail":false,"events":false}}
+```
+
+`kind` is `transition` for a lifecycle edge (`planning`, `executing`,
+`finalizing`, `publishing`) and `periodic` for an advisory observation inside
+a phase.
+
+### The counts
+
+`records_read` is the number of source records read so far, across every
+source. It never decreases within a run, and it reaches the same figure the
+terminal reports as the run's total record count. **It has no companion
+total, and no total will be added.** A source is read as a stream, so its
+record count is not established until its last record has been read: any
+"records remaining" Clinker could publish mid-run would be a guess presented
+as a measurement. A supervisor answers *is this run moving* by comparing
+`records_read` between two events, which is the question the record is here
+to answer. *When will it finish* is not a question this stream answers.
+
+`files_done` and `files_total` are the one denominator Clinker does
+establish before it reads anything: a source's file set is enumerated at
+startup, so the count is known rather than estimated. `files_total` is
+`null` when **any** source of the run reads from something other than an
+enumerated file set — a network source, for instance. A denominator covering
+only part of a run's work is withdrawn rather than published, because nothing
+on the wire would say which part it covered.
+
+`files_total` is also `null` on the earliest records of a run, before source
+discovery has completed. It is written once and never changes afterwards, so
+a consumer may cache it on first sight; it becoming non-`null` mid-stream is
+normal and is not an identity change.
+
+Two things a consumer must not do with these counts:
+
+- **Do not treat `files_done / files_total` as a completion percentage.**
+  It measures input consumed, not work finished. It reaches 100% while sort
+  merges, aggregate finalization, and output publication are still running,
+  which is exactly the shape of a progress bar that sits at 100% and appears
+  to hang.
+- **Do not divide by a `null` total.** Absence means unknown for this run,
+  not zero and not an error. Clinker publishes no percentage of its own for
+  this reason: a ratio against an absent denominator is the one value that
+  turns a missing number into a wrong one.
+
+### The record cap and the cadence floor
+
+Periodic records are bounded twice. At most one is emitted per second, and at
+most **128** per run. After the 128th, Clinker emits exactly one further
+record with `truncation.events` set to `true`, and then stops emitting
+periodic records for the rest of the run. Transitions are never capped, so
+`finalizing` and `publishing` still arrive, as does the terminal.
+
+Because the two bounds compose, **any run longer than roughly two minutes
+stops producing periodic progress well before it ends.** This is deliberate:
+it is what keeps the stream bounded regardless of how long a run takes.
+
+`truncation.events` is the in-band signal for it. A consumer that sees it
+should conclude that *the periodic stream has ended and the run is
+continuing normally*. It must **not** conclude that the run has stalled,
+and must not treat the silence that follows as evidence of a hung process.
+A supervisor that kills or retries a run on progress silence will kill
+healthy long runs, and for a pipeline that writes output, a retry means the
+work is done twice.
+
+Liveness is the parent's own responsibility, on the parent's own clock — see
+step 3 of the [adapter loop](#language-neutral-adapter-loop). The run's real
+outcome is the terminal record, which always arrives.
 
 ## Cancellation and process trees
 

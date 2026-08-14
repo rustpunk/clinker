@@ -599,7 +599,7 @@ pub struct RunArgs {
     #[arg(long, help_heading = "Environment")]
     pub env: Option<String>,
 
-    /// Suppress stderr progress output
+    /// Suppress the applied-overlay summary on stderr
     #[arg(long, help_heading = "Output")]
     pub quiet: bool,
 
@@ -2851,6 +2851,13 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         clinker_exec::pipeline::shutdown::ShutdownToken::new,
         MachineEmitter::shutdown_token,
     );
+    // One handle, two holders: the executor advances it from this thread while
+    // the periodic worker samples it from its own. Created before the worker
+    // starts so the first record it writes already reads real counters.
+    let run_progress = clinker_exec::progress::RunProgress::new();
+    if let Some(emitter) = machine {
+        emitter.attach_run_progress(run_progress.clone());
+    }
     let machine_progress = machine
         .map(MachineEmitter::start_execution_progress)
         .transpose()
@@ -3477,6 +3484,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         source_vars: effective_runtime_variables.source_vars,
         record_vars: effective_runtime_variables.record_vars,
         telemetry_producer: telemetry_producer.clone(),
+        progress: Some(run_progress.clone()),
         shutdown_token: Some(shutdown_token.clone()),
         spill_root_dir: spill_root_dir.clone(),
         spill_disk_cap_bytes,

@@ -1,48 +1,136 @@
 //! Progress reporting for pipeline execution.
 //!
-//! `ProgressReporter` is a callback trait invoked at chunk boundaries.
-//! `StderrReporter` throttles output to 1 update/sec.
-//! `NullReporter` is a no-op for `--quiet` mode.
+//! One producer, sampled by observers. [`RunProgress`] is the shared counter
+//! handle the executor advances while it runs; a reporter on another thread
+//! samples it on its own clock and [`BoundedProgress`] coalesces those samples
+//! into the bounded [`ProgressSnapshot`] records the machine stream carries.
+//!
+//! Counters are published, never pushed: the executor calls no reporter, so a
+//! new rendering costs a reader and nothing on the hot path. Every denominator
+//! question routes through [`denominator`], so no two renderings can disagree
+//! about whether a total is known.
+//!
+//! Record counts carry no denominator. A streaming source cannot bound its own
+//! cardinality without reading it to the end, so the run has no honest record
+//! total to divide by. The file axis carries the one denominator this engine
+//! does establish ahead of the read: a source's file set is enumerated before
+//! any of it is opened.
+//!
+//! A byte axis would be the better denominator — it is what comparable engines
+//! report — but it needs a byte position the format layer does not expose, so
+//! it is absent rather than present-and-empty.
 
-use std::fmt::Write as FmtWrite;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const DEFAULT_MAX_MACHINE_EVENTS: usize = 128;
 const DEFAULT_MAX_DETAIL_BYTES: usize = 64;
 
-/// Progress update emitted at chunk boundaries.
-#[derive(Debug, Clone)]
-pub struct ProgressUpdate {
-    pub phase: String,
-    pub file: String,
-    pub processed: u64,
-    pub total: Option<u64>,
-    pub elapsed: Duration,
+/// Live run counters, alone on a cache line.
+///
+/// The alignment keeps a hot writer from sharing a line with whatever the
+/// allocator places next: the padding is free while one thread writes, and a
+/// cold neighbour on the same line is not.
+#[repr(align(64))]
+#[derive(Debug, Default)]
+struct ProgressCounters {
+    records_read: AtomicU64,
+    files_done: AtomicU64,
 }
 
-impl ProgressUpdate {
-    /// Format as spec §10.5: `[cxl] file: Phase N name... X/Y records (Z%) [T]`
-    pub fn format(&self) -> String {
-        let mut s = format!("[cxl] {}: {}... ", self.file, self.phase);
-        if let Some(total) = self.total {
-            let pct = if total > 0 {
-                (self.processed as f64 / total as f64 * 100.0) as u64
-            } else {
-                0
-            };
-            write!(s, "{}/{} records ({}%) ", self.processed, total, pct).unwrap();
-        } else {
-            write!(s, "{} records ", self.processed).unwrap();
+/// Cloneable handle to one run's live progress counters.
+///
+/// Clones share the counters. The executor advances them from the dispatch
+/// thread; an observer on another thread samples them on its own schedule and
+/// may read a value already superseded. That staleness is the contract, not a
+/// defect — nothing may decide on a sampled value. Decisions read the exact
+/// state the executor owns.
+///
+/// The file total is sealed at most once, early in the run, and distinguishes
+/// three states a reader must tell apart: not yet established, established as
+/// unknowable for this run's source shapes, and established.
+#[derive(Clone, Debug, Default)]
+pub struct RunProgress {
+    counters: Arc<ProgressCounters>,
+    files_total: Arc<OnceLock<Option<u64>>>,
+}
+
+impl RunProgress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish `delta` more source records read.
+    ///
+    /// Callers accumulate in a plain local and flush here at a boundary they
+    /// already cross; one atomic per record would cost more than the count is
+    /// worth on a record-at-a-time path.
+    pub fn advance_records(&self, delta: u64) {
+        if delta > 0 {
+            self.counters
+                .records_read
+                .fetch_add(delta, Ordering::Relaxed);
         }
-        write!(s, "[{:.1}s]", self.elapsed.as_secs_f64()).unwrap();
-        s
+    }
+
+    /// Publish `delta` more source files fully consumed.
+    pub fn advance_files(&self, delta: u64) {
+        if delta > 0 {
+            self.counters.files_done.fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
+    /// Record how many source files this run will read, or `None` where any
+    /// source's input is not an enumerated file set.
+    ///
+    /// Sealing is once-only; a later call is ignored rather than overwriting,
+    /// so a denominator cannot drift mid-run.
+    pub fn seal_files_total(&self, total: Option<u64>) {
+        let _ = self.files_total.set(total);
+    }
+
+    /// Read both counters and the file total.
+    ///
+    /// The reads are independent, so the sample is not a consistent cut: a
+    /// file that closes between the `records_read` load and the `files_done`
+    /// load contributes its closure and not the records that preceded it.
+    /// Only a display consumes this, and a display tolerates a reading that
+    /// was true a moment ago; a decision would not, and none reads it.
+    pub fn sample(&self) -> ProgressSample {
+        ProgressSample {
+            records_read: self.counters.records_read.load(Ordering::Relaxed),
+            files_done: self.counters.files_done.load(Ordering::Relaxed),
+            files_total: self.files_total.get().copied().flatten(),
+        }
     }
 }
 
-/// Callback trait for progress reporting. Testable via VecReporter.
-pub trait ProgressReporter: Send + Sync {
-    fn report(&self, update: &ProgressUpdate);
+/// One reading of a run's live counters.
+///
+/// `records_read` is deliberately denominator-free. `files_total` is `None`
+/// both before it is established and when a source's input is not an
+/// enumerated file set; a reader that needs to tell those apart is asking a
+/// question no progress record answers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProgressSample {
+    pub records_read: u64,
+    pub files_done: u64,
+    pub files_total: Option<u64>,
+}
+
+/// The single place a denominator is judged usable.
+///
+/// Returns `None` when no total is established, when the total is zero, and
+/// when `done` has passed it — a total the run has already overrun describes
+/// the run no better than no total does, and reporting past 100% is worse than
+/// reporting nothing. Every rendering routes through this, so none of them can
+/// claim a ratio another would refuse.
+pub fn denominator(done: u64, total: Option<u64>) -> Option<(u64, u64)> {
+    match total {
+        Some(total) if total > 0 && done <= total => Some((done, total)),
+        _ => None,
+    }
 }
 
 /// Whether a machine progress record marks a lifecycle edge or an advisory
@@ -69,6 +157,7 @@ pub struct ProgressSnapshot {
     phase: String,
     kind: ProgressKind,
     elapsed: Duration,
+    sample: ProgressSample,
     detail_truncated: bool,
     event_limit_reached: bool,
 }
@@ -84,6 +173,11 @@ impl ProgressSnapshot {
 
     pub const fn elapsed(&self) -> Duration {
         self.elapsed
+    }
+
+    /// The counter reading this record was built from.
+    pub const fn sample(&self) -> ProgressSample {
+        self.sample
     }
 
     pub const fn detail_truncated(&self) -> bool {
@@ -127,16 +221,27 @@ impl BoundedProgress {
         }
     }
 
-    pub fn transition(&mut self, phase: &str) -> ProgressSnapshot {
-        self.snapshot(phase, ProgressKind::Transition, Instant::now(), false)
+    pub fn transition(&mut self, phase: &str, sample: ProgressSample) -> ProgressSnapshot {
+        self.snapshot(
+            phase,
+            ProgressKind::Transition,
+            sample,
+            Instant::now(),
+            false,
+        )
     }
 
-    pub fn periodic(&mut self, phase: &str) -> Option<ProgressSnapshot> {
-        self.periodic_at(phase, Instant::now())
+    pub fn periodic(&mut self, phase: &str, sample: ProgressSample) -> Option<ProgressSnapshot> {
+        self.periodic_at(phase, sample, Instant::now())
     }
 
     /// Deterministic-time form used by focused cadence tests.
-    pub fn periodic_at(&mut self, phase: &str, now: Instant) -> Option<ProgressSnapshot> {
+    pub fn periodic_at(
+        &mut self,
+        phase: &str,
+        sample: ProgressSample,
+        now: Instant,
+    ) -> Option<ProgressSnapshot> {
         if self
             .last_periodic
             .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
@@ -149,10 +254,10 @@ impl BoundedProgress {
                 return None;
             }
             self.periodic_limit_reported = true;
-            return Some(self.snapshot(phase, ProgressKind::Periodic, now, true));
+            return Some(self.snapshot(phase, ProgressKind::Periodic, sample, now, true));
         }
         self.periodic_emitted = self.periodic_emitted.saturating_add(1);
-        Some(self.snapshot(phase, ProgressKind::Periodic, now, false))
+        Some(self.snapshot(phase, ProgressKind::Periodic, sample, now, false))
     }
 
     /// Give back the one-shot event-limit notice for a record that may not
@@ -172,6 +277,7 @@ impl BoundedProgress {
         &self,
         phase: &str,
         kind: ProgressKind,
+        sample: ProgressSample,
         now: Instant,
         event_limit_reached: bool,
     ) -> ProgressSnapshot {
@@ -180,6 +286,7 @@ impl BoundedProgress {
             phase,
             kind,
             elapsed: now.duration_since(self.started),
+            sample,
             detail_truncated,
             event_limit_reached,
         }
@@ -197,212 +304,170 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> (String, bool) {
     (value[..boundary].to_owned(), true)
 }
 
-/// Writes progress to stderr, throttled to 1 update per second.
-pub struct StderrReporter {
-    last_report: Mutex<Instant>,
-}
-
-impl Default for StderrReporter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl StderrReporter {
-    pub fn new() -> Self {
-        Self {
-            last_report: Mutex::new(Instant::now() - Duration::from_secs(2)),
-        }
-    }
-}
-
-impl ProgressReporter for StderrReporter {
-    fn report(&self, update: &ProgressUpdate) {
-        let mut last = self.last_report.lock().unwrap();
-        if last.elapsed() >= Duration::from_secs(1) {
-            eprintln!("{}", update.format());
-            *last = Instant::now();
-        }
-    }
-}
-
-/// No-op reporter for `--quiet` mode.
-pub struct NullReporter;
-
-impl ProgressReporter for NullReporter {
-    fn report(&self, _update: &ProgressUpdate) {}
-}
-
-/// Collects all updates for testing.
-#[cfg(any(test, feature = "test-utils"))]
-pub struct VecReporter {
-    pub updates: Mutex<Vec<ProgressUpdate>>,
-}
-
-#[cfg(any(test, feature = "test-utils"))]
-impl VecReporter {
-    pub fn new() -> Self {
-        Self {
-            updates: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-utils"))]
-impl Default for VecReporter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(any(test, feature = "test-utils"))]
-impl ProgressReporter for VecReporter {
-    fn report(&self, update: &ProgressUpdate) {
-        self.updates.lock().unwrap().push(update.clone());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_stderr_reporter_throttle() {
-        let reporter = StderrReporter::new();
-        let update = ProgressUpdate {
-            phase: "Phase 1 indexing".into(),
-            file: "test.csv".into(),
-            processed: 100,
-            total: Some(1000),
-            elapsed: Duration::from_secs(1),
-        };
+    fn counters_publish_what_the_executor_advanced() {
+        let progress = RunProgress::new();
+        progress.advance_records(40);
+        progress.advance_records(2);
+        progress.advance_files(1);
 
-        // First report should go through (initialized 2 seconds in the past)
-        reporter.report(&update);
-        let t1 = *reporter.last_report.lock().unwrap();
-
-        // Immediate second report should be throttled (no update to last_report)
-        let update2 = ProgressUpdate {
-            processed: 200,
-            ..update.clone()
-        };
-        reporter.report(&update2);
-        let t2 = *reporter.last_report.lock().unwrap();
-        assert_eq!(t1, t2, "second report within 1 second should be throttled");
+        let sample = progress.sample();
+        assert_eq!(sample.records_read, 42);
+        assert_eq!(sample.files_done, 1);
     }
 
     #[test]
-    fn test_stderr_reporter_format_with_total() {
-        let update = ProgressUpdate {
-            phase: "Phase 2 transforming".into(),
-            file: "orders.csv".into(),
-            processed: 150000,
-            total: Some(500000),
-            elapsed: Duration::from_secs_f64(12.3),
-        };
-        let formatted = update.format();
-        assert!(formatted.contains("[cxl] orders.csv:"));
-        assert!(formatted.contains("Phase 2 transforming"));
-        assert!(formatted.contains("150000/500000 records"));
-        assert!(formatted.contains("30%"));
-        assert!(formatted.contains("[12.3s]"));
+    fn clones_share_one_set_of_counters() {
+        let progress = RunProgress::new();
+        let observer = progress.clone();
+        progress.advance_records(7);
+        assert_eq!(observer.sample().records_read, 7);
     }
 
     #[test]
-    fn test_stderr_reporter_format_without_total() {
-        let update = ProgressUpdate {
-            phase: "Phase 2 transforming".into(),
-            file: "stream.csv".into(),
-            processed: 50000,
-            total: None,
-            elapsed: Duration::from_secs_f64(5.0),
-        };
-        let formatted = update.format();
-        assert!(formatted.contains("50000 records"));
-        assert!(!formatted.contains('/'));
-        assert!(!formatted.contains('%'));
+    fn an_unsealed_total_is_absent_not_zero() {
+        let progress = RunProgress::new();
+        assert_eq!(progress.sample().files_total, None);
     }
 
     #[test]
-    fn test_null_reporter_silent() {
-        let reporter = NullReporter;
-        let update = ProgressUpdate {
-            phase: "Phase 1 indexing".into(),
-            file: "test.csv".into(),
-            processed: 100,
-            total: Some(1000),
-            elapsed: Duration::from_secs(1),
-        };
-        // Should not panic or produce any output
-        reporter.report(&update);
+    fn a_total_sealed_as_unknowable_stays_absent() {
+        let progress = RunProgress::new();
+        progress.seal_files_total(None);
+        assert_eq!(progress.sample().files_total, None);
     }
 
     #[test]
-    fn test_vec_reporter_collects() {
-        let reporter = VecReporter::new();
-        let update = ProgressUpdate {
-            phase: "Phase 1 indexing".into(),
-            file: "test.csv".into(),
-            processed: 100,
-            total: Some(1000),
-            elapsed: Duration::from_secs(1),
-        };
-        reporter.report(&update);
-        reporter.report(&update);
-        let updates = reporter.updates.lock().unwrap();
-        assert_eq!(updates.len(), 2);
+    fn a_sealed_total_cannot_drift() {
+        let progress = RunProgress::new();
+        progress.seal_files_total(Some(4));
+        progress.seal_files_total(Some(9));
+        assert_eq!(progress.sample().files_total, Some(4));
     }
 
     #[test]
-    fn test_progress_update_phase_specific() {
-        let p1 = ProgressUpdate {
-            phase: "Phase 1 indexing".into(),
-            file: "test.csv".into(),
-            processed: 100,
-            total: Some(1000),
-            elapsed: Duration::from_secs(1),
-        };
-        let p2 = ProgressUpdate {
-            phase: "Phase 2 transforming".into(),
-            file: "test.csv".into(),
-            processed: 50,
-            total: Some(1000),
-            elapsed: Duration::from_secs(2),
-        };
-        assert!(p1.format().contains("Phase 1 indexing"));
-        assert!(p2.format().contains("Phase 2 transforming"));
+    fn denominator_refuses_every_total_it_cannot_stand_behind() {
+        assert_eq!(denominator(5, Some(10)), Some((5, 10)));
+        assert_eq!(denominator(10, Some(10)), Some((10, 10)));
+        assert_eq!(denominator(5, None), None, "no total established");
+        assert_eq!(
+            denominator(0, Some(0)),
+            None,
+            "a zero total divides nothing"
+        );
+        assert_eq!(
+            denominator(11, Some(10)),
+            None,
+            "a total the run overran describes it no better than none"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_carries_the_sample_it_was_built_from() {
+        let progress = RunProgress::new();
+        progress.advance_records(9);
+        progress.seal_files_total(Some(3));
+        let mut bounded = BoundedProgress::default();
+
+        let snapshot = bounded.transition("planning", progress.sample());
+        assert_eq!(snapshot.sample().records_read, 9);
+        assert_eq!(snapshot.sample().files_total, Some(3));
     }
 
     #[test]
     fn machine_progress_coalesces_periodic_updates() {
         let mut progress = BoundedProgress::default();
-        let first = progress.periodic("executing").expect("first snapshot");
+        let sample = ProgressSample::default();
+        let first = progress
+            .periodic("executing", sample)
+            .expect("first snapshot");
         assert_eq!(first.kind(), ProgressKind::Periodic);
-        assert!(progress.periodic("executing").is_none());
+        assert!(progress.periodic("executing", sample).is_none());
     }
 
     #[test]
     fn machine_progress_bounds_utf8_detail_and_discardable_events() {
         let mut progress = BoundedProgress::new(1, 5);
-        let transition = progress.transition("éééé");
+        let sample = ProgressSample::default();
+        let transition = progress.transition("éééé", sample);
         assert_eq!(transition.phase(), "éé");
         assert!(transition.detail_truncated());
         assert!(!transition.event_limit_reached());
 
-        assert!(progress.periodic_at("work", Instant::now()).is_some());
+        assert!(
+            progress
+                .periodic_at("work", sample, Instant::now())
+                .is_some()
+        );
         let later = Instant::now() + Duration::from_secs(2);
         let capped = progress
-            .periodic_at("work", later)
+            .periodic_at("work", sample, later)
             .expect("one cap notification");
         assert!(capped.event_limit_reached());
         assert!(
             progress
-                .periodic_at("ignored", later + Duration::from_secs(2))
+                .periodic_at("ignored", sample, later + Duration::from_secs(2))
                 .is_none()
         );
 
-        let finalizing = progress.transition("finalizing");
+        let finalizing = progress.transition("finalizing", sample);
         assert_eq!(finalizing.kind(), ProgressKind::Transition);
         assert!(!finalizing.event_limit_reached());
+    }
+
+    /// The cap notice is the one record that explains the silence after it, so
+    /// a run that reaches the real default must emit it exactly once. Driven
+    /// through injected instants: the one-second floor is not overridable, so
+    /// reaching 128 records on a wall clock would take over two minutes.
+    #[test]
+    fn the_default_cap_announces_itself_exactly_once() {
+        let mut progress = BoundedProgress::default();
+        let sample = ProgressSample::default();
+        let start = Instant::now();
+        let mut ordinary = 0_usize;
+        let mut notices = 0_usize;
+
+        // Two hundred due periodic slots against a 128-record cap.
+        for tick in 0..200 {
+            let now = start + Duration::from_secs(tick * 2);
+            if let Some(snapshot) = progress.periodic_at("executing", sample, now) {
+                if snapshot.event_limit_reached() {
+                    notices += 1;
+                } else {
+                    ordinary += 1;
+                }
+            }
+        }
+
+        assert_eq!(ordinary, DEFAULT_MAX_MACHINE_EVENTS);
+        assert_eq!(notices, 1, "the cap announces itself once and only once");
+    }
+
+    #[test]
+    fn a_restored_cap_notice_is_offered_once_more_and_no_further() {
+        let mut progress = BoundedProgress::new(0, DEFAULT_MAX_DETAIL_BYTES);
+        let sample = ProgressSample::default();
+        let start = Instant::now();
+
+        let first = progress
+            .periodic_at("executing", sample, start)
+            .expect("cap notice");
+        assert!(first.event_limit_reached());
+
+        progress.restore_event_limit_notice();
+        let second = progress
+            .periodic_at("executing", sample, start + Duration::from_secs(2))
+            .expect("re-offered cap notice");
+        assert!(second.event_limit_reached());
+
+        assert!(
+            progress
+                .periodic_at("executing", sample, start + Duration::from_secs(4))
+                .is_none()
+        );
     }
 }

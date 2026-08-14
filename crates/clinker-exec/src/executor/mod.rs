@@ -656,6 +656,10 @@ impl PipelineExecutor {
                 Arc<crate::pipeline::memory::ConsumerHandle>,
             ),
         > = HashMap::with_capacity(source_configs.len());
+        // Files this run will read across every source, accumulated as each
+        // source's already-enumerated input is claimed. `None` once any
+        // source turns out not to be an enumerated file set.
+        let mut files_total: Option<u64> = Some(0);
         for src_cfg in &source_configs {
             let source_id = plan
                 .graph
@@ -687,6 +691,18 @@ impl PipelineExecutor {
                     src_cfg.name
                 )))
             })?;
+            // Count this source's files toward the run's file denominator
+            // before the input moves into its ingest thread. One non-file
+            // transport withdraws the denominator for the whole run rather
+            // than letting it describe only the file-backed part: a total
+            // that covers some of the work is worse than none, because
+            // nothing on the wire says which part it covered.
+            files_total = match (&source_input, files_total) {
+                (crate::source::SourceInput::Files(files), Some(seen)) => {
+                    Some(seen.saturating_add(files.len() as u64))
+                }
+                _ => None,
+            };
             // Single ConsumerHandle shared between the SourceConsumer
             // wrapper (BackPressurePreferred / Priority pause target)
             // and the SourceIngestChannel that mirrors the channel queue
@@ -771,6 +787,7 @@ impl PipelineExecutor {
             // within the documented shutdown bound; the file arm ignores
             // it (dropped-receiver stop suffices).
             let ingest_shutdown = params.shutdown_token.clone();
+            let ingest_progress = params.progress.clone();
             // One OS thread per Source. Spawned before the DAG dispatch
             // drains so the producers fill the bounded channels while the
             // consumer dispatch loop runs concurrently. Joined after
@@ -784,6 +801,7 @@ impl PipelineExecutor {
                         config_clone,
                         stream,
                         ingest_shutdown,
+                        ingest_progress,
                     )
                 })
                 .map_err(|e| PipelineError::Internal {
@@ -792,6 +810,11 @@ impl PipelineExecutor {
                     detail: format!("failed to spawn source ingest thread: {e}"),
                 })?;
             ingest_handles.push(handle);
+        }
+        // Sealed once every source has been claimed, so the denominator a
+        // reader sees is either absent or covers the whole run.
+        if let Some(progress) = &params.progress {
+            progress.seal_files_total(files_total);
         }
 
         let dispatch_outcome = match Self::execute_dag(
@@ -1380,6 +1403,8 @@ impl PipelineExecutor {
             dlq_entries: std::mem::take(dlq_entries),
             dlq_per_source: HashMap::new(),
             total_per_source,
+            records_pending_publish: 0,
+            progress: params.progress.clone(),
             type_error_population: dispatch::TypeErrorPopulation::default(),
             applied_attempt_populations: HashSet::new(),
             rollback_cursors: HashMap::new(),
