@@ -1042,7 +1042,8 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   The useful artifact would be an absolute baseline for graviola alone, which
   needs a loopback TLS server — a `rustls` dev-dependency and a committed
   certificate fixture with an expiry, both approval-gated. Reasoning in
-  [65_PURE_RUST_BUILD_FINDINGS.md](65_PURE_RUST_BUILD_FINDINGS.md) §3.
+  [65_PURE_RUST_BUILD_FINDINGS.md](65_PURE_RUST_BUILD_FINDINGS.md) §3; tracked
+  as #1079.
 - **60 (filed 2026-08-14):** CI never completes a TLS handshake. Every REST and
   OTLP test binds a loopback listener speaking plain HTTP, and the one test that
   reaches a public endpoint is `#[ignore = "requires outbound network"]`
@@ -1050,4 +1051,5 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   handshake attempt fails at the peer rather than in provider setup, which
   rules out a provider that cannot initialize but not one that negotiates
   wrongly. The only evidence of a successful handshake is a dated manual note in
-  that file. Closing this is the same loopback-TLS-server work as 59.
+  that file. Closing this is the same loopback-TLS-server work as 59, tracked as
+  #1079.

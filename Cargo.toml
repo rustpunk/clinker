@@ -77,12 +77,12 @@ static_assertions = "1"
 # build-dependency, which the workspace's pure-Rust pillar (no C build
 # dependencies in clinker crates) forbids.
 #
-# It is a real cost rather than a free trade, and the comment here used to claim
-# otherwise. Measured on one x86_64 host, `pure` hashes at ~85% of the assembly
-# build's throughput at the same instruction set, and at ~57% once the assembly
-# build is allowed the AVX-512 kernels `pure` has no equivalent for. The pillar
-# is the binding constraint and this is its price; the figures, the method, and
-# what they do not cover are in docs/ai/60_PERFORMANCE_NOTES.md.
+# It is a real cost rather than a free trade. Measured on one x86_64 host, `pure`
+# hashes at ~85% of the assembly build's throughput at the same instruction set,
+# and at ~57% once the assembly build is allowed the AVX-512 kernels `pure` has
+# no equivalent for. The pillar is the binding constraint and this is its price;
+# the figures, the method, and what they do not cover are in
+# docs/ai/60_PERFORMANCE_NOTES.md.
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 uuid = { version = "1", features = ["v4"] }
 crossbeam-channel = "0.5"

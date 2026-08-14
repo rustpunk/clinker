@@ -141,8 +141,8 @@ it would be detected. This is recorded in
 An absolute handshake-latency baseline for graviola alone — no `ring` arm — is
 possible and would be the useful artifact, but it needs a loopback TLS server, which
 means a `rustls` dev-dependency and a committed certificate fixture with an expiry.
-That is a scoped piece of work with its own approval, deliberately not smuggled in
-here.
+Both are approval-gated, so that work is scoped separately and tracked as #1079
+rather than smuggled in here.
 
 ## 4. The enforcing gate
 
