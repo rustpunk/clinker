@@ -27,10 +27,15 @@ publish = false
 cc = "=1.2.58"
 
 # Not called from here. Pinned because `cc` delegates MSVC toolchain and
-# environment discovery to it, which makes it part of the variable set this
-# control certifies — and `cc` requires it through a caret range, so without an
-# exact requirement stated here any `cargo update` would drift it away from the
-# workspace's resolution and fail the parity check with no manifest change to
-# explain why. A direct entry is the only place Cargo lets a transitive version
-# be fixed.
+# environment discovery to it, so it is part of the variable set this control
+# would certify on Windows — and `cc` requires it through a caret range, so
+# without an exact requirement stated here any `cargo update` drifts it away from
+# the workspace's resolution. A direct entry is the only place Cargo lets a
+# transitive version be fixed.
+#
+# CI asserts parity on `cc` only: the `Build portability` job runs on Linux and
+# neutralizes the Linux compiler variables, so it never exercises the MSVC
+# discovery this crate governs. Asserting a version the job cannot exercise was
+# how the parity check grew the machinery that kept breaking it. The pin stays so
+# the divergence cannot happen silently; it is simply not what the gate proves.
 find-msvc-tools = "=0.1.9"

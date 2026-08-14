@@ -142,88 +142,65 @@ jobs:
       # and nothing else lints it either — hence the format and lint passes here.
       - name: Prove the no-C gate bites
         run: |
-          # The control has to exercise the same toolchain-discovery crates the
-          # workspace's build scripts would, because which environment variables
-          # get read is version-specific. Not just `cc`: it delegates MSVC
-          # toolchain and environment discovery to `find-msvc-tools`, so a
-          # divergence there is a divergence in half the set this certifies.
+          # The control must exercise the same `cc` the workspace resolves,
+          # because which environment variables a build script consults is
+          # version-specific, and a control reading a different set certifies a
+          # coverage the workspace never had.
           #
-          # One awk pass over both lockfiles rather than a pipeline. Earlier
-          # revisions of this check used sort/comm/grep and each rewrite bought a
-          # new defect from the plumbing rather than the logic: collation that has
-          # to match between two tools, a `||` that binds to the wrong end of a
-          # pipe, substring matches reporting `scc` as a resolution of `cc`. The
-          # comparison is three packages; it does not need any of that. Only
-          # `[[package]]` blocks are read, so a lockfile's own top-level
-          # `version` field and any `[[patch.unused]]` entries are skipped.
+          # Scoped to `cc` alone, and deliberately. Earlier revisions compared
+          # every crate the two lockfiles shared and each rewrite bought a defect
+          # from the machinery rather than the logic — collation that has to agree
+          # between two tools, a `||` bound to the wrong end of a pipe, substring
+          # matches reporting `scc` as a resolution of `cc`, and an `x in a`
+          # guarding an assignment to `a[x]`, which gawk and mawk disagree about.
+          # `cc` is the crate that decides the variable set; `find-msvc-tools`
+          # governs MSVC discovery, which this Linux job never reaches. Both stay
+          # pinned in the fixture manifest so neither drifts unnoticed, but only
+          # the one this job can actually exercise is asserted here.
           #
-          # Exact version, and exactly one of it. Accepting "some version the
-          # workspace also locks" would pass a workspace holding two `cc` majors
-          # while the control certifies whichever one the build scripts do not
-          # use — the failure this whole step exists to prevent.
-          report=$(awk -v fixture="tools/no-c-gate-fixture/Cargo.lock" '
-            /^\[\[package\]\]/ { in_pkg = 1; n = ""; next }
-            in_pkg && /^name = / { gsub(/"/, ""); n = $3; next }
-            in_pkg && /^version = / && n != "" {
-              gsub(/"/, "")
-              if (FILENAME == fixture) {
-                if (n != "clinker-no-c-gate-fixture") { want[n] = $3 }
-              } else {
-                count[n]++
-                seen[n] = (n in seen) ? seen[n] " " $3 : $3
-              }
-              in_pkg = 0
-            }
-            END {
-              if (!("cc" in want)) { exit 2 }
-              if (!("cc" in count)) { exit 3 }
-              for (n in want) {
-                if (!(n in count)) {
-                  printf "  %s %s — absent from the workspace lockfile\n", \
-                    n, want[n]
-                  bad = 1
-                } else if (count[n] > 1) {
-                  # Kept on one line: a backslash continuation inside the string
-                  # would resume at column 1, which dedents out of this block
-                  # scalar and makes the workflow unparseable.
-                  printf "  %s %s — the workspace locks %d versions (%s), so the control can only certify one\n", n, want[n], count[n], seen[n]
-                  bad = 1
-                } else if (seen[n] != want[n]) {
-                  printf "  %s %s — the workspace resolves %s\n", \
-                    n, want[n], seen[n]
-                  bad = 1
-                }
-              }
-              exit bad ? 1 : 0
-            }
-          ' Cargo.lock tools/no-c-gate-fixture/Cargo.lock) && status=0 || status=$?
+          # awk emits data and the shell decides. No arrays, no ternaries, and no
+          # exit-status sentinels: awk exits 2 of its own accord when it cannot
+          # open a file, so a sentinel in that range turns a missing lockfile into
+          # a confident wrong verdict. Only `[[package]]` blocks are read, so a
+          # lockfile's top-level `version` field and any `[[patch.unused]]` entry
+          # are skipped.
+          cc_versions() {
+            awk '/^\[\[package\]\]/ { p = 1; n = ""; next }
+                 p && /^name = / { gsub(/"/, ""); n = $3; next }
+                 p && /^version = / {
+                   if (n == "cc") { gsub(/"/, ""); print $3 }
+                   p = 0
+                 }' "$1"
+          }
+          control_cc=$(cc_versions tools/no-c-gate-fixture/Cargo.lock)
+          workspace_cc=$(cc_versions Cargo.lock)
 
-          case "$status" in
-            0)
-              echo "control and workspace agree on every crate the control locks."
-              ;;
-            2)
-              echo "the negative control no longer depends on cc, so it cannot"
-              echo "compile C and cannot demonstrate anything."
-              exit 1
-              ;;
-            3)
-              # The end state this whole guarantee points at. There is nothing
-              # left to reconcile against, and that is a success, not a break.
-              echo "cc has left the workspace lockfile entirely; nothing to"
-              echo "reconcile, and the control still compiles C on its own."
-              ;;
-            *)
-              echo "the negative control and the workspace disagree, so it would"
-              echo "certify a set of environment variables the workspace's build"
-              echo "scripts never read:"
-              echo "$report"
-              echo "Fix by editing the '=' pins in"
-              echo "tools/no-c-gate-fixture/Cargo.toml to the workspace's"
-              echo "versions and regenerating its lockfile."
-              exit 1
-              ;;
-          esac
+          if [ -z "$control_cc" ]; then
+            echo "the negative control no longer depends on cc, so it cannot"
+            echo "compile C and cannot demonstrate anything."
+            exit 1
+          elif [ -z "$workspace_cc" ]; then
+            # The end state this whole guarantee points at. There is nothing left
+            # to reconcile against, and that is a success, not a break.
+            echo "cc has left the workspace lockfile entirely; nothing to"
+            echo "reconcile, and the control still compiles C on its own."
+          elif [ "$(printf '%s\n' "$workspace_cc" | wc -l)" -gt 1 ]; then
+            echo "the workspace locks more than one cc:"
+            printf '%s\n' "$workspace_cc" | sed 's/^/  /'
+            echo "The control can exercise only one of them, so which variables"
+            echo "the build scripts read is no longer determined. Resolve the"
+            echo "duplicate, or narrow this check deliberately."
+            exit 1
+          elif [ "$control_cc" != "$workspace_cc" ]; then
+            echo "the control locks cc $control_cc but the workspace resolves cc"
+            echo "$workspace_cc, so it would certify a set of environment"
+            echo "variables the workspace's build scripts never read."
+            echo "Fix by setting cc = \"=$workspace_cc\" in"
+            echo "tools/no-c-gate-fixture/Cargo.toml and regenerating its lock."
+            exit 1
+          else
+            echo "control and workspace agree on cc $workspace_cc"
+          fi
 
           # Direction 1: with a working toolchain the fixture must build. A fixture
           # that can never build would fail the next check for its own reasons and
