@@ -77,9 +77,14 @@ jobs:
     # that must agree, and the dangerous drift is removal: drop a variable from
     # the build step but leave it in the negative control, and the control still
     # fails in `cc` — a green tick — while the workspace build can now reach a
-    # real compiler through the un-neutralized variable. The one step that needs
-    # a working compiler unsets them explicitly with `env -u`, which fails loudly
-    # if a name here is renamed and the two lists stop matching.
+    # real compiler through the un-neutralized variable.
+    #
+    # The two steps that need a working compiler unset these by name with
+    # `env -u`. Note what that does and does not catch: adding a name here
+    # without adding it to both `env -u` lists breaks those steps loudly, but
+    # *removing* one here while leaving it in an `env -u` list is silent, since
+    # `env -u` on an unset variable is a no-op. Treat this block and the two
+    # `env -u` lists as one edit.
     env:
       CC: /bin/false
       CXX: /bin/false
@@ -137,26 +142,59 @@ jobs:
       # and nothing else lints it either — hence the format and lint passes here.
       - name: Prove the no-C gate bites
         run: |
-          # The control has to exercise the same `cc` the workspace's build scripts
-          # do. A newer `cc` reads environment variables an older one does not, so
-          # a control on a different version certifies coverage of a variable set
-          # that is not the one under test.
-          fixture_cc=$(sed -n '/^name = "cc"$/{n;s/^version = "\(.*\)"$/\1/p;}' \
-            tools/no-c-gate-fixture/Cargo.lock)
-          workspace_cc=$(sed -n '/^name = "cc"$/{n;s/^version = "\(.*\)"$/\1/p;}' \
-            Cargo.lock)
-          if [ "$fixture_cc" != "$workspace_cc" ]; then
-            echo "the negative control uses cc $fixture_cc but the workspace"
-            echo "resolves cc $workspace_cc, so it proves coverage of a different"
-            echo "set of environment variables. Re-pin tools/no-c-gate-fixture."
+          # The control has to exercise the same toolchain-discovery crates the
+          # workspace's build scripts do, because which environment variables get
+          # read is version-specific. Every package the two lockfiles share must
+          # agree, not just `cc`: `cc` delegates MSVC toolchain and environment
+          # discovery to `find-msvc-tools`, so a divergence there is a divergence
+          # in half the variable set this control exists to certify.
+          # Only inside `[[package]]` blocks: a lockfile opens with its own
+          # top-level `version = N` format field, which would otherwise be
+          # emitted as a nameless entry and compared as if it were a crate.
+          lock_versions() {
+            awk '/^\[\[package\]\]/ { in_pkg = 1; n = ""; next }
+                 in_pkg && /^name = / { gsub(/"/, ""); n = $3; next }
+                 in_pkg && /^version = / && n != "" {
+                   gsub(/"/, ""); print n, $3; in_pkg = 0 }' "$1" | sort
+          }
+          lock_versions tools/no-c-gate-fixture/Cargo.lock \
+            >"${RUNNER_TEMP}/fixture-lock.txt"
+          lock_versions Cargo.lock >"${RUNNER_TEMP}/workspace-lock.txt"
+
+          if ! grep -q '^cc ' "${RUNNER_TEMP}/fixture-lock.txt"; then
+            echo "the negative control no longer depends on cc, so it cannot"
+            echo "compile C and cannot demonstrate anything."
             exit 1
           fi
-          echo "control and workspace agree on cc $workspace_cc"
+          if ! grep -q '^cc ' "${RUNNER_TEMP}/workspace-lock.txt"; then
+            # The end state this whole guarantee points at. There is nothing left
+            # to reconcile the control against, and that is a success, not a break
+            # — the failure mode this branch exists to avoid.
+            echo "cc has left the workspace lockfile entirely; no shared version"
+            echo "to reconcile, and the control still compiles C on its own."
+          else
+            join "${RUNNER_TEMP}/fixture-lock.txt" \
+                 "${RUNNER_TEMP}/workspace-lock.txt" >"${RUNNER_TEMP}/shared.txt"
+            mismatched=$(awk '$2 != $3 {
+              print "  " $1 ": control has " $2 ", workspace has " $3 }' \
+              "${RUNNER_TEMP}/shared.txt")
+            if [ -n "$mismatched" ]; then
+              echo "the negative control and the workspace disagree on a shared"
+              echo "dependency, so the control certifies coverage of a variable"
+              echo "set the workspace does not read:"
+              echo "$mismatched"
+              echo "Re-pin tools/no-c-gate-fixture to the workspace's versions."
+              exit 1
+            fi
+            echo "control and workspace agree on all shared packages:"
+            sed 's/^/  /' "${RUNNER_TEMP}/shared.txt"
+          fi
 
           # Direction 1: with a working toolchain the fixture must build. A fixture
           # that can never build would fail the next check for its own reasons and
-          # report a working gate regardless of the gate. `env -u` rather than a
-          # second literal list, so there is one place the variable names live.
+          # report a working gate regardless of the gate. `env -u` rather than
+          # re-stating values, so the job-level block stays the only place the
+          # variables are assigned — see the caveat on that block about removal.
           if ! env -u CC -u CXX -u AR \
                  -u CC_x86_64_unknown_linux_gnu \
                  -u CXX_x86_64_unknown_linux_gnu \
@@ -223,6 +261,17 @@ jobs:
                  --invert ring \
                  >"${RUNNER_TEMP}/ring.txt" 2>"${RUNNER_TEMP}/ring.err"; then
             if grep -q "did not match any packages" "${RUNNER_TEMP}/ring.err"; then
+              # cargo emits this for any spec it cannot resolve, so on its own it
+              # cannot tell "ring is gone" from "we asked about a name that does
+              # not exist". A rename or typo in the argument above would otherwise
+              # land here and report success on every future run, with the
+              # guarantee silently switched off. Confirm the absence against the
+              # lockfile directly, against a name this check hardcodes.
+              if grep -q '^name = "ring"$' Cargo.lock; then
+                echo "cargo tree resolved no such package, yet ring IS in"
+                echo "Cargo.lock — this check is asking about the wrong name."
+                exit 1
+              fi
               echo "ring is not in the lockfile at all — the strongest form of this"
               echo "guarantee."
               exit 0
