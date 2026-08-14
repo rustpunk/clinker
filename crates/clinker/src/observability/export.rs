@@ -1960,22 +1960,55 @@ mode = "none"
             .expect("the observability policy resolves")
     }
 
+    /// Emit one log, retrying while the arena is merely busy.
+    ///
+    /// Admission takes the arena with `try_lock` and reports `Contended` rather
+    /// than waiting, so a producer racing a drain is a designed outcome, not a
+    /// fault. Tests that run a live export worker race it by construction: the
+    /// worker loops drain-then-deliver, and an emit landing inside a drain's
+    /// lock window is dropped. Asserting on a single attempt makes the test
+    /// depend on the scheduler rather than on the behaviour it names.
+    ///
+    /// Retrying is bounded and only forgives `Contended`. A genuine admission
+    /// regression — sampling, capacity, a poisoned arena — is not retried away:
+    /// those outcomes fail on the first attempt, and exhausting the budget
+    /// fails too, so this cannot turn a broken arena green.
     fn emit_one_log(producer: &TelemetryProducer) {
+        const ATTEMPTS: u32 = 200;
         let correlation = correlation();
-        let outcome = producer.emit_log(LogEvent {
-            event: "transform.customer_seen",
-            severity: Severity::Info,
-            message: "customer observed",
-            correlation: RunCorrelation {
-                execution_id: &correlation.execution_id,
-                batch_id: &correlation.batch_id,
-                pipeline_name: &correlation.pipeline_name,
-            },
-            fields: &[],
-        });
-        assert!(
-            outcome.is_accepted(),
-            "the arena admits the fixture: {outcome:?}"
+        let mut last = None;
+        for attempt in 0..ATTEMPTS {
+            let outcome = producer.emit_log(LogEvent {
+                event: "transform.customer_seen",
+                severity: Severity::Info,
+                message: "customer observed",
+                correlation: RunCorrelation {
+                    execution_id: &correlation.execution_id,
+                    batch_id: &correlation.batch_id,
+                    pipeline_name: &correlation.pipeline_name,
+                },
+                fields: &[],
+            });
+            if outcome.is_accepted() {
+                return;
+            }
+            assert!(
+                matches!(
+                    outcome,
+                    clinker_exec::telemetry::AdmissionOutcome::Dropped(
+                        clinker_exec::telemetry::DropReason::Contended
+                    )
+                ),
+                "the arena admits the fixture: {outcome:?}"
+            );
+            last = Some(outcome);
+            if attempt + 1 < ATTEMPTS {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        panic!(
+            "the arena stayed contended across {ATTEMPTS} attempts, last outcome {:?}",
+            last.expect("a rejected attempt records its outcome")
         );
     }
 
