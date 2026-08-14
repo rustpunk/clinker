@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-exclude = ["tools/dependency-policy", "tools/release-policy"]
+exclude = [
+    "tools/dependency-policy",
+    "tools/release-policy",
+    # Compiles C on purpose, as the negative control for the no-C-toolchain gate.
+    # Excluded so it never enters this workspace's graph, lockfile, or `cargo tree`.
+    "tools/no-c-gate-fixture",
+]
 members = [
     "crates/clinker-record",
     "crates/cxl",
@@ -64,13 +70,19 @@ arc-swap = "1.9"
 static_assertions = "1"
 # `pure` is misleadingly named: on blake3 1.x it does NOT mean scalar. It
 # compiles the SSE2/SSE4.1/AVX2 paths as Rust `std::arch` intrinsics and
-# dispatches them at runtime via `cpufeatures`, so source-staging copies hash
-# at full SIMD speed on every x86_64 host. What `pure` gives up is the
-# hand-written assembly / AVX-512 variants — and those are built by invoking a
-# C toolchain through blake3's `cc` build-dependency, which the workspace's
-# pure-Rust pillar (no C build dependencies in clinker crates) forbids. Keeping
-# `pure` therefore buys SIMD without a build-time C compiler: the correct trade
-# for this repo, not a performance compromise.
+# dispatches them at runtime, so source-staging copies do get SIMD. That much is
+# measured rather than assumed — forcing the AVX2 path off halves throughput.
+# What `pure` gives up is the hand-written assembly and the AVX-512 kernels, and
+# those are built by invoking a C toolchain through blake3's `cc`
+# build-dependency, which the workspace's pure-Rust pillar (no C build
+# dependencies in clinker crates) forbids.
+#
+# It is a real cost rather than a free trade. Measured on one x86_64 host, `pure`
+# hashes at ~85% of the assembly build's throughput at the same instruction set,
+# and at ~57% once the assembly build is allowed the AVX-512 kernels `pure` has
+# no equivalent for. The pillar is the binding constraint and this is its price;
+# the figures, the method, and what they do not cover are in
+# docs/ai/60_PERFORMANCE_NOTES.md.
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 uuid = { version = "1", features = ["v4"] }
 crossbeam-channel = "0.5"
@@ -103,8 +115,10 @@ http = "1"
 # workspace, contradicting the pure-Rust pillar. Naming the other two halves
 # directly keeps the Mozilla webpki root store exactly as it was and leaves
 # the crypto provider unset, so `clinker-net` installs graviola on the agent
-# it builds. ureq only falls back to ring when no provider is configured, and
-# with `_ring` off that fallback is a compile-time-absent path.
+# it builds. ureq only falls back to ring when no provider is configured; with
+# `_ring` off that fallback is still compiled, as a function whose body is a
+# panic, so a future agent built without naming a provider fails loudly at the
+# first request rather than quietly acquiring one.
 ureq = { version = "3", default-features = false, features = [
     "rustls-no-provider",
     "rustls-webpki-roots",

@@ -12,6 +12,37 @@ Use the labels below carefully:
 
 ## Evidence Boundaries
 
+### The blake3 `pure` figures are a one-off, not a gate
+
+Content hashing runs blake3 with the `pure` feature, which costs throughput. The
+figures below were taken once, by hand, on a developer machine, and cannot be
+reproduced in CI — the comparison arm needs a C toolchain, which the
+`Build portability` job exists to refuse. Treat them as a dated observation, not a
+baseline anything is checked against.
+
+Measured 2026-08-14 on an AMD Ryzen 9 7950X3D, rustc 1.96.0, single-threaded,
+streaming 1 MiB chunks to match `COPY_CHUNK_BYTES` in
+`crates/clinker-channel/src/staging_copy.rs`, best of three passes over 2 GiB:
+
+| build | dispatch | MiB/s | vs default |
+|---|---|---:|---:|
+| default | assembly + AVX-512 | 7933 | 1.00 |
+| default, `no_avx512` | assembly + AVX2 | 5284 | 0.67 |
+| **`pure`** (shipped) | Rust intrinsics + AVX2 | **4516** | **0.57** |
+| `pure`, `no_avx2` | Rust intrinsics + SSE4.1 | 2414 | 0.30 |
+
+Roughly 15% of the cost is assembly-versus-intrinsics at the same instruction set
+and is paid on every x86_64 CPU; the rest is AVX-512, which `pure` has no equivalent
+for and which is only paid where the hardware offers it. The last row is a control:
+it confirms `pure` dispatches SIMD at runtime rather than falling back to scalar.
+
+This measures hashing in isolation, on one CPU. It is not an end-to-end figure for
+the staged-copy path, and `verify: blake3` versus `none` would not produce one —
+`copy_into` hashes unconditionally, so that delta is a second full read of the
+source plus a second hash, and is I/O-dominated. An end-to-end envelope at
+0.5–2 GB belongs with the large-file qualification work. Method and interpretation:
+[65_PURE_RUST_BUILD_FINDINGS.md](65_PURE_RUST_BUILD_FINDINGS.md).
+
 ### Allocation instrumentation is untrusted
 
 The optional `clinker-exec -> clinker-bench-support` edge and the

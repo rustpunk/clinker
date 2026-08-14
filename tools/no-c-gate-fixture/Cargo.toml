@@ -1,0 +1,33 @@
+[package]
+name = "clinker-no-c-gate-fixture"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A crate that deliberately compiles C, so the no-C-toolchain gate can be shown to fail"
+publish = false
+
+# Detached from the root workspace, and listed in the root `exclude`. Its own
+# lockfile is invisible to the dependency-policy digest, which reads the root
+# `Cargo.lock` only, and its crate is invisible to `cargo tree --workspace`. That
+# isolation is the point: this crate exists to compile C, which the workspace it
+# guards must never do.
+[workspace]
+
+[build-dependencies]
+# The real `cc` crate rather than a hand-rolled `Command`. What is under test is
+# whether the CI job's environment covers the variables a genuine C-compiling
+# build script consults, and only `cc` itself knows the full set.
+#
+# Exactly the version the root `Cargo.lock` resolves, and the `Build portability`
+# job fails if the two ever diverge. Which environment variables a build script
+# consults is version-specific — newer releases read overrides older ones ignore
+# — so a control on a different `cc` would certify coverage of a set the
+# workspace's build scripts never read.
+#
+# Pin `cc` and nothing beneath it. Its transitives float within its own
+# requirements, including `find-msvc-tools`, which it delegates MSVC discovery
+# to: that path belongs to Windows, while the only job that builds this crate
+# runs on Linux with the Linux compiler variables neutralized. Pinning a crate no
+# job exercises asserts a protection nothing checks, and would block this file's
+# upgrade path the moment a newer `cc` required a newer transitive.
+cc = "=1.2.58"

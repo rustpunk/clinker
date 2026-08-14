@@ -45,6 +45,9 @@ Validate this page against:
 - `45_COMMON_AGENT_MISTAKES.md`: recurring agent mistakes and the drift traps behind them; companion to `40_COMMON_PATTERNS.md`.
 - `50_TESTING_AND_COMMANDS.md`: canonical command guide.
 - `60_PERFORMANCE_NOTES.md`: hot paths, memory-sensitive code, and benchmark entry points.
+- `65_PURE_RUST_BUILD_FINDINGS.md`: why the build needs no C toolchain, which TLS
+  provider was chosen and what was rejected, what the `blake3` `pure` trade costs,
+  and how the gate proves itself.
 - `70_GLOSSARY.md`: project-specific terms.
 - `80_OPEN_QUESTIONS.md`: unresolved or explicitly deferred uncertainty;
   locked and resolved production decisions route to `15_PRODUCTION_CONTRACTS.md`.

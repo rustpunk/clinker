@@ -73,36 +73,363 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # Job-level rather than per-step. Two step-level copies would be two places
+    # that must agree, and the dangerous drift is removal: drop a variable from
+    # the build step but leave it in the negative control, and the control still
+    # fails in `cc` — a green tick — while the workspace build can now reach a
+    # real compiler through the un-neutralized variable.
+    #
+    # The two steps that need a working compiler unset these by name with
+    # `env -u`. Note what that does and does not catch: adding a name here
+    # without adding it to both `env -u` lists breaks those steps loudly, but
+    # *removing* one here while leaving it in an `env -u` list is silent, since
+    # `env -u` on an unset variable is a no-op. Treat this block and the two
+    # `env -u` lists as one edit.
+    env:
+      CC: /bin/false
+      CXX: /bin/false
+      AR: /bin/false
+      CC_x86_64_unknown_linux_gnu: /bin/false
+      CXX_x86_64_unknown_linux_gnu: /bin/false
+      AR_x86_64_unknown_linux_gnu: /bin/false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      # This job now builds every workspace target, a second `clinker`
+      # resolution, the fixture twice, and every capability-feature combination,
+      # all into one `target/`. That is the pattern that has exhausted the hosted
+      # runner's root volume mid-link elsewhere in this file.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: "1.91"
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      # Both the default binary, which links TLS, and the one with no network
-      # capability at all. The first is the claim that matters; the second
-      # confirms the smaller graph did not acquire one either.
+      # The whole workspace including dev, test, and bench targets, because that is
+      # the scope the README and the installation guide claim. Then the binary with
+      # no network capability at all, which is a different graph rather than a
+      # subset — it confirms the smaller resolution did not acquire a toolchain
+      # requirement of its own.
+      #
+      # `CC` and friends are consumed by build scripts, not by rustc's choice of
+      # linker driver, so linking still works here through the real `cc` on PATH.
       - name: Build with no working C compiler
-        env:
-          CC: /bin/false
-          CXX: /bin/false
-          AR: /bin/false
-          CC_x86_64_unknown_linux_gnu: /bin/false
-          CXX_x86_64_unknown_linux_gnu: /bin/false
-          AR_x86_64_unknown_linux_gnu: /bin/false
         run: |
-          cargo build --locked -p clinker
+          cargo build --locked --workspace --all-targets
           cargo build --locked -p clinker --no-default-features
 
+      # The negative control. The step above passes both when nothing in the graph
+      # compiles C and when the mechanism has quietly stopped working, and from the
+      # outside those are the same green tick. `tools/no-c-gate-fixture` compiles one
+      # C file through the real `cc` crate — the real crate, because what is under
+      # test is whether the environment above covers the variables a genuine
+      # C-compiling build script consults, and only `cc` knows that set.
+      #
+      # Both directions are checked, and the failure is matched against its cause.
+      # "The build failed" on its own is not evidence: a fetch error or a stale
+      # lockfile satisfies it while proving nothing. Every assertion in this job
+      # has to name the reason it expects, or it will eventually be satisfied by
+      # a different one.
+      #
+      # The fixture is excluded from the root workspace, so nothing else builds it,
+      # and nothing else lints it either — hence the format and lint passes here.
+      - name: Prove the no-C gate bites
+        run: |
+          # The control must exercise the same `cc` the workspace resolves,
+          # because which environment variables a build script consults is
+          # version-specific, and a control reading a different set certifies a
+          # coverage the workspace never had.
+          #
+          # Scoped to `cc` alone, and deliberately. Comparing every crate the two
+          # lockfiles share needs sorting, set operations, and a rule for crates
+          # legitimately locked at two majors — machinery whose failure modes are
+          # its own rather than the question's: collation that must agree between
+          # two tools, a `||` that binds to the wrong end of a pipe, substring
+          # matches reporting `scc` as a resolution of `cc`, and an `x in a`
+          # guarding an assignment to `a[x]`, which gawk and mawk disagree about.
+          # None of it is needed to answer whether the control exercises the `cc`
+          # the workspace resolves, so none of it is here.
+          # `find-msvc-tools`, which `cc` delegates MSVC discovery to, is not
+          # checked and is not pinned: this job runs on Linux and neutralizes the
+          # Linux compiler variables, so it never reaches that path, and a pin
+          # nothing exercises is a claim of protection that does not exist —
+          # while blocking the remedy below the moment a newer `cc` requires a
+          # newer `find-msvc-tools`.
+          #
+          # awk emits data and the shell decides. No arrays, no ternaries, and no
+          # exit-status sentinels: awk exits 2 of its own accord when it cannot
+          # open a file, so a sentinel in that range turns a missing lockfile into
+          # a confident wrong verdict. Only `[[package]]` blocks are read, so a
+          # lockfile's top-level `version` field and any `[[patch.unused]]` entry
+          # are skipped.
+          # One extraction, and everything below is derived from it, so the guard
+          # counts the same lines the decision reads rather than restating the
+          # parse in a second function that has to be kept in step.
+          #
+          # What makes the "cc has left the workspace" branch safe to treat as a
+          # success is not the deduplication but the validation above it: the two
+          # lockfiles here are separate files regenerated at different times, so
+          # the root can move to a new format while the fixture's lags, and any
+          # parse that silently yields nothing would be read as an absence.
+          # Every `[[package]]` block leaves exactly one line behind: a name and
+          # version, or `!unreduced`. Nothing is dropped quietly, and that is the
+          # whole point — an entry this parser skips silently is indistinguishable
+          # downstream from a crate the lockfile does not contain, and "cc is
+          # absent" is a success here. A count of surviving lines only notices
+          # when every entry is lost, so one malformed `cc` beside healthy
+          # neighbours would otherwise sail through.
+          #
+          # The block ends at the next section header, not at a version line.
+          # Ending it at the version line meant a block that never reached one
+          # produced neither a row nor a marker, so a reshaped *key* — as opposed
+          # to a reshaped value — evaporated; and the parser stayed inside the
+          # unclosed block, reading the following section's fields as that
+          # package's, which let a `[[patch.unused]]` entry surface as a live
+          # dependency.
+          #
+          # Stripping double quotes handles the spelling cargo emits today and
+          # nothing else. Literal strings, a respelled key, a reshaped value, and
+          # a truncated block all land on the marker.
+          #
+          # Written as if/else, which is a style choice here and not a fix. The
+          # portability defect this step actually hit was narrower: `x in a` on
+          # the right of an assignment to `a[x]`, where mawk and busybox awk
+          # instantiate the subscript before evaluating the test and gawk does
+          # not — see the note above. Ternaries themselves behave identically on
+          # all three. Avoiding the wrong construct would leave the real one
+          # available to the next revision that needs an array.
+          lock_packages() {
+            awk 'function close_block() {
+                   if (open) { print "!unreduced" }
+                   open = 0; n = ""
+                 }
+                 /^\[/ {
+                   close_block()
+                   if ($0 ~ /^\[\[package\]\]/) { open = 1 }
+                   next
+                 }
+                 open && /^name = / { gsub(/"/, ""); n = $3; next }
+                 open && /^version = / {
+                   gsub(/"/, "")
+                   if (n ~ /^[A-Za-z0-9_.+-]+$/ && $3 ~ /^[A-Za-z0-9_.+-]+$/) {
+                     print n, $3
+                   } else {
+                     print "!unreduced"
+                   }
+                   open = 0; n = ""
+                   next
+                 }
+                 END { close_block() }' "$1"
+          }
+          versions_of() { awk -v want="$1" '$1 == want { print $2 }'; }
+          line_count() {
+            if [ -z "$1" ]; then echo 0; else printf '%s\n' "$1" | wc -l; fi
+          }
+
+          # Establish that the parse produced something before reading meaning
+          # into what it did not produce. "No cc found" is a pass, so a lockfile
+          # this parser cannot read would otherwise report "nothing to reconcile"
+          # and switch the check off without saying so.
+          #
+          # Readability is tested separately, because counting a missing file
+          # yields an empty string, and `[ "" -eq 0 ]` is a bash error whose
+          # non-zero status an `if` condition silently reads as false — the guard
+          # would then never fire and never say why.
+          for lock in Cargo.lock tools/no-c-gate-fixture/Cargo.lock; do
+            if [ ! -r "$lock" ]; then
+              echo "$lock is missing or unreadable, so this check cannot run."
+              exit 1
+            fi
+          done
+          workspace_packages=$(lock_packages Cargo.lock)
+          control_packages=$(lock_packages tools/no-c-gate-fixture/Cargo.lock)
+          for side in "workspace:$workspace_packages" "control:$control_packages"; do
+            if [ "$(line_count "${side#*:}")" -eq 0 ]; then
+              echo "no packages were parsed out of the ${side%%:*} lockfile, so"
+              echo "this check cannot tell an absent cc from a lockfile it does"
+              echo "not understand."
+              exit 1
+            fi
+            # A count only notices total loss. One malformed entry among healthy
+            # ones would leave the count intact and the crate missing, and a
+            # missing crate is this step's success condition — so every rejection
+            # has to be fatal on its own, not merely subtracted.
+            unreduced=$(printf '%s\n' "${side#*:}" | grep -c '^!unreduced$' || true)
+            if [ "$unreduced" -ne 0 ]; then
+              echo "the ${side%%:*} lockfile contains entries this parser could"
+              echo "not reduce to a name and a version ($unreduced of them), so an"
+              echo "absent cc cannot be told apart from one it failed to read."
+              exit 1
+            fi
+          done
+
+          # Hand the verified parse to the ring step rather than have it parse the
+          # lockfile again. Two parsers of one format have cost this file two
+          # defects already: a fix applied to one and not the other, and integrity
+          # guards present in one and absent from the other. Steps do not share a
+          # shell, so the parse is shared as data. Everything above has already
+          # established that both files were readable, that the parse produced
+          # entries, and that no entry was rejected — so what lands here is
+          # trustworthy by construction rather than by a second set of checks.
+          printf '%s\n' "$workspace_packages" \
+            >"${RUNNER_TEMP}/workspace-packages.txt"
+
+          control_cc=$(printf '%s\n' "$control_packages" | versions_of cc)
+          workspace_cc=$(printf '%s\n' "$workspace_packages" | versions_of cc)
+
+          if [ -z "$control_cc" ]; then
+            echo "the negative control no longer depends on cc, so it cannot"
+            echo "compile C and cannot demonstrate anything."
+            exit 1
+          elif [ "$(line_count "$control_cc")" -gt 1 ]; then
+            echo "the negative control locks more than one cc:"
+            printf '%s\n' "$control_cc" | sed 's/^/  /'
+            echo "It can only compile C through one of them, so which version it"
+            echo "certifies is undefined. Resolve the duplicate in"
+            echo "tools/no-c-gate-fixture/Cargo.lock."
+            exit 1
+          elif [ -z "$workspace_cc" ]; then
+            # The end state this whole guarantee points at. There is nothing left
+            # to reconcile against, and that is a success, not a break.
+            echo "cc has left the workspace lockfile entirely; nothing to"
+            echo "reconcile, and the control still compiles C on its own."
+          elif [ "$(line_count "$workspace_cc")" -gt 1 ]; then
+            echo "the workspace locks more than one cc:"
+            printf '%s\n' "$workspace_cc" | sed 's/^/  /'
+            echo "The control can exercise only one of them, so which variables"
+            echo "the build scripts read is no longer determined. Resolve the"
+            echo "duplicate, or narrow this check deliberately."
+            exit 1
+          elif [ "$control_cc" != "$workspace_cc" ]; then
+            echo "the control locks cc $control_cc but the workspace resolves cc"
+            echo "$workspace_cc, so it would certify a set of environment"
+            echo "variables the workspace's build scripts never read."
+            echo "Fix by setting cc = \"=$workspace_cc\" in"
+            echo "tools/no-c-gate-fixture/Cargo.toml and regenerating its lock."
+            exit 1
+          else
+            echo "control and workspace agree on cc $workspace_cc"
+          fi
+
+          # Direction 1: with a working toolchain the fixture must build. A fixture
+          # that can never build would fail the next check for its own reasons and
+          # report a working gate regardless of the gate. `env -u` rather than
+          # re-stating values, so the job-level block stays the only place the
+          # variables are assigned — see the caveat on that block about removal.
+          if ! env -u CC -u CXX -u AR \
+                 -u CC_x86_64_unknown_linux_gnu \
+                 -u CXX_x86_64_unknown_linux_gnu \
+                 -u AR_x86_64_unknown_linux_gnu \
+                 cargo build --locked \
+                   --manifest-path tools/no-c-gate-fixture/Cargo.toml \
+                   >"${RUNNER_TEMP}/fixture-ok.log" 2>&1; then
+            echo "the negative control is broken: it does not build even with a"
+            echo "working C compiler, so it cannot demonstrate anything."
+            tail -30 "${RUNNER_TEMP}/fixture-ok.log"
+            exit 1
+          fi
+
+          # Direction 2: under the job's environment it must fail, and fail in cc.
+          if cargo build --locked \
+               --manifest-path tools/no-c-gate-fixture/Cargo.toml \
+               --target-dir "${RUNNER_TEMP}/fixture-no-cc" \
+               >"${RUNNER_TEMP}/red-gate.log" 2>&1; then
+            echo "the no-C gate did not bite: a cc-invoking build script compiled"
+            echo "with every C-compiler variable pointed at /bin/false."
+            exit 1
+          fi
+          if ! grep -q "error occurred in cc-rs" "${RUNNER_TEMP}/red-gate.log"; then
+            echo "the fixture failed, but not in the C compiler — so this run says"
+            echo "nothing about the gate. Failure was:"
+            tail -30 "${RUNNER_TEMP}/red-gate.log"
+            exit 1
+          fi
+          echo "gate bit as required; the fixture failed in cc:"
+          grep "error occurred in cc-rs" "${RUNNER_TEMP}/red-gate.log" | head -1
+
+      - name: Check the negative control's own source
+        run: |
+          cargo fmt --manifest-path tools/no-c-gate-fixture/Cargo.toml --all -- --check
+          env -u CC -u CXX -u AR \
+            -u CC_x86_64_unknown_linux_gnu \
+            -u CXX_x86_64_unknown_linux_gnu \
+            -u AR_x86_64_unknown_linux_gnu \
+            cargo clippy --manifest-path tools/no-c-gate-fixture/Cargo.toml \
+              --all-targets --locked -- -D warnings
+
+      # This check has three outcomes, not two, and conflating any pair of them
+      # gets it wrong.
+      #
+      #   - `ring` is in the lockfile but reaches nothing: exit 0, empty stdout,
+      #     `warning: nothing to print.` on stderr. This is today's state — it is
+      #     locked as `rustls-webpki`'s inactive optional dependency. PASS.
+      #   - `ring` is absent from the lockfile entirely: exit 101, `package ID
+      #     specification 'ring' did not match any packages`. This is the *best*
+      #     state this guarantee can be in, so it must PASS — treating a non-zero
+      #     exit as "the check did not run" would turn a `rustls-webpki` bump that
+      #     drops the optional edge into a red build.
+      #   - anything else non-zero: the check genuinely did not run. FAIL, rather
+      #     than reporting on a resolution that never happened.
+      #
+      # Which is why the status is read from the command and not from a `grep`
+      # downstream of a pipe: a pipe reports grep's status, and a `cargo tree`
+      # that failed then produces no output, no match, and a green step.
+      # `--target all` because a ring edge reachable only from the Windows or
+      # macOS resolution is still a ring edge.
       - name: Refuse a ring edge in any resolution
         run: |
-          if cargo tree --workspace --all-features --invert ring 2>/dev/null | grep -q ring; then
+          if ! cargo tree --locked --workspace --all-features --target all \
+                 --invert ring \
+                 >"${RUNNER_TEMP}/ring.txt" 2>"${RUNNER_TEMP}/ring.err"; then
+            if grep -q "did not match any packages" "${RUNNER_TEMP}/ring.err"; then
+              # cargo emits this for any spec it cannot resolve, so on its own it
+              # cannot tell "ring is gone" from "we asked about a name that does
+              # not exist". A rename or typo in the argument above would otherwise
+              # land here and report success on every future run, with the
+              # guarantee silently switched off. Cargo cannot settle it either:
+              # from its side both cases are the same "no such package".
+              #
+              # So the lockfile is consulted as an independent source of truth,
+              # for a name spelled out here rather than shared with the query
+              # above — a typo has to disagree with something to be caught.
+              #
+              # The parse comes from the reconciliation step, which already
+              # established that the file was readable, that it yielded entries,
+              # and that none was rejected. Do not parse the lockfile again here.
+              # A second parser has to carry every property the first one does —
+              # the block boundary, and the integrity guards — and a copy carrying
+              # one but not the other reports "no ring" for a file it could not
+              # read, because `awk` exits 2 of its own accord when it cannot open
+              # one and that is indistinguishable from a clean miss.
+              if [ ! -r "${RUNNER_TEMP}/workspace-packages.txt" ]; then
+                echo "the lockfile reconciliation step left no parse behind, so"
+                echo "ring's absence cannot be confirmed against the lockfile."
+                exit 1
+              fi
+              if grep -q '^ring ' "${RUNNER_TEMP}/workspace-packages.txt"; then
+                echo "cargo tree resolved no such package, yet ring IS in"
+                echo "Cargo.lock — this check is asking about the wrong name."
+                exit 1
+              fi
+              echo "ring is not in the lockfile at all — the strongest form of this"
+              echo "guarantee."
+              exit 0
+            fi
+            echo "cargo tree failed, so the ring check did not run:"
+            cat "${RUNNER_TEMP}/ring.err"
+            exit 1
+          fi
+          if [ -s "${RUNNER_TEMP}/ring.txt" ]; then
             echo "ring is back in the dependency graph; it builds C through cc"
+            cat "${RUNNER_TEMP}/ring.txt"
             exit 1
           fi
 
@@ -227,10 +554,10 @@ jobs:
       - run: cargo check --features bench-alloc -p clinker-benchmarks
       - run: cargo test --benches -p clinker-benchmarks
 
-  # Execute the full suite on the other two first-class targets. These
-  # runners have a native C toolchain, so the `ring` (TLS) build script in
-  # clinker-net/clinker links cleanly here — which the ubuntu cross-check
-  # job below cannot do without an MSVC/Apple cross-linker. This is where
+  # Execute the full suite on the other two first-class targets. These runners
+  # link natively, which the ubuntu cross-check job below cannot do without an
+  # MSVC/Apple cross-linker. Nothing here needs a C toolchain — TLS runs on
+  # rustls with the graviola provider, which has no build script. This is where
   # the platform `#[cfg(windows)]` / `#[cfg(target_os = "macos")]` test
   # modules — including the de-gated RSS-validity assertions — actually run.
   test-windows:

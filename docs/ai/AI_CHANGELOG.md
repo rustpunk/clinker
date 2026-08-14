@@ -39,6 +39,51 @@ Representative code and manifest evidence cited by those docs includes:
 
 ## Entries
 
+### 2026-08-14: The No-C Gate Proves Itself, and the `pure` Trade Is Measured
+
+Type: Source-backed fact (issues #952 and #954), with one human decision noted.
+
+Summary: The `Build portability` job now builds the whole workspace and every
+test and benchmark target with no working C compiler, which is the scope the
+README and installation guide already claimed and previously outran — only
+`-p clinker` was built. It then builds `tools/no-c-gate-fixture`, a crate
+excluded from the workspace whose build script compiles C through the real `cc`
+crate, and requires it to succeed with a working toolchain and to fail *in `cc`*
+without one. A gate that only ever sees compliant code cannot distinguish "no
+crate compiles C" from "the mechanism stopped working"; the fixture is what
+separates them. The ring check was rewritten to read `cargo tree`'s own exit
+status instead of piping it into `grep`, which reported grep's status and turned
+a failed `cargo tree` into a silent pass, and to resolve `--target all` so a ring
+edge reachable only from the Windows or macOS resolution is still caught.
+
+Measured, and it corrected a claim: blake3's `pure` feature costs roughly 15% of
+hashing throughput against the assembly build at the same instruction set, and
+roughly 43% against one using AVX-512 kernels `pure` has no equivalent for. The
+root `Cargo.toml` comment previously asserted `pure` was "not a performance
+compromise"; that was never measured and is not true. The trade is still correct
+— the alternative compiles C — but it is now stated as a cost rather than as a
+free lunch. Figures in
+[docs/ai/60_PERFORMANCE_NOTES.md](60_PERFORMANCE_NOTES.md), method and
+interpretation in
+[docs/ai/65_PURE_RUST_BUILD_FINDINGS.md](65_PURE_RUST_BUILD_FINDINGS.md).
+
+Human decision: the TLS half of the investigation's performance criterion was
+closed unmet rather than executed. Comparing graviola against ring needs ring
+back in a resolvable graph and a CI job exempt from the no-C environment, which
+is what the guarantee exists to prevent, and no measured delta could change a
+choice made on how ring builds rather than on how it performs. The consequence —
+no TLS performance envelope, and no successful handshake in CI — is recorded as
+open questions 59 and 60 rather than left implicit.
+
+Rejected: adding a committed `pure`-versus-default benchmark. Cargo unions
+features per package-version per resolve, so two blake3 edges in one manifest
+collapse into a single `pure` build unit and both arms measure the same code.
+The comparison needs two separate resolves and a C toolchain for one of them, so
+it cannot live in this tree and is recorded as dated one-off evidence instead.
+
+Evidence: `.github/workflows/ci.yml` (`build-portability`),
+`tools/no-c-gate-fixture/`, root `Cargo.toml`, `deny.toml`.
+
 ### 2026-07-27: Materialized Slots Declare Their Readers at Publication
 
 Type: Source-backed fact (issues #996 and #1033).
