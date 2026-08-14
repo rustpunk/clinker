@@ -135,8 +135,9 @@ jobs:
       #
       # Both directions are checked, and the failure is matched against its cause.
       # "The build failed" on its own is not evidence: a fetch error or a stale
-      # lockfile would satisfy it while proving nothing, which is the same defect as
-      # the `grep` this job used to run against `cargo tree`.
+      # lockfile satisfies it while proving nothing. Every assertion in this job
+      # has to name the reason it expects, or it will eventually be satisfied by
+      # a different one.
       #
       # The fixture is excluded from the root workspace, so nothing else builds it,
       # and nothing else lints it either — hence the format and lint passes here.
@@ -147,13 +148,15 @@ jobs:
           # version-specific, and a control reading a different set certifies a
           # coverage the workspace never had.
           #
-          # Scoped to `cc` alone, and deliberately. Earlier revisions compared
-          # every crate the two lockfiles shared and each rewrite bought a defect
-          # from the machinery rather than the logic — collation that has to agree
-          # between two tools, a `||` bound to the wrong end of a pipe, substring
+          # Scoped to `cc` alone, and deliberately. Comparing every crate the two
+          # lockfiles share needs sorting, set operations, and a rule for crates
+          # legitimately locked at two majors — machinery whose failure modes are
+          # its own rather than the question's: collation that must agree between
+          # two tools, a `||` that binds to the wrong end of a pipe, substring
           # matches reporting `scc` as a resolution of `cc`, and an `x in a`
           # guarding an assignment to `a[x]`, which gawk and mawk disagree about.
-          # `cc` alone is asserted, and that is the whole of what this proves.
+          # None of it is needed to answer whether the control exercises the `cc`
+          # the workspace resolves, so none of it is here.
           # `find-msvc-tools`, which `cc` delegates MSVC discovery to, is not
           # checked and is not pinned: this job runs on Linux and neutralizes the
           # Linux compiler variables, so it never reaches that path, and a pin
@@ -400,12 +403,12 @@ jobs:
               #
               # The parse comes from the reconciliation step, which already
               # established that the file was readable, that it yielded entries,
-              # and that none was rejected. Parsing it a second time here would
-              # mean a second parser to keep correct, and the two previous
-              # attempts at that both ended with the copy missing something the
-              # original had: first a block-boundary rule, then the integrity
-              # guards, whose absence let `awk`'s own exit 2 on an unreadable file
-              # read as "no ring found" and pass.
+              # and that none was rejected. Do not parse the lockfile again here.
+              # A second parser has to carry every property the first one does —
+              # the block boundary, and the integrity guards — and a copy carrying
+              # one but not the other reports "no ring" for a file it could not
+              # read, because `awk` exits 2 of its own accord when it cannot open
+              # one and that is indistinguishable from a clean miss.
               if [ ! -r "${RUNNER_TEMP}/workspace-packages.txt" ]; then
                 echo "the lockfile reconciliation step left no parse behind, so"
                 echo "ring's absence cannot be confirmed against the lockfile."
