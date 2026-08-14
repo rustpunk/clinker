@@ -268,6 +268,17 @@ jobs:
             fi
           done
 
+          # Hand the verified parse to the ring step rather than have it parse the
+          # lockfile again. Two parsers of one format have cost this file two
+          # defects already: a fix applied to one and not the other, and integrity
+          # guards present in one and absent from the other. Steps do not share a
+          # shell, so the parse is shared as data. Everything above has already
+          # established that both files were readable, that the parse produced
+          # entries, and that no entry was rejected — so what lands here is
+          # trustworthy by construction rather than by a second set of checks.
+          printf '%s\n' "$workspace_packages" \
+            >"${RUNNER_TEMP}/workspace-packages.txt"
+
           control_cc=$(printf '%s\n' "$control_packages" | versions_of cc)
           workspace_cc=$(printf '%s\n' "$workspace_packages" | versions_of cc)
 
@@ -384,24 +395,23 @@ jobs:
               # from its side both cases are the same "no such package".
               #
               # So the lockfile is consulted as an independent source of truth,
-              # for a name this check spells out rather than sharing with the
-              # query above — a typo has to disagree with something to be caught.
-              # Block boundaries follow the same rule as the reconciliation step:
-              # a block ends at the next section header, so a `[[patch.unused]]`
-              # entry naming ring is not read as a live dependency, and a block
-              # with no name line cannot absorb the section that follows it.
-              if awk 'function close_block() { open = 0 }
-                      /^\[/ {
-                        close_block()
-                        if ($0 ~ /^\[\[package\]\]/) { open = 1 }
-                        next
-                      }
-                      open && /^name = / {
-                        gsub(/"/, "")
-                        if ($3 == "ring") { found = 1 }
-                        next
-                      }
-                      END { if (found) { exit 0 } ; exit 1 }' Cargo.lock; then
+              # for a name spelled out here rather than shared with the query
+              # above — a typo has to disagree with something to be caught.
+              #
+              # The parse comes from the reconciliation step, which already
+              # established that the file was readable, that it yielded entries,
+              # and that none was rejected. Parsing it a second time here would
+              # mean a second parser to keep correct, and the two previous
+              # attempts at that both ended with the copy missing something the
+              # original had: first a block-boundary rule, then the integrity
+              # guards, whose absence let `awk`'s own exit 2 on an unreadable file
+              # read as "no ring found" and pass.
+              if [ ! -r "${RUNNER_TEMP}/workspace-packages.txt" ]; then
+                echo "the lockfile reconciliation step left no parse behind, so"
+                echo "ring's absence cannot be confirmed against the lockfile."
+                exit 1
+              fi
+              if grep -q '^ring ' "${RUNNER_TEMP}/workspace-packages.txt"; then
                 echo "cargo tree resolved no such package, yet ring IS in"
                 echo "Cargo.lock — this check is asking about the wrong name."
                 exit 1
