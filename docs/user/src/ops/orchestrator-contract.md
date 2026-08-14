@@ -208,7 +208,9 @@ A `progress` event carries a `progress` object and a `truncation` object:
 ```json
 {"event":"progress","seq":7,
  "progress":{"phase":"executing","kind":"periodic","elapsed_ms":1031,
-             "records_read":200000,"files_done":5,"files_total":5},
+             "records_read":200000,
+             "bytes_read":27000835,"bytes_total":81777788,
+             "files_done":0,"files_total":1},
  "truncation":{"detail":false,"events":false}}
 ```
 
@@ -230,13 +232,30 @@ as a measurement. A supervisor answers *is this run moving* by comparing
 `records_read` between two events, which is the question the record is here
 to answer. *When will it finish* is not a question this stream answers.
 
-`files_done` and `files_total` are the one denominator Clinker does
-establish before it reads anything: a source's file set is enumerated at
-startup, so the count is known rather than estimated. `files_total` is
-`null` when **any** source of the run reads from something other than an
-enumerated file set — a network source, for instance. A denominator covering
-only part of a run's work is withdrawn rather than published, because nothing
-on the wire would say which part it covered.
+`bytes_read` and `bytes_total` are the denominator to prefer. `bytes_total`
+is the summed on-disk size of every input, read from file metadata before
+anything is opened, so it is measured rather than estimated. `bytes_read`
+advances **within** a file, not only at file boundaries, which is what makes
+it useful on the common single-large-file run where every other count sits
+still until the end.
+
+`bytes_total` is `null` in two cases. First, when any source cannot supply a
+size — a network source, or a path whose metadata will not read. Second, when
+any source is read **more than once**: `json` and `xml` sources re-open their
+input to pre-scan the envelope before streaming the body, so their bytes cross
+the counter twice and the count becomes IO performed rather than input
+consumed. Rather than publish a total the count will overrun, Clinker
+withdraws it. `bytes_read` is still emitted in that case and still rises
+monotonically — it remains a usable liveness signal, just not a fraction.
+
+`files_done` and `files_total` are a second, independent denominator, useful
+where the byte one is withdrawn. A source's file set is enumerated at startup,
+so the count is known rather than estimated. `files_total` is `null` when
+**any** source reads from something other than an enumerated file set.
+
+Neither denominator is a substitute for the other and they are never combined.
+A denominator covering only part of a run's work is withdrawn rather than
+published, because nothing on the wire would say which part it covered.
 
 `files_total` is also `null` on the earliest records of a run, before source
 discovery has completed. It is written once and never changes afterwards, so
@@ -245,11 +264,10 @@ normal and is not an identity change.
 
 Two things a consumer must not do with these counts:
 
-- **Do not treat `files_done / files_total` as a completion percentage.**
-  It measures input consumed, not work finished. It reaches 100% while sort
-  merges, aggregate finalization, and output publication are still running,
-  which is exactly the shape of a progress bar that sits at 100% and appears
-  to hang.
+- **Do not treat either ratio as a completion percentage.** Both measure
+  input consumed, not work finished. They reach 100% while sort merges,
+  aggregate finalization, and output publication are still running, which is
+  exactly the shape of a progress bar that sits at 100% and appears to hang.
 - **Do not divide by a `null` total.** Absence means unknown for this run,
   not zero and not an error. Clinker publishes no percentage of its own for
   this reason: a ratio against an absent denominator is the one value that

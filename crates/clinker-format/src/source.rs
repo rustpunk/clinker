@@ -29,8 +29,78 @@
 
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+
+/// Shared count of the bytes a source has handed to its readers.
+///
+/// Attached with [`ReopenableSource::with_tally`] and incremented inside
+/// [`ReopenableSource::open_with_identity`], which every reader's bytes pass
+/// through — so a reader neither implements nor delegates anything to be
+/// counted, and a format added later is counted without knowing this exists.
+///
+/// Clones share one counter. The reading thread increments; an observer on
+/// another thread may read a value already superseded, which is the contract
+/// for a progress display and unfit for a decision.
+///
+/// `multi_pass` records that some source was converted for repeated reading
+/// (JSON's and XML's envelope pre-scan plus body). Those bytes cross this
+/// counter more than once, so the total measures IO performed rather than
+/// progress through the input, and no denominator may be paired with it. The
+/// flag is the reason a caller can tell those apart; see
+/// [`ByteTally::is_multi_pass`].
+#[derive(Clone, Debug, Default)]
+pub struct ByteTally {
+    read: Arc<AtomicU64>,
+    multi_pass: Arc<AtomicBool>,
+}
+
+impl ByteTally {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bytes handed to readers so far. Monotonic.
+    pub fn read(&self) -> u64 {
+        self.read.load(Ordering::Relaxed)
+    }
+
+    /// Whether any source sharing this tally will deliver its bytes more than
+    /// once, making the count IO performed rather than input consumed.
+    pub fn is_multi_pass(&self) -> bool {
+        self.multi_pass.load(Ordering::Relaxed)
+    }
+
+    fn add(&self, n: u64) {
+        if n > 0 {
+            self.read.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    fn mark_multi_pass(&self) {
+        self.multi_pass.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Counts bytes on their way out of a source to a reader.
+///
+/// Wraps whatever [`ReopenableSource::open_with_identity`] produced, so the
+/// count follows the bytes rather than the reader that asked for them. One
+/// relaxed add per `read` call — per buffer fill for a buffered reader, not
+/// per record.
+struct CountingReader<R> {
+    inner: R,
+    tally: ByteTally,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.tally.add(n as u64);
+        Ok(n)
+    }
+}
 
 /// A cheap `(len, mtime)` snapshot of a re-opened source's content, taken off
 /// the *open* handle (not the path) so it reflects the bytes that open will
@@ -72,7 +142,19 @@ pub struct SourceIdentity {
 /// [`into_reopenable`](Self::into_reopenable) so every [`open`](Self::open)
 /// thereafter yields an independent `Read`; a one-pass reader just calls
 /// [`open`](Self::open) once and streams it.
-pub enum ReopenableSource {
+pub struct ReopenableSource {
+    kind: SourceKind,
+    /// Byte counter to credit on every open, when a caller asked for one.
+    /// Carried by the source rather than passed at each open so no call site
+    /// can obtain bytes without counting them.
+    tally: Option<ByteTally>,
+}
+
+/// The three byte-source shapes. Private: callers construct through
+/// [`ReopenableSource::path`], [`one_shot`](ReopenableSource::one_shot) and
+/// [`buffer`](ReopenableSource::buffer), so the tally cannot be dropped by
+/// building a source directly.
+enum SourceKind {
     /// Re-open a stable filesystem path. Each open is a fresh `std::fs::File`;
     /// for a staged, advisory-locked source two opens read identical bytes.
     Path(PathBuf),
@@ -93,7 +175,23 @@ impl ReopenableSource {
     /// so a slow/paced reader keeps its per-row timing. JSON, which needs two
     /// passes, calls [`into_reopenable`](Self::into_reopenable) to buffer it.
     pub fn one_shot(reader: Box<dyn Read + Send>) -> Self {
-        ReopenableSource::OneShot(Mutex::new(Some(reader)))
+        Self::of(SourceKind::OneShot(Mutex::new(Some(reader))))
+    }
+
+    fn of(kind: SourceKind) -> Self {
+        Self { kind, tally: None }
+    }
+
+    /// Credit every byte this source hands out to `tally`.
+    ///
+    /// Attaching here rather than passing a counter to each open is what makes
+    /// the count unforgettable: every reader obtains bytes through
+    /// [`open_with_identity`](Self::open_with_identity), so a source carrying a
+    /// tally is counted whatever reads it, including a format written later.
+    #[must_use]
+    pub fn with_tally(mut self, tally: ByteTally) -> Self {
+        self.tally = Some(tally);
+        self
     }
 
     /// Build a buffered source by draining a one-shot reader into shared bytes.
@@ -109,12 +207,12 @@ impl ReopenableSource {
     pub fn buffer<R: Read>(mut reader: R) -> std::io::Result<Self> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes)?;
-        Ok(ReopenableSource::Buffered(Arc::from(bytes)))
+        Ok(Self::of(SourceKind::Buffered(Arc::from(bytes))))
     }
 
     /// Build a path-backed source that re-opens `path` fresh on every open.
     pub fn path(path: impl Into<PathBuf>) -> Self {
-        ReopenableSource::Path(path.into())
+        Self::of(SourceKind::Path(path.into()))
     }
 
     /// Convert into a shape that supports repeated [`open`](Self::open) calls.
@@ -133,8 +231,16 @@ impl ReopenableSource {
     /// convert before opening. A poisoned reader slot (a panic mid-open on
     /// another thread) surfaces as an opaque [`std::io::Error`].
     pub fn into_reopenable(self) -> std::io::Result<Self> {
-        match self {
-            ReopenableSource::OneShot(slot) => {
+        // Converting is what a multi-pass reader does before its first open, so
+        // it is the one place that knows these bytes will be delivered more
+        // than once. Recording it here keeps a doubled count from being paired
+        // with a denominator it would overrun.
+        if let Some(tally) = &self.tally {
+            tally.mark_multi_pass();
+        }
+        let tally = self.tally;
+        let converted = match self.kind {
+            SourceKind::OneShot(slot) => {
                 let reader = slot
                     .into_inner()
                     .map_err(|_| std::io::Error::other("one-shot reader slot poisoned"))?
@@ -145,10 +251,14 @@ impl ReopenableSource {
                              before the first open",
                         )
                     })?;
-                Self::buffer(reader)
+                Self::buffer(reader)?
             }
-            already => Ok(already),
-        }
+            already => Self::of(already),
+        };
+        Ok(Self {
+            kind: converted.kind,
+            tally,
+        })
     }
 
     /// Open a `Read` over the source's bytes, positioned at the start.
@@ -186,8 +296,24 @@ impl ReopenableSource {
     /// once without first converting via
     /// [`into_reopenable`](Self::into_reopenable).
     pub fn open_with_identity(&self) -> std::io::Result<(Box<dyn Read + Send>, SourceIdentity)> {
-        match self {
-            ReopenableSource::Path(path) => {
+        let (reader, identity) = self.open_uncounted()?;
+        let Some(tally) = self.tally.clone() else {
+            return Ok((reader, identity));
+        };
+        Ok((
+            Box::new(CountingReader {
+                inner: reader,
+                tally,
+            }),
+            identity,
+        ))
+    }
+
+    /// Open the raw bytes, before any counting wrapper. Private so the counted
+    /// path is the only way out of this type.
+    fn open_uncounted(&self) -> std::io::Result<(Box<dyn Read + Send>, SourceIdentity)> {
+        match &self.kind {
+            SourceKind::Path(path) => {
                 let file = open_shared(path)?;
                 // Stat the open handle, not the path, so the identity reflects
                 // exactly the bytes this handle reads even if the path is
@@ -199,14 +325,14 @@ impl ReopenableSource {
                 };
                 Ok((Box::new(file), identity))
             }
-            ReopenableSource::Buffered(bytes) => {
+            SourceKind::Buffered(bytes) => {
                 let identity = SourceIdentity {
                     len: bytes.len() as u64,
                     mtime: None,
                 };
                 Ok((Box::new(Cursor::new(Arc::clone(bytes))), identity))
             }
-            ReopenableSource::OneShot(slot) => {
+            SourceKind::OneShot(slot) => {
                 let reader = slot
                     .lock()
                     .map_err(|_| std::io::Error::other("one-shot reader slot poisoned"))?
@@ -392,6 +518,86 @@ mod tests {
             id2.ensure_matches(&id1).is_err(),
             "ensure_matches must fail loud on a changed file"
         );
+    }
+
+    #[test]
+    fn a_tallied_source_counts_every_byte_it_hands_out() {
+        let tally = ByteTally::new();
+        let src = ReopenableSource::buffer(Cursor::new(b"twelve bytes".to_vec()))
+            .unwrap()
+            .with_tally(tally.clone());
+        assert_eq!(tally.read(), 0, "nothing is counted before a read");
+
+        let mut sink = Vec::new();
+        src.open().unwrap().read_to_end(&mut sink).unwrap();
+        assert_eq!(tally.read(), 12);
+        assert!(!tally.is_multi_pass());
+    }
+
+    #[test]
+    fn an_untallied_source_is_unchanged() {
+        let src = ReopenableSource::buffer(Cursor::new(b"plain".to_vec())).unwrap();
+        let mut sink = String::new();
+        src.open().unwrap().read_to_string(&mut sink).unwrap();
+        assert_eq!(sink, "plain");
+    }
+
+    /// The count follows the bytes, not the reader, so a second pass over the
+    /// same source adds to it. That makes the total IO performed rather than
+    /// input consumed, which is exactly what `is_multi_pass` warns a caller
+    /// about — without it, a doubled count would be paired with a denominator
+    /// it overruns.
+    #[test]
+    fn converting_for_a_second_pass_marks_the_tally_and_doubles_the_count() {
+        let tally = ByteTally::new();
+        let src = ReopenableSource::buffer(Cursor::new(b"sixteen bytes!!!".to_vec()))
+            .unwrap()
+            .with_tally(tally.clone())
+            .into_reopenable()
+            .unwrap();
+        assert!(
+            tally.is_multi_pass(),
+            "conversion is the moment repeated delivery becomes certain"
+        );
+
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        src.open().unwrap().read_to_end(&mut a).unwrap();
+        src.open().unwrap().read_to_end(&mut b).unwrap();
+        assert_eq!(a.len(), 16);
+        assert_eq!(tally.read(), 32, "both passes cross the counter");
+    }
+
+    #[test]
+    fn a_tally_survives_conversion_of_a_one_shot() {
+        let tally = ByteTally::new();
+        let src = ReopenableSource::one_shot(Box::new(Cursor::new(b"kept".to_vec())))
+            .with_tally(tally.clone())
+            .into_reopenable()
+            .unwrap();
+        let mut sink = Vec::new();
+        src.open().unwrap().read_to_end(&mut sink).unwrap();
+        assert_eq!(tally.read(), 4, "the tally is not dropped by buffering");
+    }
+
+    #[test]
+    fn a_path_source_counts_its_file_bytes() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "clinker-tally-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"on disk")
+            .unwrap();
+        let tally = ByteTally::new();
+        let src = ReopenableSource::path(&path).with_tally(tally.clone());
+        let mut sink = Vec::new();
+        src.open().unwrap().read_to_end(&mut sink).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(tally.read(), 7);
     }
 
     #[test]

@@ -670,6 +670,76 @@ fn machine_progress_counts_rise_to_the_records_the_run_read() {
     );
 }
 
+/// The byte axis is the one denominator that moves *within* a file. Counting it
+/// only at file boundaries would leave a single-file run — the common shape —
+/// reporting nothing until it finished, which is the gap this axis exists to
+/// close. The input is sized so the read cannot complete between the periodic
+/// worker's one-second ticks.
+#[test]
+fn machine_progress_bytes_advance_inside_a_single_file() {
+    let directory = fixture();
+    // Writes the pipeline plus a two-row input; the input is then replaced with
+    // one large enough that the read spans several periodic ticks.
+    write_pipeline(directory.path(), "big-out.csv");
+    let rows: String = (0..600_000)
+        .map(|i| format!("{i},somewhat-longer-row-value-{i}\n"))
+        .collect();
+    std::fs::write(
+        directory.path().join("input.csv"),
+        format!("id,name\n{rows}"),
+    )
+    .expect("large input fixture");
+
+    let output = invoke(
+        directory.path(),
+        &["--machine", "ndjson-v1", "--batch-id", "bytes"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stream = events(&output);
+    let progress: Vec<&Value> = stream
+        .iter()
+        .filter(|event| event["event"] == "progress")
+        .collect();
+
+    let expected = std::fs::metadata(directory.path().join("input.csv"))
+        .expect("input metadata")
+        .len();
+
+    let mut previous = 0_u64;
+    let mut saw_partial = false;
+    for event in &progress {
+        let read = event["progress"]["bytes_read"]
+            .as_u64()
+            .expect("bytes_read");
+        assert!(read >= previous, "bytes_read fell: {event}");
+        previous = read;
+        match event["progress"]["bytes_total"].as_u64() {
+            Some(total) => {
+                assert_eq!(total, expected, "the total is the input's real size");
+                assert!(read <= total, "bytes_read must not overrun its total");
+                if read > 0 && read < total {
+                    saw_partial = true;
+                }
+            }
+            // Absent only before source discovery has established it.
+            None => assert_eq!(read, 0, "a run reports no bytes before it has a total"),
+        }
+    }
+    assert_eq!(
+        previous, expected,
+        "the last record accounts for every byte"
+    );
+    assert!(
+        saw_partial,
+        "no record caught the read in progress; bytes would be useless for a \
+         single-file run: {progress:?}"
+    );
+}
+
 /// The file denominator is either absent or covers the whole run. A source
 /// that is not an enumerated file set withdraws it rather than letting it
 /// describe only the file-backed part.

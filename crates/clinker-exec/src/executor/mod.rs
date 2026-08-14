@@ -660,6 +660,10 @@ impl PipelineExecutor {
         // source's already-enumerated input is claimed. `None` once any
         // source turns out not to be an enumerated file set.
         let mut files_total: Option<u64> = Some(0);
+        // Total input size, summed from the same on-disk metadata the scheduler
+        // reads. `None` as soon as one source cannot supply a size — a
+        // non-file transport, or a path whose metadata will not read.
+        let mut bytes_total: Option<u64> = Some(0);
         for src_cfg in &source_configs {
             let source_id = plan
                 .graph
@@ -701,6 +705,20 @@ impl PipelineExecutor {
                 (crate::source::SourceInput::Files(files), Some(seen)) => {
                     Some(seen.saturating_add(files.len() as u64))
                 }
+                _ => None,
+            };
+            bytes_total = match (&source_input, bytes_total) {
+                (crate::source::SourceInput::Files(files), Some(seen)) => files
+                    .iter()
+                    // One unreadable size withdraws the whole denominator, for
+                    // the same reason one non-file source does: a total that
+                    // covers part of the input describes nothing a reader can
+                    // act on, and nothing on the wire would say which part.
+                    .try_fold(seen, |acc, slot| {
+                        std::fs::metadata(&slot.path)
+                            .ok()
+                            .map(|meta| acc.saturating_add(meta.len()))
+                    }),
                 _ => None,
             };
             // Single ConsumerHandle shared between the SourceConsumer
@@ -815,6 +833,7 @@ impl PipelineExecutor {
         // reader sees is either absent or covers the whole run.
         if let Some(progress) = &params.progress {
             progress.seal_files_total(files_total);
+            progress.seal_bytes_total(bytes_total);
         }
 
         let dispatch_outcome = match Self::execute_dag(

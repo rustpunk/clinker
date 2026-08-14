@@ -19,9 +19,13 @@
 //! does establish ahead of the read: a source's file set is enumerated before
 //! any of it is opened.
 //!
-//! A byte axis would be the better denominator — it is what comparable engines
-//! report — but it needs a byte position the format layer does not expose, so
-//! it is absent rather than present-and-empty.
+//! The byte axis carries the denominator comparable engines actually report.
+//! Bytes are counted inside the format layer's single byte-source funnel, so a
+//! reader neither implements nor delegates anything to be counted. `bytes_total`
+//! is withdrawn when a source's size cannot be read, and when any reader makes
+//! more than one pass over its input — those bytes cross the counter twice, so
+//! the count measures IO performed rather than input consumed and would overrun
+//! the very total it was to be divided by.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -57,6 +61,11 @@ struct ProgressCounters {
 pub struct RunProgress {
     counters: Arc<ProgressCounters>,
     files_total: Arc<OnceLock<Option<u64>>>,
+    bytes_total: Arc<OnceLock<Option<u64>>>,
+    /// Bytes counted by the format layer as sources hand them to readers. Not
+    /// one of [`ProgressCounters`]: nothing here increments it, and the
+    /// executor never writes it — the count happens where the bytes are.
+    bytes: clinker_format::ByteTally,
 }
 
 impl RunProgress {
@@ -93,6 +102,18 @@ impl RunProgress {
         let _ = self.files_total.set(total);
     }
 
+    /// Record the run's total input size in bytes, or `None` where any source
+    /// cannot establish one. Sealed once, like the file total.
+    pub fn seal_bytes_total(&self, total: Option<u64>) {
+        let _ = self.bytes_total.set(total);
+    }
+
+    /// The counter to attach to each source so its bytes are counted as they
+    /// are read. Handed to the format layer, which owns the counting.
+    pub fn byte_tally(&self) -> clinker_format::ByteTally {
+        self.bytes.clone()
+    }
+
     /// Read both counters and the file total.
     ///
     /// The reads are independent, so the sample is not a consistent cut: a
@@ -105,6 +126,18 @@ impl RunProgress {
             records_read: self.counters.records_read.load(Ordering::Relaxed),
             files_done: self.counters.files_done.load(Ordering::Relaxed),
             files_total: self.files_total.get().copied().flatten(),
+            bytes_read: self.bytes.read(),
+            // A multi-pass reader delivers its bytes more than once, so the
+            // count is IO performed, not input consumed, and would climb past
+            // any total it was divided by. Withdrawing the denominator here —
+            // rather than at sealing time — is what keeps the two from ever
+            // being paired, whichever source turns out to need a second pass
+            // and however late that is discovered.
+            bytes_total: if self.bytes.is_multi_pass() {
+                None
+            } else {
+                self.bytes_total.get().copied().flatten()
+            },
         }
     }
 }
@@ -120,6 +153,8 @@ pub struct ProgressSample {
     pub records_read: u64,
     pub files_done: u64,
     pub files_total: Option<u64>,
+    pub bytes_read: u64,
+    pub bytes_total: Option<u64>,
 }
 
 /// Whether a machine progress record marks a lifecycle edge or an advisory
@@ -336,6 +371,61 @@ mod tests {
         progress.seal_files_total(Some(4));
         progress.seal_files_total(Some(9));
         assert_eq!(progress.sample().files_total, Some(4));
+    }
+
+    #[test]
+    fn bytes_read_reflects_what_the_sources_handed_out() {
+        use std::io::Read as _;
+        let progress = RunProgress::new();
+        assert_eq!(progress.sample().bytes_read, 0);
+
+        let source = clinker_format::ReopenableSource::buffer(std::io::Cursor::new(
+            b"thirteen bytes".to_vec(),
+        ))
+        .expect("buffer")
+        .with_tally(progress.byte_tally());
+        let mut sink = Vec::new();
+        source
+            .open()
+            .expect("open")
+            .read_to_end(&mut sink)
+            .expect("read");
+
+        assert_eq!(progress.sample().bytes_read, 14);
+    }
+
+    /// A reader that converts for a second pass will deliver its bytes twice,
+    /// so the count stops being "input consumed" and the denominator has to go
+    /// — otherwise a supervisor divides by a total the numerator will overrun.
+    #[test]
+    fn a_multi_pass_source_withdraws_the_byte_total() {
+        let progress = RunProgress::new();
+        progress.seal_bytes_total(Some(1024));
+        assert_eq!(
+            progress.sample().bytes_total,
+            Some(1024),
+            "a single-pass run keeps its denominator"
+        );
+
+        let _converted =
+            clinker_format::ReopenableSource::buffer(std::io::Cursor::new(vec![0u8; 8]))
+                .expect("buffer")
+                .with_tally(progress.byte_tally())
+                .into_reopenable()
+                .expect("convert");
+
+        assert_eq!(
+            progress.sample().bytes_total,
+            None,
+            "the total is withdrawn the moment repeated delivery becomes certain"
+        );
+    }
+
+    #[test]
+    fn a_byte_total_sealed_as_unknowable_stays_absent() {
+        let progress = RunProgress::new();
+        progress.seal_bytes_total(None);
+        assert_eq!(progress.sample().bytes_total, None);
     }
 
     #[test]

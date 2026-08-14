@@ -176,6 +176,22 @@ fn build_multi_file_reader(
             })
         },
     );
+    // Attach the run's byte counter to every slot before any of them is opened.
+    // Counting lives with the source rather than with the reader, so a format
+    // added later is counted without knowing this exists.
+    let files = match progress.as_ref() {
+        Some(progress) => {
+            let tally = progress.byte_tally();
+            files
+                .into_iter()
+                .map(|slot| crate::source::multi_file::FileSlot {
+                    path: slot.path,
+                    source: slot.source.with_tally(tally.clone()),
+                })
+                .collect()
+        }
+        None => files,
+    };
     Ok(Box::new(
         MultiFileFormatReader::new(files, factory).with_progress(progress),
     ))
