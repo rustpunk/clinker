@@ -4836,6 +4836,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             records_ok: counters.ok_count,
             records_written: counters.records_written,
             records_dlq: counters.dlq_count,
+            records_null_dropped: counters.null_dropped_count,
             execution_mode: report.execution_summary.clone(),
             peak_rss_bytes: report.peak_rss_bytes,
             thread_count: num_threads(args),

@@ -556,6 +556,24 @@ Sort records before writing:
 - `last` -- nulls sort after all non-null values.
 - `drop` -- records with null sort keys are excluded from output.
 
+`drop` removes records, so a run using it writes fewer records than it read
+and that is not a fault. A missing column counts as a null key: a record that
+never carried the sort field is dropped the same as one carrying an explicit
+null. With several dropping fields, a record is excluded if *any* of its keys
+is null, and counts once however many of them are.
+
+The excluded records are counted. `records_null_dropped` in the metrics spool
+(`clinker metrics collect`) reports how many, separately from `records_dlq`
+and from filter losses, so a short output can be attributed rather than
+guessed at. The `Sort` stage reports it as well: its `records_in` is the
+population the sort was handed and `records_out` the population that
+survived, and the difference between them is the drop.
+
+Nothing else records these records. Unlike a DLQ entry, a dropped record
+leaves no artifact to inspect afterwards -- if you need to see which records
+were removed rather than only how many, route them out with a filter before
+the sort instead of declaring `drop`.
+
 Shorthand: a bare string defaults to ascending with nulls last:
 
 ```yaml

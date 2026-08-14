@@ -62,6 +62,17 @@ pub struct ExecutionMetrics {
     pub records_written: u64,
     /// Records routed to the DLQ.
     pub records_dlq: u64,
+    /// Records excluded by a `null_order: drop` sort field. Unlike DLQ
+    /// entries these leave no artifact to count afterwards, so this is the
+    /// only record of them; a run whose output is short by exactly this
+    /// many rows is behaving as configured.
+    ///
+    /// `#[serde(default)]` keeps the spool collector able to read files
+    /// written before this counter landed — they round-trip as zero, which
+    /// is indistinguishable from a genuine zero, so treat the absence of
+    /// the key rather than its value as the signal when auditing old files.
+    #[serde(default)]
+    pub records_null_dropped: u64,
     /// DAG-derived execution summary from `ExecutionReport.execution_summary`.
     pub execution_mode: String,
     /// Peak process RSS in bytes observed across chunk boundaries.
@@ -375,6 +386,7 @@ mod tests {
             records_ok: 99,
             records_written: 99,
             records_dlq: 1,
+            records_null_dropped: 2,
             execution_mode: "Streaming".into(),
             peak_rss_bytes: Some(52_428_800),
             thread_count: 4,
@@ -427,6 +439,7 @@ mod tests {
         assert_eq!(parsed.records_ok, 99);
         assert_eq!(parsed.records_written, 99);
         assert_eq!(parsed.records_dlq, 1);
+        assert_eq!(parsed.records_null_dropped, 2);
         assert_eq!(parsed.exit_code, 0);
         assert_eq!(parsed.peak_rss_bytes, Some(52_428_800));
     }

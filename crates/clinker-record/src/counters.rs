@@ -34,6 +34,22 @@ pub struct PipelineCounters {
     pub dlq_count: u64,
     pub filtered_count: u64,
     pub distinct_count: u64,
+    /// Records excluded by a `null_order: drop` sort field, summed over
+    /// every sort that applied one. Counts records, not fields: a record
+    /// whose key is null on two dropping fields is one exclusion.
+    ///
+    /// Kept separate from `filtered_count` because the two answer
+    /// different questions — a filter is an authored predicate over record
+    /// content, while this is a consequence of how a sort was asked to
+    /// treat a missing key, and an author who did not read `null_order`
+    /// closely may not know they requested it at all.
+    ///
+    /// Report-only, like `records_written`: not exposed as a `$pipeline.*`
+    /// member. The exclusions happen at a terminal sort, so a CXL
+    /// expression evaluating mid-pipeline would read zero regardless of
+    /// how many records the run eventually drops — a number that is
+    /// always available but never yet true.
+    pub null_dropped_count: u64,
     /// Counters for the retraction protocol that fires when an
     /// aggregate's `group_by` omits a correlation-key field. All fields
     /// stay zero on pipelines whose every aggregate has
@@ -139,6 +155,12 @@ impl PipelineCounters {
     /// Increment `distinct_count` by n.
     pub fn increment_distinct(&mut self, n: u64) {
         self.distinct_count += n;
+    }
+
+    /// Increment `null_dropped_count` by n. Use once per record excluded
+    /// by a `null_order: drop` sort field.
+    pub fn increment_null_dropped(&mut self, n: u64) {
+        self.null_dropped_count += n;
     }
 
     /// Snapshot the current counters for sharing with a chunk's parallel evaluation.

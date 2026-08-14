@@ -47,6 +47,7 @@ schema bump means draining the spool first.
   "records_ok": 49950,
   "records_written": 49950,
   "records_dlq": 50,
+  "records_null_dropped": 0,
   "execution_mode": "Streaming",
   "peak_rss_bytes": 134217728,
   "thread_count": 4,
@@ -85,6 +86,7 @@ schema bump means draining the spool first.
 | `records_ok` | integer | Distinct source records that reached at least one output. Under inclusive Route fan-out one input matching N branches counts once |
 | `records_written` | integer | Total writes across all sinks. Equals `records_ok` for single-output exclusive pipelines; exceeds it under inclusive Route fan-out or multiple Output sinks |
 | `records_dlq` | integer | Records routed to the dead-letter queue |
+| `records_null_dropped` | integer | Records excluded by an Output `null_order: drop` sort field (see [Sort order](../nodes/output.md#sort-order)). Absent from spool files written before this counter existed, where it reads as `0` |
 | `execution_mode` | string | DAG-derived execution summary: `Streaming` (no full-stage materialization required) or `TwoPass` (a blocking stage forces an accumulation pass) |
 | `peak_rss_bytes` | integer/null | Peak resident set size in bytes, sampled across chunk boundaries on Linux, macOS, and Windows. `null` on platforms where RSS sampling is unavailable |
 | `thread_count` | integer | Thread pool size used |
