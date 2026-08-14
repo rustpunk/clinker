@@ -380,22 +380,30 @@ jobs:
               # cannot tell "ring is gone" from "we asked about a name that does
               # not exist". A rename or typo in the argument above would otherwise
               # land here and report success on every future run, with the
-              # guarantee silently switched off.
+              # guarantee silently switched off. Cargo cannot settle it either:
+              # from its side both cases are the same "no such package".
               #
-              # Ask the identical question about a package that must resolve. If
-              # `clinker` cannot be found either, the invocation is broken and its
-              # failure to find `ring` says nothing about the graph. Cargo is its
-              # own oracle here deliberately: reading the lockfile directly meant
-              # a second parser of a format this file already parses elsewhere,
-              # and the two drifted — the copy kept a defect the original had
-              # fixed, and read a `[[patch.unused]]` entry as a live dependency.
-              if ! cargo tree --locked --workspace --all-features --target all \
-                     --invert clinker >/dev/null \
-                     2>"${RUNNER_TEMP}/ring-control.err"; then
-                echo "cargo tree cannot resolve 'clinker' either, so its inability"
-                echo "to resolve 'ring' is a broken invocation rather than a clean"
-                echo "dependency graph:"
-                cat "${RUNNER_TEMP}/ring-control.err"
+              # So the lockfile is consulted as an independent source of truth,
+              # for a name this check spells out rather than sharing with the
+              # query above — a typo has to disagree with something to be caught.
+              # Block boundaries follow the same rule as the reconciliation step:
+              # a block ends at the next section header, so a `[[patch.unused]]`
+              # entry naming ring is not read as a live dependency, and a block
+              # with no name line cannot absorb the section that follows it.
+              if awk 'function close_block() { open = 0 }
+                      /^\[/ {
+                        close_block()
+                        if ($0 ~ /^\[\[package\]\]/) { open = 1 }
+                        next
+                      }
+                      open && /^name = / {
+                        gsub(/"/, "")
+                        if ($3 == "ring") { found = 1 }
+                        next
+                      }
+                      END { if (found) { exit 0 } ; exit 1 }' Cargo.lock; then
+                echo "cargo tree resolved no such package, yet ring IS in"
+                echo "Cargo.lock — this check is asking about the wrong name."
                 exit 1
               fi
               echo "ring is not in the lockfile at all — the strongest form of this"
