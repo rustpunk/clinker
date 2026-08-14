@@ -176,15 +176,22 @@ jobs:
           # lockfiles here are separate files regenerated at different times, so
           # the root can move to a new format while the fixture's lags, and any
           # parse that silently yields nothing would be read as an absence.
-          # A name is only accepted once it reduces to something shaped like a
-          # crate name. Stripping double quotes handles the spelling cargo emits
-          # today and nothing else — a lockfile using TOML literal strings would
-          # yield `'cc'`, which is non-empty, so it would satisfy a bare
+          # Both fields are accepted only once they reduce to the shape they are
+          # meant to have. Stripping double quotes handles the spelling cargo
+          # emits today and nothing else — a lockfile using TOML literal strings
+          # would yield `'cc'`, which is non-empty, so it would satisfy a bare
           # emptiness test, fail to match `cc`, and report the workspace as no
           # longer depending on it. Rejecting the unreduced value instead makes
           # that a parse failure, and because a spelling change is uniform across
           # every entry, it empties the whole parse and trips the guard below
           # rather than quietly losing one crate.
+          #
+          # The version is checked the same way and not only the name. Validating
+          # one and not the other would leave the emptier field able to produce a
+          # blank version, an empty `workspace_cc`, and the "cc has left the
+          # workspace" success branch — safe today only because a name check on
+          # the same file happens to fire first, which is a coupling rather than
+          # a guarantee.
           #
           # Written as if/else, which is a style choice here and not a fix. The
           # portability defect this step actually hit was narrower: `x in a` on
@@ -201,7 +208,8 @@ jobs:
                    next
                  }
                  p && /^version = / {
-                   if (n != "") { gsub(/"/, ""); print n, $3 }
+                   gsub(/"/, "")
+                   if (n != "" && $3 ~ /^[A-Za-z0-9_.+-]+$/) { print n, $3 }
                    p = 0
                  }' "$1"
           }
