@@ -178,7 +178,7 @@ pub(crate) type BodyParser = XmlParser<BufReader<Box<dyn Read + Send>>>;
 pub struct XmlReader {
     /// The re-openable byte source. Body iteration and the envelope pre-scan
     /// each open their own fresh [`Read`] from it, so no whole-document buffer
-    /// is held for a file-backed (`ReopenableSource::Path`) source.
+    /// is held for a file-backed (path) source.
     source: ReopenableSource,
     /// Content identity of the bytes the body open read, captured at
     /// construction. The envelope pre-scan re-opens the source and confirms it
@@ -257,9 +257,9 @@ impl XmlReader {
     ///
     /// For pathless inputs (test cursors, the `<inline>`/`<empty>` slots, REST
     /// bodies) that have no on-disk path to re-open: the bytes are captured
-    /// once into a small `ReopenableSource::Buffered`. Bounded because such
+    /// once into a small buffered `ReopenableSource`. Bounded because such
     /// inputs are small by construction; file-backed sources use
-    /// [`from_source`](Self::from_source) with `ReopenableSource::Path` instead
+    /// [`from_source`](Self::from_source) with a path-backed `ReopenableSource` instead
     /// and are never buffered whole.
     ///
     /// # Errors

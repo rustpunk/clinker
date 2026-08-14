@@ -56,8 +56,8 @@ impl FileSlot {
     /// Wrap a one-shot `Read` handle plus its path into a slot.
     ///
     /// For in-memory inputs (test/bench cursors, the `<empty>` slot) that have
-    /// no on-disk path to re-open: the reader is held lazily as a
-    /// `ReopenableSource::OneShot` and streamed directly by a one-pass format,
+    /// no on-disk path to re-open: the reader is held lazily as
+    /// a one-shot `ReopenableSource` and streamed directly by a one-pass format,
     /// so a paced/slow reader keeps its per-row timing and nothing is read at
     /// slot construction. A multi-pass reader (JSON) buffers it on demand.
     /// File-backed production sources use [`from_path`](Self::from_path)
@@ -66,6 +66,21 @@ impl FileSlot {
         Self {
             path: path.into(),
             source: ReopenableSource::one_shot(reader),
+        }
+    }
+
+    /// Wrap a path with no bytes behind it, for a matcher that found no files.
+    ///
+    /// Backed by empty *buffered* bytes rather than an empty one-shot reader so
+    /// the slot can answer its own length. A one-shot cannot, and an unknowable
+    /// length withdraws the run's byte denominator — meaning one absent
+    /// optional input would silently cost every other source its progress
+    /// total. A source that reads nothing reads zero bytes, and says so.
+    pub fn empty(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            source: ReopenableSource::buffer(std::io::empty())
+                .expect("draining an empty reader cannot fail"),
         }
     }
 

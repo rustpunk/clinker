@@ -1038,16 +1038,18 @@ impl MachineState {
         let sample = snapshot.sample();
         // `records_read` carries no companion total. A streaming source does
         // not establish its own cardinality until its last row is read, so
-        // there is no honest denominator to pair it with. `files_total` is
-        // the one this engine does establish ahead of the read, and is `null`
-        // on a run whose sources are not enumerated file sets. No percentage
-        // is computed here: a ratio built on an absent total is the one value
-        // a supervisor must never be handed.
+        // there is no honest denominator to pair it with. The byte and file
+        // axes carry the totals on-disk metadata does establish, each `null`
+        // on a run whose sources establish none. No percentage is computed
+        // here: a ratio built on an absent total is the one value a supervisor
+        // must never be handed.
         let progress = serde_json::json!({
             "phase": snapshot.phase(),
             "kind": kind.as_str(),
             "elapsed_ms": snapshot.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             "records_read": sample.records_read,
+            "bytes_read": sample.bytes_read,
+            "bytes_total": sample.bytes_total,
             "files_done": sample.files_done,
             "files_total": sample.files_total,
         });

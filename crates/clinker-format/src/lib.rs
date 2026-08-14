@@ -39,7 +39,7 @@ pub use schema::{
     Column, DEFAULT_VALUE_DELIMITER, Discriminator, GeneratedSchema, RECORD_TYPE_COLUMN,
     RecordType, SourceSchema, StructureConstraint, multi_record_superset,
 };
-pub use source::ReopenableSource;
+pub use source::{ByteTally, ReopenableSource};
 pub use traits::{FormatReader, FormatWriter, SourceLifecycleEvent};
 
 // Default positional-element/field ceilings each reader enforces on a

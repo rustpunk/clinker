@@ -19,9 +19,13 @@
 //! does establish ahead of the read: a source's file set is enumerated before
 //! any of it is opened.
 //!
-//! A byte axis would be the better denominator — it is what comparable engines
-//! report — but it needs a byte position the format layer does not expose, so
-//! it is absent rather than present-and-empty.
+//! The byte axis carries the denominator comparable engines actually report.
+//! Bytes are counted inside the format layer's single byte-source funnel, so a
+//! reader neither implements nor delegates anything to be counted. `bytes_total`
+//! is withdrawn when a source's size cannot be read, and when any reader makes
+//! more than one pass over its input — those bytes cross the counter twice, so
+//! the count measures IO performed rather than input consumed and would overrun
+//! the very total it was to be divided by.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -50,13 +54,19 @@ struct ProgressCounters {
 /// defect — nothing may decide on a sampled value. Decisions read the exact
 /// state the executor owns.
 ///
-/// The file total is sealed at most once, early in the run, and distinguishes
-/// three states a reader must tell apart: not yet established, established as
-/// unknowable for this run's source shapes, and established.
+/// Both totals are sealed at most once, before the first source begins
+/// reading, and each distinguishes three states a reader must tell apart: not
+/// yet established, established as unknowable for this run's sources, and
+/// established. A total a reader has once seen never reverts to an absence.
 #[derive(Clone, Debug, Default)]
 pub struct RunProgress {
     counters: Arc<ProgressCounters>,
     files_total: Arc<OnceLock<Option<u64>>>,
+    bytes_total: Arc<OnceLock<Option<u64>>>,
+    /// Bytes counted by the format layer as sources hand them to readers. Not
+    /// one of [`ProgressCounters`]: nothing here increments it, and the
+    /// executor never writes it — the count happens where the bytes are.
+    bytes: clinker_format::ByteTally,
 }
 
 impl RunProgress {
@@ -93,7 +103,25 @@ impl RunProgress {
         let _ = self.files_total.set(total);
     }
 
-    /// Read both counters and the file total.
+    /// Record the run's total input size in bytes, or `None` where any source
+    /// cannot establish one. Sealed once, like the file total.
+    ///
+    /// A total of zero is stored as an absence. Zero is not a denominator: a
+    /// reader dividing by it gets `NaN` rather than a ratio, and a run with no
+    /// bytes to read is not a run nought per cent through its input. Enforced
+    /// here rather than at the call site so no caller can publish the division
+    /// by forgetting to guard it.
+    pub fn seal_bytes_total(&self, total: Option<u64>) {
+        let _ = self.bytes_total.set(total.filter(|bytes| *bytes > 0));
+    }
+
+    /// The counter to attach to each source so its bytes are counted as they
+    /// are read. Handed to the format layer, which owns the counting.
+    pub fn byte_tally(&self) -> clinker_format::ByteTally {
+        self.bytes.clone()
+    }
+
+    /// Read every counter and both totals.
     ///
     /// The reads are independent, so the sample is not a consistent cut: a
     /// file that closes between the `records_read` load and the `files_done`
@@ -105,6 +133,8 @@ impl RunProgress {
             records_read: self.counters.records_read.load(Ordering::Relaxed),
             files_done: self.counters.files_done.load(Ordering::Relaxed),
             files_total: self.files_total.get().copied().flatten(),
+            bytes_read: self.bytes.read(),
+            bytes_total: self.bytes_total.get().copied().flatten(),
         }
     }
 }
@@ -120,6 +150,8 @@ pub struct ProgressSample {
     pub records_read: u64,
     pub files_done: u64,
     pub files_total: Option<u64>,
+    pub bytes_read: u64,
+    pub bytes_total: Option<u64>,
 }
 
 /// Whether a machine progress record marks a lifecycle edge or an advisory
@@ -336,6 +368,60 @@ mod tests {
         progress.seal_files_total(Some(4));
         progress.seal_files_total(Some(9));
         assert_eq!(progress.sample().files_total, Some(4));
+    }
+
+    #[test]
+    fn bytes_read_reflects_what_the_sources_handed_out() {
+        use std::io::Read as _;
+        let progress = RunProgress::new();
+        assert_eq!(progress.sample().bytes_read, 0);
+
+        let source = clinker_format::ReopenableSource::buffer(std::io::Cursor::new(
+            b"thirteen bytes".to_vec(),
+        ))
+        .expect("buffer")
+        .with_tally(progress.byte_tally());
+        let mut sink = Vec::new();
+        source
+            .open()
+            .expect("open")
+            .read_to_end(&mut sink)
+            .expect("read");
+
+        assert_eq!(progress.sample().bytes_read, 14);
+    }
+
+    /// A reader that converts for a second pass will deliver its bytes twice,
+    /// so the count stops being "input consumed" and the denominator has to go
+    /// — otherwise a supervisor divides by a total the numerator will overrun.
+    #[test]
+    fn a_sealed_byte_total_cannot_drift() {
+        let progress = RunProgress::new();
+        progress.seal_bytes_total(Some(1024));
+        progress.seal_bytes_total(Some(4096));
+        progress.seal_bytes_total(None);
+        assert_eq!(
+            progress.sample().bytes_total,
+            Some(1024),
+            "a reader that has seen the total must never see it withdrawn"
+        );
+    }
+
+    #[test]
+    fn a_byte_total_sealed_as_unknowable_stays_absent() {
+        let progress = RunProgress::new();
+        progress.seal_bytes_total(None);
+        assert_eq!(progress.sample().bytes_total, None);
+    }
+
+    /// Zero is not a denominator — dividing by it yields `NaN`, not `0%` — so a
+    /// run with no bytes to read reports an absence rather than a total no
+    /// consumer can use.
+    #[test]
+    fn a_zero_byte_total_is_reported_as_an_absence() {
+        let progress = RunProgress::new();
+        progress.seal_bytes_total(Some(0));
+        assert_eq!(progress.sample().bytes_total, None);
     }
 
     #[test]

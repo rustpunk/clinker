@@ -19,7 +19,7 @@
 //! the [`ReopenableSource`], so neither consumes the other and no shared
 //! whole-file byte buffer is retained for file-backed inputs. A pathless input
 //! (a test cursor, the `<inline>`/`<empty>` slot, a REST body) is held as a
-//! small `ReopenableSource::Buffered` — the honest one-shot fallback, bounded
+//! small buffered `ReopenableSource` — the honest one-shot fallback, bounded
 //! because such inputs are small by construction.
 
 use std::collections::HashSet;
@@ -97,7 +97,7 @@ pub struct JsonReader {
     deferred_first: Option<serde_json::Value>,
     /// The re-openable byte source. Body iteration and the envelope pre-scan
     /// each open their own fresh [`Read`] from it, so no whole-file buffer is
-    /// held for a file-backed (`ReopenableSource::Path`) source.
+    /// held for a file-backed (path) source.
     source: ReopenableSource,
     /// Content identity of the bytes the body open read, captured at
     /// construction. The envelope pre-scan re-opens the source and confirms it
@@ -171,9 +171,9 @@ impl JsonReader {
     ///
     /// For pathless inputs (test cursors, the `<inline>`/`<empty>` slots, REST
     /// bodies) that have no on-disk path to re-open: the bytes are captured
-    /// once into a small `ReopenableSource::Buffered`. Bounded because such
+    /// once into a small buffered `ReopenableSource`. Bounded because such
     /// inputs are small by construction; file-backed sources use
-    /// [`from_source`](Self::from_source) with `ReopenableSource::Path` instead
+    /// [`from_source`](Self::from_source) with a path-backed `ReopenableSource` instead
     /// and are never buffered whole.
     ///
     /// # Errors
