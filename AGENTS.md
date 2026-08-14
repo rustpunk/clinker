@@ -82,6 +82,50 @@ Recurring ground truths. Each has been got wrong more than once; treat a design 
 - **`$doc.*` section names are author-defined** in pipeline YAML. `head`, `foot`, `header`, `footer` are examples, never built-ins — do not hardcode them in plans, designs, examples, or docs.
 - **Never infer workload frequency from fixture data.** Example and test corpora are written to exercise a path, not to describe production. Optimize for every shape the surface admits rather than the shape a fixture happens to have.
 
+## Observability And Memory Obligations
+
+OpenLineage lineage, OTLP telemetry, and the memory budget are part of a node's contract, not instrumentation fitted afterwards. Every new node, new feature, and refactor answers all three trigger tests below. "Where appropriate" is decided by the trigger, and an exemption is claimed out loud in the PR rather than left silent — an unstated exemption is indistinguishable from an oversight.
+
+Backfill is in scope. When a change touches a node type that predates these obligations, bring that node type up to them in the same PR; leaving a touched node at the old standard is what keeps the gaps permanent.
+
+Deployment configuration for both delivery paths is the workspace `ObservabilityConfig` in `crates/clinker-plan/src/config/observability.rs`, whose `otlp` and `lineage` tables are independently optional, and delivery is wired at the CLI edge in `crates/clinker/src/observability.rs`. Neither path may become a dependency of the engine core.
+
+Three mechanisms make an omission invisible today, which is why these are written as obligations rather than reminders:
+
+- The `clinker-lineage` builder dispatches over plan nodes through catch-all arms, so a new `PlanNode` variant compiles clean and silently produces no lineage.
+- `MetricKey` and `SpanName` in `clinker_exec::telemetry` name only `Transform` work, so every other node type is telemetry-blind by construction.
+- Registering with `MemoryArbitrator` is a call a consumer makes, not an obligation the compiler enforces, so an operator that accumulates without registering builds and passes its tests.
+
+### Lineage
+
+Trigger: the change affects how a column's value is determined, or whether, where, and in what order a row travels.
+
+- Reading a field to produce a value earns a DIRECT edge; reading it to decide inclusion, routing, grouping, or ordering earns INDIRECT influence.
+- A new or renamed dataset boundary — anything that reads or writes external data — earns its `dataset_identity` mapping.
+- Adding a `PlanNode` variant earns an explicit arm in the lineage builder, including when the correct arm is a documented no-op. A variant left to a catch-all reads exactly like one that was forgotten.
+- `clinker-lineage` stays plan-time and read-only, keeps no dependency on `clinker-exec`, holds no clock, and takes no in-crate HTTP transport. Meet run-lifecycle lineage through `emit::start_event` and `emit::terminal_event`, driven from the CLI edge in `crates/clinker/src/lifecycle.rs`.
+- Exempt: a change touching no field values and no row selection, grouping, or ordering — a performance refactor with identical output, an internal error type, diagnostic wording.
+
+### Telemetry
+
+Trigger: the change introduces execution work with a lifecycle, or an outcome worth counting.
+
+- Work that starts, finishes, and can fail earns a `SpanName` variant and an `emit_span`; records, errors, drops, spills, and retries earn a `MetricKey` variant and a `record_metric`. Extending those enums is the ordinary way to meet this obligation, not an escalation.
+- Keep both enums closed and fixed-cardinality. A metric keyed by a data value — a group key, a filename, an author-supplied node output — is what makes a startup-sized arena unsizable.
+- Emission is admission-controlled and may be dropped. No behavior may depend on a signal being admitted, and no producer may block, grow the arena, or spill to make room.
+- Emit a span once, after its work completes, closed at both ends. A collector has no representation for half a span, and independent admission can deliver one half without the other; the live "has begun" signal is the corresponding metric.
+- Event fields are deny-by-default and pass field policy before serialization. Carry record values as `SignalValue::Record` so policy sees them typed — formatting a record into a message string moves it past the policy that governs it.
+- Exempt: plan-time code that performs no execution work, and a count already derivable from existing metrics.
+
+### Memory budget
+
+Trigger: the change retains anything whose size grows with input — buffered records, hash tables, group state, sort runs, join build sides, spill indexes, retained tails.
+
+- That state implements `MemoryConsumer`, registers through `register_consumer` on entry and unregisters on every exit path including error and cancellation, reports true bytes through its `ConsumerHandle`, and honors both `take_spill_request` and `wait_while_paused`.
+- Exempt: allocation bounded by a constant independent of input size, or state an ancestor consumer already accounts for — name that consumer.
+- Small inputs in practice, a passing test, and short-lived state are not bounds. The question is whether a bound exists that holds however much data arrives.
+- Growing a buffer never answers a dropped telemetry signal. The observability arena is fixed and sheds load deliberately, so enlarging it to retain signals converts a reporting gap into a memory-bound violation.
+
 ## Verification
 
 A gate that was not run, or whose result was read from the wrong place, is a gate that did not happen.
@@ -164,5 +208,6 @@ Agent workflow policy:
 - Relevant tests/checks were run, or skipped with a clear reason.
 - `git diff --check` passes.
 - Behavior changes have matching docs and tests.
+- Each obligation in [Observability And Memory Obligations](#observability-and-memory-obligations) is met for every node type the change touches, or its exemption is stated in the PR.
 - Open questions are captured in `docs/ai/80_OPEN_QUESTIONS.md`.
 - Final response summarizes changed files, validation, and any remaining risks.
