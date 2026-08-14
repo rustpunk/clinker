@@ -3181,10 +3181,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         if slots.is_empty() {
             // Stash a single empty reader so the executor's "missing reader"
             // check passes. Records flow through as zero-row sources.
-            slots.push(clinker_exec::source::multi_file::FileSlot::new(
-                "<empty>",
-                Box::new(std::io::empty()),
-            ));
+            slots.push(clinker_exec::source::multi_file::FileSlot::empty("<empty>"));
         }
         readers.insert(
             source_name,

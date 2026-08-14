@@ -69,6 +69,21 @@ impl FileSlot {
         }
     }
 
+    /// Wrap a path with no bytes behind it, for a matcher that found no files.
+    ///
+    /// Backed by empty *buffered* bytes rather than an empty one-shot reader so
+    /// the slot can answer its own length. A one-shot cannot, and an unknowable
+    /// length withdraws the run's byte denominator — meaning one absent
+    /// optional input would silently cost every other source its progress
+    /// total. A source that reads nothing reads zero bytes, and says so.
+    pub fn empty(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            source: ReopenableSource::buffer(std::io::empty())
+                .expect("draining an empty reader cannot fail"),
+        }
+    }
+
     /// Build a slot for a file-backed source: `provenance` is the originating
     /// path stamped on records (`$source.file`), `read_path` is the stable
     /// (staged) path the reader re-opens. The reader opens `read_path` fresh

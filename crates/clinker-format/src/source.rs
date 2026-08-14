@@ -6,8 +6,11 @@
 //! whole input — while a one-pass reader (CSV, XML, fixed-width, EDI) consumes
 //! the bytes lazily, one streamed `Read` and no buffer.
 //!
-//! Three shapes, each honest about its memory:
-//! - [`ReopenableSource::Path`] re-opens a stable on-disk path. With staging
+//! Three shapes, each honest about its memory. They are a private detail of
+//! the type — a source is built through [`ReopenableSource::path`],
+//! [`ReopenableSource::one_shot`] or [`ReopenableSource::buffer`], so a caller
+//! cannot assemble one that bypasses the byte counting every open performs:
+//! - A **path** source re-opens a stable on-disk path. With staging
 //!   enabled the input is a content-addressed copy held under an advisory read
 //!   lock for the run, so two opens read byte-identical content; with staging
 //!   off the original path is re-opened directly. Either way the batch model
@@ -16,20 +19,20 @@
 //!   taken at each open that fails loud if the file changed between passes,
 //!   rather than splicing a stale envelope onto a freshly-read body. Memory is
 //!   O(1) per open — no whole-file buffer is ever held.
-//! - [`ReopenableSource::OneShot`] wraps a single pathless `Box<dyn Read>`
+//! - A **one-shot** source wraps a single pathless `Box<dyn Read>`
 //!   (a test/bench cursor, the `<empty>` slot, a network body). It is consumed
-//!   *lazily*: the first [`open`](Self::open) hands out the reader as-is, so a
+//!   *lazily*: the first [`open`](ReopenableSource::open) hands out the reader as-is, so a
 //!   one-pass format streams it without buffering and a paced/slow reader keeps
 //!   its streaming timing. A second pass is only possible after
-//!   [`into_reopenable`](Self::into_reopenable) buffers it.
-//! - [`ReopenableSource::Buffered`] holds bytes in a shared `Arc<[u8]>`, handing
-//!   out cursors. A `OneShot` becomes `Buffered` on demand when a multi-pass
+//!   [`into_reopenable`](ReopenableSource::into_reopenable) buffers it.
+//! - A **buffered** source holds bytes in a shared `Arc<[u8]>`, handing
+//!   out cursors. A one-shot becomes buffered on demand when a multi-pass
 //!   reader (JSON) needs a second open; bounded because pathless inputs are
 //!   small by construction.
 
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -44,16 +47,15 @@ use std::time::SystemTime;
 /// another thread may read a value already superseded, which is the contract
 /// for a progress display and unfit for a decision.
 ///
-/// `multi_pass` records that some source was converted for repeated reading
-/// (JSON's and XML's envelope pre-scan plus body). Those bytes cross this
-/// counter more than once, so the total measures IO performed rather than
-/// progress through the input, and no denominator may be paired with it. The
-/// flag is the reason a caller can tell those apart; see
-/// [`ByteTally::is_multi_pass`].
+/// A source read more than once (a multi-pass format's envelope pre-scan plus
+/// its body) crosses this counter twice, so the count then measures IO
+/// performed rather than input consumed. Whether that is so is decided from the
+/// declared format before any reader exists, by the caller — not discovered
+/// here — so a published denominator cannot turn back into an absence part-way
+/// through a run.
 #[derive(Clone, Debug, Default)]
 pub struct ByteTally {
     read: Arc<AtomicU64>,
-    multi_pass: Arc<AtomicBool>,
 }
 
 impl ByteTally {
@@ -66,20 +68,10 @@ impl ByteTally {
         self.read.load(Ordering::Relaxed)
     }
 
-    /// Whether any source sharing this tally will deliver its bytes more than
-    /// once, making the count IO performed rather than input consumed.
-    pub fn is_multi_pass(&self) -> bool {
-        self.multi_pass.load(Ordering::Relaxed)
-    }
-
     fn add(&self, n: u64) {
         if n > 0 {
             self.read.fetch_add(n, Ordering::Relaxed);
         }
-    }
-
-    fn mark_multi_pass(&self) {
-        self.multi_pass.store(true, Ordering::Relaxed);
     }
 }
 
@@ -182,6 +174,23 @@ impl ReopenableSource {
         Self { kind, tally: None }
     }
 
+    /// The number of bytes an open would deliver, when that is knowable.
+    ///
+    /// Answered by the source itself so the size describes the bytes a reader
+    /// will actually receive — for a staged input, the staged copy rather than
+    /// the original path it was matched from, which staging exists precisely
+    /// because the run cannot rely on.
+    ///
+    /// `None` for a one-shot reader, whose length is unknowable without
+    /// consuming it. `Buffered` and `Path` answer exactly.
+    pub fn known_len(&self) -> Option<u64> {
+        match &self.kind {
+            SourceKind::Path(path) => std::fs::metadata(path).ok().map(|meta| meta.len()),
+            SourceKind::Buffered(bytes) => Some(bytes.len() as u64),
+            SourceKind::OneShot(_) => None,
+        }
+    }
+
     /// Credit every byte this source hands out to `tally`.
     ///
     /// Attaching here rather than passing a counter to each open is what makes
@@ -231,13 +240,6 @@ impl ReopenableSource {
     /// convert before opening. A poisoned reader slot (a panic mid-open on
     /// another thread) surfaces as an opaque [`std::io::Error`].
     pub fn into_reopenable(self) -> std::io::Result<Self> {
-        // Converting is what a multi-pass reader does before its first open, so
-        // it is the one place that knows these bytes will be delivered more
-        // than once. Recording it here keeps a doubled count from being paired
-        // with a denominator it would overrun.
-        if let Some(tally) = &self.tally {
-            tally.mark_multi_pass();
-        }
         let tally = self.tally;
         let converted = match self.kind {
             SourceKind::OneShot(slot) => {
@@ -531,7 +533,71 @@ mod tests {
         let mut sink = Vec::new();
         src.open().unwrap().read_to_end(&mut sink).unwrap();
         assert_eq!(tally.read(), 12);
-        assert!(!tally.is_multi_pass());
+    }
+
+    #[test]
+    fn a_source_reports_the_length_an_open_would_deliver() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "clinker-len-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"nine byte")
+            .unwrap();
+        assert_eq!(ReopenableSource::path(&path).known_len(), Some(9));
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            ReopenableSource::buffer(Cursor::new(b"four".to_vec()))
+                .unwrap()
+                .known_len(),
+            Some(4)
+        );
+        assert_eq!(
+            ReopenableSource::buffer(std::io::empty())
+                .unwrap()
+                .known_len(),
+            Some(0),
+            "a source with no bytes knows it, rather than withdrawing a total"
+        );
+        assert_eq!(
+            ReopenableSource::one_shot(Box::new(Cursor::new(b"x".to_vec()))).known_len(),
+            None,
+            "a one-shot length is unknowable without consuming it"
+        );
+    }
+
+    /// Counting happens as bytes are handed over, not when a source is
+    /// exhausted. This is the property that makes the byte axis useful on a
+    /// single large input, where every other count sits still until the end —
+    /// and it is checked here, deterministically, rather than by racing a
+    /// once-per-second progress record against a read still in flight.
+    #[test]
+    fn a_partial_read_counts_only_what_it_took() {
+        let tally = ByteTally::new();
+        let src = ReopenableSource::buffer(Cursor::new(vec![b'x'; 4096]))
+            .unwrap()
+            .with_tally(tally.clone());
+
+        let mut reader = src.open().unwrap();
+        let mut head = [0_u8; 100];
+        reader.read_exact(&mut head).unwrap();
+        let after_first = tally.read();
+        assert!(
+            (100..4096).contains(&after_first),
+            "a partial read reports partial bytes, got {after_first}"
+        );
+
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(tally.read(), 4096, "the whole source is accounted for");
+        assert!(
+            tally.read() > after_first,
+            "the count advanced within the one open"
+        );
     }
 
     #[test]
@@ -543,22 +609,16 @@ mod tests {
     }
 
     /// The count follows the bytes, not the reader, so a second pass over the
-    /// same source adds to it. That makes the total IO performed rather than
-    /// input consumed, which is exactly what `is_multi_pass` warns a caller
-    /// about — without it, a doubled count would be paired with a denominator
-    /// it overruns.
+    /// same source adds to it. This is why a run whose format re-reads its
+    /// input publishes no byte denominator: the count would overrun it.
     #[test]
-    fn converting_for_a_second_pass_marks_the_tally_and_doubles_the_count() {
+    fn a_second_pass_doubles_the_count() {
         let tally = ByteTally::new();
         let src = ReopenableSource::buffer(Cursor::new(b"sixteen bytes!!!".to_vec()))
             .unwrap()
             .with_tally(tally.clone())
             .into_reopenable()
             .unwrap();
-        assert!(
-            tally.is_multi_pass(),
-            "conversion is the moment repeated delivery becomes certain"
-        );
 
         let mut a = Vec::new();
         let mut b = Vec::new();

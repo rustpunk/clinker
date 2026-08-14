@@ -708,16 +708,26 @@ impl PipelineExecutor {
                 _ => None,
             };
             bytes_total = match (&source_input, bytes_total) {
+                // A format that re-reads its input makes the byte count IO
+                // performed rather than input consumed, so it would overrun any
+                // total. Decided from the declared format, before a reader
+                // exists, so the answer is fixed for the whole run.
+                (crate::source::SourceInput::Files(_), _)
+                    if ingest::format_rereads_input(&src_cfg.format) =>
+                {
+                    None
+                }
                 (crate::source::SourceInput::Files(files), Some(seen)) => files
                     .iter()
-                    // One unreadable size withdraws the whole denominator, for
-                    // the same reason one non-file source does: a total that
-                    // covers part of the input describes nothing a reader can
+                    // Each source reports its own length, so a staged input is
+                    // sized by the staged copy a reader will actually read
+                    // rather than the original path it was matched from. One
+                    // unknowable length withdraws the whole denominator, for
+                    // the same reason one non-file source does: a total
+                    // covering part of the input describes nothing a reader can
                     // act on, and nothing on the wire would say which part.
                     .try_fold(seen, |acc, slot| {
-                        std::fs::metadata(&slot.path)
-                            .ok()
-                            .map(|meta| acc.saturating_add(meta.len()))
+                        slot.source.known_len().map(|len| acc.saturating_add(len))
                     }),
                 _ => None,
             };

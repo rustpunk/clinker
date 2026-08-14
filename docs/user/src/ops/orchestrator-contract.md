@@ -248,6 +248,20 @@ consumed. Rather than publish a total the count will overrun, Clinker
 withdraws it. `bytes_read` is still emitted in that case and still rises
 monotonically — it remains a usable liveness signal, just not a fraction.
 
+**`bytes_read` counts file-backed input only.** A source with no bytes on
+disk — a network source, for instance — contributes nothing to it, so a run
+reading only from such a source reports `bytes_read: 0` for its whole life
+while records flow normally. A `null` `bytes_total` is the signal that this
+may be so: **when `bytes_total` is `null`, judge liveness from `records_read`,
+not from bytes.** Reading a still `0` byte count as a stalled run is the one
+mistake this field invites.
+
+Like `files_total`, `bytes_total` is `null` on the earliest records of a run,
+before source discovery has established it. It is written once and never
+changes afterwards — including never reverting to `null` — so a consumer may
+cache it on first sight, and its arrival mid-stream is normal rather than an
+identity change.
+
 `files_done` and `files_total` are a second, independent denominator, useful
 where the byte one is withdrawn. A source's file set is enumerated at startup,
 so the count is known rather than estimated. `files_total` is `null` when

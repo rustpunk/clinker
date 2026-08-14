@@ -28,6 +28,36 @@ use clinker_plan::error::PipelineError;
 /// the whole file; every other (one-pass) format opens the source once and
 /// streams that single `Read`. Returns `Box<dyn FormatReader>` — all downstream
 /// code uses trait methods (`schema()`, `next_record()`).
+/// Whether a format reads its input more than once.
+///
+/// The envelope pre-scan of a multi-pass format re-opens the source, so its
+/// bytes cross the run's byte counter twice and the count stops describing
+/// input consumed. A run containing one publishes no byte denominator.
+///
+/// Answered from the declared format, before any reader exists, so the
+/// denominator is decided once and cannot change under a reader that has
+/// already been observed — the alternative, discovering it when a reader
+/// happens to convert its source, would let a published total turn back into
+/// an absence part-way through a run.
+///
+/// Enumerated rather than matched with a wildcard, and deliberately adjacent to
+/// [`build_format_reader`] whose arms decide the same thing: a format added
+/// there without an answer here fails to compile.
+pub(super) fn format_rereads_input(format: &clinker_plan::config::InputFormat) -> bool {
+    use clinker_plan::config::InputFormat;
+    match format {
+        // Both open the source a second time for their envelope pre-scan; see
+        // the `into_reopenable` calls in the json and xml readers.
+        InputFormat::Json(_) | InputFormat::Xml(_) => true,
+        InputFormat::Csv(_)
+        | InputFormat::FixedWidth(_)
+        | InputFormat::Edifact(_)
+        | InputFormat::X12(_)
+        | InputFormat::Hl7(_)
+        | InputFormat::Swift(_) => false,
+    }
+}
+
 fn build_format_reader(
     input: &clinker_plan::config::SourceConfig,
     schema: &SourceSchema,

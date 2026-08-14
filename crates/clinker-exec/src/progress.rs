@@ -127,17 +127,7 @@ impl RunProgress {
             files_done: self.counters.files_done.load(Ordering::Relaxed),
             files_total: self.files_total.get().copied().flatten(),
             bytes_read: self.bytes.read(),
-            // A multi-pass reader delivers its bytes more than once, so the
-            // count is IO performed, not input consumed, and would climb past
-            // any total it was divided by. Withdrawing the denominator here —
-            // rather than at sealing time — is what keeps the two from ever
-            // being paired, whichever source turns out to need a second pass
-            // and however late that is discovered.
-            bytes_total: if self.bytes.is_multi_pass() {
-                None
-            } else {
-                self.bytes_total.get().copied().flatten()
-            },
+            bytes_total: self.bytes_total.get().copied().flatten(),
         }
     }
 }
@@ -398,26 +388,15 @@ mod tests {
     /// so the count stops being "input consumed" and the denominator has to go
     /// — otherwise a supervisor divides by a total the numerator will overrun.
     #[test]
-    fn a_multi_pass_source_withdraws_the_byte_total() {
+    fn a_sealed_byte_total_cannot_drift() {
         let progress = RunProgress::new();
         progress.seal_bytes_total(Some(1024));
+        progress.seal_bytes_total(Some(4096));
+        progress.seal_bytes_total(None);
         assert_eq!(
             progress.sample().bytes_total,
             Some(1024),
-            "a single-pass run keeps its denominator"
-        );
-
-        let _converted =
-            clinker_format::ReopenableSource::buffer(std::io::Cursor::new(vec![0u8; 8]))
-                .expect("buffer")
-                .with_tally(progress.byte_tally())
-                .into_reopenable()
-                .expect("convert");
-
-        assert_eq!(
-            progress.sample().bytes_total,
-            None,
-            "the total is withdrawn the moment repeated delivery becomes certain"
+            "a reader that has seen the total must never see it withdrawn"
         );
     }
 
