@@ -294,6 +294,10 @@ where
     for item in input {
         let (record, source_row) = item?;
         if dropped_for_null_key(&record, sort_fields) {
+            // Counted at the drop, not after the loop: an error raised
+            // further down the stream must not take the exclusions already
+            // observed with it.
+            ctx.counters.increment_null_dropped(1);
             dropped = dropped.saturating_add(1);
             continue;
         }
@@ -321,14 +325,15 @@ where
         }
     }
 
-    ctx.counters.increment_null_dropped(dropped);
     let received = sort_count.saturating_add(dropped);
 
     let Some(buf) = buffer else {
-        // No record survived to open a buffer. Report anyway: a stream that
-        // dropped every record it saw is the case an operator most needs to
-        // see, and it is the one an early return would hide.
-        ctx.collector.record(sort_timer.finish(received, 0));
+        // Deliberately records no stage here. The document-DLQ commit path
+        // calls this once per record, so a stream whose every record drops
+        // would push one `StageMetrics` — and pay its RSS, CPU, and I/O
+        // syscalls — per dropped record, growing with input cardinality.
+        // `null_dropped_count` above already carries the loss, at a fixed
+        // cost, which is why the stage entry is not needed to see it.
         return Ok(AuthoredSortStream::InMemory(Vec::new().into_iter()));
     };
     let (sorted, residue) = buf.finish().map_err(|error| {

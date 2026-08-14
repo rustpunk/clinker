@@ -38,6 +38,12 @@ pub struct PipelineCounters {
     /// every sort that applied one. Counts records, not fields: a record
     /// whose key is null on two dropping fields is one exclusion.
     ///
+    /// Counts exclusions rather than distinct source records, so it carries
+    /// the same fan-out multiplicity as `records_written` and not the
+    /// distinct-input semantics of `ok_count`: two Outputs that each declare
+    /// a dropping sort each drop their own copy, and one source record
+    /// excluded at both counts twice.
+    ///
     /// Kept separate from `filtered_count` because the two answer
     /// different questions — a filter is an authored predicate over record
     /// content, while this is a consequence of how a sort was asked to

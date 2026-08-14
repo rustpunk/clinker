@@ -4728,6 +4728,16 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             counters.records_written,
             counters.dlq_count
         );
+        // Named only when it happened. An operator who never wrote
+        // `null_order: drop` should not have to learn what a zero here
+        // means, and one who did should not have to configure a metrics
+        // spool to find out that records left this way.
+        if counters.null_dropped_count > 0 {
+            tracing::info!(
+                "{} record(s) excluded by null_order: drop",
+                counters.null_dropped_count
+            );
+        }
     }
 
     // Per-stage actual spill volume at end-of-run, so an operator can compare

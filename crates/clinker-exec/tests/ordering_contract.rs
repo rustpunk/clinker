@@ -853,6 +853,14 @@ fn null_order_drop_is_counted_and_survives_spilling() {
 /// Before this held, `records_in == records_out` on a stage that had already
 /// discarded rows — the signature of a lossless stage, printed by one that
 /// was not.
+///
+/// This asserts only that the stage stopped under-reporting its input. It
+/// deliberately does *not* assert `records_in - records_out` equals the drop
+/// count: `StageName::Sort` is also the name the aggregate stage times under,
+/// where the same difference is a group reduction. On a fixture with no
+/// aggregate the two happen to coincide, and an assertion that reads as a
+/// contract while holding only as a fixture property is how the rule this
+/// change fixes got written in the first place.
 #[test]
 fn sort_stage_reports_the_population_it_received() {
     for mode in ["document", "envelope"] {
@@ -863,13 +871,16 @@ fn sort_stage_reports_the_population_it_received() {
             .filter(|stage| stage.name == clinker_exec::executor::stage_metrics::StageName::Sort)
             .collect();
         assert!(!sorts.is_empty(), "{mode} must record a Sort stage");
-        let dropped: u64 = sorts
-            .iter()
-            .map(|stage| stage.records_in - stage.records_out)
-            .sum();
-        assert_eq!(
-            dropped, report.counters.null_dropped_count,
-            "{mode}: summed Sort records_in - records_out must equal the drop count"
+        assert!(
+            sorts
+                .iter()
+                .any(|stage| stage.records_in > stage.records_out),
+            "{mode}: a sort that excluded records must report receiving more \
+             than it emitted, got {:?}",
+            sorts
+                .iter()
+                .map(|stage| (stage.records_in, stage.records_out))
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -908,6 +919,9 @@ fn a_sort_without_a_dropping_field_reports_no_drops() {
     .expect("undropped fixture must run");
 
     assert_eq!(report.counters.null_dropped_count, 0);
+    // Safe to read every `StageName::Sort` entry as an authored sort here only
+    // because this fixture has no aggregate node, which times under the same
+    // name and legitimately emits fewer rows than it takes.
     for stage in report
         .stages
         .iter()
