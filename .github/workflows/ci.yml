@@ -176,22 +176,20 @@ jobs:
           # lockfiles here are separate files regenerated at different times, so
           # the root can move to a new format while the fixture's lags, and any
           # parse that silently yields nothing would be read as an absence.
-          # Both fields are accepted only once they reduce to the shape they are
-          # meant to have. Stripping double quotes handles the spelling cargo
-          # emits today and nothing else — a lockfile using TOML literal strings
-          # would yield `'cc'`, which is non-empty, so it would satisfy a bare
-          # emptiness test, fail to match `cc`, and report the workspace as no
-          # longer depending on it. Rejecting the unreduced value instead makes
-          # that a parse failure, and because a spelling change is uniform across
-          # every entry, it empties the whole parse and trips the guard below
-          # rather than quietly losing one crate.
+          # Every entry either reduces to a name and a version of the shape those
+          # fields should have, or emits `!unreduced`. Nothing is dropped
+          # quietly, and that is the whole point: an entry this parser skips
+          # silently is indistinguishable downstream from a crate the lockfile
+          # does not contain, and "cc is absent" is a success here. Rejecting a
+          # malformed entry without saying so would therefore *produce* the
+          # wrong-and-green outcome rather than prevent it — a count of surviving
+          # lines only notices when every entry is lost, so a single malformed
+          # `cc` beside healthy neighbours would sail through.
           #
-          # The version is checked the same way and not only the name. Validating
-          # one and not the other would leave the emptier field able to produce a
-          # blank version, an empty `workspace_cc`, and the "cc has left the
-          # workspace" success branch — safe today only because a name check on
-          # the same file happens to fire first, which is a coupling rather than
-          # a guarantee.
+          # Stripping double quotes handles the spelling cargo emits today and
+          # nothing else. A lockfile using TOML literal strings yields `'cc'`,
+          # and a future revision could reshape either field; both land on the
+          # marker rather than on a silent skip.
           #
           # Written as if/else, which is a style choice here and not a fix. The
           # portability defect this step actually hit was narrower: `x in a` on
@@ -202,14 +200,14 @@ jobs:
           # available to the next revision that needs an array.
           lock_packages() {
             awk '/^\[\[package\]\]/ { p = 1; n = ""; next }
-                 p && /^name = / {
-                   gsub(/"/, "")
-                   if ($3 ~ /^[A-Za-z0-9_.+-]+$/) { n = $3 } else { n = "" }
-                   next
-                 }
+                 p && /^name = / { gsub(/"/, ""); n = $3; next }
                  p && /^version = / {
                    gsub(/"/, "")
-                   if (n != "" && $3 ~ /^[A-Za-z0-9_.+-]+$/) { print n, $3 }
+                   if (n ~ /^[A-Za-z0-9_.+-]+$/ && $3 ~ /^[A-Za-z0-9_.+-]+$/) {
+                     print n, $3
+                   } else {
+                     print "!unreduced"
+                   }
                    p = 0
                  }' "$1"
           }
@@ -240,6 +238,17 @@ jobs:
               echo "no packages were parsed out of the ${side%%:*} lockfile, so"
               echo "this check cannot tell an absent cc from a lockfile it does"
               echo "not understand."
+              exit 1
+            fi
+            # A count only notices total loss. One malformed entry among healthy
+            # ones would leave the count intact and the crate missing, and a
+            # missing crate is this step's success condition — so every rejection
+            # has to be fatal on its own, not merely subtracted.
+            unreduced=$(printf '%s\n' "${side#*:}" | grep -c '^!unreduced$' || true)
+            if [ "$unreduced" -ne 0 ]; then
+              echo "the ${side%%:*} lockfile contains entries this parser could"
+              echo "not reduce to a name and a version ($unreduced of them), so an"
+              echo "absent cc cannot be told apart from one it failed to read."
               exit 1
             fi
           done
