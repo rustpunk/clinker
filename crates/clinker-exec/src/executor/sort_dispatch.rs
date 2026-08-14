@@ -176,6 +176,25 @@ where
     Ok(())
 }
 
+/// Whether a record is excluded by an authored `null_order: drop` field.
+///
+/// A record qualifies when *any* dropping field's key is absent from the
+/// record or present and null — an absent column and an explicit null are
+/// the same missing key as far as ordering is concerned.
+///
+/// The buffered and streaming sorters share this rather than each spelling
+/// the test out: the two paths must exclude the same records and report the
+/// same count, and the cheapest way to guarantee that is to leave them no
+/// way to disagree.
+fn dropped_for_null_key(record: &Record, sort_fields: &[clinker_plan::config::SortField]) -> bool {
+    sort_fields.iter().any(|field| {
+        field.null_order == Some(clinker_plan::config::NullOrder::Drop)
+            && record
+                .get(&field.field)
+                .is_none_or(clinker_record::Value::is_null)
+    })
+}
+
 /// Apply the shared stable authored-key sort to a materialized record stream.
 ///
 /// `SourceRowId` remains payload throughout resident sorting and spill merge;
@@ -190,15 +209,18 @@ pub(super) fn sort_records_by_authored_fields(
 ) -> Result<Vec<(Record, crate::executor::stream_event::SourceRowId)>, PipelineError> {
     use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 
-    input_records.retain(|(record, _)| {
-        !sort_fields.iter().any(|field| {
-            field.null_order == Some(clinker_plan::config::NullOrder::Drop)
-                && record
-                    .get(&field.field)
-                    .is_none_or(clinker_record::Value::is_null)
-        })
-    });
+    // Opened before the null-key filter so the stage's elapsed time covers
+    // the work that removes records, and `records_in` is the population the
+    // stage was handed rather than what survived it.
+    let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
+    let received = input_records.len() as u64;
+    input_records.retain(|(record, _)| !dropped_for_null_key(record, sort_fields));
+    ctx.counters
+        .increment_null_dropped(received - input_records.len() as u64);
     if input_records.is_empty() {
+        // Report even here. Returning without recording would hide the drop
+        // on exactly the run that dropped everything.
+        ctx.collector.record(sort_timer.finish(received, 0));
         return Ok(input_records);
     }
     let schema = input_records[0].0.schema().clone();
@@ -214,7 +236,6 @@ pub(super) fn sort_records_by_authored_fields(
         schema,
     );
 
-    let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
     let sort_count = input_records.len() as u64;
     let charge = crate::pipeline::spill_merge::SpillChargeGuard::new(
         std::sync::Arc::clone(&ctx.memory_budget),
@@ -238,7 +259,7 @@ pub(super) fn sort_records_by_authored_fields(
         )?,
     };
     ctx.collector
-        .record(sort_timer.finish(sort_count, sort_count));
+        .record(sort_timer.finish(received, sort_count));
     Ok(out)
 }
 
@@ -266,17 +287,18 @@ where
     let mut buffer: Option<SortBuffer<crate::executor::stream_event::SourceRowId>> = None;
     let mut spill_compress = false;
     let mut sort_count = 0u64;
+    let mut dropped = 0u64;
     let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
     let charge = SpillChargeGuard::new(std::sync::Arc::clone(&ctx.memory_budget), node_name);
 
     for item in input {
         let (record, source_row) = item?;
-        if sort_fields.iter().any(|field| {
-            field.null_order == Some(clinker_plan::config::NullOrder::Drop)
-                && record
-                    .get(&field.field)
-                    .is_none_or(clinker_record::Value::is_null)
-        }) {
+        if dropped_for_null_key(&record, sort_fields) {
+            // Counted at the drop, not after the loop: an error raised
+            // further down the stream must not take the exclusions already
+            // observed with it.
+            ctx.counters.increment_null_dropped(1);
+            dropped = dropped.saturating_add(1);
             continue;
         }
         let buf = buffer.get_or_insert_with(|| {
@@ -303,7 +325,15 @@ where
         }
     }
 
+    let received = sort_count.saturating_add(dropped);
+
     let Some(buf) = buffer else {
+        // Deliberately records no stage here. The document-DLQ commit path
+        // calls this once per record, so a stream whose every record drops
+        // would push one `StageMetrics` — and pay its RSS, CPU, and I/O
+        // syscalls — per dropped record, growing with input cardinality.
+        // `null_dropped_count` above already carries the loss, at a fixed
+        // cost, which is why the stage entry is not needed to see it.
         return Ok(AuthoredSortStream::InMemory(Vec::new().into_iter()));
     };
     let (sorted, residue) = buf.finish().map_err(|error| {
@@ -313,7 +343,7 @@ where
     })?;
     charge_enforcer_spill(&charge, node_name, residue)?;
     ctx.collector
-        .record(sort_timer.finish(sort_count, sort_count));
+        .record(sort_timer.finish(received, sort_count));
 
     match sorted {
         SortedOutput::InMemory(records) => Ok(AuthoredSortStream::InMemory(records.into_iter())),

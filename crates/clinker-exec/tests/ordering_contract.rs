@@ -784,6 +784,156 @@ fn run_compound_boundary(memory_limit: &str, mode: &str) -> String {
     output.as_string()
 }
 
+/// Run the compound boundary fixture and keep the report, not just the bytes.
+fn run_compound_boundary_reported(
+    memory_limit: &str,
+    mode: &str,
+) -> clinker_exec::executor::ExecutionReport {
+    let plan = compile(&compound_sort_yaml(memory_limit, mode));
+    let readers: SourceReaders = HashMap::from([(
+        "rows".to_string(),
+        SourceInput::Files(vec![
+            FileSlot::new(
+                PathBuf::from(format!("{mode}-one.csv")),
+                Box::new(Cursor::new(compound_boundary_csv().as_bytes().to_vec())),
+            ),
+            FileSlot::new(
+                PathBuf::from(format!("{mode}-two.csv")),
+                Box::new(Cursor::new(
+                    compound_boundary_second_csv().as_bytes().to_vec(),
+                )),
+            ),
+        ]),
+    )]);
+    let output = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(output.clone()) as Box<dyn Write + Send>,
+    )]);
+
+    PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        writers,
+        &PipelineRunParams::default(),
+    )
+    .unwrap_or_else(|error| panic!("{mode} writer-boundary fixture failed: {error}"))
+}
+
+/// A record excluded by `null_order: drop` is counted, and the count is the
+/// same whether the sort stayed resident or spilled.
+///
+/// The fixture drops exactly two rows — one with an empty `key`, one with an
+/// empty `group` — so a count that tracked dropping *fields* rather than
+/// dropped *records* would still read two here; the compound fixture below
+/// separates those.
+#[test]
+fn null_order_drop_is_counted_and_survives_spilling() {
+    for mode in ["document", "envelope"] {
+        for limit in ["64M", "2400"] {
+            let report = run_compound_boundary_reported(limit, mode);
+            assert_eq!(
+                report.counters.null_dropped_count, 2,
+                "{mode} at limit {limit} must count both null-keyed rows"
+            );
+            assert_eq!(
+                report.counters.filtered_count, 0,
+                "{mode} at limit {limit} must not report the drop as a filter"
+            );
+            assert_eq!(
+                report.counters.dlq_count, 0,
+                "{mode} at limit {limit} must not report the drop as a DLQ entry"
+            );
+        }
+    }
+}
+
+/// The Sort stage reports the population it was handed, not the survivors.
+///
+/// Before this held, `records_in == records_out` on a stage that had already
+/// discarded rows — the signature of a lossless stage, printed by one that
+/// was not.
+///
+/// This asserts only that the stage stopped under-reporting its input. It
+/// deliberately does *not* assert `records_in - records_out` equals the drop
+/// count: `StageName::Sort` is also the name the aggregate stage times under,
+/// where the same difference is a group reduction. On a fixture with no
+/// aggregate the two happen to coincide, and an assertion that reads as a
+/// contract while holding only as a fixture property is how the rule this
+/// change fixes got written in the first place.
+#[test]
+fn sort_stage_reports_the_population_it_received() {
+    for mode in ["document", "envelope"] {
+        let report = run_compound_boundary_reported("64M", mode);
+        let sorts: Vec<_> = report
+            .stages
+            .iter()
+            .filter(|stage| stage.name == clinker_exec::executor::stage_metrics::StageName::Sort)
+            .collect();
+        assert!(!sorts.is_empty(), "{mode} must record a Sort stage");
+        assert!(
+            sorts
+                .iter()
+                .any(|stage| stage.records_in > stage.records_out),
+            "{mode}: a sort that excluded records must report receiving more \
+             than it emitted, got {:?}",
+            sorts
+                .iter()
+                .map(|stage| (stage.records_in, stage.records_out))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A pipeline with no dropping field reports zero, so a non-zero count is
+/// always attributable to an authored `null_order: drop`.
+#[test]
+fn a_sort_without_a_dropping_field_reports_no_drops() {
+    let plan = compile(&output_pipeline("64M", 4, true));
+    let readers: SourceReaders = HashMap::from([(
+        "rows".to_string(),
+        single_file_reader(
+            "rows.csv",
+            Box::new(Cursor::new(equal_key_csv().into_bytes())),
+        ),
+    )]);
+    let out_a = SharedBuffer::new();
+    let out_b = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([
+        (
+            "out_a".to_string(),
+            Box::new(out_a.clone()) as Box<dyn Write + Send>,
+        ),
+        (
+            "out_b".to_string(),
+            Box::new(out_b.clone()) as Box<dyn Write + Send>,
+        ),
+    ]);
+
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        writers,
+        &PipelineRunParams::default(),
+    )
+    .expect("undropped fixture must run");
+
+    assert_eq!(report.counters.null_dropped_count, 0);
+    // Safe to read every `StageName::Sort` entry as an authored sort here only
+    // because this fixture has no aggregate node, which times under the same
+    // name and legitimately emits fewer rows than it takes.
+    for stage in report
+        .stages
+        .iter()
+        .filter(|stage| stage.name == clinker_exec::executor::stage_metrics::StageName::Sort)
+    {
+        assert_eq!(
+            stage.records_in, stage.records_out,
+            "a sort that drops nothing must report equal in and out"
+        );
+    }
+}
+
 #[test]
 fn writer_boundary_document_streaming_complete_populations() {
     assert_eq!(

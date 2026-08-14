@@ -556,6 +556,34 @@ Sort records before writing:
 - `last` -- nulls sort after all non-null values.
 - `drop` -- records with null sort keys are excluded from output.
 
+`drop` removes records, so a run using it writes fewer records than it read
+and that is not a fault. A missing column counts as a null key: a record that
+never carried the sort field is dropped the same as one carrying an explicit
+null. With several dropping fields, a record is excluded if *any* of its keys
+is null, and counts once however many of them are.
+
+The excluded records are counted, separately from `records_dlq` and from
+filter losses, so a short output can be attributed rather than guessed at. A
+run that dropped any reports the number on completion:
+
+```
+1234 record(s) excluded by null_order: drop
+```
+
+and the same number is written as `records_null_dropped` in the metrics spool
+when one is configured (see [Metrics](../ops/metrics.md)).
+
+Under fan-out the count is per exclusion, not per source record: two Outputs
+that each declare a dropping `sort_order` each drop their own copy, so one
+source record excluded at both counts twice — the same multiplicity
+`records_written` carries. Subtracting this from `records_total` is therefore
+only sound on a pipeline with a single dropping Output.
+
+Nothing else records these records. Unlike a DLQ entry, a dropped record
+leaves no artifact to inspect afterwards -- if you need to see which records
+were removed rather than only how many, route them out with a filter before
+the sort instead of declaring `drop`.
+
 Shorthand: a bare string defaults to ascending with nulls last:
 
 ```yaml
