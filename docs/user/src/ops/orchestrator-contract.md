@@ -219,9 +219,11 @@ a phase.
 ### The counts
 
 `records_read` is the number of source records read so far, across every
-source. It never decreases within a run, and it reaches the same figure the
-terminal reports as the run's total record count. **It has no companion
-total, and no total will be added.** A source is read as a stream, so its
+source. It never decreases within a run, and the last one a run emits is the
+number of records that run read. **It has no companion total, and no total
+will be added.** The terminal carries no record count of its own: a progress
+record is the only place this stream reports one, so there is nothing to
+reconcile it against and no disagreement to arbitrate. A source is read as a stream, so its
 record count is not established until its last record has been read: any
 "records remaining" Clinker could publish mid-run would be a guess presented
 as a measurement. A supervisor answers *is this run moving* by comparing

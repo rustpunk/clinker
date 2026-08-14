@@ -6,9 +6,12 @@
 //! into the bounded [`ProgressSnapshot`] records the machine stream carries.
 //!
 //! Counters are published, never pushed: the executor calls no reporter, so a
-//! new rendering costs a reader and nothing on the hot path. Every denominator
-//! question routes through [`denominator`], so no two renderings can disagree
-//! about whether a total is known.
+//! new rendering costs a reader and nothing on the hot path.
+//!
+//! Nothing here derives a ratio, and no consumer is handed one. A count and a
+//! total travel as two plain numbers, so a renderer that wants a fraction
+//! decides for itself what an absent total means rather than inheriting a
+//! judgement made here.
 //!
 //! Record counts carry no denominator. A streaming source cannot bound its own
 //! cardinality without reading it to the end, so the run has no honest record
@@ -117,20 +120,6 @@ pub struct ProgressSample {
     pub records_read: u64,
     pub files_done: u64,
     pub files_total: Option<u64>,
-}
-
-/// The single place a denominator is judged usable.
-///
-/// Returns `None` when no total is established, when the total is zero, and
-/// when `done` has passed it — a total the run has already overrun describes
-/// the run no better than no total does, and reporting past 100% is worse than
-/// reporting nothing. Every rendering routes through this, so none of them can
-/// claim a ratio another would refuse.
-pub fn denominator(done: u64, total: Option<u64>) -> Option<(u64, u64)> {
-    match total {
-        Some(total) if total > 0 && done <= total => Some((done, total)),
-        _ => None,
-    }
 }
 
 /// Whether a machine progress record marks a lifecycle edge or an advisory
@@ -347,23 +336,6 @@ mod tests {
         progress.seal_files_total(Some(4));
         progress.seal_files_total(Some(9));
         assert_eq!(progress.sample().files_total, Some(4));
-    }
-
-    #[test]
-    fn denominator_refuses_every_total_it_cannot_stand_behind() {
-        assert_eq!(denominator(5, Some(10)), Some((5, 10)));
-        assert_eq!(denominator(10, Some(10)), Some((10, 10)));
-        assert_eq!(denominator(5, None), None, "no total established");
-        assert_eq!(
-            denominator(0, Some(0)),
-            None,
-            "a zero total divides nothing"
-        );
-        assert_eq!(
-            denominator(11, Some(10)),
-            None,
-            "a total the run overran describes it no better than none"
-        );
     }
 
     #[test]

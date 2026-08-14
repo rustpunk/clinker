@@ -222,6 +222,15 @@ where
         // `release_source_consumer` at drain end clears the flag and resumes.
         ctx.activate_source_for_drain(name.as_str());
         loop {
+            // About to wait on an empty channel: publish the staged tail
+            // first. A source that trickles never reaches the 1024-record
+            // boundary below, and a count frozen at zero while the run is
+            // merely slow is the reading a supervisor must not be given.
+            // Costs nothing while records are flowing, because the channel
+            // is not empty then.
+            if rx.is_empty() {
+                crate::executor::dispatch::publish_record_progress(ctx);
+            }
             let item: Option<crate::executor::source_stream::SourceStreamEvent> = match timeout {
                 Some(t) => match rx.recv_timeout(t) {
                     Ok(item) => Some(item),
@@ -233,11 +242,6 @@ where
                         // idles via `observe`. Idempotent on
                         // repeat timeouts.
                         ctx.watermarks.mark_idle(name.as_str(), &last_file);
-                        // A source this quiet will not reach the 1024-record
-                        // boundary soon, and a count that stops moving while
-                        // the run is merely slow reads as a stall. Publishing
-                        // here costs one atomic per idle period.
-                        crate::executor::dispatch::publish_record_progress(ctx);
                         continue;
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
@@ -261,7 +265,6 @@ where
                     records_since_check += 1;
                     if records_since_check >= 1024 {
                         records_since_check = 0;
-                        crate::executor::dispatch::publish_record_progress(ctx);
                         ctx.check_shutdown()?;
                     }
                     drained.push((rec, rn));
@@ -271,7 +274,6 @@ where
                     records_since_check += 1;
                     if records_since_check >= 1024 {
                         records_since_check = 0;
-                        crate::executor::dispatch::publish_record_progress(ctx);
                         ctx.check_shutdown()?;
                     }
                 }

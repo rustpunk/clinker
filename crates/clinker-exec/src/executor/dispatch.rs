@@ -300,6 +300,14 @@ pub(crate) enum ConsumedSourceEvent {
     Population,
 }
 
+/// Rows staged before the shared write path publishes them itself.
+///
+/// Matches the cadence the drain loops already poll shutdown at. Publishing
+/// from inside the write path rather than at each loop's boundary is what
+/// keeps a drain loop added later from silently reporting a frozen count:
+/// there is one place to forget, and it is the place that cannot be skipped.
+const RECORDS_PER_PUBLISH: u64 = 1024;
+
 /// Advance every ingest population by `delta` rows attributed to `source`.
 ///
 /// The one write path for both readings of "records ingested so far": the
@@ -317,6 +325,9 @@ fn advance_source_population(ctx: &mut ExecutorContext<'_>, source: &Arc<str>, d
         *slot = slot.saturating_add(delta);
     }
     ctx.records_pending_publish = ctx.records_pending_publish.saturating_add(delta);
+    if ctx.records_pending_publish >= RECORDS_PER_PUBLISH {
+        publish_record_progress(ctx);
+    }
 }
 
 /// Publish the rows staged since the last flush to the run's progress handle.
@@ -341,7 +352,7 @@ pub(crate) fn record_type_error(
     ctx: &mut ExecutorContext<'_>,
     event: &crate::executor::dlq::TypeErrorEvent,
 ) {
-    advance_source_population(ctx, &Arc::clone(&event.source_name), 1);
+    advance_source_population(ctx, &event.source_name, 1);
     ctx.type_error_population.rejected = ctx.type_error_population.rejected.saturating_add(1);
 }
 
@@ -3631,7 +3642,18 @@ pub(crate) fn merge_fused_interleave(
             // Every source closed.
             break;
         }
-        let oper = sel.select();
+        // Publish the staged tail before blocking. This loop has no
+        // record-count boundary of its own, so without this a fused
+        // interleave over several sources would report a frozen count for
+        // its whole run and jump only as each source closed — the stalled
+        // reading this counter exists to rule out.
+        let oper = match sel.try_select() {
+            Ok(ready) => ready,
+            Err(_) => {
+                publish_record_progress(ctx);
+                sel.select()
+            }
+        };
         let op_index = oper.index();
         let i = op_to_pred[op_index];
         // Complete the chosen operation on its receiver. `Ok` is a
@@ -4075,7 +4097,6 @@ pub(crate) fn transform_fused_consume(
                     records_since_check += 1;
                     if records_since_check >= 1024 {
                         records_since_check = 0;
-                        publish_record_progress(ctx);
                         ctx.check_shutdown()?;
                     }
                     continue;
@@ -4102,7 +4123,6 @@ pub(crate) fn transform_fused_consume(
             records_since_check += 1;
             if records_since_check >= 1024 {
                 records_since_check = 0;
-                publish_record_progress(ctx);
                 ctx.check_shutdown()?;
             }
 
