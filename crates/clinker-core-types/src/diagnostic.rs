@@ -156,6 +156,7 @@ diagnostic_registry! {
     "E220", Error, "`rest` transport declares a non-`json`/`xml` decode format";
     "E221", Error, "REST source read failure (HTTP request / body-read error)";
     "E222", Error, "An envelope section declares a `json_pointer` that is not a valid RFC 6901 pointer";
+    "E223", Error, "`rest` transport declared, but this build has the `rest` capability compiled out";
     // ── Channel `sources:` patches ──────────────────────────────────────
     "E230", Error, "Channel source patch key is malformed, unaddressable, or targets a source no node declares";
     "E231", Error, "Channel schema patch names a column the source does not declare";

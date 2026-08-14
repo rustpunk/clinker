@@ -1,4 +1,5 @@
 //! Fail-closed continuation and redirect security contracts for REST sources.
+#![cfg(feature = "transport")]
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};

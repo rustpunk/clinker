@@ -4,6 +4,8 @@
 //! dispatch path. Confirms record counts and `$source.*` provenance
 //! resolving to the stable `<source:NAME>` synthetic id.
 
+#![cfg(feature = "transport")]
+
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};

@@ -148,7 +148,14 @@ cargo install --path crates/cxl-cli
 cargo test --workspace
 ```
 
-There are no C build dependencies.
+There are no C build dependencies: no crate in the graph runs a C compiler, and
+CI proves it by building the workspace with `CC` and friends pointed at a
+program that fails. TLS runs on rustls with the pure-Rust [graviola] provider,
+so the `rest` source and the OTLP exporter cost nothing at build time —
+graviola supports `x86_64` and `aarch64`, which is where Clinker is built and
+tested.
+
+[graviola]: https://github.com/ctz/graviola/
 
 ## Repository layout
 

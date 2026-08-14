@@ -56,6 +56,59 @@ jobs:
           cargo run --manifest-path tools/dependency-policy/Cargo.toml
           --locked --offline -- --scope final --root .
 
+  # Two things nothing else checks, because everything else builds the default
+  # binary on a runner that happens to have a C compiler.
+  #
+  # The first is the pure-Rust pillar. `cargo build` succeeding proves nothing
+  # about it here: a `cc`-invoking build script would simply find the compiler
+  # and work. Pointing every variable a build script consults at a program that
+  # fails is what makes the claim testable — a dependency that starts needing a
+  # toolchain fails this job instead of failing whoever first builds without one.
+  #
+  # The second is the capability features. Each is gated at the call sites of
+  # one subsystem, and a `#[cfg]` that stops matching produces code that builds
+  # in whichever combination someone happens to compile and not in the others.
+  build-portability:
+    name: Build portability
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.91"
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # Both the default binary, which links TLS, and the one with no network
+      # capability at all. The first is the claim that matters; the second
+      # confirms the smaller graph did not acquire one either.
+      - name: Build with no working C compiler
+        env:
+          CC: /bin/false
+          CXX: /bin/false
+          AR: /bin/false
+          CC_x86_64_unknown_linux_gnu: /bin/false
+          CXX_x86_64_unknown_linux_gnu: /bin/false
+          AR_x86_64_unknown_linux_gnu: /bin/false
+        run: |
+          cargo build --locked -p clinker
+          cargo build --locked -p clinker --no-default-features
+
+      - name: Refuse a ring edge in any resolution
+        run: |
+          if cargo tree --workspace --all-features --invert ring 2>/dev/null | grep -q ring; then
+            echo "ring is back in the dependency graph; it builds C through cc"
+            exit 1
+          fi
+
+      - name: Build every capability-feature combination
+        run: bash scripts/check-feature-combinations.sh
+
   release-policy:
     name: Release policy
     runs-on: ubuntu-24.04
@@ -215,10 +268,12 @@ jobs:
   # Type-check the non-Linux targets from the ubuntu host. `--all-targets`
   # so test and bench targets compile too — a #[cfg(windows)] /
   # #[cfg(target_os = "macos")] branch that fails to build now fails CI
-  # here, not only when a native runner reaches it. Scoped to the crates
-  # that cross-compile without a C toolchain; clinker-net and clinker pull
-  # in `ring`, whose build script needs a cross-linker the ubuntu host
-  # lacks, so their non-Linux coverage comes from the native runners above.
+  # here, not only when a native runner reaches it.
+  #
+  # This covers the whole workspace. It used to exclude clinker-net and
+  # clinker, whose TLS stack reached `ring`, whose build script needs a cross
+  # C toolchain the ubuntu host does not have; with the provider now graviola,
+  # which has no build script at all, both cross-check like everything else.
   cross-platform:
     runs-on: ubuntu-latest
     permissions:
@@ -239,10 +294,12 @@ jobs:
           cargo check --all-targets --target x86_64-pc-windows-msvc
           -p clinker-exec -p clinker-plan -p clinker-schema
           -p clinker-channel -p cxl-cli -p clinker-lineage
+          -p clinker-net -p clinker
       - run: >-
           cargo check --all-targets --target aarch64-apple-darwin
           -p clinker-exec -p clinker-plan -p clinker-schema
           -p clinker-channel -p cxl-cli -p clinker-lineage
+          -p clinker-net -p clinker
 
   # Positive remote-publication evidence is limited to these disposable,
   # self-provisioned Linux loopback profiles. A missing package, mount,

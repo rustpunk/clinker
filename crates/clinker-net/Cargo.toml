@@ -14,7 +14,18 @@ clinker-record = { workspace = true }
 serde_json = { workspace = true }
 indexmap = { workspace = true }
 tracing = { workspace = true }
-ureq = { workspace = true }
+http = { workspace = true }
+ureq = { workspace = true, optional = true }
+rustls-graviola = { workspace = true, optional = true }
+
+[features]
+default = []
+# The HTTP transports themselves — the `rest` reader's request loop and the
+# OTLP exporter's send/retry loop. Endpoint admission, continuation parsing
+# and redirect policy are URI and header analysis and stay compiled either
+# way, so a build without this feature still holds the rules that decide what
+# a transport is allowed to reach.
+transport = ["dep:ureq", "dep:rustls-graviola"]
 
 [dev-dependencies]
 clinker-exec = { workspace = true, features = ["test-utils"] }

@@ -562,6 +562,9 @@ impl MachineEmitter {
     /// artifacts, every state count zero, and no cleanup debt is the same
     /// statement in the vocabulary the reconciliation table already defines:
     /// nothing was published, and that is the whole of it.
+    // The only run that publishes nothing and still succeeds is the plan-only
+    // lineage export, so this row has no other caller.
+    #[cfg(feature = "lineage")]
     pub(crate) fn emit_completed_without_attempt(&self) -> io::Result<TerminalOutcome> {
         self.with_state(|state| {
             let fields = serde_json::Map::from_iter([

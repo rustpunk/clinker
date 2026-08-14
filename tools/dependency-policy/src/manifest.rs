@@ -28,18 +28,27 @@ const INTERNAL_CRATES: [&str; 15] = [
     "cxl-cli",
 ];
 const CORE_DEPENDENCIES: [&str; 3] = ["miette", "petgraph", "serde-saphyr"];
-const NETWORK_DEPENDENCIES: [&str; 9] = [
+const NETWORK_DEPENDENCIES: [&str; 11] = [
     "clinker-core-types",
     "clinker-exec",
     "clinker-format",
     "clinker-plan",
     "clinker-record",
+    "http",
     "indexmap",
+    "rustls-graviola",
     "serde_json",
     "tracing",
     "ureq",
 ];
 const NETWORK_DEV_DEPENDENCIES: [&str; 2] = ["clinker-bench-support", "clinker-exec"];
+/// The `clinker-net` edges the `transport` feature switches on.
+///
+/// These two are the HTTP client and the TLS provider it runs over: the whole
+/// of what a build without the transport does not compile. Everything else in
+/// `NETWORK_DEPENDENCIES` is needed either way, which is what keeps endpoint
+/// admission compiled in a binary that cannot make a request.
+const NETWORK_OPTIONAL_DEPENDENCIES: [&str; 2] = ["rustls-graviola", "ureq"];
 const LINEAGE_DEPENDENCIES: [&str; 7] = [
     "clinker-core-types",
     "clinker-plan",
@@ -49,16 +58,26 @@ const LINEAGE_DEPENDENCIES: [&str; 7] = [
     "serde",
     "serde_json",
 ];
-const NETWORK_METADATA_DEPENDENCIES: [ExpectedMetadataDependency; 11] = [
+const NETWORK_METADATA_DEPENDENCIES: [ExpectedMetadataDependency; 13] = [
     ExpectedMetadataDependency::normal("clinker-core-types", &[], true),
     ExpectedMetadataDependency::normal("clinker-exec", &[], true),
     ExpectedMetadataDependency::normal("clinker-format", &[], true),
     ExpectedMetadataDependency::normal("clinker-plan", &[], true),
     ExpectedMetadataDependency::normal("clinker-record", &[], true),
+    ExpectedMetadataDependency::normal("http", &[], true),
     ExpectedMetadataDependency::normal("indexmap", &["serde"], true),
+    ExpectedMetadataDependency::optional("rustls-graviola", &[], true),
     ExpectedMetadataDependency::normal("serde_json", &["preserve_order"], true),
     ExpectedMetadataDependency::normal("tracing", &[], true),
-    ExpectedMetadataDependency::normal("ureq", &["rustls"], false),
+    // Not `rustls`: that feature is `rustls-no-provider` plus ring plus the
+    // webpki roots, and ring is the C-toolchain build dependency this
+    // workspace does not take. The two halves named here are the same TLS
+    // stack with the provider left for `clinker-net` to set to graviola.
+    ExpectedMetadataDependency::optional(
+        "ureq",
+        &["rustls-no-provider", "rustls-webpki-roots"],
+        false,
+    ),
     ExpectedMetadataDependency::development("clinker-bench-support", &[]),
     ExpectedMetadataDependency::development("clinker-exec", &["test-utils"]),
 ];
@@ -85,9 +104,9 @@ const LINEAGE_METADATA_DEPENDENCIES: [ExpectedMetadataDependency; 7] = [
 /// approved, never to make a red gate green. The values are whatever
 /// [`check_lock_membership`] computes for the approved `Cargo.lock`, which is
 /// what its own failure reports as `found`.
-const LOCK_PACKAGE_COUNT: usize = 308;
+const LOCK_PACKAGE_COUNT: usize = 310;
 pub const LOCK_PACKAGE_DIGEST: &str =
-    "a6a8aa1a76d44e16dc67e954ec61581fa06d276e1fcf9e0fc6829bddad4666c2";
+    "1c954228bea00199c368598d7d952fe2ad3f122234fc8342f36693641beff2c8";
 
 #[derive(Clone, Copy)]
 struct ExpectedMetadataDependency {
@@ -95,6 +114,11 @@ struct ExpectedMetadataDependency {
     kind: Option<&'static str>,
     features: &'static [&'static str],
     uses_default_features: bool,
+    /// Whether a feature decides that this edge exists at all.
+    ///
+    /// Recorded per edge rather than inferred, so an edge that becomes
+    /// optional without anyone deciding it should still fails the gate.
+    optional: bool,
 }
 
 impl ExpectedMetadataDependency {
@@ -108,6 +132,22 @@ impl ExpectedMetadataDependency {
             kind: None,
             features,
             uses_default_features,
+            optional: false,
+        }
+    }
+
+    /// A normal edge that a feature switches on.
+    const fn optional(
+        name: &'static str,
+        features: &'static [&'static str],
+        uses_default_features: bool,
+    ) -> Self {
+        Self {
+            name,
+            kind: None,
+            features,
+            uses_default_features,
+            optional: true,
         }
     }
 
@@ -117,6 +157,7 @@ impl ExpectedMetadataDependency {
             kind: Some("dev"),
             features,
             uses_default_features: true,
+            optional: false,
         }
     }
 }
@@ -133,7 +174,7 @@ pub(crate) fn check_core(root: &Path) -> BoundaryResult<()> {
     }
     require_exact_dependencies(CORE_CRATE, &manifest, "dependencies", &CORE_DEPENDENCIES)?;
     require_exact_dependencies(CORE_CRATE, &manifest, "dev-dependencies", &[])?;
-    require_exact_workspace_declarations(CORE_CRATE, &manifest, "dependencies", None)?;
+    require_exact_workspace_declarations(CORE_CRATE, &manifest, "dependencies", None, &[])?;
     Ok(())
 }
 
@@ -155,12 +196,19 @@ pub(crate) fn check_consumer(root: &Path, crate_name: &str) -> BoundaryResult<()
                 "dev-dependencies",
                 &NETWORK_DEV_DEPENDENCIES,
             )?;
-            require_exact_workspace_declarations(crate_name, &manifest, "dependencies", None)?;
+            require_exact_workspace_declarations(
+                crate_name,
+                &manifest,
+                "dependencies",
+                None,
+                &NETWORK_OPTIONAL_DEPENDENCIES,
+            )?;
             require_exact_workspace_declarations(
                 crate_name,
                 &manifest,
                 "dev-dependencies",
                 Some(("clinker-exec", &["test-utils"])),
+                &[],
             )
         }
         "clinker-lineage" => {
@@ -171,7 +219,7 @@ pub(crate) fn check_consumer(root: &Path, crate_name: &str) -> BoundaryResult<()
                 &LINEAGE_DEPENDENCIES,
             )?;
             require_exact_dependencies(crate_name, &manifest, "dev-dependencies", &[])?;
-            require_exact_workspace_declarations(crate_name, &manifest, "dependencies", None)
+            require_exact_workspace_declarations(crate_name, &manifest, "dependencies", None, &[])
         }
         _ => Err(BoundaryError::new(format!(
             "unsupported dependency policy consumer {crate_name}"
@@ -184,6 +232,7 @@ fn require_exact_workspace_declarations(
     manifest: &TomlValue,
     section: &str,
     featureful: Option<(&str, &[&str])>,
+    optional: &[&str],
 ) -> BoundaryResult<()> {
     let Some(dependencies) = table(manifest, section)? else {
         return Ok(());
@@ -194,6 +243,25 @@ fn require_exact_workspace_declarations(
                 "{crate_name} [{section}] {dependency} must be an inherited workspace dependency"
             ))
         })?;
+        // `optional = true` is the one key beyond the inherited declaration a
+        // crate may add without re-specifying anything: it says a feature
+        // decides whether the edge exists, not what version or features it
+        // resolves to. Which dependencies may carry it is enumerated by the
+        // caller rather than left open, so an edge that quietly becomes
+        // optional still fails here.
+        let mut allowance = 1;
+        if optional.contains(&dependency.as_str()) {
+            if declaration.get("optional") != Some(&TomlValue::Boolean(true)) {
+                return Err(BoundaryError::new(format!(
+                    "{crate_name} [{section}] {dependency} is approved as optional and must declare `optional = true`"
+                )));
+            }
+            allowance += 1;
+        } else if declaration.contains_key("optional") {
+            return Err(BoundaryError::new(format!(
+                "{crate_name} [{section}] {dependency} must not be optional under dependency policy"
+            )));
+        }
         let exact = match featureful {
             Some((featureful_dependency, expected_features))
                 if dependency == featureful_dependency =>
@@ -202,12 +270,12 @@ fn require_exact_workspace_declarations(
                     .get("features")
                     .and_then(TomlValue::as_array)
                     .map(|features| features.iter().filter_map(TomlValue::as_str).collect());
-                declaration.len() == 2
+                declaration.len() == allowance + 1
                     && declaration.get("workspace") == Some(&TomlValue::Boolean(true))
                     && actual_features.as_deref() == Some(expected_features)
             }
             _ => {
-                declaration.len() == 1
+                declaration.len() == allowance
                     && declaration.get("workspace") == Some(&TomlValue::Boolean(true))
             }
         };
@@ -261,6 +329,19 @@ fn require_exact_dependencies(
     Ok(())
 }
 
+/// The feature table each policed crate is approved to carry, by name.
+///
+/// A crate absent from here may carry none at all, which is what every one of
+/// them carried when this gate was written. Listing a feature is the recorded
+/// act of approving it, exactly as the lockfile pair above is: the gate still
+/// refuses one nobody has looked at, and now says which one rather than
+/// refusing the whole table.
+///
+/// The values are the feature names only. What each one switches on is
+/// enumerated in the crate's own manifest, beside the dependencies it gates,
+/// which is the one place that cannot drift from what Cargo actually resolves.
+const APPROVED_FEATURES: [(&str, &[&str]); 1] = [("clinker-net", &["default", "transport"])];
+
 fn reject_build_or_feature_expansion(
     root: &Path,
     crate_name: &str,
@@ -288,9 +369,18 @@ fn reject_build_or_feature_expansion(
             "{crate_name} must not add a build script under dependency policy"
         )));
     }
-    if manifest.get("features").is_some() {
+    let approved: BTreeSet<String> = APPROVED_FEATURES
+        .iter()
+        .find(|(name, _)| *name == crate_name)
+        .map(|(_, features)| features.iter().map(|f| (*f).to_owned()).collect())
+        .unwrap_or_default();
+    let declared: BTreeSet<String> = table(manifest, "features")?
+        .into_iter()
+        .flat_map(|table| table.keys().cloned())
+        .collect();
+    if declared != approved {
         return Err(BoundaryError::new(format!(
-            "{crate_name} must not add or expand a feature table under dependency policy"
+            "{crate_name} [features] must contain exactly the preapproved features; expected={approved:?}, actual={declared:?}"
         )));
     }
     if !dependency_keys(manifest, "build-dependencies")?.is_empty() {
@@ -485,7 +575,7 @@ fn check_exact_metadata_dependencies(
             .collect();
         let expected_features: BTreeSet<&str> = expected_edge.features.iter().copied().collect();
         let unrenamed = edge.get("rename").is_none_or(JsonValue::is_null);
-        let required = !edge
+        let optional = edge
             .get("optional")
             .and_then(JsonValue::as_bool)
             .unwrap_or(false);
@@ -496,7 +586,7 @@ fn check_exact_metadata_dependencies(
         let untargeted = edge.get("target").is_none_or(JsonValue::is_null);
         if actual_features != expected_features
             || !unrenamed
-            || !required
+            || optional != expected_edge.optional
             || uses_default != expected_edge.uses_default_features
             || !untargeted
         {

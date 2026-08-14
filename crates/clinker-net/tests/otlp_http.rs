@@ -1,4 +1,5 @@
 //! OTLP/HTTP transport contract tests.
+#![cfg(feature = "transport")]
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -15,6 +16,12 @@ use ureq::http::header::{AUTHORIZATION, HeaderName, HeaderValue};
 #[path = "../src/otlp.rs"]
 #[allow(dead_code)]
 mod otlp_under_test;
+
+// The delivery half builds its agent through this, and reaches it by an
+// absolute path so that the one definition of the crypto provider serves both
+// the crate and this include of it.
+#[path = "../src/tls.rs"]
+mod tls;
 
 use otlp_under_test::{
     OtlpAuthentication, OtlpCredentialApplicationError, OtlpCredentialApplicator,

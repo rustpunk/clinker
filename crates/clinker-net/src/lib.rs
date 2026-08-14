@@ -21,21 +21,28 @@
 
 mod otlp;
 mod rest;
+#[cfg(feature = "transport")]
+mod tls;
 
+#[cfg(feature = "transport")]
 use clinker_format::FormatError;
 
+#[cfg(feature = "transport")]
 use rest::RestRecordSource;
 
+#[cfg(feature = "transport")]
+pub use otlp::send_otlp_json;
 pub use otlp::{
     AdmittedOtlpEndpoint, OtlpAuthentication, OtlpCredentialApplicationError,
     OtlpCredentialApplicator, OtlpCredentialRequest, OtlpDeliveryBounds, OtlpDeliveryBudget,
     OtlpDeliveryBudgetError, OtlpDeliveryFailure, OtlpDeliveryFailureKind, OtlpDeliveryOutcome,
-    OtlpEndpointAdmissionError, OtlpRetryCause, OtlpSignal, admit_otlp_endpoint, send_otlp_json,
+    OtlpEndpointAdmissionError, OtlpRetryCause, OtlpSignal, admit_otlp_endpoint,
 };
 
 /// Build the REST record source for a `rest` Source from its declared
 /// node config. The caller (the CLI reader-build) registers the returned
 /// reader as a [`clinker_exec::source::SourceInput::Records`].
+#[cfg(feature = "transport")]
 pub fn build_rest_source(
     cfg: clinker_plan::config::RestSourceConfig,
     source: &clinker_plan::config::SourceConfig,
@@ -48,6 +55,7 @@ pub fn build_rest_source(
 
 /// Construct a `FormatError::SchemaInference` for a body-decode/setup
 /// failure that is not an I/O error (malformed pagination body, etc.).
+#[cfg(feature = "transport")]
 fn schema_err(msg: String) -> FormatError {
     FormatError::SchemaInference(msg)
 }

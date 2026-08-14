@@ -5,15 +5,35 @@ edition.workspace = true
 license.workspace = true
 description = "CLI for the Clinker ETL engine"
 
+# All three are on by default, so the published binary is unchanged and no
+# pipeline that runs today stops running. Turning one off is for a deployment
+# that wants a smaller binary or a narrower dependency graph, and a build that
+# lacks a capability says so at config validation rather than at the point of
+# use — see `docs/user/src/getting-started/installation.md`.
+[features]
+default = ["rest", "otlp", "lineage"]
+# The `rest` source transport.
+rest = ["dep:clinker-net"]
+# OTLP/HTTP export of logs, metrics and spans to a collector. The telemetry
+# arena and its admission accounting are the executor's and stay either way;
+# this is the exporter that drains them.
+otlp = ["dep:clinker-net"]
+# OpenLineage run and column-lineage emission. `clinker-lineage` has no
+# transport dependency of its own — it writes NDJSON to a file or a pipe — so
+# this is a separate axis from the two above and not implied by either.
+lineage = ["dep:clinker-lineage"]
+
 [dependencies]
 clinker-exec = { workspace = true }
 clinker-plan = { workspace = true }
 clinker-core-types = { workspace = true }
-clinker-net = { workspace = true }
+clinker-net = { workspace = true, features = [
+    "transport",
+], optional = true }
 clinker-channel = { workspace = true }
 clinker-format = { workspace = true }
 clinker-record = { workspace = true }
-clinker-lineage = { workspace = true }
+clinker-lineage = { workspace = true, optional = true }
 cxl = { workspace = true }
 clap = { workspace = true }
 indexmap = { workspace = true }

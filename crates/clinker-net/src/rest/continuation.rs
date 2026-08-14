@@ -8,7 +8,7 @@
 use std::fmt;
 
 use clinker_core_types::{FailureCategory, FailureClassification, RetryAdvice};
-use ureq::http::Uri;
+use http::Uri;
 
 /// A normalized origin used to authorize every request in one REST pull.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,7 +192,7 @@ fn resolve(base: &AuthorizedUrl, reference: &str) -> Result<AuthorizedUrl, Conti
 /// refusing it aborted pagination after the first page and discarded the
 /// partial extract over an answer that was never ambiguous.
 pub(crate) fn next_link(
-    headers: &ureq::http::HeaderMap,
+    headers: &http::HeaderMap,
     effective_url: &AuthorizedUrl,
     admitted_origin: &Origin,
 ) -> Result<Option<AuthorizedUrl>, ContinuationError> {
@@ -215,7 +215,7 @@ pub(crate) fn next_link(
     // decoded.
     let mut targets = TargetSet::default();
     let mut unreadable: Option<ContinuationError> = None;
-    for value in headers.get_all(ureq::http::header::LINK) {
+    for value in headers.get_all(http::header::LINK) {
         let parsed = parse_link_field(value.as_bytes());
         for target in parsed.next_targets {
             targets.offer(&target, effective_url, admitted_origin);
@@ -295,13 +295,13 @@ impl TargetSet {
 /// produce these too, and only a reply naming two different targets is the
 /// ambiguity this refuses.
 pub(crate) fn redirect_location(
-    headers: &ureq::http::HeaderMap,
+    headers: &http::HeaderMap,
     effective_url: &AuthorizedUrl,
     admitted_origin: &Origin,
 ) -> Result<AuthorizedUrl, ContinuationError> {
     let mut targets = TargetSet::default();
     let mut unreadable: Option<ContinuationError> = None;
-    for value in headers.get_all(ureq::http::header::LOCATION) {
+    for value in headers.get_all(http::header::LOCATION) {
         let Ok(value) = value.to_str() else {
             unreadable.get_or_insert_with(|| {
                 ContinuationError::for_code("rest.protocol.malformed_continuation")
@@ -730,8 +730,8 @@ fn unquote(value: &[u8]) -> Result<Vec<u8>, ContinuationError> {
 mod tests {
     use super::*;
 
-    fn headers_of(name: ureq::http::HeaderName, values: &[&str]) -> ureq::http::HeaderMap {
-        let mut headers = ureq::http::HeaderMap::new();
+    fn headers_of(name: http::HeaderName, values: &[&str]) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
         for value in values {
             headers.append(name.clone(), value.parse().expect("a valid header value"));
         }
@@ -750,12 +750,8 @@ mod tests {
         let next = "<https://api.example.test/v1/items?page=2>; rel=\"next\"";
 
         for spelling in ["", "   ", &format!("{next},"), &format!(",{next}")] {
-            let read = next_link(
-                &headers_of(ureq::http::header::LINK, &[spelling]),
-                &base,
-                &origin,
-            )
-            .unwrap_or_else(|error| panic!("{spelling:?} is readable, got {error}"));
+            let read = next_link(&headers_of(http::header::LINK, &[spelling]), &base, &origin)
+                .unwrap_or_else(|error| panic!("{spelling:?} is readable, got {error}"));
             let expected = spelling
                 .contains("rel=")
                 .then_some("https://api.example.test/v1/items?page=2");
@@ -766,7 +762,7 @@ mod tests {
         // says to take the first.
         let repeated_rel = "<https://api.example.test/v1/items?page=2>; rel=\"next\"; rel=\"next\"";
         let read = next_link(
-            &headers_of(ureq::http::header::LINK, &[repeated_rel]),
+            &headers_of(http::header::LINK, &[repeated_rel]),
             &base,
             &origin,
         )
@@ -777,13 +773,9 @@ mod tests {
         // A `;` and a `rel=` inside a quoted value belong to the value.
         let quoted = "<https://api.example.test/v1/items?page=2>; \
                       title=\"a; rel=first\"; rel=\"next\"";
-        let read = next_link(
-            &headers_of(ureq::http::header::LINK, &[quoted]),
-            &base,
-            &origin,
-        )
-        .expect("a quoted parameter is one parameter")
-        .expect("there is a next page");
+        let read = next_link(&headers_of(http::header::LINK, &[quoted]), &base, &origin)
+            .expect("a quoted parameter is one parameter")
+            .expect("there is a next page");
         assert_eq!(read.as_str(), "https://api.example.test/v1/items?page=2");
     }
 
@@ -803,15 +795,13 @@ mod tests {
         let (origin, base) =
             authorize_initial("https://api.example.test/v1/items").expect("initial URL");
         let mut headers = headers_of(
-            ureq::http::header::LINK,
+            http::header::LINK,
             &["<https://api.example.test/v1/items?page=2>; rel=\"next\""],
         );
         headers.append(
-            ureq::http::header::LINK,
-            ureq::http::HeaderValue::from_bytes(
-                b"<https://api.example.test/v1/\xff>; rel=\"next\"",
-            )
-            .expect("a header carrying a byte outside visible ASCII"),
+            http::header::LINK,
+            http::HeaderValue::from_bytes(b"<https://api.example.test/v1/\xff>; rel=\"next\"")
+                .expect("a header carrying a byte outside visible ASCII"),
         );
 
         let refused = next_link(&headers, &base, &origin)
@@ -832,17 +822,17 @@ mod tests {
     fn a_parameter_this_reader_never_decodes_cannot_end_the_pull() {
         let (origin, base) =
             authorize_initial("https://api.example.test/v1/items").expect("initial URL");
-        let mut headers = ureq::http::HeaderMap::new();
+        let mut headers = http::HeaderMap::new();
         headers.append(
-            ureq::http::header::LINK,
-            ureq::http::HeaderValue::from_bytes(
+            http::header::LINK,
+            http::HeaderValue::from_bytes(
                 b"<https://api.example.test/v1/items?page=2>; rel=\"next\"; title=\"caf\xc3\xa9\"",
             )
             .expect("a header carrying valid UTF-8 outside ASCII"),
         );
         headers.append(
-            ureq::http::header::LINK,
-            ureq::http::HeaderValue::from_bytes(b"</v1/prev>; rel=\"prev\"; title=\"\xff\"")
+            http::header::LINK,
+            http::HeaderValue::from_bytes(b"</v1/prev>; rel=\"prev\"; title=\"\xff\"")
                 .expect("a header carrying a byte that is not UTF-8 at all"),
         );
 
@@ -917,10 +907,7 @@ mod tests {
             authorize_initial("https://api.example.test/v1/items").expect("initial URL");
         let third = "<https://api.example.test/v1/items?page=9>; rel=\"next\"";
         let conflicting = next_link(
-            &headers_of(
-                ureq::http::header::LINK,
-                &[&format!("{junk}, {second}, {third}")],
-            ),
+            &headers_of(http::header::LINK, &[&format!("{junk}, {second}, {third}")]),
             &base,
             &origin,
         )
@@ -944,7 +931,7 @@ mod tests {
         let next = "<https://api.example.test/v1/items?page=2>; rel=\"next\"";
 
         let repeated = next_link(
-            &headers_of(ureq::http::header::LINK, &[next, next]),
+            &headers_of(http::header::LINK, &[next, next]),
             &base,
             &origin,
         )
@@ -957,7 +944,7 @@ mod tests {
 
         let conflicting = next_link(
             &headers_of(
-                ureq::http::header::LINK,
+                http::header::LINK,
                 &[
                     next,
                     "<https://api.example.test/v1/items?page=9>; rel=\"next\"",
@@ -974,7 +961,7 @@ mod tests {
 
         let target = "https://api.example.test/v1/items?page=2";
         let redirect = redirect_location(
-            &headers_of(ureq::http::header::LOCATION, &[target, target]),
+            &headers_of(http::header::LOCATION, &[target, target]),
             &base,
             &origin,
         )
@@ -983,7 +970,7 @@ mod tests {
 
         let disagreeing = redirect_location(
             &headers_of(
-                ureq::http::header::LOCATION,
+                http::header::LOCATION,
                 &[target, "https://api.example.test/v1/items?page=9"],
             ),
             &base,
@@ -1340,15 +1327,15 @@ mod tests {
     fn relation_token_lists_select_exactly_one_next_target() {
         let (origin, base) =
             authorize_initial("http://api.example.test/v1/items").expect("initial URL");
-        let mut headers = ureq::http::HeaderMap::new();
+        let mut headers = http::HeaderMap::new();
         headers.append(
-            ureq::http::header::LINK,
+            http::header::LINK,
             "</v1/items?page=1>; rel=prev"
                 .parse()
                 .expect("previous Link"),
         );
         headers.append(
-            ureq::http::header::LINK,
+            http::header::LINK,
             "</v1/items?page=2>; rel=\"alternate next\""
                 .parse()
                 .expect("next Link"),

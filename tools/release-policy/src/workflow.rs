@@ -338,6 +338,7 @@ fn expected_permissions(
         "ci.yml" => vec![
             ("dependency-policy", read()),
             ("release-policy", read()),
+            ("build-portability", read()),
             ("check", read()),
             ("test-windows", read()),
             ("test-macos", read()),

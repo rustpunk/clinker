@@ -145,6 +145,11 @@ impl RunCorrelationIdentity {
     }
 }
 
+// These four blocks are read only by the two optional exporters, which turn a
+// lifecycle snapshot into OpenLineage facets and OTLP resource attributes. The
+// facts themselves are recorded on every run; only the reading of them is an
+// exporter concern.
+#[cfg(any(feature = "otlp", feature = "lineage"))]
 impl RunLifecycleStartFacts {
     pub(crate) fn batch_id(&self) -> &str {
         &self.batch_id
@@ -163,6 +168,7 @@ impl RunLifecycleStartFacts {
     }
 }
 
+#[cfg(any(feature = "otlp", feature = "lineage"))]
 impl PlanFingerprintFacts {
     pub(crate) const fn algorithm(self) -> &'static str {
         self.algorithm
@@ -177,6 +183,7 @@ impl PlanFingerprintFacts {
     }
 }
 
+#[cfg(any(feature = "otlp", feature = "lineage"))]
 impl RunLifecycleTerminalFacts {
     pub(crate) const fn finished_at(&self) -> DateTime<Utc> {
         self.finished_at
@@ -195,11 +202,16 @@ impl RunLifecycleTerminalFacts {
         self.counts
     }
 
+    /// How long the run took. OpenLineage carries this on the terminal event;
+    /// OTLP derives span durations from timestamps instead, so it has no
+    /// reader outside lineage.
+    #[cfg(feature = "lineage")]
     pub(crate) const fn duration_ms(&self) -> i64 {
         self.duration_ms
     }
 }
 
+#[cfg(any(feature = "otlp", feature = "lineage"))]
 impl RunLifecycleSnapshot {
     pub(crate) fn start(&self) -> &RunLifecycleStartFacts {
         &self.start
@@ -275,8 +287,17 @@ mod tests {
                 Some(RunCountFacts::default()),
             )
             .expect("first terminal");
-        assert_eq!(start_snapshot.batch_id(), "batch");
-        assert!(facts.snapshot().terminal().is_some());
+        // The accessors these two read exist for the optional exporters, so a
+        // build with neither has nothing to assert here. What the assertions
+        // below check — that a second terminal is refused — is the invariant
+        // this test is named for, and it holds in every build.
+        #[cfg(any(feature = "otlp", feature = "lineage"))]
+        {
+            assert_eq!(start_snapshot.batch_id(), "batch");
+            assert!(facts.snapshot().terminal().is_some());
+        }
+        #[cfg(not(any(feature = "otlp", feature = "lineage")))]
+        drop(start_snapshot);
         assert_eq!(
             facts.record_terminal(
                 start,
