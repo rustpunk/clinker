@@ -656,14 +656,57 @@ impl PipelineExecutor {
                 Arc<crate::pipeline::memory::ConsumerHandle>,
             ),
         > = HashMap::with_capacity(source_configs.len());
-        // Files this run will read across every source, accumulated as each
-        // source's already-enumerated input is claimed. `None` once any
-        // source turns out not to be an enumerated file set.
+        // Both denominators are established from every source's already-
+        // enumerated input, and sealed, before the loop below spawns the first
+        // ingest thread. Accumulating them inside that loop would let an early
+        // source deliver bytes while a later source's contribution was still
+        // outstanding, so a progress record could report bytes read against a
+        // total not yet published — a reader would see the count move before
+        // it had anything to measure it against.
+        //
+        // `files_total` is `None` once any source is not an enumerated file
+        // set. `bytes_total` is `None` additionally when a size cannot be read,
+        // and when a format re-reads its input: those bytes cross the counter
+        // twice, so the count would overrun the total.
         let mut files_total: Option<u64> = Some(0);
-        // Total input size, summed from the same on-disk metadata the scheduler
-        // reads. `None` as soon as one source cannot supply a size — a
-        // non-file transport, or a path whose metadata will not read.
         let mut bytes_total: Option<u64> = Some(0);
+        for src_cfg in &source_configs {
+            let Some(source_input) = readers.get(&src_cfg.name) else {
+                continue; // The loop below reports the missing reader.
+            };
+            files_total = match (source_input, files_total) {
+                (crate::source::SourceInput::Files(files), Some(seen)) => {
+                    Some(seen.saturating_add(files.len() as u64))
+                }
+                _ => None,
+            };
+            bytes_total = match (source_input, bytes_total) {
+                (crate::source::SourceInput::Files(_), _)
+                    if ingest::format_rereads_input(&src_cfg.format) =>
+                {
+                    None
+                }
+                (crate::source::SourceInput::Files(files), Some(seen)) => files
+                    .iter()
+                    // Each source reports its own length, so a staged input is
+                    // sized by the staged copy a reader will actually read
+                    // rather than the original path it was matched from. One
+                    // unknowable length withdraws the whole denominator, for
+                    // the same reason one non-file source does: a total
+                    // covering part of the input describes nothing a reader
+                    // can act on, and nothing on the wire would say which part.
+                    .try_fold(seen, |acc, slot| {
+                        slot.source.known_len().map(|len| acc.saturating_add(len))
+                    }),
+                _ => None,
+            };
+        }
+        if let Some(progress) = &params.progress {
+            progress.seal_files_total(files_total);
+            // A zero total is stored as an absence by `seal_bytes_total`; see
+            // there for why zero is not a denominator.
+            progress.seal_bytes_total(bytes_total);
+        }
         for src_cfg in &source_configs {
             let source_id = plan
                 .graph
@@ -695,42 +738,6 @@ impl PipelineExecutor {
                     src_cfg.name
                 )))
             })?;
-            // Count this source's files toward the run's file denominator
-            // before the input moves into its ingest thread. One non-file
-            // transport withdraws the denominator for the whole run rather
-            // than letting it describe only the file-backed part: a total
-            // that covers some of the work is worse than none, because
-            // nothing on the wire says which part it covered.
-            files_total = match (&source_input, files_total) {
-                (crate::source::SourceInput::Files(files), Some(seen)) => {
-                    Some(seen.saturating_add(files.len() as u64))
-                }
-                _ => None,
-            };
-            bytes_total = match (&source_input, bytes_total) {
-                // A format that re-reads its input makes the byte count IO
-                // performed rather than input consumed, so it would overrun any
-                // total. Decided from the declared format, before a reader
-                // exists, so the answer is fixed for the whole run.
-                (crate::source::SourceInput::Files(_), _)
-                    if ingest::format_rereads_input(&src_cfg.format) =>
-                {
-                    None
-                }
-                (crate::source::SourceInput::Files(files), Some(seen)) => files
-                    .iter()
-                    // Each source reports its own length, so a staged input is
-                    // sized by the staged copy a reader will actually read
-                    // rather than the original path it was matched from. One
-                    // unknowable length withdraws the whole denominator, for
-                    // the same reason one non-file source does: a total
-                    // covering part of the input describes nothing a reader can
-                    // act on, and nothing on the wire would say which part.
-                    .try_fold(seen, |acc, slot| {
-                        slot.source.known_len().map(|len| acc.saturating_add(len))
-                    }),
-                _ => None,
-            };
             // Single ConsumerHandle shared between the SourceConsumer
             // wrapper (BackPressurePreferred / Priority pause target)
             // and the SourceIngestChannel that mirrors the channel queue
@@ -838,12 +845,6 @@ impl PipelineExecutor {
                     detail: format!("failed to spawn source ingest thread: {e}"),
                 })?;
             ingest_handles.push(handle);
-        }
-        // Sealed once every source has been claimed, so the denominator a
-        // reader sees is either absent or covers the whole run.
-        if let Some(progress) = &params.progress {
-            progress.seal_files_total(files_total);
-            progress.seal_bytes_total(bytes_total);
         }
 
         let dispatch_outcome = match Self::execute_dag(

@@ -54,9 +54,10 @@ struct ProgressCounters {
 /// defect — nothing may decide on a sampled value. Decisions read the exact
 /// state the executor owns.
 ///
-/// The file total is sealed at most once, early in the run, and distinguishes
-/// three states a reader must tell apart: not yet established, established as
-/// unknowable for this run's source shapes, and established.
+/// Both totals are sealed at most once, before the first source begins
+/// reading, and each distinguishes three states a reader must tell apart: not
+/// yet established, established as unknowable for this run's sources, and
+/// established. A total a reader has once seen never reverts to an absence.
 #[derive(Clone, Debug, Default)]
 pub struct RunProgress {
     counters: Arc<ProgressCounters>,
@@ -104,8 +105,14 @@ impl RunProgress {
 
     /// Record the run's total input size in bytes, or `None` where any source
     /// cannot establish one. Sealed once, like the file total.
+    ///
+    /// A total of zero is stored as an absence. Zero is not a denominator: a
+    /// reader dividing by it gets `NaN` rather than a ratio, and a run with no
+    /// bytes to read is not a run nought per cent through its input. Enforced
+    /// here rather than at the call site so no caller can publish the division
+    /// by forgetting to guard it.
     pub fn seal_bytes_total(&self, total: Option<u64>) {
-        let _ = self.bytes_total.set(total);
+        let _ = self.bytes_total.set(total.filter(|bytes| *bytes > 0));
     }
 
     /// The counter to attach to each source so its bytes are counted as they
@@ -114,7 +121,7 @@ impl RunProgress {
         self.bytes.clone()
     }
 
-    /// Read both counters and the file total.
+    /// Read every counter and both totals.
     ///
     /// The reads are independent, so the sample is not a consistent cut: a
     /// file that closes between the `records_read` load and the `files_done`
@@ -404,6 +411,16 @@ mod tests {
     fn a_byte_total_sealed_as_unknowable_stays_absent() {
         let progress = RunProgress::new();
         progress.seal_bytes_total(None);
+        assert_eq!(progress.sample().bytes_total, None);
+    }
+
+    /// Zero is not a denominator — dividing by it yields `NaN`, not `0%` — so a
+    /// run with no bytes to read reports an absence rather than a total no
+    /// consumer can use.
+    #[test]
+    fn a_zero_byte_total_is_reported_as_an_absence() {
+        let progress = RunProgress::new();
+        progress.seal_bytes_total(Some(0));
         assert_eq!(progress.sample().bytes_total, None);
     }
 

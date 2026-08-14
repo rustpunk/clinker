@@ -20,14 +20,6 @@ use clinker_format::{Column, SourceSchema};
 use clinker_plan::config::PipelineConfig;
 use clinker_plan::error::PipelineError;
 
-/// Build a format-specific reader from input config and a re-openable source.
-///
-/// Dispatches on `InputFormat` to construct the correct reader type. The JSON
-/// and XML arms thread the [`ReopenableSource`] straight through so their
-/// envelope pre-scan and body stream each open a fresh `Read` without buffering
-/// the whole file; every other (one-pass) format opens the source once and
-/// streams that single `Read`. Returns `Box<dyn FormatReader>` — all downstream
-/// code uses trait methods (`schema()`, `next_record()`).
 /// Whether a format reads its input more than once.
 ///
 /// The envelope pre-scan of a multi-pass format re-opens the source, so its
@@ -58,6 +50,18 @@ pub(super) fn format_rereads_input(format: &clinker_plan::config::InputFormat) -
     }
 }
 
+/// Build a format-specific reader from input config and a re-openable source.
+///
+/// Dispatches on `InputFormat` to construct the correct reader type. The JSON
+/// and XML arms thread the [`ReopenableSource`] straight through so their
+/// envelope pre-scan and body stream each open a fresh `Read` without buffering
+/// the whole file; every other (one-pass) format opens the source once and
+/// streams that single `Read`. Returns `Box<dyn FormatReader>` — all downstream
+/// code uses trait methods (`schema()`, `next_record()`).
+///
+/// Which arms thread the source through is the same question
+/// [`format_rereads_input`] answers, and
+/// `every_one_pass_format_reads_its_input_exactly_once` holds the two to it.
 fn build_format_reader(
     input: &clinker_plan::config::SourceConfig,
     schema: &SourceSchema,
@@ -1623,6 +1627,91 @@ fn build_swift_reader_config(
         config.max_fields = max;
     }
     config
+}
+
+#[cfg(test)]
+mod byte_pass_contract {
+    //! Holds [`format_rereads_input`] to what the readers actually do.
+    //!
+    //! The exhaustive match there catches a format *variant* added without an
+    //! answer, but not an existing arm of [`build_format_reader`] later gaining
+    //! a second read — a header-sniff pre-pass on csv, say. That change would
+    //! leave the predicate answering `false` while `bytes_read` quietly grew
+    //! past a published `bytes_total`, and a supervisor would render more than
+    //! 100%. Nothing in the type system ties the two together, so this does:
+    //! every format declared single-pass is built and drained, and its source
+    //! must have handed over its bytes exactly once.
+
+    use clinker_format::{ByteTally, ReopenableSource};
+
+    use super::{build_format_reader, format_rereads_input};
+
+    /// A source config for `format_type`, taken through the real config parser
+    /// so the reader is built from the same shape a pipeline would produce.
+    fn source_config(format_type: &str) -> clinker_plan::config::SourceConfig {
+        let yaml = format!(
+            r#"
+pipeline:
+  name: byte_pass_contract
+nodes:
+  - type: source
+    name: probe
+    config:
+      name: probe
+      type: {format_type}
+      path: placeholder.dat
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: name, type: string }}
+  - type: output
+    name: out
+    input: probe
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+        );
+        let mut config = clinker_plan::config::parse_config(&yaml).expect("parse");
+        for spanned in &mut config.nodes {
+            if let clinker_plan::config::PipelineNode::Source { config: body, .. } =
+                &mut spanned.value
+            {
+                body.source.path = None;
+                return body.source.clone();
+            }
+        }
+        unreachable!("source node present")
+    }
+
+    #[test]
+    fn every_one_pass_format_reads_its_input_exactly_once() {
+        let text = "id,name\n1,a\n2,b\n";
+        let input = source_config("csv");
+        assert!(
+            !format_rereads_input(&input.format),
+            "the probe must cover a format declared single-pass"
+        );
+
+        let tally = ByteTally::new();
+        let source = ReopenableSource::buffer(std::io::Cursor::new(text.as_bytes().to_vec()))
+            .expect("buffer")
+            .with_tally(tally.clone());
+        let schema = clinker_format::SourceSchema::Columns(vec![
+            clinker_format::Column::bare("id", cxl::typecheck::Type::String),
+            clinker_format::Column::bare("name", cxl::typecheck::Type::String),
+        ]);
+
+        let mut reader = build_format_reader(&input, &schema, source).expect("build reader");
+        while reader.next_record().expect("read record").is_some() {}
+
+        assert_eq!(
+            tally.read(),
+            text.len() as u64,
+            "a format declared single-pass must deliver its bytes once; reading \
+             them twice would push bytes_read past a published bytes_total"
+        );
+    }
 }
 
 #[cfg(test)]

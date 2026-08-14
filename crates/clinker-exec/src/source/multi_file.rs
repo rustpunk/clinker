@@ -56,8 +56,8 @@ impl FileSlot {
     /// Wrap a one-shot `Read` handle plus its path into a slot.
     ///
     /// For in-memory inputs (test/bench cursors, the `<empty>` slot) that have
-    /// no on-disk path to re-open: the reader is held lazily as a
-    /// `ReopenableSource::OneShot` and streamed directly by a one-pass format,
+    /// no on-disk path to re-open: the reader is held lazily as
+    /// a one-shot `ReopenableSource` and streamed directly by a one-pass format,
     /// so a paced/slow reader keeps its per-row timing and nothing is read at
     /// slot construction. A multi-pass reader (JSON) buffers it on demand.
     /// File-backed production sources use [`from_path`](Self::from_path)

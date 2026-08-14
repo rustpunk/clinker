@@ -239,14 +239,20 @@ advances **within** a file, not only at file boundaries, which is what makes
 it useful on the common single-large-file run where every other count sits
 still until the end.
 
-`bytes_total` is `null` in two cases. First, when any source cannot supply a
+`bytes_total` is never `0`. A run with no bytes to read publishes `null`
+instead, because a zero total is not a denominator — dividing by it yields
+`NaN`, not `0%`, and a run with nothing to read is not a run that is nought
+per cent through anything.
+
+`bytes_total` is `null` in three cases. First, when any source cannot supply a
 size — a network source, or a path whose metadata will not read. Second, when
 any source is read **more than once**: `json` and `xml` sources re-open their
 input to pre-scan the envelope before streaming the body, so their bytes cross
 the counter twice and the count becomes IO performed rather than input
 consumed. Rather than publish a total the count will overrun, Clinker
-withdraws it. `bytes_read` is still emitted in that case and still rises
-monotonically — it remains a usable liveness signal, just not a fraction.
+withdraws it. Third, as above, when the run's inputs are empty. `bytes_read`
+is still emitted in every one of those cases and still rises monotonically —
+it remains a usable liveness signal, just not a fraction.
 
 **`bytes_read` counts file-backed input only.** A source with no bytes on
 disk — a network source, for instance — contributes nothing to it, so a run
