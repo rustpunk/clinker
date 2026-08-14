@@ -152,6 +152,10 @@ required by the audience and files changed.
 - [docs/ai/60_PERFORMANCE_NOTES.md](60_PERFORMANCE_NOTES.md): performance- and
   memory-sensitive paths, benchmark entry points, cache notes, and unsafe
   performance boundaries.
+- [docs/ai/65_PURE_RUST_BUILD_FINDINGS.md](65_PURE_RUST_BUILD_FINDINGS.md): the
+  record behind the no-C-toolchain guarantee — TLS provider choice and
+  rejections, what the `blake3` `pure` trade costs, how the gate proves itself,
+  and which questions were closed unmet.
 - [docs/ai/70_GLOSSARY.md](70_GLOSSARY.md): repository-specific terms for
   product, crates, pipeline nodes, CXL, execution, formats, and storage.
 - [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md): unresolved or
@@ -183,6 +187,7 @@ docs, or intended behavior need clarification.
 | New repeated pattern | [docs/ai/40_COMMON_PATTERNS.md](40_COMMON_PATTERNS.md) |
 | New command/test workflow | [docs/ai/50_TESTING_AND_COMMANDS.md](50_TESTING_AND_COMMANDS.md) |
 | Performance-sensitive change | [docs/ai/60_PERFORMANCE_NOTES.md](60_PERFORMANCE_NOTES.md), benchmark docs or tests when relevant |
+| Dependency, TLS, or build-toolchain change | [docs/ai/65_PURE_RUST_BUILD_FINDINGS.md](65_PURE_RUST_BUILD_FINDINGS.md), [docs/ai/30_DESIGN_RULES.md](30_DESIGN_RULES.md), and the `Build portability` job if the guarantee's scope moves |
 | New domain term | [docs/ai/70_GLOSSARY.md](70_GLOSSARY.md) |
 | Unresolved uncertainty | [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md) |
 | New crate-level guidance | The crate-local `AGENTS.md`, and [docs/ai/90_CRATE_AGENT_PLAN.md](90_CRATE_AGENT_PLAN.md) if the plan changes |

@@ -33,7 +33,7 @@ Root `AGENTS.md` still applies. This file adds local guidance for `clinker-net`.
 
 ### Allowed dependencies
 
-Current normal dependencies are intentional: `clinker-exec`, `clinker-plan`, `clinker-format`, `clinker-record`, `serde_json`, `indexmap`, `tracing`, and workspace `ureq` configured with rustls and no default native TLS path. Current dev dependencies are `clinker-exec` with `test-utils` and `clinker-bench-support`.
+Current normal dependencies are intentional: `clinker-exec`, `clinker-plan`, `clinker-format`, `clinker-record`, `serde_json`, `indexmap`, `tracing`, and — behind this crate's `transport` feature, which is off by default and turned on by `clinker`'s `rest` and `otlp` features — workspace `ureq` configured with `rustls-no-provider` plus `rustls-webpki-roots`, and `rustls-graviola` as the crypto provider. Not ureq's `rustls` feature: that is those two plus ring, which builds C. The provider is installed per agent in `src/tls.rs`, never through `CryptoProvider::install_default`. Current dev dependencies are `clinker-exec` with `test-utils` and `clinker-bench-support`.
 
 ### Forbidden or suspicious dependencies
 

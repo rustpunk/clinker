@@ -83,9 +83,12 @@ graph runs one. TLS for the `rest` source and the OTLP exporter goes through
 rustls with the [graviola] provider, which ships as Rust and inline assembly
 rather than the C and per-architecture assembly that other providers build,
 and content hashing uses blake3's pure-Rust SIMD paths. CI builds the
-workspace with every C-compiler environment variable pointed at a program that
-fails, so a dependency that starts needing one is caught rather than noticed
-by whoever first builds without a compiler installed.
+workspace, including its test and benchmark targets, with every C-compiler
+environment variable pointed at a program that fails, so a dependency that
+starts needing one is caught rather than noticed by whoever first builds
+without a compiler installed. That job also builds a crate that deliberately
+compiles C and requires it to fail, so the check is known to still work and not
+merely to be passing.
 
 Graviola supports `x86_64` and `aarch64`. Those are the architectures Clinker
 is built and tested on; another one needs a different rustls provider, and the

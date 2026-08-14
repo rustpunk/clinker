@@ -175,10 +175,20 @@ to [open questions](80_OPEN_QUESTIONS.md) rather than promoting it here.
 ## Dependency Rules
 
 - The workspace dependency policy is to avoid adding new native toolchain
-  requirements without review. `deny.toml` bans `cmake`, and root `Cargo.toml`
-  comments explain choices such as `blake3` with `pure` and `ureq` with
-  `rustls` to avoid OpenSSL/native-tls and extra C build steps in Clinker
-  crates.
+  requirements without review. The no-C-toolchain guarantee is enforced by the
+  `Build portability` CI job, not by `deny.toml`: the job builds the workspace
+  and all its targets with every C-compiler environment variable pointed at a
+  failing program, and then builds `tools/no-c-gate-fixture` — a crate that does
+  compile C — and requires that to fail. A name blocklist cannot do this,
+  because it cannot tell a build script that runs `cc` from one that merely
+  declares it, which is exactly `blake3` under the `pure` feature the workspace
+  pins. `deny.toml` bans `cmake` alone, whose presence in a graph is not
+  separable from running it.
+- Root `Cargo.toml` comments explain the choices that keep it that way: `blake3`
+  with `pure`, and `ureq` with `rustls-no-provider` plus `rustls-webpki-roots`
+  and the `rustls-graviola` provider rather than ureq's `rustls` feature, which
+  brings ring and with it a C build step. The `pure` trade is measured, not
+  assumed — see [60_PERFORMANCE_NOTES.md](60_PERFORMANCE_NOTES.md).
 - Do not introduce `openssl`, `native-tls`, `cmake`, new C build requirements,
   or equivalent transitive requirements without explicit architectural approval
   and corresponding `cargo deny` updates.
@@ -189,9 +199,12 @@ to [open questions](80_OPEN_QUESTIONS.md) rather than promoting it here.
   `clinker-exec` has an optional `clinker-bench-support` edge for
   `bench-alloc`; do not let benchmark helpers leak into default execution
   paths.
-- Network transport currently uses blocking `ureq` over rustls. Adding async
-  clients or a Tokio-driven runtime would be an architecture change, not a
-  local connector tweak.
+- Network transport currently uses blocking `ureq` over rustls with the
+  `rustls-graviola` crypto provider, installed per agent in
+  `crates/clinker-net/src/tls.rs` rather than through
+  `CryptoProvider::install_default`, which is process-global and single-call.
+  Adding async clients or a Tokio-driven runtime would be an architecture
+  change, not a local connector tweak.
 - The dependency gate is scoped to the capability, not to the manifest diff, and
   it covers development, test, benchmark, and release tooling as well as runtime
   crates. Hand-rolling a capability an established crate provides — a parser,

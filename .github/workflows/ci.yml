@@ -84,9 +84,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      # Both the default binary, which links TLS, and the one with no network
-      # capability at all. The first is the claim that matters; the second
-      # confirms the smaller graph did not acquire one either.
+      # The whole workspace including dev, test, and bench targets, because that is
+      # the scope the README and the installation guide claim. Then the binary with
+      # no network capability at all, which is a different graph rather than a
+      # subset — it confirms the smaller resolution did not acquire a toolchain
+      # requirement of its own.
       - name: Build with no working C compiler
         env:
           CC: /bin/false
@@ -96,13 +98,78 @@ jobs:
           CXX_x86_64_unknown_linux_gnu: /bin/false
           AR_x86_64_unknown_linux_gnu: /bin/false
         run: |
-          cargo build --locked -p clinker
+          cargo build --locked --workspace --all-targets
           cargo build --locked -p clinker --no-default-features
 
+      # The negative control. The step above passes both when nothing in the graph
+      # compiles C and when the mechanism has quietly stopped working, and from the
+      # outside those are the same green tick. `tools/no-c-gate-fixture` compiles one
+      # C file through the real `cc` crate — the real crate, because what is under
+      # test is whether the environment above covers the variables a genuine
+      # C-compiling build script consults, and only `cc` knows that set.
+      #
+      # Both directions are checked, and the failure is matched against its cause.
+      # "The build failed" on its own is not evidence: a fetch error or a stale
+      # lockfile would satisfy it while proving nothing, which is the same defect as
+      # the `grep` this job used to run against `cargo tree`.
+      #
+      # The fixture is excluded from the root workspace, so nothing else builds it.
+      # The environment is repeated rather than shared because GitHub Actions'
+      # workflow parser does not resolve YAML anchors, and a silently-empty `env`
+      # here would let the fixture find the runner's real compiler and pass.
+      - name: Prove the no-C gate bites
+        run: |
+          # Direction 1: with the runner's own toolchain the fixture must build. A
+          # fixture that can never build would fail the next check for its own
+          # reasons and report a working gate regardless of the gate.
+          if ! cargo build --locked \
+                 --manifest-path tools/no-c-gate-fixture/Cargo.toml \
+                 >"${RUNNER_TEMP}/fixture-ok.log" 2>&1; then
+            echo "the negative control is broken: it does not build even with a"
+            echo "working C compiler, so it cannot demonstrate anything."
+            tail -30 "${RUNNER_TEMP}/fixture-ok.log"
+            exit 1
+          fi
+
+          # Direction 2: under the gate's environment it must fail, and fail in cc.
+          if CC=/bin/false CXX=/bin/false AR=/bin/false \
+             CC_x86_64_unknown_linux_gnu=/bin/false \
+             CXX_x86_64_unknown_linux_gnu=/bin/false \
+             AR_x86_64_unknown_linux_gnu=/bin/false \
+             cargo build --locked \
+               --manifest-path tools/no-c-gate-fixture/Cargo.toml \
+               --target-dir "${RUNNER_TEMP}/fixture-no-cc" \
+               >"${RUNNER_TEMP}/red-gate.log" 2>&1; then
+            echo "the no-C gate did not bite: a cc-invoking build script compiled"
+            echo "with every C-compiler variable pointed at /bin/false."
+            exit 1
+          fi
+          if ! grep -q "error occurred in cc-rs" "${RUNNER_TEMP}/red-gate.log"; then
+            echo "the fixture failed, but not in the C compiler — so this run says"
+            echo "nothing about the gate. Failure was:"
+            tail -30 "${RUNNER_TEMP}/red-gate.log"
+            exit 1
+          fi
+          echo "gate bit as required; the fixture failed in cc:"
+          grep "error occurred in cc-rs" "${RUNNER_TEMP}/red-gate.log" | head -1
+
+      # `cargo tree --invert` exits 0 whether or not it finds anything, writing
+      # `warning: nothing to print.` to stderr when the package is absent. So the
+      # signal is an empty stdout, and the command's own status has to be checked
+      # on its own: piping into `grep` reports grep's status, which turns a broken
+      # `cargo tree` into a silent pass. `--target all` because a ring edge reachable
+      # only from the Windows or macOS resolution is still a ring edge.
       - name: Refuse a ring edge in any resolution
         run: |
-          if cargo tree --workspace --all-features --invert ring 2>/dev/null | grep -q ring; then
+          if ! cargo tree --workspace --all-features --target all --invert ring \
+                 >"${RUNNER_TEMP}/ring.txt" 2>"${RUNNER_TEMP}/ring.err"; then
+            echo "cargo tree failed, so the ring check did not run:"
+            cat "${RUNNER_TEMP}/ring.err"
+            exit 1
+          fi
+          if [ -s "${RUNNER_TEMP}/ring.txt" ]; then
             echo "ring is back in the dependency graph; it builds C through cc"
+            cat "${RUNNER_TEMP}/ring.txt"
             exit 1
           fi
 
@@ -227,10 +294,10 @@ jobs:
       - run: cargo check --features bench-alloc -p clinker-benchmarks
       - run: cargo test --benches -p clinker-benchmarks
 
-  # Execute the full suite on the other two first-class targets. These
-  # runners have a native C toolchain, so the `ring` (TLS) build script in
-  # clinker-net/clinker links cleanly here — which the ubuntu cross-check
-  # job below cannot do without an MSVC/Apple cross-linker. This is where
+  # Execute the full suite on the other two first-class targets. These runners
+  # link natively, which the ubuntu cross-check job below cannot do without an
+  # MSVC/Apple cross-linker. Nothing here needs a C toolchain — TLS runs on
+  # rustls with the graviola provider, which has no build script. This is where
   # the platform `#[cfg(windows)]` / `#[cfg(target_os = "macos")]` test
   # modules — including the de-gated RSS-validity assertions — actually run.
   test-windows:

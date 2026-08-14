@@ -1,0 +1,20 @@
+[package]
+name = "clinker-no-c-gate-fixture"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A crate that deliberately compiles C, so the no-C-toolchain gate can be shown to fail"
+publish = false
+
+# Detached from the root workspace, and listed in the root `exclude`. Its own
+# lockfile is invisible to the dependency-policy digest, which reads the root
+# `Cargo.lock` only, and its crate is invisible to `cargo tree --workspace`. That
+# isolation is the point: this crate exists to compile C, which the workspace it
+# guards must never do.
+[workspace]
+
+[build-dependencies]
+# The real `cc` crate rather than a hand-rolled `Command`. What is under test is
+# whether the CI job's environment covers the variables a genuine C-compiling
+# build script consults, and only `cc` itself knows the full set.
+cc = "1"

@@ -1031,3 +1031,23 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   `rest.rs`'s `Tls` and `HostNotFound` classifications, and the
   `source.endpoint.untrusted_tls` code they feed, may rarely fire for the case
   they were written for.
+- **59 (filed 2026-08-14):** There is no TLS performance envelope. The
+  investigation that gated the ring-to-graviola migration asked for handshake
+  latency and throughput against ring, and that comparison is not available
+  here: measuring it would need ring back in a resolvable graph and a CI job
+  exempt from the no-C environment, which is what the pillar exists to prevent,
+  and no delta could change a choice made on how ring builds rather than on how
+  it performs. The consequence is that a future change to the TLS path has
+  nothing to be measured against and a regression in it would not be detected.
+  The useful artifact would be an absolute baseline for graviola alone, which
+  needs a loopback TLS server — a `rustls` dev-dependency and a committed
+  certificate fixture with an expiry, both approval-gated. Reasoning in
+  [65_PURE_RUST_BUILD_FINDINGS.md](65_PURE_RUST_BUILD_FINDINGS.md) §3.
+- **60 (filed 2026-08-14):** CI never completes a TLS handshake. Every REST and
+  OTLP test binds a loopback listener speaking plain HTTP, and the one test that
+  reaches a public endpoint is `#[ignore = "requires outbound network"]`
+  (`crates/clinker-net/tests/tls_provider.rs`). The offline test proves a
+  handshake attempt fails at the peer rather than in provider setup, which
+  rules out a provider that cannot initialize but not one that negotiates
+  wrongly. The only evidence of a successful handshake is a dated manual note in
+  that file. Closing this is the same loopback-TLS-server work as 59.

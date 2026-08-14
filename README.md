@@ -149,11 +149,13 @@ cargo test --workspace
 ```
 
 There are no C build dependencies: no crate in the graph runs a C compiler, and
-CI proves it by building the workspace with `CC` and friends pointed at a
-program that fails. TLS runs on rustls with the pure-Rust [graviola] provider,
-so the `rest` source and the OTLP exporter cost nothing at build time —
-graviola supports `x86_64` and `aarch64`, which is where Clinker is built and
-tested.
+CI proves it by building the workspace and all its test and benchmark targets
+with `CC` and friends pointed at a program that fails. The same job builds one
+crate that *does* compile C and requires it to fail, so a green result means the
+check still works rather than only that nothing tripped it. TLS runs on rustls
+with the pure-Rust [graviola] provider, so the `rest` source and the OTLP
+exporter cost nothing at build time — graviola supports `x86_64` and `aarch64`,
+which is where Clinker is built and tested.
 
 [graviola]: https://github.com/ctz/graviola/
 

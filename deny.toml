@@ -9,9 +9,12 @@
 # invoked. Banning `cc` by name would refuse a graph that compiles no C.
 #
 # What enforces the guarantee is the `Build portability` CI job, which builds
-# the workspace with every C-compiler environment variable pointed at a program
-# that fails. A build script that invokes one fails there; one that only
-# declares the dependency does not.
+# the workspace and all its test and benchmark targets with every C-compiler
+# environment variable pointed at a program that fails. A build script that
+# invokes one fails there; one that only declares the dependency does not. The
+# same job then builds `tools/no-c-gate-fixture`, which does compile C, and
+# requires that to fail — otherwise a green run would be indistinguishable from
+# a mechanism that had stopped working.
 #
 # Run: cargo deny check
 
