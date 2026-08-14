@@ -25,3 +25,12 @@ publish = false
 # `Build portability` job compares the two lockfiles and fails if they diverge,
 # so this pin cannot silently drift out of step with the workspace.
 cc = "=1.2.58"
+
+# Not called from here. Pinned because `cc` delegates MSVC toolchain and
+# environment discovery to it, which makes it part of the variable set this
+# control certifies — and `cc` requires it through a caret range, so without an
+# exact requirement stated here any `cargo update` would drift it away from the
+# workspace's resolution and fail the parity check with no manifest change to
+# explain why. A direct entry is the only place Cargo lets a transitive version
+# be fixed.
+find-msvc-tools = "=0.1.9"

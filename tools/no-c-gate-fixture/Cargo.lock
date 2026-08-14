@@ -17,6 +17,7 @@ name = "clinker-no-c-gate-fixture"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "find-msvc-tools",
 ]
 
 [[package]]

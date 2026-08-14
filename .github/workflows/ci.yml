@@ -151,11 +151,14 @@ jobs:
           # Only inside `[[package]]` blocks: a lockfile opens with its own
           # top-level `version = N` format field, which would otherwise be
           # emitted as a nameless entry and compared as if it were a crate.
+          # `LC_ALL=C` because `comm` below requires both inputs ordered under the
+          # same collation as its own comparison, and a locale that ignores
+          # punctuation orders `a-c` and `ab` differently from a byte sort.
           lock_versions() {
             awk '/^\[\[package\]\]/ { in_pkg = 1; n = ""; next }
                  in_pkg && /^name = / { gsub(/"/, ""); n = $3; next }
                  in_pkg && /^version = / && n != "" {
-                   gsub(/"/, ""); print n, $3; in_pkg = 0 }' "$1" | sort
+                   gsub(/"/, ""); print n, $3; in_pkg = 0 }' "$1" | LC_ALL=C sort
           }
           lock_versions tools/no-c-gate-fixture/Cargo.lock \
             >"${RUNNER_TEMP}/fixture-lock.txt"
@@ -173,21 +176,31 @@ jobs:
             echo "cc has left the workspace lockfile entirely; no shared version"
             echo "to reconcile, and the control still compiles C on its own."
           else
-            join "${RUNNER_TEMP}/fixture-lock.txt" \
-                 "${RUNNER_TEMP}/workspace-lock.txt" >"${RUNNER_TEMP}/shared.txt"
-            mismatched=$(awk '$2 != $3 {
-              print "  " $1 ": control has " $2 ", workspace has " $3 }' \
-              "${RUNNER_TEMP}/shared.txt")
-            if [ -n "$mismatched" ]; then
-              echo "the negative control and the workspace disagree on a shared"
-              echo "dependency, so the control certifies coverage of a variable"
-              echo "set the workspace does not read:"
-              echo "$mismatched"
-              echo "Re-pin tools/no-c-gate-fixture to the workspace's versions."
+            # Set membership, not pairwise equality. A lockfile may legitimately
+            # carry two majors of one crate — this workspace already locks 14
+            # names twice — and the control can only hold one of them. Pairing by
+            # name would emit both combinations and read the non-matching one as a
+            # disagreement, failing a control that is in fact correct and printing
+            # a remedy ("re-pin the fixture") that cannot be carried out. What has
+            # to hold is weaker and is the actual requirement: every version the
+            # control locks is *a* version the workspace also resolves.
+            unmatched=$(grep -v '^clinker-no-c-gate-fixture ' \
+              "${RUNNER_TEMP}/fixture-lock.txt" \
+              | comm -23 - "${RUNNER_TEMP}/workspace-lock.txt")
+            if [ -n "$unmatched" ]; then
+              echo "the negative control locks versions the workspace does not"
+              echo "resolve, so it certifies coverage of a variable set the"
+              echo "workspace's build scripts would never read:"
+              echo "$unmatched" | sed 's/^/  /'
+              echo "Workspace resolutions of those crates:"
+              echo "$unmatched" | cut -d' ' -f1 \
+                | grep -Ff - "${RUNNER_TEMP}/workspace-lock.txt" \
+                | sed 's/^/  /' || echo "  (none — the crate is absent entirely)"
               exit 1
             fi
-            echo "control and workspace agree on all shared packages:"
-            sed 's/^/  /' "${RUNNER_TEMP}/shared.txt"
+            echo "every package the control locks is one the workspace resolves:"
+            grep -v '^clinker-no-c-gate-fixture ' \
+              "${RUNNER_TEMP}/fixture-lock.txt" | sed 's/^/  /'
           fi
 
           # Direction 1: with a working toolchain the fixture must build. A fixture
@@ -267,7 +280,15 @@ jobs:
               # land here and report success on every future run, with the
               # guarantee silently switched off. Confirm the absence against the
               # lockfile directly, against a name this check hardcodes.
-              if grep -q '^name = "ring"$' Cargo.lock; then
+              #
+              # Scoped to `[[package]]` blocks: `[[patch.unused]]` entries carry a
+              # `name` field in the same shape, and a raw grep would read one as a
+              # live dependency and fail a healthy graph.
+              if awk '/^\[\[package\]\]/ { in_pkg = 1; next }
+                      in_pkg && /^name = / { gsub(/"/, "");
+                                             if ($3 == "ring") { found = 1 }
+                                             in_pkg = 0 }
+                      END { exit found ? 0 : 1 }' Cargo.lock; then
                 echo "cargo tree resolved no such package, yet ring IS in"
                 echo "Cargo.lock — this check is asking about the wrong name."
                 exit 1
