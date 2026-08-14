@@ -249,8 +249,11 @@ Run-scoped state is passed explicitly through handles and registries.
 `MemoryConsumer` and `ArbitrationPolicy` let the shared `MemoryArbitrator`
 observe consumers and choose pause/spill actions. `WriterRegistry` is a public
 executor input shape; registries such as `WindowRuntimeRegistry` are
-crate-private implementation handoffs. `ProgressReporter` is a callback seam,
-not a global event bus.
+crate-private implementation handoffs. `RunProgress` is a published-counter
+seam, not a callback and not a global event bus: the executor advances its
+counters and an observer on another thread samples them on its own clock, so
+adding a reader costs nothing on the hot path and no producer has to know a
+reader exists.
 
 A stateful operator must account for every retained structure, register and
 unregister consumers for the correct lifetime, poll spill/abort gates at

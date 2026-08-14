@@ -261,13 +261,14 @@ pub(crate) fn source_name_arc_of(record: &Record) -> Arc<str> {
 /// ratio crosses `error_handling.dlq.max_rate`. Per-source > pipeline-wide
 /// precedence so the offending source surfaces in the rendered diagnostic.
 ///
-/// The rate denominator is the full per-source ingest count, seeded
-/// once at executor entry from
-/// [`ExecutorContext::total_per_source`] — not a moving "records
-/// processed so far" counter. The total is read from each ingest
-/// thread's `JoinHandle` once its crossbeam `Receiver` drains, then
-/// frozen for the duration of the run, so the ratio remains stable
-/// across the dispatch loop's `recv` interleaving.
+/// The rate denominator is [`ExecutorContext::total_per_source`], a running
+/// count of the rows this source has ingested so far — seeded to zero at
+/// executor entry and advanced as each row is accounted, not a total known
+/// ahead of the read. A streaming source cannot supply one: its cardinality
+/// is not established until its last row is read. The `min_records` floor in
+/// [`check_dlq_rate`] exists for exactly that reason, keeping the first few
+/// rows from tripping a ratio computed against a denominator still in single
+/// digits.
 pub(crate) fn push_dlq(
     ctx: &mut ExecutorContext<'_>,
     entry: DlqEntry,
@@ -299,12 +300,51 @@ pub(crate) enum ConsumedSourceEvent {
     Population,
 }
 
+/// Rows staged before the shared write path publishes them itself.
+///
+/// Matches the cadence the drain loops already poll shutdown at. Publishing
+/// from inside the write path rather than at each loop's boundary is what
+/// keeps a drain loop added later from silently reporting a frozen count:
+/// there is one place to forget, and it is the place that cannot be skipped.
+const RECORDS_PER_PUBLISH: u64 = 1024;
+
+/// Advance every ingest population by `delta` rows attributed to `source`.
+///
+/// The one write path for both readings of "records ingested so far": the
+/// exact per-source map a threshold decision fires on, and the delta staged
+/// for the observer's published counter. Advancing them separately would let
+/// the number a supervisor watches drift from the number a DLQ rate check
+/// acts on, and nothing would notice.
+///
+/// Staged, not published: the caller flushes at a boundary it already crosses
+/// via [`publish_record_progress`], so a record-at-a-time path pays one atomic
+/// per chunk rather than one per row.
+fn advance_source_population(ctx: &mut ExecutorContext<'_>, source: &Arc<str>, delta: u64) {
+    ctx.type_error_population.attempted = ctx.type_error_population.attempted.saturating_add(delta);
+    if let Some(slot) = ctx.total_per_source.get_mut(source) {
+        *slot = slot.saturating_add(delta);
+    }
+    ctx.records_pending_publish = ctx.records_pending_publish.saturating_add(delta);
+    if ctx.records_pending_publish >= RECORDS_PER_PUBLISH {
+        publish_record_progress(ctx);
+    }
+}
+
+/// Publish the rows staged since the last flush to the run's progress handle.
+///
+/// Called at chunk boundaries. An observer therefore reads a count that lags
+/// by at most one chunk — the bounded staleness a display tolerates and a
+/// decision must not, which is why no threshold reads this value.
+pub(crate) fn publish_record_progress(ctx: &mut ExecutorContext<'_>) {
+    let staged = std::mem::take(&mut ctx.records_pending_publish);
+    if let Some(progress) = &ctx.progress {
+        progress.advance_records(staged);
+    }
+}
+
 /// Record one successfully admitted source row in the threshold denominator.
 pub(crate) fn record_source_success(ctx: &mut ExecutorContext<'_>, source: &Arc<str>) {
-    ctx.type_error_population.attempted = ctx.type_error_population.attempted.saturating_add(1);
-    if let Some(slot) = ctx.total_per_source.get_mut(source) {
-        *slot = slot.saturating_add(1);
-    }
+    advance_source_population(ctx, source, 1);
 }
 
 /// Add exactly one rejected row to the shared type-error population.
@@ -312,11 +352,8 @@ pub(crate) fn record_type_error(
     ctx: &mut ExecutorContext<'_>,
     event: &crate::executor::dlq::TypeErrorEvent,
 ) {
-    ctx.type_error_population.attempted = ctx.type_error_population.attempted.saturating_add(1);
+    advance_source_population(ctx, &event.source_name, 1);
     ctx.type_error_population.rejected = ctx.type_error_population.rejected.saturating_add(1);
-    if let Some(slot) = ctx.total_per_source.get_mut(&event.source_name) {
-        *slot = slot.saturating_add(1);
-    }
 }
 
 /// Apply one complete ordered-file population exactly once, then decide its
@@ -353,17 +390,11 @@ pub(crate) fn apply_source_attempt_population(
             detail: format!("duplicate population application for {:?}", delta.id),
         });
     }
-    ctx.type_error_population.attempted = ctx
-        .type_error_population
-        .attempted
-        .saturating_add(delta.attempted);
+    advance_source_population(ctx, expected_source, delta.attempted);
     ctx.type_error_population.rejected = ctx
         .type_error_population
         .rejected
         .saturating_add(delta.rejected);
-    if let Some(slot) = ctx.total_per_source.get_mut(expected_source) {
-        *slot = slot.saturating_add(delta.attempted);
-    }
     if matches!(ctx.strategy, ErrorStrategy::Continue) {
         evaluate_type_error_threshold(ctx)?;
     }
@@ -1280,11 +1311,21 @@ pub(crate) struct ExecutorContext<'a> {
     /// alongside `counters.dlq_count` at the [`push_dlq`] funnel so
     /// per-source `max_rate` thresholds can fire with attribution.
     pub(crate) dlq_per_source: HashMap<Arc<str>, u64>,
-    /// Per-source total record counters keyed by Source-node name.
-    /// Seeded once at executor entry from
-    /// [`ExecutorContext::source_records`] so the rate-check
-    /// denominator is the per-source ingest count, not a moving target.
+    /// Rows ingested so far per Source-node name — a running count seeded to
+    /// zero at executor entry and advanced through
+    /// [`advance_source_population`] as each row is accounted. It is the DLQ
+    /// rate denominator, so it is read for decisions and must stay exact;
+    /// nothing samples it from another thread.
     pub(crate) total_per_source: HashMap<Arc<str>, u64>,
+    /// Rows accounted but not yet published to [`Self::progress`], flushed at
+    /// chunk boundaries by [`publish_record_progress`]. Staging keeps one
+    /// atomic per chunk off a per-record path that would otherwise pay one
+    /// per row.
+    pub(crate) records_pending_publish: u64,
+    /// Live counters an out-of-thread observer samples, when the caller asked
+    /// for one. Write-only from here: the executor publishes and never reads
+    /// back, so a sampled value can never reach a decision.
+    pub(crate) progress: Option<crate::progress::RunProgress>,
     /// Decoded source attempts and their declared-type-error subset.
     pub(crate) type_error_population: TypeErrorPopulation,
     /// Ordered physical-file populations already applied. A covered attempt
@@ -1901,6 +1942,14 @@ impl<'a> ExecutorContext<'a> {
     /// Source dispatch arm (and the Merge.interleave fusion arm) when
     /// a source's crossbeam `Receiver` disconnects.
     pub(crate) fn finalize_source_count(&mut self, source_name: &Arc<str>, count: u64) {
+        // Flush the drain's last partial chunk. Without this the tail of every
+        // source — up to 1023 rows — would reach the observer only if some
+        // later source happened to cross a boundary, and the final published
+        // count of a short run would sit at zero.
+        let staged = std::mem::take(&mut self.records_pending_publish);
+        if let Some(progress) = &self.progress {
+            progress.advance_records(staged);
+        }
         self.source_count_per_source
             .insert(Arc::clone(source_name), Some(count));
         // Plane B: the exact post-read row count supersedes the Plane A
@@ -3593,7 +3642,18 @@ pub(crate) fn merge_fused_interleave(
             // Every source closed.
             break;
         }
-        let oper = sel.select();
+        // Publish the staged tail before blocking. This loop has no
+        // record-count boundary of its own, so without this a fused
+        // interleave over several sources would report a frozen count for
+        // its whole run and jump only as each source closed — the stalled
+        // reading this counter exists to rule out.
+        let oper = match sel.try_select() {
+            Ok(ready) => ready,
+            Err(_) => {
+                publish_record_progress(ctx);
+                sel.select()
+            }
+        };
         let op_index = oper.index();
         let i = op_to_pred[op_index];
         // Complete the chosen operation on its receiver. `Ok` is a

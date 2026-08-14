@@ -155,6 +155,7 @@ fn build_multi_file_reader(
     input: &clinker_plan::config::SourceConfig,
     schema: &SourceSchema,
     files: Vec<crate::source::multi_file::FileSlot>,
+    progress: Option<crate::progress::RunProgress>,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     use crate::source::multi_file::{FactoryFn, MultiFileFormatReader};
 
@@ -175,7 +176,9 @@ fn build_multi_file_reader(
             })
         },
     );
-    Ok(Box::new(MultiFileFormatReader::new(files, factory)))
+    Ok(Box::new(
+        MultiFileFormatReader::new(files, factory).with_progress(progress),
+    ))
 }
 
 /// Wrap a format reader with schema-based type coercion if the source
@@ -381,6 +384,7 @@ pub(super) fn ingest_source(
     config: PipelineConfig,
     stream: crate::executor::source_stream::SourceIngestChannel,
     shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
+    progress: Option<crate::progress::RunProgress>,
 ) -> Result<IngestTaskOutcome, PipelineError> {
     // Branch once on transport. The file arm builds the
     // MultiFileFormatReader + schema-coercion stack and hands the
@@ -406,12 +410,14 @@ pub(super) fn ingest_source(
                     src_cfg.name
                 )))
             })?;
-            let raw_reader = build_multi_file_reader(&src_cfg, schema, files)?;
+            let raw_reader = build_multi_file_reader(&src_cfg, schema, files, progress.clone())?;
             let src_reader = wrap_with_schema_coercion(raw_reader, &config, &src_cfg.name)?;
             // The file arm reaches the shared driver through the blanket
             // `RecordSource for Box<dyn FormatReader>` impl.
             drive_record_source(src_cfg, Box::new(src_reader), stream, shutdown_token)
         }
+        // A non-file transport reads no files, so it credits none. The run's
+        // file denominator was already withdrawn for this shape.
         crate::source::SourceInput::Records(src_reader) => {
             drive_record_source(src_cfg, src_reader, stream, shutdown_token)
         }

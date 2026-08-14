@@ -222,6 +222,15 @@ where
         // `release_source_consumer` at drain end clears the flag and resumes.
         ctx.activate_source_for_drain(name.as_str());
         loop {
+            // About to wait on an empty channel: publish the staged tail
+            // first. A source that trickles never reaches the 1024-record
+            // boundary below, and a count frozen at zero while the run is
+            // merely slow is the reading a supervisor must not be given.
+            // Costs nothing while records are flowing, because the channel
+            // is not empty then.
+            if rx.is_empty() {
+                crate::executor::dispatch::publish_record_progress(ctx);
+            }
             let item: Option<crate::executor::source_stream::SourceStreamEvent> = match timeout {
                 Some(t) => match rx.recv_timeout(t) {
                     Ok(item) => Some(item),

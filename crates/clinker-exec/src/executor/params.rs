@@ -34,6 +34,11 @@ pub struct PipelineRunParams {
     /// every Record's `record_vars` map at materialization, layered
     /// atop `collect_record_var_defaults`.
     pub record_vars: IndexMap<String, Value>,
+    /// Per-run live progress counters, advanced by the executor and sampled by
+    /// an observer on another thread. `None` keeps the executor from
+    /// publishing anything; the counters that drive its own decisions are
+    /// owned state and are unaffected either way.
+    pub progress: Option<crate::progress::RunProgress>,
     /// Per-run shutdown handle. The executor checks this at chunk boundaries
     /// and inside `Arena::build`. `None` disables shutdown signaling for this
     /// run; production callers typically construct one via

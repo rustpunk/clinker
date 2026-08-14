@@ -106,6 +106,9 @@ pub struct MultiFileFormatReader {
     /// Ordered structural events accumulated while the wrapper advances.
     /// Physical open/close entries make zero-record files visible.
     lifecycle_events: Vec<clinker_format::SourceLifecycleEvent>,
+    /// Run counters to credit as each physical file closes. `None` when the
+    /// caller asked for no published progress.
+    progress: Option<crate::progress::RunProgress>,
 }
 
 impl MultiFileFormatReader {
@@ -132,6 +135,35 @@ impl MultiFileFormatReader {
             schema: None,
             factory,
             lifecycle_events: Vec::new(),
+            progress: None,
+        }
+    }
+
+    /// Credit each closing physical file to `progress`.
+    ///
+    /// Kept separate from [`Self::new`] so a caller with no observer builds
+    /// the wrapper unchanged. Every file the wrapper opens is eventually
+    /// closed, including one that yielded no records, so the credited count
+    /// and the file set the run was handed describe the same thing.
+    #[must_use]
+    pub fn with_progress(mut self, progress: Option<crate::progress::RunProgress>) -> Self {
+        self.progress = progress;
+        self
+    }
+
+    /// Close the file currently active: queue its structural close event and
+    /// credit it to the run's file count.
+    ///
+    /// The single place a physical file is declared finished. A close pushed
+    /// without the credit would leave a supervisor's file count short of the
+    /// stream's own structural record of the same event.
+    fn close_current_file(&mut self) {
+        self.lifecycle_events
+            .push(clinker_format::SourceLifecycleEvent::PhysicalFileClose(
+                Arc::clone(&self.current_file),
+            ));
+        if let Some(progress) = &self.progress {
+            progress.advance_files(1);
         }
     }
 
@@ -271,11 +303,7 @@ impl FormatReader for MultiFileFormatReader {
                 None => {
                     self.lifecycle_events
                         .extend(active.take_source_lifecycle_events());
-                    self.lifecycle_events.push(
-                        clinker_format::SourceLifecycleEvent::PhysicalFileClose(Arc::clone(
-                            &self.current_file,
-                        )),
-                    );
+                    self.close_current_file();
                     // Inner reader EOF'd; advance to next file.
                     if !self.advance()? {
                         return Ok(None);
@@ -298,12 +326,9 @@ impl FormatReader for MultiFileFormatReader {
         // is lost. Verify the new file's schema before its records flow,
         // exactly as the EOF-driven advance in `next_record` does.
         if let Some(active) = self.active.as_mut() {
-            self.lifecycle_events
-                .extend(active.take_source_lifecycle_events());
-            self.lifecycle_events
-                .push(clinker_format::SourceLifecycleEvent::PhysicalFileClose(
-                    Arc::clone(&self.current_file),
-                ));
+            let queued = active.take_source_lifecycle_events();
+            self.lifecycle_events.extend(queued);
+            self.close_current_file();
         }
         self.active = None;
         if !self.advance()? {
