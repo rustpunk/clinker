@@ -1,12 +1,26 @@
 # cargo-deny configuration for clinker
-# Ensures zero C build dependencies in clinker crates (pure Rust only)
+#
+# Licence and advisory policy, plus a name-level ban on `cmake`. It does NOT
+# enforce the workspace's no-C-toolchain guarantee, and the header used to say
+# it did: a name blocklist cannot see the difference between a build script
+# that calls a C compiler and one that merely declares `cc` and never runs it.
+# `blake3` is exactly that case — `cc` is in the lockfile as its
+# build-dependency and, under the `pure` feature this workspace pins, is never
+# invoked. Banning `cc` by name would refuse a graph that compiles no C.
+#
+# What enforces the guarantee is the `Build portability` CI job, which builds
+# the workspace with every C-compiler environment variable pointed at a program
+# that fails. A build script that invokes one fails there; one that only
+# declares the dependency does not.
 #
 # Run: cargo deny check
 
 [bans]
 multiple-versions = "warn"
 deny = [
-    # Ban cmake — enforces pure Rust compilation
+    # cmake is banned by name because, unlike `cc`, its presence in the graph
+    # is not separable from running it: a crate that depends on the `cmake`
+    # crate does so in order to drive a CMake build.
     { name = "cmake" },
 ]
 skip = [
