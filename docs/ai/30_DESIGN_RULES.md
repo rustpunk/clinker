@@ -132,10 +132,14 @@ to [open questions](80_OPEN_QUESTIONS.md) rather than promoting it here.
   request authentication, fixed signal routing, and CLI runtime setup.
 - **Invariant:** `clinker-plan` owns only strict secret-free raw endpoint/auth
   intent and numeric telemetry/lineage bounds. `clinker-net` alone parses and
-  normalizes that text with `ureq::http::Uri`, returning the opaque
+  normalizes that text with `http::Uri`, returning the opaque
   `AdmittedOtlpEndpoint` proof and deriving only `/v1/logs`, `/v1/metrics`, and
   `/v1/traces`. The CLI composes that proof with the bounds before effects; it
   does not add another URI parser, raw-string overload, admitted type, or route.
+  Admission is named against `http` directly rather than through ureq's
+  re-export of it, so the rule holds in a `clinker-net` built without the
+  `transport` feature — a binary with no HTTP client still carries the decision
+  about what an endpoint may be.
 - **Rationale:** One capability transition prevents divergent security checks,
   credential-bearing origins, and route confusion while keeping raw config and
   network authority in their owning crates.

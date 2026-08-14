@@ -5,6 +5,8 @@
 //! budget on it costs the per-request deadline once per attempt before naming
 //! a condition that was already settled at the first.
 
+#![cfg(feature = "transport")]
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;

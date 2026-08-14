@@ -90,10 +90,35 @@ serial_test = "3"
 petgraph = "0.8"
 fastrand = "2"
 quick-xml = "0.41"
-# Synchronous HTTP client for the `rest` source transport. rustls + ring
-# only (pure-Rust TLS) — `default-features = false` drops the native-tls
-# path so no openssl/native-tls/cmake enters the graph.
-ureq = { version = "3", default-features = false, features = ["rustls"] }
+# URI, header-name and header-map vocabulary. This is the same `http` crate
+# ureq re-exports as `ureq::http`, so naming it directly adds no crate to the
+# graph — it separates the admission and continuation policy, which is pure
+# URI and header analysis, from the transport that carries it. That policy
+# then compiles and is tested with `clinker-net`'s `transport` feature off.
+http = "1"
+# Synchronous HTTP client for the `rest` source transport and the OTLP
+# exporter, behind `clinker-net/transport`. `default-features = false` drops
+# the native-tls path so no openssl/native-tls/cmake enters the graph.
+#
+# The feature set is ureq's own `rustls` split back into its two halves.
+# `rustls` expands to `rustls-no-provider + _ring + rustls-webpki-roots`, and
+# the `_ring` third is what pulled ring — whose build script compiles C and
+# per-architecture assembly through `cc` — into every default build of the
+# workspace, contradicting the pure-Rust pillar. Naming the other two halves
+# directly keeps the Mozilla webpki root store exactly as it was and leaves
+# the crypto provider unset, so `clinker-net` installs graviola on the agent
+# it builds. ureq only falls back to ring when no provider is configured, and
+# with `_ring` off that fallback is a compile-time-absent path.
+ureq = { version = "3", default-features = false, features = [
+    "rustls-no-provider",
+    "rustls-webpki-roots",
+] }
+# Pure-Rust rustls crypto provider, from the rustls author. Replaces ring as
+# the provider behind the `rest` and OTLP transports: same formally-verified
+# s2n-bignum field arithmetic, but shipped as Rust and inline assembly with no
+# build script, so no C toolchain is needed to build clinker. Limited to
+# `x86_64` and `aarch64`, which is every target this workspace builds for.
+rustls-graviola = "0.4"
 clinker-bench-support = { path = "crates/clinker-bench-support" }
 clinker-scenarios = { path = "crates/clinker-scenarios" }
 tempfile = "3"

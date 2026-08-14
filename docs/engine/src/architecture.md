@@ -90,7 +90,7 @@ OpenLineage output datasets remain distinct and valid output vocabulary. See
 - **Memory-aware aggregation.** Hash aggregation with disk spill; streaming aggregation when sort order permits; RSS tracking with soft/hard limits. The mechanism is documented in [Memory Arbitration & Scheduling](memory-arbitration.md).
 - **Compile-time CXL typechecking.** Type inference produces a `TypedProgram`; see [Compiler Phases & Type Unification](cxl-internals.md).
 - **Diagnostics.** All user-facing errors use `miette` for span-annotated reports. `Spanned<PipelineNode>` covers the YAML side, `cxl::Span` covers the expression side, and they compose into one report.
-- **Pure Rust policy.** `deny.toml` bans cmake; no C build dependencies in clinker crates.
+- **Pure Rust policy.** `deny.toml` bans cmake, and no crate in the graph invokes a C compiler. The two places that could — TLS and content hashing — are held to Rust implementations: rustls with the graviola provider rather than ring or aws-lc-rs, and blake3's `pure` feature, which keeps the `std::arch` SIMD paths and gives up only the variants its build script would compile through `cc`. A CI job builds the workspace with every C-compiler environment variable pointed at a failing program, so this is checked rather than asserted.
 
 The boundaries available to engine extensions are described in
 [Extension Seams](extension-seams.md).

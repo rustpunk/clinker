@@ -42,10 +42,12 @@ fn expected_metadata(root: &std::path::Path) -> JsonValue {
                 normal_edge(root, "clinker-format", &[], true),
                 normal_edge(root, "clinker-plan", &[], true),
                 normal_edge(root, "clinker-record", &[], true),
+                normal_edge(root, "http", &[], true),
                 normal_edge(root, "indexmap", &["serde"], true),
+                optional_edge(root, "rustls-graviola", &[], true),
                 normal_edge(root, "serde_json", &["preserve_order"], true),
                 normal_edge(root, "tracing", &[], true),
-                normal_edge(root, "ureq", &["rustls"], false),
+                optional_edge(root, "ureq", &["rustls-no-provider", "rustls-webpki-roots"], false),
                 development_edge(root, "clinker-bench-support", &[]),
                 development_edge(root, "clinker-exec", &["test-utils"])
              ]},
@@ -123,6 +125,17 @@ fn normal_edge(
     })
 }
 
+fn optional_edge(
+    root: &std::path::Path,
+    name: &str,
+    features: &[&str],
+    uses_default_features: bool,
+) -> JsonValue {
+    let mut edge = normal_edge(root, name, features, uses_default_features);
+    edge["optional"] = json!(true);
+    edge
+}
+
 fn development_edge(root: &std::path::Path, name: &str, features: &[&str]) -> JsonValue {
     let mut edge = normal_edge(root, name, features, true);
     edge["kind"] = json!("dev");
@@ -186,7 +199,7 @@ fn core_manifest_rejects_dependency_build_and_feature_expansion() {
         (
             "feature-table",
             "\n[features]\ndefault = []\n",
-            "feature table",
+            "preapproved features",
         ),
     ];
     for (label, suffix, expected) in cases {
@@ -297,9 +310,13 @@ fn target_specific_and_unapproved_consumer_dependencies_are_rejected() {
 
     let tree = manifest_fixture("unapproved-consumer-dependency", &["clinker-net"]);
     rewrite(&tree, "crates/clinker-net/Cargo.toml", |text| {
+        // Anchored on `[dependencies]` rather than on whatever table follows
+        // it: the crate now carries a `[features]` table in between, and
+        // inserting ahead of `[dev-dependencies]` put the new key in there
+        // instead — testing the feature rule while claiming to test this one.
         text.replacen(
-            "[dev-dependencies]",
-            "tempfile = { workspace = true }\n\n[dev-dependencies]",
+            "[dependencies]\n",
+            "[dependencies]\ntempfile = { workspace = true }\n",
             1,
         )
     });
@@ -338,7 +355,7 @@ fn cargo_metadata_rejects_edge_kind_feature_optional_default_and_target_changes(
 
     let tree = TempTree::new("inherited-consumer-feature-expansion");
     let mut metadata = expected_metadata(tree.root());
-    metadata["packages"][1]["dependencies"][6]["features"] = json!(["preserve_order", "raw_value"]);
+    metadata["packages"][1]["dependencies"][8]["features"] = json!(["preserve_order", "raw_value"]);
     let error = check_metadata(tree.root(), &metadata, Scope::ClinkerNet)
         .expect_err("inherited workspace feature expansion must be rejected")
         .to_string();

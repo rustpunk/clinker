@@ -77,3 +77,52 @@ toolchain when you build.
 | Rust edition    | 2024        |
 | Minimum version | 1.91        |
 | C dependencies  | None        |
+
+A working C compiler is not one of the requirements: nothing in the build
+graph runs one. TLS for the `rest` source and the OTLP exporter goes through
+rustls with the [graviola] provider, which ships as Rust and inline assembly
+rather than the C and per-architecture assembly that other providers build,
+and content hashing uses blake3's pure-Rust SIMD paths. CI builds the
+workspace with every C-compiler environment variable pointed at a program that
+fails, so a dependency that starts needing one is caught rather than noticed
+by whoever first builds without a compiler installed.
+
+Graviola supports `x86_64` and `aarch64`. Those are the architectures Clinker
+is built and tested on; another one needs a different rustls provider, and the
+ones available today build C.
+
+[graviola]: https://github.com/ctz/graviola/
+
+## Optional capabilities
+
+Three parts of Clinker are Cargo features of the `clinker` crate. All three are
+**on by default** — a downloaded binary, or one built with plain
+`cargo install --path crates/clinker`, has every one of them, and nothing in
+this documentation assumes otherwise.
+
+| Feature   | What it adds                                                      |
+|-----------|-------------------------------------------------------------------|
+| `rest`    | The `rest` source transport (`transport: rest` on a source node).  |
+| `otlp`    | OTLP/HTTP export of logs, metrics and spans to a collector.        |
+| `lineage` | OpenLineage emission: `--lineage` and `--lineage-events`.          |
+
+They exist for deployments that want a smaller binary or a narrower dependency
+graph — a build with no `rest` and no `otlp` links no HTTP client and no TLS
+stack at all:
+
+```bash
+# File sources and lineage only: no network transport is compiled in.
+cargo install --path crates/clinker --no-default-features --features lineage
+```
+
+A build without a capability still parses every construct the full one does.
+What it will not do is run one silently: a pipeline that declares a `rest`
+source, a `clinker.toml` that sets `observability.otlp.endpoint`, or a
+`--lineage` flag is refused at validation — before any source is opened or any
+output written — with a diagnostic that names what was asked for and says the
+capability is not in this binary.
+
+Turning `otlp` off also stops telemetry being *recorded*: the fixed arena is
+reserved for an exporter to drain, so with no exporter there is nothing to
+reserve it for, and the `--machine ndjson-v1` terminal then carries no
+`observability` field at all.

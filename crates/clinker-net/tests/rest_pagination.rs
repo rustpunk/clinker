@@ -6,6 +6,8 @@
 //! 5988 Link header) and confirms the reader pages to last-page EOF,
 //! yielding exactly the dataset with no duplication or truncation.
 
+#![cfg(feature = "transport")]
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
