@@ -186,8 +186,13 @@ jobs:
           # every entry, it empties the whole parse and trips the guard below
           # rather than quietly losing one crate.
           #
-          # Written as if/else rather than a ternary: assigning from a ternary is
-          # what gawk and mawk disagreed about earlier in this file's history.
+          # Written as if/else, which is a style choice here and not a fix. The
+          # portability defect this step actually hit was narrower: `x in a` on
+          # the right of an assignment to `a[x]`, where mawk and busybox awk
+          # instantiate the subscript before evaluating the test and gawk does
+          # not — see the note above. Ternaries themselves behave identically on
+          # all three. Avoiding the wrong construct would leave the real one
+          # available to the next revision that needs an array.
           lock_packages() {
             awk '/^\[\[package\]\]/ { p = 1; n = ""; next }
                  p && /^name = / {
