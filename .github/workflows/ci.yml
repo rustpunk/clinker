@@ -380,19 +380,22 @@ jobs:
               # cannot tell "ring is gone" from "we asked about a name that does
               # not exist". A rename or typo in the argument above would otherwise
               # land here and report success on every future run, with the
-              # guarantee silently switched off. Confirm the absence against the
-              # lockfile directly, against a name this check hardcodes.
+              # guarantee silently switched off.
               #
-              # Scoped to `[[package]]` blocks: `[[patch.unused]]` entries carry a
-              # `name` field in the same shape, and a raw grep would read one as a
-              # live dependency and fail a healthy graph.
-              if awk '/^\[\[package\]\]/ { in_pkg = 1; next }
-                      in_pkg && /^name = / { gsub(/"/, "");
-                                             if ($3 == "ring") { found = 1 }
-                                             in_pkg = 0 }
-                      END { exit found ? 0 : 1 }' Cargo.lock; then
-                echo "cargo tree resolved no such package, yet ring IS in"
-                echo "Cargo.lock — this check is asking about the wrong name."
+              # Ask the identical question about a package that must resolve. If
+              # `clinker` cannot be found either, the invocation is broken and its
+              # failure to find `ring` says nothing about the graph. Cargo is its
+              # own oracle here deliberately: reading the lockfile directly meant
+              # a second parser of a format this file already parses elsewhere,
+              # and the two drifted — the copy kept a defect the original had
+              # fixed, and read a `[[patch.unused]]` entry as a live dependency.
+              if ! cargo tree --locked --workspace --all-features --target all \
+                     --invert clinker >/dev/null \
+                     2>"${RUNNER_TEMP}/ring-control.err"; then
+                echo "cargo tree cannot resolve 'clinker' either, so its inability"
+                echo "to resolve 'ring' is a broken invocation rather than a clean"
+                echo "dependency graph:"
+                cat "${RUNNER_TEMP}/ring-control.err"
                 exit 1
               fi
               echo "ring is not in the lockfile at all — the strongest form of this"
