@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::process::{Command, Output};
 
-use clinker_core_types::diagnostic::REGISTRY;
+use clinker_core_types::diagnostic::{DiagnosticCategory, DiagnosticLifecycle, REGISTRY};
 
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_clinker"))
@@ -52,7 +52,16 @@ fn list_and_code_share_every_registry_descriptor_in_stable_order() {
         assert_eq!(actual["Severity"], severity);
         assert_eq!(actual["Status"], entry.lifecycle.as_str());
         assert_eq!(actual["Category"], entry.category.as_str());
-        assert_eq!(actual["Retryability"], entry.retry_advice.as_str());
+        assert_eq!(
+            actual["Retryability"],
+            entry.retry_advice.as_str().replace('_', "-")
+        );
+        assert!(
+            ["Status", "Category", "Retryability"]
+                .iter()
+                .all(|field| !actual[*field].contains('_')),
+            "descriptor enum values must use one kebab-case convention"
+        );
         assert_eq!(actual["Meaning"], entry.meaning);
         assert_eq!(actual["Correction"], entry.correction);
 
@@ -87,6 +96,24 @@ fn filters_are_exact_and_include_the_retired_reservation() {
             .iter()
             .all(|entry| entry["Severity"] == "warning")
     );
+
+    let unknown_status = run(&["explain", "--list", "--status", "unknown"]);
+    let status_error = String::from_utf8_lossy(&unknown_status.stderr);
+    let statuses = DiagnosticLifecycle::ALL
+        .iter()
+        .map(|value| value.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(status_error.contains(&format!("Valid statuses: {statuses}")));
+
+    let unknown_category = run(&["explain", "--list", "--category", "unknown"]);
+    let category_error = String::from_utf8_lossy(&unknown_category.stderr);
+    let categories = DiagnosticCategory::ALL
+        .iter()
+        .map(|value| value.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(category_error.contains(&format!("Valid categories: {categories}")));
 
     for args in [
         &["explain", "--list", "--status", ""] as &[&str],

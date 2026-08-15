@@ -136,14 +136,10 @@ authored name is unique \
 (composition defaults, channel defaults, channel fixed); a three-part \
 `source.column.attribute` path traces a source-schema attribute across the \
 Base < Pipeline < Group < Channel schema layers. \
-Use --code to look up the documentation for a diagnostic code (composition codes \
-E101–E108, combine codes E300-E319/E325/E326/E327 and W302/W305/W306, memory codes E310-E312, \
-spill codes E320/E321, EDI output-split codes E323/E338, storage-validation \
-codes E330-E334, staging-copy codes E335-E337, the multi-record discriminator \
-code E345, and W101). \
-Use --list to enumerate every registered diagnostic descriptor, optionally \
-filtered by exact lifecycle status or category. Use --code to render one \
-registry descriptor and its optional longer detail page.",
+Use --list to enumerate every registered diagnostic descriptor and discover \
+the exact codes accepted by --code, optionally filtered by lifecycle status \
+or category. Use --code to render one registry descriptor and its optional \
+longer detail page.",
         after_long_help = "\
 EXAMPLES:
   # Show provenance for a composition config field
@@ -6166,9 +6162,12 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
             .as_deref()
             .map(|value| {
                 DiagnosticLifecycle::parse(value).ok_or_else(|| {
-                    format!(
-                        "unknown diagnostic status '{value}'. Valid statuses: active, retired-reserved"
-                    )
+                    let valid = DiagnosticLifecycle::ALL
+                        .iter()
+                        .map(|value| value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("unknown diagnostic status '{value}'. Valid statuses: {valid}")
                 })
             })
             .transpose()?;
@@ -6177,9 +6176,12 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
             .as_deref()
             .map(|value| {
                 DiagnosticCategory::parse(value).ok_or_else(|| {
-                    format!(
-                        "unknown diagnostic category '{value}'. Valid categories: advisory, composition, configuration, execution-and-format, security, source-and-expression, terminal-authoring"
-                    )
+                    let valid = DiagnosticCategory::ALL
+                        .iter()
+                        .map(|value| value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("unknown diagnostic category '{value}'. Valid categories: {valid}")
                 })
             })
             .transpose()?;
@@ -6340,12 +6342,18 @@ fn render_diagnostic_descriptor(entry: &clinker_core_types::diagnostic::Registry
     format!(
         "Code: {}\nSeverity: {severity}\nStatus: {}\nCategory: {}\nRetryability: {}\nMeaning: {}\nCorrection: {}\n",
         entry.code,
-        entry.lifecycle.as_str(),
-        entry.category.as_str(),
-        entry.retry_advice.as_str(),
+        descriptor_token(entry.lifecycle.as_str()),
+        descriptor_token(entry.category.as_str()),
+        descriptor_token(entry.retry_advice.as_str()),
         entry.meaning,
         entry.correction,
     )
+}
+
+/// Normalize closed enum values for the descriptor's lowercase kebab-case
+/// surface without defining a second spelling table.
+fn descriptor_token(value: &str) -> String {
+    value.replace('_', "-")
 }
 
 /// One-line summary of an applied overlay resolution for run/explain output.

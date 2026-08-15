@@ -89,9 +89,9 @@ inference-only `int | float` union CXL resolves during type unification — is
 `float` explicitly.
 
 There is no `clinker guess` command in the current CLI. Decision D-55 locks an
-authoring-only inference workflow for Phase 4 / AUTH-03: a deterministic,
-bounded multi-file preview by default, plus an exhaustive bounded-memory mode
-for conclusive evidence. That future command will inspect only columns marked
+authoring-only inference workflow under AUTH-03: a deterministic, bounded
+multi-file preview by default, plus an exhaustive bounded-memory mode for
+conclusive evidence. That future command will inspect only columns marked
 `numeric`; it will not run transformations or outputs, and it will not weaken
 runtime validation. Until AUTH-03 ships, inspect the source data yourself and
 commit a concrete `int` or `float` declaration before compiling the pipeline.

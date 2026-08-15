@@ -147,7 +147,7 @@ to [open questions](80_OPEN_QUESTIONS.md) rather than promoting it here.
   `crates/clinker-net/src/otlp.rs`, `crates/clinker/src/observability.rs`, and
   `crates/clinker-net/tests/otlp_http.rs`.
 - **Exceptions:** Credential-free HTTPS sends no headers. Referenced auth stays
-  secret-free until Phase 4 D-13/D-15 and AUTH-01 provide a borrowed run-local
+  secret-free until D-13/D-15 and AUTH-01 provide a borrowed run-local
   applicator after endpoint admission; it may not change origin or route.
 - **Verification:** Run the endpoint admission and successful-post tests plus
   the CLI pre-effect observability partition.

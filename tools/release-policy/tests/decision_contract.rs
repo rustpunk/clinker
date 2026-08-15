@@ -285,7 +285,7 @@ fn malformed_or_incompatible_invocations_exit_two_without_stdout() {
     }
 }
 
-fn phase4_metadata() -> Value {
+fn dependency_metadata() -> Value {
     let output = Command::new("cargo")
         .current_dir(repository_root())
         .args(["metadata", "--format-version", "1", "--locked", "--offline"])
@@ -349,34 +349,37 @@ fn metadata_node_mut<'a>(
         .expect("resolved node")
 }
 
-fn phase4_rejected(metadata: &Value) {
+fn dependency_metadata_rejected(metadata: &Value) {
     assert!(
-        clinker_release_policy::decision::verify_phase4_capability_metadata(
+        clinker_release_policy::decision::verify_dependency_capability_metadata(
             &repository_root(),
             metadata,
         )
         .is_err(),
-        "mutated Phase 4 metadata unexpectedly passed"
+        "mutated dependency metadata unexpectedly passed"
     );
 }
 
 #[test]
-fn phase4_capability_owner_real_workspace_passes() {
+fn dependency_capability_real_workspace_passes() {
     let output = gate(&[
         "decision",
-        "verify-phase4-capabilities",
+        "verify-dependency-capabilities",
         "--workspace-root",
         ".",
     ]);
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(output.stdout, b"Phase 4 dependency capabilities verified\n");
+    assert_eq!(
+        output.stdout,
+        b"Approved dependency capabilities verified\n"
+    );
     assert!(output.stderr.is_empty());
 }
 
 #[test]
-fn phase4_capability_owner_feature_and_edge_drift_rejects() {
-    let baseline = phase4_metadata();
-    clinker_release_policy::decision::verify_phase4_capability_metadata(
+fn dependency_capability_feature_and_consumer_drift_rejects() {
+    let baseline = dependency_metadata();
+    clinker_release_policy::decision::verify_dependency_capability_metadata(
         &repository_root(),
         &baseline,
     )
@@ -387,50 +390,50 @@ fn phase4_capability_owner_feature_and_edge_drift_rejects() {
         metadata_package_mut(&mut premature_precision, "clinker-format", None),
         "serde_json",
     )["features"] = json!(["arbitrary_precision", "preserve_order"]);
-    phase4_rejected(&premature_precision);
+    dependency_metadata_rejected(&premature_precision);
 
     let mut raw_value = baseline.clone();
     metadata_dependency_mut(
         metadata_package_mut(&mut raw_value, "clinker-format", None),
         "serde_json",
     )["features"] = json!(["preserve_order", "raw_value"]);
-    phase4_rejected(&raw_value);
+    dependency_metadata_rejected(&raw_value);
 
-    let mut missing_owner = baseline.clone();
-    metadata_package_mut(&mut missing_owner, "clinker", None)["dependencies"]
+    let mut missing_consumer = baseline.clone();
+    metadata_package_mut(&mut missing_consumer, "clinker-channel", None)["dependencies"]
         .as_array_mut()
         .unwrap()
         .retain(|dependency| dependency["name"] != "fs4");
-    phase4_rejected(&missing_owner);
+    dependency_metadata_rejected(&missing_consumer);
 
-    let mut misplaced_owner = baseline.clone();
+    let mut unapproved_consumer = baseline.clone();
     let fs4 = metadata_dependency_mut(
-        metadata_package_mut(&mut misplaced_owner, "clinker", None),
+        metadata_package_mut(&mut unapproved_consumer, "clinker-channel", None),
         "fs4",
     )
     .clone();
-    metadata_package_mut(&mut misplaced_owner, "clinker-plan", None)["dependencies"]
+    metadata_package_mut(&mut unapproved_consumer, "clinker", None)["dependencies"]
         .as_array_mut()
         .unwrap()
         .push(Value::Object(fs4));
-    phase4_rejected(&misplaced_owner);
+    dependency_metadata_rejected(&unapproved_consumer);
 
     let mut wrong_kind = baseline.clone();
     metadata_dependency_mut(
-        metadata_package_mut(&mut wrong_kind, "clinker", None),
+        metadata_package_mut(&mut wrong_kind, "clinker-exec", None),
         "fs4",
     )["kind"] = json!("dev");
-    phase4_rejected(&wrong_kind);
+    dependency_metadata_rejected(&wrong_kind);
 
     let mut version_drift = baseline.clone();
     metadata_package_mut(&mut version_drift, "serde_json", Some("1.0.149"))["version"] =
         json!("1.0.150");
-    phase4_rejected(&version_drift);
+    dependency_metadata_rejected(&version_drift);
 }
 
 #[test]
-fn phase4_capability_native_and_transitive_drift_rejects() {
-    let baseline = phase4_metadata();
+fn dependency_capability_native_and_transitive_drift_rejects() {
+    let baseline = dependency_metadata();
 
     let mut custom_build = baseline.clone();
     metadata_package_mut(&mut custom_build, "fs4", Some("1.1.0"))["targets"]
@@ -441,18 +444,18 @@ fn phase4_capability_native_and_transitive_drift_rejects() {
             "crate_types": ["bin"],
             "name": "build-script-build"
         }));
-    phase4_rejected(&custom_build);
+    dependency_metadata_rejected(&custom_build);
 
     let mut links = baseline.clone();
     metadata_package_mut(&mut links, "fs4", Some("1.1.0"))["links"] = json!("fs4_native");
-    phase4_rejected(&links);
+    dependency_metadata_rejected(&links);
 
     let mut build_dependency = baseline.clone();
     metadata_dependency_mut(
         metadata_package_mut(&mut build_dependency, "fs4", Some("1.1.0")),
         "rustix",
     )["kind"] = json!("build");
-    phase4_rejected(&build_dependency);
+    dependency_metadata_rejected(&build_dependency);
 
     let mut native_edge = baseline.clone();
     metadata_node_mut(&mut native_edge, "#fs4@1.1.0")["deps"]
@@ -463,7 +466,7 @@ fn phase4_capability_native_and_transitive_drift_rejects() {
             "pkg": "registry+example#cc@1.0.0",
             "dep_kinds": [{"kind": null, "target": null}]
         }));
-    phase4_rejected(&native_edge);
+    dependency_metadata_rejected(&native_edge);
 
     let mut substituted_direct_package = baseline.clone();
     metadata_node_mut(&mut substituted_direct_package, "#fs4@1.1.0")["deps"]
@@ -472,7 +475,7 @@ fn phase4_capability_native_and_transitive_drift_rejects() {
         .iter_mut()
         .find(|dependency| dependency["name"] == "rustix")
         .unwrap()["pkg"] = json!("registry+example#cc@1.0.0");
-    phase4_rejected(&substituted_direct_package);
+    dependency_metadata_rejected(&substituted_direct_package);
 
     let mut transitive_edge = baseline.clone();
     metadata_node_mut(&mut transitive_edge, "#rustix@1.1.4")["deps"]
@@ -483,7 +486,7 @@ fn phase4_capability_native_and_transitive_drift_rejects() {
             "pkg": "registry+example#bindgen@1.0.0",
             "dep_kinds": [{"kind": null, "target": null}]
         }));
-    phase4_rejected(&transitive_edge);
+    dependency_metadata_rejected(&transitive_edge);
 
     let mut substituted_transitive_package = baseline.clone();
     metadata_node_mut(&mut substituted_transitive_package, "#rustix@1.1.4")["deps"]
@@ -492,21 +495,21 @@ fn phase4_capability_native_and_transitive_drift_rejects() {
         .iter_mut()
         .find(|dependency| dependency["name"] == "bitflags")
         .unwrap()["pkg"] = json!("registry+example#bindgen@1.0.0");
-    phase4_rejected(&substituted_transitive_package);
+    dependency_metadata_rejected(&substituted_transitive_package);
 
     let mut target_drift = baseline.clone();
     metadata_dependency_mut(
         metadata_package_mut(&mut target_drift, "fs4", Some("1.1.0")),
         "rustix",
     )["target"] = json!("cfg(unix)");
-    phase4_rejected(&target_drift);
+    dependency_metadata_rejected(&target_drift);
 }
 
 #[test]
-fn phase4_capability_malformed_duplicate_and_command_failure_rejects() {
-    phase4_rejected(&Value::Null);
+fn dependency_capability_malformed_duplicate_and_command_failure_rejects() {
+    dependency_metadata_rejected(&Value::Null);
 
-    let mut duplicate = phase4_metadata();
+    let mut duplicate = dependency_metadata();
     let fs4 = duplicate["packages"]
         .as_array()
         .unwrap()
@@ -515,11 +518,11 @@ fn phase4_capability_malformed_duplicate_and_command_failure_rejects() {
         .unwrap()
         .clone();
     duplicate["packages"].as_array_mut().unwrap().push(fs4);
-    phase4_rejected(&duplicate);
+    dependency_metadata_rejected(&duplicate);
 
     let output = gate(&[
         "decision",
-        "verify-phase4-capabilities",
+        "verify-dependency-capabilities",
         "--workspace-root",
         "path-that-does-not-exist",
     ]);

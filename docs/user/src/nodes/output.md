@@ -5,9 +5,9 @@ Output nodes write processed records to files. They are the terminal nodes of a 
 > **Terminal-node migration (not available yet):** The current binary accepts
 > only `type: output`, and every runnable example on this page uses that
 > spelling. Decision D-56 assigns a one-way, project-wide rename of the
-> terminal destination concept to Sink and `type: sink` to Phase 4 / AUTH-09.
-> That atomic migration must finish before Phase 4.1 adds REST and SQL
-> endpoints; do not write `type: sink` in current pipelines. The rename is
+> terminal destination concept to Sink and `type: sink` under AUTH-09.
+> That atomic migration must finish before REST and SQL endpoint expansion;
+> do not write `type: sink` in current pipelines. The rename is
 > deliberately narrow: composition and node output ports, produced artifacts,
 > files and paths, serialization formats, stdout, command or machine output,
 > writer results, and OpenLineage output datasets keep the word “output.” See

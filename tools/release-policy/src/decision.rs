@@ -51,8 +51,8 @@ const AUTHORIZATION_IDENTITY_FIELDS: [&str; 9] = [
     "inventory_ref",
     "authorized_release_maintainer_ref",
 ];
-const PHASE4_METADATA_LIMIT: u64 = 4 * 1024 * 1024;
-const PHASE4_STDERR_LIMIT: usize = 64 * 1024;
+const DEPENDENCY_METADATA_LIMIT: u64 = 4 * 1024 * 1024;
+const DEPENDENCY_STDERR_LIMIT: usize = 64 * 1024;
 const SERDE_JSON_VERSION: &str = "1.0.149";
 const FS4_VERSION: &str = "1.1.0";
 const SERDE_JSON_ID: &str =
@@ -69,12 +69,12 @@ const WINDOWS_SYS_ID: &str =
 const WINDOWS_LINK_ID: &str =
     "registry+https://github.com/rust-lang/crates.io-index#windows-link@0.2.1";
 
-/// Verify the fixed Phase 4 dependency contract from Cargo's own structured
+/// Verify the approved dependency contract from Cargo's own structured
 /// manifest and lockfile resolution.
-pub fn verify_phase4_capabilities(workspace_root: &Path) -> Result<(), GateError> {
+pub fn verify_dependency_capabilities(workspace_root: &Path) -> Result<(), GateError> {
     let workspace_root = workspace_root
         .canonicalize()
-        .map_err(|error| GateError::io("resolve Phase 4 workspace root", &error))?;
+        .map_err(|error| GateError::io("resolve dependency workspace root", &error))?;
     let manifest = workspace_root.join("Cargo.toml");
     if !manifest.is_file() {
         return Err(GateError::usage("--workspace-root must contain Cargo.toml"));
@@ -103,41 +103,41 @@ pub fn verify_phase4_capabilities(workspace_root: &Path) -> Result<(), GateError
             ],
             environment,
             timeout: Duration::from_secs(60),
-            output_limit: PHASE4_STDERR_LIMIT,
+            output_limit: DEPENDENCY_STDERR_LIMIT,
         },
         capture,
-        PHASE4_METADATA_LIMIT,
+        DEPENDENCY_METADATA_LIMIT,
     )?;
     if result.termination != Termination::Exited(Some(0))
         || result.stdout_truncated
         || result.stderr_truncated
     {
         return Err(GateError::internal(
-            "decision.phase4_metadata",
+            "decision.dependency_metadata",
             "locked offline Cargo metadata did not complete within fixed bounds",
         ));
     }
     output
         .seek(SeekFrom::Start(0))
         .map_err(|error| GateError::io("rewind Cargo metadata capture", &error))?;
-    let mut bytes = Vec::with_capacity(PHASE4_METADATA_LIMIT as usize);
+    let mut bytes = Vec::with_capacity(DEPENDENCY_METADATA_LIMIT as usize);
     output
-        .take(PHASE4_METADATA_LIMIT + 1)
+        .take(DEPENDENCY_METADATA_LIMIT + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| GateError::io("read Cargo metadata capture", &error))?;
-    if bytes.len() > PHASE4_METADATA_LIMIT as usize {
+    if bytes.len() > DEPENDENCY_METADATA_LIMIT as usize {
         return Err(policy("Cargo metadata exceeded its fixed byte limit"));
     }
     let metadata: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| policy("Cargo metadata was not valid JSON"))?;
-    verify_phase4_capability_metadata(&workspace_root, &metadata)
+    verify_dependency_capability_metadata(&workspace_root, &metadata)
 }
 
 /// Verify a captured Cargo metadata document.
 ///
 /// This is public so contract tests can exercise adversarial metadata without
 /// adding a second manifest parser or invoking mutable approval state.
-pub fn verify_phase4_capability_metadata(
+pub fn verify_dependency_capability_metadata(
     workspace_root: &Path,
     metadata: &serde_json::Value,
 ) -> Result<(), GateError> {
@@ -174,7 +174,7 @@ pub fn verify_phase4_capability_metadata(
 
     reject_duplicate_packages(packages)?;
     verify_serde_json_contract(workspace_root, packages, nodes)?;
-    verify_fs4_owner_contract(workspace_root, packages)?;
+    verify_fs4_consumer_contract(workspace_root, packages)?;
     verify_fs4_package_contract(packages, nodes)?;
     Ok(())
 }
@@ -253,29 +253,23 @@ fn verify_serde_json_contract(
     Ok(())
 }
 
-fn verify_fs4_owner_contract(
+fn verify_fs4_consumer_contract(
     workspace_root: &Path,
     packages: &[serde_json::Value],
 ) -> Result<(), GateError> {
-    for (name, relative_manifest, expects_fs4) in [
-        ("clinker", "crates/clinker/Cargo.toml", true),
-        ("clinker-plan", "crates/clinker-plan/Cargo.toml", false),
-        ("clinker-format", "crates/clinker-format/Cargo.toml", false),
-        ("clinker-record", "crates/clinker-record/Cargo.toml", false),
-        (
-            "clinker-core-types",
-            "crates/clinker-core-types/Cargo.toml",
-            false,
-        ),
-        ("cxl", "crates/cxl/Cargo.toml", false),
-    ] {
-        let package = exact_package_by_name(packages, name)?;
-        let manifest = metadata_string_field(package, "manifest_path", "workspace package")?;
-        if Path::new(manifest) != workspace_root.join(relative_manifest) {
-            return Err(policy(format!(
-                "{relative_manifest} resolved through an unexpected manifest"
-            )));
+    let expected = BTreeMap::from([
+        ("clinker-channel", "crates/clinker-channel/Cargo.toml"),
+        ("clinker-exec", "crates/clinker-exec/Cargo.toml"),
+    ]);
+    let mut consumers = BTreeSet::new();
+
+    for package in packages {
+        let package = metadata_object(package, "metadata package")?;
+        let manifest = metadata_string_field(package, "manifest_path", "metadata package")?;
+        if !Path::new(manifest).starts_with(workspace_root) {
+            continue;
         }
+        let name = metadata_string_field(package, "name", "workspace package")?;
         let dependencies = metadata_array_field(package, "dependencies", "workspace package")?;
         let fs4: Vec<_> = dependencies
             .iter()
@@ -284,24 +278,41 @@ fn verify_fs4_owner_contract(
                 dependency.get("name").and_then(serde_json::Value::as_str) == Some("fs4")
             })
             .collect();
-        if expects_fs4 {
-            if fs4.len() != 1 {
-                return Err(policy(
-                    "crates/clinker/Cargo.toml must own exactly one direct fs4 edge",
-                ));
-            }
-            require_dependency_shape(
-                fs4[0],
-                "fs4",
-                "^1",
-                false,
-                &["sync"],
-                None,
-                "crates/clinker/Cargo.toml fs4 dependency",
-            )?;
-        } else if !fs4.is_empty() {
-            return Err(policy(format!("{relative_manifest} must not declare fs4")));
+        if fs4.is_empty() {
+            continue;
         }
+        if fs4.len() != 1 {
+            return Err(policy(format!(
+                "workspace package {name} must not declare duplicate fs4 edges"
+            )));
+        }
+        let Some(relative_manifest) = expected.get(name) else {
+            return Err(policy(format!(
+                "workspace package {name} is not an approved direct fs4 consumer"
+            )));
+        };
+        if Path::new(manifest) != workspace_root.join(relative_manifest) {
+            return Err(policy(format!(
+                "{relative_manifest} resolved through an unexpected manifest"
+            )));
+        }
+        require_dependency_shape(
+            fs4[0],
+            "fs4",
+            "^1",
+            false,
+            &["sync"],
+            None,
+            &format!("{relative_manifest} fs4 dependency"),
+        )?;
+        consumers.insert(name);
+    }
+
+    let expected_consumers: BTreeSet<_> = expected.keys().copied().collect();
+    if consumers != expected_consumers {
+        return Err(policy(
+            "direct fs4 consumers must be exactly clinker-channel and clinker-exec",
+        ));
     }
     Ok(())
 }
@@ -420,23 +431,6 @@ fn exact_package<'a>(
     if matches.len() != 1 {
         return Err(policy(format!(
             "metadata must contain exactly one {name} {version} package"
-        )));
-    }
-    Ok(matches[0])
-}
-
-fn exact_package_by_name<'a>(
-    packages: &'a [serde_json::Value],
-    name: &str,
-) -> Result<&'a serde_json::Map<String, serde_json::Value>, GateError> {
-    let matches: Vec<_> = packages
-        .iter()
-        .filter_map(serde_json::Value::as_object)
-        .filter(|package| package.get("name").and_then(serde_json::Value::as_str) == Some(name))
-        .collect();
-    if matches.len() != 1 {
-        return Err(policy(format!(
-            "metadata must contain exactly one workspace package {name}"
         )));
     }
     Ok(matches[0])

@@ -193,10 +193,10 @@ node's `name` for its caller-visible namespace.
 | `outputs` | Reserved | Parsed but does not override `_compose.outputs` |
 | `alias` | Reserved | Parsed but does not namespace body nodes |
 
-### Locked Phase 4 contract
+### Locked replacement contract
 
-D-12 through D-16 lock the replacement for these inert surfaces, but Phase 4
-has not implemented it yet:
+D-12 through D-16 lock the replacement for these inert surfaces, but it has
+not been implemented yet:
 
 - Resource kinds come from a bounded typed registry. Each registered kind owns
   its descriptor schema, validation, runtime opener, capabilities, redaction,
@@ -219,7 +219,7 @@ has not implemented it yet:
 
 See the canonical
 [composition-resource and call-site contract](https://github.com/rustpunk/clinker/blob/main/docs/ai/15_PRODUCTION_CONTRACTS.md#composition-resources-and-call-site-surface)
-for status, evidence, compatibility impact, and Phase 4 / AUTH-01 ownership.
+for status, evidence, compatibility impact, and the AUTH-01 boundary.
 
 ## Complete example
 

@@ -75,8 +75,8 @@ Rust `pub` controls whether a path is reachable. It does not establish that
 Clinker supports the path as an integration API. D-18 locks four compatibility
 classes: supported integration API, workspace-internal exposed API, test
 support, and deprecated cleanup debt; D-19 also distinguishes a deprecated
-route whose supported replacement already exists. Structural facade work is
-owned by Phase 4. See
+route whose supported replacement already exists. D-18 and D-19 own the
+structural facade work. See
 [validation authority and Rust API compatibility](15_PRODUCTION_CONTRACTS.md#validation-authority-and-rust-api-compatibility).
 
 Every D-19 seed has exactly one class:
@@ -104,7 +104,7 @@ none of the D-19 seed symbols is assigned to it. In particular,
 
 The current planner and runtime use `PipelineNode::Output`, `OutputConfig`,
 Output-oriented dispatch, and public YAML `type: output`. D-56 assigns the
-terminal-node-only migration to Sink to Phase 4 / AUTH-09, wholly before Phase
+terminal-node-only migration to Sink to AUTH-09, wholly before Phase
 4.1 endpoint work. Phase 1 does not change Rust, YAML, examples, fixtures, or
 tests. Output ports, artifacts, paths, formats, stdout, machine output, writer
 results, and OpenLineage output datasets keep their existing vocabulary. See

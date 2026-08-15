@@ -94,7 +94,7 @@ The per-value `fixed`-lock half of this entry is resolved; see the archive.)
 - Status: Resolved
 - Decision: D-12 through D-15
 - Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` defines the typed catalog-and-slot model; `crates/clinker-plan/src/plan/bind_schema.rs` still contains the current `validate_resources` stub.
-- Implementation owner: Phase 4 / AUTH-01
+- Implementation owner: AUTH-01
 - Verified: 2026-07-29
 
 ### 3. Should pipeline-target channel config keys be validated before overlay application?
@@ -153,7 +153,7 @@ strengthen-or-keep-advisory decision.)
 - Status: Resolved
 - Decision: D-17
 - Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` makes `clinker-plan` the sole execution-admission authority and bounds `clinker-schema` as advisory; `crates/clinker-schema/src/validate.rs` contains the current advisory checks.
-- Implementation owner: Phase 4 / AUTH-02
+- Implementation owner: AUTH-02
 - Verified: 2026-07-29
 
 ### 6. Should user-facing docs be updated to the unified `nodes:` shape and all current node types?
@@ -191,7 +191,7 @@ stale-user-docs sweep.)
 - Status: Resolved
 - Decision: D-44
 - Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` classifies the composition examples as executable documentation and requires `_compose:` plus `nodes:`; `examples/pipelines/compositions/` is the owned migration corpus.
-- Implementation owner: Phase 4 / AUTH-04
+- Implementation owner: AUTH-04
 - Verified: 2026-07-29
 
 ## Medium Priority
@@ -264,7 +264,7 @@ stale-user-docs sweep.)
 - Status: Resolved
 - Decision: D-45
 - Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` prohibits accepted parse-only options and names the first audit set; `crates/clinker/src/main.rs` is the current `RunArgs` and run-path authority.
-- Implementation owner: Phase 4 / AUTH-05
+- Implementation owner: AUTH-05
 - Verified: 2026-07-29
 
 ### 14. Should `PipelineCounters::ok_count` use a globally unique source-row identity?
@@ -400,7 +400,7 @@ stale-user-docs sweep.)
 - Status: Resolved
 - Decision: D-49
 - Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` locks the per-format charset matrix; the current boundaries are implemented under `crates/clinker-format/src/` and described in `docs/user/src/formats/`.
-- Implementation owner: Phase 4 / AUTH-06
+- Implementation owner: AUTH-06
 - Verified: 2026-07-29
 
 ## Low Priority
@@ -442,7 +442,7 @@ stale-user-docs sweep.)
 - Status: Resolved
 - Decision: D-23
 - Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` requires source-unused declarations to be removed after a complete source/feature/API audit; current declarations are visible in the named crate manifests.
-- Implementation owner: Phase 4 / CONT-05
+- Implementation owner: CONT-05
 - Verified: 2026-07-29
 
 ### 25. Is `tokio` reserved dependency surface or stale workspace debt?
@@ -463,7 +463,7 @@ stale-user-docs sweep.)
 - Status: Resolved
 - Decision: D-23
 - Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` classifies unused workspace Tokio as removable source-unused debt; `Cargo.toml` records the current declaration while production source remains synchronous.
-- Implementation owner: Phase 4 / CONT-05
+- Implementation owner: CONT-05
 - Verified: 2026-07-29
 
 ### 26. Which weakly inferred AI common-pattern notes should become project rules?
@@ -601,7 +601,7 @@ see the Resolved Archive. This entry keeps the one remaining follow-on.)
 - Status: Resolved
 - Decision: D-55
 - Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` locks bounded preview, exhaustive evidence, and guarded rewrite semantics; `crates/clinker-plan/src/schema/mod.rs` retains strict E158 runtime admission and `crates/clinker/src/main.rs` has no current `guess` command.
-- Implementation owner: Phase 4 / AUTH-03
+- Implementation owner: AUTH-03
 - Verified: 2026-07-29
 
 ### 32. Should reserved composition call-site `outputs:` and `alias:` be removed or implemented?
@@ -627,7 +627,7 @@ see the Resolved Archive. This entry keeps the one remaining follow-on.)
 - Status: Resolved
 - Decision: D-16
 - Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` rejects ordinary call-site `outputs:` and `alias:` while preserving `_compose.outputs` and overlay insertion aliases; `crates/clinker-plan/src/config/pipeline_node.rs` shows the currently parsed fields.
-- Implementation owner: Phase 4 / AUTH-01
+- Implementation owner: AUTH-01
 - Verified: 2026-07-29
 
 ### 33. Should parsed `PipelineMeta` specification stubs remain accepted YAML?

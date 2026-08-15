@@ -47,7 +47,6 @@ tracing-subscriber = { workspace = true }
 uuid = { version = "1", features = ["v7"] }
 miette = { workspace = true }
 tempfile = { workspace = true }
-fs4 = { workspace = true }
 
 [dev-dependencies]
 clinker-exec = { workspace = true, features = ["test-utils"] }

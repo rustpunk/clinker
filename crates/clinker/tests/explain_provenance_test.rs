@@ -307,7 +307,7 @@ fn test_explain_error_code_e319_outputs_doc_content() {
 }
 
 #[test]
-fn test_explain_help_shows_e319_range() {
+fn test_explain_help_points_code_discovery_at_the_registry_list() {
     let output = Command::new(clinker_bin())
         .arg("explain")
         .arg("--help")
@@ -322,8 +322,9 @@ fn test_explain_help_shows_e319_range() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        stdout.contains("E300-E319"),
-        "help output must advertise the E319 combine range.\nstdout: {stdout}"
+        stdout.contains("Use --list to enumerate every registered diagnostic descriptor")
+            && stdout.contains("exact codes accepted by --code"),
+        "help output must direct code discovery to the registry-backed list.\nstdout: {stdout}"
     );
 }
 
@@ -376,18 +377,20 @@ fn test_explain_staging_codes_are_lookup_able() {
 }
 
 #[test]
-fn test_explain_help_lists_staging_codes() {
+fn test_explain_list_discovers_staging_codes() {
     let output = Command::new(clinker_bin())
         .arg("explain")
-        .arg("--help")
+        .arg("--list")
         .output()
         .expect("spawn clinker");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("E335-E337"),
-        "help output must advertise the staging-copy code range.\nstdout: {stdout}"
-    );
+    for code in ["E335", "E336", "E337"] {
+        assert!(
+            stdout.contains(&format!("Code: {code}\n")),
+            "registry list must discover {code}.\nstdout: {stdout}"
+        );
+    }
 }
 
 #[test]

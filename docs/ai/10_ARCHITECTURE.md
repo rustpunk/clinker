@@ -120,7 +120,7 @@ envelope may refresh. See
 Current parser, planner, runtime, examples, and docs use `Output` and public
 YAML `type: output` for the terminal writer node. D-56 assigns one atomic,
 one-way migration of that **terminal destination concept** to Sink and
-`type: sink` to Phase 4 / AUTH-09, before Phase 4.1 endpoint work. It is not
+`type: sink` under AUTH-09, before endpoint expansion. It is not
 available today. Output-port maps, produced artifacts and paths, serialization
 formats, stdout, command and machine output, writer results, and OpenLineage
 output datasets remain valid output vocabulary. See
@@ -186,7 +186,7 @@ second URI parser or admitted-endpoint type.
 
 Credential-free HTTPS with no headers is production-reachable. A
 provider-neutral referenced mode is accepted as secret-free intent but fails
-before exporter effects until Phase 4 D-13/D-15 and AUTH-01 supply the run-local
+before exporter effects until D-13/D-15 and AUTH-01 supply the run-local
 credential handle and applicator. That later applicator cannot change the
 admitted origin or fixed signal routes.
 

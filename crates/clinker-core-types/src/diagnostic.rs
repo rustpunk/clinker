@@ -57,6 +57,9 @@ pub enum DiagnosticLifecycle {
 }
 
 impl DiagnosticLifecycle {
+    /// Every lifecycle admitted by diagnostic discovery filters.
+    pub const ALL: &'static [Self] = &[Self::Active, Self::RetiredReserved];
+
     /// Return the stable CLI/filter spelling for this lifecycle.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -68,11 +71,10 @@ impl DiagnosticLifecycle {
     /// Parse an exact lifecycle filter. Unknown or empty spellings are
     /// rejected instead of falling back to the active set.
     pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "active" => Some(Self::Active),
-            "retired-reserved" => Some(Self::RetiredReserved),
-            _ => None,
-        }
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_str() == value)
     }
 }
 
@@ -96,6 +98,17 @@ pub enum DiagnosticCategory {
 }
 
 impl DiagnosticCategory {
+    /// Every category admitted by diagnostic discovery filters.
+    pub const ALL: &'static [Self] = &[
+        Self::Configuration,
+        Self::Composition,
+        Self::SourceAndExpression,
+        Self::ExecutionAndFormat,
+        Self::TerminalAuthoring,
+        Self::Security,
+        Self::Advisory,
+    ];
+
     /// Return the stable CLI/filter spelling for this category.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -112,16 +125,10 @@ impl DiagnosticCategory {
     /// Parse an exact category filter. Unknown or empty spellings are
     /// rejected instead of selecting an accidental catch-all category.
     pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "configuration" => Some(Self::Configuration),
-            "composition" => Some(Self::Composition),
-            "source-and-expression" => Some(Self::SourceAndExpression),
-            "execution-and-format" => Some(Self::ExecutionAndFormat),
-            "terminal-authoring" => Some(Self::TerminalAuthoring),
-            "security" => Some(Self::Security),
-            "advisory" => Some(Self::Advisory),
-            _ => None,
-        }
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_str() == value)
     }
 }
 
@@ -1073,10 +1080,7 @@ mod diagnostic_tests {
 
     #[test]
     fn registry_filters_are_typed_exact_and_stable() {
-        for lifecycle in [
-            DiagnosticLifecycle::Active,
-            DiagnosticLifecycle::RetiredReserved,
-        ] {
+        for &lifecycle in DiagnosticLifecycle::ALL {
             assert_eq!(
                 DiagnosticLifecycle::parse(lifecycle.as_str()),
                 Some(lifecycle)
@@ -1089,16 +1093,7 @@ mod diagnostic_tests {
         assert_eq!(DiagnosticLifecycle::parse(""), None);
         assert_eq!(DiagnosticLifecycle::parse("retired"), None);
 
-        let categories = [
-            DiagnosticCategory::Configuration,
-            DiagnosticCategory::Composition,
-            DiagnosticCategory::SourceAndExpression,
-            DiagnosticCategory::ExecutionAndFormat,
-            DiagnosticCategory::TerminalAuthoring,
-            DiagnosticCategory::Security,
-            DiagnosticCategory::Advisory,
-        ];
-        for category in categories {
+        for &category in DiagnosticCategory::ALL {
             assert_eq!(DiagnosticCategory::parse(category.as_str()), Some(category));
             assert!(
                 registry_entries_with_category(category).all(|entry| entry.category == category)

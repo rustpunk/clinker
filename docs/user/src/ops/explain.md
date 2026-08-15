@@ -225,7 +225,8 @@ Two notes on where the snippet comes from:
 
 `clinker explain --list` enumerates every registered diagnostic in stable code
 order. Each entry includes its code, severity, status, category, retryability,
-meaning, and correction. Narrow the list with exact filters:
+meaning, and correction. Closed enum values in this descriptor use lowercase
+kebab-case. Narrow the list with exact filters:
 
 ```bash
 clinker explain --list
