@@ -231,6 +231,11 @@ fn policy_jobs_reject_no_op_command_substitutions() {
     let release = release_workflow();
     let scenarios = [
         (
+            "CI workspace dependency prefetch missing",
+            "ci.yml",
+            ci.replacen("          cargo fetch --locked\n", "", 1),
+        ),
+        (
             "CI dependency policy no-op",
             "ci.yml",
             ci.replacen(

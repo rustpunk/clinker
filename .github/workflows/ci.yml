@@ -451,8 +451,9 @@ jobs:
           toolchain: "1.91"
           components: clippy, rustfmt
 
-      - name: Fetch locked policy dependencies
+      - name: Fetch locked workspace and policy dependencies
         run: |
+          cargo fetch --locked
           cargo fetch --manifest-path tools/dependency-policy/Cargo.toml --locked
           cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked
 
