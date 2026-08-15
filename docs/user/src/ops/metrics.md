@@ -572,8 +572,8 @@ request, retry, response, arena, and flush bounds in one immutable run-local
 bundle. `auth.mode = "none"` is the supported production capability today and
 sends no credential headers. `auth.mode = "reference"` remains a logical,
 secret-free policy name, but the run fails before exporter effects until the
-Phase 4 AUTH-01 credential applicator supplies that capability; the
-applicator will not be allowed to change the admitted origin or fixed routes.
+AUTH-01 credential applicator supplies that capability; the applicator will
+not be allowed to change the admitted origin or fixed routes.
 
 Logs, metrics, and traces share one finite telemetry arena and exporter worker,
 but retain distinct typed per-signal delivery outcomes and fixed aggregate

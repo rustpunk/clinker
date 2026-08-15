@@ -79,8 +79,8 @@ and [Streaming vs. Blocking Stages](execution-model.md#plan-admission-and-runtim
 
 `PipelineNode::Output` and YAML `type: output` are the current terminal-writer
 surface. D-56 assigns an atomic migration of that terminal destination concept
-to `Sink` / `type: sink` to Phase 4 / AUTH-09, before Phase 4.1 endpoint
-expansion. The migration has not landed. Output ports, produced artifacts and
+to `Sink` / `type: sink` under AUTH-09, before endpoint expansion. The
+migration has not landed. Output ports, produced artifacts and
 paths, serialization formats, stdout and machine output, writer results, and
 OpenLineage output datasets remain distinct and valid output vocabulary. See
 [Terminal destination vocabulary](https://github.com/rustpunk/clinker/blob/main/docs/ai/15_PRODUCTION_CONTRACTS.md#terminal-destination-vocabulary).

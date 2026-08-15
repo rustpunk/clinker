@@ -223,15 +223,42 @@ Two notes on where the snippet comes from:
 
 ## Looking up diagnostic codes
 
-`clinker explain --code <CODE>` prints the documentation page for a code that
-has one, including retraction-specific codes:
+`clinker explain --list` enumerates every registered diagnostic in stable code
+order. Each entry includes its code, severity, status, category, retryability,
+meaning, and correction. Closed enum values in this descriptor use lowercase
+kebab-case. Narrow the list with exact filters:
+
+```bash
+clinker explain --list
+clinker explain --list --status retired-reserved
+clinker explain --list --category source-and-expression
+```
+
+The status vocabulary is closed:
+
+| Status | Meaning |
+|--------|---------|
+| `active` | The code describes a condition in the current authoring surface. |
+| `retired-reserved` | The old condition is no longer accepted, but its identifier remains permanently reserved and still explains the paste-ready correction. |
+
+Categories are `configuration`, `composition`, `source-and-expression`,
+`execution-and-format`, `terminal-authoring`, `security`, and `advisory`.
+Unknown or empty filter values fail; a valid combination that matches no code
+also fails instead of printing an ambiguous empty result.
+
+`clinker explain --code <CODE>` prints the same registry-owned descriptor as
+the list view, followed by a longer detail page when one exists:
 
 ```bash
 clinker explain --code E15Y   # retraction-mode aggregate incompatible with strategy: streaming
+clinker explain --code E376   # retired type: output spelling; use type: sink
 ```
 
-Not every code that can head a report has a page yet — pages are written per
-condition, and the code set is larger. **The report itself tells you which:** the
-`See: clinker explain --code <CODE>` line is appended only when that code has a
-page, so a report carrying it is a code this command can answer for. Passing a
-code with no page reports it as unknown and lists every code that does have one.
+Not every registered code has a longer page. A registered code without one is
+still valid and prints its complete descriptor plus `Detail page: none`; only a
+code absent from the registry is unknown. The `See: clinker explain --code
+<CODE>` line is appended to a diagnostic only when the longer page exists.
+
+List and code discovery are static authoring metadata. They do not compile a
+pipeline, inspect records, or render runtime values or secrets. Use only the
+`clinker explain` spelling: there is no separate diagnostic command.

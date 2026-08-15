@@ -518,10 +518,11 @@ pub const EXPLAIN_PAGES: &[(&str, &str)] = &[
     ("W366", include_str!("../../../../docs/explain/W366.md")),
 ];
 
-/// Look up error/warning code documentation embedded at compile time.
+/// Look up an optional diagnostic detail page embedded at compile time.
 ///
-/// Returns the doc content for any code in [`EXPLAIN_PAGES`], or `None` for
-/// an unknown code.
+/// Code identity and descriptor metadata belong to
+/// [`clinker_core_types::diagnostic::REGISTRY`]. This table only enriches a
+/// registered descriptor with longer worked guidance.
 pub fn explain_code(code: &str) -> Option<&'static str> {
     EXPLAIN_PAGES
         .iter()
@@ -529,13 +530,10 @@ pub fn explain_code(code: &str) -> Option<&'static str> {
         .map(|(_, doc)| *doc)
 }
 
-/// Every code [`explain_code`] can answer for, sorted.
+/// Every code with an optional detail page, sorted.
 ///
-/// The CLI prints this when a user names a code that does not exist, so it is
-/// derived rather than retyped. A hand-maintained list goes stale the first
-/// time a code is added, and then tells a user who mistyped after following an
-/// `explain --code` hint that the valid range stops before the code the hint
-/// named.
+/// This is page inventory, not the diagnostic registry. Callers deciding
+/// whether a code exists must consult `clinker-core-types` instead.
 pub fn explain_codes() -> Vec<&'static str> {
     let mut codes: Vec<&'static str> = EXPLAIN_PAGES.iter().map(|(c, _)| *c).collect();
     codes.sort_unstable();

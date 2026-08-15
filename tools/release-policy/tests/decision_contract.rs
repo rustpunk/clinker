@@ -285,6 +285,252 @@ fn malformed_or_incompatible_invocations_exit_two_without_stdout() {
     }
 }
 
+fn dependency_metadata() -> Value {
+    let output = Command::new("cargo")
+        .current_dir(repository_root())
+        .args(["metadata", "--format-version", "1", "--locked", "--offline"])
+        .output()
+        .expect("cargo metadata must execute");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("cargo metadata JSON")
+}
+
+fn metadata_package_mut<'a>(
+    metadata: &'a mut Value,
+    name: &str,
+    version: Option<&str>,
+) -> &'a mut serde_json::Map<String, Value> {
+    metadata["packages"]
+        .as_array_mut()
+        .expect("metadata packages")
+        .iter_mut()
+        .find_map(|package| {
+            let package = package.as_object_mut()?;
+            (package["name"] == name && version.is_none_or(|version| package["version"] == version))
+                .then_some(package)
+        })
+        .expect("metadata package")
+}
+
+fn metadata_dependency_mut<'a>(
+    package: &'a mut serde_json::Map<String, Value>,
+    name: &str,
+) -> &'a mut serde_json::Map<String, Value> {
+    package["dependencies"]
+        .as_array_mut()
+        .expect("package dependencies")
+        .iter_mut()
+        .find_map(|dependency| {
+            let dependency = dependency.as_object_mut()?;
+            (dependency["name"] == name).then_some(dependency)
+        })
+        .expect("package dependency")
+}
+
+fn metadata_node_mut<'a>(
+    metadata: &'a mut Value,
+    id_fragment: &str,
+) -> &'a mut serde_json::Map<String, Value> {
+    metadata["resolve"]["nodes"]
+        .as_array_mut()
+        .expect("resolve nodes")
+        .iter_mut()
+        .find_map(|node| {
+            let node = node.as_object_mut()?;
+            node["id"]
+                .as_str()
+                .is_some_and(|id| id.contains(id_fragment))
+                .then_some(node)
+        })
+        .expect("resolved node")
+}
+
+fn dependency_metadata_rejected(metadata: &Value) {
+    assert!(
+        clinker_release_policy::decision::verify_dependency_capability_metadata(
+            &repository_root(),
+            metadata,
+        )
+        .is_err(),
+        "mutated dependency metadata unexpectedly passed"
+    );
+}
+
+#[test]
+fn dependency_capability_real_workspace_passes() {
+    let output = gate(&[
+        "decision",
+        "verify-dependency-capabilities",
+        "--workspace-root",
+        ".",
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.stdout,
+        b"Approved dependency capabilities verified\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn dependency_capability_feature_and_consumer_drift_rejects() {
+    let baseline = dependency_metadata();
+    clinker_release_policy::decision::verify_dependency_capability_metadata(
+        &repository_root(),
+        &baseline,
+    )
+    .expect("real metadata contract");
+
+    let mut premature_precision = baseline.clone();
+    metadata_dependency_mut(
+        metadata_package_mut(&mut premature_precision, "clinker-format", None),
+        "serde_json",
+    )["features"] = json!(["arbitrary_precision", "preserve_order"]);
+    dependency_metadata_rejected(&premature_precision);
+
+    let mut raw_value = baseline.clone();
+    metadata_dependency_mut(
+        metadata_package_mut(&mut raw_value, "clinker-format", None),
+        "serde_json",
+    )["features"] = json!(["preserve_order", "raw_value"]);
+    dependency_metadata_rejected(&raw_value);
+
+    let mut missing_consumer = baseline.clone();
+    metadata_package_mut(&mut missing_consumer, "clinker-channel", None)["dependencies"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|dependency| dependency["name"] != "fs4");
+    dependency_metadata_rejected(&missing_consumer);
+
+    let mut unapproved_consumer = baseline.clone();
+    let fs4 = metadata_dependency_mut(
+        metadata_package_mut(&mut unapproved_consumer, "clinker-channel", None),
+        "fs4",
+    )
+    .clone();
+    metadata_package_mut(&mut unapproved_consumer, "clinker", None)["dependencies"]
+        .as_array_mut()
+        .unwrap()
+        .push(Value::Object(fs4));
+    dependency_metadata_rejected(&unapproved_consumer);
+
+    let mut wrong_kind = baseline.clone();
+    metadata_dependency_mut(
+        metadata_package_mut(&mut wrong_kind, "clinker-exec", None),
+        "fs4",
+    )["kind"] = json!("dev");
+    dependency_metadata_rejected(&wrong_kind);
+
+    let mut version_drift = baseline.clone();
+    metadata_package_mut(&mut version_drift, "serde_json", Some("1.0.149"))["version"] =
+        json!("1.0.150");
+    dependency_metadata_rejected(&version_drift);
+}
+
+#[test]
+fn dependency_capability_native_and_transitive_drift_rejects() {
+    let baseline = dependency_metadata();
+
+    let mut custom_build = baseline.clone();
+    metadata_package_mut(&mut custom_build, "fs4", Some("1.1.0"))["targets"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "kind": ["custom-build"],
+            "crate_types": ["bin"],
+            "name": "build-script-build"
+        }));
+    dependency_metadata_rejected(&custom_build);
+
+    let mut links = baseline.clone();
+    metadata_package_mut(&mut links, "fs4", Some("1.1.0"))["links"] = json!("fs4_native");
+    dependency_metadata_rejected(&links);
+
+    let mut build_dependency = baseline.clone();
+    metadata_dependency_mut(
+        metadata_package_mut(&mut build_dependency, "fs4", Some("1.1.0")),
+        "rustix",
+    )["kind"] = json!("build");
+    dependency_metadata_rejected(&build_dependency);
+
+    let mut native_edge = baseline.clone();
+    metadata_node_mut(&mut native_edge, "#fs4@1.1.0")["deps"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "name": "cc",
+            "pkg": "registry+example#cc@1.0.0",
+            "dep_kinds": [{"kind": null, "target": null}]
+        }));
+    dependency_metadata_rejected(&native_edge);
+
+    let mut substituted_direct_package = baseline.clone();
+    metadata_node_mut(&mut substituted_direct_package, "#fs4@1.1.0")["deps"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|dependency| dependency["name"] == "rustix")
+        .unwrap()["pkg"] = json!("registry+example#cc@1.0.0");
+    dependency_metadata_rejected(&substituted_direct_package);
+
+    let mut transitive_edge = baseline.clone();
+    metadata_node_mut(&mut transitive_edge, "#rustix@1.1.4")["deps"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "name": "bindgen",
+            "pkg": "registry+example#bindgen@1.0.0",
+            "dep_kinds": [{"kind": null, "target": null}]
+        }));
+    dependency_metadata_rejected(&transitive_edge);
+
+    let mut substituted_transitive_package = baseline.clone();
+    metadata_node_mut(&mut substituted_transitive_package, "#rustix@1.1.4")["deps"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|dependency| dependency["name"] == "bitflags")
+        .unwrap()["pkg"] = json!("registry+example#bindgen@1.0.0");
+    dependency_metadata_rejected(&substituted_transitive_package);
+
+    let mut target_drift = baseline.clone();
+    metadata_dependency_mut(
+        metadata_package_mut(&mut target_drift, "fs4", Some("1.1.0")),
+        "rustix",
+    )["target"] = json!("cfg(unix)");
+    dependency_metadata_rejected(&target_drift);
+}
+
+#[test]
+fn dependency_capability_malformed_duplicate_and_command_failure_rejects() {
+    dependency_metadata_rejected(&Value::Null);
+
+    let mut duplicate = dependency_metadata();
+    let fs4 = duplicate["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"] == "fs4" && package["version"] == "1.1.0")
+        .unwrap()
+        .clone();
+    duplicate["packages"].as_array_mut().unwrap().push(fs4);
+    dependency_metadata_rejected(&duplicate);
+
+    let output = gate(&[
+        "decision",
+        "verify-dependency-capabilities",
+        "--workspace-root",
+        "path-that-does-not-exist",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+}
+
 fn assert_policy_rejection(output: &Output) {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());

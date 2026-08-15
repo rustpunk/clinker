@@ -530,8 +530,8 @@ fn validate_ci_policy_jobs(jobs: &BTreeMap<String, Job>) -> Result<(), GateError
     )?;
     require_plain_command_step(
         &steps[2],
-        "Fetch locked policy dependencies",
-        "cargo fetch --manifest-path tools/dependency-policy/Cargo.toml --locked cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked",
+        "Fetch locked workspace and policy dependencies",
+        "cargo fetch --locked cargo fetch --manifest-path tools/dependency-policy/Cargo.toml --locked cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked",
     )?;
     require_plain_command_step(
         &steps[3],

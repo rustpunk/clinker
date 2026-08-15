@@ -1,6 +1,9 @@
 //! Core schema data model types.
 //!
-//! `SourceSchema` is the root type representing a `.schema.yaml` file.
+//! `SourceSchema` is the root advisory type representing a metadata-oriented
+//! `.schema.yaml` file. It is intentionally distinct from the planner-owned
+//! executable source-schema vocabulary; parsing this model never admits a
+//! pipeline for execution.
 //! `FieldDescriptor` is recursive — nested fields for JSON objects and XML
 //! elements are represented as children.
 
@@ -8,12 +11,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// A parsed `.schema.yaml` file describing a data source's structure.
+/// A parsed advisory `.schema.yaml` file describing a data source's structure.
 ///
 /// Schemas are version-controlled YAML files that define field names, types,
 /// and constraints. They serve three purposes: autocomplete (field names feed
 /// the editor), validation (pipelines referencing missing fields get warnings),
 /// and documentation (schemas describe data structure without requiring data).
+/// `clinker-plan` independently decides whether a pipeline can execute.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SourceSchema {
     /// Metadata from the `_schema` block.

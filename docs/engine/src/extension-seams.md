@@ -115,13 +115,13 @@ untyped JSON. Binding currently accepts every call-site resource because
 `validate_resources` is a stub, and the executor does not consume those values.
 Accepted input at this seam must not be mistaken for working runtime behavior.
 
-D-12 through D-15 assign the replacement to Phase 4 / AUTH-01: a bounded typed
+D-12 through D-15 assign the replacement to AUTH-01: a bounded typed
 kind registry, concrete named catalog, declared typed slots, fail-closed
 call-site and overlay binding, attempted-versus-winning provenance, and
 secret-safe preflight handles. Reusable content and compiled plans may retain
 only non-secret semantics and secret references; credentials and live handles
-are run-local and must be closed on failure. D-16 also requires Phase 4 to
-reject ordinary composition call-site `outputs` and `alias`, which currently
+are run-local and must be closed on failure. D-16 also requires rejection of
+ordinary composition call-site `outputs` and `alias`, which currently
 parse without providing the promised remapping or namespace. `_compose.outputs`,
 the composition node name, and the distinct overlay insertion alias remain
 valid concepts.
@@ -139,7 +139,7 @@ D-23. Each approves only the boundary named here:
 | D-20 | `clinker-format -> cxl` may import only logical type and document path/index vocabulary: `cxl::typecheck::Type` and `cxl::analyzer::doc_paths::{DocPath, DocIndex}`. | No parser, resolver, evaluator, planner, or other analyzer dependency. | Phase 1 contract; neutral extraction is deferred. |
 | D-21 | `clinker-exec -> clinker-bench-support` may remain optional behind `bench-alloc`, outside default and release graphs. | No default-runtime edge or trusted allocation claim until forwarding, allocator identity, plausible measurements, and distortion are qualified. | Phase 5 / PERF-07. |
 | D-22 | Direct `serde_saphyr::from_str*` calls belong only in `clinker-plan::yaml` and parser-specific tests. | No production or cross-module test bypass of `clinker_plan::yaml`. | Phase 2 repair; Phase 6 / EVID-03 qualification. |
-| D-23 | A manifest dependency remains only after source, build, generated-code, feature, test, and supported-API use is proven. | No speculative dependency or async/runtime coupling. | Phase 4 bounded cleanup. |
+| D-23 | A manifest dependency remains only after source, build, generated-code, feature, test, and supported-API use is proven. | No speculative dependency or async/runtime coupling. | CONT-05 bounded cleanup. |
 
 D-20 is implemented as a transitional exception. D-21 and D-23 are only
 partly implemented, and D-22's known executor-test bypass has not yet been

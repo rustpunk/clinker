@@ -142,6 +142,10 @@ A gate that was not run, or whose result was read from the wrong place, is a gat
 ## Repository Hygiene
 
 - The git identity for this repository is `rustpunk`, which is not the machine default. Check it before the first commit of a session.
+- Implementation stages are planning coordinates, not durable vocabulary. Never
+  name functions, types, tests, commands, diagnostics, comments, or committed
+  documentation after a phase number. Use the domain behavior or a stable
+  decision or requirement identifier instead.
 - Stage by explicit path. `git add -A` sweeps scratch and probe files that tooling leaves in the tree; review `git status` and `git show --stat` before pushing.
 - Never use `git add -f`. Ignored paths — `docs/internal/`, `notes/`, local settings — are ignored deliberately.
 - Local progress and tracking files stay out of git.

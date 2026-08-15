@@ -107,7 +107,7 @@ permanent stability.
 - **Counterexamples / limits:** Test-only loopback construction is not a
   production constructor. The borrowed credential applicator runs after
   admission and cannot replace the origin or fixed route; referenced credential
-  resolution remains Phase 4 AUTH-01 work.
+  resolution remains AUTH-01 work.
 - **Verified:** 2026-08-07.
 
 ### Run-scoped handles and registries

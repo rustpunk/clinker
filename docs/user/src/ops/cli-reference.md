@@ -22,22 +22,22 @@ clinker run [OPTIONS] <CONFIG>
 |------|---------|-------------|
 | `--memory-limit <SIZE>` | YAML `memory.limit`, else `512M` | Memory budget for the execution. Uses the same grammar as the YAML `memory.limit`: a byte count with an optional binary (1024-based) `K`/`M`/`G` suffix (`K` = 1024 bytes, `M` = 1024², `G` = 1024³), where a bare integer is bytes. Other forms — a decimal `GB`, an explicit `GiB`, or a fractional value such as `1.5G` — are rejected. When the limit is approached, aggregation operators spill to disk rather than crashing. When passed, this value overrides any `memory.limit` set in the pipeline YAML; when omitted, the YAML value applies (or the `512M` default when the YAML is also silent). An empty or whitespace-only value — as an ops wrapper produces when it forwards an unset variable, e.g. `--memory-limit "$CLINKER_MEM"` with `CLINKER_MEM` unset — is treated the same as omitting the flag. A non-empty malformed value (for example the decimal `4GB` rather than the binary `4G`) is rejected at the CLI boundary with an error naming `--memory-limit` and echoing the value, so a typo fails loudly instead of silently falling back to the default and shrinking a larger YAML budget. Because the flag simply populates `pipeline.memory.limit`, a startup budget error (`E312`) for a value you passed via `--memory-limit` refers to that same limit. |
 | `--threads <N>` | number of CPUs | Size of the executor thread pool. The selected value is also recorded in execution metrics. |
-| `--error-threshold <N>` | `0` | **Accepted but not enforced in the current binary.** Parsing this flag does not stop a run after that many DLQ records. Phase 4 / AUTH-05 owns the D-45 CLI audit that must wire it or replace it with a nonzero tombstone. |
+| `--error-threshold <N>` | `0` | **Accepted but not enforced in the current binary.** Parsing this flag does not stop a run after that many DLQ records. AUTH-05 and D-45 require the CLI audit to wire it or replace it with a nonzero tombstone. |
 | `--batch-id <ID>` | UUID v7 | Logical-batch correlation available as `pipeline.batch_id`, in `{batch_id}` output-path templates, machine events, and opt-in output provenance sidecars. Supplying it does not override the fresh UUIDv7 execution ID and does not provide deduplication, resume, or exactly-once behavior. It is not currently a field in the metrics-spool payload. |
 | `--machine ndjson-v1` | -- | Opt into the `clinker.run` schema-1 lifecycle on stdout. Requires a non-empty `--batch-id`; conflicts with plan/dry-run output and with `--lineage -` or `--lineage-events -`. File-based lineage remains compatible: a plan-only `--lineage <FILE>` export shares this stream's identity and closes it with an explicit empty publication inventory, since it runs no attempt. Every line is one compact JSON object; human diagnostics move to stderr. Consumers must concurrently drain both pipes, reject unsupported schema majors, accept only additive schema-1 fields, and reconcile exactly one supported terminal with the actual process status and current-attempt artifact evidence. EOF, malformed output, forced termination, or a missing/duplicate terminal is incomplete, never success. See [Running Clinker Directly or Under a Supervisor](orchestrator-contract.md). |
 | `--explain [FORMAT]` | `text` | Print the execution plan and exit without processing data. Accepted formats: `text`, `json`, `dot`. With `json` or `dot`, standard output carries only the document and human diagnostics move to stderr, so a consumer can redirect stdout straight into a parser; with `text` they stay together on stdout. See [Explain Plans](explain.md). |
 | `--lineage <PATH>` | -- | Preflight the workspace lineage identity policy, build column lineage, and write it as OpenLineage NDJSON, then exit without processing data. Give a file path, or `-` for stdout. The export is the whole invocation, so one that cannot be delivered exits non-zero rather than reporting success: a destination the exporter cannot write exits `4`, and an event the `[observability.lineage]` byte caps reject exits `1`. Each diagnostic names the destination, states which of the two failed, and prints the configuration change where one applies. A failed export leaves no partial file behind, so a following upload step cannot pick up a stale one. Both this flag and `--lineage-events` need the `lineage` capability, which the released binary has; a build compiled without it refuses the flag at validation rather than exiting zero having emitted nothing (see [Optional capabilities](../getting-started/installation.md#optional-capabilities)). See [Column Lineage](lineage.md). |
 | `--lineage-events <PATH>` | -- | Preflight the workspace lineage identity policy, run the pipeline, and emit live OpenLineage run events (a `START` at run begin, then a terminal `COMPLETE` / `FAIL` / `ABORT` with real timing and row counts) as NDJSON to a file path, or `-` for stdout. Cannot be combined with `--lineage`, `--explain`, `--dry-run`, or `-n`. With `-`, normal run output can interleave with the event stream; use a file for clean NDJSON. See [Live run events](lineage.md#live-run-events). |
 | `--dry-run` | -- | With no `-n`, loads and validates the pipeline configuration, prints resolved outputs, and exits before full plan compilation or data access. It does **not** currently type-check CXL or validate DAG wiring; use `--explain` for the current no-data compile check. |
-| `-n, --dry-run-n <N>` | -- | **Current limitation:** requires an explicit `--dry-run`, but the current binary does not apply the `N` limit and instead continues into a normal full run. Do not use this as a bounded preview. Phase 4 / AUTH-05 owns the D-45 fix. |
-| `--dry-run-output <FILE>` | -- | **Accepted but unused in the current binary.** It does not redirect output. Phase 4 / AUTH-05 must wire it or replace it with a nonzero tombstone. |
+| `-n, --dry-run-n <N>` | -- | **Current limitation:** requires an explicit `--dry-run`, but the current binary does not apply the `N` limit and instead continues into a normal full run. Do not use this as a bounded preview. AUTH-05 and D-45 require this behavior to be wired or rejected. |
+| `--dry-run-output <FILE>` | -- | **Accepted but unused in the current binary.** It does not redirect output. AUTH-05 requires it to be wired or replaced with a nonzero tombstone. |
 | `--rules-path <DIR>` | selected workspace's `rules/` | Select the CXL module rules root for this run. Precedence is explicit CLI value, then `pipeline.rules_path`, then `[catalog].rules_root`, then the workspace-relative `rules/` default. A relative value is anchored to the workspace selected by `--base-dir` or workspace discovery, not the process working directory. One root is selected; Clinker does not search multiple roots. See [Modules and `use`](../cxl/modules.md#rules-root-selection) and the [typed workspace catalog](../pipelines/channels.md#typed-workspace-catalog). |
 | `--base-dir <DIR>` | -- | Base directory for resolving relative paths in the YAML config. Defaults to the directory containing the config file. |
 | `--allow-absolute-paths` | -- | Permit absolute file paths in the pipeline YAML. By default, absolute paths are rejected to encourage portable configs. |
 | `--env <NAME>` | -- | Sets `CLINKER_ENV` in the current process before the pipeline loads. The current run path does not otherwise consume that value for channel selection; select a channel explicitly with `--channel`. |
 | `--quiet` | -- | Suppresses the “applied overlay” summary. Other stdout, tracing, warnings, and errors are not uniformly silenced. |
 | `--force` | -- | Overrides an output's `if_exists: error` policy and permits overwrite. Outputs using the default `if_exists: overwrite` already overwrite without this flag; `unique_suffix` keeps its own collision behavior. |
-| `--log-level <LEVEL>` | `info` | Logging verbosity: `error`, `warn`, `info`, `debug`, or `trace`. **Current limitation:** an unrecognized value is silently treated as `info` instead of being rejected; Phase 4 / AUTH-05 owns strict CLI typing. |
+| `--log-level <LEVEL>` | `info` | Logging verbosity: `error`, `warn`, `info`, `debug`, or `trace`. **Current limitation:** an unrecognized value is silently treated as `info` instead of being rejected; AUTH-05 requires strict CLI typing. |
 | `--metrics-spool-dir <DIR>` | -- | Directory for per-execution metrics files. See [Metrics & Monitoring](metrics.md). |
 | `--channel <ID>` | -- | Apply a logical id from `[catalog.channels]`. The selected file must also have a `[catalog.pipelines]` id listed in the channel manifest. Matching groups are target-bounded before labels narrow them. |
 | `--group <NAME>` | -- | Force-include a group overlay by name (repeatable). The selected pipeline or one of its admitted compositions must appear in the group's explicit `targets:` set. Use `clinker channels resolve` to preview the effective plan. |
@@ -46,7 +46,7 @@ clinker run [OPTIONS] <CONFIG>
 The limitations called out above are the current parser/runtime behavior, not
 recommended contracts. Decision D-45 requires every visible option to be
 wired and behavior-tested, or replaced by a nonzero tombstone with a
-paste-ready alternative. That audit is assigned to Phase 4 / AUTH-05.
+paste-ready alternative under AUTH-05.
 
 ### Examples
 
@@ -78,6 +78,43 @@ Machine mode adds a child-process control stream; it does not add scheduling,
 retry, heartbeat, or process-tree management to Clinker. A supervising parent
 must heartbeat independently of advisory progress and start a fresh process
 with a new execution ID for every retry.
+
+---
+
+## clinker explain
+
+Inspect one compiled field's provenance or discover registry-owned diagnostic
+descriptors.
+
+```text
+clinker explain <CONFIG> --field <PATH> [OPTIONS]
+clinker explain --list [--status <STATUS>] [--category <CATEGORY>]
+clinker explain --code <CODE>
+```
+
+Exactly one of `--field`, `--list`, or `--code` is required. A pipeline path is
+required only for `--field` and is rejected for the two static discovery modes.
+
+| Flag | Description |
+|------|-------------|
+| `--field <PATH>` | Explain one exact or unambiguous shorthand field address in the compiled pipeline. |
+| `--list` | Print every registered descriptor in stable code order. |
+| `--status <STATUS>` | With `--list`, require `active` or `retired-reserved`. |
+| `--category <CATEGORY>` | With `--list`, require one of `configuration`, `composition`, `source-and-expression`, `execution-and-format`, `terminal-authoring`, `security`, or `advisory`. |
+| `--code <CODE>` | Print one registered descriptor and its optional longer detail page. |
+| `--channel <ID>` | With `--field`, apply the selected channel before compiling provenance. |
+| `--group <NAME>` | With `--field`, force-include a group overlay (repeatable). |
+| `--no-auto-groups` | With `--field`, suppress selector-derived groups. |
+| `--base-dir <DIR>` | Workspace root used by the field-provenance compile path; defaults to `.`. |
+
+All seven descriptor fields—code, severity, status, category, retryability,
+meaning, and correction—come from the same leaf registry in both discovery
+views. Closed enum values in the descriptor use lowercase kebab-case; filter
+spellings come from the same enum tables used to parse those filters. A detail
+page can add examples but cannot define whether a code exists.
+Unknown or empty filters, no-match combinations, unknown codes, and conflicting
+modes exit nonzero. See [Explain Plans](explain.md) for examples and for the
+separate `clinker run --explain` plan display.
 
 ---
 
