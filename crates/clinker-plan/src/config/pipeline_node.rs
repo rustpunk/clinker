@@ -1728,7 +1728,7 @@ pub struct CombineBody {
 #[derive(Debug, Clone, Serialize)]
 pub struct OutputBody {
     #[serde(flatten)]
-    pub output: crate::config::OutputConfig,
+    pub output: crate::config::SinkConfig,
 }
 
 impl<'de> Deserialize<'de> for OutputBody {
@@ -1753,7 +1753,7 @@ impl<'de> Deserialize<'de> for OutputBody {
                 // loses nested item locations. Delegate the native map stream
                 // directly so `OutputMapping` can retain each sequence item's
                 // span for E364/E365.
-                let output = crate::config::OutputConfig::deserialize(
+                let output = crate::config::SinkConfig::deserialize(
                     de::value::MapAccessDeserializer::new(map),
                 )?;
                 Ok(OutputBody { output })

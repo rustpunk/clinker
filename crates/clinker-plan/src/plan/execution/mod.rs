@@ -40,7 +40,7 @@ use serde::Serialize;
 
 use std::sync::Arc;
 
-use crate::config::{AggregateConfig, OutputConfig, RouteMode, SortField, SourceConfig};
+use crate::config::{AggregateConfig, RouteMode, SinkConfig, SortField, SourceConfig};
 use crate::plan::composition_body::CompositionBodyId;
 use crate::plan::index::{AnalyticWindowSpec, IndexSpec};
 use crate::plan::row_type::QualifiedField;
@@ -688,7 +688,7 @@ pub struct PlanTransformPayload {
 /// Fully-resolved Output payload.
 #[derive(Debug, Clone)]
 pub struct PlanOutputPayload {
-    pub output: OutputConfig,
+    pub output: SinkConfig,
     pub validated_path: Option<crate::security::ValidatedPath>,
     /// Plan-time flag: this Output's path template uses a per-record
     /// token (`{source_file}` / `{source_path}`) AND its parent

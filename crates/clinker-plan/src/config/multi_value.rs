@@ -33,7 +33,7 @@ use clinker_format::{Column, OnConflict, SourceSchema, SplitToRowsMode, under_fi
 use crate::config::format::{InputFormat, OutputFormat};
 use crate::config::pipeline_node::PipelineNode;
 use crate::config::source::SourceConfig;
-use crate::config::{OutputConfig, XmlOutputOptions};
+use crate::config::{SinkConfig, XmlOutputOptions};
 use crate::yaml::Spanned;
 
 /// Whether an output format can encode a `multiple: true` field.
@@ -934,7 +934,7 @@ pub fn source_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
 /// can arise at runtime (a `match: collect` combine output), so a static
 /// requirement would reject a legitimate override; an entry that never matches
 /// an array is simply an inert override.
-fn validate_join_declarations(output: &OutputConfig) -> Vec<DeclarationFault> {
+fn validate_join_declarations(output: &SinkConfig) -> Vec<DeclarationFault> {
     let mut faults = Vec::new();
     let entries = output.join_values.as_deref().unwrap_or(&[]);
     if entries.is_empty() {

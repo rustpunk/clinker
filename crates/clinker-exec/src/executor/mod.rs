@@ -1821,7 +1821,7 @@ impl PipelineExecutor {
 /// pipeline. The probe registry is keyed for lookup, not presentation; walking
 /// it directly would sort advisories by output name.
 fn collect_mapping_advisories(
-    output_configs: &[clinker_plan::config::OutputConfig],
+    output_configs: &[clinker_plan::config::SinkConfig],
     mapping_probes: &BTreeMap<String, crate::projection::MappingProbe>,
 ) -> Vec<String> {
     output_configs

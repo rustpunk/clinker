@@ -21,7 +21,7 @@
 
 use std::path::Path;
 
-use clinker_plan::config::{OutputConfig, SourceConfig};
+use clinker_plan::config::{SinkConfig, SourceConfig};
 use clinker_plan::plan::execution::PlanNode;
 
 use crate::openlineage::Dataset;
@@ -166,13 +166,13 @@ pub(crate) fn source_dataset_identity(source: &SourceConfig, base_dir: &Path) ->
     DatasetId::file(name)
 }
 
-/// Dataset identity of an output node from its parsed [`OutputConfig`].
+/// Dataset identity of an output node from its parsed [`SinkConfig`].
 ///
 /// Always [`FILE_NAMESPACE`] + the absolutized output path. The path may be a
 /// template carrying tokens (e.g. `{source_file}`) or driving per-file `split:`
 /// fan-out; tokens are **not** resolved at plan time — the literal template
 /// form is kept verbatim as the dataset name.
-pub(crate) fn output_dataset_identity(output: &OutputConfig, base_dir: &Path) -> DatasetId {
+pub(crate) fn output_dataset_identity(output: &SinkConfig, base_dir: &Path) -> DatasetId {
     DatasetId::file(absolutize(base_dir, &output.path))
 }
 
@@ -308,7 +308,7 @@ mod tests {
         serde_json::from_value(value).expect("valid source config")
     }
 
-    fn output_config(value: serde_json::Value) -> OutputConfig {
+    fn output_config(value: serde_json::Value) -> SinkConfig {
         serde_json::from_value(value).expect("valid output config")
     }
 

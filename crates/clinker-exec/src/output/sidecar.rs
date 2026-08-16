@@ -1,6 +1,6 @@
 //! Provenance sidecar JSON writer.
 //!
-//! When `OutputConfig.write_meta` is `true`, a JSON file at
+//! When `SinkConfig.write_meta` is `true`, a JSON file at
 //! `<resolved_path>.meta.json` is emitted after the main stream is
 //! flushed. The sidecar answers "which pipeline produced this file?"
 //! without requiring the user to embed a hash in the filename.

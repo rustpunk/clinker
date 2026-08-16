@@ -28,7 +28,7 @@ use cxl::eval::{EvalContext, ProgramEvaluator, SkipReason, StableEvalContext};
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
-use clinker_plan::config::{ErrorStrategy, OutputConfig, PipelineConfig};
+use clinker_plan::config::{ErrorStrategy, PipelineConfig, SinkConfig};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::EntityRef;
 
@@ -1114,8 +1114,8 @@ pub(crate) struct ExecutorContext<'a> {
     /// runtime-retained slice of the former compile artifacts; resolved
     /// by `CompositionBodyId` via `composition_bodies.get(&id)`.
     pub(crate) composition_bodies: &'a CompositionBodies,
-    pub(crate) output_configs: &'a [OutputConfig],
-    pub(crate) primary_output: &'a OutputConfig,
+    pub(crate) output_configs: &'a [SinkConfig],
+    pub(crate) primary_output: &'a SinkConfig,
     pub(crate) stable: &'a StableEvalContext,
     /// Run-scoped non-blocking telemetry handle. Cloned only when enabled;
     /// `None` keeps dispatch on the zero-work signal path.
@@ -1739,7 +1739,7 @@ pub(crate) struct RetainedAggregatorState {
 pub(crate) fn mapping_probe<'p>(
     probes: &'p mut BTreeMap<String, crate::projection::MappingProbe>,
     output_name: &str,
-    out_cfg: &clinker_plan::config::OutputConfig,
+    out_cfg: &clinker_plan::config::SinkConfig,
 ) -> &'p mut crate::projection::MappingProbe {
     if !probes.contains_key(output_name) {
         probes.insert(
@@ -1757,7 +1757,7 @@ impl<'a> ExecutorContext<'a> {
     pub(crate) fn merge_mapping_probe(
         &mut self,
         output_name: &str,
-        out_cfg: &clinker_plan::config::OutputConfig,
+        out_cfg: &clinker_plan::config::SinkConfig,
         probe: &crate::projection::MappingProbe,
     ) {
         if out_cfg.mapping.is_some() {

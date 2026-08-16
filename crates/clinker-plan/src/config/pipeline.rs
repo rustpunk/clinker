@@ -293,7 +293,7 @@ impl PipelineConfig {
     }
 
     /// Public iterator over output nodes.
-    pub fn output_configs(&self) -> impl Iterator<Item = &OutputConfig> + '_ {
+    pub fn output_configs(&self) -> impl Iterator<Item = &SinkConfig> + '_ {
         self.nodes.iter().filter_map(|n| match &n.value {
             PipelineNode::Output { config: body, .. } => Some(&body.output),
             _ => None,
@@ -779,7 +779,7 @@ impl PipelineConfig {
         // two compile sites have converged onto this one.
         let source_configs: Vec<crate::config::SourceConfig> =
             self.source_configs().cloned().collect();
-        let output_configs: Vec<crate::config::OutputConfig> =
+        let output_configs: Vec<crate::config::SinkConfig> =
             self.output_configs().cloned().collect();
         let primary_source: String = source_configs
             .first()

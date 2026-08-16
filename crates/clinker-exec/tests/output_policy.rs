@@ -1,7 +1,7 @@
 //! End-to-end tests for the output collision policy and path templating.
 //!
 //! Covers each `if_exists` policy through `open_output`, the path-template
-//! interaction with `OutputConfig`, and a multi-threaded race test that
+//! interaction with `SinkConfig`, and a multi-threaded race test that
 //! exercises destination-local reservations under concurrent contention.
 
 use std::collections::HashMap;

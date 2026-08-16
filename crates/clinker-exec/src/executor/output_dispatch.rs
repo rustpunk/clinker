@@ -227,14 +227,14 @@ fn validate_writer_disposition(boundary: &PhysicalWriterBoundary) -> Result<(), 
     }
 }
 
-/// Resolve the [`OutputConfig`](clinker_plan::config::OutputConfig) for the
+/// Resolve the [`SinkConfig`](clinker_plan::config::SinkConfig) for the
 /// Output named `name`, falling back to the pipeline's primary output when no
 /// per-name entry exists. Borrows `ctx` immutably, so the caller resolves it
 /// before taking any `&mut ctx`.
 fn resolve_out_cfg<'a>(
     ctx: &'a ExecutorContext<'_>,
     name: &str,
-) -> &'a clinker_plan::config::OutputConfig {
+) -> &'a clinker_plan::config::SinkConfig {
     ctx.output_configs
         .iter()
         .find(|o| o.name == *name)
@@ -754,7 +754,7 @@ fn record_has_widened_extras(record: &Record) -> bool {
 /// minority.
 fn build_csv_union_schema(
     unbuffered: &[(Record, crate::executor::stream_event::SourceRowId)],
-    out_cfg: &clinker_plan::config::OutputConfig,
+    out_cfg: &clinker_plan::config::SinkConfig,
     cxl_emit_names_opt: Option<&[String]>,
 ) -> Arc<Schema> {
     let mut union: IndexSet<Box<str>> = IndexSet::new();
@@ -1290,14 +1290,14 @@ fn missing_output_input_error(
 /// state both write paths share. Bundling the four cross-branch borrows
 /// (error sink, the write / projection cumulative timers, and the
 /// stage-metric collector) with the per-call write descriptor (output
-/// name, resolved [`OutputConfig`](clinker_plan::config::OutputConfig), explicit
+/// name, resolved [`SinkConfig`](clinker_plan::config::SinkConfig), explicit
 /// CXL emit names, and the projected output schema) keeps the fan-out and
 /// single-writer helpers below clippy's argument threshold and gives them
 /// one shared shape — a change to how an Output write is attributed (e.g.
 /// a new metric guard) lands on the struct, not on two signatures.
 struct FanOutContext<'a> {
     name: &'a str,
-    out_cfg: &'a clinker_plan::config::OutputConfig,
+    out_cfg: &'a clinker_plan::config::SinkConfig,
     cxl_emit_names_opt: Option<&'a [String]>,
     output_schema: &'a Arc<clinker_record::Schema>,
     output_errors: &'a mut Vec<PipelineError>,

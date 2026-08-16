@@ -1554,7 +1554,7 @@ pub(crate) fn validate_log_event_shapes(
 /// is what covers the open-row and sidecar cases.
 fn validate_output_mapping_columns(
     node_name: &str,
-    output: &crate::config::OutputConfig,
+    output: &crate::config::SinkConfig,
     upstream: &Row,
     span: Span,
     diags: &mut Vec<Diagnostic>,
