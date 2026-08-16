@@ -100,9 +100,9 @@ inputs:
 }
 
 #[test]
-fn test_pipeline_node_parses_output() {
+fn test_pipeline_node_parses_sink() {
     let yaml = r#"
-type: output
+type: sink
 name: out_us
 input: rejoin
 config:
@@ -111,7 +111,35 @@ config:
   path: out_us.csv
 "#;
     let node = parse_node(yaml);
-    assert!(matches!(node.value, PipelineNode::Output { .. }));
+    assert!(matches!(node.value, PipelineNode::Sink { .. }));
+}
+
+#[test]
+fn test_pipeline_node_rejects_retired_output_with_e376_correction() {
+    let yaml = r#"
+type: output
+name: retired
+input: rejoin
+config:
+  name: retired
+  type: csv
+  path: retired.csv
+"#;
+    let err = from_str::<Spanned<PipelineNode>>(yaml)
+        .expect_err("the retired terminal discriminator must be rejected");
+    let message = err.to_string();
+    assert!(
+        message.contains("E376"),
+        "missing diagnostic code: {message}"
+    );
+    assert!(
+        message.contains("retired `type: output` spelling"),
+        "missing offending spelling: {message}"
+    );
+    assert!(
+        message.contains("Correction: type: sink"),
+        "missing paste-ready correction: {message}"
+    );
 }
 
 #[test]
@@ -201,7 +229,7 @@ nodes:
     input: src
     config:
       cxl: "emit foo = 1"
-  - type: output
+  - type: sink
     name: out
     input: clean
     config:
@@ -497,7 +525,7 @@ nodes:
     input: src
     config:
       cxl: "emit foo = 1"
-  - type: output
+  - type: sink
     name: out
     input: clean
     config:
@@ -529,7 +557,7 @@ nodes:
       schema:
         - { name: amount, type: string }
 
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -607,7 +635,7 @@ nodes:
       schema:
         - { name: amount, type: string }
 
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -782,7 +810,7 @@ nodes:
     input: src
     config:
       cxl: "emit bogus = not_a_column + 1"
-  - type: output
+  - type: sink
     name: out
     input: t
     config:
@@ -848,7 +876,7 @@ nodes:
     input: src
     config:
       cxl: "emit doubled = amount * 2"
-  - type: output
+  - type: sink
     name: out
     input: t
     config:

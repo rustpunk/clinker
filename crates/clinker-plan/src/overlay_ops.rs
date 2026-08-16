@@ -1248,7 +1248,7 @@ fn reroute_single_ref(node: &mut PipelineNode, from: &str, to: &str) {
         PipelineNode::Transform { header, .. }
         | PipelineNode::Aggregate { header, .. }
         | PipelineNode::Route { header, .. }
-        | PipelineNode::Output { header, .. }
+        | PipelineNode::Sink { header, .. }
         | PipelineNode::Reshape { header, .. }
         | PipelineNode::Cull { header, .. }
         | PipelineNode::Composition { header, .. } => repoint(&mut header.input.value, from, to),
@@ -2527,7 +2527,7 @@ nodes:
         - { name: amount, type: int }
         - { name: cust_id, type: string }
         - { name: order_notes, type: string }
-  - type: output
+  - type: sink
     name: sink
     input: orders
     config:

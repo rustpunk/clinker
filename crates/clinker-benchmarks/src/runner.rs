@@ -136,7 +136,7 @@ fn rewrite_split_output_paths(
     config: &mut clinker_plan::config::PipelineConfig,
 ) -> Option<TempDir> {
     let has_split = config.nodes.iter().any(|n| {
-        matches!(&n.value, PipelineNode::Output { config: body, .. } if body.output.split.is_some())
+        matches!(&n.value, PipelineNode::Sink { config: body, .. } if body.output.split.is_some())
     });
     if !has_split {
         return None;
@@ -159,7 +159,7 @@ fn rewrite_split_output_paths(
     unsafe { std::env::set_var("CLINKER_ALLOW_ABSOLUTE_PATHS", "1") };
 
     for node in &mut config.nodes {
-        if let PipelineNode::Output { config: body, .. } = &mut node.value
+        if let PipelineNode::Sink { config: body, .. } = &mut node.value
             && body.output.split.is_some()
         {
             let filename = std::path::Path::new(&body.output.path)

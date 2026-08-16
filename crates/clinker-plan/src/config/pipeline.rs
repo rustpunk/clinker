@@ -295,7 +295,7 @@ impl PipelineConfig {
     /// Public iterator over output nodes.
     pub fn output_configs(&self) -> impl Iterator<Item = &SinkConfig> + '_ {
         self.nodes.iter().filter_map(|n| match &n.value {
-            PipelineNode::Output { config: body, .. } => Some(&body.output),
+            PipelineNode::Sink { config: body, .. } => Some(&body.output),
             _ => None,
         })
     }
@@ -345,7 +345,7 @@ impl PipelineConfig {
             PipelineNode::Source { config: body, .. } if body.source.name == stage_name => {
                 body.source.notes.as_ref()
             }
-            PipelineNode::Output { config: body, .. } if body.output.name == stage_name => {
+            PipelineNode::Sink { config: body, .. } if body.output.name == stage_name => {
                 body.output.notes.as_ref()
             }
             PipelineNode::Transform { header, .. }
@@ -372,7 +372,7 @@ impl PipelineConfig {
                     body.source.notes = notes;
                     return;
                 }
-                PipelineNode::Output { config: body, .. } if body.output.name == stage_name => {
+                PipelineNode::Sink { config: body, .. } if body.output.name == stage_name => {
                     body.output.notes = notes;
                     return;
                 }
@@ -818,7 +818,7 @@ impl PipelineConfig {
                     analytic_window: None,
                 }),
                 PipelineNode::Source { .. }
-                | PipelineNode::Output { .. }
+                | PipelineNode::Sink { .. }
                 | PipelineNode::Merge { .. }
                 | PipelineNode::Reshape { .. }
                 | PipelineNode::Cull { .. }
@@ -1436,7 +1436,7 @@ impl PipelineConfig {
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Reshape { header, .. }
                 | PipelineNode::Cull { header, .. }
-                | PipelineNode::Output { header, .. } => {
+                | PipelineNode::Sink { header, .. } => {
                     wire(&input_full_reference(&header.input.value), None);
                 }
                 PipelineNode::Composition {
@@ -2714,7 +2714,7 @@ fn resolve_all_input_references(
             | PipelineNode::Route { header, .. }
             | PipelineNode::Reshape { header, .. }
             | PipelineNode::Cull { header, .. }
-            | PipelineNode::Output { header, .. } => {
+            | PipelineNode::Sink { header, .. } => {
                 emit(consumer_name, None, &header.input);
             }
             PipelineNode::Merge { header, .. } => {
@@ -2991,7 +2991,7 @@ fn stream_cardinality<'a>(
         | PipelineNode::Route { .. }
         | PipelineNode::Cull { .. }
         | PipelineNode::Reshape { .. }
-        | PipelineNode::Output { .. } => join_input_cardinality(by_name, node, visited),
+        | PipelineNode::Sink { .. } => join_input_cardinality(by_name, node, visited),
     }
 }
 
@@ -3992,7 +3992,7 @@ pub(crate) fn lower_node_to_plan_node(
                 output_schema: schema_from_bound(),
             })
         }
-        PipelineNode::Output { config, .. } => Some(PlanNode::Output {
+        PipelineNode::Sink { config, .. } => Some(PlanNode::Output {
             name: name.to_string(),
             id,
             span,
@@ -5685,7 +5685,7 @@ nodes:
         - {{ name: a, type: string }}
       options:
 {options_body}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -5712,7 +5712,7 @@ nodes:
       path: in.csv
       schema:
         - {{ name: a, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -5831,7 +5831,7 @@ nodes:
       path: in.csv
       schema:
         - {{ name: a, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -5916,7 +5916,7 @@ mod inert_metadata_tests {
 
     fn pipeline(metadata: &str) -> String {
         format!(
-            "pipeline:\n  name: inert_metadata\n{metadata}nodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: csv\n      path: in.csv\n      schema: [{{ name: id, type: int }}]\n  - type: output\n    name: out\n    input: src\n    config: {{ name: out, type: csv, path: out.csv }}\n"
+            "pipeline:\n  name: inert_metadata\n{metadata}nodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: csv\n      path: in.csv\n      schema: [{{ name: id, type: int }}]\n  - type: sink\n    name: out\n    input: src\n    config: {{ name: out, type: csv, path: out.csv }}\n"
         )
     }
 
@@ -6037,7 +6037,7 @@ nodes:
       path: in.csv
       schema:
         - {{ name: a, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

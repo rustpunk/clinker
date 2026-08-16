@@ -240,7 +240,7 @@ fn test_multi_output_route_targets_match_outputs() {
                 // Helper: check if any node has this port as its input
                 let has_downstream = |expected: &NodeInput| {
                     config.nodes.iter().any(|n| match &n.value {
-                        PipelineNode::Output { header, .. }
+                        PipelineNode::Sink { header, .. }
                         | PipelineNode::Transform { header, .. }
                         | PipelineNode::Aggregate { header, .. }
                         | PipelineNode::Route { header, .. } => header.input.value == *expected,

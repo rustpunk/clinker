@@ -1397,7 +1397,7 @@ pub(crate) fn validate_output_path_collisions(
     }
 
     for n in nodes {
-        let PipelineNode::Output { config, .. } = &n.value else {
+        let PipelineNode::Sink { config, .. } = &n.value else {
             continue;
         };
         let p = config.output.path.as_str();
@@ -2925,7 +2925,7 @@ fn bind_schema_inner(
                     artifacts.typed_insert(node_id, Arc::new(synthetic_typed_program(row)));
                 }
             }
-            PipelineNode::Output { header, config } => {
+            PipelineNode::Sink { header, config } => {
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     let row = upstream.clone();
                     validate_output_mapping_columns(&name, &config.output, &row, span, diags);
@@ -3351,7 +3351,7 @@ fn bind_composition(
                         }
                     }
                 }
-                PipelineNode::Output { config, .. } => {
+                PipelineNode::Sink { config, .. } => {
                     if let crate::config::OutputFormat::Csv(Some(opts)) = &config.output.format
                         && let Some(delimiter) = opts.delimiter.as_deref()
                     {
@@ -3399,7 +3399,7 @@ fn bind_composition(
                     SourceSchema::File(rel) => (rel, format!("source {:?}", config.source.name)),
                     _ => continue,
                 },
-                PipelineNode::Output { config, .. } => match &config.output.schema {
+                PipelineNode::Sink { config, .. } => match &config.output.schema {
                     Some(SourceSchema::File(rel)) => {
                         (rel, format!("output {:?}", config.output.name))
                     }
@@ -3428,7 +3428,7 @@ fn bind_composition(
         for (idx, inline) in resolved {
             match &mut body_file.nodes[idx].value {
                 PipelineNode::Source { config, .. } => config.schema = inline,
-                PipelineNode::Output { config, .. } => config.output.schema = Some(inline),
+                PipelineNode::Sink { config, .. } => config.output.schema = Some(inline),
                 _ => {}
             }
         }
@@ -3836,7 +3836,7 @@ fn bind_composition(
             | PipelineNode::Route { header, .. }
             | PipelineNode::Reshape { header, .. }
             | PipelineNode::Cull { header, .. }
-            | PipelineNode::Output { header, .. } => {
+            | PipelineNode::Sink { header, .. } => {
                 let r = match &header.input.value {
                     crate::config::node_header::NodeInput::Single(s) => s.clone(),
                     crate::config::node_header::NodeInput::Port { node, port } => {
@@ -3961,7 +3961,7 @@ fn bind_composition(
             | PipelineNode::Route { header, .. }
             | PipelineNode::Reshape { header, .. }
             | PipelineNode::Cull { header, .. }
-            | PipelineNode::Output { header, .. } => {
+            | PipelineNode::Sink { header, .. } => {
                 vec![match &header.input.value {
                     crate::config::node_header::NodeInput::Single(s) => s.clone(),
                     crate::config::node_header::NodeInput::Port { node, port } => {

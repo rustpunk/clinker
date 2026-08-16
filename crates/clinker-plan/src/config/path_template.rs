@@ -358,7 +358,7 @@ pub fn resolve_output_path_templates_in_place(
         .nodes
         .iter()
         .filter_map(|s| match &s.value {
-            PipelineNode::Output { config: body, .. } => Some(body.output.name.clone()),
+            PipelineNode::Sink { config: body, .. } => Some(body.output.name.clone()),
             _ => None,
         })
         .collect();
@@ -369,7 +369,7 @@ pub fn resolve_output_path_templates_in_place(
         .collect();
 
     for spanned in config.nodes.iter_mut() {
-        let PipelineNode::Output { config: body, .. } = &mut spanned.value else {
+        let PipelineNode::Sink { config: body, .. } = &mut spanned.value else {
             continue;
         };
         let output_name = body.output.name.clone();
