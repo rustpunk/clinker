@@ -627,7 +627,7 @@ pub(crate) fn output_mapping_faults_spanned(
 
     let mut faults = Vec::new();
     for (node_index, spanned) in nodes.iter().enumerate() {
-        let PipelineNode::Output {
+        let PipelineNode::Sink {
             header,
             config: body,
         } = &spanned.value
@@ -933,7 +933,7 @@ mod tests {
             format!(
                 "  - type: source\n    name: src\n    config:\n      name: src\n      \
                  type: csv\n      path: in.csv\n      schema:\n        - {{ name: sku, \
-                 type: string }}\n        - {{ name: qty, type: int }}\n  - type: output\n    \
+                 type: string }}\n        - {{ name: qty, type: int }}\n  - type: sink\n    \
                  name: out\n    input: src\n    config:\n      name: out\n      type: csv\n      \
                  path: out.csv\n{extra}      mapping:{mapping_value}"
             )

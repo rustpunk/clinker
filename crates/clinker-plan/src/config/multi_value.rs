@@ -1122,7 +1122,7 @@ pub fn output_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
     let mut faults = Vec::new();
     let reachability = source_data_reachability(nodes);
     for (node_index, spanned) in nodes.iter().enumerate() {
-        let PipelineNode::Output {
+        let PipelineNode::Sink {
             header,
             config: body,
         } = &spanned.value

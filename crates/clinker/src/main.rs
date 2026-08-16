@@ -4314,7 +4314,7 @@ fn apply_cli_force_policy(config: &mut clinker_plan::config::PipelineConfig, for
         return;
     }
     for node in &mut config.nodes {
-        if let clinker_plan::config::PipelineNode::Output { config: body, .. } = &mut node.value
+        if let clinker_plan::config::PipelineNode::Sink { config: body, .. } = &mut node.value
             && body.output.if_exists == clinker_plan::config::IfExistsPolicy::Error
         {
             body.output.if_exists = clinker_plan::config::IfExistsPolicy::Overwrite;
@@ -8506,7 +8506,7 @@ nodes:
       path: orders.csv
       schema:
         - { name: a, type: string }
-  - type: output
+  - type: sink
     name: out
     input: orders
     config:
@@ -8543,7 +8543,7 @@ nodes:
       path: orders.csv
       schema:
         - { name: a, type: string }
-  - type: output
+  - type: sink
     name: out
     input: orders
     config:

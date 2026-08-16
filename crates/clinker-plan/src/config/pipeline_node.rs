@@ -114,7 +114,7 @@ pub enum PipelineNode {
         header: CombineHeader,
         config: CombineBody,
     },
-    Output {
+    Sink {
         #[serde(flatten)]
         header: NodeHeader,
         config: OutputBody,
@@ -418,11 +418,23 @@ impl<'de> Deserialize<'de> for PipelineNode {
                         Ok(PipelineNode::Combine { header, config })
                     }
                     "output" => {
+                        let entry = clinker_core_types::diagnostic::registry_entry("E376")
+                            .ok_or_else(|| {
+                                de::Error::custom(
+                                    "internal error: reserved E376 diagnostic is missing",
+                                )
+                            })?;
+                        Err(de::Error::custom(format!(
+                            "{}: {}. Correction: {}",
+                            entry.code, entry.meaning, entry.correction
+                        )))
+                    }
+                    "sink" => {
                         let payload = OutputPayload::deserialize(
                             de::value::MapAccessDeserializer::new(dispatch),
                         )?;
                         let (header, config) = payload.into_variant_parts();
-                        Ok(PipelineNode::Output { header, config })
+                        Ok(PipelineNode::Sink { header, config })
                     }
                     "reshape" => {
                         let payload = ReshapePayload::deserialize(
@@ -460,7 +472,7 @@ impl<'de> Deserialize<'de> for PipelineNode {
                             "route",
                             "merge",
                             "combine",
-                            "output",
+                            "sink",
                             "reshape",
                             "cull",
                             "envelope",
@@ -516,7 +528,7 @@ impl SourcePayload {
     }
 }
 
-// ---- Transform / Aggregate / Route / Output (consumer NodeHeader) ----
+// ---- Transform / Aggregate / Route / Sink (consumer NodeHeader) ----
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1002,7 +1014,7 @@ impl PipelineNode {
             }
             PipelineNode::Source { .. }
             | PipelineNode::Merge { .. }
-            | PipelineNode::Output { .. }
+            | PipelineNode::Sink { .. }
             | PipelineNode::Composition { .. } => {}
         }
     }
@@ -1014,7 +1026,7 @@ impl PipelineNode {
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
+            | PipelineNode::Sink { header, .. }
             | PipelineNode::Reshape { header, .. }
             | PipelineNode::Cull { header, .. }
             | PipelineNode::Composition { header, .. } => &header.name,
@@ -1033,7 +1045,7 @@ impl PipelineNode {
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
+            | PipelineNode::Sink { header, .. }
             | PipelineNode::Reshape { header, .. }
             | PipelineNode::Cull { header, .. }
             | PipelineNode::Composition { header, .. } => Some(header.input.value.name()),
@@ -1051,7 +1063,7 @@ impl PipelineNode {
     ///
     /// `Source` has no inputs and yields an empty vector. The
     /// single-input consumer variants (`Transform`, `Aggregate`,
-    /// `Route`, `Output`, `Composition`) yield their one `input:`. The
+    /// `Route`, `Sink`, `Composition`) yield their one `input:`. The
     /// multi-input variants yield each entry of their input collection:
     /// `Merge` walks its ordered `inputs:` list, `Combine` walks its
     /// named `input:` map in insertion order.
@@ -1066,7 +1078,7 @@ impl PipelineNode {
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
+            | PipelineNode::Sink { header, .. }
             | PipelineNode::Reshape { header, .. }
             | PipelineNode::Cull { header, .. }
             | PipelineNode::Composition { header, .. } => vec![header.input.value.name()],
@@ -1115,7 +1127,7 @@ impl PipelineNode {
             PipelineNode::Route { .. } => "route",
             PipelineNode::Merge { .. } => "merge",
             PipelineNode::Combine { .. } => "combine",
-            PipelineNode::Output { .. } => "output",
+            PipelineNode::Sink { .. } => "sink",
             PipelineNode::Reshape { .. } => "reshape",
             PipelineNode::Cull { .. } => "cull",
             PipelineNode::Envelope { .. } => "envelope",
@@ -1124,7 +1136,7 @@ impl PipelineNode {
     }
 
     /// The single upstream input reference for the single-input consumer
-    /// variants (`Transform`, `Aggregate`, `Route`, `Output`, `Reshape`,
+    /// variants (`Transform`, `Aggregate`, `Route`, `Sink`, `Reshape`,
     /// `Cull`, `Composition`). Returns `None` for `Source` (no input) and for
     /// the multi-input / multi-port variants (`Merge`, `Combine`, `Envelope`),
     /// whose wiring the caller must walk explicitly through their own input
@@ -1138,7 +1150,7 @@ impl PipelineNode {
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
+            | PipelineNode::Sink { header, .. }
             | PipelineNode::Reshape { header, .. }
             | PipelineNode::Cull { header, .. }
             | PipelineNode::Composition { header, .. } => Some(&header.input.value),
@@ -1160,7 +1172,7 @@ impl PipelineNode {
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
+            | PipelineNode::Sink { header, .. }
             | PipelineNode::Reshape { header, .. }
             | PipelineNode::Cull { header, .. }
             | PipelineNode::Composition { header, .. } => {
@@ -1183,7 +1195,7 @@ impl PipelineNode {
     /// overlay op engine's `set config.cxl` uses to replace a stage's logic
     /// wholesale; the supplied [`CxlSource`] carries the op's span so a later
     /// typecheck error anchors to the override, not the base pipeline. Every
-    /// other variant (`Source`, `Route`, `Merge`, `Output`, `Reshape`, `Cull`,
+    /// other variant (`Source`, `Route`, `Merge`, `Sink`, `Reshape`, `Cull`,
     /// `Envelope`, `Composition`) has no single primary `cxl:` field and is
     /// left unchanged.
     pub fn set_primary_cxl(&mut self, cxl: CxlSource) -> bool {
@@ -1203,7 +1215,7 @@ impl PipelineNode {
             PipelineNode::Source { .. }
             | PipelineNode::Route { .. }
             | PipelineNode::Merge { .. }
-            | PipelineNode::Output { .. }
+            | PipelineNode::Sink { .. }
             | PipelineNode::Reshape { .. }
             | PipelineNode::Cull { .. }
             | PipelineNode::Envelope { .. }
@@ -2113,7 +2125,7 @@ nodes:
     resources:
       db: shared.db
 
-  - type: output
+  - type: sink
     name: out
     input: totals
     config:
@@ -2139,7 +2151,7 @@ nodes:
             &doc.nodes[5].value,
             PipelineNode::Composition { .. }
         ));
-        assert!(matches!(&doc.nodes[6].value, PipelineNode::Output { .. }));
+        assert!(matches!(&doc.nodes[6].value, PipelineNode::Sink { .. }));
     }
 
     /// Verifies unknown node types produce a clear error naming the tag.
