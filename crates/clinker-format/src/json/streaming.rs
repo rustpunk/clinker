@@ -24,6 +24,12 @@ use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess,
 
 use crate::error::FormatError;
 
+// `serde_json` presents a number to a generic `deserialize_any` visitor as a
+// one-entry map when `arbitrary_precision` is enabled. This is the same token
+// its own `Value` visitor recognizes; handling it here keeps the counting
+// visitor semantically identical while preserving the number's source lexeme.
+const ARBITRARY_PRECISION_NUMBER_TOKEN: &str = "$serde_json::private::Number";
+
 /// One declared section's RFC 6901 pointer, decoded to path segments, plus
 /// its author-chosen name.
 ///
@@ -403,6 +409,26 @@ impl<'de, 'a, 's> Visitor<'de> for CountingValueVisitor<'a, 's> {
 
     fn visit_map<M: MapAccess<'de>>(mut self, mut map: M) -> Result<serde_json::Value, M::Error> {
         let mut out = serde_json::Map::new();
+        let Some(first_key) = map.next_key::<String>()? else {
+            return Ok(serde_json::Value::Object(out));
+        };
+
+        if first_key == ARBITRARY_PRECISION_NUMBER_TOKEN {
+            let lexeme = map.next_value::<String>()?;
+            self.charge(lexeme.len())?;
+            let number = lexeme
+                .parse::<serde_json::Number>()
+                .map_err(serde::de::Error::custom)?;
+            return Ok(serde_json::Value::Number(number));
+        }
+
+        self.charge(first_key.len())?;
+        let first_value = map.next_value_seed(CountingValueSeed {
+            section: self.section,
+            state: self.state,
+        })?;
+        out.insert(first_key, first_value);
+
         while let Some(key) = map.next_key::<String>()? {
             // Charge the key bytes (the retained map owns the key string).
             self.charge(key.len())?;
@@ -413,5 +439,39 @@ impl<'de, 'a, 's> Visitor<'de> for CountingValueVisitor<'a, 's> {
             out.insert(key, value);
         }
         Ok(serde_json::Value::Object(out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SectionTarget, extract_sections};
+    use std::io::{BufReader, Cursor};
+
+    #[test]
+    fn retained_sections_preserve_arbitrary_precision_number_nodes() {
+        const HUGE: &str = "1234567890123456789012345678901234567890";
+        let source = format!(r#"{{"Meta":{{"ratio":0.5,"huge":{HUGE}}}}}"#);
+        let mut reader = BufReader::new(Cursor::new(source.as_bytes()));
+        let targets = [SectionTarget::new("Meta".into(), "/Meta")];
+
+        let sections = extract_sections(&mut reader, &targets, None).expect("extract Meta");
+        let meta = sections
+            .get("Meta")
+            .and_then(serde_json::Value::as_object)
+            .expect("Meta object");
+
+        assert_eq!(meta["ratio"].as_f64(), Some(0.5));
+        assert_eq!(meta["huge"].to_string(), HUGE);
+    }
+
+    #[test]
+    fn arbitrary_precision_number_lexemes_count_against_the_section_cap() {
+        let source = br#"{"Meta":1234567890123456789012345678901234567890}"#;
+        let mut reader = BufReader::new(Cursor::new(source));
+        let targets = [SectionTarget::new("Meta".into(), "/Meta")];
+
+        let error = extract_sections(&mut reader, &targets, Some(8)).unwrap_err();
+
+        assert!(error.to_string().contains("document-index cap exceeded"));
     }
 }
