@@ -212,7 +212,13 @@ fn verify_serde_json_contract(
     require_string_set(
         serde_node,
         "features",
-        &["default", "indexmap", "preserve_order", "std"],
+        &[
+            "arbitrary_precision",
+            "default",
+            "indexmap",
+            "preserve_order",
+            "std",
+        ],
         "resolved serde_json features",
     )?;
 
@@ -239,7 +245,7 @@ fn verify_serde_json_contract(
                 "serde_json",
                 "^1",
                 true,
-                &["preserve_order"],
+                &["arbitrary_precision", "preserve_order"],
                 None,
                 "workspace serde_json declaration",
             )?;
@@ -258,6 +264,7 @@ fn verify_fs4_consumer_contract(
     packages: &[serde_json::Value],
 ) -> Result<(), GateError> {
     let expected = BTreeMap::from([
+        ("clinker", "crates/clinker/Cargo.toml"),
         ("clinker-channel", "crates/clinker-channel/Cargo.toml"),
         ("clinker-exec", "crates/clinker-exec/Cargo.toml"),
     ]);
@@ -311,7 +318,7 @@ fn verify_fs4_consumer_contract(
     let expected_consumers: BTreeSet<_> = expected.keys().copied().collect();
     if consumers != expected_consumers {
         return Err(policy(
-            "direct fs4 consumers must be exactly clinker-channel and clinker-exec",
+            "direct fs4 consumers must be exactly clinker, clinker-channel, and clinker-exec",
         ));
     }
     Ok(())

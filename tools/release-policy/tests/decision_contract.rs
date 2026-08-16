@@ -374,6 +374,30 @@ fn dependency_capability_real_workspace_passes() {
         b"Approved dependency capabilities verified\n"
     );
     assert!(output.stderr.is_empty());
+
+    let mut metadata = dependency_metadata();
+    let serde_json = metadata_dependency_mut(
+        metadata_package_mut(&mut metadata, "clinker-format", None),
+        "serde_json",
+    );
+    assert_eq!(
+        serde_json["features"],
+        json!(["arbitrary_precision", "preserve_order"])
+    );
+
+    let fs4 = metadata_dependency_mut(metadata_package_mut(&mut metadata, "clinker", None), "fs4");
+    assert_eq!(fs4["features"], json!(["sync"]));
+    assert_eq!(fs4["uses_default_features"], json!(false));
+
+    let fixture = repository_root().join("tools/no-c-gate-fixture");
+    assert!(fixture.join("build.rs").is_file());
+    assert!(
+        metadata["packages"]
+            .as_array()
+            .expect("metadata packages")
+            .iter()
+            .all(|package| package["name"] != "clinker-no-c-gate-fixture")
+    );
 }
 
 #[test]
@@ -385,22 +409,38 @@ fn dependency_capability_feature_and_consumer_drift_rejects() {
     )
     .expect("real metadata contract");
 
-    let mut premature_precision = baseline.clone();
+    let mut missing_precision = baseline.clone();
     metadata_dependency_mut(
-        metadata_package_mut(&mut premature_precision, "clinker-format", None),
+        metadata_package_mut(&mut missing_precision, "clinker-format", None),
         "serde_json",
-    )["features"] = json!(["arbitrary_precision", "preserve_order"]);
-    dependency_metadata_rejected(&premature_precision);
+    )["features"] = json!(["preserve_order"]);
+    dependency_metadata_rejected(&missing_precision);
 
     let mut raw_value = baseline.clone();
     metadata_dependency_mut(
         metadata_package_mut(&mut raw_value, "clinker-format", None),
         "serde_json",
-    )["features"] = json!(["preserve_order", "raw_value"]);
+    )["features"] = json!(["arbitrary_precision", "preserve_order", "raw_value"]);
     dependency_metadata_rejected(&raw_value);
 
+    let mut missing_resolved_precision = baseline.clone();
+    metadata_node_mut(&mut missing_resolved_precision, "#serde_json@1.0.149")["features"] =
+        json!(["default", "indexmap", "preserve_order", "std"]);
+    dependency_metadata_rejected(&missing_resolved_precision);
+
+    let mut extra_resolved_feature = baseline.clone();
+    metadata_node_mut(&mut extra_resolved_feature, "#serde_json@1.0.149")["features"] = json!([
+        "arbitrary_precision",
+        "default",
+        "indexmap",
+        "preserve_order",
+        "raw_value",
+        "std"
+    ]);
+    dependency_metadata_rejected(&extra_resolved_feature);
+
     let mut missing_consumer = baseline.clone();
-    metadata_package_mut(&mut missing_consumer, "clinker-channel", None)["dependencies"]
+    metadata_package_mut(&mut missing_consumer, "clinker", None)["dependencies"]
         .as_array_mut()
         .unwrap()
         .retain(|dependency| dependency["name"] != "fs4");
@@ -412,7 +452,7 @@ fn dependency_capability_feature_and_consumer_drift_rejects() {
         "fs4",
     )
     .clone();
-    metadata_package_mut(&mut unapproved_consumer, "clinker", None)["dependencies"]
+    metadata_package_mut(&mut unapproved_consumer, "clinker-plan", None)["dependencies"]
         .as_array_mut()
         .unwrap()
         .push(Value::Object(fs4));
@@ -420,10 +460,17 @@ fn dependency_capability_feature_and_consumer_drift_rejects() {
 
     let mut wrong_kind = baseline.clone();
     metadata_dependency_mut(
-        metadata_package_mut(&mut wrong_kind, "clinker-exec", None),
+        metadata_package_mut(&mut wrong_kind, "clinker", None),
         "fs4",
     )["kind"] = json!("dev");
     dependency_metadata_rejected(&wrong_kind);
+
+    let mut wrong_fs4_feature = baseline.clone();
+    metadata_dependency_mut(
+        metadata_package_mut(&mut wrong_fs4_feature, "clinker", None),
+        "fs4",
+    )["features"] = json!([]);
+    dependency_metadata_rejected(&wrong_fs4_feature);
 
     let mut version_drift = baseline.clone();
     metadata_package_mut(&mut version_drift, "serde_json", Some("1.0.149"))["version"] =
