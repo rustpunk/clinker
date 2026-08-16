@@ -216,9 +216,15 @@ When a source declares a `correlation_key:`, the engine tracks correlation-group
 
 `include_correlation_keys` does **not** surface auto-widened columns -- `include_unmapped` is the separate flag for that. The two are independent: each, both, or neither can be set.
 
-### Nested columns and non-JSON writers
+### Nested columns and writer capabilities
 
-The CSV, XML, fixed-width, EDIFACT, X12, and HL7 writers can only write flat scalar columns; a nested value reaching one of them fails with an `UnserializableMapValue` error. JSON writes nested values natively. The usual cause is an auto-widened column reaching a non-JSON writer with `include_unmapped: false` — see [Auto-Widen & Schema Drift](../formats/auto-widen.md#writer-errors-on-unexpanded-columns) for the fix.
+JSON and XML write map and array values recursively. JSON uses native objects
+and arrays; XML maps ordinary keys to child elements, reserves unescaped
+`@...`/`#text` keys for attributes/text, and repeats a child name for arrays.
+CSV, fixed-width, EDIFACT, X12, and HL7 remain scalar formats and reject a map
+that reaches a column slot. See [JSON](../formats/json.md#native-map-and-array-values),
+[XML](../formats/xml.md#native-map-and-array-values), and
+[Auto-Widen & Schema Drift](../formats/auto-widen.md#writer-errors-on-unexpanded-columns).
 
 ### Field mapping
 

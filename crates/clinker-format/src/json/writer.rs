@@ -166,6 +166,15 @@ impl<W: Write> JsonWriter<W> {
     fn serialize_record(&mut self, record: &Record) -> Result<(), FormatError> {
         use serde::Serialize as _;
         self.ensure_plan(record)?;
+        for (index, value) in record.values().iter().enumerate() {
+            if !self.config.include_engine_stamped && record.schema().is_engine_stamped(index) {
+                continue;
+            }
+            clinker_record::nested_key::validate_nested_depth(value)
+                .map_err(|error| FormatError::Json(error.to_string()))?;
+            clinker_record::nested_key::validate_nested_keys(value)
+                .map_err(|error| FormatError::Json(error.to_string()))?;
+        }
         // Disjoint field borrows: serializing reads the plan (`plan_cache`)
         // while writing into `scratch`.
         let Self {
@@ -480,10 +489,21 @@ pub(crate) fn clinker_to_json(val: &Value) -> Result<serde_json::Value, FormatEr
         Value::DateTime(dt) => Jv::String(dt.to_string()),
         Value::Array(arr) => Jv::Array(arr.iter().map(clinker_to_json).collect::<Result<_, _>>()?),
         Value::Map(m) => {
-            let obj = m
-                .iter()
-                .map(|(k, v)| Ok((k.to_string(), clinker_to_json(v)?)))
-                .collect::<Result<_, FormatError>>()?;
+            let mut obj = serde_json::Map::with_capacity(m.len());
+            for (raw_key, value) in m.iter() {
+                let key = clinker_record::nested_key::NestedKey::decode(raw_key)
+                    .map_err(|error| FormatError::Json(error.to_string()))?;
+                let logical_key = key.text.into_owned();
+                if obj
+                    .insert(logical_key.clone(), clinker_to_json(value)?)
+                    .is_some()
+                {
+                    return Err(FormatError::Json(format!(
+                        "duplicate logical nested key {:?}",
+                        logical_key
+                    )));
+                }
+            }
             Jv::Object(obj)
         }
     })
@@ -702,7 +722,9 @@ impl serde::Serialize for ValueSer<'_> {
             Value::Map(m) => {
                 let mut map = serializer.serialize_map(Some(m.len()))?;
                 for (k, v) in m.iter() {
-                    map.serialize_entry(k.as_ref(), &ValueSer(v))?;
+                    let key = clinker_record::nested_key::NestedKey::decode(k)
+                        .map_err(S::Error::custom)?;
+                    map.serialize_entry(key.text.as_ref(), &ValueSer(v))?;
                 }
                 map.end()
             }

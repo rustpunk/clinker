@@ -76,7 +76,12 @@ Different records can carry different auto-widened columns — for example a `Me
 
 ### Writer errors on unexpanded columns
 
-The CSV, XML, and fixed-width writers can only write flat scalar columns. If a `$widened` sidecar map reaches one of these writers without being expanded — which happens when you set `include_unmapped: false` but a nested value is still present — the write fails with an `UnserializableMapValue` error naming the format and column. (JSON has no such limit; it writes nested values natively.)
+CSV and fixed-width writers can only write flat scalar columns. If an
+unexpanded map reaches one of those writers, the write fails with an
+`UnserializableMapValue` error naming the format and column. JSON and XML can
+write a user-visible nested value natively, although the engine-stamped
+`$widened` sidecar is still expanded or stripped by the Output projection and
+is never an author-facing XML structure.
 
 The fix is to either leave `include_unmapped` at its default of `true`, so the columns are expanded to top-level before writing, or to convert the value to a scalar in CXL before emitting it. The error message lists both routes.
 

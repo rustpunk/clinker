@@ -221,6 +221,29 @@ in full on [Field Paths](../cxl/field-paths.md):
   as that map or array. Expansion adds structure above the value, never inside
   it.
 
+### Native map and array values
+
+CXL can construct maps, arrays, and array comprehensions directly; a JSON
+output writes those values recursively as native objects and arrays. Map key
+insertion order and array item order are preserved:
+
+```cxl
+emit payload = {
+  customer: customer_name,
+  items: [{sku: item.sku, quantity: item.quantity} for item in line_items],
+}
+```
+
+The output contains `"payload"` as an object with an `"items"` array. There is
+no implicit stringification or fallback encoding. Canonically escaped neutral
+keys are decoded before JSON writes them: the CXL key spelling `"\\@literal"`
+writes the JSON key `"@literal"`.
+
+Before writing any bytes for a record, the writer validates all nested keys,
+rejects duplicate logical keys, and enforces the shared 64-container depth
+limit. A failed nested value therefore cannot leave a partial JSON record in
+the output.
+
 ### Keeping a literal `.` in a key
 
 To emit a key that genuinely contains a `.`, escape the separator in the column

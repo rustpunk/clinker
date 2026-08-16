@@ -1,6 +1,6 @@
 # Streaming Output Writes
 
-Output nodes are the terminal sinks of a pipeline. When the planner certifies a single linear producer feeding one Output, the executor can take a **streaming handoff** that wires the producer arm to a dedicated writer thread through a bounded crossbeam channel and fires `Writer::write_record` per record, concurrent with producer emission. Other producer shapes materialize their output before the writer fires. This page covers the topology that selects the streaming handoff, its relationship to Source-to-Merge fusion, the back-pressure chain, the counter semantics that must match the buffered arm, and the writer contract that rejects `Value::Map` payloads.
+Output nodes are the terminal sinks of a pipeline. When the planner certifies a single linear producer feeding one Output, the executor can take a **streaming handoff** that wires the producer arm to a dedicated writer thread through a bounded crossbeam channel and fires `Writer::write_record` per record, concurrent with producer emission. Other producer shapes materialize their output before the writer fires. This page covers the topology that selects the streaming handoff, its relationship to Source-to-Merge fusion, the back-pressure chain, the counter semantics that must match the buffered arm, and the per-format nested-value contract.
 
 *User-facing view: the User Guide's "Output Nodes" page.*
 
@@ -296,14 +296,23 @@ Counter behavior under the streaming path matches the buffered Output arm **exac
 
 Stage metrics (`SchemaScan`, `Write`, `Projection`) accumulate into the same fields the buffered path uses. The dispatcher folds the streaming task's per-task accounting back into the run-wide totals at end of DAG, so a streaming run and a buffered run over the same input produce identical counter output.
 
-## Writer rejection of `Value::Map` payloads
+## Writer handling of `Value::Map` payloads
 
-CSV, XML, fixed-width, EDIFACT, X12, and HL7 writers **refuse** records carrying a `Value::Map` payload at any column slot, raising:
+CSV, fixed-width, EDIFACT, X12, and HL7 writers **refuse** records carrying a `Value::Map` payload at any column slot, raising:
 
 ```
 FormatError::UnserializableMapValue { format, column }
 ```
 
-JSON is the exception — it serializes `Value::Map` natively as a nested object.
+JSON serializes `Value::Map` natively as a nested object. XML also accepts a
+map at an element field and recursively maps ordinary keys to child elements,
+unescaped `@...` keys to attributes, `#text` to text, and arrays to repeated
+children. Both recursive writers validate the shared key grammar, decoded-key
+collisions, and the 64-container depth cap before any record bytes reach the
+sink.
 
-The typical cause is a `$widened` sidecar reaching a non-JSON writer because the Output node set `include_unmapped: false`, which strips the sidecar's expansion and leaves the raw `Value::Map` slot to hit the writer. The contract is the same on the streaming and buffered paths: the writer rejects the map-valued record rather than emitting a malformed row. See [Schema Drift & the `$widened` Sidecar](auto-widen-internals.md) for the sidecar lifecycle, the `include_unmapped` interaction, and the remediation routes for this rejection.
+The engine-stamped `$widened` sidecar is handled at projection: it is expanded
+or stripped rather than exposed as author XML. The contract is the same on the
+streaming and buffered paths. See
+[Schema Drift & the `$widened` Sidecar](auto-widen-internals.md) for that
+lifecycle.

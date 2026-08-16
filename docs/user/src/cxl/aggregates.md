@@ -98,10 +98,10 @@ cxl: |
   emit all_order_ids = collect(order_id)
 ```
 
-Because `collect` emits an array, route the result to a JSON output
-(which serializes arrays natively) or coerce it to a scalar in a
-downstream `Transform` (for example `emit ids = all_order_ids.join(";")`).
-The CSV, XML, and fixed-width writers reject an array-valued field.
+Because `collect` emits an array, JSON writes it as a native array, XML as
+repeated child elements, and CSV as a delimited cell. Coerce it to a scalar for
+a format such as fixed-width (for example
+`emit ids = all_order_ids.join(";")`).
 
 ### weighted_avg(value, weight) -> Float or Decimal
 

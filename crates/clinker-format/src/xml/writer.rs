@@ -25,6 +25,7 @@ use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::name::QName;
 
 use clinker_record::field_path::{self, FieldPathError};
+use clinker_record::nested_key::{NestedKey, validate_nested_depth, validate_nested_keys};
 use clinker_record::{DocumentContext, Record, Schema, Value};
 
 use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
@@ -140,8 +141,8 @@ impl<W: Write> XmlWriter<W> {
 
     /// Fill the reusable `fill` buffer with this record's rendered field values
     /// and per-field presence, in the same iterator order the plan indexes.
-    /// Runs before any bytes are emitted, so a `Value::Map` field (rejected by
-    /// [`write_value_text`]) fails the record without leaving partial output.
+    /// Runs before any bytes are emitted, so malformed recursive values fail
+    /// the record without leaving partial output.
     fn fill_values(&mut self, record: &Record) -> Result<(), FormatError> {
         let Self {
             plan_cache,
@@ -152,14 +153,29 @@ impl<W: Write> XmlWriter<W> {
         let cache = plan_cache.as_ref().expect("plan built before fill_values");
         let flags = &cache.field_is_attr;
         let preserve = config.preserve_nulls;
+        let attribute_prefix = &config.attribute_prefix;
         fill.reset(flags.len());
         if config.include_engine_stamped {
             for (i, (name, val)) in record.iter_all_fields().enumerate() {
-                fill_slot(&mut fill.slots[i], flags[i], preserve, name, val)?;
+                fill_slot(
+                    &mut fill.slots[i],
+                    flags[i],
+                    preserve,
+                    attribute_prefix,
+                    name,
+                    val,
+                )?;
             }
         } else {
             for (i, (name, val)) in record.iter_user_fields().enumerate() {
-                fill_slot(&mut fill.slots[i], flags[i], preserve, name, val)?;
+                fill_slot(
+                    &mut fill.slots[i],
+                    flags[i],
+                    preserve,
+                    attribute_prefix,
+                    name,
+                    val,
+                )?;
             }
         }
         Ok(())
@@ -187,13 +203,38 @@ impl<W: Write> XmlWriter<W> {
         if let Some((field, ref v)) = count_value {
             pairs.push((field, v));
         }
-        let tree = build_field_tree(&pairs, config.preserve_nulls, &config.attribute_prefix)?;
+        let names = pairs.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+        let (plan, field_is_attr) = build_tree_plan(&names, config)?;
+        let mut fill = FillBuf::new();
+        fill.reset(pairs.len());
+        for (index, (name, value)) in pairs.iter().enumerate() {
+            fill_slot(
+                &mut fill.slots[index],
+                field_is_attr[index],
+                config.preserve_nulls,
+                &config.attribute_prefix,
+                name,
+                value,
+            )?;
+        }
+        let values = pairs.iter().map(|(_, value)| *value).collect::<Vec<_>>();
         let mut start = BytesStart::new(wrapper);
-        push_attributes(&mut start, &tree.attrs);
+        for attr in &plan.root.attrs {
+            if fill.emits(attr.field) {
+                push_one_attribute(&mut start, &attr.name, fill.text(attr.field));
+            }
+        }
         writer
             .write_event(Event::Start(start))
             .map_err(|e| FormatError::Xml(e.to_string()))?;
-        write_field_tree(writer, &tree.children)?;
+        emit_body(
+            writer,
+            &plan.root,
+            &fill,
+            &values,
+            config.preserve_nulls,
+            &config.attribute_prefix,
+        )?;
         let end = BytesEnd::new(wrapper);
         writer
             .write_event(Event::End(end))
@@ -220,70 +261,23 @@ impl<W: Write> XmlWriter<W> {
     }
 }
 
-/// Recursively write a field tree as nested XML elements. Takes the emitter
-/// directly rather than `&mut self`, so a caller can render an envelope section
-/// while holding a disjoint borrow of the framer.
-fn write_field_tree<W: Write>(
-    writer: &mut XmlEmitter<W>,
-    nodes: &[FieldNode],
-) -> Result<(), FormatError> {
-    for node in nodes {
-        match node {
-            FieldNode::Leaf { name, text } => {
-                if text.is_empty() {
-                    // Self-closing empty element (for preserve_nulls: true)
-                    let elem = BytesStart::new(name.as_str());
-                    writer
-                        .write_event(Event::Empty(elem))
-                        .map_err(|e| FormatError::Xml(e.to_string()))?;
-                } else {
-                    let start = BytesStart::new(name.as_str());
-                    writer
-                        .write_event(Event::Start(start))
-                        .map_err(|e| FormatError::Xml(e.to_string()))?;
-                    let text_event = BytesText::new(text);
-                    writer
-                        .write_event(Event::Text(text_event))
-                        .map_err(|e| FormatError::Xml(e.to_string()))?;
-                    let end = BytesEnd::new(name.as_str());
-                    writer
-                        .write_event(Event::End(end))
-                        .map_err(|e| FormatError::Xml(e.to_string()))?;
-                }
-            }
-            FieldNode::Branch { name, body } => {
-                let mut start = BytesStart::new(name.as_str());
-                push_attributes(&mut start, &body.attrs);
-                if body.children.is_empty() {
-                    // Attribute-only branch: nothing nests inside, so the
-                    // element self-closes carrying its attributes.
-                    writer
-                        .write_event(Event::Empty(start))
-                        .map_err(|e| FormatError::Xml(e.to_string()))?;
-                } else {
-                    writer
-                        .write_event(Event::Start(start))
-                        .map_err(|e| FormatError::Xml(e.to_string()))?;
-                    write_field_tree(writer, &body.children)?;
-                    let end = BytesEnd::new(name.as_str());
-                    writer
-                        .write_event(Event::End(end))
-                        .map_err(|e| FormatError::Xml(e.to_string()))?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 impl<W: Write + Send> FormatWriter for XmlWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
         // Both the plan build and the value fill run before the record start
         // tag is emitted: attribute-classified fields must be known when the
-        // tag opens, and a rejected field (map payload, malformed attribute
+        // tag opens, and a rejected field (malformed nested value or attribute
         // name) must not leave a dangling half-written record behind.
         self.ensure_plan(record)?;
         self.fill_values(record)?;
+
+        // The plan indexes emitted schema fields positionally. Borrow the
+        // corresponding values for the recursive collection emitter; this
+        // vector is bounded by schema width and does not clone record data.
+        let emitted_values: Vec<&Value> = if self.config.include_engine_stamped {
+            record.iter_all_fields().map(|(_, value)| value).collect()
+        } else {
+            record.iter_user_fields().map(|(_, value)| value).collect()
+        };
 
         self.write_header()?;
 
@@ -307,7 +301,14 @@ impl<W: Write + Send> FormatWriter for XmlWriter<W> {
         }
         writer.write_event(Event::Start(start)).map_err(xml_err)?;
 
-        emit_body(writer, &plan.root, fill)?;
+        emit_body(
+            writer,
+            &plan.root,
+            fill,
+            &emitted_values,
+            config.preserve_nulls,
+            &config.attribute_prefix,
+        )?;
 
         writer
             .write_event(Event::End(BytesEnd::new(&*config.record_element)))
@@ -381,83 +382,14 @@ impl<W: Write + Send> FormatWriter for XmlWriter<W> {
     }
 }
 
-// ── Field tree for dotted name → nested element expansion ────────────
-
 /// Wrap a field-name grammar failure as this writer's error.
 fn field_path_error(source: FieldPathError) -> FormatError {
     FormatError::field_path("XML", source)
 }
 
-/// One element's content: the attributes attached to its start tag plus its
-/// child nodes. The whole body is materialized before the element's start
-/// tag is emitted, because attributes have to be known at that point.
-#[derive(Default)]
-struct ElementBody {
-    attrs: Vec<(String, String)>,
-    children: Vec<FieldNode>,
-}
-
-enum FieldNode {
-    Leaf { name: String, text: String },
-    Branch { name: String, body: ElementBody },
-}
-
-/// Build an element body from dotted field names. Fields with shared
-/// prefixes are grouped under a single parent branch
-/// (`Address.City` + `Address.State` → one `Address` branch with two leaf
-/// children), and a field whose final segment carries the attribute prefix
-/// becomes an attribute of its enclosing element instead of a child
-/// (`@id` → attribute on the returned body, `Address.@type` → attribute on
-/// the `Address` branch).
-///
-/// Null attribute fields are dropped even under `preserve_nulls` — a null
-/// element round-trips as a self-closing tag, but an attribute has no
-/// present-but-empty form that reads back as null.
-///
-/// Returns `FormatError::UnserializableMapValue` if any field carries
-/// a `Value::Map` payload — XML elements have no canonical scalar
-/// serialization for a map, and `value_to_text` raises from the Map
-/// arm directly. Returns `FormatError::Xml` for a malformed attribute
-/// path (a prefixed segment with children nested under it, or a bare
-/// prefix with no attribute name).
-fn build_field_tree(
-    fields: &[(&str, &Value)],
-    preserve_nulls: bool,
-    attribute_prefix: &str,
-) -> Result<ElementBody, FormatError> {
-    field_path::check_expandable(fields.iter().map(|&(name, _)| name)).map_err(field_path_error)?;
-    let mut root = ElementBody::default();
-
-    for &(name, val) in fields {
-        let path = field_path::decode(name).map_err(field_path_error)?;
-        if val.is_null() && (!preserve_nulls || is_attribute_path(&path, attribute_prefix)) {
-            continue;
-        }
-        let text = value_to_text(name, val)?;
-        insert_field(&mut root, name, &path, &text, attribute_prefix)?;
-    }
-
-    Ok(root)
-}
-
-/// Push name/value attributes onto an element's start tag, escaping each
-/// value.
-///
-/// quick-xml's `(&str, &str)` attribute conversion escapes only the five
-/// predefined entities, leaving literal tab / CR / LF untouched — a
-/// conformant parser then collapses those to spaces (XML attribute-value
-/// normalization), silently altering values that carry literal whitespace.
-/// They are written as character references instead, which both clinker's
-/// reader and any conformant parser resolve back to the exact bytes.
-fn push_attributes(start: &mut BytesStart, attrs: &[(String, String)]) {
-    for (key, value) in attrs {
-        push_one_attribute(start, key, value);
-    }
-}
-
 /// Push a single name/value attribute onto an element's start tag, escaping the
-/// value (see [`push_attributes`] for why literal whitespace is emitted as
-/// character references).
+/// value. Literal whitespace is emitted as character references so a
+/// conformant parser does not normalize it to spaces.
 fn push_one_attribute(start: &mut BytesStart, key: &str, value: &str) {
     start.push_attribute(Attribute {
         key: QName(key.as_bytes()),
@@ -489,15 +421,6 @@ fn escape_attribute_value(raw: &str) -> String {
         }
     }
     escaped
-}
-
-/// True when the path's final segment is attribute-classified — i.e. a
-/// non-empty prefix marks it as an attribute of its enclosing element.
-fn is_attribute_path(path: &[Cow<'_, str>], attribute_prefix: &str) -> bool {
-    !attribute_prefix.is_empty()
-        && path
-            .last()
-            .is_some_and(|segment| segment.starts_with(attribute_prefix))
 }
 
 /// True when `c` may begin an XML 1.0 `Name` (the `NameStartChar`
@@ -570,86 +493,12 @@ fn check_xml_name(name: &str, context: &str) -> Result<(), FormatError> {
     }
 }
 
-/// Insert a decoded field path into the tree, creating branches as needed.
-/// An attribute-prefixed segment must be the path's final segment (an
-/// attribute is a leaf — nothing can nest under it); `field` is the full
-/// original field name, carried for error messages.
-fn insert_field(
-    body: &mut ElementBody,
-    field: &str,
-    path: &[Cow<'_, str>],
-    text: &str,
-    attribute_prefix: &str,
-) -> Result<(), FormatError> {
-    let (segment, rest) = path
-        .split_first()
-        .expect("a decoded field path has at least one segment");
-    if !rest.is_empty() {
-        if !attribute_prefix.is_empty() && segment.starts_with(attribute_prefix) {
-            return Err(FormatError::Xml(format!(
-                "field '{field}': attribute-prefixed segment '{segment}' \
-                 cannot have fields nested under it — an XML attribute is a leaf"
-            )));
-        }
-        check_xml_name(segment, &format!("field '{field}': element"))?;
-        // Find or create a branch for `segment`
-        let branch = body.children.iter_mut().find(
-            |n| matches!(n, FieldNode::Branch { name, .. } if name.as_str() == segment.as_ref()),
-        );
-        if let Some(FieldNode::Branch {
-            body: branch_body, ..
-        }) = branch
-        {
-            insert_field(branch_body, field, rest, text, attribute_prefix)
-        } else {
-            let mut branch_body = ElementBody::default();
-            insert_field(&mut branch_body, field, rest, text, attribute_prefix)?;
-            body.children.push(FieldNode::Branch {
-                name: segment.to_string(),
-                body: branch_body,
-            });
-            Ok(())
-        }
-    } else if !attribute_prefix.is_empty() && segment.starts_with(attribute_prefix) {
-        let attr_name = &segment[attribute_prefix.len()..];
-        if attr_name.is_empty() {
-            return Err(FormatError::Xml(format!(
-                "field '{field}': attribute prefix '{attribute_prefix}' \
-                 carries no attribute name"
-            )));
-        }
-        if !is_valid_xml_name(attr_name) {
-            return Err(FormatError::Xml(format!(
-                "field '{field}': attribute name '{attr_name}' is not a \
-                 well-formed XML name"
-            )));
-        }
-        body.attrs.push((attr_name.to_string(), text.to_string()));
-        Ok(())
-    } else {
-        check_xml_name(segment, &format!("field '{field}': element"))?;
-        body.children.push(FieldNode::Leaf {
-            name: segment.to_string(),
-            text: text.to_string(),
-        });
-        Ok(())
-    }
-}
-
 /// Convert a clinker Value to XML text content.
 ///
-/// This renders a single scalar into one element body. A top-level
-/// `Value::Array` at a record element field is a `multiple:` field, emitted as
-/// repeated child elements before reaching here (see [`fill_slot`] and
-/// [`emit_repeated_leaf`]) — so an array reaching this scalar renderer is a
-/// NESTED collection (an array or map inside a `multiple:` field), which has no
-/// element-body serialization. A `Value::Map` likewise has none. Both return
-/// `FormatError::UnserializableMapValue` / `FormatError::UnserializableArrayValue`
-/// carrying the offending column rather than being silently flattened, which
-/// would hide a routing bug (e.g. a `$widened` sidecar reaching the writer
-/// without `include_unmapped: true` expansion). The envelope-section path also
-/// renders through here, so a section field carrying a collection is rejected
-/// the same way.
+/// This renders one scalar for an element body, attribute, or `#text` entry.
+/// Recursive callers dispatch arrays and maps before reaching this helper; the
+/// collection error arms are defensive invariant checks rather than a fallback
+/// serialization.
 fn value_to_text(col: &str, val: &Value) -> Result<String, FormatError> {
     let mut buf = String::new();
     write_value_text(&mut buf, col, val)?;
@@ -657,9 +506,7 @@ fn value_to_text(col: &str, val: &Value) -> Result<String, FormatError> {
 }
 
 /// Render a clinker Value as XML text content into `buf` (appending). Shares
-/// its logic with [`value_to_text`] so the record fast path and the envelope
-/// section path stay byte-identical. `Value::Map` and `Value::Array` are
-/// rejected exactly as `value_to_text` documents.
+/// its logic with [`value_to_text`] so every scalar path stays byte-identical.
 fn write_value_text(buf: &mut String, col: &str, val: &Value) -> Result<(), FormatError> {
     use std::fmt::Write as _;
     match val {
@@ -766,14 +613,25 @@ struct PlanCache {
 
 /// Build the tree plan for a record's schema. Walks the fields in iterator
 /// order (position = field index) and classifies each into the element tree,
-/// validating attribute names up front. Mirrors [`build_field_tree`]'s shape
-/// exactly so output stays byte-identical.
+/// validating attribute names up front.
 fn build_plan_cache(record: &Record, config: &XmlWriterConfig) -> Result<PlanCache, FormatError> {
     let names: Vec<&str> = if config.include_engine_stamped {
         record.iter_all_fields().map(|(name, _)| name).collect()
     } else {
         record.iter_user_fields().map(|(name, _)| name).collect()
     };
+    let (plan, field_is_attr) = build_tree_plan(&names, config)?;
+    Ok(PlanCache {
+        schema: Arc::clone(record.schema()),
+        plan,
+        field_is_attr,
+    })
+}
+
+fn build_tree_plan(
+    names: &[&str],
+    config: &XmlWriterConfig,
+) -> Result<(TreePlan, Vec<bool>), FormatError> {
     field_path::check_expandable(names.iter().copied()).map_err(field_path_error)?;
     let mut root = PlanBody::default();
     let mut field_is_attr = vec![false; names.len()];
@@ -789,11 +647,7 @@ fn build_plan_cache(record: &Record, config: &XmlWriterConfig) -> Result<PlanCac
             &mut field_is_attr,
         )?;
     }
-    Ok(PlanCache {
-        schema: Arc::clone(record.schema()),
-        plan: TreePlan { root },
-        field_is_attr,
-    })
+    Ok((TreePlan { root }, field_is_attr))
 }
 
 /// Insert a decoded field path into the plan, creating branches as needed —
@@ -931,16 +785,13 @@ struct FillBuf {
 
 #[derive(Default)]
 struct FillSlot {
-    /// Scalar rendering. Empty when the field is null-dropped or holds an array.
+    /// Scalar rendering. Empty when the field is null-dropped or holds a
+    /// recursively structured value.
     text: String,
-    /// Per-element renderings when the field's value is a `Value::Array`. The
-    /// live entries are `parts[..part_count]`; the `Vec` and each inner `String`
-    /// retain their capacity across records, like `text` does.
-    parts: Vec<String>,
-    part_count: usize,
-    /// True when this slot holds an array — the repeated-element emit path reads
-    /// `parts` rather than `text`.
-    is_array: bool,
+    /// True for a native array or map. The emitter then borrows the original
+    /// record value after the validation pass instead of materializing a
+    /// second owned tree.
+    is_structured: bool,
     emits: bool,
 }
 
@@ -967,12 +818,8 @@ impl FillBuf {
         &self.slots[field].text
     }
 
-    /// The per-element renderings for an array field, or `None` for a scalar.
-    /// A returned slice is always non-empty: an empty array sets `emits = false`,
-    /// so callers gate on `emits` before reaching here.
-    fn parts(&self, field: usize) -> Option<&[String]> {
-        let slot = &self.slots[field];
-        slot.is_array.then_some(&slot.parts[..slot.part_count])
+    fn is_structured(&self, field: usize) -> bool {
+        self.slots[field].is_structured
     }
 }
 
@@ -983,38 +830,23 @@ impl FillBuf {
 /// preserved null element renders to the empty string, emitted as a self-closing
 /// tag).
 ///
-/// A `Value::Array` at an ELEMENT field is a `multiple:` field: each element is
-/// rendered into `parts` for the repeated-element emit path, and an empty array
-/// drops the field (`emits = false`) so it emits nothing. An array at an
-/// ATTRIBUTE field is rejected — an XML attribute holds a single value and
-/// cannot repeat.
+/// Arrays and maps at element fields are fully validated here before the record
+/// start tag is written, then emitted recursively from the borrowed value.
+/// Attributes remain scalar-only.
 fn fill_slot(
     slot: &mut FillSlot,
     is_attr: bool,
     preserve_nulls: bool,
+    attribute_prefix: &str,
     name: &str,
     val: &Value,
 ) -> Result<(), FormatError> {
-    slot.is_array = false;
-    slot.part_count = 0;
+    slot.is_structured = false;
     match val {
         Value::Array(items) if !is_attr => {
-            // BACKSTOP GAP: this treats ANY top-level array at an element field
-            // as a `multiple:` field and emits repeated elements, because the
-            // writer is not given the declared-`multiple:` column set — its
-            // config carries only the `join_values` override subset, not every
-            // declared-multiple field. A misrouted runtime array on a column
-            // that is NOT declared `multiple:` (e.g. a stray `match: collect`
-            // result) is therefore emitted as repeats rather than failing loud
-            // with `UnserializableArrayValue`. A NESTED array (array-inside-a-
-            // field) is still caught by `write_value_text` in `fill_parts`;
-            // only the top-level non-multiple case slips through. Restoring the
-            // loud backstop needs the plan to thread the declared-multiple set
-            // into `XmlWriterConfig` — the same missing plumbing the CSV writer
-            // has at https://github.com/rustpunk/clinker/issues/853.
-            slot.is_array = true;
+            validate_xml_nested_value(val, name, attribute_prefix)?;
+            slot.is_structured = true;
             slot.text.clear();
-            fill_parts(slot, name, items)?;
             slot.emits = !items.is_empty();
         }
         Value::Array(_) => {
@@ -1022,6 +854,19 @@ fn fill_slot(
                 "field '{name}': an XML attribute cannot hold multiple values — a \
                  `multiple:` field maps to repeated elements, not an attribute"
             )));
+        }
+        Value::Map(_) if is_attr => {
+            return Err(FormatError::UnserializableMapValue {
+                format: "XML",
+                column: name.to_string(),
+            });
+        }
+        Value::Map(_) => {
+            validate_xml_nested_value(val, name, attribute_prefix)?;
+            slot.is_structured = true;
+            slot.text.clear();
+            // A map has a named container even when it has no children.
+            slot.emits = true;
         }
         _ => {
             let skip = if is_attr {
@@ -1039,31 +884,86 @@ fn fill_slot(
     Ok(())
 }
 
-/// Render each element of a `multiple:` field's array into the slot's `parts`,
-/// reusing the existing `String` capacity. A nested collection element (an array
-/// or map inside the field) has no element body and is rejected by
-/// [`write_value_text`], the same misroute detection the scalar path applies.
-fn fill_parts(slot: &mut FillSlot, name: &str, items: &[Value]) -> Result<(), FormatError> {
-    if slot.parts.len() < items.len() {
-        slot.parts.resize_with(items.len(), String::new);
+/// Validate every recursive XML decision before any bytes for the record are
+/// written. Neutral maps preserve insertion order; unescaped reserved keys
+/// become attributes or text, while escaped keys remain ordinary element
+/// names. Arrays repeat their containing element name and therefore cannot be
+/// nested directly inside another array without an intervening map key.
+fn validate_xml_nested_value(
+    value: &Value,
+    field: &str,
+    attribute_prefix: &str,
+) -> Result<(), FormatError> {
+    validate_nested_depth(value)
+        .map_err(|error| FormatError::Xml(format!("field '{field}': {error}")))?;
+    validate_nested_keys(value)
+        .map_err(|error| FormatError::Xml(format!("field '{field}': {error}")))?;
+
+    fn visit(value: &Value, field: &str, attribute_prefix: &str) -> Result<(), FormatError> {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    if matches!(item, Value::Array(_)) {
+                        return Err(FormatError::UnserializableArrayValue {
+                            format: "XML",
+                            column: field.to_string(),
+                        });
+                    }
+                    visit(item, field, attribute_prefix)?;
+                }
+            }
+            Value::Map(entries) => {
+                for (raw_key, child) in entries.iter() {
+                    let key = NestedKey::decode(raw_key).expect("keys validated above");
+                    let is_attribute = !key.escaped
+                        && !attribute_prefix.is_empty()
+                        && key.text.starts_with(attribute_prefix);
+                    let is_text = !key.escaped && key.text == "#text";
+                    if is_attribute {
+                        let name = &key.text[attribute_prefix.len()..];
+                        if name.is_empty() {
+                            return Err(FormatError::Xml(format!(
+                                "field '{field}': attribute prefix '{attribute_prefix}' carries no attribute name"
+                            )));
+                        }
+                        check_xml_name(name, &format!("field '{field}': nested attribute"))?;
+                        if matches!(child, Value::Array(_) | Value::Map(_)) {
+                            return Err(FormatError::Xml(format!(
+                                "field '{field}': nested XML attribute '{}' must hold a scalar value",
+                                key.text
+                            )));
+                        }
+                    } else if is_text {
+                        if matches!(child, Value::Array(_) | Value::Map(_)) {
+                            return Err(FormatError::Xml(format!(
+                                "field '{field}': nested XML #text must hold a scalar value"
+                            )));
+                        }
+                    } else {
+                        check_xml_name(&key.text, &format!("field '{field}': nested element"))?;
+                        visit(child, field, attribute_prefix)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
-    for (i, item) in items.iter().enumerate() {
-        slot.parts[i].clear();
-        write_value_text(&mut slot.parts[i], name, item)?;
-    }
-    slot.part_count = items.len();
-    Ok(())
+
+    visit(value, field, attribute_prefix)
 }
 
 /// Emit a body's child nodes (its start-tag attributes are handled by the
 /// caller). A branch is emitted only when it has at least one emitting
 /// attribute or child, and self-closes when it has no emitting children —
-/// matching the pruning `build_field_tree` performs by never inserting a
-/// dropped field.
+/// matching the null-pruning rules used while filling each leaf.
 fn emit_body<W: Write>(
     writer: &mut XmlEmitter<W>,
     body: &PlanBody,
     fill: &FillBuf,
+    values: &[&Value],
+    preserve_nulls: bool,
+    attribute_prefix: &str,
 ) -> Result<(), FormatError> {
     for child in &body.children {
         match child {
@@ -1075,8 +975,15 @@ fn emit_body<W: Write>(
                 if !fill.emits(*field) {
                     continue;
                 }
-                if let Some(parts) = fill.parts(*field) {
-                    emit_repeated_leaf(writer, name, repeat, parts)?;
+                if fill.is_structured(*field) {
+                    emit_structured_leaf(
+                        writer,
+                        name,
+                        repeat,
+                        values[*field],
+                        preserve_nulls,
+                        attribute_prefix,
+                    )?;
                     continue;
                 }
                 let text = fill.text(*field);
@@ -1122,7 +1029,7 @@ fn emit_body<W: Write>(
                 }
                 if has_children {
                     writer.write_event(Event::Start(start)).map_err(xml_err)?;
-                    emit_body(writer, body, fill)?;
+                    emit_body(writer, body, fill, values, preserve_nulls, attribute_prefix)?;
                     writer
                         .write_event(Event::End(BytesEnd::new(name.as_str())))
                         .map_err(xml_err)?;
@@ -1133,6 +1040,160 @@ fn emit_body<W: Write>(
         }
     }
     Ok(())
+}
+
+/// Emit one schema leaf whose value is a native map or array. Array items reuse
+/// the leaf (or configured `repeat_as`) name; a map is one structured item.
+fn emit_structured_leaf<W: Write>(
+    writer: &mut XmlEmitter<W>,
+    leaf_name: &str,
+    repeat: &Option<XmlRepeat>,
+    value: &Value,
+    preserve_nulls: bool,
+    attribute_prefix: &str,
+) -> Result<(), FormatError> {
+    let item_name = repeat.as_ref().map_or(leaf_name, |r| r.item_name.as_str());
+    let wrap_in = repeat.as_ref().and_then(|r| r.wrap_in.as_deref());
+    if let Some(container) = wrap_in {
+        writer
+            .write_event(Event::Start(BytesStart::new(container)))
+            .map_err(xml_err)?;
+    }
+
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                emit_named_value(writer, item_name, item, preserve_nulls, attribute_prefix)?;
+            }
+        }
+        Value::Map(_) => {
+            emit_named_value(writer, item_name, value, preserve_nulls, attribute_prefix)?
+        }
+        _ => unreachable!("structured slots contain only maps and arrays"),
+    }
+
+    if let Some(container) = wrap_in {
+        writer
+            .write_event(Event::End(BytesEnd::new(container)))
+            .map_err(xml_err)?;
+    }
+    Ok(())
+}
+
+/// Emit a named native value recursively. Validation has already established
+/// legal names, scalar-only attributes/text, canonical keys, and bounded depth.
+fn emit_named_value<W: Write>(
+    writer: &mut XmlEmitter<W>,
+    name: &str,
+    value: &Value,
+    preserve_nulls: bool,
+    attribute_prefix: &str,
+) -> Result<(), FormatError> {
+    match value {
+        Value::Null if !preserve_nulls => Ok(()),
+        Value::Null => writer
+            .write_event(Event::Empty(BytesStart::new(name)))
+            .map_err(xml_err),
+        Value::Array(items) => {
+            for item in items {
+                emit_named_value(writer, name, item, preserve_nulls, attribute_prefix)?;
+            }
+            Ok(())
+        }
+        Value::Map(entries) => {
+            let mut start = BytesStart::new(name);
+            for (raw_key, child) in entries.iter() {
+                let key = NestedKey::decode(raw_key).expect("keys validated before emission");
+                let is_attribute = !key.escaped
+                    && !attribute_prefix.is_empty()
+                    && key.text.starts_with(attribute_prefix);
+                if is_attribute && !child.is_null() {
+                    let attr_name = &key.text[attribute_prefix.len()..];
+                    let text = value_to_text(raw_key, child)?;
+                    push_one_attribute(&mut start, attr_name, &text);
+                }
+            }
+
+            if !map_has_content(entries, preserve_nulls, attribute_prefix) {
+                return writer.write_event(Event::Empty(start)).map_err(xml_err);
+            }
+            writer.write_event(Event::Start(start)).map_err(xml_err)?;
+            for (raw_key, child) in entries.iter() {
+                let key = NestedKey::decode(raw_key).expect("keys validated before emission");
+                let is_attribute = !key.escaped
+                    && !attribute_prefix.is_empty()
+                    && key.text.starts_with(attribute_prefix);
+                if is_attribute {
+                    continue;
+                }
+                if !key.escaped && key.text == "#text" {
+                    if !child.is_null() {
+                        let text = value_to_text(raw_key, child)?;
+                        if !text.is_empty() {
+                            writer
+                                .write_event(Event::Text(BytesText::new(&text)))
+                                .map_err(xml_err)?;
+                        }
+                    }
+                    continue;
+                }
+                emit_named_value(writer, &key.text, child, preserve_nulls, attribute_prefix)?;
+            }
+            writer
+                .write_event(Event::End(BytesEnd::new(name)))
+                .map_err(xml_err)
+        }
+        _ => {
+            let text = value_to_text(name, value)?;
+            if text.is_empty() {
+                writer
+                    .write_event(Event::Empty(BytesStart::new(name)))
+                    .map_err(xml_err)
+            } else {
+                writer
+                    .write_event(Event::Start(BytesStart::new(name)))
+                    .map_err(xml_err)?;
+                writer
+                    .write_event(Event::Text(BytesText::new(&text)))
+                    .map_err(xml_err)?;
+                writer
+                    .write_event(Event::End(BytesEnd::new(name)))
+                    .map_err(xml_err)
+            }
+        }
+    }
+}
+
+fn map_has_content(
+    entries: &indexmap::IndexMap<Box<str>, Value>,
+    preserve_nulls: bool,
+    attribute_prefix: &str,
+) -> bool {
+    entries.iter().any(|(raw_key, child)| {
+        let key = NestedKey::decode(raw_key).expect("keys validated before emission");
+        let is_attribute =
+            !key.escaped && !attribute_prefix.is_empty() && key.text.starts_with(attribute_prefix);
+        if is_attribute {
+            return false;
+        }
+        if !key.escaped && key.text == "#text" {
+            return match child {
+                Value::Null => false,
+                Value::String(text) => !text.is_empty(),
+                _ => true,
+            };
+        }
+        value_emits(child, preserve_nulls)
+    })
+}
+
+fn value_emits(value: &Value, preserve_nulls: bool) -> bool {
+    match value {
+        Value::Null => preserve_nulls,
+        Value::Array(items) => items.iter().any(|item| value_emits(item, preserve_nulls)),
+        Value::Map(_) => true,
+        _ => true,
+    }
 }
 
 /// Emit a `multiple:` field's values as repeated child elements. `parts` holds
@@ -1443,30 +1504,78 @@ mod tests {
         assert_eq!(r2.get("name"), Some(&Value::String("Bob".into())));
     }
 
-    /// XML writer rejects `Value::Map` payloads with
-    /// `FormatError::UnserializableMapValue`. The pre-walk in
-    /// `write_fields` catches the misroute before the value-to-text
-    /// function silently JSON-encodes the map inside an element.
+    /// Native maps use reserved `@...` and `#text` keys while ordinary keys
+    /// become child elements. Arrays repeat their containing child name and
+    /// preserve author insertion order.
     #[test]
-    fn test_xml_writer_rejects_map_value() {
+    fn test_xml_writer_emits_recursive_map_and_array_values() {
         use indexmap::IndexMap;
         let schema = Arc::new(Schema::new(vec!["id".into(), "payload".into()]));
-        let mut sidecar: IndexMap<Box<str>, Value> = IndexMap::new();
-        sidecar.insert("a".into(), Value::Integer(1));
+
+        let mut first: IndexMap<Box<str>, Value> = IndexMap::new();
+        first.insert("@id".into(), Value::Integer(1));
+        first.insert("#text".into(), Value::String("alpha".into()));
+        let mut second: IndexMap<Box<str>, Value> = IndexMap::new();
+        second.insert("@id".into(), Value::Integer(2));
+        second.insert("#text".into(), Value::String("beta".into()));
+
+        let mut payload: IndexMap<Box<str>, Value> = IndexMap::new();
+        payload.insert("@kind".into(), Value::String("event".into()));
+        payload.insert("#text".into(), Value::String("before".into()));
+        payload.insert(
+            "item".into(),
+            Value::Array(vec![
+                Value::Map(Box::new(first)),
+                Value::Map(Box::new(second)),
+            ]),
+        );
+        payload.insert("tail".into(), Value::String("after".into()));
         let record = Record::new(
             Arc::clone(&schema),
-            vec![Value::Integer(7), Value::Map(Box::new(sidecar))],
+            vec![Value::Integer(7), Value::Map(Box::new(payload))],
         );
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        assert_eq!(
+            output,
+            "<Root><Record><id>7</id><payload kind=\"event\">before<item id=\"1\">alpha</item><item id=\"2\">beta</item><tail>after</tail></payload></Record></Root>"
+        );
+    }
+
+    #[test]
+    fn test_xml_writer_rejects_duplicate_decoded_map_keys_before_output() {
+        use indexmap::IndexMap;
+        let schema = Arc::new(Schema::new(vec!["payload".into()]));
+        let mut payload: IndexMap<Box<str>, Value> = IndexMap::new();
+        payload.insert("@id".into(), Value::Integer(1));
+        payload.insert("\\@id".into(), Value::Integer(2));
+        let record = Record::new(Arc::clone(&schema), vec![Value::Map(Box::new(payload))]);
         let mut buf = Vec::new();
         let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
         let err = writer.write_record(&record).unwrap_err();
-        match err {
-            FormatError::UnserializableMapValue { format, column } => {
-                assert_eq!(format, "XML");
-                assert_eq!(column, "payload");
-            }
-            other => panic!("expected UnserializableMapValue, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, FormatError::Xml(message) if message.contains("duplicate logical nested key \"@id\"")),
+            "unexpected error: {err:?}"
+        );
+        drop(writer);
+        assert!(buf.is_empty(), "rejected record must emit no partial XML");
+    }
+
+    #[test]
+    fn test_xml_writer_rejects_collection_valued_nested_attribute_before_output() {
+        use indexmap::IndexMap;
+        let schema = Arc::new(Schema::new(vec!["payload".into()]));
+        let mut payload: IndexMap<Box<str>, Value> = IndexMap::new();
+        payload.insert("@ids".into(), Value::Array(vec![Value::Integer(1)]));
+        let record = Record::new(Arc::clone(&schema), vec![Value::Map(Box::new(payload))]);
+        let mut buf = Vec::new();
+        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let err = writer.write_record(&record).unwrap_err();
+        assert!(
+            matches!(&err, FormatError::Xml(message) if message.contains("attribute '@ids' must hold a scalar")),
+            "unexpected error: {err:?}"
+        );
+        drop(writer);
+        assert!(buf.is_empty(), "rejected record must emit no partial XML");
     }
 
     /// Build a `[id, tags]` record whose `tags` field carries `values`.
@@ -2411,6 +2520,37 @@ mod tests {
         let out = String::from_utf8(buf).unwrap();
         assert!(
             out.contains(r#"<header version="1.1"><batch_id>A</batch_id></header>"#),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn xml_envelope_section_writes_native_nested_value() {
+        use indexmap::IndexMap;
+
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let config = XmlWriterConfig {
+            envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
+                header_from_doc: Some("Head".into()),
+                footer_from_doc: None,
+                footer_record_count_field: None,
+            }),
+            ..Default::default()
+        };
+        let mut metadata: IndexMap<Box<str>, Value> = IndexMap::new();
+        metadata.insert("@kind".into(), Value::String("batch".into()));
+        metadata.insert("name".into(), Value::String("A".into()));
+        let doc = doc_with_sections(&[("Head", &[("metadata", Value::Map(Box::new(metadata)))])]);
+        let mut buf = Vec::new();
+        {
+            let mut w = XmlWriter::new(&mut buf, Arc::clone(&schema), config);
+            w.begin_document(&doc).unwrap();
+            w.end_document(&doc).unwrap();
+            w.flush().unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains(r#"<header><metadata kind="batch"><name>A</name></metadata></header>"#),
             "got: {out}"
         );
     }

@@ -150,7 +150,13 @@ leading backslash makes a reserved-looking key literal: `\@name`, `\#text`,
 or `\\name`. In CXL source each backslash in a quoted string is itself escaped,
 so write `"\\@name"`, `"\\#text"`, or `"\\\\name"`. Other leading-backslash
 forms are rejected. Output formats decide how the neutral nested value is
-encoded; their format documentation defines that boundary.
+encoded. JSON removes the structural escape when writing the key; XML assigns
+roles to the unescaped forms as described in
+[Writing XML](../formats/xml.md#native-map-and-array-values).
+
+The runnable `examples/pipelines/nested_values.yaml` pipeline sends one
+constructed value to both JSON and XML so the two native encodings can be
+compared directly.
 
 ## Schema types
 

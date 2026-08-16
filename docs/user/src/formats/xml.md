@@ -154,6 +154,51 @@ Attribute handling details:
 - An element with only attribute fields and no children self-closes:
   `Address.@type` alone emits `<Address type="home"/>`.
 
+### Native map and array values
+
+An element-valued CXL map is written recursively. Ordinary keys become child
+elements, an unescaped key beginning with `attribute_prefix` becomes an
+attribute on the current element, and the unescaped key `#text` becomes text in
+the current element. Map insertion order controls text/child order; attributes
+are collected onto the start tag. Arrays held under an ordinary key repeat that
+key as the element name.
+
+```cxl
+emit payload = {
+  "@kind": "event",
+  "#text": "before",
+  item: [
+    {"@id": 1, "#text": "alpha"},
+    {"@id": 2, "#text": "beta"},
+  ],
+  tail: "after",
+}
+```
+
+writes:
+
+```xml
+<payload kind="event">before<item id="1">alpha</item><item id="2">beta</item><tail>after</tail></payload>
+```
+
+The rules are deliberately strict:
+
+- Attribute and `#text` values must be scalar or null; maps and arrays there
+  are rejected.
+- A direct array inside another array is rejected because XML has no child name
+  to repeat. Put the inner array under a map key to supply that name.
+- Every decoded ordinary key and attribute name must be a well-formed XML name.
+  A canonical escape (`"\\@literal"`, `"\\#text"`, or `"\\\\name"` in CXL
+  source) disables the structural role, but it does not make an otherwise
+  illegal XML name legal.
+- Duplicate logical keys, malformed escapes, and values deeper than 64
+  containers reject the whole record before its first byte is emitted. XML
+  never silently falls back to JSON text.
+
+With `preserve_nulls: false`, null child elements and null array items are
+omitted; with it enabled they emit as self-closing elements. Null attributes
+are always omitted.
+
 ### Writing multi-value fields (repeated elements)
 
 A `multiple:` field is written as **repeated child elements**, one per value, in
