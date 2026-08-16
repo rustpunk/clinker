@@ -67,7 +67,11 @@ const NETWORK_METADATA_DEPENDENCIES: [ExpectedMetadataDependency; 13] = [
     ExpectedMetadataDependency::normal("http", &[], true),
     ExpectedMetadataDependency::normal("indexmap", &["serde"], true),
     ExpectedMetadataDependency::optional("rustls-graviola", &[], true),
-    ExpectedMetadataDependency::normal("serde_json", &["preserve_order"], true),
+    ExpectedMetadataDependency::normal(
+        "serde_json",
+        &["arbitrary_precision", "preserve_order"],
+        true,
+    ),
     ExpectedMetadataDependency::normal("tracing", &[], true),
     // Not `rustls`: that feature is `rustls-no-provider` plus ring plus the
     // webpki roots, and ring is the C-toolchain build dependency this
@@ -88,7 +92,11 @@ const LINEAGE_METADATA_DEPENDENCIES: [ExpectedMetadataDependency; 7] = [
     ExpectedMetadataDependency::normal("cxl", &[], true),
     ExpectedMetadataDependency::normal("petgraph", &[], true),
     ExpectedMetadataDependency::normal("serde", &["derive", "rc"], true),
-    ExpectedMetadataDependency::normal("serde_json", &["preserve_order"], true),
+    ExpectedMetadataDependency::normal(
+        "serde_json",
+        &["arbitrary_precision", "preserve_order"],
+        true,
+    ),
 ];
 /// The resolved graph this policy has been shown, as a count and a digest over
 /// every locked package's name, version, source and checksum.

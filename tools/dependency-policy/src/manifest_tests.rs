@@ -45,7 +45,12 @@ fn expected_metadata(root: &std::path::Path) -> JsonValue {
                 normal_edge(root, "http", &[], true),
                 normal_edge(root, "indexmap", &["serde"], true),
                 optional_edge(root, "rustls-graviola", &[], true),
-                normal_edge(root, "serde_json", &["preserve_order"], true),
+                normal_edge(
+                    root,
+                    "serde_json",
+                    &["arbitrary_precision", "preserve_order"],
+                    true,
+                ),
                 normal_edge(root, "tracing", &[], true),
                 optional_edge(root, "ureq", &["rustls-no-provider", "rustls-webpki-roots"], false),
                 development_edge(root, "clinker-bench-support", &[]),
@@ -61,7 +66,12 @@ fn expected_metadata(root: &std::path::Path) -> JsonValue {
                 normal_edge(root, "cxl", &[], true),
                 normal_edge(root, "petgraph", &[], true),
                 normal_edge(root, "serde", &["derive", "rc"], true),
-                normal_edge(root, "serde_json", &["preserve_order"], true)
+                normal_edge(
+                    root,
+                    "serde_json",
+                    &["arbitrary_precision", "preserve_order"],
+                    true,
+                )
              ]}
         ]
     })
@@ -355,9 +365,18 @@ fn cargo_metadata_rejects_edge_kind_feature_optional_default_and_target_changes(
 
     let tree = TempTree::new("inherited-consumer-feature-expansion");
     let mut metadata = expected_metadata(tree.root());
-    metadata["packages"][1]["dependencies"][8]["features"] = json!(["preserve_order", "raw_value"]);
+    metadata["packages"][1]["dependencies"][8]["features"] =
+        json!(["arbitrary_precision", "preserve_order", "raw_value"]);
     let error = check_metadata(tree.root(), &metadata, Scope::ClinkerNet)
         .expect_err("inherited workspace feature expansion must be rejected")
+        .to_string();
+    assert!(error.contains("clinker-net -> serde_json"), "{error}");
+
+    let tree = TempTree::new("missing-inherited-arbitrary-precision");
+    let mut metadata = expected_metadata(tree.root());
+    metadata["packages"][1]["dependencies"][8]["features"] = json!(["preserve_order"]);
+    let error = check_metadata(tree.root(), &metadata, Scope::ClinkerNet)
+        .expect_err("missing approved workspace feature must be rejected")
         .to_string();
     assert!(error.contains("clinker-net -> serde_json"), "{error}");
 }
