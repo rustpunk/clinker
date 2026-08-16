@@ -20,7 +20,7 @@ impl Span {
 /// CXL token produced by the lexer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
-    // --- Keywords (21) ---
+    // --- Keywords (23) ---
     Let,
     Emit,
     If,
@@ -42,6 +42,8 @@ pub enum Token {
     Filter,
     Distinct,
     By,
+    For,
+    In,
 
     // --- Operators (14) ---
     Plus,
@@ -433,6 +435,8 @@ impl<'src> Lexer<'src> {
             "filter" => Token::Filter,
             "distinct" => Token::Distinct,
             "by" => Token::By,
+            "for" => Token::For,
+            "in" => Token::In,
             _ => Token::Ident(text.into()),
         };
 
@@ -467,7 +471,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_lex_keywords_all_21() {
+    fn test_lex_keywords_all_23() {
         let keywords = [
             ("let", Token::Let),
             ("emit", Token::Emit),
@@ -490,8 +494,10 @@ mod tests {
             ("filter", Token::Filter),
             ("distinct", Token::Distinct),
             ("by", Token::By),
+            ("for", Token::For),
+            ("in", Token::In),
         ];
-        assert_eq!(keywords.len(), 21);
+        assert_eq!(keywords.len(), 23);
         for (src, expected) in keywords {
             let tokens = Lexer::tokenize(src);
             assert_eq!(tokens[0].0, expected, "keyword '{}' failed", src);

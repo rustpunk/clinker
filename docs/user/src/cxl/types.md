@@ -1,6 +1,6 @@
 # Types & Literals
 
-CXL has 9 value types. Every field value, literal, and expression result is one of these types.
+CXL has 10 value types. Every field value, literal, and expression result is one of these types.
 
 ## Value types
 
@@ -106,6 +106,51 @@ $ cxl eval -e 'emit nothing = null'
   "nothing": null
 }
 ```
+
+### Arrays and comprehensions
+
+Array literals accept full expressions and preserve their written order:
+
+```cxl
+emit values = [order_id, amount * 2, null]
+```
+
+Use one `for` clause and an optional trailing `if` to construct an array from
+another array:
+
+```cxl
+emit positive_doubles = [item * 2 for item in values if item > 0]
+```
+
+The source must be an array; `null` and scalar sources are errors. The binding
+is local to the item expression and predicate, cannot destructure, and cannot
+shadow an input field or surrounding `let` binding.
+
+### Maps
+
+Map literals preserve key insertion order. Bare identifiers and quoted strings
+are static keys; brackets hold a computed expression whose result must be a
+non-null string:
+
+```cxl
+emit payload = {
+  customer: customer_name,
+  items: [{sku: item.sku, quantity: item.quantity} for item in line_items],
+  [dynamic_key]: dynamic_value,
+}
+```
+
+Duplicate keys are errors, including two differently escaped spellings that
+decode to the same logical key. Nested maps and arrays are limited to 64
+container levels, and CXL construction is limited to 10 MiB per input record;
+both limits fail the record instead of growing without bound.
+
+Nested keys use one canonical escape grammar. After CXL string decoding, one
+leading backslash makes a reserved-looking key literal: `\@name`, `\#text`,
+or `\\name`. In CXL source each backslash in a quoted string is itself escaped,
+so write `"\\@name"`, `"\\#text"`, or `"\\\\name"`. Other leading-backslash
+forms are rejected. Output formats decide how the neutral nested value is
+encoded; their format documentation defines that boundary.
 
 ## Schema types
 

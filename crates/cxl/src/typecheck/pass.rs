@@ -540,6 +540,72 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
+            Expr::ArrayLiteral {
+                node_id, elements, ..
+            } => {
+                for element in elements {
+                    self.check_expr(element, in_predicate);
+                }
+                self.set_type(*node_id, Type::Array);
+                Type::Array
+            }
+
+            Expr::MapLiteral {
+                node_id, entries, ..
+            } => {
+                for entry in entries {
+                    if let crate::ast::MapKey::Computed(key) = &entry.key {
+                        let key_ty = self.check_expr(key, in_predicate);
+                        if !matches!(key_ty.unwrap_nullable(), Type::String | Type::Any) {
+                            self.error(
+                                key.span(),
+                                format!("computed map key must be String, got {key_ty}"),
+                                Some("convert the key explicitly with `.to_string()`".into()),
+                            );
+                        }
+                    }
+                    self.check_expr(&entry.value, in_predicate);
+                }
+                self.set_type(*node_id, Type::Map);
+                Type::Map
+            }
+
+            Expr::ArrayComprehension {
+                node_id,
+                item,
+                binding,
+                source,
+                predicate,
+                ..
+            } => {
+                let source_ty = self.check_expr(source, in_predicate);
+                if !matches!(source_ty.unwrap_nullable(), Type::Array | Type::Any) {
+                    self.error(
+                        source.span(),
+                        format!("array comprehension requires an Array source, got {source_ty}"),
+                        Some("handle null explicitly or provide an Array-valued expression".into()),
+                    );
+                }
+                self.lexical_types
+                    .push(HashMap::from([(binding.clone(), Type::Any)]));
+                self.check_expr(item, in_predicate);
+                if let Some(predicate) = predicate {
+                    let predicate_ty = self.check_expr(predicate, in_predicate);
+                    if !matches!(predicate_ty, Type::Bool | Type::Any) {
+                        self.error(
+                            predicate.span(),
+                            format!(
+                                "array-comprehension predicate must be Bool, got {predicate_ty}"
+                            ),
+                            Some("use an explicit boolean comparison".into()),
+                        );
+                    }
+                }
+                self.lexical_types.pop();
+                self.set_type(*node_id, Type::Array);
+                Type::Array
+            }
+
             Expr::FieldRef {
                 node_id,
                 name,
@@ -1513,6 +1579,31 @@ impl<'a> TypeChecker<'a> {
                 self.walk_agg_ctx(rhs, let_exprs);
             }
             Expr::Unary { operand, .. } => self.walk_agg_ctx(operand, let_exprs),
+            Expr::ArrayLiteral { elements, .. } => {
+                for element in elements {
+                    self.walk_agg_ctx(element, let_exprs);
+                }
+            }
+            Expr::MapLiteral { entries, .. } => {
+                for entry in entries {
+                    if let crate::ast::MapKey::Computed(key) = &entry.key {
+                        self.walk_agg_ctx(key, let_exprs);
+                    }
+                    self.walk_agg_ctx(&entry.value, let_exprs);
+                }
+            }
+            Expr::ArrayComprehension {
+                item,
+                source,
+                predicate,
+                ..
+            } => {
+                self.walk_agg_ctx(source, let_exprs);
+                self.walk_agg_ctx(item, let_exprs);
+                if let Some(predicate) = predicate {
+                    self.walk_agg_ctx(predicate, let_exprs);
+                }
+            }
             Expr::Coalesce { lhs, rhs, .. } => {
                 self.walk_agg_ctx(lhs, let_exprs);
                 self.walk_agg_ctx(rhs, let_exprs);
@@ -2038,6 +2129,9 @@ fn reindex_expr(expr: &mut Expr, next_id: &mut u32) {
         Expr::Binary { node_id, .. }
         | Expr::Unary { node_id, .. }
         | Expr::Literal { node_id, .. }
+        | Expr::ArrayLiteral { node_id, .. }
+        | Expr::MapLiteral { node_id, .. }
+        | Expr::ArrayComprehension { node_id, .. }
         | Expr::FieldRef { node_id, .. }
         | Expr::QualifiedFieldRef { node_id, .. }
         | Expr::MethodCall { node_id, .. }
@@ -2071,6 +2165,31 @@ fn reindex_expr(expr: &mut Expr, next_id: &mut u32) {
             reindex_expr(rhs, next_id);
         }
         Expr::Unary { operand, .. } => reindex_expr(operand, next_id),
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                reindex_expr(element, next_id);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let crate::ast::MapKey::Computed(key) = &mut entry.key {
+                    reindex_expr(key, next_id);
+                }
+                reindex_expr(&mut entry.value, next_id);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            reindex_expr(item, next_id);
+            reindex_expr(source, next_id);
+            if let Some(predicate) = predicate {
+                reindex_expr(predicate, next_id);
+            }
+        }
         Expr::MethodCall { receiver, args, .. } => {
             reindex_expr(receiver, next_id);
             for arg in args {
@@ -2168,6 +2287,50 @@ mod tests {
         assert!(parsed.errors.is_empty());
         let resolved = resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
         type_check(resolved, schema).expect_err("Expected type errors but got Ok")
+    }
+
+    #[test]
+    fn nested_constructor_types_are_checked() {
+        let typed = typecheck_ok(
+            "emit payload = {items: [1, 2], selected: [item for item in values if item > 0]}",
+            &["values"],
+            &empty_row(),
+        );
+        let Statement::Emit { expr, .. } = &typed.program.statements[0] else {
+            panic!("expected emit");
+        };
+        assert_eq!(typed.types[expr.node_id().0 as usize], Some(Type::Map));
+    }
+
+    #[test]
+    fn computed_map_key_requires_string() {
+        let diagnostics = typecheck_err("emit payload = {[1]: true}", &[], &empty_row());
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("computed map key must be String")
+        }));
+    }
+
+    #[test]
+    fn comprehension_rejects_null_source_and_non_bool_predicate() {
+        let null_source = typecheck_err("emit values = [item for item in null]", &[], &empty_row());
+        assert!(null_source.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("array comprehension requires an Array source")
+        }));
+
+        let non_bool = typecheck_err(
+            "emit values = [item for item in [1, 2] if 42]",
+            &[],
+            &empty_row(),
+        );
+        assert!(non_bool.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("array-comprehension predicate must be Bool")
+        }));
     }
 
     fn typecheck_with_module(

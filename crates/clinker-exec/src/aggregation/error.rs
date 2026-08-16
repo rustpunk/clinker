@@ -30,6 +30,19 @@ pub enum AggregateEvalError {
     /// reported via this variant rather than panicking.
     #[error("unsupported aggregate residual construct: {what}")]
     UnsupportedResidual { what: &'static str },
+    #[error("aggregate residual type mismatch: expected {expected}, got {got}")]
+    TypeMismatch {
+        expected: &'static str,
+        got: &'static str,
+    },
+    #[error("duplicate map key '{key}' in aggregate residual")]
+    DuplicateMapKey { key: String },
+    #[error("invalid nested map key '{key}' in aggregate residual: {message}")]
+    InvalidNestedKey { key: String, message: String },
+    #[error("aggregate residual nested-value construction exceeds {limit} bytes")]
+    ConstructionLimitExceeded { limit: usize },
+    #[error("aggregate residual nested-value construction exceeds depth {limit}")]
+    ConstructionDepthExceeded { limit: usize },
 }
 
 /// Errors raised by the hash aggregator hot loop. The 16.3.13 dispatch

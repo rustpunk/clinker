@@ -57,7 +57,7 @@ use clinker_record::{GroupByKey, RecordStorage, Value, value_to_group_key};
 use regex::Regex;
 use rust_decimal::Decimal;
 
-use crate::ast::{BinOp, EmitTarget, Expr, LiteralValue, Statement, TraceLevel, UnaryOp};
+use crate::ast::{BinOp, EmitTarget, Expr, LiteralValue, MapKey, Statement, TraceLevel, UnaryOp};
 use crate::lexer::Span;
 use crate::resolve::ResolvedBinding;
 use crate::resolve::traits::{FieldResolver, WindowContext};
@@ -84,6 +84,57 @@ struct Frame<'a, 'w, S: RecordStorage + 'w> {
     resolver: &'a dyn FieldResolver,
     window: Option<&'a dyn WindowContext<'w, S>>,
     env: HashMap<String, Value>,
+    construction: ConstructionBudget,
+}
+
+/// Per-record budget for author-constructed arrays and maps. The budget is
+/// charged before container growth and is shared by every nested constructor
+/// evaluated for the record.
+struct ConstructionBudget {
+    retained_bytes: usize,
+    depth: usize,
+}
+
+const MAX_CONSTRUCTED_BYTES: usize = 10 * 1024 * 1024;
+
+impl ConstructionBudget {
+    fn enter(&mut self, span: Span) -> Result<(), EvalError> {
+        if self.depth >= clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH {
+            return Err(EvalError::new(
+                EvalErrorKind::ConstructionDepthExceeded {
+                    limit: clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH,
+                },
+                span,
+            ));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    fn charge(&mut self, bytes: usize, span: Span) -> Result<(), EvalError> {
+        let next = self.retained_bytes.checked_add(bytes).ok_or_else(|| {
+            EvalError::new(
+                EvalErrorKind::ConstructionLimitExceeded {
+                    limit: MAX_CONSTRUCTED_BYTES,
+                },
+                span,
+            )
+        })?;
+        if next > MAX_CONSTRUCTED_BYTES {
+            return Err(EvalError::new(
+                EvalErrorKind::ConstructionLimitExceeded {
+                    limit: MAX_CONSTRUCTED_BYTES,
+                },
+                span,
+            ));
+        }
+        self.retained_bytes = next;
+        Ok(())
+    }
 }
 
 /// Mutable cross-record evaluation state threaded into `eval_record`.
@@ -238,6 +289,10 @@ impl CompiledScalar {
             resolver,
             window: None,
             env: HashMap::new(),
+            construction: ConstructionBudget {
+                retained_bytes: 0,
+                depth: 0,
+            },
         };
         (self.expr)(&mut frame)
     }
@@ -346,6 +401,10 @@ impl<S: RecordStorage + 'static> CompiledProgram<S> {
             resolver,
             window,
             env: HashMap::new(),
+            construction: ConstructionBudget {
+                retained_bytes: 0,
+                depth: 0,
+            },
         };
         // The cumulative fan-out budget is per input record; reset it
         // before any `emit each` block runs so one record's expansion
@@ -866,6 +925,173 @@ fn compile_expr<S: RecordStorage + 'static>(typed: &TypedProgram, expr: &Expr) -
             // is one `Value` clone with no variant re-match.
             let baked = literal_to_value(value);
             Box::new(move |_frame| Ok(baked.clone()))
+        }
+        Expr::ArrayLiteral { elements, span, .. } => {
+            let elements = elements
+                .iter()
+                .map(|element| compile_expr::<S>(typed, element))
+                .collect::<Vec<_>>();
+            let span = *span;
+            Box::new(move |frame| {
+                frame.construction.enter(span)?;
+                let result = (|| {
+                    frame
+                        .construction
+                        .charge(elements.len() * std::mem::size_of::<Value>(), span)?;
+                    let mut values = Vec::with_capacity(elements.len());
+                    for element in &elements {
+                        let value = element(frame)?;
+                        frame.construction.charge(value.heap_size(), span)?;
+                        values.push(value);
+                    }
+                    Ok(Value::Array(values))
+                })();
+                frame.construction.leave();
+                result
+            })
+        }
+        Expr::MapLiteral { entries, span, .. } => {
+            enum CompiledKey<S: RecordStorage + 'static> {
+                Static(Box<str>),
+                Computed(CompiledExpr<S>),
+            }
+            let entries = entries
+                .iter()
+                .map(|entry| {
+                    let key = match &entry.key {
+                        MapKey::Static(key) => CompiledKey::Static(key.clone()),
+                        MapKey::Computed(key) => {
+                            CompiledKey::Computed(compile_expr::<S>(typed, key))
+                        }
+                    };
+                    (key, compile_expr::<S>(typed, &entry.value), entry.span)
+                })
+                .collect::<Vec<_>>();
+            let span = *span;
+            Box::new(move |frame| {
+                frame.construction.enter(span)?;
+                let result = (|| {
+                    let entry_bytes = std::mem::size_of::<Box<str>>()
+                        + std::mem::size_of::<Value>()
+                        + std::mem::size_of::<u64>()
+                        + std::mem::size_of::<usize>();
+                    frame
+                        .construction
+                        .charge(entries.len() * entry_bytes, span)?;
+                    let mut values: indexmap::IndexMap<Box<str>, Value> =
+                        indexmap::IndexMap::with_capacity(entries.len());
+                    for (key, value, entry_span) in &entries {
+                        let key_text: Box<str> = match key {
+                            CompiledKey::Static(key) => key.clone(),
+                            CompiledKey::Computed(key) => match key(frame)? {
+                                Value::String(key) => key.as_str().into(),
+                                other => {
+                                    return Err(EvalError::type_mismatch(
+                                        "non-null String map key",
+                                        other.type_name(),
+                                        *entry_span,
+                                    ));
+                                }
+                            },
+                        };
+                        frame.construction.charge(key_text.len(), *entry_span)?;
+                        let decoded = clinker_record::nested_key::NestedKey::decode(&key_text)
+                            .map_err(|error| {
+                                EvalError::new(
+                                    EvalErrorKind::InvalidNestedKey {
+                                        key: key_text.to_string(),
+                                        message: error.to_string(),
+                                    },
+                                    *entry_span,
+                                )
+                            })?;
+                        let logical_key = decoded.text.as_ref();
+                        if values.keys().any(|prior| {
+                            clinker_record::nested_key::NestedKey::decode(prior)
+                                .expect("previous keys were validated before insertion")
+                                .text
+                                == logical_key
+                        }) {
+                            return Err(EvalError::new(
+                                EvalErrorKind::DuplicateMapKey {
+                                    key: logical_key.to_string(),
+                                },
+                                *entry_span,
+                            ));
+                        }
+                        let value = value(frame)?;
+                        frame.construction.charge(value.heap_size(), *entry_span)?;
+                        values.insert(key_text, value);
+                    }
+                    Ok(Value::Map(Box::new(values)))
+                })();
+                frame.construction.leave();
+                result
+            })
+        }
+        Expr::ArrayComprehension {
+            item,
+            binding,
+            source,
+            predicate,
+            span,
+            ..
+        } => {
+            let item = compile_expr::<S>(typed, item);
+            let source = compile_expr::<S>(typed, source);
+            let predicate = predicate
+                .as_ref()
+                .map(|predicate| compile_expr::<S>(typed, predicate));
+            let binding = binding.to_string();
+            let span = *span;
+            Box::new(move |frame| {
+                frame.construction.enter(span)?;
+                let result = (|| {
+                    let source_value = source(frame)?;
+                    let Value::Array(source_values) = source_value else {
+                        return Err(EvalError::type_mismatch(
+                            "Array comprehension source",
+                            source_value.type_name(),
+                            span,
+                        ));
+                    };
+                    frame
+                        .construction
+                        .charge(source_values.len() * std::mem::size_of::<Value>(), span)?;
+                    let previous = frame.env.remove(&binding);
+                    let values_result = (|| {
+                        let mut values = Vec::with_capacity(source_values.len());
+                        for source_value in source_values {
+                            frame.env.insert(binding.clone(), source_value);
+                            if let Some(predicate) = &predicate {
+                                match predicate(frame)? {
+                                    Value::Bool(true) => {}
+                                    Value::Bool(false) => continue,
+                                    other => {
+                                        return Err(EvalError::type_mismatch(
+                                            "Bool comprehension predicate",
+                                            other.type_name(),
+                                            span,
+                                        ));
+                                    }
+                                }
+                            }
+                            let value = item(frame)?;
+                            frame.construction.charge(value.heap_size(), span)?;
+                            values.push(value);
+                        }
+                        Ok(Value::Array(values))
+                    })();
+                    if let Some(previous) = previous {
+                        frame.env.insert(binding.clone(), previous);
+                    } else {
+                        frame.env.remove(&binding);
+                    }
+                    values_result
+                })();
+                frame.construction.leave();
+                result
+            })
         }
         Expr::FieldRef { name, .. } => {
             let name = name.to_string();
@@ -1501,9 +1727,17 @@ fn window_predicate_fold<'a, 'w, S: RecordStorage + 'w>(
             resolver: &row,
             window,
             env,
+            construction: std::mem::replace(
+                &mut frame.construction,
+                ConstructionBudget {
+                    retained_bytes: 0,
+                    depth: 0,
+                },
+            ),
         };
         let raw = predicate(&mut sub);
         env = std::mem::take(&mut sub.env);
+        frame.construction = sub.construction;
         let raw = match raw {
             Ok(v) => v,
             Err(e) => {

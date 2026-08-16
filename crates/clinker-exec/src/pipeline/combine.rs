@@ -412,7 +412,7 @@ pub enum CombineError {
     /// Key-expression evaluation failed. `side` is `"driving"` or
     /// `"build"` so the executor can produce an accurate diagnostic.
     KeyEvalFailed {
-        source: EvalError,
+        source: Box<EvalError>,
         side: &'static str,
     },
 
@@ -447,7 +447,7 @@ impl std::fmt::Display for CombineError {
 impl std::error::Error for CombineError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            CombineError::KeyEvalFailed { source, .. } => Some(source),
+            CombineError::KeyEvalFailed { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -712,7 +712,7 @@ impl CombineHashTable {
             let keys = extractor
                 .extract(ctx, &rec)
                 .map_err(|e| CombineError::KeyEvalFailed {
-                    source: e,
+                    source: Box::new(e),
                     side: "build",
                 })?;
 

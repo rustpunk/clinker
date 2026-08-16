@@ -237,6 +237,34 @@ fn reject_non_label(expr: &Expr) -> Result<(), SelectorError> {
             reject_non_label(rhs)
         }
         Expr::Unary { operand, .. } => reject_non_label(operand),
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                reject_non_label(element)?;
+            }
+            Ok(())
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let cxl::ast::MapKey::Computed(key) = &entry.key {
+                    reject_non_label(key)?;
+                }
+                reject_non_label(&entry.value)?;
+            }
+            Ok(())
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            reject_non_label(source)?;
+            reject_non_label(item)?;
+            if let Some(predicate) = predicate {
+                reject_non_label(predicate)?;
+            }
+            Ok(())
+        }
         Expr::IfThenElse {
             condition,
             then_branch,
@@ -555,6 +583,20 @@ mod tests {
         // recursive walk must still find it.
         let err = LabelSelector::compile(r#"region == "west" and $source.row == 1"#).unwrap_err();
         assert!(matches!(err, SelectorError::ForbiddenReference(_)));
+    }
+
+    #[test]
+    fn forbidden_reference_inside_nested_constructor_is_rejected() {
+        for source in [
+            r#"{ok: true, leak: $source.row} == {ok: true, leak: 1}"#,
+            r#"[item for item in [1, $record.secret]] == [1]"#,
+        ] {
+            let err = LabelSelector::compile(source).unwrap_err();
+            assert!(
+                matches!(err, SelectorError::ForbiddenReference(_)),
+                "expected nested forbidden reference in {source:?}, got {err:?}"
+            );
+        }
     }
 
     #[test]

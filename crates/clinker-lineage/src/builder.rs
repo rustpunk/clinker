@@ -1579,6 +1579,31 @@ fn collect_agg_leaves<'a>(expr: &'a Expr, out: &mut Vec<AggLeaf<'a>>) {
             collect_agg_leaves(rhs, out);
         }
         Expr::Unary { operand, .. } => collect_agg_leaves(operand, out),
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                collect_agg_leaves(element, out);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let cxl::ast::MapKey::Computed(key) = &entry.key {
+                    collect_agg_leaves(key, out);
+                }
+                collect_agg_leaves(&entry.value, out);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            collect_agg_leaves(source, out);
+            collect_agg_leaves(item, out);
+            if let Some(predicate) = predicate {
+                collect_agg_leaves(predicate, out);
+            }
+        }
         Expr::IfThenElse {
             condition,
             then_branch,
@@ -1714,6 +1739,31 @@ fn collect_field_refs(expr: &Expr, out: &mut Vec<QualifiedField>) {
             collect_field_refs(rhs, out);
         }
         Expr::Unary { operand, .. } => collect_field_refs(operand, out),
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                collect_field_refs(element, out);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let cxl::ast::MapKey::Computed(key) = &entry.key {
+                    collect_field_refs(key, out);
+                }
+                collect_field_refs(&entry.value, out);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            collect_field_refs(source, out);
+            collect_field_refs(item, out);
+            if let Some(predicate) = predicate {
+                collect_field_refs(predicate, out);
+            }
+        }
         Expr::IfThenElse {
             condition,
             then_branch,
@@ -1793,6 +1843,31 @@ fn collect_doc_paths_in_expr(expr: &Expr, out: &mut Vec<DocPath>) {
             collect_doc_paths_in_expr(rhs, out);
         }
         Expr::Unary { operand, .. } => collect_doc_paths_in_expr(operand, out),
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                collect_doc_paths_in_expr(element, out);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let cxl::ast::MapKey::Computed(key) = &entry.key {
+                    collect_doc_paths_in_expr(key, out);
+                }
+                collect_doc_paths_in_expr(&entry.value, out);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            collect_doc_paths_in_expr(source, out);
+            collect_doc_paths_in_expr(item, out);
+            if let Some(predicate) = predicate {
+                collect_doc_paths_in_expr(predicate, out);
+            }
+        }
         Expr::IfThenElse {
             condition,
             then_branch,
@@ -2530,6 +2605,52 @@ nodes:
                 namespace: "file".to_string(),
                 name: src.to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn transform_nested_constructor_dependencies_are_direct_lineage() {
+        let yaml = r#"
+pipeline: { name: nested_lineage }
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: data/rows.csv
+      schema:
+        - { name: dept, type: string }
+        - { name: amount, type: int }
+        - { name: score, type: int }
+        - { name: region, type: string }
+  - type: transform
+    name: construct
+    input: rows
+    config:
+      cxl: |
+        emit payload = {
+          dept: dept,
+          values: [item + amount for item in [score] if region == "west"],
+        }
+  - type: output
+    name: out
+    input: construct
+    config: { name: out, type: json, path: out/nested.json, include_unmapped: false }
+"#;
+        let lineage = lineage_of(yaml);
+        let source = "/w/data/rows.csv";
+        let fields = &only_output(&lineage).facet.fields;
+        use TransformationSubtype::Transformation;
+        assert_field(
+            fields,
+            "payload",
+            &[
+                direct(source, "amount", Transformation),
+                direct(source, "dept", Transformation),
+                direct(source, "region", Transformation),
+                direct(source, "score", Transformation),
+            ],
         );
     }
 

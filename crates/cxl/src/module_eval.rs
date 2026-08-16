@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::ast::{Expr, FnDecl, MatchArm, Module, ModuleConst, NodeId};
+use crate::ast::{Expr, FnDecl, MapEntry, MapKey, MatchArm, Module, ModuleConst, NodeId};
 use crate::lexer::Span;
 
 const RUNTIME_MODULE_NODE: NodeId = NodeId(u32::MAX);
@@ -366,6 +366,37 @@ fn collect_declaration_dependencies(
             visit(rhs, lexical, dependencies)
         }
         Expr::Unary { operand, .. } => visit(operand, lexical, dependencies),
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                visit(element, lexical, dependencies)?;
+            }
+            Ok(())
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let MapKey::Computed(key) = &entry.key {
+                    visit(key, lexical, dependencies)?;
+                }
+                visit(&entry.value, lexical, dependencies)?;
+            }
+            Ok(())
+        }
+        Expr::ArrayComprehension {
+            item,
+            binding,
+            source,
+            predicate,
+            ..
+        } => {
+            visit(source, lexical, dependencies)?;
+            let mut nested = lexical.clone();
+            nested.insert(binding.to_string());
+            visit(item, &nested, dependencies)?;
+            if let Some(predicate) = predicate {
+                visit(predicate, &nested, dependencies)?;
+            }
+            Ok(())
+        }
         Expr::IfThenElse {
             condition,
             then_branch,
@@ -773,6 +804,76 @@ impl RuntimeModuleRegistry {
                 operand: Box::new(expand(operand, stack)?),
                 span: call_span,
             },
+            Expr::ArrayLiteral { elements, .. } => Expr::ArrayLiteral {
+                node_id: RUNTIME_MODULE_NODE,
+                elements: elements
+                    .iter()
+                    .map(|element| expand(element, stack))
+                    .collect::<Result<Vec<_>, _>>()?,
+                span: call_span,
+            },
+            Expr::MapLiteral { entries, .. } => Expr::MapLiteral {
+                node_id: RUNTIME_MODULE_NODE,
+                entries: entries
+                    .iter()
+                    .map(|entry| {
+                        Ok(MapEntry {
+                            key: match &entry.key {
+                                MapKey::Static(key) => MapKey::Static(key.clone()),
+                                MapKey::Computed(key) => {
+                                    MapKey::Computed(Box::new(expand(key, stack)?))
+                                }
+                            },
+                            value: expand(&entry.value, stack)?,
+                            span: call_span,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+                span: call_span,
+            },
+            Expr::ArrayComprehension {
+                item,
+                binding,
+                source,
+                predicate,
+                ..
+            } => {
+                let source = Box::new(expand(source, stack)?);
+                let mut nested_substitutions = substitutions.clone();
+                nested_substitutions.remove(binding.as_ref());
+                let mut nested_protected = protected.clone();
+                nested_protected.insert(binding.to_string());
+                let item = Box::new(self.expand_expr(
+                    module_id,
+                    item,
+                    &nested_substitutions,
+                    &nested_protected,
+                    stack,
+                    call_span,
+                )?);
+                let predicate = predicate
+                    .as_ref()
+                    .map(|predicate| {
+                        self.expand_expr(
+                            module_id,
+                            predicate,
+                            &nested_substitutions,
+                            &nested_protected,
+                            stack,
+                            call_span,
+                        )
+                        .map(Box::new)
+                    })
+                    .transpose()?;
+                Expr::ArrayComprehension {
+                    node_id: RUNTIME_MODULE_NODE,
+                    item,
+                    binding: binding.clone(),
+                    source,
+                    predicate,
+                    span: call_span,
+                }
+            }
             Expr::Coalesce { lhs, rhs, .. } => Expr::Coalesce {
                 node_id: RUNTIME_MODULE_NODE,
                 lhs: Box::new(expand(lhs, stack)?),
@@ -1027,6 +1128,31 @@ fn walk_expr(expr: &Expr, refs: &mut Vec<String>) {
         Expr::Unary { operand, .. } => {
             walk_expr(operand, refs);
         }
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                walk_expr(element, refs);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let MapKey::Computed(key) = &entry.key {
+                    walk_expr(key, refs);
+                }
+                walk_expr(&entry.value, refs);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            walk_expr(source, refs);
+            walk_expr(item, refs);
+            if let Some(predicate) = predicate {
+                walk_expr(predicate, refs);
+            }
+        }
         Expr::Coalesce { lhs, rhs, .. } => {
             walk_expr(lhs, refs);
             walk_expr(rhs, refs);
@@ -1198,6 +1324,31 @@ fn collect_function_refs(expr: &Expr, names: &HashMap<&str, usize>, refs: &mut V
             collect_function_refs(rhs, names, refs);
         }
         Expr::Unary { operand, .. } => collect_function_refs(operand, names, refs),
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                collect_function_refs(element, names, refs);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let MapKey::Computed(key) = &entry.key {
+                    collect_function_refs(key, names, refs);
+                }
+                collect_function_refs(&entry.value, names, refs);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            collect_function_refs(source, names, refs);
+            collect_function_refs(item, names, refs);
+            if let Some(predicate) = predicate {
+                collect_function_refs(predicate, names, refs);
+            }
+        }
         Expr::IfThenElse {
             condition,
             then_branch,

@@ -86,6 +86,31 @@ pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &Expr) {
             visitor.visit_expr(rhs);
         }
         Expr::Unary { operand, .. } => visitor.visit_expr(operand),
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                visitor.visit_expr(element);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let crate::ast::MapKey::Computed(key) = &entry.key {
+                    visitor.visit_expr(key);
+                }
+                visitor.visit_expr(&entry.value);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            visitor.visit_expr(item);
+            visitor.visit_expr(source);
+            if let Some(predicate) = predicate {
+                visitor.visit_expr(predicate);
+            }
+        }
         Expr::MethodCall { receiver, args, .. } => {
             visitor.visit_expr(receiver);
             for arg in args {

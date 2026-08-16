@@ -190,6 +190,27 @@ pub enum Expr {
         value: LiteralValue,
         span: Span,
     },
+    /// Ordered array construction: `[expr, ...]`.
+    ArrayLiteral {
+        node_id: NodeId,
+        elements: Vec<Expr>,
+        span: Span,
+    },
+    /// Insertion-ordered map construction: `{ key: expr, [expr]: expr }`.
+    MapLiteral {
+        node_id: NodeId,
+        entries: Vec<MapEntry>,
+        span: Span,
+    },
+    /// Single-clause array comprehension: `[item for binding in source if predicate]`.
+    ArrayComprehension {
+        node_id: NodeId,
+        item: Box<Expr>,
+        binding: Box<str>,
+        source: Box<Expr>,
+        predicate: Option<Box<Expr>>,
+        span: Span,
+    },
     FieldRef {
         node_id: NodeId,
         name: Box<str>,
@@ -378,6 +399,21 @@ pub enum Expr {
     },
 }
 
+/// One entry in a map literal, retained in author order.
+#[derive(Debug, Clone)]
+pub struct MapEntry {
+    pub key: MapKey,
+    pub value: Expr,
+    pub span: Span,
+}
+
+/// A map key is either author text or a computed string expression.
+#[derive(Debug, Clone)]
+pub enum MapKey {
+    Static(Box<str>),
+    Computed(Box<Expr>),
+}
+
 impl Expr {
     /// Get the span of this expression.
     pub fn span(&self) -> Span {
@@ -385,6 +421,9 @@ impl Expr {
             Expr::Binary { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Literal { span, .. }
+            | Expr::ArrayLiteral { span, .. }
+            | Expr::MapLiteral { span, .. }
+            | Expr::ArrayComprehension { span, .. }
             | Expr::FieldRef { span, .. }
             | Expr::QualifiedFieldRef { span, .. }
             | Expr::MethodCall { span, .. }
@@ -415,6 +454,9 @@ impl Expr {
             Expr::Binary { node_id, .. }
             | Expr::Unary { node_id, .. }
             | Expr::Literal { node_id, .. }
+            | Expr::ArrayLiteral { node_id, .. }
+            | Expr::MapLiteral { node_id, .. }
+            | Expr::ArrayComprehension { node_id, .. }
             | Expr::FieldRef { node_id, .. }
             | Expr::QualifiedFieldRef { node_id, .. }
             | Expr::MethodCall { node_id, .. }
@@ -475,6 +517,31 @@ impl Expr {
                 rhs.support_into(fields);
             }
             Expr::Unary { operand, .. } => operand.support_into(fields),
+            Expr::ArrayLiteral { elements, .. } => {
+                for element in elements {
+                    element.support_into(fields);
+                }
+            }
+            Expr::MapLiteral { entries, .. } => {
+                for entry in entries {
+                    if let MapKey::Computed(key) = &entry.key {
+                        key.support_into(fields);
+                    }
+                    entry.value.support_into(fields);
+                }
+            }
+            Expr::ArrayComprehension {
+                item,
+                source,
+                predicate,
+                ..
+            } => {
+                source.support_into(fields);
+                item.support_into(fields);
+                if let Some(predicate) = predicate {
+                    predicate.support_into(fields);
+                }
+            }
             Expr::IfThenElse {
                 condition,
                 then_branch,
@@ -647,6 +714,31 @@ fn fold_config_expr(expr: &mut Expr, resolve: &impl Fn(&str) -> Option<LiteralVa
             fold_config_expr(rhs, resolve);
         }
         Expr::Unary { operand, .. } => fold_config_expr(operand, resolve),
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                fold_config_expr(element, resolve);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let MapKey::Computed(key) = &mut entry.key {
+                    fold_config_expr(key, resolve);
+                }
+                fold_config_expr(&mut entry.value, resolve);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            fold_config_expr(item, resolve);
+            fold_config_expr(source, resolve);
+            if let Some(predicate) = predicate {
+                fold_config_expr(predicate, resolve);
+            }
+        }
         Expr::MethodCall { receiver, args, .. } => {
             fold_config_expr(receiver, resolve);
             for a in args.iter_mut() {
@@ -742,6 +834,39 @@ pub fn offset_node_ids(expr: &mut Expr, base: u32) {
         } => {
             shift(node_id, base);
             offset_node_ids(operand, base);
+        }
+        Expr::ArrayLiteral {
+            node_id, elements, ..
+        } => {
+            shift(node_id, base);
+            for element in elements {
+                offset_node_ids(element, base);
+            }
+        }
+        Expr::MapLiteral {
+            node_id, entries, ..
+        } => {
+            shift(node_id, base);
+            for entry in entries {
+                if let MapKey::Computed(key) = &mut entry.key {
+                    offset_node_ids(key, base);
+                }
+                offset_node_ids(&mut entry.value, base);
+            }
+        }
+        Expr::ArrayComprehension {
+            node_id,
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            shift(node_id, base);
+            offset_node_ids(item, base);
+            offset_node_ids(source, base);
+            if let Some(predicate) = predicate {
+                offset_node_ids(predicate, base);
+            }
         }
         Expr::MethodCall {
             node_id,
@@ -857,6 +982,36 @@ pub fn rebase_expr_spans(expr: &mut Expr, delta: u32) {
         Expr::Unary { span, operand, .. } => {
             shift(span, delta);
             rebase_expr_spans(operand, delta);
+        }
+        Expr::ArrayLiteral { span, elements, .. } => {
+            shift(span, delta);
+            for element in elements {
+                rebase_expr_spans(element, delta);
+            }
+        }
+        Expr::MapLiteral { span, entries, .. } => {
+            shift(span, delta);
+            for entry in entries {
+                shift(&mut entry.span, delta);
+                if let MapKey::Computed(key) = &mut entry.key {
+                    rebase_expr_spans(key, delta);
+                }
+                rebase_expr_spans(&mut entry.value, delta);
+            }
+        }
+        Expr::ArrayComprehension {
+            span,
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            shift(span, delta);
+            rebase_expr_spans(item, delta);
+            rebase_expr_spans(source, delta);
+            if let Some(predicate) = predicate {
+                rebase_expr_spans(predicate, delta);
+            }
         }
         Expr::MethodCall {
             span,

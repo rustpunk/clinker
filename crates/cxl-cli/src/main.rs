@@ -640,11 +640,54 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
         cxl::ast::Expr::Literal { value, .. } => match value {
             cxl::ast::LiteralValue::Int(n) => n.to_string(),
             cxl::ast::LiteralValue::Float(f) => f.to_string(),
-            cxl::ast::LiteralValue::String(s) => format!("\"{}\"", s),
+            cxl::ast::LiteralValue::String(s) => format!("{s:?}"),
             cxl::ast::LiteralValue::Date(d) => format!("#{}", d.format("%Y-%m-%d")),
             cxl::ast::LiteralValue::Bool(b) => b.to_string(),
             cxl::ast::LiteralValue::Null => "null".into(),
         },
+        cxl::ast::Expr::ArrayLiteral { elements, .. } => format!(
+            "[{}]",
+            elements
+                .iter()
+                .map(format_expr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        cxl::ast::Expr::MapLiteral { entries, .. } => format!(
+            "{{{}}}",
+            entries
+                .iter()
+                .map(|entry| {
+                    let key = match &entry.key {
+                        cxl::ast::MapKey::Static(key) => format!("{key:?}"),
+                        cxl::ast::MapKey::Computed(key) => {
+                            format!("[{}]", format_expr(key))
+                        }
+                    };
+                    format!("{key}: {}", format_expr(&entry.value))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        cxl::ast::Expr::ArrayComprehension {
+            item,
+            binding,
+            source,
+            predicate,
+            ..
+        } => {
+            let mut formatted = format!(
+                "[{} for {} in {}",
+                format_expr(item),
+                binding,
+                format_expr(source)
+            );
+            if let Some(predicate) = predicate {
+                formatted.push_str(&format!(" if {}", format_expr(predicate)));
+            }
+            formatted.push(']');
+            formatted
+        }
         cxl::ast::Expr::FieldRef { name, .. } => name.to_string(),
         cxl::ast::Expr::QualifiedFieldRef { parts, .. } => {
             parts.iter().map(|p| &**p).collect::<Vec<_>>().join(".")
@@ -940,5 +983,21 @@ mod tests {
         // format_statement should normalize whitespace
         let formatted = format_statement(&parsed.ast.statements[0]);
         assert!(formatted.contains("emit x = 1 + 2"));
+    }
+
+    #[test]
+    fn test_cxl_fmt_nested_constructors_are_canonical_and_reparse() {
+        let source = r##"emit payload = {
+  "@kind": "event",
+  items: [item * 2 for item in values if item > 0],
+}"##;
+        let parsed = cxl::parser::Parser::parse(source);
+        assert!(parsed.errors.is_empty());
+        let formatted = format_statement(&parsed.ast.statements[0]);
+        assert_eq!(
+            formatted,
+            r#"emit payload = {"@kind": "event", "items": [item * 2 for item in values if item > 0]}"#
+        );
+        assert!(cxl::parser::Parser::parse(&formatted).errors.is_empty());
     }
 }

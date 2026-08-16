@@ -47,6 +47,16 @@ records. Statements execute top to bottom; later statements can reference
 fields produced by earlier `emit` or `let` statements, and a false `filter`
 excludes the record. Evaluation performs no type inference.
 
+Array literals, map literals, and array comprehensions are ordinary expression
+nodes throughout this pipeline, including inside aggregate residuals. Every AST
+walker must recurse into item/value expressions, computed map keys,
+comprehension sources, and predicates; otherwise schema binding, dependency
+analysis, semantic identity, or lineage can silently miss an input. Runtime
+construction preserves author order, rejects duplicate logical keys after
+canonical escape decoding, and shares a per-record 10 MiB allocation budget and
+64-container depth cap across nested constructors. The aggregate residual
+evaluator enforces the same rules.
+
 The phase split is what makes CXL's compile-time guarantee meaningful: a `cxl check transform.cxl` runs Parse → Resolve → Typecheck and reports any error with a span before a single record is read, e.g.
 
 ```text

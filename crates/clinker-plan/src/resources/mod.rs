@@ -936,6 +936,46 @@ impl SemanticModuleHasher {
                 self.tag(2);
                 self.literal(value);
             }
+            Expr::ArrayLiteral { elements, .. } => {
+                self.tag(24);
+                self.expression_list(elements);
+            }
+            Expr::MapLiteral { entries, .. } => {
+                self.tag(25);
+                self.usize(entries.len());
+                for entry in entries {
+                    match &entry.key {
+                        cxl::ast::MapKey::Static(key) => {
+                            self.tag(0);
+                            self.string(key);
+                        }
+                        cxl::ast::MapKey::Computed(key) => {
+                            self.tag(1);
+                            self.expression(key);
+                        }
+                    }
+                    self.expression(&entry.value);
+                }
+            }
+            Expr::ArrayComprehension {
+                item,
+                binding,
+                source,
+                predicate,
+                ..
+            } => {
+                self.tag(26);
+                self.expression(item);
+                self.string(binding);
+                self.expression(source);
+                match predicate {
+                    Some(predicate) => {
+                        self.tag(1);
+                        self.expression(predicate);
+                    }
+                    None => self.tag(0),
+                }
+            }
             Expr::FieldRef { name, .. } => {
                 self.tag(3);
                 self.string(name);
@@ -1143,4 +1183,30 @@ fn semantic_module_digest(module: &Module) -> [u8; 32] {
     }
 
     hasher.finish()
+}
+
+#[cfg(test)]
+mod semantic_nested_value_tests {
+    use super::*;
+    use cxl::parser::Parser;
+
+    fn digest(source: &str) -> [u8; 32] {
+        let parsed = Parser::parse_module(source);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        semantic_module_digest(&parsed.module)
+    }
+
+    #[test]
+    fn nested_constructor_identity_ignores_layout_but_preserves_author_order() {
+        let compact = digest("let PAYLOAD = {first: [1, 2], last: [x for x in [3, 4]]}");
+        let multiline =
+            digest("let PAYLOAD = {\n  first: [1, 2],\n  last: [x for x in [3, 4]],\n}");
+        let reordered = digest("let PAYLOAD = {last: [x for x in [3, 4]], first: [1, 2]}");
+        assert_eq!(compact, multiline);
+        assert_ne!(compact, reordered, "map insertion order is semantic");
+    }
 }
