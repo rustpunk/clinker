@@ -69,7 +69,7 @@ use crate::executor::output_dispatch::OrderedWriterBoundary;
 use crate::executor::stream_event::{SourceRowId, StreamEvent};
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
 use crate::executor::{DlqEntry, build_format_writer};
-use clinker_plan::config::OutputConfig;
+use clinker_plan::config::SinkConfig;
 use clinker_plan::error::PipelineError;
 
 /// Identity of one document the policy operates on: its source file (the
@@ -346,7 +346,7 @@ struct DocBucket {
 /// decisions, then flushed at the driver's end.
 pub(crate) struct DocumentDlqDriver<'cfg> {
     output_name: String,
-    out_cfg: &'cfg OutputConfig,
+    out_cfg: &'cfg SinkConfig,
     cxl_emit_names: Option<Vec<String>>,
     /// Per-file spillable buckets, dropped at each file's outermost close.
     buckets: HashMap<DocKey, DocBucket>,
@@ -376,7 +376,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
     pub(crate) fn new(
         ctx: &ExecutorContext<'_>,
         output_name: &str,
-        out_cfg: &'cfg OutputConfig,
+        out_cfg: &'cfg SinkConfig,
         cxl_emit_names: Vec<String>,
         writer_boundary: OrderedWriterBoundary,
     ) -> Self {

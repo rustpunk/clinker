@@ -9,7 +9,6 @@ pub mod fs_type;
 pub mod multi_value;
 pub mod node_header;
 pub mod observability;
-pub mod output;
 pub mod output_mapping;
 pub mod patch;
 pub mod path_template;
@@ -18,6 +17,7 @@ pub mod pipeline_node;
 pub mod record_path;
 pub mod route;
 pub mod scoped_var;
+pub mod sink;
 pub mod sort;
 pub mod source;
 pub mod storage;
@@ -48,7 +48,6 @@ pub use fs_type::{
 };
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use observability::*;
-pub use output::*;
 pub use output_mapping::{MappingEntry, OutputMapping};
 pub use patch::{
     BodySourcePatchMap, ColumnPatch, DiscriminatorPatch, EnvelopeFieldOp, NestedSectionOp,
@@ -62,6 +61,7 @@ pub use pipeline_node::{
 };
 pub use route::*;
 pub use scoped_var::*;
+pub use sink::*;
 pub use sort::*;
 pub use source::*;
 pub use storage::{

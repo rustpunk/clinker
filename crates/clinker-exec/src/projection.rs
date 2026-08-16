@@ -5,7 +5,7 @@ use clinker_record::{Record, SchemaBuilder, Value, round_decimal_to_scale};
 use cxl::typecheck::Type;
 use indexmap::IndexMap;
 
-use clinker_plan::config::OutputConfig;
+use clinker_plan::config::SinkConfig;
 
 /// Apply schema aliases to emitted fields: rename keys from original to alias names.
 ///
@@ -34,7 +34,7 @@ pub fn apply_aliases(emitted: &mut IndexMap<String, Value>, aliases: &HashMap<St
 pub fn project_output(
     input_record: &Record,
     emitted: &IndexMap<String, Value>,
-    config: &OutputConfig,
+    config: &SinkConfig,
 ) -> Record {
     project_output_with_meta(input_record, emitted, &IndexMap::new(), config)
 }
@@ -52,7 +52,7 @@ pub fn project_output_with_meta(
     input_record: &Record,
     _emitted: &IndexMap<String, Value>,
     _metadata: &IndexMap<String, Value>,
-    config: &OutputConfig,
+    config: &SinkConfig,
 ) -> Record {
     project_output_from_record(input_record, config, None)
 }
@@ -78,7 +78,7 @@ pub fn project_output_with_meta(
 /// still governs everything the block does not list.
 pub fn project_output_from_record(
     input_record: &Record,
-    config: &OutputConfig,
+    config: &SinkConfig,
     cxl_emit_names: Option<&[String]>,
 ) -> Record {
     project_output_probed(input_record, config, cxl_emit_names, None)
@@ -93,7 +93,7 @@ pub fn project_output_from_record(
 /// the ad-hoc and test projections, which produce no report.
 pub fn project_output_probed(
     input_record: &Record,
-    config: &OutputConfig,
+    config: &SinkConfig,
     cxl_emit_names: Option<&[String]>,
     mut probe: Option<&mut MappingProbe>,
 ) -> Record {
@@ -354,7 +354,7 @@ pub fn project_output_probed(
 /// [`MappingProbe::discard_staged_record`] before staging another record.
 pub(crate) fn project_output_staged(
     input_record: &Record,
-    config: &OutputConfig,
+    config: &SinkConfig,
     cxl_emit_names: Option<&[String]>,
     probe: &mut MappingProbe,
 ) -> Record {
@@ -383,7 +383,7 @@ pub(crate) fn project_output_staged(
 /// path only clears and sets reusable flags.
 ///
 /// Self-describing on purpose: it carries the source names it was built from
-/// rather than re-reading them out of an [`OutputConfig`] at report time. The
+/// rather than re-reading them out of an [`SinkConfig`] at report time. The
 /// report is produced after the dispatch walk, where the only handle left is
 /// the Output's name, and matching that name back to a config is a lookup that
 /// can miss — a miss would report one Output's entries under another's name.
@@ -412,7 +412,7 @@ pub struct MappingProbe {
 impl MappingProbe {
     /// A probe sized for `config`'s mapping block. Cheap for an Output with no
     /// `mapping:` — it allocates nothing and reports nothing.
-    pub fn for_config(config: &OutputConfig) -> Self {
+    pub fn for_config(config: &SinkConfig) -> Self {
         let (sources, outputs): (Vec<Box<str>>, Vec<Box<str>>) =
             config.mapping.as_ref().map_or_else(
                 || (Vec::new(), Vec::new()),
@@ -513,7 +513,7 @@ impl MappingProbe {
     /// column look populated. The checks mirror the gather/exclude/mapping
     /// visibility rules in [`project_output_probed`] and allocate no
     /// per-record state.
-    pub(crate) fn observe_committed_record(&mut self, record: &Record, config: &OutputConfig) {
+    pub(crate) fn observe_committed_record(&mut self, record: &Record, config: &SinkConfig) {
         self.note_record();
         let Some(mapping) = config.mapping.as_ref() else {
             return;
@@ -615,7 +615,7 @@ impl MappingProbe {
 
 /// Whether `name` is present in the temporary field map built by the output
 /// projection after its visibility and `exclude:` rules run.
-fn projection_field_is_present(record: &Record, config: &OutputConfig, name: &str) -> bool {
+fn projection_field_is_present(record: &Record, config: &SinkConfig, name: &str) -> bool {
     if config
         .exclude
         .as_ref()
@@ -647,7 +647,7 @@ fn projection_field_is_present(record: &Record, config: &OutputConfig, name: &st
 
 /// Under `include_unmapped: false`, only correlation columns can be appended
 /// after the declared mapping, and only when the author explicitly opts in.
-fn correlation_field_is_present(record: &Record, config: &OutputConfig, name: &str) -> bool {
+fn correlation_field_is_present(record: &Record, config: &SinkConfig, name: &str) -> bool {
     if !config.include_correlation_keys
         || config
             .exclude
@@ -686,7 +686,7 @@ fn correlation_field_is_present(record: &Record, config: &OutputConfig, name: &s
 /// through untouched. Blocking/streaming: pure per-record transform, no
 /// buffering; cost is proportional to the declared column count and is skipped
 /// entirely for the schema-less outputs (CSV/JSON without a `schema:` block).
-fn round_declared_output_decimals(record: &mut Record, config: &OutputConfig) {
+fn round_declared_output_decimals(record: &mut Record, config: &SinkConfig) {
     let Some(columns) = config.schema.as_ref().and_then(|s| s.as_columns()) else {
         return;
     };
@@ -762,7 +762,7 @@ mod tests {
         input.set("full_name", Value::String("Alice Smith".into()));
         let emitted = IndexMap::new();
 
-        let config = OutputConfig {
+        let config = SinkConfig {
             name: "out".into(),
             format: clinker_plan::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
@@ -805,7 +805,7 @@ mod tests {
         let input = make_input();
         let emitted = IndexMap::new();
 
-        let config = OutputConfig {
+        let config = SinkConfig {
             name: "out".into(),
             format: clinker_plan::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
@@ -842,7 +842,7 @@ mod tests {
 
         let mapping = OutputMapping::new(vec![MappingEntry::rename("given_name", "first_name")]);
 
-        let config = OutputConfig {
+        let config = SinkConfig {
             name: "out".into(),
             format: clinker_plan::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
@@ -891,8 +891,8 @@ mod tests {
         )
     }
 
-    fn fast_path_output_config(include_correlation_keys: bool) -> OutputConfig {
-        OutputConfig {
+    fn fast_path_output_config(include_correlation_keys: bool) -> SinkConfig {
+        SinkConfig {
             name: "out".into(),
             format: clinker_plan::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
@@ -992,7 +992,7 @@ mod tests {
         // but a mapping under `include_unmapped: false` emits only what it
         // lists, which would conflate this test with the selection semantic it
         // is not about.
-        let config_slow = OutputConfig {
+        let config_slow = SinkConfig {
             name: "out".into(),
             format: clinker_plan::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
@@ -1375,7 +1375,7 @@ mod tests {
                 Value::Map(Box::new(sidecar)),
             ],
         );
-        let config = OutputConfig {
+        let config = SinkConfig {
             name: "out".into(),
             format: clinker_plan::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
@@ -1445,7 +1445,7 @@ mod tests {
         ));
         input.set_doc_ctx(Arc::clone(&ctx));
 
-        let config = OutputConfig {
+        let config = SinkConfig {
             name: "out".into(),
             format: clinker_plan::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
@@ -1487,8 +1487,8 @@ mod tests {
     /// keys) carrying an optional output `schema:`. `cxl_emit_names = None`
     /// keeps every user field, so a declared decimal column reaches the
     /// rounding pass.
-    fn scale_config(schema: Option<SourceSchema>) -> OutputConfig {
-        OutputConfig {
+    fn scale_config(schema: Option<SourceSchema>) -> SinkConfig {
+        SinkConfig {
             name: "out".into(),
             format: clinker_plan::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),

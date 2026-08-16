@@ -19,7 +19,7 @@ use clinker_format::traits::FormatWriter;
 use clinker_format::x12::Charset;
 use clinker_format::x12::writer::{X12Writer, X12WriterConfig};
 use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
-use clinker_plan::config::{OutputConfig, OutputFormat};
+use clinker_plan::config::{OutputFormat, SinkConfig};
 use clinker_plan::error::PipelineError;
 
 /// Output writer registry. Holds two parallel maps:
@@ -212,7 +212,7 @@ fn build_swift_writer_config(
 /// Fixed-width output requires an explicit single-record column list specifying
 /// names, widths, and optionally start positions, justification, and padding.
 fn extract_output_field_defs(
-    output: &OutputConfig,
+    output: &SinkConfig,
 ) -> Result<Vec<clinker_format::Column>, PipelineError> {
     let schema = output.schema.as_ref().ok_or_else(|| {
         PipelineError::Config(clinker_plan::config::ConfigError::Validation(
@@ -265,7 +265,7 @@ fn resolve_envelope_spec(
 }
 
 fn build_writer_factory(
-    output: &OutputConfig,
+    output: &SinkConfig,
     repeat_header: bool,
     field_defs: Option<Vec<clinker_format::Column>>,
 ) -> Result<WriterFactory, PipelineError> {
@@ -445,7 +445,7 @@ fn build_writer_factory(
 /// For split outputs: creates a `SplittingWriter` with a file factory and writer factory.
 /// For non-split outputs: creates a single writer wrapped in `CountedFormatWriter`.
 pub(crate) fn build_format_writer(
-    output: &OutputConfig,
+    output: &SinkConfig,
     raw_writer: Box<dyn Write + Send>,
     schema: Arc<Schema>,
     output_staging: crate::output::staging::OutputStagingRegistry,

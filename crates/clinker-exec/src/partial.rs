@@ -1,12 +1,12 @@
 //! Per-item fallback parser for graceful degradation in external tooling.
 //!
 //! Walks the unified `nodes:` array directly. Sources and outputs
-//! deserialize into `SourceConfig`/`OutputConfig` via the Body wrappers;
+//! deserialize into `SourceConfig`/`SinkConfig` via the Body wrappers;
 //! transforms/aggregates/routes produce a lightweight [`PartialTransform`]
 //! tile with only the fields the canvas renders.
 
 use clinker_plan::config::{
-    ErrorHandlingConfig, OutputConfig, PipelineMeta, SourceConfig, interpolate_env_vars,
+    ErrorHandlingConfig, PipelineMeta, SinkConfig, SourceConfig, interpolate_env_vars,
 };
 
 #[derive(Debug, Clone)]
@@ -35,7 +35,7 @@ pub struct PartialPipelineConfig {
     pub pipeline: Result<PipelineMeta, String>,
     pub inputs: Vec<PartialItem<SourceConfig>>,
     pub transformations: Vec<PartialItem<PartialTransform>>,
-    pub outputs: Vec<PartialItem<OutputConfig>>,
+    pub outputs: Vec<PartialItem<SinkConfig>>,
     pub error_handling: Result<ErrorHandlingConfig, String>,
     pub notes: Option<serde_json::Value>,
     pub errors: Vec<String>,
@@ -68,7 +68,7 @@ pub fn parse_partial_config(yaml: &str) -> Result<PartialPipelineConfig, String>
 
     let mut inputs: Vec<PartialItem<SourceConfig>> = Vec::new();
     let mut transformations: Vec<PartialItem<PartialTransform>> = Vec::new();
-    let mut outputs: Vec<PartialItem<OutputConfig>> = Vec::new();
+    let mut outputs: Vec<PartialItem<SinkConfig>> = Vec::new();
 
     if let Some(nodes_value) = obj.get("nodes")
         && let Some(nodes_arr) = nodes_value.as_array()
@@ -108,7 +108,7 @@ fn project_partial_nodes(
     nodes_arr: &[serde_json::Value],
     inputs: &mut Vec<PartialItem<SourceConfig>>,
     transformations: &mut Vec<PartialItem<PartialTransform>>,
-    outputs: &mut Vec<PartialItem<OutputConfig>>,
+    outputs: &mut Vec<PartialItem<SinkConfig>>,
     errors: &mut Vec<String>,
 ) {
     for (i, node) in nodes_arr.iter().enumerate() {
@@ -147,7 +147,7 @@ fn project_partial_nodes(
                 }
             }
             "output" => {
-                match serde_json::from_value::<OutputConfig>(merge_name_into(&config, &name)) {
+                match serde_json::from_value::<SinkConfig>(merge_name_into(&config, &name)) {
                     Ok(out) => outputs.push(PartialItem::Ok(out)),
                     Err(e) => {
                         let msg = format!("nodes[{i}] ({name}): {e}");

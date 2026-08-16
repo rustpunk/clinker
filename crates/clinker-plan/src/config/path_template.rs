@@ -1,6 +1,6 @@
 //! Output path templating with conditional emit.
 //!
-//! Templates appear in `OutputConfig.path` and use `{token}` braces to
+//! Templates appear in `SinkConfig.path` and use `{token}` braces to
 //! interpolate plan-time values (source filename, channel, pipeline
 //! hash, run timestamp, ids) plus the runtime collision counter `{n}`.
 //! Literal braces escape as `{{` and `}}`.

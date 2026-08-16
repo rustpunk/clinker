@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// Output destination configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutputConfig {
+pub struct SinkConfig {
     pub name: String,
     pub path: String,
     /// Typed runtime path segments populated during template resolution.
@@ -106,7 +106,7 @@ pub struct OutputConfig {
     pub notes: Option<serde_json::Value>,
 }
 
-impl OutputConfig {
+impl SinkConfig {
     #[must_use]
     pub fn has_per_record_path_tokens(&self) -> bool {
         self.resolved_path_template.as_ref().map_or_else(

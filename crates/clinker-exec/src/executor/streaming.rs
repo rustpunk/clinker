@@ -18,7 +18,7 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema};
 
 use clinker_format::traits::FormatWriter;
-use clinker_plan::config::{ErrorStrategy, OutputConfig, PipelineConfig};
+use clinker_plan::config::{ErrorStrategy, PipelineConfig, SinkConfig};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::certify_streaming_edge;
 
@@ -67,7 +67,7 @@ pub(super) fn compute_streaming_output_specs(
     config: &PipelineConfig,
     fused_transforms: &HashSet<petgraph::graph::NodeIndex>,
     init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
-    output_configs: &[OutputConfig],
+    output_configs: &[SinkConfig],
     writers: &WriterRegistry,
 ) -> Vec<StreamingOutputSpec> {
     use clinker_plan::plan::execution::PlanNode;
@@ -173,7 +173,7 @@ pub(crate) struct StreamingOutputSpec {
     /// as the upstream-node label in the streaming task's E314
     /// schema-mismatch diagnostics.
     pub(crate) producer_name: String,
-    pub(crate) out_cfg: OutputConfig,
+    pub(crate) out_cfg: SinkConfig,
     /// Compile-time input schema for the Output; used by the streaming
     /// task to run the same `check_input_schema` invariant the buffered
     /// path enforces (E314 SchemaMismatch diagnostics).
@@ -227,7 +227,7 @@ pub(crate) struct StreamingOutputTaskOutput {
     /// This Output's config, so the fold can size a probe entry the dispatcher
     /// arms never created. Owned for the same reason the rest of
     /// [`StreamingOutputSpec`] is: the thread outlives the borrow.
-    pub(crate) out_cfg: OutputConfig,
+    pub(crate) out_cfg: SinkConfig,
 }
 
 impl StreamingOutputTaskOutput {
