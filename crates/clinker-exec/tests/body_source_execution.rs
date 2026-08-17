@@ -472,11 +472,11 @@ fn tracer_two_calls_open_distinct_finite_body_source_sessions() {
         .collect();
     logical_nodes.sort_unstable();
     assert_eq!(logical_nodes, ["first.read", "second.read"]);
-    assert_eq!(source_signals.started, 2);
-    assert_eq!(source_signals.completed, 2);
+    assert_eq!(source_signals.started, 3);
+    assert_eq!(source_signals.completed, 3);
     assert_eq!(source_signals.failed, 0);
     assert_eq!(source_signals.interrupted, 0);
-    assert_eq!(source_signals.spans.len(), 2);
+    assert_eq!(source_signals.spans.len(), 3);
     assert!(
         source_signals
             .spans
@@ -640,7 +640,7 @@ fn partial_group_open_failure_closes_sessions_without_starting_downstream() {
     assert_eq!((started, completed, failed), (2, 1, 1));
     assert_eq!(spans.len(), 2);
     assert!(spans.iter().any(|span| span.status == SpanStatus::Error));
-    assert_eq!((source_started, source_terminal, source_spans), (0, 0, 0));
+    assert_eq!((source_started, source_terminal, source_spans), (1, 1, 1));
 }
 
 #[test]
@@ -660,16 +660,32 @@ fn read_failure_after_open_emits_one_failed_terminal_per_started_source() {
     result.expect_err("the admitted reader fails after its group opens");
 
     let signals = drain_source_signals(&receiver);
-    assert!(signals.started > 0);
-    assert_eq!(signals.failed, signals.started);
-    assert_eq!(signals.completed, 0);
+    assert_eq!(signals.started, 2);
+    assert_eq!(signals.failed, 1);
+    assert_eq!(signals.completed, 1);
     assert_eq!(signals.interrupted, 0);
     assert_eq!(signals.spans.len() as u64, signals.started);
     assert!(
         signals
             .spans
             .iter()
-            .all(|span| span.status == SpanStatus::Error && span.logical_node == "source")
+            .all(|span| span.logical_node == "source")
+    );
+    assert_eq!(
+        signals
+            .spans
+            .iter()
+            .filter(|span| span.status == SpanStatus::Error)
+            .count(),
+        1
+    );
+    assert_eq!(
+        signals
+            .spans
+            .iter()
+            .filter(|span| span.status == SpanStatus::Ok)
+            .count(),
+        1
     );
 
     let events = events.snapshot();
@@ -764,16 +780,32 @@ fn cancellation_after_open_closes_the_active_session_and_group_lease() {
     );
 
     let signals = drain_source_signals(&receiver);
-    assert!(signals.started > 0);
-    assert_eq!(signals.interrupted, signals.started);
-    assert_eq!(signals.completed, 0);
+    assert_eq!(signals.started, 2);
+    assert_eq!(signals.interrupted, 1);
+    assert_eq!(signals.completed, 1);
     assert_eq!(signals.failed, 0);
     assert_eq!(signals.spans.len() as u64, signals.started);
     assert!(
         signals
             .spans
             .iter()
-            .all(|span| span.status == SpanStatus::Unset && span.logical_node == "source")
+            .all(|span| span.logical_node == "source")
+    );
+    assert_eq!(
+        signals
+            .spans
+            .iter()
+            .filter(|span| span.status == SpanStatus::Unset)
+            .count(),
+        1
+    );
+    assert_eq!(
+        signals
+            .spans
+            .iter()
+            .filter(|span| span.status == SpanStatus::Ok)
+            .count(),
+        1
     );
 }
 
@@ -799,7 +831,7 @@ fn source_span_admission_loss_does_not_change_execution_or_cleanup() {
     assert!(second.as_string().contains("0001"));
     assert!(observer.snapshot().sampled_drops > 0);
     let signals = drain_source_signals(&receiver);
-    assert_eq!((signals.started, signals.completed), (2, 2));
+    assert_eq!((signals.started, signals.completed), (3, 3));
     assert_eq!((signals.failed, signals.interrupted), (0, 0));
 
     let events = events.snapshot();

@@ -152,6 +152,7 @@ pub struct ResourceDatasetIdentity {
 pub struct CatalogResource {
     id: LogicalResourceId,
     descriptor: ResourceDescriptor,
+    canonical_target: PathBuf,
 }
 
 impl CatalogResource {
@@ -163,6 +164,17 @@ impl CatalogResource {
     /// Admitted typed descriptor.
     pub fn descriptor(&self) -> &ResourceDescriptor {
         &self.descriptor
+    }
+
+    /// Canonical workspace-contained target admitted with this descriptor.
+    ///
+    /// Runtime edge code must open this target rather than reconstructing the
+    /// authored path. Keeping the validation result makes a later change to an
+    /// authored symlink unable to redirect an admitted resource outside the
+    /// workspace. This physical path must not enter `CompiledPlan`, lineage,
+    /// diagnostics, or telemetry.
+    pub fn canonical_target(&self) -> &Path {
+        &self.canonical_target
     }
 
     /// Stable, relocation-independent dataset identity for this resource.
@@ -383,7 +395,7 @@ impl WorkspaceCatalog {
 
         for (raw_id, config) in &config.resources {
             let id = LogicalResourceId::parse(raw_id)?;
-            let descriptor = match config {
+            let (descriptor, canonical_target) = match config {
                 CatalogResourceConfig::File { path, access } => {
                     let target = validate_runtime_file_target(&workspace_root, path, &id)?;
                     if let Some((previous_kind, previous_id)) = physical_ids.get(&target) {
@@ -392,14 +404,24 @@ impl WorkspaceCatalog {
                             previous_id, previous_kind, id, "runtime file"
                         )));
                     }
-                    physical_ids.insert(target, ("runtime file", id.clone()));
-                    ResourceDescriptor::File {
-                        path: path.clone(),
-                        access: *access,
-                    }
+                    physical_ids.insert(target.clone(), ("runtime file", id.clone()));
+                    (
+                        ResourceDescriptor::File {
+                            path: path.clone(),
+                            access: *access,
+                        },
+                        target,
+                    )
                 }
             };
-            resources.insert(id.clone(), CatalogResource { id, descriptor });
+            resources.insert(
+                id.clone(),
+                CatalogResource {
+                    id,
+                    descriptor,
+                    canonical_target,
+                },
+            );
         }
 
         Ok(Self {

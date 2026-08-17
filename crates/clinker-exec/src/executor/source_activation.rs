@@ -320,7 +320,7 @@ fn observe_open<T>(
     result.map_err(capability_error)
 }
 
-fn observe_source<T>(
+pub(super) fn observe_source<T>(
     producer: Option<&TelemetryProducer>,
     shutdown: Option<&crate::pipeline::shutdown::ShutdownToken>,
     operation: impl FnOnce() -> Result<T, PipelineError>,

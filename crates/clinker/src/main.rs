@@ -2921,7 +2921,6 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     let admitted_run_capabilities =
         credential_profile::admit_uncredentialed_run_capabilities_with_catalog(
             &compiled_plan,
-            compile_ctx.workspace_root(),
             &activation_catalog,
         )
         .map_err(|error| {

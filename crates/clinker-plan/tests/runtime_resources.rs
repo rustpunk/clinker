@@ -429,3 +429,44 @@ fn identity_resource_dataset_inputs_are_stable_and_secret_free() {
     assert!(!rendered.contains("orders.csv"));
     assert!(!rendered.contains("credential"));
 }
+
+#[cfg(unix)]
+#[test]
+fn identity_catalog_retains_the_validated_target_after_symlink_retarget() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = write_workspace();
+    let outside = tempfile::tempdir().expect("outside directory");
+    let alias = workspace.path().join("data/current.csv");
+    symlink(workspace.path().join("data/orders.csv"), &alias).expect("inside alias");
+    let config = CatalogConfig {
+        resources: BTreeMap::from([(
+            "current".to_string(),
+            CatalogResourceConfig::File {
+                path: PathBuf::from("data/current.csv"),
+                access: FileResourceAccess::Read,
+            },
+        )]),
+        ..CatalogConfig::default()
+    };
+    let catalog = WorkspaceCatalog::load(workspace.path(), &config).expect("catalog admits alias");
+    let id = LogicalResourceId::parse("current").expect("logical id");
+    let admitted = catalog
+        .resolve_resource(&id)
+        .expect("resource")
+        .canonical_target()
+        .to_path_buf();
+
+    std::fs::remove_file(&alias).expect("remove admitted alias");
+    symlink(outside.path().join("outside.csv"), &alias).expect("retarget alias");
+
+    assert_eq!(
+        admitted,
+        workspace
+            .path()
+            .join("data/orders.csv")
+            .canonicalize()
+            .expect("canonical admitted target")
+    );
+    assert!(!admitted.starts_with(outside.path()));
+}

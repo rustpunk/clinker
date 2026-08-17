@@ -741,7 +741,7 @@ nodes:
     config:
       option: "use ignored.option"
     resources:
-      target: "use ignored.target"
+      target: "use.ignored.target"
 "#,
     )
     .expect("non-CXL fixture parses");

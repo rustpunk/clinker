@@ -132,7 +132,6 @@ pub fn admit_uncredentialed_run_capabilities(
 #[cfg_attr(test, allow(dead_code))]
 pub fn admit_uncredentialed_run_capabilities_with_catalog(
     plan: &clinker_plan::plan::CompiledPlan,
-    workspace_root: &std::path::Path,
     catalog: &clinker_plan::resources::WorkspaceCatalog,
 ) -> Result<AdmittedRunCapabilities, ActivationAdmissionError> {
     let activation = plan.dag().source_activation();
@@ -177,14 +176,13 @@ pub fn admit_uncredentialed_run_capabilities_with_catalog(
                     if !compatible {
                         return Err(ActivationAdmissionError::InvalidCompiledActivation);
                     }
-                    let path = workspace_root.join(descriptor.path());
                     let provenance = format!(
                         "{}/{}",
                         requirement.dataset_identity.namespace, requirement.dataset_identity.name
                     );
                     Ok(AdmittedSourceOpener::new(
                         member,
-                        Box::new(FileResourceOpener { path, provenance }),
+                        Box::new(file_resource_opener(resource, provenance)),
                     ))
                 })
                 .collect::<Result<Vec<_>, ActivationAdmissionError>>()?;
@@ -203,6 +201,16 @@ pub fn admit_uncredentialed_run_capabilities_with_catalog(
 struct FileResourceOpener {
     path: std::path::PathBuf,
     provenance: String,
+}
+
+fn file_resource_opener(
+    resource: &clinker_plan::resources::CatalogResource,
+    provenance: String,
+) -> FileResourceOpener {
+    FileResourceOpener {
+        path: resource.canonical_target().to_path_buf(),
+        provenance,
+    }
 }
 
 impl CapabilityOpener for FileResourceOpener {
@@ -236,7 +244,68 @@ impl CapabilitySession for FileResourceSession {
 mod file_resource_opener_tests {
     use std::io::{Read, Write};
 
+    #[cfg(unix)]
+    use std::collections::BTreeMap;
+
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_opener_ignores_a_retargeted_authored_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let inside_path = workspace.path().join("inside.csv");
+        let outside_path = outside.path().join("outside.csv");
+        let alias = workspace.path().join("current.csv");
+        std::fs::write(&inside_path, b"id\ninside\n").expect("inside file");
+        std::fs::write(&outside_path, b"id\noutside\n").expect("outside file");
+        symlink(&inside_path, &alias).expect("inside alias");
+        let catalog = clinker_plan::resources::WorkspaceCatalog::load(
+            workspace.path(),
+            &clinker_plan::resources::CatalogConfig {
+                resources: BTreeMap::from([(
+                    "current".to_string(),
+                    clinker_plan::resources::CatalogResourceConfig::File {
+                        path: "current.csv".into(),
+                        access: clinker_plan::resources::FileResourceAccess::Read,
+                    },
+                )]),
+                ..Default::default()
+            },
+        )
+        .expect("catalog admits inside alias");
+        let id = clinker_plan::resources::LogicalResourceId::parse("current")
+            .expect("logical resource id");
+        let resource = catalog.resolve_resource(&id).expect("catalog resource");
+
+        std::fs::remove_file(&alias).expect("remove inside alias");
+        symlink(&outside_path, &alias).expect("outside alias");
+        let mut session = Box::new(file_resource_opener(
+            resource,
+            "clinker-resource:file/current".to_string(),
+        ))
+        .open()
+        .expect("open validated target");
+        let clinker_exec::executor::SourceInput::Files(mut slots) = session
+            .take_source_input()
+            .expect("transfer admitted source input")
+        else {
+            panic!("file resource session must return file slots");
+        };
+        let mut contents = String::new();
+        slots
+            .pop()
+            .expect("one file slot")
+            .source
+            .open()
+            .expect("open retained source")
+            .read_to_string(&mut contents)
+            .expect("read retained source");
+
+        assert_eq!(contents, "id\ninside\n");
+    }
 
     #[test]
     fn opened_session_keeps_the_admitted_file_after_path_replacement() {

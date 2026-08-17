@@ -1060,6 +1060,8 @@ impl PipelineExecutor {
             // within the documented shutdown bound; the file arm ignores
             // it (dropped-receiver stop suffices).
             let ingest_shutdown = params.shutdown_token.clone();
+            let lifecycle_shutdown = ingest_shutdown.clone();
+            let lifecycle_telemetry = params.telemetry_producer.clone();
             let ingest_progress = params.progress.clone();
             let ingest_source_runtime = source_runtime.clone();
             // One OS thread per Source. Spawned before the DAG dispatch
@@ -1069,14 +1071,20 @@ impl PipelineExecutor {
             let handle = std::thread::Builder::new()
                 .name(format!("clinker-ingest-{}", src_cfg.name))
                 .spawn(move || {
-                    ingest_source(
-                        src_cfg_owned,
-                        source_input,
-                        config_clone,
-                        stream,
-                        ingest_shutdown,
-                        ingest_progress,
-                        ingest_source_runtime,
+                    source_activation::observe_source(
+                        lifecycle_telemetry.as_ref(),
+                        lifecycle_shutdown.as_ref(),
+                        || {
+                            ingest_source(
+                                src_cfg_owned,
+                                source_input,
+                                config_clone,
+                                stream,
+                                ingest_shutdown,
+                                ingest_progress,
+                                ingest_source_runtime,
+                            )
+                        },
                     )
                 })
                 .map_err(|e| PipelineError::Internal {
