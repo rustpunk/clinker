@@ -476,7 +476,7 @@ nodes:
         emit did = drivers.did
         emit bid = builds.bid
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:
@@ -564,7 +564,7 @@ nodes:
         emit did = drivers.did
         emit bid = builds.bid
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:
@@ -1003,7 +1003,7 @@ nodes:
         emit did = drivers.did
         emit bid = builds.bid
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:
@@ -1216,7 +1216,7 @@ nodes:
         emit bid = builds.bid
         emit ratio = drivers.k1 / builds.factor
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:
@@ -1349,7 +1349,7 @@ nodes:
         emit did = drivers.did
         emit bid = builds.bid
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:
@@ -1488,7 +1488,7 @@ nodes:
         emit did = drivers.did
         emit bid = builds.bid
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:
@@ -1606,7 +1606,7 @@ nodes:
         emit did = drivers.did
         emit bid = builds.bid
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:

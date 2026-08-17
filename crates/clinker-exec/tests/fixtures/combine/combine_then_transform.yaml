@@ -45,7 +45,7 @@ nodes:
         emit order_id = order_id
         emit product_name = product_name
         emit doubled_amount = amount
-  - type: output
+  - type: sink
     name: upsize_out
     input: upsize
     config:

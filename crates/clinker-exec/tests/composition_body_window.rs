@@ -145,7 +145,7 @@ nodes:
   use: ../compositions/body_post_aggregate_window.comp.yaml
   inputs:
     inp: src
-- type: output
+- type: sink
   name: out
   input: body
   config:
@@ -217,7 +217,7 @@ nodes:
   use: ../compositions/body_parent_node_window.comp.yaml
   inputs:
     inp: src
-- type: output
+- type: sink
   name: out
   input: body
   config:
@@ -320,7 +320,7 @@ nodes:
   use: ../compositions/outer.comp.yaml
   inputs:
     inp: src
-- type: output
+- type: sink
   name: out
   input: outer
   config:
@@ -442,7 +442,7 @@ nodes:
   input: src
   use: ../compositions/outer.comp.yaml
   inputs: { inp: src }
-- type: output
+- type: sink
   name: out
   input: outer
   config: { name: out, type: csv, path: out.csv, include_unmapped: true }
@@ -521,7 +521,7 @@ nodes:
   input: src
   use: ../compositions/cross_source.comp.yaml
   inputs: { inp: src }
-- type: output
+- type: sink
   name: out
   input: body
   config: { name: out, type: csv, path: out.csv, include_unmapped: true }
@@ -589,7 +589,7 @@ nodes:
   input: src
   use: ../compositions/merge_root.comp.yaml
   inputs: { left: src, right: src }
-- type: output
+- type: sink
   name: out
   input: body
   config: { name: out, type: csv, path: out.csv, include_unmapped: true }
@@ -626,7 +626,7 @@ nodes:
   use: ../compositions/body_post_aggregate_window.comp.yaml
   inputs:
     inp: src
-- type: output
+- type: sink
   name: out
   input: body
   config:
@@ -743,7 +743,7 @@ nodes:
   input: src
   use: ../compositions/outer.comp.yaml
   inputs: { inp: src }
-- type: output
+- type: sink
   name: out
   input: outer
   config: { name: out, type: csv, path: out.csv, include_unmapped: true }
@@ -818,7 +818,7 @@ nodes:
   input: src
   use: ../compositions/outer.comp.yaml
   inputs: { inp: src }
-- type: output
+- type: sink
   name: out
   input: outer
   config: { name: out, type: csv, path: out.csv, include_unmapped: true }
@@ -861,7 +861,7 @@ nodes:
   input: src
   use: ../compositions/inner.comp.yaml
   inputs: { inp: src }
-- type: output
+- type: sink
   name: out
   input: body
   config: { name: out, type: csv, path: out.csv, include_unmapped: true }
@@ -931,7 +931,7 @@ nodes:
   use: ../compositions/body_e150b.comp.yaml
   inputs:
     inp: src
-- type: output
+- type: sink
   name: out
   input: body
   config:

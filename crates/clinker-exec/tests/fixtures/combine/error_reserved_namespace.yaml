@@ -32,7 +32,7 @@ nodes:
       cxl: |
         emit order_id = orders.order_id
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: reserved_out
     input: reserved
     config:

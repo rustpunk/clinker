@@ -133,7 +133,7 @@ nodes:
     inputs:
       orders: orders_src
       products: products_src
-  - type: output
+  - type: sink
     name: out
     input: enrich_call
     config:
@@ -198,7 +198,7 @@ nodes:
     inputs:
       orders: orders_src
       products: products_src
-  - type: output
+  - type: sink
     name: out
     input: enrich_call
     config:
@@ -279,7 +279,7 @@ nodes:
     inputs:
       orders: orders_src
       products: products_src
-  - type: output
+  - type: sink
     name: out
     input: nested_call
     config:
@@ -350,7 +350,7 @@ nodes:
     inputs:
       orders: orders_src
       products: products_src
-  - type: output
+  - type: sink
     name: out
     input: collect_call
     config:
@@ -448,7 +448,7 @@ nodes:
     inputs:
       a: a_src
       b: b_src
-  - type: output
+  - type: sink
     name: out
     input: bad_call
     config:
@@ -616,7 +616,7 @@ nodes:
     inputs:
       orders: orders_src
       products: products_src
-  - type: output
+  - type: sink
     name: out_a
     input: join_a
     config:
@@ -624,7 +624,7 @@ nodes:
       type: csv
       path: out_a.csv
       include_unmapped: true
-  - type: output
+  - type: sink
     name: out_b
     input: join_b
     config:

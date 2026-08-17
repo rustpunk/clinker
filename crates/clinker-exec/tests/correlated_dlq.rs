@@ -180,7 +180,7 @@ nodes:
       emit val = value.to_int()
 
       '
-- type: output
+- type: sink
   name: out
   input: validate
   config:
@@ -242,7 +242,7 @@ nodes:
       emit val = value.to_int()
 
       '
-- type: output
+- type: sink
   name: out
   input: validate
   config:
@@ -322,7 +322,7 @@ nodes:
       b: 'emp != ""'
     default: a
 
-- type: output
+- type: sink
   name: out_a
   input: split.a
   config:
@@ -331,7 +331,7 @@ nodes:
     type: csv
     include_unmapped: true
 
-- type: output
+- type: sink
   name: out_b
   input: split.b
   config:
@@ -423,7 +423,7 @@ nodes:
     cxl: |
       emit emp = employee_id
       emit s = $window.sum(value)
-- type: output
+- type: sink
   name: out
   input: with_window
   config:
@@ -480,7 +480,7 @@ nodes:
     cxl: 'emit total = sum(value)
 
       '
-- type: output
+- type: sink
   name: out
   input: agg
   config:
@@ -575,7 +575,7 @@ nodes:
       emit total = sum(val)
 
       '
-- type: output
+- type: sink
   name: out
   input: agg
   config:
@@ -653,7 +653,7 @@ nodes:
       emit val = value.to_int()
 
       '
-- type: output
+- type: sink
   name: out
   input: rewrite
   config:
@@ -726,7 +726,7 @@ nodes:
       emit total = sum(val)
 
       '
-- type: output
+- type: sink
   name: out
   input: agg
   config:
@@ -833,7 +833,7 @@ nodes:
       emit dept = d.dept
     propagate_ck: driver
 
-- type: output
+- type: sink
   name: out
   input: enriched
   config:
@@ -1012,7 +1012,7 @@ nodes:
       emit amount_int = o.amount_int
     propagate_ck: driver
 
-- type: output
+- type: sink
   name: out
   input: enriched
   config:
@@ -1140,7 +1140,7 @@ nodes:
       good: 'amount.to_int() > 0'
     default: good
 
-- type: output
+- type: sink
   name: out
   input: split.good
   config:
@@ -1237,7 +1237,7 @@ nodes:
       emit session_start = s.session_start
     propagate_ck: driver
 
-- type: output
+- type: sink
   name: out
   input: enriched
   config:

@@ -32,7 +32,7 @@ nodes:
       where: "orders.product_id == products.product_id"
       cxl: ""
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: bad_out
     input: bad
     config:

@@ -124,7 +124,7 @@ nodes:
       emit total = sum(amount)
 
       '
-- type: output
+- type: sink
   name: out
   input: dept_totals
   config:
@@ -183,7 +183,7 @@ nodes:
       emit val = value.to_int()
 
       '
-- type: output
+- type: sink
   name: out
   input: validate
   config:
@@ -231,7 +231,7 @@ nodes:
       emit val = value.to_int()
 
       '
-- type: output
+- type: sink
   name: out
   input: validate
   config:
@@ -306,7 +306,7 @@ nodes:
       emit n = count(*)
 
       '
-- type: output
+- type: sink
   name: out
   input: dept_totals
   config:
@@ -461,7 +461,7 @@ nodes:
       emit mean = avg(amount_int)
 
       '
-- type: output
+- type: sink
   name: out
   input: dept_stats
   config:
@@ -591,7 +591,7 @@ nodes:
       emit per_capita = total / n
 
       '
-- type: output
+- type: sink
   name: out
   input: per_capita
   config:
@@ -715,7 +715,7 @@ nodes:
       emit n = count(*)
 
       '
-- type: output
+- type: sink
   name: out
   input: dept_totals
   config:
@@ -858,7 +858,7 @@ nodes:
       emit n = count(*)
 
       '
-- type: output
+- type: sink
   name: out
   input: dept_totals
   config:
@@ -990,7 +990,7 @@ nodes:
       emit total = sum(amount_int)
 
       '
-- type: output
+- type: sink
   name: out
   input: dept_totals
   config:
@@ -1075,7 +1075,7 @@ nodes:
       emit total = sum(amount_int)
 
       '
-- type: output
+- type: sink
   name: out
   input: dept_totals
   config:
@@ -1158,7 +1158,7 @@ nodes:
       emit total = sum(amount_int)
 
       '
-- type: output
+- type: sink
   name: out
   input: dept_totals
   config:
@@ -1239,7 +1239,7 @@ nodes:
       emit lo = min(payload)
 
       '
-- type: output
+- type: sink
   name: out
   input: dept_stats
   config:
@@ -1316,7 +1316,7 @@ nodes:
       emit lo = min(payload)
 
       '
-- type: output
+- type: sink
   name: out
   input: dept_stats
   config:

@@ -40,7 +40,7 @@ nodes:
         emit bracket_id = tax_brackets.bracket_id
         emit rate = tax_brackets.rate
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: bracketed_out
     input: bracketed
     config:

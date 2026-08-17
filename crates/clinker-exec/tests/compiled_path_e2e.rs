@@ -116,7 +116,7 @@ nodes:
         emit comment = (note ?? "none").trim()
         emit expensive = prices.filter(it => it > 10)
         emit price_count = prices.length()
-  - type: output
+  - type: sink
     name: out
     input: derive
     config:
@@ -199,7 +199,7 @@ nodes:
         distinct by region
         emit region_upper = region.upper()
         emit seq = seq
-  - type: output
+  - type: sink
     name: out
     input: dedup
     config:
@@ -279,7 +279,7 @@ nodes:
           emit sku = it["sku"].upper()
           emit band = if it["qty"] >= 100 then "bulk" else "retail"
         }
-  - type: output
+  - type: sink
     name: out
     input: explode
     config:

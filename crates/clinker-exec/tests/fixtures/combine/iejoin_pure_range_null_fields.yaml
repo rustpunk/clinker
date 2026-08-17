@@ -43,7 +43,7 @@ nodes:
         emit did = readings.did
         emit bid = bands.bid
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: banded_out
     input: banded
     config:

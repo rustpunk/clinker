@@ -26,7 +26,7 @@ nodes:
         emit order_id = orders.order_id
         emit amount = orders.amount
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: lonely_out
     input: lonely
     config:

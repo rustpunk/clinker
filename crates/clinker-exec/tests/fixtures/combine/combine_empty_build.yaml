@@ -51,7 +51,7 @@ nodes:
         emit category = products.category
         emit amount = orders.amount
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: enriched_out
     input: enriched
     config:

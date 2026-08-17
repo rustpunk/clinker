@@ -127,7 +127,7 @@ nodes:
         emit amount = o.amount
         emit tier = l.tier
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config: { name: out, type: csv, path: out.csv }
@@ -184,7 +184,7 @@ nodes:
         emit amount = o.amount
         emit ledger_ref = l.ledger_ref
       propagate_ck: all
-  - type: output
+  - type: sink
     name: out
     input: joined
     config: { name: out, type: csv, path: out.csv }
@@ -238,7 +238,7 @@ nodes:
         emit order_id = o.order_id
         emit ledger_ref = l.ledger_ref
       propagate_ck: { named: [order_id] }
-  - type: output
+  - type: sink
     name: out
     input: joined
     config: { name: out, type: csv, path: out.csv }
@@ -303,7 +303,7 @@ nodes:
         emit amount = orders.amount
         emit ledger_ref = ledger.ledger_ref
       propagate_ck: all
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
@@ -378,7 +378,7 @@ nodes:
         emit amount = o.amount
         emit ledger_ref = l.ledger_ref
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
@@ -446,7 +446,7 @@ nodes:
         emit amount = o.amount
         emit tag = s.tag
       propagate_ck: all
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
@@ -500,7 +500,7 @@ nodes:
       on_miss: null_fields
       cxl: ""
       propagate_ck: all
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
@@ -566,7 +566,7 @@ nodes:
         emit b_val = b.b_val
         emit c_val = c.c_val
       propagate_ck: all
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
@@ -640,7 +640,7 @@ nodes:
         emit amount = o.amount
         emit ledger_ref = l.ledger_ref
       propagate_ck: all
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
@@ -746,7 +746,7 @@ nodes:
         emit total = a.total
         emit budget = l.budget
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config: { name: out, type: csv, path: out.csv }
@@ -815,7 +815,7 @@ nodes:
         emit lead = d.lead
         emit total = a.total
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config: { name: out, type: csv, path: out.csv }
@@ -884,7 +884,7 @@ nodes:
         emit lead = d.lead
         emit total = a.total
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:
@@ -1000,7 +1000,7 @@ nodes:
         emit total = a.total
         emit budget = l.budget
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:

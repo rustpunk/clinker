@@ -27,6 +27,6 @@ pub fn dlq_validate_pipeline(name: &str, correlation_key: &str, schema: &str) ->
 - type: source\n  name: src\n  config:\n    name: src\n    path: input.csv\n    correlation_key: {correlation_key}\n    type: csv\n    schema:\n\
 {schema}\
 - type: transform\n  name: validate\n  input: src\n  config:\n    cxl: 'emit emp_id = employee_id\n\n      emit val = value.to_int()\n\n      '\n\
-- type: output\n  name: out\n  input: validate\n  config:\n    name: out\n    path: output.csv\n    type: csv\n    include_unmapped: true\n"
+- type: sink\n  name: out\n  input: validate\n  config:\n    name: out\n    path: output.csv\n    type: csv\n    include_unmapped: true\n"
     )
 }
