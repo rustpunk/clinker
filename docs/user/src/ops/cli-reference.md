@@ -48,6 +48,30 @@ recommended contracts. Decision D-45 requires every visible option to be
 wired and behavior-tested, or replaced by a nonzero tombstone with a
 paste-ready alternative under AUTH-05.
 
+### Credential profile foundation
+
+The current binary does **not** yet accept a credential-profile option or a
+credential-profile configuration table. Referenced credentials therefore do
+not activate a source, destination, or observability exporter through this
+surface. Do not pass an environment, channel, or group as a substitute: those
+selectors never choose credentials, and there is no default or sentinel
+profile.
+
+The run-local foundation that later preflight wiring will call is already
+bounded. Its default ceilings are 64 named profiles, 256 provider
+registrations across those profiles, 1 MiB of decoded profile/provider
+definition state, and 256 simultaneously retained handles. Admission checks
+all definition counts and bytes before a profile can resolve a requirement.
+Each live lease reports its exact retained bytes to the run memory arbitrator
+before provider allocation; cap, memory, provider, pause, or spill failures
+revoke and release the partial set in reverse acquisition order and unregister
+the registry.
+
+These are foundation limits, not newly available command-line behavior. A
+later complete preflight surface must add the one explicit profile selector,
+credential-required omission checks, and consumer activation together before
+the option can appear in the options table above.
+
 ### Examples
 
 ```bash
