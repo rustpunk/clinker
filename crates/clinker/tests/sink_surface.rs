@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use clinker_exec::executor::{
@@ -23,6 +24,7 @@ use clinker_plan::config::{ClinkerToml, CompileContext, parse_config};
 use clinker_plan::error::PipelineError;
 
 const INPUT: &str = "id,label\n2,beta\n1,alpha\n";
+const RETIRED_TERMINAL_DISCRIMINATOR: &str = "type: output";
 
 const SYNC_PIPELINE: &str = r#"
 pipeline: { name: sink_sync }
@@ -334,6 +336,137 @@ fn telemetry_full_arena_cannot_change_sink_bytes_or_exit_status() {
     assert!(
         actual.spans.is_empty(),
         "the full ordinary lane drops the optional Sink span"
+    );
+}
+
+#[test]
+fn retired_terminal_spelling_reports_source_located_e376_without_output_effects() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("input.csv"), INPUT).expect("input fixture");
+    let pipeline = workspace.path().join("retired-terminal.yaml");
+    std::fs::write(
+        &pipeline,
+        r#"pipeline: { name: retired_terminal }
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: input.csv
+      schema:
+        - { name: id, type: int }
+        - { name: label, type: string }
+  - type: output
+    name: delivered
+    input: rows
+    config:
+      name: delivered
+      type: csv
+      path: delivered.csv
+"#,
+    )
+    .expect("retired terminal fixture");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_clinker"))
+        .current_dir(workspace.path())
+        .args(["run", "retired-terminal.yaml"])
+        .output()
+        .expect("run clinker");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty(), "a rejected config has no stdout");
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    for required in [
+        "retired-terminal.yaml",
+        "E376",
+        RETIRED_TERMINAL_DISCRIMINATOR,
+        "Correction: type: sink",
+    ] {
+        assert!(
+            diagnostic.contains(required),
+            "diagnostic must contain {required:?}:\n{diagnostic}"
+        );
+    }
+    assert!(
+        !workspace.path().join("delivered.csv").exists(),
+        "the rejected terminal cannot publish output"
+    );
+    assert!(
+        !workspace.path().join(".clinker-attempts").exists(),
+        "the rejected terminal cannot start a publication attempt"
+    );
+}
+
+fn retired_terminal_line(contents: &str) -> Option<usize> {
+    contents.lines().enumerate().find_map(|(index, line)| {
+        let authored = line.split_once('#').map_or(line, |(prefix, _)| prefix);
+        authored
+            .match_indices(RETIRED_TERMINAL_DISCRIMINATOR)
+            .any(|(column, _)| {
+                let before = authored[..column].chars().next_back();
+                let after = authored[column + RETIRED_TERMINAL_DISCRIMINATOR.len()..]
+                    .chars()
+                    .next();
+                before.is_none_or(|character| {
+                    character.is_ascii_whitespace() || matches!(character, '-' | '{' | ',')
+                }) && after.is_none_or(|character| {
+                    character.is_ascii_whitespace() || matches!(character, '}' | ',')
+                })
+            })
+            .then_some(index + 1)
+    })
+}
+
+fn scan_authored_yaml(root: &Path, violations: &mut Vec<String>) -> io::Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            scan_authored_yaml(&path, violations)?;
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| matches!(extension, "yaml" | "yml"))
+        {
+            let contents = std::fs::read_to_string(&path)?;
+            if let Some(line) = retired_terminal_line(&contents) {
+                violations.push(format!("{}:{line}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn authored_standalone_yaml_uses_only_the_sink_terminal_discriminator() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest
+        .parent()
+        .and_then(Path::parent)
+        .expect("clinker crate lives under the workspace crates directory");
+    let mut violations = Vec::new();
+    for root in [workspace.join("benches"), workspace.join("examples")] {
+        scan_authored_yaml(&root, &mut violations).expect("scan authored YAML root");
+    }
+    for entry in std::fs::read_dir(workspace.join("crates")).expect("workspace crates directory") {
+        let entry = entry.expect("crate entry");
+        if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            scan_authored_yaml(&entry.path().join("tests"), &mut violations)
+                .expect("scan crate test and fixture YAML");
+        }
+    }
+
+    violations.sort();
+    assert!(
+        violations.is_empty(),
+        "authored standalone YAML still uses `{RETIRED_TERMINAL_DISCRIMINATOR}`:\n{}",
+        violations.join("\n")
     );
 }
 
