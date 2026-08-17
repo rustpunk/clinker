@@ -394,11 +394,16 @@ struct SinkStreamConsumer {
     writer: Option<Box<dyn FormatWriter>>,
     /// Holds the raw sink until the first record triggers the lazy build.
     raw_writer_slot: Option<Box<dyn Write + Send>>,
+    sink_byte_counter: Option<clinker_format::SharedByteCounter>,
     structured_guard: StructuredOutputDocumentGuard,
 }
 
 impl SinkStreamConsumer {
-    fn new(raw_writer: Box<dyn Write + Send>, spec: StreamingSinkSpec) -> Self {
+    fn new(
+        raw_writer: Box<dyn Write + Send>,
+        spec: StreamingSinkSpec,
+        sink_byte_counter: Option<clinker_format::SharedByteCounter>,
+    ) -> Self {
         debug_assert!(spec.writer_boundary.is_incremental_streaming());
         let structured_guard = StructuredOutputDocumentGuard::new(&spec.out_cfg.format);
         let mapping_probe = crate::projection::MappingProbe::for_config(&spec.out_cfg);
@@ -426,6 +431,7 @@ impl SinkStreamConsumer {
             )),
             writer: None,
             raw_writer_slot: Some(raw_writer),
+            sink_byte_counter,
             structured_guard,
         }
     }
@@ -498,6 +504,7 @@ impl StreamingConsumer for SinkStreamConsumer {
                 raw,
                 schema,
                 crate::output::staging::OutputStagingRegistry::default(),
+                self.sink_byte_counter.clone(),
             ) {
                 Ok(w) => {
                     self.writer = Some(w);
@@ -630,19 +637,44 @@ pub(super) fn streaming_sink(
     spec: StreamingSinkSpec,
     charge_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
     telemetry_producer: Option<crate::telemetry::TelemetryProducer>,
+    shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
 ) -> StreamingOutputTaskOutput {
     let mut signal = telemetry_producer
         .map(|producer| crate::telemetry::SinkSignal::new(producer, spec.output_name.clone()));
-    let mut consumer = SinkStreamConsumer::new(raw_writer, spec);
+    let sink_byte_counter = signal
+        .as_ref()
+        .map(|_| clinker_format::SharedByteCounter::new());
+    let mut consumer = SinkStreamConsumer::new(raw_writer, spec, sink_byte_counter.clone());
     drain_streaming_channel(&rx, &charge_handle, &mut consumer);
     if let Some(mut signal) = signal.take() {
         signal.record_records(consumer.out.records_written);
+        signal.record_bytes(
+            sink_byte_counter
+                .as_ref()
+                .map_or(0, clinker_format::SharedByteCounter::bytes_written),
+        );
         let errors = consumer.out.errors.len();
         signal.record_errors(u64::try_from(errors).unwrap_or(u64::MAX));
-        if consumer.closed_cleanly && errors == 0 {
-            signal.complete();
-        } else {
+        let has_interrupted_error = consumer
+            .out
+            .errors
+            .iter()
+            .any(|error| matches!(error, PipelineError::Interrupted));
+        let has_failure = consumer
+            .out
+            .errors
+            .iter()
+            .any(|error| !matches!(error, PipelineError::Interrupted));
+        let interrupted = has_interrupted_error
+            || shutdown_token
+                .as_ref()
+                .is_some_and(crate::pipeline::shutdown::ShutdownToken::is_requested);
+        if has_failure || (!consumer.closed_cleanly && !interrupted) {
             signal.fail();
+        } else if interrupted {
+            signal.interrupt();
+        } else {
+            signal.complete();
         }
     }
     consumer.out

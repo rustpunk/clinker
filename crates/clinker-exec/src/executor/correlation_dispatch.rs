@@ -338,12 +338,19 @@ fn flush_clean_records_to_writers(
             let logical_node = ctx.qualified_node_name(&output_name);
             crate::telemetry::SinkSignal::new(producer, logical_node.into_owned())
         });
+        let sink_byte_counter = signal
+            .as_ref()
+            .map(|_| clinker_format::SharedByteCounter::new());
         let slots = match order_clean_slots(ctx, current_dag, &output_name, slots) {
             Ok(slots) => slots,
             Err(error) => {
                 if let Some(mut signal) = signal.take() {
                     signal.record_errors(1);
-                    signal.fail();
+                    if matches!(&error, PipelineError::Interrupted) {
+                        signal.interrupt();
+                    } else {
+                        signal.fail();
+                    }
                 }
                 return Err(error);
             }
@@ -385,6 +392,7 @@ fn flush_clean_records_to_writers(
             raw_writer,
             Arc::clone(&output_schema),
             ctx.output_staging.clone(),
+            sink_byte_counter.clone(),
         ) {
             Ok(mut writer) => {
                 let mut write_failed = false;
@@ -452,10 +460,21 @@ fn flush_clean_records_to_writers(
                 ctx.records_emitted += written;
                 if let Some(mut signal) = signal.take() {
                     signal.record_records(written);
+                    signal.record_bytes(
+                        sink_byte_counter
+                            .as_ref()
+                            .map_or(0, clinker_format::SharedByteCounter::bytes_written),
+                    );
                     let new_errors = ctx.output_errors.len().saturating_sub(errors_before);
                     signal.record_errors(u64::try_from(new_errors).unwrap_or(u64::MAX));
                     if write_failed || flush_failed {
                         signal.fail();
+                    } else if ctx
+                        .shutdown_token
+                        .as_ref()
+                        .is_some_and(crate::pipeline::shutdown::ShutdownToken::is_requested)
+                    {
+                        signal.interrupt();
                     } else {
                         signal.complete();
                     }
@@ -465,6 +484,11 @@ fn flush_clean_records_to_writers(
                 ctx.output_errors.push(e);
                 if let Some(mut signal) = signal.take() {
                     signal.record_errors(1);
+                    signal.record_bytes(
+                        sink_byte_counter
+                            .as_ref()
+                            .map_or(0, clinker_format::SharedByteCounter::bytes_written),
+                    );
                     signal.fail();
                 }
             }

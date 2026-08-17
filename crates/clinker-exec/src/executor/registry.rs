@@ -449,6 +449,7 @@ pub(crate) fn build_format_writer(
     raw_writer: Box<dyn Write + Send>,
     schema: Arc<Schema>,
     output_staging: crate::output::staging::OutputStagingRegistry,
+    sink_byte_counter: Option<SharedByteCounter>,
 ) -> Result<Box<dyn FormatWriter>, PipelineError> {
     // Extract field definitions for fixed-width output (requires explicit schema).
     let field_defs = if matches!(output.format, OutputFormat::FixedWidth(_)) {
@@ -468,6 +469,7 @@ pub(crate) fn build_format_writer(
         let if_exists = output.if_exists;
         let unique_suffix_width = output.unique_suffix_width;
         let output_name = output.name.clone();
+        let sink_byte_counter_for_files = sink_byte_counter.clone();
 
         let file_factory: clinker_format::splitting::FileFactory =
             Box::new(move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
@@ -500,7 +502,12 @@ pub(crate) fn build_format_writer(
                     output_staging.stage_output(output_name.clone(), if_exists, false, path_for_n)
                 };
                 let (_path, file) = staged.map_err(|e| std::io::Error::other(format!("{e:?}")))?;
-                Ok(Box::new(BufWriter::with_capacity(65536, file)))
+                let buffered =
+                    Box::new(BufWriter::with_capacity(65536, file)) as Box<dyn Write + Send>;
+                Ok(match &sink_byte_counter_for_files {
+                    Some(counter) => Box::new(CountingWriter::new(buffered, counter.clone())),
+                    None => buffered,
+                })
             });
 
         // SplittingWriter creates its own files; don't use raw_writer.
@@ -514,7 +521,7 @@ pub(crate) fn build_format_writer(
         )))
     } else {
         let buf_writer = BufWriter::with_capacity(65536, raw_writer);
-        let counter = SharedByteCounter::new();
+        let counter = sink_byte_counter.unwrap_or_default();
         let counting_writer = CountingWriter::new(
             Box::new(buf_writer) as Box<dyn Write + Send>,
             counter.clone(),

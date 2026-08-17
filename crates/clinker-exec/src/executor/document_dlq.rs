@@ -625,6 +625,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                 raw_writer,
                 output_schema,
                 ctx.output_staging.clone(),
+                ctx.sink_byte_counter.clone(),
             ) {
                 Ok(w) => self.writer = Some(w),
                 Err(e) => {

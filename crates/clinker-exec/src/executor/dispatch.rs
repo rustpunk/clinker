@@ -1120,6 +1120,10 @@ pub(crate) struct ExecutorContext<'a> {
     /// Run-scoped non-blocking telemetry handle. Cloned only when enabled;
     /// `None` keeps dispatch on the zero-work signal path.
     pub(crate) telemetry_producer: Option<crate::telemetry::TelemetryProducer>,
+    /// Counter shared by every physical writer opened for the Sink currently
+    /// executing on the dispatcher thread. It is installed only for that
+    /// Sink's work-unit scope and cleared before the next node dispatch.
+    pub(crate) sink_byte_counter: Option<clinker_format::SharedByteCounter>,
     /// Backing storage for `$source.batch` — per-pipeline-run UUID v7
     /// (per-source attribution is sub-issue #54). Distinct from
     /// `pipeline.batch_id`.

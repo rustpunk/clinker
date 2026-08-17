@@ -1656,6 +1656,7 @@ impl PipelineExecutor {
             ));
             let writer_charge_handle = charge_handle.clone();
             let telemetry_producer = params.telemetry_producer.clone();
+            let sink_shutdown_token = params.shutdown_token.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("clinker-output-{output_name}"))
                 .spawn(move || {
@@ -1665,6 +1666,7 @@ impl PipelineExecutor {
                         spec,
                         writer_charge_handle,
                         telemetry_producer,
+                        sink_shutdown_token,
                     )
                 })
                 .map_err(|e| PipelineError::Internal {
@@ -1685,6 +1687,7 @@ impl PipelineExecutor {
             primary_output: &output_configs[0],
             stable: &stable,
             telemetry_producer: params.telemetry_producer.clone(),
+            sink_byte_counter: None,
             source_batch_arc: &source_batch_arc,
             source_count_per_source,
             source_ingestion_timestamp,

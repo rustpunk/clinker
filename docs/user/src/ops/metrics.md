@@ -618,9 +618,9 @@ or console export and cannot use this external delivery path.
 Clinker speaks OTLP/JSON over the three fixed routes. What it puts on the wire:
 
 **Traces.** One run is one trace. The lifecycle span `clinker.run` is the trace
-root and every Transform span is a child of it, so a collector can reconstruct
-the whole run from any single span. Each span carries a trace id, a span id, and
-both `startTimeUnixNano` and `endTimeUnixNano`.
+root and every Transform and Sink span is a child of it, so a collector can
+reconstruct the whole run from any single span. Each span carries a trace id, a
+span id, and both `startTimeUnixNano` and `endTimeUnixNano`.
 
 A Transform is one span, emitted when the Transform finishes and covering the
 interval it ran for. It is not a `start` record followed by an `end` record.
@@ -640,6 +640,16 @@ previous export, not a running total, and carries the `startTimeUnixNano` and
 `timeUnixNano` bounding that interval. Sum the deltas to get the run total;
 reading any single point as an absolute value will understate the run, often by
 a large factor on a long one.
+
+Each real Sink writer work unit likewise emits one `clinker.sink.started` and
+exactly one of `clinker.sink.completed`, `clinker.sink.failed`, or
+`clinker.sink.interrupted`. `clinker.sink.records`, `clinker.sink.errors`, and
+`clinker.sink.bytes` report the rows handled, errors observed, and serialized
+bytes accepted by that writer boundary. Synchronous, fused streaming, and
+correlation-deferred writers all use the same counter names and one closed
+`clinker.sink` span. A failed flush can therefore report bytes accepted before
+the destination rejected the flush; the failed terminal counter remains the
+authoritative outcome.
 
 An instrument that recorded nothing in an interval carries no points for it.
 That is an ordinary interval, not a malformed export: the batch is delivered

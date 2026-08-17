@@ -346,17 +346,36 @@ where
         let logical_node = ctx.qualified_node_name(name);
         crate::telemetry::SinkSignal::new(producer, logical_node.into_owned())
     });
+    let sink_byte_counter = signal
+        .as_ref()
+        .map(|_| clinker_format::SharedByteCounter::new());
+    debug_assert!(ctx.sink_byte_counter.is_none());
+    ctx.sink_byte_counter = sink_byte_counter.clone();
     let records_before = ctx.counters.records_written;
     let errors_before = ctx.output_errors.len();
     let result = dispatch_sink_work(ctx, current_dag, node_idx, node);
+    ctx.sink_byte_counter = None;
     if let Some(mut signal) = signal.take() {
         signal.record_records(ctx.counters.records_written.saturating_sub(records_before));
+        signal.record_bytes(
+            sink_byte_counter
+                .as_ref()
+                .map_or(0, clinker_format::SharedByteCounter::bytes_written),
+        );
         let new_errors = ctx.output_errors.len().saturating_sub(errors_before);
         signal.record_errors(u64::try_from(new_errors).unwrap_or(u64::MAX));
-        if result.is_ok() && new_errors == 0 {
-            signal.complete();
-        } else {
+        let interrupted_error = matches!(&result, Err(PipelineError::Interrupted));
+        if (result.is_err() && !interrupted_error) || new_errors > 0 {
             signal.fail();
+        } else if interrupted_error
+            || ctx
+                .shutdown_token
+                .as_ref()
+                .is_some_and(crate::pipeline::shutdown::ShutdownToken::is_requested)
+        {
+            signal.interrupt();
+        } else {
+            signal.complete();
         }
     }
     result
@@ -707,6 +726,7 @@ fn dispatch_sink_work(
             dlq_pending: &mut dlq_pending,
             written_rows: &mut written_rows,
             output_staging: &output_staging,
+            sink_byte_counter: ctx.sink_byte_counter.clone(),
             mapping_probe: out_cfg
                 .mapping
                 .as_ref()
@@ -1049,6 +1069,7 @@ fn dispatch_sink_envelope(
                             raw_writer,
                             schema,
                             ctx.output_staging.clone(),
+                            ctx.sink_byte_counter.clone(),
                         ))
                     });
                 }
@@ -1365,6 +1386,9 @@ struct FanOutContext<'a> {
     /// here, so a written sibling sharing its row_num still counts.
     written_rows: &'a mut Vec<crate::executor::stream_event::SourceRowId>,
     output_staging: &'a crate::output::staging::OutputStagingRegistry,
+    /// Optional fixed-size counter for this Sink work unit. Fan-out writers
+    /// share it so the terminal metric is the sum of physical bytes.
+    sink_byte_counter: Option<clinker_format::SharedByteCounter>,
 }
 
 /// Write `unbuffered` through a single pre-opened writer. Errors from
@@ -1382,6 +1406,7 @@ fn emit_single_writer(
         raw_writer,
         Arc::clone(fan_ctx.output_schema),
         fan_ctx.output_staging.clone(),
+        fan_ctx.sink_byte_counter.clone(),
     ) {
         Ok(mut csv_writer) => {
             fan_ctx.collector.record(scan_timer.finish(1, 1));
@@ -1487,6 +1512,7 @@ fn emit_fan_out(
             raw,
             Arc::clone(fan_ctx.output_schema),
             fan_ctx.output_staging.clone(),
+            fan_ctx.sink_byte_counter.clone(),
         ) {
             Ok(fw) => {
                 format_writers.insert(file_arc, fw);

@@ -147,13 +147,16 @@ pub enum MetricKey {
     GuessInterrupted,
     SinkStarted,
     SinkCompleted,
+    SinkFailed,
+    SinkInterrupted,
     SinkRecords,
     SinkErrors,
+    SinkBytes,
 }
 
 impl MetricKey {
     /// Every fixed metric key in stable counter-index order.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 36] = [
         Self::TransformStarted,
         Self::TransformCompleted,
         Self::TransformRecords,
@@ -185,8 +188,11 @@ impl MetricKey {
         Self::GuessInterrupted,
         Self::SinkStarted,
         Self::SinkCompleted,
+        Self::SinkFailed,
+        Self::SinkInterrupted,
         Self::SinkRecords,
         Self::SinkErrors,
+        Self::SinkBytes,
     ];
     /// Number of entries in [`Self::ALL`].
     pub const COUNT: usize = Self::ALL.len();
@@ -226,8 +232,11 @@ impl MetricKey {
             Self::GuessInterrupted => 28,
             Self::SinkStarted => 29,
             Self::SinkCompleted => 30,
-            Self::SinkRecords => 31,
-            Self::SinkErrors => 32,
+            Self::SinkFailed => 31,
+            Self::SinkInterrupted => 32,
+            Self::SinkRecords => 33,
+            Self::SinkErrors => 34,
+            Self::SinkBytes => 35,
         }
     }
 }
@@ -320,6 +329,7 @@ pub(crate) struct SinkSignal {
     started_at_unix_nanos: u64,
     records: u64,
     errors: u64,
+    bytes: u64,
     closed: bool,
 }
 
@@ -336,6 +346,7 @@ impl SinkSignal {
             started_at_unix_nanos,
             records: 0,
             errors: 0,
+            bytes: 0,
             closed: false,
         }
     }
@@ -349,6 +360,11 @@ impl SinkSignal {
     /// Add errors observed by this work unit.
     pub(crate) fn record_errors(&mut self, errors: u64) {
         self.errors = self.errors.saturating_add(errors);
+    }
+
+    /// Record bytes accepted by the physical writer boundary.
+    pub(crate) fn record_bytes(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
     }
 
     /// Close a work unit that reached its runtime completion boundary.
@@ -369,7 +385,15 @@ impl SinkSignal {
             self.errors = 1;
         }
         self.emit_counts();
+        self.producer.record_metric(MetricKey::SinkFailed, 1);
         self.close_span(SpanStatus::Error);
+    }
+
+    /// Close a work unit stopped by run cancellation.
+    pub(crate) fn interrupt(mut self) {
+        self.emit_counts();
+        self.producer.record_metric(MetricKey::SinkInterrupted, 1);
+        self.close_span(SpanStatus::Unset);
     }
 
     fn emit_counts(&self) {
@@ -380,6 +404,10 @@ impl SinkSignal {
         if self.errors > 0 {
             self.producer
                 .record_metric(MetricKey::SinkErrors, self.errors);
+        }
+        if self.bytes > 0 {
+            self.producer
+                .record_metric(MetricKey::SinkBytes, self.bytes);
         }
     }
 
@@ -408,6 +436,7 @@ impl Drop for SinkSignal {
             self.errors = 1;
         }
         self.emit_counts();
+        self.producer.record_metric(MetricKey::SinkFailed, 1);
         self.close_span(SpanStatus::Error);
     }
 }
@@ -1901,8 +1930,9 @@ mod tests {
 
     use super::{
         AdmissionLane, AdmissionOutcome, DrainOutcome, DropReason, LogEvent, MAX_IDENTITY_BYTES,
-        MetricKey, RunCorrelation, Severity, SignalField, SpanFact, SpanName, SpanStatus,
-        TRUNCATION_MARKER, TelemetryArena, TelemetryProducer, TelemetryReceiver, bounded_utf8,
+        MetricKey, RunCorrelation, Severity, SignalField, SinkSignal, SpanFact, SpanName,
+        SpanStatus, TRUNCATION_MARKER, TelemetryArena, TelemetryProducer, TelemetryReceiver,
+        bounded_utf8,
     };
 
     #[test]
@@ -1937,6 +1967,13 @@ mod tests {
             MetricKey::GuessUnresolved,
             MetricKey::GuessFailed,
             MetricKey::GuessInterrupted,
+            MetricKey::SinkStarted,
+            MetricKey::SinkCompleted,
+            MetricKey::SinkFailed,
+            MetricKey::SinkInterrupted,
+            MetricKey::SinkRecords,
+            MetricKey::SinkErrors,
+            MetricKey::SinkBytes,
         ];
 
         assert_eq!(MetricKey::COUNT, expected.len());
@@ -1951,6 +1988,45 @@ mod tests {
                 1,
                 "{key:?} appears more than once"
             );
+        }
+    }
+
+    #[test]
+    fn sink_lifecycle_closes_each_terminal_outcome_with_one_span() {
+        let cases = [
+            (MetricKey::SinkCompleted, SpanStatus::Ok),
+            (MetricKey::SinkFailed, SpanStatus::Error),
+            (MetricKey::SinkInterrupted, SpanStatus::Unset),
+        ];
+
+        for (terminal, expected_status) in cases {
+            let (producer, receiver) = arena("256B");
+            let mut signal = SinkSignal::new(producer, "sink".to_string());
+            signal.record_records(2);
+            signal.record_bytes(17);
+            match terminal {
+                MetricKey::SinkCompleted => signal.complete(),
+                MetricKey::SinkFailed => signal.fail(),
+                MetricKey::SinkInterrupted => signal.interrupt(),
+                _ => unreachable!("test covers only Sink terminal outcomes"),
+            }
+
+            let batch = receiver
+                .try_recv_batch()
+                .expect("an isolated Sink lifecycle is admitted");
+            assert_eq!(batch.metric(MetricKey::SinkStarted), 1);
+            assert_eq!(batch.metric(terminal), 1);
+            assert_eq!(
+                batch.metric(MetricKey::SinkCompleted)
+                    + batch.metric(MetricKey::SinkFailed)
+                    + batch.metric(MetricKey::SinkInterrupted),
+                1
+            );
+            assert_eq!(batch.metric(MetricKey::SinkRecords), 2);
+            assert_eq!(batch.metric(MetricKey::SinkBytes), 17);
+            assert_eq!(batch.traces().len(), 1);
+            assert_eq!(batch.traces()[0].name, SpanName::Sink);
+            assert_eq!(batch.traces()[0].status, expected_status);
         }
     }
 

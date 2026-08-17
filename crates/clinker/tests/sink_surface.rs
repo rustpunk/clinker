@@ -128,6 +128,22 @@ impl Write for FailingWriter {
     }
 }
 
+struct InterruptingWriter {
+    token: clinker_exec::pipeline::shutdown::ShutdownToken,
+    output: SharedBuffer,
+}
+
+impl Write for InterruptingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.token.request();
+        self.output.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
 fn observability_policy() -> clinker_plan::config::ResolvedObservabilityPolicy {
     ClinkerToml::parse(
         r#"
@@ -206,8 +222,11 @@ fn run_with_writer(
 struct SinkTelemetry {
     started: u64,
     completed: u64,
+    failed: u64,
+    interrupted: u64,
     records: u64,
     errors: u64,
+    bytes: u64,
     spans: Vec<TraceSpan>,
 }
 
@@ -216,8 +235,11 @@ fn drain_sink(receiver: &TelemetryReceiver) -> SinkTelemetry {
     while let Some(batch) = receiver.try_recv_batch() {
         sink.started += batch.metric(MetricKey::SinkStarted);
         sink.completed += batch.metric(MetricKey::SinkCompleted);
+        sink.failed += batch.metric(MetricKey::SinkFailed);
+        sink.interrupted += batch.metric(MetricKey::SinkInterrupted);
         sink.records += batch.metric(MetricKey::SinkRecords);
         sink.errors += batch.metric(MetricKey::SinkErrors);
+        sink.bytes += batch.metric(MetricKey::SinkBytes);
         sink.spans.extend(
             batch
                 .traces()
@@ -229,14 +251,24 @@ fn drain_sink(receiver: &TelemetryReceiver) -> SinkTelemetry {
     sink
 }
 
-fn assert_success_signals(actual: &SinkTelemetry, records: u64) {
+fn assert_success_signals(actual: &SinkTelemetry, records: u64, bytes: u64) {
     assert_eq!(actual.started, 1, "one real Sink work unit starts");
     assert_eq!(actual.completed, 1, "the work unit reaches completion");
+    assert_eq!(actual.failed, 0);
+    assert_eq!(actual.interrupted, 0);
     assert_eq!(actual.records, records, "records count handled Sink rows");
     assert_eq!(actual.errors, 0, "the successful Sink reports no errors");
-    assert_eq!(actual.spans.len(), 1, "one work unit has one closed span");
-    assert_eq!(actual.spans[0].status, SpanStatus::Ok);
-    assert_eq!(actual.spans[0].logical_node, "delivered");
+    assert_eq!(actual.bytes, bytes, "bytes come from the writer boundary");
+    assert!(
+        actual.spans.len() <= 1,
+        "Sink spans are admission-controlled"
+    );
+    assert!(
+        actual
+            .spans
+            .iter()
+            .all(|span| span.status == SpanStatus::Ok && span.logical_node == "delivered")
+    );
     assert!(
         actual.spans[0].ended_at_unix_nanos >= actual.spans[0].started_at_unix_nanos,
         "the complete span is closed at both ends"
@@ -252,7 +284,7 @@ fn telemetry_sync_sink_reports_the_completed_writer_work() {
 
     assert_eq!(report.counters.records_written, 2);
     assert_eq!(output.bytes(), b"id,label\n1,alpha\n2,beta\n");
-    assert_success_signals(&drain_sink(&receiver), 2);
+    assert_success_signals(&drain_sink(&receiver), 2, output.bytes().len() as u64);
 }
 
 #[test]
@@ -264,7 +296,7 @@ fn telemetry_streaming_sink_reports_the_writer_thread_work_once() {
 
     assert_eq!(report.counters.records_written, 2);
     assert_eq!(output.bytes(), b"id,label\n2,beta\n1,alpha\n");
-    assert_success_signals(&drain_sink(&receiver), 2);
+    assert_success_signals(&drain_sink(&receiver), 2, output.bytes().len() as u64);
 }
 
 #[test]
@@ -276,7 +308,7 @@ fn telemetry_correlation_sink_reports_the_deferred_writer_work_once() {
 
     assert_eq!(report.counters.records_written, 2);
     assert_eq!(output.bytes(), b"id,label\n1,alpha\n2,beta\n");
-    assert_success_signals(&drain_sink(&receiver), 2);
+    assert_success_signals(&drain_sink(&receiver), 2, output.bytes().len() as u64);
 }
 
 #[test]
@@ -291,6 +323,8 @@ fn telemetry_sink_failure_has_one_error_span_and_no_completion() {
     let actual = drain_sink(&receiver);
     assert_eq!(actual.started, 1);
     assert_eq!(actual.completed, 0, "failed work did not complete");
+    assert_eq!(actual.failed, 1, "failed work has one terminal outcome");
+    assert_eq!(actual.interrupted, 0);
     assert_eq!(
         actual.records, 2,
         "both rows reached the buffered writer before its flush failed"
@@ -299,8 +333,65 @@ fn telemetry_sink_failure_has_one_error_span_and_no_completion() {
         actual.errors >= 1,
         "the writer failure is counted: {actual:?}"
     );
-    assert_eq!(actual.spans.len(), 1);
-    assert_eq!(actual.spans[0].status, SpanStatus::Error);
+    assert_eq!(
+        actual.bytes,
+        b"id,label\n1,alpha\n2,beta\n".len() as u64,
+        "bytes accepted before the flush failure remain observable"
+    );
+    assert!(
+        actual.spans.len() <= 1,
+        "Sink spans are admission-controlled"
+    );
+    assert!(
+        actual
+            .spans
+            .iter()
+            .all(|span| span.status == SpanStatus::Error)
+    );
+}
+
+#[test]
+fn telemetry_streaming_sink_interruption_has_one_terminal_outcome() {
+    let (producer, receiver) = TelemetryArena::reserve(&observability_policy()).expect("arena");
+    let token = clinker_exec::pipeline::shutdown::ShutdownToken::detached();
+    let output = SharedBuffer::default();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "delivered".to_string(),
+        Box::new(InterruptingWriter {
+            token: token.clone(),
+            output: output.clone(),
+        }) as _,
+    )]);
+    let run_params = PipelineRunParams {
+        shutdown_token: Some(token),
+        ..params(producer)
+    };
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &compile(STREAMING_PIPELINE),
+        readers(),
+        writers,
+        &run_params,
+    )
+    .expect("shutdown unwinds without changing Sink error semantics");
+    assert!(report.interrupted);
+
+    let actual = drain_sink(&receiver);
+    assert_eq!(actual.started, 1);
+    assert_eq!(actual.completed, 0);
+    assert_eq!(actual.failed, 0);
+    assert_eq!(actual.interrupted, 1);
+    assert_eq!(actual.errors, 0);
+    assert_eq!(actual.bytes, output.bytes().len() as u64);
+    assert!(
+        actual.spans.len() <= 1,
+        "Sink spans are admission-controlled"
+    );
+    assert!(
+        actual
+            .spans
+            .iter()
+            .all(|span| span.status == SpanStatus::Unset)
+    );
 }
 
 #[test]
@@ -330,7 +421,10 @@ fn telemetry_full_arena_cannot_change_sink_bytes_or_exit_status() {
         "fixed metrics remain coalesced out of lane"
     );
     assert_eq!(actual.completed, 1);
+    assert_eq!(actual.failed, 0);
+    assert_eq!(actual.interrupted, 0);
     assert_eq!(actual.records, 2);
+    assert_eq!(actual.bytes, output.bytes().len() as u64);
     assert!(
         actual.spans.is_empty(),
         "the full ordinary lane drops the optional Sink span"
