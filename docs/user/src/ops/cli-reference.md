@@ -152,12 +152,20 @@ Multi-record owners use
 same-named leaves never collapse into a fake single-record address or share a
 proposal derived from another record type.
 
-Sampling is bounded to four discovered files per selected source, 1,024 records
-per sampled file, 8 MiB per file, and eight retained evidence items per field.
-Files beyond either file bound are reported as uncovered, and hitting the
-record bound is reported as truncated. The limits and every sampled or
-uncovered file are included in the report so a proposal is never presented as
-having broader evidence than Clinker actually read.
+Discovery streams through the matcher and retains a deterministic sample of at
+most four files per selected source; the report includes the complete
+`discovered_files` count and one `unreported_file_count` aggregate instead of
+retaining a path/report for every omitted file. Sampling then reads at most
+1,024 records and 8 MiB per retained file. Hitting the record bound is reported
+as truncated, and a retained file over the byte bound is reported as uncovered.
+
+Candidate storage is capped at 100,000 source-schema leaves, matching the
+canonical YAML parser's 100,000-node limit; each YAML document is also capped
+at 32 MiB. Each parser-owned `NumericObservation` retains at most 128 numeric
+lexeme bytes, and each exact schema owner retains at most eight evidence items.
+These limits appear in the JSON report. Candidate, observation, evidence, and
+coverage collections are therefore fixed-bounded independently of source file
+count; the preview does not register a runtime memory consumer.
 
 Exit `0` means a complete preview document was written, including when one or
 more fields remain unresolved. Selection, configuration, and field errors exit

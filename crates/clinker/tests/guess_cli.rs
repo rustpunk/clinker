@@ -157,6 +157,52 @@ fn preview_selector_multi_record_field_reports_each_literal_numeric_owner() {
 }
 
 #[test]
+fn preview_many_files_keeps_fixed_coverage_and_evidence_storage() {
+    let workspace = workspace();
+    let pipeline_path = workspace.path().join("pipeline.yaml");
+    let pipeline = std::fs::read_to_string(&pipeline_path).expect("read pipeline fixture");
+    std::fs::write(
+        &pipeline_path,
+        pipeline.replacen("path: input.csv", "glob: input-*.csv", 1),
+    )
+    .expect("select a many-file input set");
+    let body = format!(
+        "kind,order_id,amount\n{}",
+        "D,c-detail,10\nA,c-adjustment,20.5\n".repeat(10)
+    );
+    for index in 0..12 {
+        std::fs::write(
+            workspace.path().join(format!("input-{index:02}.csv")),
+            &body,
+        )
+        .expect("write sampled input");
+    }
+
+    let report = parse_success(&guess(workspace.path(), &["--field", "csv_orders.amount"]));
+    let coverage = &report["coverage"][0];
+    assert_eq!(coverage["discovered_files"], 12);
+    assert_eq!(coverage["unreported_file_count"], 8);
+    let files = coverage["files"].as_array().expect("bounded file reports");
+    assert_eq!(files.len(), 4);
+    assert_eq!(files[0]["path"], "input-00.csv");
+    assert_eq!(files[3]["path"], "input-03.csv");
+
+    for owner in report["fields"][0]["owners"]
+        .as_array()
+        .expect("owner reports")
+    {
+        assert_eq!(owner["observations"], 40);
+        assert_eq!(
+            owner["evidence"]
+                .as_array()
+                .expect("bounded evidence")
+                .len(),
+            8
+        );
+    }
+}
+
+#[test]
 fn preview_selector_channel_uses_effective_json_schema_and_parser() {
     let workspace = workspace();
     let output = guess(

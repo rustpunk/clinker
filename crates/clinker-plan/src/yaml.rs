@@ -35,6 +35,9 @@ pub use serde_saphyr::{Location, Span, Spanned};
 /// pathological inputs never reach the deserializer at all.
 pub const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 
+/// Maximum number of YAML nodes admitted by one canonical parse.
+pub const MAX_NODES: usize = 100_000;
+
 /// Wrapper around [`serde_saphyr::Error`] so callers do not have to
 /// import the underlying crate. Implements `Display` / `Error` and
 /// `From<serde_saphyr::Error>`.
@@ -74,7 +77,7 @@ fn budget_options() -> serde_saphyr::Options {
             max_inclusion_depth: 0,
             // 100 000 nodes — covers the largest plausible fixture with a
             // ~10x margin.
-            max_nodes: 100_000,
+            max_nodes: MAX_NODES,
             // Reject exponential alias expansion (the canonical
             // billion-laughs defense).
             enforce_alias_anchor_ratio: true,

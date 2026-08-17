@@ -23,7 +23,8 @@ use crate::GuessArgs;
 const MAX_FILES_PER_SOURCE: usize = 4;
 const MAX_RECORDS_PER_FILE: u64 = 1_024;
 const MAX_INPUT_BYTES_PER_FILE: u64 = 8 * 1_024 * 1_024;
-const MAX_EVIDENCE_PER_FIELD: usize = 8;
+const MAX_EVIDENCE_PER_OWNER: usize = 8;
+const MAX_SCHEMA_LEAVES: usize = clinker_plan::yaml::MAX_NODES;
 
 /// A classified `guess` failure. Selection/configuration errors are command
 /// misuse (exit 1); source I/O and reader failures are infrastructure (exit 4).
@@ -133,7 +134,7 @@ impl FieldAccumulator {
                 self.unresolved.insert(issue_label(issue));
             }
         }
-        if self.evidence.len() < MAX_EVIDENCE_PER_FIELD {
+        if self.evidence.len() < MAX_EVIDENCE_PER_OWNER {
             self.evidence.push(EvidenceReport::from(observation));
         }
     }
@@ -179,10 +180,14 @@ struct SelectionReport {
 
 #[derive(Debug, Serialize)]
 struct LimitsReport {
+    max_yaml_input_bytes: usize,
+    max_yaml_nodes_per_document: usize,
+    max_schema_leaves: usize,
     max_files_per_source: usize,
     max_records_per_file: u64,
     max_input_bytes_per_file: u64,
-    max_evidence_per_field: usize,
+    max_numeric_lexeme_evidence_bytes: usize,
+    max_evidence_per_owner: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -190,6 +195,7 @@ struct SourceCoverage {
     source: String,
     format: &'static str,
     discovered_files: usize,
+    unreported_file_count: usize,
     files: Vec<FileCoverage>,
 }
 
@@ -346,10 +352,15 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
         target: effective.config.pipeline.name.clone(),
         selection: effective.selection,
         limits: LimitsReport {
+            max_yaml_input_bytes: clinker_plan::yaml::MAX_INPUT_BYTES,
+            max_yaml_nodes_per_document: clinker_plan::yaml::MAX_NODES,
+            max_schema_leaves: MAX_SCHEMA_LEAVES,
             max_files_per_source: MAX_FILES_PER_SOURCE,
             max_records_per_file: MAX_RECORDS_PER_FILE,
             max_input_bytes_per_file: MAX_INPUT_BYTES_PER_FILE,
-            max_evidence_per_field: MAX_EVIDENCE_PER_FIELD,
+            max_numeric_lexeme_evidence_bytes:
+                clinker_format::numeric_observation::MAX_NUMERIC_LEXEME_EVIDENCE_BYTES,
+            max_evidence_per_owner: MAX_EVIDENCE_PER_OWNER,
         },
         coverage,
         fields,
@@ -481,6 +492,7 @@ fn select_candidates(
 ) -> Result<Vec<Candidate>, GuessError> {
     let mut candidates = IndexMap::new();
     let mut all_fields: HashMap<String, Vec<Type>> = HashMap::new();
+    let mut schema_leaves = 0usize;
     for node in &config.nodes {
         let PipelineNode::Source {
             header,
@@ -495,11 +507,12 @@ fn select_candidates(
                     register_candidate_column(
                         &mut candidates,
                         &mut all_fields,
+                        &mut schema_leaves,
                         &header.name,
                         None,
                         column,
                         true,
-                    );
+                    )?;
                 }
             }
             SourceSchema::MultiRecord { record_types, .. } => {
@@ -508,11 +521,12 @@ fn select_candidates(
                         register_candidate_column(
                             &mut candidates,
                             &mut all_fields,
+                            &mut schema_leaves,
                             &header.name,
                             Some(&record_type.id),
                             column,
                             false,
-                        );
+                        )?;
                     }
                 }
             }
@@ -572,18 +586,25 @@ fn select_candidates(
 fn register_candidate_column(
     candidates: &mut IndexMap<String, Candidate>,
     all_fields: &mut HashMap<String, Vec<Type>>,
+    schema_leaves: &mut usize,
     source: &str,
     record: Option<&str>,
     column: &Column,
     observe_physical_name: bool,
-) {
+) -> Result<(), GuessError> {
+    if *schema_leaves >= MAX_SCHEMA_LEAVES {
+        return Err(GuessError::configuration(format!(
+            "the selected effective configuration exceeds the guess limit of {MAX_SCHEMA_LEAVES} source-schema leaves (the canonical YAML node cap); correction: narrow the selected configuration"
+        )));
+    }
+    *schema_leaves += 1;
     let selector = format!("{source}.{}", column.name);
     all_fields
         .entry(selector.clone())
         .or_default()
         .push(column.ty.clone());
     if !contains_numeric_leaf(&column.ty) {
-        return;
+        return Ok(());
     }
     let address = match record {
         Some(record) => {
@@ -610,6 +631,7 @@ fn register_candidate_column(
         observed_fields,
         accumulator_index: usize::MAX,
     });
+    Ok(())
 }
 
 fn index_numeric_owners(candidates: &mut [Candidate]) -> usize {
@@ -654,51 +676,35 @@ fn sample_sources(
                 source: source_name.to_owned(),
                 format: body.source.format.format_name(),
                 discovered_files: 0,
+                unreported_file_count: 0,
                 files: Vec::new(),
             });
             continue;
         }
-        let discovered = clinker_plan::config::discovery::discover(&body.source, config_dir)
-            .map_err(|error| match error {
-                clinker_plan::config::discovery::DiscoveryError::Io(_) => {
-                    GuessError::infrastructure(format!(
-                        "source {source_name:?} discovery failed: {error}"
-                    ))
-                }
-                _ => GuessError::configuration(format!(
-                    "source {source_name:?} discovery failed: {error}"
-                )),
-            })?;
-        let paths = discovered
-            .files()
-            .iter()
-            .map(|file| file.path.clone())
-            .collect::<Vec<_>>();
-        let mut files = Vec::with_capacity(paths.len());
-        for (file_index, path) in paths.iter().enumerate() {
+        let discovered = clinker_plan::config::discovery::discover_bounded(
+            &body.source,
+            config_dir,
+            MAX_FILES_PER_SOURCE,
+        )
+        .map_err(|error| match error {
+            clinker_plan::config::discovery::DiscoveryError::Io(_) => GuessError::infrastructure(
+                format!("source {source_name:?} discovery failed: {error}"),
+            ),
+            _ => GuessError::configuration(format!(
+                "source {source_name:?} discovery failed: {error}"
+            )),
+        })?;
+        let discovered_files = discovered.discovered_file_count();
+        let unreported_file_count = discovered_files.saturating_sub(discovered.files().len());
+        let mut files = Vec::with_capacity(discovered.files().len());
+        for discovered_file in discovered.files() {
+            let path = &discovered_file.path;
             let display_path = stable_input_path(path, config_dir);
-            let metadata = std::fs::metadata(path).map_err(|error| {
-                GuessError::infrastructure(format!(
-                    "cannot inspect source file {}: {error}",
-                    display_path
-                ))
-            })?;
-            if file_index >= MAX_FILES_PER_SOURCE {
-                files.push(FileCoverage {
-                    path: display_path,
-                    status: "uncovered_file_limit",
-                    input_bytes: Some(metadata.len()),
-                    bytes_read: 0,
-                    records_sampled: 0,
-                    truncated: true,
-                });
-                continue;
-            }
-            if metadata.len() > MAX_INPUT_BYTES_PER_FILE {
+            if discovered_file.size > MAX_INPUT_BYTES_PER_FILE {
                 files.push(FileCoverage {
                     path: display_path,
                     status: "uncovered_file_byte_limit",
-                    input_bytes: Some(metadata.len()),
+                    input_bytes: Some(discovered_file.size),
                     bytes_read: 0,
                     records_sampled: 0,
                     truncated: true,
@@ -748,7 +754,7 @@ fn sample_sources(
                 } else {
                     "sampled"
                 },
-                input_bytes: Some(metadata.len()),
+                input_bytes: Some(discovered_file.size),
                 bytes_read: tally.read(),
                 records_sampled: records,
                 truncated,
@@ -757,7 +763,8 @@ fn sample_sources(
         coverage.push(SourceCoverage {
             source: source_name.to_owned(),
             format: body.source.format.format_name(),
-            discovered_files: paths.len(),
+            discovered_files,
+            unreported_file_count,
             files,
         });
     }
