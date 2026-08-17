@@ -81,6 +81,61 @@ with a new execution ID for every retry.
 
 ---
 
+## clinker guess
+
+Preview concrete `int` or `float` replacements for inference-only `numeric`
+columns without editing the pipeline.
+
+```text
+clinker guess [OPTIONS] <CONFIG>
+```
+
+With no selector, `guess` reads the base pipeline. `--channel <ID>` selects one
+cataloged channel plus its target-admitted derived groups; `--group <NAME>`
+selects one explicit, target-admitted group without a channel. The two
+selectors conflict. A missing or ambiguous selector is an error rather than a
+fallback to the base pipeline, so the report always describes exactly one
+effective configuration.
+
+| Flag | Description |
+|------|-------------|
+| `<CONFIG>` | Pipeline YAML containing the source-schema `numeric` leaves to inspect. |
+| `--channel <ID>` | Select one cataloged channel and its derived, target-admitted groups. |
+| `--group <NAME>` | Select one explicit, target-admitted group without a channel. |
+| `--field <NODE.COLUMN>` | Narrow the preview to one `numeric` source column. Repeatable; repeated selectors are deduplicated in request order. Unknown, malformed, or already-concrete fields are rejected. |
+| `--base-dir <DIR>` | Workspace root holding `clinker.toml` and the channel/group roots. Defaults to the pipeline file's directory. |
+
+The command constructs readers through the same CSV, JSON, and XML option and
+schema-coercion path as runtime ingest. It emits one deterministic JSON document
+containing the selected configuration, bounded coverage, parser-owned numeric
+evidence, unresolved reasons, proposed types, and an exact semantic YAML patch.
+The patch is a preview string inside the report; this command never changes the
+pipeline or an overlay.
+
+Sampling is bounded to four discovered files per selected source, 1,024 records
+per sampled file, 8 MiB per file, and eight retained evidence items per field.
+Files beyond either file bound are reported as uncovered, and hitting the
+record bound is reported as truncated. The limits and every sampled or
+uncovered file are included in the report so a proposal is never presented as
+having broader evidence than Clinker actually read.
+
+Exit `0` means a complete preview document was written, including when one or
+more fields remain unresolved. Selection, configuration, and field errors exit
+`1`; source discovery, input I/O, reader, and stdout failures exit `4`.
+
+```bash
+# Preview every inference-only numeric leaf in the base pipeline
+clinker guess pipeline.yaml
+
+# Preview one field under a cataloged channel
+clinker guess pipeline.yaml --channel acme --field orders.amount
+
+# Preview one explicit group without a channel
+clinker guess pipeline.yaml --group enterprise
+```
+
+---
+
 ## clinker explain
 
 Inspect one compiled field's provenance or discover registry-owned diagnostic

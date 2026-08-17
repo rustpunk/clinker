@@ -1,0 +1,9 @@
+channel:
+  target: guess.pipeline
+sources:
+  csv_orders:
+    schema:
+      amount: { type: int }
+  json_orders:
+    schema:
+      ratio: { type: numeric }

@@ -1,0 +1,22 @@
+version: 1
+configuration_files:
+  - pipeline.yaml
+  - channel.yaml
+  - group.yaml
+inputs:
+  - input.csv
+  - input.json
+  - input.xml
+expected_artifacts:
+  - expected-preview.json
+  - expected.patch
+cases:
+  - name: preview_selector_base_csv
+    selector: base
+    field: csv_orders.amount
+  - name: preview_selector_channel_json
+    selector: channel:json_preview
+    field: json_orders.ratio
+  - name: preview_selector_group_xml
+    selector: group:xml_preview
+    field: xml_orders.total
