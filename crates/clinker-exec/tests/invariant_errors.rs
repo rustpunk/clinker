@@ -49,7 +49,7 @@ nodes:
       cxl: |
         emit id = id
         emit renamed = label
-  - type: output
+  - type: sink
     name: out
     input: rename
     config:
@@ -204,12 +204,12 @@ fn dispatch_mismatch_cases() -> [DispatchMismatchCase; 12] {
             invoke: DispatchFaultGuard::dispatch_envelope_mismatch_for_testing,
         },
         DispatchMismatchCase {
-            matrix_name: "output",
-            dispatcher: "dispatch_output",
-            expected_kind: "output",
+            matrix_name: "sink",
+            dispatcher: "dispatch_sink",
+            expected_kind: "sink",
             actual_kind: "transform",
             node_name: "rename",
-            invoke: DispatchFaultGuard::dispatch_output_mismatch_for_testing,
+            invoke: DispatchFaultGuard::dispatch_sink_mismatch_for_testing,
         },
         DispatchMismatchCase {
             matrix_name: "cull",
@@ -486,7 +486,7 @@ fn exhaustive_twelve_dispatcher_matrix() {
             "merge",
             "sort",
             "envelope",
-            "output",
+            "sink",
             "cull",
             "reshape",
         ],

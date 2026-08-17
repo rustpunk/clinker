@@ -4084,9 +4084,7 @@ fn output_is_fan_out(
         .node_indices()
         .find(|i| dag.graph[*i].name() == output_name)
         .and_then(|i| match &dag.graph[i] {
-            PlanNode::Output { resolved, .. } => {
-                resolved.as_ref().map(|r| r.fan_out_per_source_file)
-            }
+            PlanNode::Sink { resolved, .. } => resolved.as_ref().map(|r| r.fan_out_per_source_file),
             _ => None,
         })
         .unwrap_or(false)

@@ -279,7 +279,7 @@ pub fn classify_stream_nodes(
         .node_indices()
         .map(|idx| {
             let class = match &plan.graph[idx] {
-                PlanNode::Output { .. } => StreamClass::Streaming,
+                PlanNode::Sink { .. } => StreamClass::Streaming,
                 PlanNode::Source { name, .. } if fused_sources.contains(name.as_str()) => {
                     StreamClass::Streaming
                 }
@@ -497,7 +497,7 @@ pub fn certify_streaming_edge(
     // `driving_upstream` index instead — the single-incoming guard would
     // reject it.
     let producer_idx: petgraph::graph::NodeIndex = match &plan.graph[consumer_idx] {
-        PlanNode::Output { resolved, .. } => {
+        PlanNode::Sink { resolved, .. } => {
             let payload = resolved.as_deref()?;
             // Authored output sorting materializes through the bounded shared
             // SortBuffer before writing. Per-source-file fan-out and split
@@ -1129,7 +1129,7 @@ nodes:
                 combine_strategy(dag)
             );
             let combine = find_node(dag, "combine", |n| matches!(n, PlanNode::Combine { .. }));
-            let output = find_node(dag, "output", |n| matches!(n, PlanNode::Output { .. }));
+            let output = find_node(dag, "output", |n| matches!(n, PlanNode::Sink { .. }));
             // The combine→Output edge certifies as a streaming output edge,
             // resolving the block-band combine as the producer.
             assert_eq!(
@@ -1159,9 +1159,7 @@ nodes:
             let combine = find_node(dag, "combine", |node| {
                 matches!(node, PlanNode::Combine { .. })
             });
-            let output = find_node(dag, "output", |node| {
-                matches!(node, PlanNode::Output { .. })
-            });
+            let output = find_node(dag, "output", |node| matches!(node, PlanNode::Sink { .. }));
             assert_eq!(
                 certify_streaming_edge(dag, output, fused, init),
                 None,
@@ -1188,7 +1186,7 @@ nodes:
             for output in dag
                 .graph
                 .node_indices()
-                .filter(|idx| matches!(&dag.graph[*idx], PlanNode::Output { .. }))
+                .filter(|idx| matches!(&dag.graph[*idx], PlanNode::Sink { .. }))
             {
                 assert_eq!(
                     certify_streaming_edge(dag, output, fused, init),
@@ -1223,7 +1221,7 @@ nodes:
                 combine_strategy(dag)
             );
             let combine = find_node(dag, "combine", |n| matches!(n, PlanNode::Combine { .. }));
-            let output = find_node(dag, "output", |n| matches!(n, PlanNode::Output { .. }));
+            let output = find_node(dag, "output", |n| matches!(n, PlanNode::Sink { .. }));
             // The combine→Output edge certifies, resolving the equi+range
             // block-band combine as the streaming producer, and the runtime
             // classification agrees.

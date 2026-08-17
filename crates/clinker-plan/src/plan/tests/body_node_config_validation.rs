@@ -651,12 +651,12 @@ nodes:
         .node_indices()
         .find(|&i| bound.graph[i].name() == "body_sink")
         .expect("body output `body_sink` present in the bound body");
-    let PlanNode::Output { resolved, .. } = &bound.graph[idx] else {
-        panic!("node `body_sink` is not an Output");
+    let PlanNode::Sink { resolved, .. } = &bound.graph[idx] else {
+        panic!("node `body_sink` is not a Sink");
     };
     let payload = resolved
         .as_ref()
-        .expect("the full plan carries the body Output's resolved payload");
+        .expect("the full plan carries the body Sink's resolved payload");
     let columns = payload
         .output
         .schema

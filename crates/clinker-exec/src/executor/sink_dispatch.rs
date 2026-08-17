@@ -1,11 +1,11 @@
-//! `PlanNode::Output` dispatch arm.
+//! `PlanNode::Sink` dispatch arm.
 //!
 //! Holds the sink-writer body lifted out of
 //! [`crate::executor::dispatch::dispatch_plan_node`]: writer init, output
 //! schema mapping, `include_unmapped` passthrough, the per-record fan-out
 //! to source-file-keyed writers, the correlation-buffer capture path, and
-//! the streaming-fused output short-circuit. The dispatcher's `Output` arm
-//! is a single delegating call into [`dispatch_output`].
+//! the streaming-fused output short-circuit. The dispatcher's `Sink` arm
+//! is a single delegating call into [`dispatch_sink`].
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -53,7 +53,7 @@ type OrderedRecordStream<'a> = Box<dyn Iterator<Item = OrderedRecord> + 'a>;
 impl OrderedWriterBoundary {
     /// Resolve the one compiled boundary for `output_id` and assert that the
     /// runtime path matches its planner-selected mode.
-    pub(crate) fn for_output(
+    pub(crate) fn for_sink(
         current_dag: &ExecutionPlanDag,
         output_id: clinker_plan::plan::PlanNodeId,
         expected_mode: WriterBoundaryMode,
@@ -246,7 +246,7 @@ fn resolve_out_cfg<'a>(
 /// schema-check), the upstream node name (for E314 diagnostics), and the CXL
 /// emit names (for `include_unmapped: false` projection). Owned so the caller
 /// can hold them across the `&mut ctx` write phase.
-struct OutputInputs {
+struct SinkInputs {
     expected_input_schema: Option<Arc<clinker_record::Schema>>,
     upstream_name: String,
     cxl_emit_names: Vec<String>,
@@ -256,14 +256,14 @@ struct OutputInputs {
 /// dispatch passes the live executor context directly; the feature-gated
 /// mismatch matrix uses the inert carrier to prove rejection precedes writer
 /// lookup, publication, correlation buffering, and input-buffer access.
-pub(crate) enum OutputDispatchContext<'borrow, 'plan> {
+pub(crate) enum SinkDispatchContext<'borrow, 'plan> {
     Live(&'borrow mut ExecutorContext<'plan>),
     #[cfg(feature = "test-utils")]
     Inert,
 }
 
 impl<'borrow, 'plan> From<&'borrow mut ExecutorContext<'plan>>
-    for OutputDispatchContext<'borrow, 'plan>
+    for SinkDispatchContext<'borrow, 'plan>
 {
     fn from(ctx: &'borrow mut ExecutorContext<'plan>) -> Self {
         Self::Live(ctx)
@@ -275,20 +275,20 @@ impl crate::executor::dispatch::DispatchFaultGuard {
     /// Execute the real output boundary with an inert context so tests can
     /// prove a wrong node returns before writer or publication state is read.
     #[doc(hidden)]
-    pub fn dispatch_output_mismatch_for_testing(
+    pub fn dispatch_sink_mismatch_for_testing(
         current_dag: &ExecutionPlanDag,
         node_idx: NodeIndex,
         node: &PlanNode,
     ) -> Result<(), PipelineError> {
-        dispatch_output(OutputDispatchContext::Inert, current_dag, node_idx, node)
+        dispatch_sink(SinkDispatchContext::Inert, current_dag, node_idx, node)
     }
 }
 
-/// Derive the [`OutputInputs`] for `node_idx` from the plan. Shared by the
-/// records-only, document-DLQ, and envelope Output arms so the input-binding
+/// Derive the [`SinkInputs`] for `node_idx` from the plan. Shared by the
+/// records-only, document-DLQ, and envelope Sink arms so the input-binding
 /// preamble lives in one place.
-fn resolve_output_inputs(current_dag: &ExecutionPlanDag, node_idx: NodeIndex) -> OutputInputs {
-    OutputInputs {
+fn resolve_sink_inputs(current_dag: &ExecutionPlanDag, node_idx: NodeIndex) -> SinkInputs {
+    SinkInputs {
         expected_input_schema: current_dag.graph[node_idx]
             .expected_input_schema_in(current_dag)
             .cloned(),
@@ -302,15 +302,15 @@ fn resolve_output_inputs(current_dag: &ExecutionPlanDag, node_idx: NodeIndex) ->
     }
 }
 
-/// Execute the `Output` arm for `node_idx`: open the writer(s), map records
+/// Execute the `Sink` arm for `node_idx`: open the writer(s), map records
 /// onto the declared output schema (passing unmapped fields through when
 /// configured), and write — taking the per-record fan-out path for
 /// source-file-keyed outputs, the correlation-buffer capture path under a
 /// correlation-key pipeline, and the streaming-fused short-circuit when a
 /// streaming sender was installed. Deferred physical boundaries block only at
 /// their compiled population grain and spill through the shared sorter.
-pub(crate) fn dispatch_output<'borrow, 'plan>(
-    ctx: impl Into<OutputDispatchContext<'borrow, 'plan>>,
+pub(crate) fn dispatch_sink<'borrow, 'plan>(
+    ctx: impl Into<SinkDispatchContext<'borrow, 'plan>>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     node: &PlanNode,
@@ -318,39 +318,39 @@ pub(crate) fn dispatch_output<'borrow, 'plan>(
 where
     'plan: 'borrow,
 {
-    let PlanNode::Output {
+    let PlanNode::Sink {
         ref name,
         ref resolved,
         ..
     } = *node
     else {
         return Err(crate::executor::invariant::dispatch_mismatch(
-            "dispatch_output",
-            "output",
+            "dispatch_sink",
+            "sink",
             node.kind_name(),
             node.name(),
         ));
     };
     #[cfg(feature = "test-utils")]
-    let OutputDispatchContext::Live(ctx) = ctx.into() else {
-        panic!("output dispatcher accessed inert context after accepting an output node")
+    let SinkDispatchContext::Live(ctx) = ctx.into() else {
+        panic!("sink dispatcher accessed inert context after accepting a sink node")
     };
     #[cfg(not(feature = "test-utils"))]
-    let OutputDispatchContext::Live(ctx) = ctx.into();
+    let SinkDispatchContext::Live(ctx) = ctx.into();
     let output_id = node.id();
-    // Streaming-Output short-circuit (issue #72). The executor
-    // entry already moved this Output's writer into a
+    // Streaming-Sink short-circuit (issue #72). The executor
+    // entry already moved this Sink's writer into a
     // `std::thread` that drained records from a bounded crossbeam
     // channel populated by the fused Merge arm. Per-record
     // `write_record` already fired concurrently with Merge
     // production; the dispatcher's end-of-DAG join surface joins
     // the thread and folds its counters / timers / errors into
-    // the context. The Output's topo turn here is a no-op.
-    if ctx.streaming_output_nodes.contains(&node_idx) {
+    // the context. The Sink's topo turn here is a no-op.
+    if ctx.streaming_sink_nodes.contains(&node_idx) {
         return Ok(());
     }
     // Document-level DLQ short-circuit. When any source declares
-    // `dlq_granularity: document`, this Output's records are decided
+    // `dlq_granularity: document`, this Sink's records are decided
     // per-document: buffered until each `DocumentClose`, then flushed clean
     // to the writer or rejected (trigger + collateral) to the DLQ. The
     // driver consumes the INTERLEAVED event stream (records + closes in
@@ -358,12 +358,12 @@ where
     // below discards — an additive read of the same buffer, not a change to
     // the records-vs-puncts split contract every other operator relies on.
     if ctx.document_dlq.is_some() {
-        let writer_boundary = OrderedWriterBoundary::for_output(
+        let writer_boundary = OrderedWriterBoundary::for_sink(
             current_dag,
             output_id,
             WriterBoundaryMode::DocumentDlq,
         )?;
-        return dispatch_output_document_dlq(ctx, current_dag, node_idx, name, writer_boundary);
+        return dispatch_sink_document_dlq(ctx, current_dag, node_idx, name, writer_boundary);
     }
     // Envelope-reconstruction short-circuit. When this Output declares
     // `reconstruct_envelope: true`, its writer's `begin_document` /
@@ -374,12 +374,9 @@ where
     // boundaries stream each body record; deferred boundaries sort one
     // document through the bounded shared spill path before framing its body.
     if resolve_out_cfg(ctx, name).reconstruct_envelope {
-        let writer_boundary = OrderedWriterBoundary::for_output(
-            current_dag,
-            output_id,
-            WriterBoundaryMode::Envelope,
-        )?;
-        return dispatch_output_envelope(ctx, current_dag, node_idx, name, writer_boundary);
+        let writer_boundary =
+            OrderedWriterBoundary::for_sink(current_dag, output_id, WriterBoundaryMode::Envelope)?;
+        return dispatch_sink_envelope(ctx, current_dag, node_idx, name, writer_boundary);
     }
     let correlation_deferred = ctx.correlation_buffers.is_some();
     let expected_mode = if correlation_deferred {
@@ -392,7 +389,7 @@ where
     } else {
         WriterBoundaryMode::RecordsOnly
     };
-    let writer_boundary = OrderedWriterBoundary::for_output(current_dag, output_id, expected_mode)?;
+    let writer_boundary = OrderedWriterBoundary::for_sink(current_dag, output_id, expected_mode)?;
     // Get input records: check own buffer first (Route
     // nodes store records at the successor's index), then
     // fall back to predecessor buffers.
@@ -409,7 +406,7 @@ where
         .graph
         .edges_directed(node_idx, Direction::Incoming)
         .next()
-        .ok_or_else(|| missing_output_input_error(current_dag, node_idx, name))?;
+        .ok_or_else(|| missing_sink_input_error(current_dag, node_idx, name))?;
     let producer = edge.source();
     let producer_port = edge.weight().producer_port.as_deref();
     let input_key =
@@ -434,14 +431,14 @@ where
         input_records = writer_boundary.order_records(ctx, input_records)?;
     }
 
-    let OutputInputs {
+    let SinkInputs {
         expected_input_schema,
         upstream_name,
         cxl_emit_names,
-    } = resolve_output_inputs(current_dag, node_idx);
+    } = resolve_sink_inputs(current_dag, node_idx);
     if let Some(expected) = expected_input_schema.as_ref() {
         for (record, _) in &input_records {
-            check_input_schema(expected, record.schema(), name, "output", &upstream_name)?;
+            check_input_schema(expected, record.schema(), name, "sink", &upstream_name)?;
         }
     }
 
@@ -532,7 +529,7 @@ where
     //   already been counted at another Output during
     //   the same DAG walk. Source identity is
     //   `row_num` (per-source counter), tracked across
-    //   all Output arms via the `ok_source_rows` set
+    //   all Sink arms via the `ok_source_rows` set
     //   declared at function scope.
     //
     // Buffered records DEFER counter increments to the
@@ -782,7 +779,7 @@ fn build_csv_union_schema(
 /// DLQ. Blocking at the document grain — a buffered record is not written
 /// until its close decides the document clean; peak memory is the
 /// concurrently-open documents, spillable under budget.
-fn dispatch_output_document_dlq(
+fn dispatch_sink_document_dlq(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
@@ -790,17 +787,17 @@ fn dispatch_output_document_dlq(
     writer_boundary: OrderedWriterBoundary,
 ) -> Result<(), PipelineError> {
     let (events, _input_clone_reservation) =
-        drain_output_input_events(ctx, current_dag, node_idx, name)?;
+        drain_sink_input_events(ctx, current_dag, node_idx, name)?;
 
-    let OutputInputs {
+    let SinkInputs {
         expected_input_schema,
         upstream_name,
         cxl_emit_names,
-    } = resolve_output_inputs(current_dag, node_idx);
+    } = resolve_sink_inputs(current_dag, node_idx);
     if let Some(expected) = expected_input_schema.as_ref() {
         for event in &events {
             if let crate::executor::stream_event::StreamEvent::Record(record, _) = event {
-                check_input_schema(expected, record.schema(), name, "output", &upstream_name)?;
+                check_input_schema(expected, record.schema(), name, "sink", &upstream_name)?;
             }
         }
     }
@@ -824,14 +821,14 @@ fn dispatch_output_document_dlq(
     driver.run(ctx, events)
 }
 
-/// Drain this Output's input buffer as the INTERLEAVED `StreamEvent`
+/// Drain this Sink's input buffer as the INTERLEAVED `StreamEvent`
 /// stream, preserving record/`DocumentClose` ordering — the boundary the
 /// records-only `drain_split` path discards — and materialize it into a
 /// `Vec` for the document-DLQ driver (which buffers per document anyway, so
 /// has no use for the lazy form). Delegates the predecessor-selection walk to
-/// [`drain_output_input_event_iter`] so the two boundary-aware Output arms
+/// [`drain_sink_input_event_iter`] so the two boundary-aware Sink arms
 /// share one mechanism.
-fn drain_output_input_events(
+fn drain_sink_input_events(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
@@ -843,7 +840,7 @@ fn drain_output_input_events(
     ),
     PipelineError,
 > {
-    let input = drain_output_input_event_iter(ctx, current_dag, node_idx, name, true)?;
+    let input = drain_sink_input_event_iter(ctx, current_dag, node_idx, name, true)?;
     let (events, reservation) = input.into_parts();
     Ok((events.collect::<Result<Vec<_>, _>>()?, reservation))
 }
@@ -892,18 +889,18 @@ fn drain_output_input_events(
 /// schema-check failure fails fast like the sibling arms, but first surfaces
 /// any already-accumulated framing/write errors and flushes the open document
 /// so nothing in flight is lost.
-fn dispatch_output_envelope(
+fn dispatch_sink_envelope(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     name: &str,
     writer_boundary: OrderedWriterBoundary,
 ) -> Result<(), PipelineError> {
-    let OutputInputs {
+    let SinkInputs {
         expected_input_schema,
         upstream_name,
         cxl_emit_names,
-    } = resolve_output_inputs(current_dag, node_idx);
+    } = resolve_sink_inputs(current_dag, node_idx);
     // Owned clone: the writer-factory closure and the projection both borrow
     // `out_cfg` across the loop's `&mut ctx` phases, so it cannot stay a
     // borrow of `ctx.output_configs`.
@@ -919,7 +916,7 @@ fn dispatch_output_envelope(
     let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
     let mut any_record = false;
 
-    let mut events = drain_output_input_event_iter(ctx, current_dag, node_idx, name, false)?;
+    let mut events = drain_sink_input_event_iter(ctx, current_dag, node_idx, name, false)?;
     let mut driver = EnvelopeWriterDriver::default();
     let mut structured_guard = StructuredOutputDocumentGuard::new(&out_cfg.format);
     let mut pending = None;
@@ -973,7 +970,7 @@ fn dispatch_output_envelope(
             let checked = population.map(|item| {
                 let (record, row_num) = item?;
                 if let Some(expected) = expected_input_schema.as_ref() {
-                    check_input_schema(expected, record.schema(), name, "output", &upstream_name)?;
+                    check_input_schema(expected, record.schema(), name, "sink", &upstream_name)?;
                 }
                 Ok((record, row_num))
             });
@@ -1122,7 +1119,7 @@ impl EnvelopeWriterDriver {
         let writer = self.writer.as_mut().expect("writer opened above");
         if let Err(e) = writer.write_record(projected) {
             // A `join_values` `on_conflict: error` collision is routed to the DLQ
-            // on the record-granularity Output arms (buffered + streaming). This
+            // on the record-granularity Sink arms (buffered + streaming). This
             // envelope-reconstruction arm holds only the projected record and no
             // `ctx` here, and a collision interacts with the per-document framing
             // it drives, so — like the correlation-commit and document-DLQ arms —
@@ -1193,22 +1190,22 @@ impl EnvelopeWriterDriver {
     }
 }
 
-/// Lazily drain this Output's input as the INTERLEAVED `StreamEvent` stream,
+/// Lazily drain this Sink's input as the INTERLEAVED `StreamEvent` stream,
 /// preserving record/boundary ordering — the envelope-reconstruction analog
-/// of [`drain_output_input_events`], but yielding an iterator rather than a
+/// of [`drain_sink_input_events`], but yielding an iterator rather than a
 /// `Vec` so a spilled predecessor buffer streams from disk one event at a
 /// time instead of materializing. Mirrors the per-record path's own-slot-first
 /// selection, then lets the producer-declared reader ledger choose a shared
 /// sequential scan or transfer the authoritative predecessor generation to
 /// its final reader. A spill-backed scan opens one chunk at a time.
-#[must_use = "an Output input must retain its scan reservation"]
-struct OutputInputEventIter {
+#[must_use = "a Sink input must retain its scan reservation"]
+struct SinkInputEventIter {
     events:
         Box<dyn Iterator<Item = Result<crate::executor::stream_event::StreamEvent, PipelineError>>>,
     reservation: Option<TransientNodeBufferReservation>,
 }
 
-impl OutputInputEventIter {
+impl SinkInputEventIter {
     fn into_parts(
         self,
     ) -> (
@@ -1219,7 +1216,7 @@ impl OutputInputEventIter {
     }
 }
 
-impl Iterator for OutputInputEventIter {
+impl Iterator for SinkInputEventIter {
     type Item = Result<crate::executor::stream_event::StreamEvent, PipelineError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1227,19 +1224,19 @@ impl Iterator for OutputInputEventIter {
     }
 }
 
-fn drain_output_input_event_iter(
+fn drain_sink_input_event_iter(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     name: &str,
     materializes: bool,
-) -> Result<OutputInputEventIter, PipelineError> {
+) -> Result<SinkInputEventIter, PipelineError> {
     use petgraph::visit::EdgeRef;
     let edge = current_dag
         .graph
         .edges_directed(node_idx, Direction::Incoming)
         .next()
-        .ok_or_else(|| missing_output_input_error(current_dag, node_idx, name))?;
+        .ok_or_else(|| missing_sink_input_error(current_dag, node_idx, name))?;
     let producer = edge.source();
     let producer_port = edge.weight().producer_port.as_deref();
     let input_key =
@@ -1256,16 +1253,16 @@ fn drain_output_input_event_iter(
     } else {
         input.into_parts()
     };
-    Ok(OutputInputEventIter {
+    Ok(SinkInputEventIter {
         events: Box::new(input.drain()),
         reservation,
     })
 }
 
-/// Build the fail-loud diagnostic only after every valid Output input location
+/// Build the fail-loud diagnostic only after every valid Sink input location
 /// (own slot, predecessor drain, or predecessor shared scan) has been checked.
 #[cold]
-fn missing_output_input_error(
+fn missing_sink_input_error(
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     name: &str,
@@ -1286,14 +1283,14 @@ fn missing_output_input_error(
     }
 }
 
-/// The Output node's resolved write target plus the run-scoped writer
+/// The Sink node's resolved write target plus the run-scoped writer
 /// state both write paths share. Bundling the four cross-branch borrows
 /// (error sink, the write / projection cumulative timers, and the
 /// stage-metric collector) with the per-call write descriptor (output
 /// name, resolved [`SinkConfig`](clinker_plan::config::SinkConfig), explicit
 /// CXL emit names, and the projected output schema) keeps the fan-out and
 /// single-writer helpers below clippy's argument threshold and gives them
-/// one shared shape — a change to how an Output write is attributed (e.g.
+/// one shared shape — a change to how a Sink write is attributed (e.g.
 /// a new metric guard) lands on the struct, not on two signatures.
 struct FanOutContext<'a> {
     name: &'a str,
@@ -1304,7 +1301,7 @@ struct FanOutContext<'a> {
     write_timer: &'a mut crate::executor::stage_metrics::CumulativeTimer,
     projection_timer: &'a mut crate::executor::stage_metrics::CumulativeTimer,
     collector: &'a mut crate::executor::stage_metrics::StageCollector,
-    /// This Output's `mapping:` resolution evidence, carried in so the per-record
+    /// This Sink's `mapping:` resolution evidence, carried in so the per-record
     /// projections below feed the same probe the rest of the run's arms do.
     mapping_probe: Option<&'a mut crate::projection::MappingProbe>,
     /// The run's error strategy, so a `join_values` `on_conflict: error`
@@ -1571,14 +1568,14 @@ mod tests {
         }
     }
 
-    fn output_clone_fixture() -> NodeBuffer {
+    fn sink_input_clone_fixture() -> NodeBuffer {
         let schema = Arc::new(Schema::new(vec!["id".into()]));
         NodeBuffer::memory_from_records(vec![(Record::new(schema, vec![Value::Integer(1)]), 1)])
     }
 
     #[test]
-    fn ordinary_output_materialization_preflight_returns_node_buffer_e310_at_baseline() {
-        let input = output_clone_fixture();
+    fn ordinary_sink_materialization_preflight_returns_node_buffer_e310_at_baseline() {
+        let input = sink_input_clone_fixture();
         let clone_bytes = input.estimated_memory_bytes();
         let hard_limit = 100 * 1024 * 1024 * 1024;
         let baseline_usage = hard_limit - clone_bytes + 1;
@@ -1612,8 +1609,8 @@ mod tests {
     }
 
     #[test]
-    fn envelope_output_iterator_holds_materialization_charge_through_iteration() {
-        let mut input = output_clone_fixture();
+    fn envelope_sink_iterator_holds_materialization_charge_through_iteration() {
+        let mut input = sink_input_clone_fixture();
         let clone_bytes = input.estimated_memory_bytes();
         let budget = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
             100 * 1024 * 1024 * 1024,
@@ -1624,7 +1621,7 @@ mod tests {
         let reservation = reserve_node_buffer_materialization(clone_bytes, &budget, "envelope_out")
             .expect("roomy Output materialization");
         let reread = input.reread().expect("re-readable Output input");
-        let mut events = OutputInputEventIter {
+        let mut events = SinkInputEventIter {
             events: Box::new(reread.drain()),
             reservation: Some(reservation),
         };

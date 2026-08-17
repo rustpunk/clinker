@@ -508,7 +508,7 @@ impl ExecutionPlanDag {
     /// Inject the terminal [`PlanNode::CorrelationCommit`] when any
     /// source declares a `correlation_key:`.
     ///
-    /// One commit node is created and every existing [`PlanNode::Output`]
+    /// One commit node is created and every existing [`PlanNode::Sink`]
     /// gains an outgoing edge to it. Output writes from the dispatcher
     /// arm route into per-group correlation buffers keyed by group; the
     /// commit arm walks those buffers at end-of-DAG.
@@ -554,7 +554,7 @@ impl ExecutionPlanDag {
         let output_indices: Vec<NodeIndex> = self
             .graph
             .node_indices()
-            .filter(|&idx| matches!(self.graph[idx], PlanNode::Output { .. }))
+            .filter(|&idx| matches!(self.graph[idx], PlanNode::Sink { .. }))
             .collect();
         if output_indices.is_empty() {
             return Ok(());
@@ -587,7 +587,7 @@ impl ExecutionPlanDag {
     /// Whether this DAG carries the correlation-key terminal commit
     /// node. Returns `true` iff [`Self::inject_correlation_commit`]
     /// has run on a pipeline with at least one source declaring a
-    /// `correlation_key:` AND at least one [`PlanNode::Output`] was
+    /// `correlation_key:` AND at least one [`PlanNode::Sink`] was
     /// present.
     pub fn required_sorted_input(&self) -> bool {
         self.graph

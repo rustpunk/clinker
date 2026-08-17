@@ -210,15 +210,15 @@ pub enum PlanNode {
         #[serde(skip)]
         output_schema: Arc<Schema>,
     },
-    Output {
+    Sink {
         name: String,
         /// Stable node identity; see the `Source` variant's `id`.
         id: PlanNodeId,
         #[serde(skip)]
         span: Span,
-        /// Full resolved Output payload.
+        /// Full resolved Sink payload.
         #[serde(skip)]
-        resolved: Option<Box<PlanOutputPayload>>,
+        resolved: Option<Box<PlanSinkPayload>>,
     },
     /// Per-correlation-group synthesis and trigger-row mutation.
     ///
@@ -439,8 +439,8 @@ pub enum PlanNode {
     /// Planner-synthesized terminal commit node for `correlation_key` pipelines.
     ///
     /// Inserted by [`ExecutionPlanDag::inject_correlation_commit`] downstream
-    /// of every [`PlanNode::Output`] when at least one source declares a
-    /// `correlation_key:`. The Output arm redirects projected records into
+    /// of every [`PlanNode::Sink`] when at least one source declares a
+    /// `correlation_key:`. The Sink arm redirects projected records into
     /// `ExecutorContext.correlation_buffers` instead of writing to the
     /// FormatWriter; this arm walks the buffer at end-of-DAG and, per
     /// correlation group, either flushes records to the appropriate writer
@@ -685,12 +685,12 @@ pub struct PlanTransformPayload {
     pub max_expansion: u64,
 }
 
-/// Fully-resolved Output payload.
+/// Fully-resolved Sink payload.
 #[derive(Debug, Clone)]
-pub struct PlanOutputPayload {
+pub struct PlanSinkPayload {
     pub output: SinkConfig,
     pub validated_path: Option<crate::security::ValidatedPath>,
-    /// Plan-time flag: this Output's path template uses a per-record
+    /// Plan-time flag: this Sink's path template uses a per-record
     /// token (`{source_file}` / `{source_path}`) AND its parent
     /// partitioning is `FilePartitioned`. The CLI pre-opens one writer
     /// per source file and the dispatcher routes each record to the
@@ -716,7 +716,7 @@ impl PlanNode {
             | PlanNode::Transform { id, .. }
             | PlanNode::Route { id, .. }
             | PlanNode::Merge { id, .. }
-            | PlanNode::Output { id, .. }
+            | PlanNode::Sink { id, .. }
             | PlanNode::Reshape { id, .. }
             | PlanNode::Cull { id, .. }
             | PlanNode::Envelope { id, .. }
@@ -735,7 +735,7 @@ impl PlanNode {
             | PlanNode::Transform { name, .. }
             | PlanNode::Route { name, .. }
             | PlanNode::Merge { name, .. }
-            | PlanNode::Output { name, .. }
+            | PlanNode::Sink { name, .. }
             | PlanNode::Reshape { name, .. }
             | PlanNode::Cull { name, .. }
             | PlanNode::Envelope { name, .. }
@@ -755,7 +755,7 @@ impl PlanNode {
             | PlanNode::Transform { span, .. }
             | PlanNode::Route { span, .. }
             | PlanNode::Merge { span, .. }
-            | PlanNode::Output { span, .. }
+            | PlanNode::Sink { span, .. }
             | PlanNode::Reshape { span, .. }
             | PlanNode::Cull { span, .. }
             | PlanNode::Envelope { span, .. }
@@ -813,7 +813,7 @@ impl PlanNode {
                 .collect(),
             PlanNode::Route { .. }
             | PlanNode::Sort { .. }
-            | PlanNode::Output { .. }
+            | PlanNode::Sink { .. }
             | PlanNode::CorrelationCommit { .. } => {
                 let idx = match dag.index_of_or_scan(self.id()) {
                     Some(i) => i,
@@ -840,7 +840,7 @@ impl PlanNode {
             | PlanNode::Envelope { output_schema, .. }
             | PlanNode::Merge { output_schema, .. } => Some(output_schema),
             PlanNode::Route { .. }
-            | PlanNode::Output { .. }
+            | PlanNode::Sink { .. }
             | PlanNode::Sort { .. }
             | PlanNode::CorrelationCommit { .. } => None,
         }
@@ -913,7 +913,7 @@ impl PlanNode {
             PlanNode::Transform { .. } => "transform",
             PlanNode::Route { .. } => "route",
             PlanNode::Merge { .. } => "merge",
-            PlanNode::Output { .. } => "output",
+            PlanNode::Sink { .. } => "sink",
             PlanNode::Sort { .. } => "sort",
             PlanNode::Aggregation { .. } => "aggregation",
             PlanNode::Composition { .. } => "composition",
@@ -981,7 +981,7 @@ impl PlanNode {
                 format!("[route:{mode_str}] {name}")
             }
             PlanNode::Merge { name, .. } => format!("[merge] {name}"),
-            PlanNode::Output { name, .. } => format!("[output] {name}"),
+            PlanNode::Sink { name, .. } => format!("[sink] {name}"),
             PlanNode::Reshape { name, config, .. } => {
                 format!(
                     "[reshape] {name} partition_by=[{}] rules={}",
@@ -1257,7 +1257,7 @@ pub(super) fn arbitration_class(node: &PlanNode) -> ArbitrationClass {
         | PlanNode::Route { .. }
         | PlanNode::Merge { .. }
         | PlanNode::Envelope { .. }
-        | PlanNode::Output { .. }
+        | PlanNode::Sink { .. }
         | PlanNode::Composition { .. }
         | PlanNode::CorrelationCommit { .. } => ArbitrationClass {
             spill_priority: None,
@@ -1337,7 +1337,7 @@ pub(super) fn writes_spill_files(node: &PlanNode) -> bool {
         | PlanNode::Route { .. }
         | PlanNode::Merge { .. }
         | PlanNode::Envelope { .. }
-        | PlanNode::Output { .. }
+        | PlanNode::Sink { .. }
         | PlanNode::Composition { .. }
         | PlanNode::CorrelationCommit { .. } => false,
     }

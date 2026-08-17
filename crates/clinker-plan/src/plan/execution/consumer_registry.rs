@@ -90,7 +90,7 @@ impl CompiledConsumerRegistry {
                     node: target.id(),
                     input_port: edge.weight().port.clone(),
                     slot_behavior,
-                    kind: if matches!(target, PlanNode::Output { .. }) {
+                    kind: if matches!(target, PlanNode::Sink { .. }) {
                         CompiledConsumerKind::PhysicalWriterBoundary
                     } else {
                         CompiledConsumerKind::Computational
@@ -152,7 +152,7 @@ mod tests {
             resolved: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),
         });
-        let output = graph.add_node(PlanNode::Output {
+        let output = graph.add_node(PlanNode::Sink {
             name: "direct".to_string(),
             id: output_id,
             span: Span::SYNTHETIC,

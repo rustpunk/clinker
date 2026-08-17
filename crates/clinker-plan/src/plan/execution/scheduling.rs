@@ -468,7 +468,7 @@ impl ExecutionPlanDag {
 
         let mut terminals = Vec::new();
         for idx in self.graph.node_indices() {
-            let PlanNode::Output {
+            let PlanNode::Sink {
                 id,
                 name,
                 resolved: Some(payload),
@@ -517,7 +517,7 @@ impl ExecutionPlanDag {
         let envelope_active = self.graph.node_weights().any(|node| {
             matches!(
                 node,
-                PlanNode::Output {
+                PlanNode::Sink {
                     resolved: Some(payload),
                     ..
                 } if payload.output.reconstruct_envelope
@@ -570,7 +570,7 @@ impl ExecutionPlanDag {
                         detail: "compiled writer consumer has no live DAG node".to_string(),
                     }
                 })?;
-                let PlanNode::Output {
+                let PlanNode::Sink {
                     id,
                     name,
                     resolved: Some(payload),
@@ -898,7 +898,7 @@ impl ExecutionPlanDag {
         let output_indices: Vec<NodeIndex> = self
             .graph
             .node_indices()
-            .filter(|i| matches!(self.graph[*i], PlanNode::Output { .. }))
+            .filter(|i| matches!(self.graph[*i], PlanNode::Sink { .. }))
             .collect();
         let parent_partitioning: HashMap<NodeIndex, PartitioningKind> = output_indices
             .iter()
@@ -921,7 +921,7 @@ impl ExecutionPlanDag {
             if !is_partitioned {
                 continue;
             }
-            let PlanNode::Output {
+            let PlanNode::Sink {
                 resolved: Some(payload),
                 ..
             } = &mut self.graph[idx]
@@ -1403,7 +1403,7 @@ fn preserves_stable_arrival(node: &PlanNode) -> bool {
         node,
         PlanNode::Source { .. }
             | PlanNode::Route { .. }
-            | PlanNode::Output { .. }
+            | PlanNode::Sink { .. }
             | PlanNode::Composition { .. }
             | PlanNode::Envelope { .. }
             | PlanNode::CorrelationCommit { .. }
@@ -1800,7 +1800,7 @@ fn compute_one(
             }
         }
 
-        PlanNode::Output { name, .. } => {
+        PlanNode::Sink { name, .. } => {
             // Terminal — properties still computed for debugging. Inherit
             // parent, rewrite provenance to point at this node when ordering
             // is non-None so explain chains through. CK set is preserved at

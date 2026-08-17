@@ -1523,7 +1523,7 @@ impl ExecutionPlanDag {
                 PlanNode::Source { .. }
                 | PlanNode::Transform { .. }
                 | PlanNode::Envelope { .. }
-                | PlanNode::Output { .. }
+                | PlanNode::Sink { .. }
                 | PlanNode::Sort { .. }
                 | PlanNode::Composition { .. }
                 | PlanNode::CorrelationCommit { .. } => {
@@ -1661,7 +1661,7 @@ impl ExecutionPlanDag {
                 PlanNode::Source { .. }
                 | PlanNode::Transform { .. }
                 | PlanNode::Envelope { .. }
-                | PlanNode::Output { .. }
+                | PlanNode::Sink { .. }
                 | PlanNode::Sort { .. }
                 | PlanNode::Composition { .. }
                 | PlanNode::CorrelationCommit { .. } => {

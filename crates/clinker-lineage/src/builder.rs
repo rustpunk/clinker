@@ -200,7 +200,7 @@ pub fn column_lineage_external(
     build_column_lineage(
         compiled,
         &|node, key| match node {
-            PlanNode::Source { .. } | PlanNode::Output { .. } => {
+            PlanNode::Source { .. } | PlanNode::Sink { .. } => {
                 Ok(Some(identities.require(key)?.dataset_id().clone()))
             }
             _ => Ok(None),
@@ -768,7 +768,7 @@ fn walk_scope(
                 cols
             }
 
-            PlanNode::Output { .. } => {
+            PlanNode::Sink { .. } => {
                 let up = single_upstream(dag, idx);
                 let mut cols = ColumnTerminals::new();
                 for_each_output_col(node, dag, |col| {
@@ -812,7 +812,7 @@ fn walk_scope(
             }
         }
 
-        if let PlanNode::Output { .. } = node
+        if let PlanNode::Sink { .. } = node
             && let Some(ds) = (ctx.resolve_dataset)(node, &node_key)?
         {
             let identity_facets = ctx
@@ -1171,7 +1171,7 @@ fn visit_scope_dataset_nodes<'a>(
         let node = &graph[idx];
         let key = qualified_node(scope, node.name());
         match node {
-            PlanNode::Source { .. } | PlanNode::Output { .. } => visit(&key, node),
+            PlanNode::Source { .. } | PlanNode::Sink { .. } => visit(&key, node),
             PlanNode::Composition { body, .. } => {
                 let Some(b) = compiled.body_of(*body) else {
                     continue;

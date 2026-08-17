@@ -94,7 +94,7 @@ fn relaxed_aggregate_seeds_a_deferred_region_with_downstream_members() {
     let output_idx = plan
         .graph
         .node_indices()
-        .find(|&i| matches!(&plan.graph[i], PlanNode::Output { name, .. } if name == "out"))
+        .find(|&i| matches!(&plan.graph[i], PlanNode::Sink { name, .. } if name == "out"))
         .expect("Output 'out' must be present");
 
     let region = plan
