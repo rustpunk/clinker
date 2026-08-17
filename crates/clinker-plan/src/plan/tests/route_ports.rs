@@ -78,14 +78,14 @@ fn port_form_references_tag_each_branch() {
       conditions:
         high: "amount.to_int() > 100"
       default: low
-  - type: output
+  - type: sink
     name: high_out
     input: split.high
     config:
       name: high_out
       type: csv
       path: high.csv
-  - type: output
+  - type: sink
     name: low_out
     input: split.low
     config:
@@ -98,8 +98,8 @@ fn port_form_references_tag_each_branch() {
     assert_eq!(
         route_port_targets(&yaml),
         vec![
-            (Some("high".to_string()), "output.high_out".to_string()),
-            (Some("low".to_string()), "output.low_out".to_string()),
+            (Some("high".to_string()), "sink.high_out".to_string()),
+            (Some("low".to_string()), "sink.low_out".to_string()),
         ],
     );
 }
@@ -119,14 +119,14 @@ fn bare_name_references_tag_the_matching_branch() {
       conditions:
         high: "amount.to_int() > 100"
       default: low
-  - type: output
+  - type: sink
     name: high
     input: split
     config:
       name: high
       type: csv
       path: high.csv
-  - type: output
+  - type: sink
     name: low
     input: split
     config:
@@ -139,8 +139,8 @@ fn bare_name_references_tag_the_matching_branch() {
     assert_eq!(
         route_port_targets(&yaml),
         vec![
-            (Some("high".to_string()), "output.high".to_string()),
-            (Some("low".to_string()), "output.low".to_string()),
+            (Some("high".to_string()), "sink.high".to_string()),
+            (Some("low".to_string()), "sink.low".to_string()),
         ],
     );
 }
@@ -159,21 +159,21 @@ fn one_branch_fans_to_multiple_consumers() {
       conditions:
         high: "amount.to_int() > 100"
       default: low
-  - type: output
+  - type: sink
     name: high_a
     input: split.high
     config:
       name: high_a
       type: csv
       path: high_a.csv
-  - type: output
+  - type: sink
     name: high_b
     input: split.high
     config:
       name: high_b
       type: csv
       path: high_b.csv
-  - type: output
+  - type: sink
     name: low_out
     input: split.low
     config:
@@ -186,9 +186,9 @@ fn one_branch_fans_to_multiple_consumers() {
     assert_eq!(
         route_port_targets(&yaml),
         vec![
-            (Some("high".to_string()), "output.high_a".to_string()),
-            (Some("high".to_string()), "output.high_b".to_string()),
-            (Some("low".to_string()), "output.low_out".to_string()),
+            (Some("high".to_string()), "sink.high_a".to_string()),
+            (Some("high".to_string()), "sink.high_b".to_string()),
+            (Some("low".to_string()), "sink.low_out".to_string()),
         ],
     );
 }

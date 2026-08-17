@@ -85,7 +85,7 @@ nodes:
     use: ../compositions/scoped_transform.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out_top
     input: shape
     config:
@@ -93,7 +93,7 @@ nodes:
       type: csv
       path: out_top.csv
       include_unmapped: true
-  - type: output
+  - type: sink
     name: out_body
     input: body
     config:

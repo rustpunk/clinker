@@ -86,7 +86,7 @@ nodes:
       cxl: |
         emit doubled = amount * 2
 
-  - type: output
+  - type: sink
     name: out
     input: scale
     config:
@@ -115,7 +115,7 @@ fn buffer_class_marks_fused_source_transform_output_chain_streaming() {
 
     assert_eq!(buffer_class_for(block, "source.primary"), "streaming");
     assert_eq!(buffer_class_for(block, "transform.scale"), "streaming");
-    assert_eq!(buffer_class_for(block, "output.out"), "streaming");
+    assert_eq!(buffer_class_for(block, "sink.out"), "streaming");
 }
 
 // ── Gate 2: route fan-out forces materialization ─────────────────────
@@ -144,7 +144,7 @@ nodes:
         out_low: "amount <= 100"
       default: out_low
 
-  - type: output
+  - type: sink
     name: out_high
     input: categorize.out_high
     config:
@@ -153,7 +153,7 @@ nodes:
       path: out_high.csv
       include_unmapped: true
 
-  - type: output
+  - type: sink
     name: out_low
     input: categorize.out_low
     config:
@@ -177,8 +177,8 @@ fn buffer_class_marks_route_materialized_and_sinks_streaming() {
 
     assert_eq!(buffer_class_for(block, "route.categorize"), "materialized");
     assert_eq!(buffer_class_for(block, "source.primary"), "materialized");
-    assert_eq!(buffer_class_for(block, "output.out_high"), "streaming");
-    assert_eq!(buffer_class_for(block, "output.out_low"), "streaming");
+    assert_eq!(buffer_class_for(block, "sink.out_high"), "streaming");
+    assert_eq!(buffer_class_for(block, "sink.out_low"), "streaming");
 }
 
 fn shared_source_interleaves_yaml() -> &'static str {
@@ -225,7 +225,7 @@ nodes:
     config:
       mode: interleave
 
-  - type: output
+  - type: sink
     name: left_out
     input: left_merge
     config:
@@ -233,7 +233,7 @@ nodes:
       type: csv
       path: left_out.csv
 
-  - type: output
+  - type: sink
     name: right_out
     input: right_merge
     config:
