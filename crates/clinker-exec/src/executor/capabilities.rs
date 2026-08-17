@@ -302,7 +302,7 @@ impl AdmittedRunCapabilities {
     ///
     /// Inventory or capacity mismatches invoke no reservation and no opener.
     /// Reservation failure drops all earlier guards in reverse order. On
-    /// success this bundle becomes the sole owner of every guard and opener.
+    /// success this bundle owns every admitted guard and opener.
     pub fn admit(
         activation: &SourceActivationPlan,
         groups: Vec<AdmittedActivationGroup>,

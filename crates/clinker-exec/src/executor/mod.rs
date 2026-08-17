@@ -275,7 +275,7 @@ pub struct PipelineExecutor;
 
 fn run_capability_error(error: capabilities::RunCapabilityError) -> PipelineError {
     PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-        "[E379] activation admission failed: {error}"
+        "activation admission failed: {error}"
     )))
 }
 
@@ -323,12 +323,15 @@ impl PipelineExecutor {
         Self::run_admitted_plan_with_readers_writers(plan, capabilities, readers, writers, params)
     }
 
-    /// Run a compiled plan using one executor-owned sealed capability bundle.
+    /// Run a compiled plan while retaining its sealed activation contract.
     ///
     /// The bundle is validated against this exact compiled activation inventory
-    /// before the executor recompiles the effective config, creates its memory
-    /// arbitrator, or constructs a Source or Sink. It remains owned by this
-    /// stack frame until success, failure, or interruption unwinds the run.
+    /// before the executor recompiles the effective config or begins ingest and
+    /// dispatch. This slice still receives caller-constructed `SourceReaders`
+    /// and writers; it retains the matching opener/group contract for the full
+    /// run but does not consume those openers or groups yet. The bundle remains
+    /// owned by this stack frame until success, failure, or interruption
+    /// unwinds the run.
     pub fn run_admitted_plan_with_readers_writers<W: Into<WriterRegistry>>(
         plan: &clinker_plan::plan::CompiledPlan,
         capabilities: capabilities::AdmittedRunCapabilities,
@@ -394,7 +397,7 @@ impl PipelineExecutor {
         )
     }
 
-    /// Run an admitted compiled plan against an explicit compile anchor.
+    /// Run a compiled plan with a retained activation contract and anchor.
     ///
     /// Capability ownership and cleanup match
     /// [`Self::run_admitted_plan_with_readers_writers`]; this variant only

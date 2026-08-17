@@ -1357,6 +1357,7 @@ fn unsupported_activation_preflight_error_is_fixed_and_sanitized() {
     let rendered = format!("{error:?} {error}");
 
     assert!(rendered.contains("credential profile preflight"));
+    assert!(!rendered.contains("[E"));
     assert!(!rendered.contains("orders.api"));
     assert!(!rendered.contains("saturated-profile"));
     assert!(!rendered.contains("lease-secret"));

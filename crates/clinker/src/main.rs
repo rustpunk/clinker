@@ -2799,17 +2799,19 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         channel_record_vars.extend(overlay.record_vars);
     }
 
-    // Seal the only runtime capability source immediately after the effective
-    // plan exists and before lineage construction, machine lifecycle writes,
-    // worker startup, discovery, staging, or Source/Sink construction. This
-    // binary does not yet expose a credential-profile surface, so any nonempty
-    // logical credential set or credential-handle capacity fails closed here.
+    // Validate and retain the runtime activation contract immediately after the
+    // effective plan exists and before lineage construction, machine lifecycle
+    // writes, worker startup, discovery, staging, or the caller-owned reader /
+    // writer setup below. Runtime opener/group consumption lands separately;
+    // this binary does not yet expose a credential-profile surface, so any
+    // nonempty logical credential set or credential-handle capacity fails
+    // closed here.
     let admitted_run_capabilities = credential_profile::admit_uncredentialed_run_capabilities(
         &compiled_plan,
     )
     .map_err(|error| {
         PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-            "[E379] activation admission failed: {error}"
+            "activation admission failed: {error}"
         )))
     })?;
 

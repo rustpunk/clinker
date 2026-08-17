@@ -402,6 +402,42 @@ fn executor_error_releases_the_unconsumed_bundle() {
 }
 
 #[test]
+fn mismatched_plan_reports_an_uncoded_sanitized_admission_error() {
+    let admitted_plan = one_source_plan();
+    let activation = admitted_plan.dag().source_activation();
+    let group = &activation.groups()[0];
+    let events = Events::new();
+    let admitted = AdmittedRunCapabilities::admit(
+        activation,
+        vec![group_request(
+            group,
+            "orders",
+            &events,
+            group.capacity(),
+            false,
+            false,
+        )],
+    )
+    .expect("group admits");
+    let different_plan = two_source_plan();
+
+    let error = PipelineExecutor::run_admitted_plan_with_readers_writers(
+        &different_plan,
+        admitted,
+        std::collections::HashMap::new(),
+        WriterRegistry::default(),
+        &PipelineRunParams::default(),
+    )
+    .expect_err("capabilities cannot cross compiled activation inventories");
+    let rendered = error.to_string();
+
+    assert!(rendered.contains("activation admission failed"));
+    assert!(!rendered.starts_with('['));
+    assert!(!rendered.contains("orders"));
+    assert_eq!(events.snapshot(), ["reserve:orders", "lease_drop:orders"]);
+}
+
+#[test]
 fn interruption_drop_releases_opened_session_before_group_capacity() {
     let plan = one_source_plan();
     let activation = plan.dag().source_activation();
