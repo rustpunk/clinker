@@ -107,7 +107,7 @@ nodes:
         emit total = total
         emit n = n
         emit ratio = 1 / (total - 60)
-  - type: output
+  - type: sink
     name: out
     input: post_check
     config:

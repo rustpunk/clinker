@@ -103,7 +103,7 @@ nodes:
       cxl: |
         emit id = id
         emit label = tag
-  - type: output
+  - type: sink
     name: out
     input: rename
     config:
@@ -208,7 +208,7 @@ nodes:
         emit amount = amount
         emit batch = $doc.BatchInfo.batch_id
         emit declared_total = $doc.Summary.total
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -303,7 +303,7 @@ nodes:
         emit grp = grp
         emit amt = amt
         emit running = $window.sum(amt)
-  - type: output
+  - type: sink
     name: out
     input: enrich
     config:
@@ -431,14 +431,14 @@ nodes:
       cxl: |
         emit id = id
         emit tag = tag
-  - type: output
+  - type: sink
     name: out_a
     input: t_a
     config:
       name: out_a
       type: csv
       path: out_a.csv
-  - type: output
+  - type: sink
     name: out_b
     input: t_b
     config:
@@ -579,7 +579,7 @@ nodes:
       cxl: |
         emit id = id
         emit label = tag
-  - type: output
+  - type: sink
     name: out
     input: rename
     config:
@@ -671,7 +671,7 @@ nodes:
       cxl: |
         emit amount = amount
         emit batch = $doc.BatchInfo.batch_id
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -814,7 +814,7 @@ nodes:
       cxl: |
         emit id = id
         emit label = tag
-  - type: output
+  - type: sink
     name: out
     input: rename
     config:

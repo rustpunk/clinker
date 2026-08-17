@@ -21,7 +21,7 @@ nodes:
 {source_body}
       schema:
         - {{ name: id, type: int }}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
