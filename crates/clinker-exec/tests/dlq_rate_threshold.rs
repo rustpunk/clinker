@@ -78,7 +78,7 @@ nodes:
       cxl: |
         emit id = id
         emit ratio = if($source.name == "src_b") then (1 / 0) else amt
-  - type: output
+  - type: sink
     name: out
     input: tfm
     config:
@@ -380,7 +380,7 @@ nodes:
       path: a.csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src_a
     config:
@@ -425,7 +425,7 @@ nodes:
       path: a.csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src_a
     config:
@@ -470,7 +470,7 @@ nodes:
       path: a.csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src_a
     config:
@@ -515,7 +515,7 @@ nodes:
       path: a.csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src_a
     config:
@@ -555,14 +555,14 @@ nodes:
       path: a.csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out1
     input: src_a
     config:
       name: out1
       type: csv
       path: shared.csv
-  - type: output
+  - type: sink
     name: out2
     input: src_a
     config:
@@ -645,7 +645,7 @@ nodes:
       path: a.csv
       schema:
         - {{ name: id, type: int }}
-  - type: output
+  - type: sink
     name: out
     input: src_a
     config:

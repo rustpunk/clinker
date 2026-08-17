@@ -71,7 +71,7 @@ nodes:
       emit department = department
       emit total = total
       emit scaled = total * 2
-- type: output
+- type: sink
   name: out
   input: scaled
   config:
@@ -210,7 +210,7 @@ nodes:
     cxl: |
       emit department = department
       emit total = total
-- type: output
+- type: sink
   name: out
   input: post
   config:
@@ -376,7 +376,7 @@ nodes:
       emit department = department
       emit total = total
       emit budget = budget
-- type: output
+- type: sink
   name: out
   input: tail
   config:
@@ -535,7 +535,7 @@ nodes:
       emit total = p.total
       emit budget = b.budget
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: enriched
   config:
@@ -733,7 +733,7 @@ nodes:
         emit department = department
         emit total = total
         emit total_plus_one = total + 1
-  - type: output
+  - type: sink
     name: out
     input: bump
     config:
@@ -930,7 +930,7 @@ nodes:
         emit department = department
         emit total = total
         emit safe_ratio = 1 / (total - 60)
-  - type: output
+  - type: sink
     name: out
     input: bump
     config:
@@ -1109,7 +1109,7 @@ nodes:
         emit department = department
         emit total = total
         emit total_plus_one = total + 1
-  - type: output
+  - type: sink
     name: out
     input: bump
     config:
@@ -1251,7 +1251,7 @@ nodes:
     conditions:
       big: total > 100
     default: small
-- type: output
+- type: sink
   name: big
   input: classify
   config:
@@ -1259,7 +1259,7 @@ nodes:
     path: big.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: small
   input: classify
   config:

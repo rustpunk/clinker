@@ -32,7 +32,7 @@ cull.drop_bad:
   buffer: materialized
   arbitration: spill_priority=15, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
-output.audit:
+sink.audit:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
@@ -40,7 +40,7 @@ output.audit:
   buffer: streaming
   arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
-output.kept:
+sink.kept:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
@@ -54,11 +54,11 @@ edge source.events -> cull.drop_bad:
   buffer: node_buffer (slot=0)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: source)
 
-edge cull.drop_bad -> output.audit:
+edge cull.drop_bad -> sink.audit:
   buffer: node_buffer (slot=1, port=removed)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: cull)
 
-edge cull.drop_bad -> output.kept:
+edge cull.drop_bad -> sink.kept:
   buffer: node_buffer (slot=1)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: cull)
 
@@ -84,5 +84,5 @@ Worker threads: 4
   ◆ FORK [cull] 'drop_bad' (line:17)
   ├──> main → drop_bad
   ├──> removed → drop_bad.removed
-  │ [output] audit (line:33)
-  │ [output] kept (line:26)
+  │ [sink] audit (line:33)
+  │ [sink] kept (line:26)

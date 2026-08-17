@@ -215,7 +215,7 @@ nodes:
       emit total = sum(amount)
 
       '
-- type: output
+- type: sink
   name: out
   input: dept_summary
   config:
@@ -553,7 +553,7 @@ nodes:
       emit w_total = $window.sum(amount)
     analytic_window:
       group_by: [dept]
-- type: output
+- type: sink
   name: out
   input: windowed
   config:

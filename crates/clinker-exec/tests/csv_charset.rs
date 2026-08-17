@@ -71,7 +71,7 @@ nodes:
         encoding: iso-8859-1
       schema:
         - { name: name, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -103,7 +103,7 @@ nodes:
         encoding: shift_jis
       schema:
         - { name: name, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -141,7 +141,7 @@ nodes:
         records:
           - { id: header, tag: H, columns: [ { name: record_type, type: string }, { name: batch_id, type: string } ] }
           - { id: detail, tag: D, columns: [ { name: record_type, type: string }, { name: batch_id, type: string } ] }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
