@@ -1385,9 +1385,18 @@ impl PipelineExecutor {
                 crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone()),
             ));
             let writer_charge_handle = charge_handle.clone();
+            let telemetry_producer = params.telemetry_producer.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("clinker-output-{output_name}"))
-                .spawn(move || streaming_sink(rx, raw_writer, spec, writer_charge_handle))
+                .spawn(move || {
+                    streaming_sink(
+                        rx,
+                        raw_writer,
+                        spec,
+                        writer_charge_handle,
+                        telemetry_producer,
+                    )
+                })
                 .map_err(|e| PipelineError::Internal {
                     op: "streaming-output-spawn",
                     node: output_name,

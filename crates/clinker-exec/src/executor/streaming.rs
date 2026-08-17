@@ -383,6 +383,10 @@ pub(super) fn drain_streaming_channel<C: StreamingConsumer>(
 struct SinkStreamConsumer {
     spec: StreamingSinkSpec,
     out: StreamingOutputTaskOutput,
+    /// Set only when channel disconnect reached the writer-finalization hook.
+    /// A fatal record error drains the channel without closing the writer work
+    /// unit, so its Sink observation must omit the completed metric.
+    closed_cleanly: bool,
     /// Pending `SchemaScan` timer, finished on the first writer build (or
     /// on close for the empty-stream case).
     scan_timer_slot: Option<stage_metrics::StageTimer>,
@@ -416,6 +420,7 @@ impl SinkStreamConsumer {
                 output_name,
                 out_cfg,
             },
+            closed_cleanly: false,
             scan_timer_slot: Some(stage_metrics::StageTimer::new(
                 stage_metrics::StageName::SchemaScan,
             )),
@@ -609,6 +614,7 @@ impl StreamingConsumer for SinkStreamConsumer {
                 self.out.errors.push(PipelineError::from(e));
             }
         }
+        self.closed_cleanly = true;
     }
 }
 
@@ -623,9 +629,22 @@ pub(super) fn streaming_sink(
     raw_writer: Box<dyn Write + Send>,
     spec: StreamingSinkSpec,
     charge_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
+    telemetry_producer: Option<crate::telemetry::TelemetryProducer>,
 ) -> StreamingOutputTaskOutput {
+    let mut signal = telemetry_producer
+        .map(|producer| crate::telemetry::SinkSignal::new(producer, spec.output_name.clone()));
     let mut consumer = SinkStreamConsumer::new(raw_writer, spec);
     drain_streaming_channel(&rx, &charge_handle, &mut consumer);
+    if let Some(mut signal) = signal.take() {
+        signal.record_records(consumer.out.records_written);
+        let errors = consumer.out.errors.len();
+        signal.record_errors(u64::try_from(errors).unwrap_or(u64::MAX));
+        if consumer.closed_cleanly && errors == 0 {
+            signal.complete();
+        } else {
+            signal.fail();
+        }
+    }
     consumer.out
 }
 

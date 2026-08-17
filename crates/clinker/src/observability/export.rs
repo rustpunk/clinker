@@ -1649,12 +1649,17 @@ fn metric_name(key: MetricKey) -> &'static str {
         MetricKey::TransformCompleted => "clinker.transform.completed",
         MetricKey::TransformRecords => "clinker.transform.records",
         MetricKey::TransformErrors => "clinker.transform.errors",
+        MetricKey::SinkStarted => "clinker.sink.started",
+        MetricKey::SinkCompleted => "clinker.sink.completed",
+        MetricKey::SinkRecords => "clinker.sink.records",
+        MetricKey::SinkErrors => "clinker.sink.errors",
     }
 }
 
 fn span_name(name: SpanName) -> &'static str {
     match name {
         SpanName::Transform => "clinker.transform",
+        SpanName::Sink => "clinker.sink",
     }
 }
 
@@ -1896,6 +1901,26 @@ mod tests {
         envelope["resourceSpans"][0]["scopeSpans"][0]["spans"]
             .as_array()
             .expect("spans")
+    }
+
+    #[test]
+    fn sink_metric_and_span_names_are_stable_and_complete() {
+        assert_eq!(
+            [
+                MetricKey::SinkStarted,
+                MetricKey::SinkCompleted,
+                MetricKey::SinkRecords,
+                MetricKey::SinkErrors,
+            ]
+            .map(metric_name),
+            [
+                "clinker.sink.started",
+                "clinker.sink.completed",
+                "clinker.sink.records",
+                "clinker.sink.errors",
+            ]
+        );
+        assert_eq!(span_name(SpanName::Sink), "clinker.sink");
     }
 
     /// Flatten one OTLP `KeyValue` list into the string attributes it carries.
