@@ -84,6 +84,8 @@ struct FixtureProvider {
     failure: Option<CredentialProviderFailure>,
     fail_after: Option<usize>,
     revoke_failure_at: Option<usize>,
+    memory_probe: Option<Arc<MemoryArbitrator>>,
+    observed_bytes_at_resolve: Arc<AtomicU64>,
     resolve_calls: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
     events: Arc<Mutex<Vec<String>>>,
@@ -130,6 +132,10 @@ impl CredentialProvider for FixtureProvider {
         _requirement: &CredentialRequirement,
     ) -> Result<Box<dyn CredentialLease>, CredentialProviderFailure> {
         let id = self.resolve_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(arbitrator) = &self.memory_probe {
+            self.observed_bytes_at_resolve
+                .store(arbitrator.sum_consumer_usage(), Ordering::SeqCst);
+        }
         if let Some(failure) = self.failure {
             return Err(failure);
         }
@@ -175,6 +181,8 @@ fn provider(
         failure: None,
         fail_after: None,
         revoke_failure_at: None,
+        memory_probe: None,
+        observed_bytes_at_resolve: Arc::new(AtomicU64::new(0)),
         resolve_calls: Arc::new(AtomicUsize::new(0)),
         drops: Arc::new(AtomicUsize::new(0)),
         events: Arc::new(Mutex::new(Vec::new())),
@@ -549,6 +557,39 @@ fn bounds_profile_and_provider_counts_fail_before_catalog_admission() {
 }
 
 #[test]
+fn bounds_catalog_reports_the_exact_admitted_definition_totals() {
+    let provider = provider(
+        vec![CredentialCapability::AuthenticateRequest],
+        vec![CredentialLifetime::Run],
+        true,
+        true,
+        2,
+    );
+    let providers: [&dyn CredentialProvider; 1] = [&provider];
+    let profiles = [
+        CredentialProfile::new(
+            CredentialProfileName::parse("first").expect("valid explicit profile"),
+            &providers,
+        ),
+        CredentialProfile::new(
+            CredentialProfileName::parse("second").expect("valid explicit profile"),
+            &providers,
+        ),
+    ];
+    let limits = profile_limits(2, 2, 1_024, 3);
+    let catalog = CredentialProfileCatalog::admit(&profiles, limits).expect("bounded catalog");
+
+    assert_eq!(catalog.profile_count(), 2);
+    assert_eq!(catalog.provider_count(), 2);
+    assert_eq!(catalog.decoded_bytes(), 167);
+    assert_eq!(catalog.limits(), limits);
+    assert_eq!(limits.max_profiles(), 2);
+    assert_eq!(limits.max_providers(), 2);
+    assert_eq!(limits.max_decoded_bytes(), 1_024);
+    assert_eq!(limits.max_live_handles(), 3);
+}
+
+#[test]
 fn bounds_decoded_definition_bytes_fail_before_catalog_admission() {
     let mut provider = provider(
         vec![CredentialCapability::AuthenticateRequest],
@@ -630,9 +671,7 @@ fn bounds_memory_overshoot_is_rejected_before_provider_allocation() {
         true,
         2,
     );
-    provider
-        .declared_lease_bytes
-        .store(128 * 1024 * 1024, Ordering::SeqCst);
+    let events = Arc::clone(&provider.events);
     let providers: [&dyn CredentialProvider; 1] = [&provider];
     let profiles = [CredentialProfile::new(
         CredentialProfileName::parse("release").expect("valid explicit profile"),
@@ -640,24 +679,76 @@ fn bounds_memory_overshoot_is_rejected_before_provider_allocation() {
     )];
     let catalog = CredentialProfileCatalog::admit(&profiles, profile_limits(1, 1, usize::MAX, 2))
         .expect("bounded profile catalog");
-    let arbitrator = memory_arbitrator(64 * 1024 * 1024);
+    let arbitrator = memory_arbitrator(u64::MAX);
     let mut registry =
         CredentialHandleRegistry::new(&arbitrator, &catalog).expect("register handle owner");
+    let selected = CredentialProfileName::parse("release").expect("valid explicit profile");
+    let requirement = requirement(vec![CredentialCapability::AuthenticateRequest]);
+    registry
+        .acquire(&selected, &requirement)
+        .expect("first handle fits the run budget");
+    provider
+        .declared_lease_bytes
+        .store(128 * 1024 * 1024, Ordering::SeqCst);
+    arbitrator.set_limit(64 * 1024 * 1024);
 
     let error = registry
-        .acquire(
-            &CredentialProfileName::parse("release").expect("valid explicit profile"),
-            &requirement(vec![CredentialCapability::AuthenticateRequest]),
-        )
+        .acquire(&selected, &requirement)
         .expect_err("prospective retained bytes exceed the run budget");
 
     assert_eq!(
         error.kind(),
         CredentialRegistryErrorKind::MemoryLimitExceeded
     );
-    assert_eq!(provider.resolve_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.resolve_calls.load(Ordering::SeqCst), 1);
     assert_eq!(registry.live_handle_count(), 0);
     assert_eq!(registry.retained_bytes(), 0);
+    assert_eq!(arbitrator.consumer_count(), 0);
+    assert_eq!(
+        *events.lock().expect("fixture event mutex"),
+        ["revoke-1", "drop-1"]
+    );
+}
+
+#[test]
+fn bounds_successful_lease_bytes_are_reported_before_provider_allocation() {
+    let arbitrator = Arc::new(memory_arbitrator(u64::MAX));
+    let mut provider = provider(
+        vec![CredentialCapability::AuthenticateRequest],
+        vec![CredentialLifetime::Run],
+        true,
+        true,
+        2,
+    );
+    provider.memory_probe = Some(Arc::clone(&arbitrator));
+    let observed_bytes = Arc::clone(&provider.observed_bytes_at_resolve);
+    let declared_lease_bytes = provider.declared_lease_bytes.load(Ordering::SeqCst);
+    let providers: [&dyn CredentialProvider; 1] = [&provider];
+    let profiles = [CredentialProfile::new(
+        CredentialProfileName::parse("release").expect("valid explicit profile"),
+        &providers,
+    )];
+    let catalog = CredentialProfileCatalog::admit(&profiles, profile_limits(1, 1, usize::MAX, 1))
+        .expect("bounded profile catalog");
+    let mut registry = CredentialHandleRegistry::new(arbitrator.as_ref(), &catalog)
+        .expect("register handle owner");
+    let table_bytes = registry.retained_bytes();
+    let requirement = requirement(vec![CredentialCapability::AuthenticateRequest]);
+    let expected = table_bytes
+        + declared_lease_bytes
+        + u64::try_from(requirement.name().as_str().len()).expect("name length fits")
+        + u64::try_from(requirement.provider_kind().as_str().len()).expect("kind length fits");
+
+    registry
+        .acquire(
+            &CredentialProfileName::parse("release").expect("valid explicit profile"),
+            &requirement,
+        )
+        .expect("bounded handle acquisition");
+
+    assert_eq!(observed_bytes.load(Ordering::SeqCst), expected);
+    assert_eq!(registry.retained_bytes(), expected);
+    registry.close().expect("clean registry close");
     assert_eq!(arbitrator.consumer_count(), 0);
 }
 
@@ -777,7 +868,7 @@ fn cleanup_spill_request_releases_before_another_acquisition() {
     registry
         .acquire(&selected, &requirement)
         .expect("second handle");
-    registry.memory_handle_for_test().request_spill();
+    registry.memory_handle().request_spill();
 
     let error = registry
         .acquire(&selected, &requirement)
@@ -813,7 +904,7 @@ fn cleanup_pause_blocks_acquisition_until_resume() {
     let arbitrator = memory_arbitrator(u64::MAX);
     let mut registry =
         CredentialHandleRegistry::new(&arbitrator, &catalog).expect("register handle owner");
-    let memory_handle = Arc::clone(registry.memory_handle_for_test());
+    let memory_handle = Arc::clone(registry.memory_handle());
     memory_handle.pause();
     let selected = CredentialProfileName::parse("release").expect("valid explicit profile");
     let requirement = requirement(vec![CredentialCapability::AuthenticateRequest]);

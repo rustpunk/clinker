@@ -6,7 +6,11 @@
 
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
+use clinker_exec::pipeline::memory::{
+    ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
+};
 use clinker_plan::credentials::{
     CredentialCapability, CredentialHandleUnits, CredentialLifetime, CredentialProviderKind,
     CredentialRenewal, CredentialRequirement, CredentialRequirementName, CredentialRevocation,
@@ -56,11 +60,98 @@ impl fmt::Display for CredentialProfileNameError {
 
 impl std::error::Error for CredentialProfileNameError {}
 
+/// Default maximum number of named profiles admitted for one run.
+pub const DEFAULT_MAX_CREDENTIAL_PROFILES: usize = 64;
+/// Default maximum provider registrations across every admitted profile.
+pub const DEFAULT_MAX_CREDENTIAL_PROVIDERS: usize = 256;
+/// Default maximum decoded bytes across profile and provider definitions.
+pub const DEFAULT_MAX_CREDENTIAL_DEFINITION_BYTES: usize = 1_048_576;
+/// Default maximum number of simultaneously live credential handles.
+pub const DEFAULT_MAX_LIVE_CREDENTIAL_HANDLES: usize = 256;
+
+/// Fixed admission limits for profile definitions and live handles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CredentialProfileLimits {
+    max_profiles: usize,
+    max_providers: usize,
+    max_decoded_bytes: usize,
+    max_live_handles: usize,
+}
+
+impl CredentialProfileLimits {
+    /// Construct explicit fixed limits for one run.
+    pub const fn new(
+        max_profiles: usize,
+        max_providers: usize,
+        max_decoded_bytes: usize,
+        max_live_handles: usize,
+    ) -> Self {
+        Self {
+            max_profiles,
+            max_providers,
+            max_decoded_bytes,
+            max_live_handles,
+        }
+    }
+
+    /// Maximum admitted profile definitions.
+    pub const fn max_profiles(self) -> usize {
+        self.max_profiles
+    }
+
+    /// Maximum provider registrations across all profiles.
+    pub const fn max_providers(self) -> usize {
+        self.max_providers
+    }
+
+    /// Maximum decoded definition bytes.
+    pub const fn max_decoded_bytes(self) -> usize {
+        self.max_decoded_bytes
+    }
+
+    /// Maximum simultaneously live handles retained by the registry.
+    pub const fn max_live_handles(self) -> usize {
+        self.max_live_handles
+    }
+}
+
+impl Default for CredentialProfileLimits {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_MAX_CREDENTIAL_PROFILES,
+            DEFAULT_MAX_CREDENTIAL_PROVIDERS,
+            DEFAULT_MAX_CREDENTIAL_DEFINITION_BYTES,
+            DEFAULT_MAX_LIVE_CREDENTIAL_HANDLES,
+        )
+    }
+}
+
 /// Opaque provider-owned state that remains live for a resolved credential.
 ///
 /// The marker deliberately exposes no secret accessor. Dropping the enclosing
 /// [`LeasedCredentialHandle`] closes the lease on every ordinary exit path.
-pub trait CredentialLease: Send + Sync {}
+pub trait CredentialLease: Send + Sync {
+    /// True retained bytes owned by this lease, including its boxed payload.
+    fn retained_bytes(&self) -> u64;
+
+    /// Revoke provider-side authority before releasing the local lease.
+    fn revoke(&mut self) -> Result<(), CredentialLeaseFailure>;
+}
+
+/// A closed, sanitized lease-revocation failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialLeaseFailure {
+    /// The provider could not confirm revocation at cleanup time.
+    Unavailable,
+}
+
+impl fmt::Display for CredentialLeaseFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("credential lease revocation could not be confirmed")
+    }
+}
+
+impl std::error::Error for CredentialLeaseFailure {}
 
 /// A closed, sanitized failure returned by a credential provider.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,7 +175,7 @@ impl std::error::Error for CredentialProviderFailure {}
 /// Compatibility metadata is inspected before `resolve` is called. Provider
 /// implementations return only an opaque owned lease and a closed failure;
 /// arbitrary secret-store errors cannot cross this boundary.
-pub trait CredentialProvider {
+pub trait CredentialProvider: Send + Sync {
     /// Stable implementation kind supplied by this provider.
     fn kind(&self) -> &CredentialProviderKind;
 
@@ -103,6 +194,22 @@ pub trait CredentialProvider {
     /// Maximum handle-capacity units admitted for one lease.
     fn handle_capacity(&self) -> CredentialHandleUnits;
 
+    /// Decoded bytes retained by this provider's profile definition.
+    ///
+    /// The count includes secret-bearing decoded configuration without
+    /// exposing it. [`CredentialProfileCatalog::admit`] checks the aggregate
+    /// before any definition becomes eligible for resolution.
+    fn decoded_definition_bytes(&self) -> usize;
+
+    /// Exact bytes the next resolved lease will retain.
+    ///
+    /// The registry charges this value before `resolve` may allocate the
+    /// lease, then verifies it against [`CredentialLease::retained_bytes`].
+    fn lease_retained_bytes(
+        &self,
+        requirement: &CredentialRequirement,
+    ) -> Result<u64, CredentialProviderFailure>;
+
     /// Resolve one validated logical requirement to an opaque owned lease.
     fn resolve(
         &self,
@@ -118,6 +225,189 @@ pub struct CredentialProfile<'run> {
     name: CredentialProfileName,
     providers: &'run [&'run dyn CredentialProvider],
 }
+
+/// A bounded, validated view over supplied credential profile definitions.
+///
+/// Admission borrows the definitions rather than copying secret-bearing
+/// provider state. Counts, decoded bytes, and duplicate names are checked in a
+/// complete pass before the catalog can be used for resolution.
+pub struct CredentialProfileCatalog<'run> {
+    profiles: &'run [CredentialProfile<'run>],
+    limits: CredentialProfileLimits,
+    provider_count: usize,
+    decoded_bytes: usize,
+}
+
+impl<'run> CredentialProfileCatalog<'run> {
+    /// Admit supplied definitions under fixed count and decoded-byte limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized error before producing a catalog when any count or
+    /// byte ceiling is exceeded, arithmetic overflows, or a profile/provider
+    /// kind is duplicated.
+    pub fn admit(
+        profiles: &'run [CredentialProfile<'run>],
+        limits: CredentialProfileLimits,
+    ) -> Result<Self, CredentialProfileAdmissionError> {
+        if profiles.len() > limits.max_profiles {
+            return Err(CredentialProfileAdmissionError::new(
+                CredentialProfileAdmissionErrorKind::TooManyProfiles,
+            ));
+        }
+
+        let mut provider_count = 0usize;
+        let mut decoded_bytes = 0usize;
+        for profile in profiles {
+            provider_count = provider_count
+                .checked_add(profile.providers.len())
+                .ok_or_else(|| {
+                    CredentialProfileAdmissionError::new(
+                        CredentialProfileAdmissionErrorKind::DefinitionSizeOverflow,
+                    )
+                })?;
+            if provider_count > limits.max_providers {
+                return Err(CredentialProfileAdmissionError::new(
+                    CredentialProfileAdmissionErrorKind::TooManyProviders,
+                ));
+            }
+
+            decoded_bytes = decoded_bytes
+                .checked_add(profile.name.as_str().len())
+                .ok_or_else(|| {
+                    CredentialProfileAdmissionError::new(
+                        CredentialProfileAdmissionErrorKind::DefinitionSizeOverflow,
+                    )
+                })?;
+            for &provider in profile.providers {
+                decoded_bytes = decoded_bytes
+                    .checked_add(provider.kind().as_str().len())
+                    .and_then(|bytes| bytes.checked_add(provider.decoded_definition_bytes()))
+                    .ok_or_else(|| {
+                        CredentialProfileAdmissionError::new(
+                            CredentialProfileAdmissionErrorKind::DefinitionSizeOverflow,
+                        )
+                    })?;
+                if decoded_bytes > limits.max_decoded_bytes {
+                    return Err(CredentialProfileAdmissionError::new(
+                        CredentialProfileAdmissionErrorKind::DecodedBytesExceeded,
+                    ));
+                }
+            }
+        }
+
+        for (index, profile) in profiles.iter().enumerate() {
+            if profiles[..index]
+                .iter()
+                .any(|earlier| earlier.name == profile.name)
+            {
+                return Err(CredentialProfileAdmissionError::new(
+                    CredentialProfileAdmissionErrorKind::DuplicateProfile,
+                ));
+            }
+            for (provider_index, provider) in profile.providers.iter().copied().enumerate() {
+                if profile.providers[..provider_index]
+                    .iter()
+                    .copied()
+                    .any(|earlier| earlier.kind() == provider.kind())
+                {
+                    return Err(CredentialProfileAdmissionError::new(
+                        CredentialProfileAdmissionErrorKind::DuplicateProvider,
+                    ));
+                }
+            }
+        }
+
+        Ok(Self {
+            profiles,
+            limits,
+            provider_count,
+            decoded_bytes,
+        })
+    }
+
+    /// Fixed limits used to admit this catalog.
+    pub const fn limits(&self) -> CredentialProfileLimits {
+        self.limits
+    }
+
+    /// Number of admitted profiles.
+    pub fn profile_count(&self) -> usize {
+        self.profiles.len()
+    }
+
+    /// Number of admitted provider registrations.
+    pub const fn provider_count(&self) -> usize {
+        self.provider_count
+    }
+
+    /// Total decoded definition bytes admitted.
+    pub const fn decoded_bytes(&self) -> usize {
+        self.decoded_bytes
+    }
+}
+
+/// Stable category for a profile-catalog admission failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialProfileAdmissionErrorKind {
+    /// The profile count exceeded its fixed ceiling.
+    TooManyProfiles,
+    /// The provider-registration count exceeded its fixed ceiling.
+    TooManyProviders,
+    /// Decoded definition bytes exceeded their fixed ceiling.
+    DecodedBytesExceeded,
+    /// Definition byte or count arithmetic overflowed.
+    DefinitionSizeOverflow,
+    /// A profile name was supplied more than once.
+    DuplicateProfile,
+    /// One profile supplied the same provider kind more than once.
+    DuplicateProvider,
+}
+
+/// A sanitized profile-catalog admission failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CredentialProfileAdmissionError {
+    kind: CredentialProfileAdmissionErrorKind,
+}
+
+impl CredentialProfileAdmissionError {
+    const fn new(kind: CredentialProfileAdmissionErrorKind) -> Self {
+        Self { kind }
+    }
+
+    /// Stable failure category.
+    pub const fn kind(self) -> CredentialProfileAdmissionErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for CredentialProfileAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self.kind {
+            CredentialProfileAdmissionErrorKind::TooManyProfiles => {
+                "credential profile count exceeds the fixed admission limit"
+            }
+            CredentialProfileAdmissionErrorKind::TooManyProviders => {
+                "credential provider count exceeds the fixed admission limit"
+            }
+            CredentialProfileAdmissionErrorKind::DecodedBytesExceeded => {
+                "credential profile decoded bytes exceed the fixed admission limit"
+            }
+            CredentialProfileAdmissionErrorKind::DefinitionSizeOverflow => {
+                "credential profile definition size overflowed"
+            }
+            CredentialProfileAdmissionErrorKind::DuplicateProfile => {
+                "credential profile name is configured more than once"
+            }
+            CredentialProfileAdmissionErrorKind::DuplicateProvider => {
+                "credential provider kind is configured more than once in one profile"
+            }
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for CredentialProfileAdmissionError {}
 
 impl<'run> CredentialProfile<'run> {
     /// Construct a named profile from a borrowed provider slice.
@@ -163,7 +453,9 @@ pub struct LeasedCredentialHandle<'run> {
     requirement_name: CredentialRequirementName,
     provider_kind: CredentialProviderKind,
     handle_units: CredentialHandleUnits,
-    _lease: Box<dyn CredentialLease>,
+    retained_bytes: u64,
+    lease: Box<dyn CredentialLease>,
+    revoked: bool,
     _run: PhantomData<&'run CredentialProfile<'run>>,
 }
 
@@ -182,11 +474,30 @@ impl LeasedCredentialHandle<'_> {
     pub const fn handle_units(&self) -> CredentialHandleUnits {
         self.handle_units
     }
+
+    fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+
+    fn revoke(&mut self) -> Result<(), CredentialLeaseFailure> {
+        if self.revoked {
+            return Ok(());
+        }
+        let result = self.lease.revoke();
+        self.revoked = true;
+        result
+    }
 }
 
 impl fmt::Debug for LeasedCredentialHandle<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("LeasedCredentialHandle { credential: <redacted> }")
+    }
+}
+
+impl Drop for LeasedCredentialHandle<'_> {
+    fn drop(&mut self) {
+        let _ = self.revoke();
     }
 }
 
@@ -215,6 +526,8 @@ pub enum CredentialResolutionErrorKind {
     ProviderUnavailable,
     /// The provider refused the logical requirement.
     ProviderRefused,
+    /// The resolved lease did not match its pre-allocation byte declaration.
+    RetainedBytesMismatch,
 }
 
 /// A sanitized explicit profile-resolution failure.
@@ -273,6 +586,9 @@ impl fmt::Display for CredentialResolutionError {
             CredentialResolutionErrorKind::ProviderRefused => {
                 "credential provider refused the logical requirement before the run began"
             }
+            CredentialResolutionErrorKind::RetainedBytesMismatch => {
+                "credential provider returned a lease with inconsistent retained-byte accounting"
+            }
         };
         formatter.write_str(message)
     }
@@ -287,10 +603,45 @@ impl std::error::Error for CredentialResolutionError {}
 /// inspect a plan or infer a profile from any other run option.
 pub fn resolve_explicit_profile<'run>(
     selected: &CredentialProfileName,
-    profiles: &'run [CredentialProfile<'run>],
+    catalog: &CredentialProfileCatalog<'run>,
     requirement: &CredentialRequirement,
 ) -> Result<LeasedCredentialHandle<'run>, CredentialResolutionError> {
-    let mut matches = profiles.iter().filter(|profile| profile.name() == selected);
+    let provider = compatible_provider(selected, catalog, requirement)?;
+    let declared_lease_bytes = provider
+        .lease_retained_bytes(requirement)
+        .map_err(resolution_provider_error)?;
+    let mut lease = provider
+        .resolve(requirement)
+        .map_err(resolution_provider_error)?;
+    if lease.retained_bytes() != declared_lease_bytes {
+        let _ = lease.revoke();
+        return Err(CredentialResolutionError::new(
+            CredentialResolutionErrorKind::RetainedBytesMismatch,
+        ));
+    }
+    let retained_bytes = handle_dynamic_bytes(requirement, declared_lease_bytes).ok_or(
+        CredentialResolutionError::new(CredentialResolutionErrorKind::RetainedBytesMismatch),
+    )?;
+    Ok(LeasedCredentialHandle {
+        requirement_name: requirement.name().clone(),
+        provider_kind: requirement.provider_kind().clone(),
+        handle_units: requirement.handle_units(),
+        retained_bytes,
+        lease,
+        revoked: false,
+        _run: PhantomData,
+    })
+}
+
+fn compatible_provider<'run>(
+    selected: &CredentialProfileName,
+    catalog: &CredentialProfileCatalog<'run>,
+    requirement: &CredentialRequirement,
+) -> Result<&'run dyn CredentialProvider, CredentialResolutionError> {
+    let mut matches = catalog
+        .profiles
+        .iter()
+        .filter(|profile| profile.name() == selected);
     let profile = matches.next().ok_or(CredentialResolutionError::new(
         CredentialResolutionErrorKind::UnknownProfile,
     ))?;
@@ -332,22 +683,382 @@ pub fn resolve_explicit_profile<'run>(
         ));
     }
 
-    let lease = provider.resolve(requirement).map_err(|failure| {
-        CredentialResolutionError::new(match failure {
-            CredentialProviderFailure::Unavailable => {
-                CredentialResolutionErrorKind::ProviderUnavailable
-            }
-            CredentialProviderFailure::Refused => CredentialResolutionErrorKind::ProviderRefused,
-        })
-    })?;
-    Ok(LeasedCredentialHandle {
-        requirement_name: requirement.name().clone(),
-        provider_kind: requirement.provider_kind().clone(),
-        handle_units: requirement.handle_units(),
-        _lease: lease,
-        _run: PhantomData,
+    Ok(provider)
+}
+
+fn resolution_provider_error(failure: CredentialProviderFailure) -> CredentialResolutionError {
+    CredentialResolutionError::new(match failure {
+        CredentialProviderFailure::Unavailable => {
+            CredentialResolutionErrorKind::ProviderUnavailable
+        }
+        CredentialProviderFailure::Refused => CredentialResolutionErrorKind::ProviderRefused,
     })
 }
+
+fn handle_dynamic_bytes(requirement: &CredentialRequirement, lease_bytes: u64) -> Option<u64> {
+    let name_bytes = u64::try_from(requirement.name().as_str().len()).ok()?;
+    let kind_bytes = u64::try_from(requirement.provider_kind().as_str().len()).ok()?;
+    lease_bytes.checked_add(name_bytes)?.checked_add(kind_bytes)
+}
+
+struct CredentialRegistryConsumer {
+    handle: Arc<ConsumerHandle>,
+}
+
+impl CredentialRegistryConsumer {
+    fn new(handle: Arc<ConsumerHandle>) -> Self {
+        Self { handle }
+    }
+}
+
+impl MemoryConsumer for CredentialRegistryConsumer {
+    fn current_usage(&self) -> u64 {
+        self.handle.bytes()
+    }
+
+    fn spill_priority(&self) -> i32 {
+        i32::MAX - 1
+    }
+
+    fn try_spill(&self, target_bytes: u64) -> Result<u64, ConsumerSpillError> {
+        self.handle.request_spill();
+        let bytes = self.handle.bytes();
+        if bytes >= target_bytes {
+            Ok(bytes)
+        } else {
+            Err(ConsumerSpillError::BelowTarget {
+                target: target_bytes,
+                freed: bytes,
+            })
+        }
+    }
+
+    fn can_back_pressure(&self) -> bool {
+        true
+    }
+
+    fn pause(&self) {
+        self.handle.pause();
+    }
+
+    fn resume(&self) {
+        self.handle.resume();
+    }
+
+    fn is_paused(&self) -> bool {
+        self.handle.is_paused()
+    }
+}
+
+/// Run-local owner for every credential lease acquired during preflight.
+///
+/// The registry preallocates a fixed handle table, registers exactly one
+/// [`MemoryConsumer`], and charges each provider-declared lease plus its
+/// secret-free handle metadata before the provider may allocate it. Credential
+/// state is never written to spill: a spill request revokes and releases the
+/// complete preflight set before another acquisition is attempted.
+pub struct CredentialHandleRegistry<'catalog, 'run>
+where
+    'run: 'catalog,
+{
+    arbitrator: &'catalog MemoryArbitrator,
+    catalog: &'catalog CredentialProfileCatalog<'run>,
+    memory_handle: Arc<ConsumerHandle>,
+    consumer_id: Option<ConsumerId>,
+    handles: Vec<LeasedCredentialHandle<'run>>,
+    retained_bytes: u64,
+}
+
+impl<'catalog, 'run> CredentialHandleRegistry<'catalog, 'run>
+where
+    'run: 'catalog,
+{
+    /// Create an empty registry and register its single memory consumer.
+    ///
+    /// The fixed handle-slot table is allocated before registration and holds
+    /// no credential state. Its actual capacity bytes are charged immediately;
+    /// every subsequent lease allocation is precharged before provider work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialRegistryErrorKind::AllocationFailed`] when the
+    /// fixed handle table cannot be reserved or its byte size cannot be
+    /// represented by the memory consumer.
+    pub fn new(
+        arbitrator: &'catalog MemoryArbitrator,
+        catalog: &'catalog CredentialProfileCatalog<'run>,
+    ) -> Result<Self, CredentialRegistryError> {
+        let mut handles = Vec::new();
+        handles
+            .try_reserve_exact(catalog.limits.max_live_handles)
+            .map_err(|_| {
+                CredentialRegistryError::new(CredentialRegistryErrorKind::AllocationFailed)
+            })?;
+        let table_bytes = handles
+            .capacity()
+            .checked_mul(std::mem::size_of::<LeasedCredentialHandle<'run>>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                CredentialRegistryError::new(CredentialRegistryErrorKind::AllocationFailed)
+            })?;
+        let memory_handle = ConsumerHandle::new();
+        memory_handle.set_bytes(table_bytes);
+        let consumer_id = arbitrator.register_consumer(Arc::new(CredentialRegistryConsumer::new(
+            Arc::clone(&memory_handle),
+        )));
+        Ok(Self {
+            arbitrator,
+            catalog,
+            memory_handle,
+            consumer_id: Some(consumer_id),
+            handles,
+            retained_bytes: table_bytes,
+        })
+    }
+
+    /// Acquire and retain one requirement through the explicit profile.
+    ///
+    /// Pause and spill requests are honored before every growth boundary. A
+    /// failed acquisition revokes all earlier handles and unregisters the
+    /// registry, so callers cannot accidentally continue from partial
+    /// preflight state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized resolution, capacity, memory, accounting, or
+    /// provider error. Every error leaves zero live handles and no registered
+    /// consumer.
+    pub fn acquire(
+        &mut self,
+        selected: &CredentialProfileName,
+        requirement: &CredentialRequirement,
+    ) -> Result<&LeasedCredentialHandle<'run>, CredentialRegistryError> {
+        if self.consumer_id.is_none() {
+            return Err(CredentialRegistryError::new(
+                CredentialRegistryErrorKind::Closed,
+            ));
+        }
+
+        if self.memory_handle.take_spill_request() {
+            return Err(self.fail_and_close(CredentialRegistryErrorKind::SpillRequested));
+        }
+        self.memory_handle.wait_while_paused();
+        if self.memory_handle.take_spill_request() {
+            return Err(self.fail_and_close(CredentialRegistryErrorKind::SpillRequested));
+        }
+        if self.handles.len() >= self.catalog.limits.max_live_handles {
+            return Err(self.fail_and_close(CredentialRegistryErrorKind::HandleLimitExceeded));
+        }
+
+        let provider = match compatible_provider(selected, self.catalog, requirement) {
+            Ok(provider) => provider,
+            Err(error) => {
+                return Err(
+                    self.fail_and_close(CredentialRegistryErrorKind::Resolution(error.kind()))
+                );
+            }
+        };
+        let lease_bytes = match provider.lease_retained_bytes(requirement) {
+            Ok(bytes) => bytes,
+            Err(failure) => {
+                return Err(self.fail_and_close(CredentialRegistryErrorKind::Resolution(
+                    resolution_provider_error(failure).kind(),
+                )));
+            }
+        };
+        let Some(dynamic_bytes) = handle_dynamic_bytes(requirement, lease_bytes) else {
+            return Err(self.fail_and_close(CredentialRegistryErrorKind::RetainedBytesOverflow));
+        };
+        let Some(prospective_bytes) = self.retained_bytes.checked_add(dynamic_bytes) else {
+            return Err(self.fail_and_close(CredentialRegistryErrorKind::RetainedBytesOverflow));
+        };
+
+        self.memory_handle.set_bytes(prospective_bytes);
+        if self.arbitrator.should_abort_local(prospective_bytes) {
+            return Err(self.fail_and_close(CredentialRegistryErrorKind::MemoryLimitExceeded));
+        }
+
+        let mut lease = match provider.resolve(requirement) {
+            Ok(lease) => lease,
+            Err(failure) => {
+                self.memory_handle.set_bytes(self.retained_bytes);
+                return Err(self.fail_and_close(CredentialRegistryErrorKind::Resolution(
+                    resolution_provider_error(failure).kind(),
+                )));
+            }
+        };
+        if lease.retained_bytes() != lease_bytes {
+            let _ = lease.revoke();
+            self.memory_handle.set_bytes(self.retained_bytes);
+            return Err(self.fail_and_close(CredentialRegistryErrorKind::RetainedBytesMismatch));
+        }
+
+        self.handles.push(LeasedCredentialHandle {
+            requirement_name: requirement.name().clone(),
+            provider_kind: requirement.provider_kind().clone(),
+            handle_units: requirement.handle_units(),
+            retained_bytes: dynamic_bytes,
+            lease,
+            revoked: false,
+            _run: PhantomData,
+        });
+        self.retained_bytes = prospective_bytes;
+        Ok(self
+            .handles
+            .last()
+            .expect("a just-pushed credential handle must exist"))
+    }
+
+    /// Number of live leases currently owned by the registry.
+    pub fn live_handle_count(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// Bytes currently reported through the registry's consumer handle.
+    pub fn retained_bytes(&self) -> u64 {
+        self.memory_handle.bytes()
+    }
+
+    /// Revoke and release every handle, then unregister the memory consumer.
+    ///
+    /// Cleanup continues after a revocation failure so no later lease or
+    /// registration survives the error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialRegistryErrorKind::CleanupFailed`] when at least
+    /// one provider could not confirm revocation. All local handles are still
+    /// released and the consumer is still unregistered.
+    pub fn close(mut self) -> Result<(), CredentialRegistryError> {
+        let cleanup_failed = self.release_all();
+        self.unregister();
+        if cleanup_failed {
+            Err(CredentialRegistryError::new(
+                CredentialRegistryErrorKind::CleanupFailed,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Borrow the non-secret memory coordination handle for run control.
+    ///
+    /// Callers may use this only to observe accounting or deliver the same
+    /// pause/spill signals as the registered consumer; it exposes no lease.
+    pub fn memory_handle(&self) -> &Arc<ConsumerHandle> {
+        &self.memory_handle
+    }
+
+    fn fail_and_close(&mut self, kind: CredentialRegistryErrorKind) -> CredentialRegistryError {
+        let _ = self.release_all();
+        self.unregister();
+        CredentialRegistryError::new(kind)
+    }
+
+    fn release_all(&mut self) -> bool {
+        let mut cleanup_failed = false;
+        while let Some(mut handle) = self.handles.pop() {
+            let bytes = handle.retained_bytes();
+            if handle.revoke().is_err() {
+                cleanup_failed = true;
+            }
+            drop(handle);
+            self.retained_bytes = self.retained_bytes.saturating_sub(bytes);
+            self.memory_handle.set_bytes(self.retained_bytes);
+        }
+        cleanup_failed
+    }
+
+    fn unregister(&mut self) {
+        self.memory_handle.set_bytes(0);
+        self.retained_bytes = 0;
+        if let Some(consumer_id) = self.consumer_id.take() {
+            let _ = self.arbitrator.unregister_consumer(consumer_id);
+        }
+    }
+}
+
+impl Drop for CredentialHandleRegistry<'_, '_> {
+    fn drop(&mut self) {
+        let _ = self.release_all();
+        self.unregister();
+    }
+}
+
+/// Stable category for registry construction, acquisition, or cleanup failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialRegistryErrorKind {
+    /// Profile/provider compatibility or provider acquisition failed.
+    Resolution(CredentialResolutionErrorKind),
+    /// The fixed handle-entry ceiling was reached.
+    HandleLimitExceeded,
+    /// Prospective retained bytes exceeded the run memory budget.
+    MemoryLimitExceeded,
+    /// The arbitrator requested release before another acquisition.
+    SpillRequested,
+    /// Retained-byte arithmetic overflowed.
+    RetainedBytesOverflow,
+    /// A provider's declared and actual retained bytes differed.
+    RetainedBytesMismatch,
+    /// At least one lease could not confirm revocation.
+    CleanupFailed,
+    /// The fixed handle table could not be allocated or represented.
+    AllocationFailed,
+    /// An acquisition was attempted after the registry closed.
+    Closed,
+}
+
+/// A sanitized credential-registry failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CredentialRegistryError {
+    kind: CredentialRegistryErrorKind,
+}
+
+impl CredentialRegistryError {
+    const fn new(kind: CredentialRegistryErrorKind) -> Self {
+        Self { kind }
+    }
+
+    /// Stable failure category.
+    pub const fn kind(self) -> CredentialRegistryErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for CredentialRegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self.kind {
+            CredentialRegistryErrorKind::Resolution(_) => {
+                "credential requirement could not be resolved through the selected profile"
+            }
+            CredentialRegistryErrorKind::HandleLimitExceeded => {
+                "credential live-handle count exceeds the fixed admission limit"
+            }
+            CredentialRegistryErrorKind::MemoryLimitExceeded => {
+                "credential handle bytes exceed the run memory budget"
+            }
+            CredentialRegistryErrorKind::SpillRequested => {
+                "credential acquisition stopped under memory pressure"
+            }
+            CredentialRegistryErrorKind::RetainedBytesOverflow => {
+                "credential retained-byte accounting overflowed"
+            }
+            CredentialRegistryErrorKind::RetainedBytesMismatch => {
+                "credential provider returned inconsistent retained-byte accounting"
+            }
+            CredentialRegistryErrorKind::CleanupFailed => {
+                "credential cleanup released all local handles but revocation was not confirmed"
+            }
+            CredentialRegistryErrorKind::AllocationFailed => {
+                "credential handle registry could not allocate its fixed table"
+            }
+            CredentialRegistryErrorKind::Closed => "credential handle registry is already closed",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for CredentialRegistryError {}
 
 fn is_profile_name(value: &str) -> bool {
     !value.is_empty()
