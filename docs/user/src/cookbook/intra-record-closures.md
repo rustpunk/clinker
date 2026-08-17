@@ -8,7 +8,7 @@ The pieces involved:
 - [Array methods](../cxl/builtins-array.md) (`filter`, `map`) for in-place transformation.
 - Bracket-index access (`it["sku"]`) for reading fields off each map element.
 - [`emit each`](../cxl/emit-each.md) for fan-out.
-- The Output node's [`include_unmapped`](../nodes/output.md#unmapped-input-field-passthrough) flag for controlling which fields reach the sink.
+- The Sink node's [`include_unmapped`](../nodes/sink.md#unmapped-input-field-passthrough) flag for controlling which fields reach the sink.
 
 ## Input data
 
@@ -124,7 +124,7 @@ Order O-1's three input items collapse to two output records (the `sku=c` line w
 
 **Explode stage.** The `explode` transform contains one `emit each` block over `kept`. For each surviving item, the body emits a flat record with the order-level identifiers (`order_id`, `customer`) repeated, plus the per-item fields lifted out of `it`. The body has no `filter` or nested `emit each` -- those are forbidden inside the block; pre-filter upstream as we did, or post-filter in a downstream transform.
 
-**`include_unmapped: false`.** The default Output policy is to pass every unmapped input field through. Here we set it to `false` so the order-level `items` array (carried through from the source), the `item_count` projection, and the intermediate `kept` array (used only as the fan-out source) do not leak into the per-line output. The `exclude: [items, kept]` list provides a belt-and-suspenders defense against future renaming.
+**`include_unmapped: false`.** The default Sink policy is to pass every unmapped input field through. Here we set it to `false` so the order-level `items` array (carried through from the source), the `item_count` projection, and the intermediate `kept` array (used only as the fan-out source) do not leak into the per-line output. The `exclude: [items, kept]` list provides a belt-and-suspenders defense against future renaming.
 
 **`max_expansion: 10000`.** Caps how many output records a single input order may produce. The default is `10000`; we set it explicitly here so the value is visible in the YAML. Orders with arrays larger than the cap route to the DLQ with category `expansion_limit_exceeded` (see [Transform Nodes -> Expansion Cap](../nodes/transform.md#expansion-cap-max_expansion)).
 
@@ -136,7 +136,7 @@ Remove `include_unmapped: false` (or set it to `true`) and the original order-le
 
 ### Emit a single record per order with the kept-items array
 
-Drop the `explode` transform and route `filter_lines` directly to the Output. Each output record stays at order grain, with `kept` carrying the post-filter array. This is the same pipeline minus the fan-out step.
+Drop the `explode` transform and route `filter_lines` directly to the Sink. Each output record stays at order grain, with `kept` carrying the post-filter array. This is the same pipeline minus the fan-out step.
 
 ### Reach for `.flat_map` instead of two transforms
 
@@ -161,4 +161,4 @@ The first `set` overwrites the SKU of the first item; the second writes `ship.re
 - [Nested Paths](../cxl/nested-paths.md) -- bracket-index and dotted-path navigation.
 - [Emit Each](../cxl/emit-each.md) -- the fan-out statement.
 - [Transform Nodes](../nodes/transform.md) -- `max_expansion` and DLQ routing.
-- [Output Nodes](../nodes/output.md) -- `include_unmapped` and field control.
+- [Sink Nodes](../nodes/sink.md) -- `include_unmapped` and field control.

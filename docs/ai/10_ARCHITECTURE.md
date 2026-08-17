@@ -9,8 +9,8 @@ Purpose: Give a senior Rust engineer or AI coding agent a practical, source-back
 Primary evidence used for this pass:
 
 - Workspace and crate boundaries: `Cargo.toml`, `crates/*/Cargo.toml`, `docs/ai/20_CRATE_MAP.md`.
-- Planning and config: `crates/clinker-plan/src/lib.rs`, `crates/clinker-plan/src/config/pipeline.rs`, `crates/clinker-plan/src/config/pipeline_node.rs`, `crates/clinker-plan/src/resources/mod.rs`, `crates/clinker-plan/src/yaml.rs`, `crates/clinker-plan/src/plan/compiled.rs`, `crates/clinker-plan/src/plan/execution/consumer_registry.rs`, `crates/clinker-plan/src/plan/execution/scheduling.rs`.
-- Runtime and IO: `crates/clinker-exec/src/executor/mod.rs`, `crates/clinker-exec/src/executor/params.rs`, `crates/clinker-exec/src/executor/source_stream.rs`, `crates/clinker-exec/src/executor/output_dispatch.rs`, `crates/clinker-exec/src/executor/stream_event.rs`, `crates/clinker-exec/src/source/mod.rs`, `crates/clinker-exec/src/source/order_barrier.rs`, `crates/clinker-exec/src/pipeline/memory.rs`, `crates/clinker-exec/src/pipeline/shutdown.rs`, `crates/clinker-exec/src/telemetry.rs`, `crates/clinker-format/src/traits.rs`, `crates/clinker-net/src/otlp.rs`.
+- Planning and config: `crates/clinker-plan/src/lib.rs`, `crates/clinker-plan/src/config/pipeline.rs`, `crates/clinker-plan/src/config/pipeline_node.rs`, `crates/clinker-plan/src/config/sink.rs`, `crates/clinker-plan/src/resources/mod.rs`, `crates/clinker-plan/src/yaml.rs`, `crates/clinker-plan/src/plan/compiled.rs`, `crates/clinker-plan/src/plan/execution/consumer_registry.rs`, `crates/clinker-plan/src/plan/execution/scheduling.rs`.
+- Runtime and IO: `crates/clinker-exec/src/executor/mod.rs`, `crates/clinker-exec/src/executor/params.rs`, `crates/clinker-exec/src/executor/source_stream.rs`, `crates/clinker-exec/src/executor/sink_dispatch.rs`, `crates/clinker-exec/src/executor/stream_event.rs`, `crates/clinker-exec/src/source/mod.rs`, `crates/clinker-exec/src/source/order_barrier.rs`, `crates/clinker-exec/src/pipeline/memory.rs`, `crates/clinker-exec/src/pipeline/shutdown.rs`, `crates/clinker-exec/src/telemetry.rs`, `crates/clinker-format/src/traits.rs`, `crates/clinker-net/src/otlp.rs`.
 - Data model and language: `crates/clinker-record/src/lib.rs`, `crates/clinker-record/src/record/mod.rs`, `crates/clinker-record/src/storage.rs`, `crates/clinker-record/src/value.rs`, `crates/cxl/src/lib.rs`.
 - Edge surfaces: `crates/clinker/src/main.rs`, `crates/clinker/src/lifecycle.rs`, `crates/clinker/src/observability.rs`, `crates/clinker-lineage/src/logical_identity.rs`, `crates/clinker-lineage/src/delivery.rs`, `crates/clinker-channel/src/lib.rs`, `crates/clinker-channel/src/discovery.rs`, `crates/clinker-channel/src/group.rs`, `crates/clinker-channel/src/resolve.rs`, `crates/clinker-schema/src/lib.rs`, `examples/pipelines/customer_etl.yaml`.
 - Tests and CI: `crates/clinker-exec/tests/*`, `crates/clinker-plan/src/plan/tests/*`, `crates/clinker-format/tests/*`, `crates/clinker-net/tests/*`, `crates/clinker-channel/tests/*`, `crates/clinker/tests/machine_supervision.rs`, `crates/clinker/tests/observability_isolation.rs`, `.github/workflows/ci.yml`.
@@ -62,9 +62,9 @@ Verified end-to-end shape:
 5. `PipelineConfig::compile` / `compile_with_diagnostics` use the variant-exhaustive `PipelineNode::visit_cxl_fields` traversal to find direct CXL roots, load only their admitted bounded module/declaration closure, bind schemas, typecheck CXL, lower nodes to `PlanNode`, and apply all structural rewrites. The finalized `ExecutionPlanDag` freezes its complete producer-port consumer registry and ordering/writer contract before `CompiledPlan` is returned.
 6. Source inputs enter runtime as `SourceInput::Files(Vec<FileSlot>)` or `SourceInput::Records(Box<dyn RecordSource>)`. File transports reach `RecordSource` through a blanket impl for `Box<dyn FormatReader>`; REST uses `build_rest_source`.
 7. Source ingest runs per declared source, resolves schemas with `schema(&mut self)`, calls finite `next_record`, assigns an attempt-local monotonic `SourceRowId`, attaches document/provenance context, and emits both successful records and recoverable type failures through one bounded `SourceAttemptEvent` stream. `AttemptPopulationDelta` carries the same attempt population into success, DLQ, and accounting paths. A retained `CompiledSourceOrder` supplies stable source identity, typed key positions/types, event shape, and unsorted policy to the memory-arbitrated barrier; the barrier verifies or stably repairs each physical file before release and never asserts global order across files.
-8. Runtime dispatch walks the plan DAG, executing `PlanNode` variants through focused dispatch modules such as `transform_dispatch`, `aggregate_dispatch`, `combine_dispatch`, `route_dispatch`, `merge_dispatch`, `reshape_dispatch`, `cull_dispatch`, `envelope_dispatch`, and `output_dispatch`. Fan-out consults the planning-owned `CompiledConsumerRegistry`; a shared producer port is materialized once and replayed independently to every compiled consumer, including spill-backed replay when memory pressure requires it.
+8. Runtime dispatch walks the plan DAG, executing `PlanNode` variants through focused dispatch modules such as `transform_dispatch`, `aggregate_dispatch`, `combine_dispatch`, `route_dispatch`, `merge_dispatch`, `reshape_dispatch`, `cull_dispatch`, `envelope_dispatch`, and `sink_dispatch`. Fan-out consults the planning-owned `CompiledConsumerRegistry`; a shared producer port is materialized once and replayed independently to every compiled consumer, including spill-backed replay when memory pressure requires it.
 9. Records are schema-indexed. Transform and aggregate CXL programs use typechecked artifacts from planning; runtime writes only fields already present in the widened output schema.
-10. Outputs consume `FormatWriter` implementations through the planning-owned `PhysicalWriterBoundary`. `OrderedWriterBoundary` performs terminal sorting with the shared `MemoryArbitrator`, `SortBuffer`, and `SortedRunMerger`, preserves the authored keys as the whole ordering guarantee, and owns finish/error/temporary-spill cleanup. Writers may also provide envelope begin/end document hooks, byte counting, splitting, and metrics.
+10. Sinks consume `FormatWriter` implementations through the planning-owned `PhysicalWriterBoundary`. `OrderedWriterBoundary` performs terminal sorting with the shared `MemoryArbitrator`, `SortBuffer`, and `SortedRunMerger`, preserves the authored keys as the whole ordering guarantee, and owns finish/error/temporary-spill cleanup. Writers may also provide envelope begin/end document hooks, byte counting, splitting, and metrics.
 11. `ExecutionReport` returns counters, DLQ entries, execution summary, peak RSS, CPU/IO totals, stage metrics, watermarks, rollback cursors, per-source counts, spill totals, streaming charge peaks, and interrupted status.
 
 Important nuance:
@@ -115,16 +115,26 @@ sequential in-process reuse to Phase 5 / PERF-01; only an enumerated runtime
 envelope may refresh. See
 [stored-plan execution and cache identity](15_PRODUCTION_CONTRACTS.md#stored-plan-execution-and-cache-identity).
 
-### Current terminal node and locked target
+### Current terminal node
 
-Current parser, planner, runtime, examples, and docs use `Output` and public
-YAML `type: sink` for the terminal writer node. D-56 assigns one atomic,
-one-way migration of that **terminal destination concept** to Sink and
-`type: sink` under AUTH-09, before endpoint expansion. It is not
-available today. Output-port maps, produced artifacts and paths, serialization
+The terminal writer is authored only as `type: sink`, deserializes to
+`PipelineNode::Sink` with `SinkConfig` from `config/sink.rs`, lowers to
+`PlanNode::Sink`, and runs through `executor/sink_dispatch.rs`. The retired
+`type: output` spelling is rejected with E376 and the paste-ready correction
+`type: sink`. Output-port maps, produced artifacts and paths, serialization
 formats, stdout, command and machine output, writer results, and OpenLineage
-output datasets remain valid output vocabulary. See
-[terminal destination vocabulary](15_PRODUCTION_CONTRACTS.md#terminal-destination-vocabulary).
+output datasets remain valid output vocabulary.
+
+Sink work uses bounded streaming handoffs or the shared memory-arbitrated
+physical-writer sort/spill boundary; it has no private unbounded accumulator.
+Real synchronous, streaming, and correlation-deferred work units record the
+closed `Sink*` metric set and one complete `SpanName::Sink` outcome without
+making telemetry admission part of execution. Lineage handles
+`PlanNode::Sink` explicitly, retaining direct mapping edges and indirect
+filter/order influence while publishing the terminal role as an OpenLineage
+output dataset. See [Sink Nodes](../user/src/nodes/sink.md), [Sink
+Internals](../engine/src/sink-internals.md), and [terminal destination
+vocabulary](15_PRODUCTION_CONTRACTS.md#terminal-destination-vocabulary).
 
 ## Architectural Boundaries
 
@@ -292,7 +302,7 @@ Verified facts:
   `FailureCategory::InternalInvariant`, and `RetryAdvice::PolicyRequired`
   before mutable operator or publication effects. This SECU-03 boundary is a
   Phase 3 runtime-invariant decision, not a numbered production-contract row;
-  locally proven internal algorithm and Output assertions remain assertions.
+  locally proven internal algorithm and Sink assertions remain assertions.
 - `FormatError` is `#[non_exhaustive]`, returned per record or setup operation, and wraps format-specific errors plus structural count, invalid record, schema inference, undeclared field, and unserializable map cases.
 - Some runtime data failures can route to DLQ depending on error strategy; other classes always abort. Examples called out in source comments include memory budget errors, unsatisfiable memory budgets, sort-order violations, internal invariant failures, and specific envelope conflicts.
 - CLI exit codes distinguish success, config/schema/CXL errors, partial DLQ completion, fatal data/eval errors, I/O/format errors, and interrupted runs.

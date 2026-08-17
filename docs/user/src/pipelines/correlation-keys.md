@@ -164,7 +164,7 @@ A composition's body operates on records flowing in from the parent pipeline; co
 
 ## Debugging
 
-Correlation grouping is tracked on internal columns you never write in YAML or CXL, and they are hidden from writer output by default. To surface them for debugging, set `include_correlation_keys: true` on an output node:
+Correlation grouping is tracked on internal columns you never write in YAML or CXL, and they are hidden from writer output by default. To surface them for debugging, set `include_correlation_keys: true` on a Sink node:
 
 ```yaml
 - type: sink
@@ -185,4 +185,4 @@ To investigate DLQ collaterals: every collateral entry's `category` is `correlat
 - [Error Handling & DLQ](error-handling.md) -- general DLQ configuration, fail-fast vs continue, type-error thresholds.
 - [Aggregate Nodes](../nodes/aggregate.md) -- group-by semantics and the strategy hint.
 - [Combine Nodes](../nodes/combine.md) -- driver selection and match modes.
-- [Output Nodes](../nodes/output.md) -- `include_correlation_keys` and other field-control flags.
+- [Sink Nodes](../nodes/sink.md) -- `include_correlation_keys` and other field-control flags.
