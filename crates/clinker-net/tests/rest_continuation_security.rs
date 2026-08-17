@@ -223,7 +223,7 @@ nodes:
 {pagination}
       schema:
         - {{ name: id, type: int }}
-  - type: output
+  - type: sink
     name: out
     input: api
     config:
