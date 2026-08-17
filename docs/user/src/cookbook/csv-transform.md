@@ -54,7 +54,7 @@ nodes:
           _ => "under 70k"
         }
 
-  - type: output
+  - type: sink
     name: report
     input: classify
     config:

@@ -123,7 +123,7 @@ no configuration: values join with `;`, and a value that itself contains the
 delimiter is a hard error rather than a cell that would split back wrongly.
 
 ```yaml
-- type: output
+- type: sink
   name: report
   input: orders
   config:

@@ -180,7 +180,7 @@ Engine-internal `$`-namespaced columns are excluded automatically.
 
 ```yaml
 nodes:
-  - type: output
+  - type: sink
     name: out
     input: messages
     config:

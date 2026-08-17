@@ -40,7 +40,7 @@ Carried-along columns follow these rules through each node type:
 ## Output controls
 
 ```yaml
-- type: output
+- type: sink
   name: out
   input: src
   config:

@@ -181,7 +181,7 @@ single array (`format: array`, the default) or one object per line
 (`format: ndjson`).
 
 ```yaml
-- type: output
+- type: sink
   name: enriched
   input: processed
   config:
