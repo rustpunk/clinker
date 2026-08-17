@@ -100,7 +100,7 @@ nodes:
       cxl: |
         emit category = category
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: by_category
     config:
@@ -179,7 +179,7 @@ nodes:
       group_by: []
       cxl: |
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: total
     config:
@@ -214,7 +214,7 @@ nodes:
       cxl: |
         emit category = category
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: by_category
     config:

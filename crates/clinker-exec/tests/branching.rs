@@ -552,7 +552,7 @@ nodes:
     cxl: 'emit doubled = name.concat("_doubled")
 
       '
-- type: output
+- type: sink
   name: dest
   input: calc
   config:
@@ -610,7 +610,7 @@ nodes:
     analytic_window:
       group_by:
       - dept
-- type: output
+- type: sink
   name: dest
   input: window_calc
   config:

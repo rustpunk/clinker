@@ -138,7 +138,7 @@ nodes:
       emit n = count(*)
 
       '
-- type: output
+- type: sink
   name: out
   input: by_dept
   config:
@@ -197,7 +197,7 @@ nodes:
       emit mean = avg(salary.to_int())
 
       '
-- type: output
+- type: sink
   name: out
   input: by_dept
   config:
@@ -259,7 +259,7 @@ nodes:
       emit names = collect(name)
 
       '
-- type: output
+- type: sink
   name: out
   input: by_dept
   config:
@@ -332,7 +332,7 @@ nodes:
       emit wavg = weighted_avg(salary.to_float(), hours.to_float())
 
       '
-- type: output
+- type: sink
   name: out
   input: by_dept
   config:
@@ -403,7 +403,7 @@ nodes:
       emit rows = count(*)
 
       '
-- type: output
+- type: sink
   name: out
   input: globals
   config:
@@ -464,7 +464,7 @@ nodes:
       emit n_all = count(*)
 
       '
-- type: output
+- type: sink
   name: out
   input: by_dept
   config:
@@ -532,7 +532,7 @@ nodes:
       emit total = sum(comp.to_int())
 
       '
-- type: output
+- type: sink
   name: out
   input: by_dept
   config:
@@ -596,7 +596,7 @@ nodes:
       emit n = count(*)
 
       '
-- type: output
+- type: sink
   name: out
   input: by_dept
   config:
@@ -648,7 +648,7 @@ nodes:
       emit n = count(*)
 
       '
-- type: output
+- type: sink
   name: out
   input: by_dept
   config:
@@ -720,7 +720,7 @@ nodes:
       emit avg_w_sum = avg(w_sum)
       emit record_count = count(*)
 
-- type: output
+- type: sink
   name: sink
   input: summarize
   config:
@@ -837,7 +837,7 @@ nodes:
         emit dept = dept
         emit total = sum(salary)
         emit $pipeline.last_total = sum(salary)
-  - type: output
+  - type: sink
     name: out
     input: agg
     config:
@@ -896,7 +896,7 @@ nodes:
       emit late_name = max(name) > ''M''
 
       '
-- type: output
+- type: sink
   name: out
   input: by_team
   config:
@@ -964,7 +964,7 @@ nodes:
       emit average = avg(amount)
 
       '
-- type: output
+- type: sink
   name: out
   input: by_dept
   config:
@@ -1022,7 +1022,7 @@ nodes:
       emit average = avg(amount)
 
       '
-- type: output
+- type: sink
   name: out
   input: by_dept
   config:
@@ -1076,7 +1076,7 @@ nodes:
       emit average = avg(amount)
 
       '
-- type: output
+- type: sink
   name: out
   input: by_dept
   config:
@@ -1140,7 +1140,7 @@ nodes:
       emit average = avg(amount)
 
       '
-- type: output
+- type: sink
   name: out
   input: by_dept
   config:

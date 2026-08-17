@@ -25,7 +25,7 @@ nodes:
       batch_size: 64
       cxl: |
         emit id = id
-  - type: output
+  - type: sink
     name: out
     input: t
     config:
@@ -71,7 +71,7 @@ nodes:
     config:
       cxl: |
         emit id = id
-  - type: output
+  - type: sink
     name: out
     input: t
     config:
@@ -101,7 +101,7 @@ nodes:
       path: in.csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -138,7 +138,7 @@ nodes:
       batch_size: 0
       cxl: |
         emit id = id
-  - type: output
+  - type: sink
     name: out
     input: t
     config:
