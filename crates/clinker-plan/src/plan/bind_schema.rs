@@ -6273,6 +6273,31 @@ fn walk_expr_for_qualified_refs(
         Expr::Unary { operand, .. } => {
             walk_expr_for_qualified_refs(Some(operand), inputs, driver_qualifier, out);
         }
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                walk_expr_for_qualified_refs(Some(element), inputs, driver_qualifier, out);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let cxl::ast::MapKey::Computed(key) = &entry.key {
+                    walk_expr_for_qualified_refs(Some(key), inputs, driver_qualifier, out);
+                }
+                walk_expr_for_qualified_refs(Some(&entry.value), inputs, driver_qualifier, out);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            walk_expr_for_qualified_refs(Some(source), inputs, driver_qualifier, out);
+            walk_expr_for_qualified_refs(Some(item), inputs, driver_qualifier, out);
+            if let Some(predicate) = predicate {
+                walk_expr_for_qualified_refs(Some(predicate), inputs, driver_qualifier, out);
+            }
+        }
         Expr::MethodCall { receiver, args, .. } => {
             walk_expr_for_qualified_refs(Some(receiver), inputs, driver_qualifier, out);
             for a in args {
