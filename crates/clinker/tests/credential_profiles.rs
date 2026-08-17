@@ -5,6 +5,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use clinker_exec::pipeline::memory::MemoryArbitrator;
+use clinker_exec::telemetry::{
+    AdmissionOutcome, MetricKey, SpanFact, SpanName, SpanStatus, TelemetryArena, TelemetryProducer,
+    TelemetryReceiver,
+};
+use clinker_plan::config::ClinkerToml;
 use clinker_plan::credentials::{
     CredentialCapability, CredentialHandleUnits, CredentialLifetime, CredentialProviderKind,
     CredentialRenewal, CredentialRequirement, CredentialRequirementName, CredentialRevocation,
@@ -18,7 +23,7 @@ use credential_profile::{
     CredentialProfileAdmissionErrorKind, CredentialProfileCatalog, CredentialProfileLimits,
     CredentialProfileName, CredentialProvider, CredentialProviderFailure,
     CredentialRegistryErrorKind, CredentialResolutionErrorKind, LeasedCredentialHandle,
-    resolve_explicit_profile,
+    resolve_explicit_profile, resolve_explicit_profile_with_telemetry,
 };
 
 fn requirement(capabilities: Vec<CredentialCapability>) -> CredentialRequirement {
@@ -212,6 +217,59 @@ fn profile_limits(
 
 fn memory_arbitrator(limit: u64) -> MemoryArbitrator {
     MemoryArbitrator::with_policy(limit, 0.80, 0.70, MemoryArbitrator::default_policy())
+}
+
+fn telemetry_arena() -> (TelemetryProducer, TelemetryReceiver) {
+    let config = r#"
+[observability]
+arena_bytes = "768KB"
+ordinary_lane_bytes = "512KB"
+high_severity_lane_bytes = "256KB"
+max_batch_bytes = "8KB"
+max_attributes_per_event = 4
+max_attribute_bytes = "64B"
+drop_policy = "drop_newest"
+sample_every = 1
+rate_limit_per_second = 100000
+rate_limit_burst = 100000
+flush_timeout_ms = 1000
+
+[observability.otlp]
+endpoint = "https://collector.invalid"
+connect_timeout_ms = 100
+request_timeout_ms = 200
+retry_max_attempts = 1
+retry_total_timeout_ms = 500
+max_response_bytes = "1KB"
+
+[observability.otlp.auth]
+mode = "none"
+"#;
+    let policy = ClinkerToml::parse(config)
+        .expect("telemetry policy parses")
+        .resolve_observability(None)
+        .expect("telemetry policy resolves");
+    TelemetryArena::reserve(&policy).expect("telemetry arena reserves")
+}
+
+fn saturate_ordinary_lane(producer: &TelemetryProducer) {
+    for sequence in 0..20_000_u64 {
+        let outcome = producer.emit_span(SpanFact {
+            name: SpanName::Transform,
+            status: SpanStatus::Ok,
+            logical_node: "fixed-saturation-probe",
+            started_at_unix_nanos: sequence,
+            ended_at_unix_nanos: sequence,
+        });
+        if outcome.is_full() {
+            return;
+        }
+        assert!(
+            matches!(outcome, AdmissionOutcome::Accepted { .. }),
+            "saturation probe was dropped for an unexpected reason: {outcome:?}"
+        );
+    }
+    panic!("ordinary telemetry lane did not reach its fixed capacity");
 }
 
 fn provider_failure_kind(failure: CredentialProviderFailure) -> CredentialResolutionErrorKind {
@@ -979,4 +1037,230 @@ fn cleanup_revoke_failure_still_releases_every_handle_and_unregisters() {
             "revoke-3", "drop-3", "revoke-2", "drop-2", "revoke-1", "drop-1",
         ]
     );
+}
+
+#[test]
+fn lifecycle_resolve_and_revoke_emit_complete_redacted_signals() {
+    let provider = provider(
+        vec![CredentialCapability::AuthenticateRequest],
+        vec![CredentialLifetime::Run],
+        true,
+        true,
+        2,
+    );
+    let providers: [&dyn CredentialProvider; 1] = [&provider];
+    let profiles = [CredentialProfile::new(
+        CredentialProfileName::parse("secret-profile-name").expect("valid explicit profile"),
+        &providers,
+    )];
+    let catalog = admitted_profiles(&profiles);
+    let selected =
+        CredentialProfileName::parse("secret-profile-name").expect("valid explicit profile");
+    let requirement = requirement(vec![CredentialCapability::AuthenticateRequest]);
+    let (producer, receiver) = telemetry_arena();
+
+    let handle =
+        resolve_explicit_profile_with_telemetry(&selected, &catalog, &requirement, &producer)
+            .expect("observed resolution succeeds");
+    drop(handle);
+
+    let batch = receiver
+        .try_recv_batch()
+        .expect("credential lifecycle signals are drainable");
+    for key in [
+        MetricKey::CredentialResolveStarted,
+        MetricKey::CredentialResolveCompleted,
+        MetricKey::CredentialRevokeStarted,
+        MetricKey::CredentialRevokeCompleted,
+    ] {
+        assert_eq!(batch.metric(key), 1, "one {key:?}");
+    }
+    for key in [
+        MetricKey::CredentialResolveFailed,
+        MetricKey::CredentialResolveInterrupted,
+        MetricKey::ResourceOpenStarted,
+        MetricKey::ResourceOpenCompleted,
+        MetricKey::ResourceOpenFailed,
+        MetricKey::ResourceOpenInterrupted,
+        MetricKey::CredentialRenewStarted,
+        MetricKey::CredentialRenewCompleted,
+        MetricKey::CredentialRenewFailed,
+        MetricKey::CredentialRenewInterrupted,
+        MetricKey::CredentialRevokeFailed,
+        MetricKey::CredentialRevokeInterrupted,
+    ] {
+        assert_eq!(
+            batch.metric(key),
+            0,
+            "an operation seam that did not run must not emit {key:?}"
+        );
+    }
+    assert_eq!(batch.traces().len(), 2);
+    assert_eq!(batch.traces()[0].name, SpanName::CredentialResolve);
+    assert_eq!(batch.traces()[0].status, SpanStatus::Ok);
+    assert_eq!(batch.traces()[1].name, SpanName::CredentialRevoke);
+    assert_eq!(batch.traces()[1].status, SpanStatus::Ok);
+    assert!(batch.traces().iter().all(|span| {
+        span.logical_node == "credential-lifecycle"
+            && span.started_at_unix_nanos <= span.ended_at_unix_nanos
+    }));
+
+    let representations = [
+        serde_json::to_string(&batch).expect("telemetry batch serializes"),
+        format!("{batch:?}"),
+    ];
+    for representation in representations {
+        for forbidden in [
+            "secret-profile-name",
+            "orders.api",
+            "request-signer",
+            "lease-secret-must-not-escape",
+        ] {
+            assert!(
+                !representation.contains(forbidden),
+                "credential context escaped into telemetry: {representation}"
+            );
+        }
+    }
+}
+
+#[test]
+fn lifecycle_failed_resolve_and_revoke_report_closed_failures() {
+    let mut resolve_provider = provider(
+        vec![CredentialCapability::AuthenticateRequest],
+        vec![CredentialLifetime::Run],
+        true,
+        true,
+        2,
+    );
+    resolve_provider.failure = Some(CredentialProviderFailure::Refused);
+    let resolve_providers: [&dyn CredentialProvider; 1] = [&resolve_provider];
+    let resolve_profiles = [CredentialProfile::new(
+        CredentialProfileName::parse("failure-profile").expect("valid explicit profile"),
+        &resolve_providers,
+    )];
+    let resolve_catalog = admitted_profiles(&resolve_profiles);
+    let selected = CredentialProfileName::parse("failure-profile").expect("valid explicit profile");
+    let requirement = requirement(vec![CredentialCapability::AuthenticateRequest]);
+    let (resolve_producer, resolve_receiver) = telemetry_arena();
+
+    let error = resolve_explicit_profile_with_telemetry(
+        &selected,
+        &resolve_catalog,
+        &requirement,
+        &resolve_producer,
+    )
+    .expect_err("provider refusal remains the operation result");
+    assert_eq!(error.kind(), CredentialResolutionErrorKind::ProviderRefused);
+    let resolve_batch = resolve_receiver
+        .try_recv_batch()
+        .expect("failed resolve signals are drainable");
+    assert_eq!(resolve_batch.metric(MetricKey::CredentialResolveStarted), 1);
+    assert_eq!(resolve_batch.metric(MetricKey::CredentialResolveFailed), 1);
+    assert_eq!(
+        resolve_batch.metric(MetricKey::CredentialResolveCompleted),
+        0
+    );
+    assert_eq!(resolve_batch.traces().len(), 1);
+    assert_eq!(resolve_batch.traces()[0].name, SpanName::CredentialResolve);
+    assert_eq!(resolve_batch.traces()[0].status, SpanStatus::Error);
+
+    let mut revoke_provider = provider(
+        vec![CredentialCapability::AuthenticateRequest],
+        vec![CredentialLifetime::Run],
+        true,
+        true,
+        2,
+    );
+    revoke_provider.revoke_failure_at = Some(1);
+    let revoke_providers: [&dyn CredentialProvider; 1] = [&revoke_provider];
+    let revoke_profiles = [CredentialProfile::new(
+        CredentialProfileName::parse("failure-profile").expect("valid explicit profile"),
+        &revoke_providers,
+    )];
+    let revoke_catalog = admitted_profiles(&revoke_profiles);
+    let arbitrator = memory_arbitrator(u64::MAX);
+    let (revoke_producer, revoke_receiver) = telemetry_arena();
+    let mut registry =
+        CredentialHandleRegistry::new_with_telemetry(&arbitrator, &revoke_catalog, revoke_producer)
+            .expect("observed registry starts");
+    registry
+        .acquire(&selected, &requirement)
+        .expect("credential resolves before failed cleanup");
+    let error = registry.close().expect_err("revoke failure remains typed");
+    assert_eq!(error.kind(), CredentialRegistryErrorKind::CleanupFailed);
+
+    let revoke_batch = revoke_receiver
+        .try_recv_batch()
+        .expect("failed revoke signals are drainable");
+    assert_eq!(revoke_batch.metric(MetricKey::CredentialRevokeStarted), 1);
+    assert_eq!(revoke_batch.metric(MetricKey::CredentialRevokeFailed), 1);
+    assert_eq!(revoke_batch.metric(MetricKey::CredentialRevokeCompleted), 0);
+    assert!(revoke_batch.traces().iter().any(|span| {
+        span.name == SpanName::CredentialRevoke && span.status == SpanStatus::Error
+    }));
+}
+
+#[test]
+fn admission_loss_preserves_resolution_and_reverse_cleanup() {
+    let provider = provider(
+        vec![CredentialCapability::AuthenticateRequest],
+        vec![CredentialLifetime::Run],
+        true,
+        true,
+        2,
+    );
+    let events = Arc::clone(&provider.events);
+    let providers: [&dyn CredentialProvider; 1] = [&provider];
+    let profiles = [CredentialProfile::new(
+        CredentialProfileName::parse("saturated-profile").expect("valid explicit profile"),
+        &providers,
+    )];
+    let catalog = CredentialProfileCatalog::admit(&profiles, profile_limits(1, 1, usize::MAX, 2))
+        .expect("bounded profile catalog");
+    let selected =
+        CredentialProfileName::parse("saturated-profile").expect("valid explicit profile");
+    let requirement = requirement(vec![CredentialCapability::AuthenticateRequest]);
+    let arbitrator = memory_arbitrator(u64::MAX);
+    let (producer, receiver) = telemetry_arena();
+    saturate_ordinary_lane(&producer);
+    let drops_before = producer.snapshot().full_drops;
+    let mut registry =
+        CredentialHandleRegistry::new_with_telemetry(&arbitrator, &catalog, producer.clone())
+            .expect("observed registry starts under saturated telemetry");
+
+    registry
+        .acquire(&selected, &requirement)
+        .expect("first result ignores telemetry admission");
+    registry
+        .acquire(&selected, &requirement)
+        .expect("second result ignores telemetry admission");
+    registry
+        .close()
+        .expect("cleanup ignores telemetry admission");
+
+    assert_eq!(provider.resolve_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.drops.load(Ordering::SeqCst), 2);
+    assert_eq!(arbitrator.consumer_count(), 0);
+    assert_eq!(
+        *events.lock().expect("fixture event mutex"),
+        ["revoke-2", "drop-2", "revoke-1", "drop-1"]
+    );
+    assert!(
+        producer.snapshot().full_drops >= drops_before.saturating_add(4),
+        "each completed resolve/revoke span may be dropped without changing behavior"
+    );
+    let batch = receiver
+        .try_recv_batch()
+        .expect("fixed counters remain drainable from a full arena");
+    assert_eq!(batch.metric(MetricKey::CredentialResolveStarted), 2);
+    assert_eq!(batch.metric(MetricKey::CredentialResolveCompleted), 2);
+    assert_eq!(batch.metric(MetricKey::CredentialRevokeStarted), 2);
+    assert_eq!(batch.metric(MetricKey::CredentialRevokeCompleted), 2);
+    assert!(batch.traces().iter().all(|span| {
+        !matches!(
+            span.name,
+            SpanName::CredentialResolve | SpanName::CredentialRevoke
+        )
+    }));
 }

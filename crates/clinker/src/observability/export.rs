@@ -1892,6 +1892,95 @@ mod tests {
         serde_json::to_value(value).expect("envelope serializes")
     }
 
+    #[test]
+    fn lifecycle_metric_and_span_wire_names_are_stable() {
+        let metric_names = [
+            (MetricKey::TransformStarted, "clinker.transform.started"),
+            (MetricKey::TransformCompleted, "clinker.transform.completed"),
+            (MetricKey::TransformRecords, "clinker.transform.records"),
+            (MetricKey::TransformErrors, "clinker.transform.errors"),
+            (
+                MetricKey::CredentialResolveStarted,
+                "clinker.credential.resolve.started",
+            ),
+            (
+                MetricKey::CredentialResolveCompleted,
+                "clinker.credential.resolve.completed",
+            ),
+            (
+                MetricKey::CredentialResolveFailed,
+                "clinker.credential.resolve.failed",
+            ),
+            (
+                MetricKey::CredentialResolveInterrupted,
+                "clinker.credential.resolve.interrupted",
+            ),
+            (
+                MetricKey::ResourceOpenStarted,
+                "clinker.resource.open.started",
+            ),
+            (
+                MetricKey::ResourceOpenCompleted,
+                "clinker.resource.open.completed",
+            ),
+            (
+                MetricKey::ResourceOpenFailed,
+                "clinker.resource.open.failed",
+            ),
+            (
+                MetricKey::ResourceOpenInterrupted,
+                "clinker.resource.open.interrupted",
+            ),
+            (
+                MetricKey::CredentialRenewStarted,
+                "clinker.credential.renew.started",
+            ),
+            (
+                MetricKey::CredentialRenewCompleted,
+                "clinker.credential.renew.completed",
+            ),
+            (
+                MetricKey::CredentialRenewFailed,
+                "clinker.credential.renew.failed",
+            ),
+            (
+                MetricKey::CredentialRenewInterrupted,
+                "clinker.credential.renew.interrupted",
+            ),
+            (
+                MetricKey::CredentialRevokeStarted,
+                "clinker.credential.revoke.started",
+            ),
+            (
+                MetricKey::CredentialRevokeCompleted,
+                "clinker.credential.revoke.completed",
+            ),
+            (
+                MetricKey::CredentialRevokeFailed,
+                "clinker.credential.revoke.failed",
+            ),
+            (
+                MetricKey::CredentialRevokeInterrupted,
+                "clinker.credential.revoke.interrupted",
+            ),
+        ];
+        assert_eq!(metric_names.len(), MetricKey::COUNT);
+        for (key, expected) in metric_names {
+            assert_eq!(metric_name(key), expected, "stable name for {key:?}");
+        }
+
+        let span_names = [
+            (SpanName::Transform, "clinker.transform"),
+            (SpanName::CredentialResolve, "clinker.credential.resolve"),
+            (SpanName::ResourceOpen, "clinker.resource.open"),
+            (SpanName::CredentialRenew, "clinker.credential.renew"),
+            (SpanName::CredentialRevoke, "clinker.credential.revoke"),
+        ];
+        for (name, expected) in span_names {
+            assert_eq!(span_name(name), expected, "stable name for {name:?}");
+        }
+    }
+
     fn spans_of(envelope: &Value) -> &Vec<Value> {
         envelope["resourceSpans"][0]["scopeSpans"][0]["spans"]
             .as_array()
