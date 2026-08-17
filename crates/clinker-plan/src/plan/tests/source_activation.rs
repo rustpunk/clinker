@@ -182,6 +182,87 @@ fn resource_slot_parses_on_a_body_source() {
 }
 
 #[test]
+fn body_source_plan_payload_retains_the_resolved_reader_contract() {
+    let body = r#"_compose:
+  name: typed_file_reader
+  inputs: {}
+  outputs: { out: read }
+  config_schema: {}
+  resources_schema:
+    orders: { kind: file, required: true }
+
+nodes:
+  - type: source
+    name: read
+    config:
+      name: read
+      type: fixed_width
+      resource: orders
+      on_unmapped: { mode: drop }
+      schema:
+        discriminator: { start: 0, width: 1 }
+        records:
+          - id: header
+            tag: H
+            columns: [{ name: batch, type: string, start: 1, width: 4 }]
+          - id: detail
+            tag: D
+            columns: [{ name: id, type: int, start: 1, width: 4 }]
+"#;
+    let workspace = write_workspace(body);
+    let plan = compile(workspace.path());
+    let bound = plan
+        .dag()
+        .graph
+        .node_weights()
+        .find_map(|node| match node {
+            PlanNode::Composition { body, .. } => plan.body_of(*body),
+            _ => None,
+        })
+        .expect("compiled body");
+    let payload = bound
+        .graph
+        .node_weights()
+        .find_map(|node| match node {
+            PlanNode::Source {
+                resolved: Some(payload),
+                ..
+            } => Some(payload.as_ref()),
+            _ => None,
+        })
+        .expect("resolved body Source payload");
+
+    assert!(matches!(
+        payload.body.source.format,
+        crate::config::InputFormat::FixedWidth(_)
+    ));
+    assert!(matches!(
+        payload.body.schema,
+        crate::config::SourceSchema::MultiRecord { .. }
+    ));
+    assert!(matches!(
+        payload.body.on_unmapped,
+        crate::config::pipeline_node::OnUnmapped::Drop
+    ));
+    let resource = payload
+        .resource
+        .as_ref()
+        .expect("typed resource requirement survives on the body Source");
+    assert_eq!(resource.slot, "orders");
+    assert_eq!(resource.dataset_identity.namespace, "clinker-resource:file");
+    assert_eq!(resource.dataset_identity.name, "shared_orders");
+    assert_eq!(
+        payload
+            .body
+            .resource
+            .as_ref()
+            .expect("resource slot survives")
+            .value,
+        "orders"
+    );
+}
+
+#[test]
 fn resource_backed_body_source_rejects_a_direct_matcher() {
     let body = BODY.replace(
         "      resource: orders",

@@ -12,6 +12,10 @@ _compose:
   outputs:
     out: shape
   config_schema: {}
+  resources_schema:
+    reference:
+      kind: file
+      required: true
 
 nodes:
   - type: source
@@ -19,7 +23,7 @@ nodes:
     config:
       name: ref
       type: csv
-      path: data/ref.csv
+      resource: reference
       schema:
         - { name: code, type: string }
   - type: transform

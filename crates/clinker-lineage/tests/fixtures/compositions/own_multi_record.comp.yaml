@@ -1,7 +1,7 @@
-# A body that declares its own multi-record source. The record types live in
-# the body file, which the compiled plan does not retain a resolved schema for,
-# so lineage has nothing to split the container by — see the builder's
-# documented limitations.
+# A body that declares its own multi-record source. Lineage's record-type
+# schema lookup remains top-level-only, so it attributes these columns to the
+# catalog resource's container dataset — see the builder's documented
+# limitations.
 _compose:
   name: own_multi_record
   inputs:
@@ -11,6 +11,10 @@ _compose:
   outputs:
     out: shape
   config_schema: {}
+  resources_schema:
+    ledger:
+      kind: file
+      required: true
 
 nodes:
   - type: source
@@ -18,7 +22,7 @@ nodes:
     config:
       name: ledger
       type: fixed_width
-      path: data/ledger.txt
+      resource: ledger
       schema:
         discriminator: { start: 0, width: 1 }
         records:

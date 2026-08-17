@@ -625,11 +625,24 @@ pub struct CompiledReshapeSynth {
 }
 
 /// Fully-resolved Source payload, populated by the
-/// `PipelineConfig::compile()` lowering path. Wraps the parse-time
-/// `SourceConfig` plus the `ValidatedPath` (proof of pre-pass success).
+/// `PipelineConfig::compile()` lowering path. Retains the complete resolved
+/// Source body plus the `ValidatedPath` proof of pre-pass success.
 /// Stored behind `Box` on `PlanNode::Source` to keep the variant slim.
 #[derive(Debug, Clone)]
 pub struct PlanSourcePayload {
+    /// Complete resolved reader contract.
+    ///
+    /// A composition-body Source is absent from the top-level
+    /// [`crate::config::PipelineConfig`]. Retaining its body here preserves
+    /// its schema and unmapped-field policy without retaining a physical
+    /// resource locator.
+    pub body: crate::config::pipeline_node::SourceBody,
+    /// Typed logical resource requirement for an authored body Source.
+    ///
+    /// Top-level Sources retain `None`. The value contains no descriptor path,
+    /// credential, secret, opener, or live handle.
+    pub resource: Option<CompiledResourceRequirement>,
+    /// Matcher/format configuration retained for existing plan consumers.
     pub source: SourceConfig,
     pub validated_path: Option<crate::security::ValidatedPath>,
 }

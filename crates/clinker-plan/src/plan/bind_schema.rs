@@ -3742,7 +3742,7 @@ fn bind_composition(
             .or_insert_with(|| artifacts.fresh_node_id());
     }
 
-    let source_instances = pending_source_requirements
+    let source_instances: Vec<CompiledSourceInstance> = pending_source_requirements
         .into_iter()
         .map(|(source_name, resource)| {
             CompiledSourceInstance::composition_body(
@@ -3888,9 +3888,20 @@ fn bind_composition(
         // re-mint), so the typed/combine entries the bind walk keyed by
         // this id resolve to the node lowered here.
         let node_id = body_node_ids[&n_name];
-        if let Some(plan_node) = crate::config::lower_node_to_plan_node(
+        if let Some(mut plan_node) = crate::config::lower_node_to_plan_node(
             n, node_id, body_span, artifacts, &lower_ctx, diags,
         ) {
+            if let crate::plan::execution::PlanNode::Source {
+                resolved: Some(payload),
+                ..
+            } = &mut plan_node
+            {
+                payload.resource = source_instances
+                    .iter()
+                    .find(|instance| instance.id().source_node == node_id)
+                    .and_then(CompiledSourceInstance::resource)
+                    .cloned();
+            }
             let idx = body_graph.add_node(plan_node);
             body_name_to_idx.insert(n_name, idx);
         }

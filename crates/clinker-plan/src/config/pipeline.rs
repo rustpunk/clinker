@@ -3889,15 +3889,19 @@ pub(crate) fn lower_node_to_plan_node(
     match node {
         PipelineNode::Source { config, .. } => {
             // The `$doc` path set the reader extracts is stamped on the
-            // runtime `PipelineConfig` source body (see `compile_with_diagnostics`),
-            // which is what the executor's ingest path reads; the DAG payload
-            // does not carry it.
-            let source = config.source.clone();
+            // Retain the complete resolved body. Top-level execution can still
+            // read the same value from `PipelineConfig`; composition-body
+            // execution has no top-level config entry and consumes this DAG
+            // payload directly.
+            let body = config.clone();
+            let source = body.source.clone();
             Some(PlanNode::Source {
                 name: name.to_string(),
                 id,
                 span,
                 resolved: Some(Box::new(PlanSourcePayload {
+                    body,
+                    resource: None,
                     source,
                     validated_path: None,
                 })),

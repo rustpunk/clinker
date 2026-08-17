@@ -147,7 +147,13 @@ pub fn resource_dataset_identity(resource: &CatalogResource) -> Option<DatasetId
 pub fn dataset_identity(node: &PlanNode, base_dir: &Path) -> Option<DatasetId> {
     match node {
         PlanNode::Source { name, resolved, .. } => Some(match resolved {
-            Some(payload) => source_dataset_identity(&payload.source, base_dir),
+            Some(payload) => match &payload.resource {
+                Some(resource) => DatasetId {
+                    namespace: resource.dataset_identity.namespace.to_string(),
+                    name: resource.dataset_identity.name.clone(),
+                },
+                None => source_dataset_identity(&payload.source, base_dir),
+            },
             None => DatasetId::fallback(name.as_str()),
         }),
         PlanNode::Output { name, resolved, .. } => Some(match resolved {
@@ -315,8 +321,15 @@ mod tests {
     use std::sync::Arc;
 
     use clinker_core_types::span::Span;
-    use clinker_plan::plan::execution::{PlanOutputPayload, PlanSourcePayload};
+    use clinker_plan::config::{
+        LayerKind, ResourceBinding, ResourceCapability, ResourceKind, ResourceLifetime,
+        ResourceOpenerKind,
+    };
+    use clinker_plan::plan::execution::{
+        CompiledResourceRequirement, PlanOutputPayload, PlanSourcePayload,
+    };
     use clinker_plan::plan::{EntityRef, PlanNodeId};
+    use clinker_plan::resources::{LogicalResourceId, ResourceDatasetIdentity};
     use clinker_record::Schema;
     use serde_json::json;
 
@@ -326,6 +339,10 @@ mod tests {
 
     fn source_config(value: serde_json::Value) -> SourceConfig {
         serde_json::from_value(value).expect("valid source config")
+    }
+
+    fn source_body(value: serde_json::Value) -> clinker_plan::config::pipeline_node::SourceBody {
+        serde_json::from_value(value).expect("valid source body")
     }
 
     fn output_config(value: serde_json::Value) -> OutputConfig {
@@ -505,6 +522,13 @@ mod tests {
     #[test]
     fn source_node_delegates_to_source_identity() {
         let payload = PlanSourcePayload {
+            body: source_body(json!({
+                "name": "in",
+                "path": "data/in.csv",
+                "type": "csv",
+                "schema": [{ "name": "id", "type": "string" }]
+            })),
+            resource: None,
             source: source_config(json!({"name": "in", "path": "data/in.csv", "type": "csv"})),
             validated_path: None,
         };
@@ -512,6 +536,46 @@ mod tests {
         assert_eq!(
             dataset_identity(&node, base()),
             Some(DatasetId::file("/work/data/in.csv".to_string()))
+        );
+    }
+
+    #[test]
+    fn body_source_uses_the_compiled_resource_dataset_identity() {
+        let payload = PlanSourcePayload {
+            body: source_body(json!({
+                "name": "in",
+                "resource": "orders",
+                "type": "csv",
+                "schema": [{ "name": "id", "type": "string" }]
+            })),
+            resource: Some(CompiledResourceRequirement {
+                slot: "orders".to_string(),
+                binding: ResourceBinding::from_layer(
+                    LogicalResourceId::parse("shared_orders").expect("logical id"),
+                    LayerKind::PipelineDefault,
+                    Span::SYNTHETIC,
+                    false,
+                ),
+                kind: ResourceKind::File,
+                required_capabilities: Box::new([ResourceCapability::Read]),
+                opener: ResourceOpenerKind::File,
+                lifetime: ResourceLifetime::Run,
+                dataset_identity: ResourceDatasetIdentity {
+                    namespace: RESOURCE_FILE_NAMESPACE,
+                    name: "shared_orders".to_string(),
+                },
+            }),
+            source: source_config(json!({"name": "in", "type": "csv"})),
+            validated_path: None,
+        };
+        let node = source_node("in", Some(payload));
+
+        assert_eq!(
+            dataset_identity(&node, base()),
+            Some(DatasetId {
+                namespace: RESOURCE_FILE_NAMESPACE.to_string(),
+                name: "shared_orders".to_string(),
+            })
         );
     }
 
