@@ -124,6 +124,7 @@ the way back in.
     name: xml_out
     type: xml
     path: "./output/result.xml"
+    preserve_nulls: false              # omit null elements; null attributes always omit
     options:
       root_element: "Root"              # default Root
       record_element: "Record"          # default Record
@@ -181,6 +182,16 @@ writes:
 <payload kind="event">before<item id="1">alpha</item><item id="2">beta</item><tail>after</tail></payload>
 ```
 
+JSON and XML share one neutral-map key grammar. After CXL string decoding,
+ordinary keys are unescaped. Exactly one leading backslash marks a literal key
+only as `\@name`, `\#text`, or `\\name`, and the neutral decoder removes that
+one marker. Because the CXL string literal must encode the backslash too, the
+source spellings are `"\\@name"`, `"\\#text"`, and `"\\\\name"`.
+Other leading-backslash forms are non-canonical and fail. An escape disables
+XML's attribute or text classification; it does not make the decoded spelling a
+legal XML name. For example, a decoded `@literal` still cannot be an element
+name, while JSON can write it as an ordinary object key.
+
 The rules are deliberately strict:
 
 - Attribute and `#text` values must be scalar or null; maps and arrays there
@@ -188,16 +199,34 @@ The rules are deliberately strict:
 - A direct array inside another array is rejected because XML has no child name
   to repeat. Put the inner array under a map key to supply that name.
 - Every decoded ordinary key and attribute name must be a well-formed XML name.
-  A canonical escape (`"\\@literal"`, `"\\#text"`, or `"\\\\name"` in CXL
-  source) disables the structural role, but it does not make an otherwise
-  illegal XML name legal.
-- Duplicate logical keys, malformed escapes, and values deeper than 64
-  containers reject the whole record before its first byte is emitted. XML
-  never silently falls back to JSON text.
+- Static and computed keys use identical decoding. Two spellings that decode to
+  the same logical key—including attribute-looking or `#text` spellings—are a
+  collision and reject rather than selecting a winner.
+- Scalars have depth zero and each map or array adds one container. Depth 64 is
+  accepted; depth 65, malformed escapes, duplicate logical keys, and invalid
+  names reject the whole record before its first byte is emitted. XML never
+  silently falls back to JSON text.
 
-With `preserve_nulls: false`, null child elements and null array items are
-omitted; with it enabled they emit as self-closing elements. Null attributes
-are always omitted.
+With the default `preserve_nulls: false`, null child elements and null array
+items are omitted; with it enabled they emit as self-closing elements. Null
+attributes are always omitted.
+
+The XML writer is deliberately two-pass per record. Its first borrowed pass
+validates the complete schema/value shape, XML names, and scalar roles before
+writing any bytes for that record. Its second pass streams directly from the
+original record. Authored strings remain borrowed; other scalars are formatted
+in a fixed 128-byte stack scratch buffer. The writer does not clone or
+materialize a second nested tree, and it retains no record values or rendered
+scalar capacity between calls. Its only memoized preparation heap state is the
+schema-derived element plan, whose size is independent of record value widths;
+recursive calls are capped at 64 containers. This is separate from the XML
+reader's optional envelope pre-scan described below.
+
+Native recursion belongs to XML and JSON/NDJSON. Flat, positional, and message
+formats do not stringify maps or arrays implicitly. Declare an encoding that
+the destination supports—such as `join_values` for a multi-value flat
+field—or reshape the value before that output; otherwise the structured value
+is rejected before bytes for that record are written.
 
 ### Writing multi-value fields (repeated elements)
 
