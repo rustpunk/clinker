@@ -97,7 +97,7 @@ nodes:
         standard_queue: 'priority == "standard"'
       default: backlog_queue
 
-  - type: output
+  - type: sink
     name: urgent_queue
     input: triage.urgent_queue
     config:
@@ -106,7 +106,7 @@ nodes:
       path: ./output/urgent.csv
       include_unmapped: false
 
-  - type: output
+  - type: sink
     name: standard_queue
     input: triage.standard_queue
     config:
@@ -115,7 +115,7 @@ nodes:
       path: ./output/standard.csv
       include_unmapped: false
 
-  - type: output
+  - type: sink
     name: backlog_queue
     input: triage.backlog_queue
     config:

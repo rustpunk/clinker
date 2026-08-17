@@ -76,7 +76,7 @@ nodes:
         emit in_stock = stock_on_hand > 0
         emit stock_on_hand = stock_on_hand
 
-  - type: output
+  - type: sink
     name: catalog_csv
     description: Flat row per product; the multi-value column joins into one cell
     input: normalize
@@ -91,7 +91,7 @@ nodes:
       join_values:
         - { field: categories, delimiter: "|" }
 
-  - type: output
+  - type: sink
     name: catalog_xml
     description: Normalised XML — repeated <category> elements survive the round trip
     input: normalize
