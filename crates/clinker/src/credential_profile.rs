@@ -690,11 +690,23 @@ fn resolve_explicit_profile_inner<'run>(
     requirement: &CredentialRequirement,
     producer: Option<&TelemetryProducer>,
 ) -> Result<LeasedCredentialHandle<'run>, CredentialResolutionError> {
+    observe_operation(producer, RESOLVE_SIGNALS, || {
+        resolve_explicit_profile_attempt(selected, catalog, requirement, producer)
+    })
+}
+
+fn resolve_explicit_profile_attempt<'run>(
+    selected: &CredentialProfileName,
+    catalog: &CredentialProfileCatalog<'run>,
+    requirement: &CredentialRequirement,
+    producer: Option<&TelemetryProducer>,
+) -> Result<LeasedCredentialHandle<'run>, CredentialResolutionError> {
     let provider = compatible_provider(selected, catalog, requirement)?;
     let declared_lease_bytes = provider
         .lease_retained_bytes(requirement)
         .map_err(resolution_provider_error)?;
-    let mut lease = observe_operation(producer, RESOLVE_SIGNALS, || provider.resolve(requirement))
+    let mut lease = provider
+        .resolve(requirement)
         .map_err(resolution_provider_error)?;
     if lease.retained_bytes() != declared_lease_bytes {
         let _ = observe_operation(producer, REVOKE_SIGNALS, || lease.revoke());
@@ -702,9 +714,12 @@ fn resolve_explicit_profile_inner<'run>(
             CredentialResolutionErrorKind::RetainedBytesMismatch,
         ));
     }
-    let retained_bytes = handle_dynamic_bytes(requirement, declared_lease_bytes).ok_or(
-        CredentialResolutionError::new(CredentialResolutionErrorKind::RetainedBytesMismatch),
-    )?;
+    let Some(retained_bytes) = handle_dynamic_bytes(requirement, declared_lease_bytes) else {
+        let _ = observe_operation(producer, REVOKE_SIGNALS, || lease.revoke());
+        return Err(CredentialResolutionError::new(
+            CredentialResolutionErrorKind::RetainedBytesMismatch,
+        ));
+    };
     Ok(LeasedCredentialHandle {
         requirement_name: requirement.name().clone(),
         provider_kind: requirement.provider_kind().clone(),
@@ -963,6 +978,17 @@ where
         selected: &CredentialProfileName,
         requirement: &CredentialRequirement,
     ) -> Result<&LeasedCredentialHandle<'run>, CredentialRegistryError> {
+        let telemetry = self.telemetry.clone();
+        observe_operation(telemetry.as_ref(), RESOLVE_SIGNALS, || {
+            self.acquire_attempt(selected, requirement)
+        })
+    }
+
+    fn acquire_attempt(
+        &mut self,
+        selected: &CredentialProfileName,
+        requirement: &CredentialRequirement,
+    ) -> Result<&LeasedCredentialHandle<'run>, CredentialRegistryError> {
         self.honor_memory_signals()?;
         if self.handles.len() >= self.catalog.limits.max_live_handles {
             return Err(self.fail_and_close(CredentialRegistryErrorKind::HandleLimitExceeded));
@@ -996,9 +1022,7 @@ where
             return Err(self.fail_and_close(CredentialRegistryErrorKind::MemoryLimitExceeded));
         }
 
-        let mut lease = match observe_operation(self.telemetry.as_ref(), RESOLVE_SIGNALS, || {
-            provider.resolve(requirement)
-        }) {
+        let mut lease = match provider.resolve(requirement) {
             Ok(lease) => lease,
             Err(failure) => {
                 self.memory_handle.set_bytes(self.retained_bytes);

@@ -1202,6 +1202,91 @@ fn lifecycle_failed_resolve_and_revoke_report_closed_failures() {
 }
 
 #[test]
+fn lifecycle_early_compatibility_failure_closes_one_resolve_attempt() {
+    let provider = provider(
+        vec![CredentialCapability::AuthenticateRequest],
+        vec![CredentialLifetime::Run],
+        true,
+        true,
+        2,
+    );
+    let providers: [&dyn CredentialProvider; 1] = [&provider];
+    let profiles = [CredentialProfile::new(
+        CredentialProfileName::parse("early-failure").expect("valid explicit profile"),
+        &providers,
+    )];
+    let catalog = admitted_profiles(&profiles);
+    let selected = CredentialProfileName::parse("early-failure").expect("valid explicit profile");
+    let requirement = requirement(vec![CredentialCapability::OpenSession]);
+    let (producer, receiver) = telemetry_arena();
+
+    let error =
+        resolve_explicit_profile_with_telemetry(&selected, &catalog, &requirement, &producer)
+            .expect_err("unsupported capability fails before provider allocation");
+
+    assert_eq!(
+        error.kind(),
+        CredentialResolutionErrorKind::UnsupportedCapability
+    );
+    assert_eq!(provider.resolve_calls.load(Ordering::SeqCst), 0);
+    let batch = receiver
+        .try_recv_batch()
+        .expect("failed resolve attempt is drainable");
+    assert_eq!(batch.metric(MetricKey::CredentialResolveStarted), 1);
+    assert_eq!(batch.metric(MetricKey::CredentialResolveFailed), 1);
+    assert_eq!(batch.metric(MetricKey::CredentialResolveCompleted), 0);
+    assert_eq!(batch.traces().len(), 1);
+    assert_eq!(batch.traces()[0].name, SpanName::CredentialResolve);
+    assert_eq!(batch.traces()[0].status, SpanStatus::Error);
+}
+
+#[test]
+fn lifecycle_registry_preallocation_failure_closes_one_resolve_attempt() {
+    let provider = provider(
+        vec![CredentialCapability::AuthenticateRequest],
+        vec![CredentialLifetime::Run],
+        true,
+        true,
+        2,
+    );
+    let providers: [&dyn CredentialProvider; 1] = [&provider];
+    let profiles = [CredentialProfile::new(
+        CredentialProfileName::parse("memory-failure").expect("valid explicit profile"),
+        &providers,
+    )];
+    let catalog = CredentialProfileCatalog::admit(&profiles, profile_limits(1, 1, usize::MAX, 1))
+        .expect("bounded profile catalog");
+    let selected = CredentialProfileName::parse("memory-failure").expect("valid explicit profile");
+    let requirement = requirement(vec![CredentialCapability::AuthenticateRequest]);
+    let arbitrator = memory_arbitrator(0);
+    let (producer, receiver) = telemetry_arena();
+    let mut registry =
+        CredentialHandleRegistry::new_with_telemetry(&arbitrator, &catalog, producer)
+            .expect("registry reserves its fixed table");
+
+    let error = registry
+        .acquire(&selected, &requirement)
+        .expect_err("run memory rejects the lease before provider allocation");
+
+    assert_eq!(
+        error.kind(),
+        CredentialRegistryErrorKind::MemoryLimitExceeded
+    );
+    assert_eq!(provider.resolve_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(registry.live_handle_count(), 0);
+    assert_eq!(arbitrator.consumer_count(), 0);
+    let batch = receiver
+        .try_recv_batch()
+        .expect("failed registry resolve attempt is drainable");
+    assert_eq!(batch.metric(MetricKey::CredentialResolveStarted), 1);
+    assert_eq!(batch.metric(MetricKey::CredentialResolveFailed), 1);
+    assert_eq!(batch.metric(MetricKey::CredentialResolveCompleted), 0);
+    assert_eq!(batch.traces().len(), 1);
+    assert_eq!(batch.traces()[0].name, SpanName::CredentialResolve);
+    assert_eq!(batch.traces()[0].status, SpanStatus::Error);
+}
+
+#[test]
 fn admission_loss_preserves_resolution_and_reverse_cleanup() {
     let provider = provider(
         vec![CredentialCapability::AuthenticateRequest],
