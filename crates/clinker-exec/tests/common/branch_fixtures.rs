@@ -26,6 +26,6 @@ pub fn branch_pipeline(name: &str, body: &str) -> String {
 - type: source\n  name: src\n  config:\n    name: src\n    type: csv\n    path: input.csv\n    schema:\n      - {{ name: id, type: string }}\n      - {{ name: amount, type: string }}\n\n\
 - type: transform\n  name: classify_emit\n  input: src\n  config:\n    cxl: 'emit amount_val = amount.to_int()\n\n      '\n\
 {body}\
-- type: output\n  name: dest\n  input: combine\n  config:\n    name: dest\n    type: csv\n    path: output.csv\n    include_unmapped: true\n"
+- type: sink\n  name: dest\n  input: combine\n  config:\n    name: dest\n    type: csv\n    path: output.csv\n    include_unmapped: true\n"
     )
 }

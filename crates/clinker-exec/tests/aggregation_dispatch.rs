@@ -81,7 +81,7 @@ nodes:
       emit n = count(*)
 
       '
-- type: output
+- type: sink
   name: out
   input: by_dept
   config:
@@ -131,7 +131,7 @@ nodes:
     cxl: 'emit n = count(*)
 
       '
-- type: output
+- type: sink
   name: out
   input: total
   config:

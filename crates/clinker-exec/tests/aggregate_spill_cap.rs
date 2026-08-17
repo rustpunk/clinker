@@ -68,7 +68,7 @@ nodes:
       cxl: |
         emit category = category
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: {AGG_NODE}
     config:

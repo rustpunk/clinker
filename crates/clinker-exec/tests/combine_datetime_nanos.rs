@@ -188,7 +188,7 @@ __SORT_BLD__
         emit did = drivers.did
         emit bid = builds.bid
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
@@ -342,7 +342,7 @@ nodes:
       cxl: |
         emit ts = ts
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: by_ts
     config:

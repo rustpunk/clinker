@@ -46,7 +46,7 @@ nodes:
       emit department = department
       emit amount = amount
       emit ratio = 1 / (amount - 30)
-- type: output
+- type: sink
   name: out
   input: ratio
   config:
