@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const FIXTURE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/guess");
 const FIXTURE_FILES: &[&str] = &[
@@ -53,13 +54,49 @@ fn workspace() -> tempfile::TempDir {
 }
 
 fn guess(root: &Path, args: &[&str]) -> Output {
+    guess_config(root, "pipeline.yaml", args)
+}
+
+fn guess_config(root: &Path, config: &str, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_clinker"))
         .current_dir(root)
         .arg("guess")
-        .arg("pipeline.yaml")
+        .arg(config)
         .args(args)
         .output()
         .expect("spawn clinker guess")
+}
+
+fn guess_with_env(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_clinker"));
+    command
+        .current_dir(root)
+        .arg("guess")
+        .arg("pipeline.yaml")
+        .args(args);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    command.output().expect("spawn clinker guess")
+}
+
+fn spawn_at_write_barrier(root: &Path, barrier: &Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_clinker"))
+        .current_dir(root)
+        .env("CLINKER_TEST_GUESS_WRITE_BARRIER", barrier)
+        .args(["guess", "pipeline.yaml", "--write"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn barred clinker guess")
+}
+
+fn wait_for_barrier(barrier: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("ready").exists() {
+        assert!(Instant::now() < deadline, "guess write barrier timed out");
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 fn parse_success(output: &Output) -> serde_json::Value {
@@ -396,6 +433,12 @@ fn modes_preview_and_check_have_exhaustive_exit_truth() {
         check_report["fields"][0]["owners"][0]["unresolved_reasons"][0],
         "unsafe_integer_widening"
     );
+
+    let conflicting = guess(workspace.path(), &["--check", "--write"]);
+    assert_eq!(conflicting.status.code(), Some(1));
+    let diagnostic = String::from_utf8_lossy(&conflicting.stderr);
+    assert!(diagnostic.contains("--check and --write"));
+    assert!(diagnostic.contains("remove one"));
 }
 
 #[test]
@@ -485,19 +528,391 @@ fn modes_preview_enforces_one_global_input_byte_budget() {
 }
 
 #[test]
-fn modes_write_is_unavailable_and_never_edits_before_cas_support() {
+fn write_single_owned_leaf_is_surgically_replaced() {
+    let workspace = workspace();
+    write_flat_json_pipeline(
+        workspace.path(),
+        "{ nullable: numeric }",
+        Some("7"),
+        "[{\"n\":1,\"untouched\":2}]",
+    );
+    let pipeline = workspace.path().join("pipeline.yaml");
+    let mut configured = std::fs::read_to_string(&pipeline)
+        .expect("read configured pipeline")
+        .replace(
+            "          default: 7",
+            "          default: 7\n          required: true\n          precision: 9\n          scale: 2",
+        );
+    configured.push_str("        - name: untouched\n          type: numeric\n");
+    std::fs::write(&pipeline, configured).expect("add sibling type attributes");
+    let before = std::fs::read_to_string(&pipeline).expect("read pipeline before write");
+
+    let output = guess(workspace.path(), &["--write", "--field", "values.n"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = parse_report(&output);
+    assert_eq!(report["mode"], "write");
+    assert_eq!(report["version"], 3);
+    assert_eq!(report["write"]["status"], "written");
+    assert_eq!(
+        report["write"]["owner"],
+        "/v1/schema/sources/values/columns/n/attributes/type"
+    );
+    let after = std::fs::read_to_string(&pipeline).expect("read pipeline after write");
+    assert_eq!(before.matches("numeric").count(), 2);
+    assert_eq!(after.matches("numeric").count(), 1);
+    assert!(after.contains("type: { nullable: int }"));
+    assert!(
+        after.contains("default: 7"),
+        "default must survive:\n{after}"
+    );
+    for sibling in ["required: true", "precision: 9", "scale: 2"] {
+        assert!(after.contains(sibling), "{sibling} must survive:\n{after}");
+    }
+    assert_eq!(
+        before.replacen("numeric", "int", 1),
+        after,
+        "only the exact type leaf may change"
+    );
+}
+
+#[test]
+fn write_unresolved_or_multi_owner_selection_emits_patch_without_edit() {
     let workspace = workspace();
     let pipeline = workspace.path().join("pipeline.yaml");
-    let before = std::fs::read(&pipeline).expect("read pipeline before write request");
-    let output = guess(workspace.path(), &["--write"]);
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--write is unavailable"), "{stderr}");
-    assert!(stderr.contains("--check"), "{stderr}");
+    let before = std::fs::read(&pipeline).expect("read pipeline");
+    let multi = guess(
+        workspace.path(),
+        &["--write", "--field", "csv_orders.amount"],
+    );
+    assert_eq!(multi.status.code(), Some(3));
+    let report = parse_report(&multi);
+    assert_eq!(report["write"]["status"], "not_written");
+    assert_eq!(report["write"]["reason"], "write_requires_one_owner");
+    assert!(report["patch"].as_str().expect("patch").contains("detail"));
+    assert!(
+        report["patch"]
+            .as_str()
+            .expect("patch")
+            .contains("adjustment")
+    );
     assert_eq!(
-        std::fs::read(&pipeline).expect("read pipeline after write request"),
+        std::fs::read(&pipeline).expect("pipeline unchanged"),
         before
     );
+
+    write_flat_json_pipeline(
+        workspace.path(),
+        "numeric",
+        None,
+        "[{\"n\":9223372036854775808},{\"n\":1.5}]",
+    );
+    let before = std::fs::read(&pipeline).expect("read unresolved pipeline");
+    let unresolved = guess(workspace.path(), &["--write"]);
+    assert_eq!(unresolved.status.code(), Some(3));
+    assert_eq!(
+        parse_report(&unresolved)["write"]["reason"],
+        "unresolved_evidence"
+    );
+    assert_eq!(
+        std::fs::read(&pipeline).expect("pipeline unchanged"),
+        before
+    );
+}
+
+#[test]
+fn write_mixed_multi_record_selector_changes_only_the_literal_numeric_owner() {
+    let workspace = workspace();
+    std::fs::write(
+        workspace.path().join("pipeline.yaml"),
+        "pipeline:\n  name: mixed_records\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: csv\n      path: input.csv\n      schema:\n        discriminator: { field: kind }\n        records:\n          - id: detail\n            tag: D\n            columns:\n              - { name: kind, type: string }\n              - { name: n, type: numeric }\n          - id: trailer\n            tag: T\n            columns:\n              - { name: kind, type: string }\n              - { name: n, type: int }\n",
+    )
+    .expect("write mixed multi-record pipeline");
+    std::fs::write(workspace.path().join("input.csv"), "kind,n\nD,1\nT,2\n")
+        .expect("write mixed multi-record input");
+
+    let output = guess(workspace.path(), &["--write", "--field", "values.n"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = parse_report(&output);
+    assert_eq!(report["fields"][0]["owners"].as_array().unwrap().len(), 1);
+    assert_eq!(report["write"]["status"], "written");
+    let after = std::fs::read_to_string(workspace.path().join("pipeline.yaml"))
+        .expect("read edited pipeline");
+    assert_eq!(after.matches("name: n, type: int").count(), 2);
+}
+
+#[test]
+fn write_identical_alias_interpolation_external_and_synthetic_overlay_are_patch_only() {
+    let base_workspace = workspace();
+    std::fs::write(
+        base_workspace.path().join("pipeline.yaml"),
+        "pipeline:\n  name: alias_owner\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: csv\n      path: input.csv\n      schema:\n        - { name: anchor, type: &number numeric }\n        - { name: n, type: *number }\n",
+    )
+    .expect("write alias pipeline");
+    std::fs::write(base_workspace.path().join("input.csv"), "anchor,n\n1,2\n")
+        .expect("write alias input");
+    let alias_before = std::fs::read(base_workspace.path().join("pipeline.yaml")).unwrap();
+    let alias = guess(base_workspace.path(), &["--write", "--field", "values.n"]);
+    assert_eq!(alias.status.code(), Some(3));
+    assert_eq!(
+        parse_report(&alias)["write"]["reason"],
+        "owner_indirect_provenance"
+    );
+    assert_eq!(
+        std::fs::read(base_workspace.path().join("pipeline.yaml")).unwrap(),
+        alias_before
+    );
+
+    write_flat_json_pipeline(base_workspace.path(), "${GUESS_TYPE}", None, "[{\"n\":1}]");
+    let interpolated = guess_with_env(
+        base_workspace.path(),
+        &["--write"],
+        &[("GUESS_TYPE", "numeric")],
+    );
+    assert_eq!(interpolated.status.code(), Some(3));
+    assert_eq!(
+        parse_report(&interpolated)["write"]["reason"],
+        "owner_not_literal_numeric"
+    );
+
+    std::fs::write(
+        base_workspace.path().join("schema.yaml"),
+        "- { name: n, type: numeric }\n",
+    )
+    .expect("write external schema");
+    std::fs::write(
+        base_workspace.path().join("pipeline.yaml"),
+        "pipeline:\n  name: external_owner\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: csv\n      path: input.csv\n      schema: schema.yaml\n",
+    )
+    .expect("write external-schema pipeline");
+    std::fs::write(base_workspace.path().join("input.csv"), "n\n1\n").unwrap();
+    let external = guess(base_workspace.path(), &["--write"]);
+    assert_eq!(external.status.code(), Some(3));
+    assert_eq!(
+        parse_report(&external)["write"]["reason"],
+        "owner_not_inline"
+    );
+
+    let overlay_workspace = workspace();
+    let overlay_pipeline = overlay_workspace.path().join("pipeline.yaml");
+    let overlay_before = std::fs::read(&overlay_pipeline).unwrap();
+    let overlay = guess(
+        overlay_workspace.path(),
+        &[
+            "--write",
+            "--channel",
+            "json_preview",
+            "--field",
+            "json_orders.ratio",
+        ],
+    );
+    assert_eq!(overlay.status.code(), Some(3));
+    assert_eq!(
+        parse_report(&overlay)["write"]["reason"],
+        "effective_config_has_overlay"
+    );
+    assert_eq!(std::fs::read(overlay_pipeline).unwrap(), overlay_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn write_symlink_config_is_patch_only() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = workspace();
+    write_flat_json_pipeline(workspace.path(), "numeric", None, "[{\"n\":1}]");
+    symlink("pipeline.yaml", workspace.path().join("linked.yaml")).expect("create config symlink");
+    let before = std::fs::read(workspace.path().join("pipeline.yaml")).unwrap();
+    let output = guess_config(workspace.path(), "linked.yaml", &["--write"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(parse_report(&output)["write"]["reason"], "config_symlink");
+    assert_eq!(
+        std::fs::read(workspace.path().join("pipeline.yaml")).unwrap(),
+        before
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_symlink_config_parent_is_patch_only() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempfile::tempdir().expect("temporary guess workspace");
+    let actual = workspace.path().join("actual");
+    std::fs::create_dir(&actual).expect("create actual config directory");
+    write_flat_json_pipeline(&actual, "numeric", None, "[{\"n\":1}]");
+    symlink("actual", workspace.path().join("linked")).expect("create config parent symlink");
+    let pipeline = actual.join("pipeline.yaml");
+    let before = std::fs::read(&pipeline).unwrap();
+    let output = guess_config(workspace.path(), "linked/pipeline.yaml", &["--write"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(parse_report(&output)["write"]["reason"], "config_symlink");
+    assert_eq!(std::fs::read(pipeline).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn write_symlink_input_is_patch_only() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = workspace();
+    write_flat_json_pipeline(workspace.path(), "numeric", None, "[{\"n\":1}]");
+    let pipeline = workspace.path().join("pipeline.yaml");
+    let before = std::fs::read(&pipeline).unwrap();
+    std::fs::rename(
+        workspace.path().join("input.json"),
+        workspace.path().join("actual-input.json"),
+    )
+    .expect("move input behind symlink");
+    symlink("actual-input.json", workspace.path().join("input.json"))
+        .expect("create input symlink");
+    let output = guess(workspace.path(), &["--write"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(parse_report(&output)["write"]["reason"], "input_symlink");
+    assert_eq!(std::fs::read(pipeline).unwrap(), before);
+}
+
+#[test]
+fn write_two_cooperating_writers_serialize_on_the_stable_lock() {
+    let workspace = workspace();
+    write_flat_json_pipeline(workspace.path(), "numeric", None, "[{\"n\":1}]");
+    let pipeline = workspace.path().join("pipeline.yaml");
+    let barrier = tempfile::tempdir().expect("write barrier directory");
+    let first = spawn_at_write_barrier(workspace.path(), barrier.path());
+    wait_for_barrier(barrier.path());
+    let second = guess(workspace.path(), &["--write"]);
+    assert_eq!(second.status.code(), Some(3));
+    assert_eq!(
+        parse_report(&second)["write"]["reason"],
+        "config_lock_contended"
+    );
+    std::fs::write(barrier.path().join("continue"), b"continue")
+        .expect("release first cooperating writer");
+    let first = first.wait_with_output().expect("collect first writer");
+    assert_eq!(first.status.code(), Some(0));
+    let after = std::fs::read_to_string(&pipeline).unwrap();
+    assert!(after.contains("type: int"));
+    assert!(
+        workspace
+            .path()
+            .join("pipeline.yaml.clinker-guess.lock")
+            .is_file()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(workspace.path().join("pipeline.yaml.clinker-guess.lock"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "lock sidecar must be owner-only");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn write_rejects_symlinked_or_broadly_accessible_lock_sidecar() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for unsafe_lock in ["symlink", "permissions"] {
+        let workspace = workspace();
+        write_flat_json_pipeline(workspace.path(), "numeric", None, "[{\"n\":1}]");
+        let pipeline = workspace.path().join("pipeline.yaml");
+        let before = std::fs::read(&pipeline).unwrap();
+        let lock_path = workspace.path().join("pipeline.yaml.clinker-guess.lock");
+        if unsafe_lock == "symlink" {
+            std::fs::write(workspace.path().join("lock-target"), b"target")
+                .expect("write lock symlink target");
+            symlink("lock-target", &lock_path).expect("create lock symlink");
+        } else {
+            std::fs::write(&lock_path, b"lock").expect("write broad lock file");
+            std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644))
+                .expect("broaden lock permissions");
+        }
+        let output = guess(workspace.path(), &["--write"]);
+        assert_eq!(output.status.code(), Some(3), "{unsafe_lock}");
+        assert_eq!(
+            parse_report(&output)["write"]["reason"],
+            format!("config_lock_{unsafe_lock}")
+        );
+        assert_eq!(std::fs::read(&pipeline).unwrap(), before);
+    }
+}
+
+#[test]
+fn write_concurrent_config_and_input_drift_are_detected_before_publication() {
+    for changed in ["config", "input"] {
+        let workspace = workspace();
+        write_flat_json_pipeline(workspace.path(), "numeric", None, "[{\"n\":1}]");
+        let barrier = tempfile::tempdir().expect("write barrier directory");
+        let child = spawn_at_write_barrier(workspace.path(), barrier.path());
+        wait_for_barrier(barrier.path());
+        if changed == "config" {
+            let pipeline = workspace.path().join("pipeline.yaml");
+            let mut raw = std::fs::read_to_string(&pipeline).unwrap();
+            raw.push_str("# concurrent writer\n");
+            std::fs::write(&pipeline, raw).expect("mutate config at barrier");
+        } else {
+            std::fs::write(workspace.path().join("input.json"), "[{\"n\":2}]")
+                .expect("mutate input at barrier");
+        }
+        std::fs::write(barrier.path().join("continue"), b"continue")
+            .expect("release write barrier");
+        let output = child.wait_with_output().expect("collect barred guess");
+        assert_eq!(output.status.code(), Some(3), "{changed} drift");
+        let report = parse_report(&output);
+        assert_eq!(report["write"]["status"], "not_written");
+        let reason = report["write"]["reason"].as_str().expect("drift reason");
+        assert!(
+            reason.starts_with(changed),
+            "unexpected {changed} drift reason {reason:?}"
+        );
+        let pipeline = std::fs::read_to_string(workspace.path().join("pipeline.yaml")).unwrap();
+        assert!(
+            pipeline.contains("type: numeric"),
+            "{changed} drift edited config"
+        );
+    }
+}
+
+#[test]
+fn write_failure_and_interruption_before_rename_preserve_original() {
+    for (environment, expected_exit) in [
+        ("CLINKER_TEST_GUESS_WRITE_FAIL_BEFORE_RENAME", 4),
+        ("CLINKER_TEST_GUESS_WRITE_INTERRUPT_BEFORE_RENAME", 130),
+    ] {
+        let workspace = workspace();
+        write_flat_json_pipeline(workspace.path(), "numeric", None, "[{\"n\":1}]");
+        let pipeline = workspace.path().join("pipeline.yaml");
+        let before = std::fs::read(&pipeline).unwrap();
+        let output = guess_with_env(workspace.path(), &["--write"], &[(environment, "1")]);
+        assert_eq!(output.status.code(), Some(expected_exit), "{environment}");
+        assert!(
+            output.stdout.is_empty(),
+            "{environment} emitted partial report"
+        );
+        assert_eq!(std::fs::read(&pipeline).unwrap(), before, "{environment}");
+        let siblings = std::fs::read_dir(workspace.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            siblings.iter().all(|name| !name.starts_with(".tmp")),
+            "{environment} left a sibling temporary: {siblings:?}"
+        );
+    }
 }
 
 #[test]

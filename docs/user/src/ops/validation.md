@@ -48,6 +48,7 @@ produce an exact patch, then review and apply that patch before compilation.
 clinker guess pipeline.yaml
 clinker guess pipeline.yaml --field orders.amount --field orders.tax
 clinker guess pipeline.yaml --channel production --check
+clinker guess pipeline.yaml --field orders.amount --write
 ```
 
 With no selector, the base pipeline is inspected. Exactly one `--channel ID`
@@ -71,15 +72,30 @@ and reports aggregate sampled, truncated, uncovered, and unreported counts for
 the rest. These fixed bounds are also printed in the JSON report.
 
 The manifest identity covers normalized path, configured order, and discovered
-size; it is not a content hash or a compare-and-swap proof. The future write
-mode must re-read and compare exact configuration and input snapshots before
-any edit. Preview and check perform no edit.
+size; it is not a content hash or a compare-and-swap proof. Preview and check
+perform no edit. Write additionally streams an exact BLAKE3 snapshot of every
+file in the capped manifest before evidence collection and compares it again
+after collection and immediately before publication.
 
 `--check` uses the same frozen, capped manifest but reads every selected file
 and record. It is exhaustive over that manifest rather than subject to the
-preview's open/record/byte sampling budgets. `--write` is reserved for the
-compare-and-swap editor and is not available yet: it exits 1, recommends
-`--check`, and does not edit the pipeline or input.
+preview's open/record/byte sampling budgets. `--write` is equally exhaustive,
+but edits only when exactly one resolved owner is an inline, literal `numeric`
+leaf in the base pipeline. An overlay, external/generated owner, alias,
+interpolation, symlink, non-local input, multiple owners, unresolved evidence,
+or changed snapshot leaves the pipeline untouched and reports the patch with
+exit 3. A successful edit changes only the `numeric` token; nullability,
+requiredness, defaults, precision, scale, and every sibling byte are preserved.
+
+Publication holds an advisory `fs4` lock on the stable sibling
+`<CONFIG>.clinker-guess.lock` file through a sibling-temp flush/fsync, final
+exact byte/semantic/input revalidation, atomic replacement, and parent directory
+fsync. The lock file remains beside the config so cooperating replacements keep
+one lock inode across renames; it must remain regular, non-symlinked, and
+owner-only on Unix. This catches any change visible at the final comparison,
+but is not a kernel-enforced content-conditional rename: a writer that ignores
+the advisory lock can still race after the final check. Use one cooperating
+configuration writer per file.
 
 Numeric votes come only from the parser-owned observations used by the shared
 runtime reader construction. Exact integers vote `int`; finite, representation-
@@ -91,9 +107,9 @@ unresolved. No confidence threshold or statistical guess is used.
 
 | Exit | Meaning |
 |------|---------|
-| 0 | Preview completed, including a preview with unresolved owners; or exhaustive check resolved every owner. |
-| 1 | Configuration or selection error, including unavailable `--write`. |
-| 3 | Exhaustive `--check` completed but at least one owner is unresolved. |
+| 0 | Preview completed, including a preview with unresolved owners; exhaustive check resolved every owner; or write published its one safe edit. |
+| 1 | Configuration or selection error. |
+| 3 | Exhaustive check is unresolved, or write emitted a patch but did not safely edit. |
 | 4 | Source discovery, reader, I/O, signal-handler, or report-output failure. |
 | 130 | Interrupted before a complete report could be emitted. |
 

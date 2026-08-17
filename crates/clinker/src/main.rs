@@ -98,16 +98,18 @@ EXAMPLES:
   clinker run pipeline.yaml --metrics-spool-dir /var/spool/clinker"
     )]
     Run(RunArgs),
-    /// Preview concrete types for inference-only numeric source columns.
+    /// Preview, check, or safely write concrete numeric source types.
     #[command(
         long_about = "\
 Inspect the source bytes selected by one effective pipeline configuration and \
 preview exact `int` or `float` replacements for source columns declared \
-`numeric`. The command is read-only and emits one stable JSON document.",
+`numeric`. Preview and check are read-only. `--write` exhausts evidence and \
+edits only one directly-authored owner after fail-closed revalidation.",
         after_long_help = "\
 EXAMPLES:
   clinker guess pipeline.yaml
   clinker guess pipeline.yaml --field orders.amount
+  clinker guess pipeline.yaml --field orders.amount --write
   clinker guess pipeline.yaml --channel acme
   clinker guess pipeline.yaml --group enterprise"
     )]
@@ -696,7 +698,7 @@ impl RunArgs {
     }
 }
 
-/// Arguments for read-only `clinker guess` analysis.
+/// Arguments for `clinker guess` analysis and guarded concretization.
 #[derive(Parser, Debug)]
 pub struct GuessArgs {
     /// Path to the pipeline YAML configuration file.
@@ -718,8 +720,8 @@ pub struct GuessArgs {
     #[arg(long)]
     pub check: bool,
 
-    /// Reserved for compare-and-swap editing; currently reports a correction.
-    #[arg(long, hide = true)]
+    /// Exhaust evidence and atomically edit one safe, directly-authored owner.
+    #[arg(long)]
     pub write: bool,
 
     /// Workspace root holding clinker.toml and channel/group roots.
