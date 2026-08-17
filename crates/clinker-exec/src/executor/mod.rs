@@ -1,3 +1,4 @@
+pub mod capabilities;
 pub mod stage_metrics;
 
 pub(crate) mod aggregate_dispatch;
@@ -272,6 +273,12 @@ impl RecordStorage for NullStorage {
 /// - TwoPass (arena + indices) when windows are present
 pub struct PipelineExecutor;
 
+fn run_capability_error(error: capabilities::RunCapabilityError) -> PipelineError {
+    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+        "[E379] activation admission failed: {error}"
+    )))
+}
+
 impl PipelineExecutor {
     /// `&CompiledPlan`-consuming public entry point.
     ///
@@ -310,6 +317,28 @@ impl PipelineExecutor {
         writers: W,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
+        let capabilities =
+            capabilities::AdmittedRunCapabilities::uncredentialed(plan.dag().source_activation())
+                .map_err(run_capability_error)?;
+        Self::run_admitted_plan_with_readers_writers(plan, capabilities, readers, writers, params)
+    }
+
+    /// Run a compiled plan using one executor-owned sealed capability bundle.
+    ///
+    /// The bundle is validated against this exact compiled activation inventory
+    /// before the executor recompiles the effective config, creates its memory
+    /// arbitrator, or constructs a Source or Sink. It remains owned by this
+    /// stack frame until success, failure, or interruption unwinds the run.
+    pub fn run_admitted_plan_with_readers_writers<W: Into<WriterRegistry>>(
+        plan: &clinker_plan::plan::CompiledPlan,
+        capabilities: capabilities::AdmittedRunCapabilities,
+        readers: SourceReaders,
+        writers: W,
+        params: &PipelineRunParams,
+    ) -> Result<ExecutionReport, PipelineError> {
+        capabilities
+            .ensure_matches(plan.dag().source_activation())
+            .map_err(run_capability_error)?;
         if plan.cxl_modules().is_empty() {
             return Self::run_with_readers_writers(plan.config(), readers, writers.into(), params);
         }
@@ -350,8 +379,37 @@ impl PipelineExecutor {
         readers: SourceReaders,
         writers: W,
         params: &PipelineRunParams,
+        compile_ctx: clinker_plan::config::CompileContext,
+    ) -> Result<ExecutionReport, PipelineError> {
+        let capabilities =
+            capabilities::AdmittedRunCapabilities::uncredentialed(plan.dag().source_activation())
+                .map_err(run_capability_error)?;
+        Self::run_admitted_plan_with_readers_writers_in_context(
+            plan,
+            capabilities,
+            readers,
+            writers,
+            params,
+            compile_ctx,
+        )
+    }
+
+    /// Run an admitted compiled plan against an explicit compile anchor.
+    ///
+    /// Capability ownership and cleanup match
+    /// [`Self::run_admitted_plan_with_readers_writers`]; this variant only
+    /// supplies the runtime compile context used for file-size estimates.
+    pub fn run_admitted_plan_with_readers_writers_in_context<W: Into<WriterRegistry>>(
+        plan: &clinker_plan::plan::CompiledPlan,
+        capabilities: capabilities::AdmittedRunCapabilities,
+        readers: SourceReaders,
+        writers: W,
+        params: &PipelineRunParams,
         mut compile_ctx: clinker_plan::config::CompileContext,
     ) -> Result<ExecutionReport, PipelineError> {
+        capabilities
+            .ensure_matches(plan.dag().source_activation())
+            .map_err(run_capability_error)?;
         compile_ctx.cxl_modules = plan.cxl_modules().clone();
         Self::run_with_readers_writers_in_context(
             plan.config(),
