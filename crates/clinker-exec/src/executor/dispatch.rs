@@ -1141,6 +1141,8 @@ pub(crate) struct ExecutorContext<'a> {
     /// time when the pipeline run began.
     pub(crate) source_ingestion_timestamp: chrono::NaiveDateTime,
     pub(crate) strategy: ErrorStrategy,
+    /// One resolved policy shared with Source readers and the final report.
+    pub(crate) run_policy: crate::executor::RunPolicy,
 
     // Owned mutable per-walk state.
     pub(crate) node_buffers: HashMap<NodeBufferKey, NodeBuffer>,
@@ -4579,6 +4581,16 @@ pub(crate) fn dispatch_plan_node(
         }
 
         PlanNode::Output { .. } => {
+            if matches!(
+                ctx.run_policy.preview(),
+                crate::executor::PreviewPolicy::ConfigOnly
+            ) {
+                return Err(PipelineError::Internal {
+                    op: "run-policy",
+                    node: node.name().to_string(),
+                    detail: "config-only policy reached Output dispatch".to_string(),
+                });
+            }
             crate::executor::output_dispatch::dispatch_output(ctx, current_dag, node_idx, &node)?;
         }
 
