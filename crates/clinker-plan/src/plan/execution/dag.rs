@@ -854,6 +854,7 @@ mod port_tag_guard_tests {
             signature_path: std::path::PathBuf::from("compositions/test.comp.yaml"),
             semantic_name: "test".to_string(),
             semantic_digest: [0; 32],
+            resource_bindings: indexmap::IndexMap::new(),
             graph: body_graph,
             topo_order: Vec::new(),
             name_to_idx: HashMap::new(),

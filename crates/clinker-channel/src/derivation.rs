@@ -308,6 +308,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            resources: Default::default(),
             vars: Default::default(),
             overrides: Vec::new(),
         }

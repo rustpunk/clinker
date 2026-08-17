@@ -19,14 +19,16 @@ pub mod yaml;
 
 pub use config::{
     CompileContext, CompositionFile, CompositionSignature, CompositionSymbolTable, NodeRef,
-    OutputAlias, ParamDecl, ParamName, ParamType, PortDecl, PortName, ResourceDecl, ResourceKind,
-    ResourceName, SourceMap, SpannedNodeRef, WORKSPACE_COMPOSITION_BUDGET,
+    OutputAlias, ParamDecl, ParamName, ParamType, PortDecl, PortName, ResourceBinding,
+    ResourceCapability, ResourceDecl, ResourceKind, ResourceLifetime, ResourceName,
+    ResourceOpenerKind, SourceMap, SpannedNodeRef, WORKSPACE_COMPOSITION_BUDGET,
     scan_workspace_signatures, validate_signatures,
 };
 pub use error::PipelineError;
 pub use overlay_ops::{
-    AddOp, BypassOp, CompositionInputPorts, LayeredOp, OverlayLayer, OverlayOp, OverlayOpError,
-    PatchSchemaOp, RemoveOp, ReplaceOp, SetOp, apply_overlay_ops, apply_overlay_ops_with_ports,
+    AddOp, BindResourceOp, BypassOp, CompositionInputPorts, LayeredOp, OverlayLayer, OverlayOp,
+    OverlayOpError, PatchSchemaOp, RemoveOp, ReplaceOp, SetOp, apply_overlay_ops,
+    apply_overlay_ops_with_ports,
 };
 pub use plan::{
     BoundBody, ColumnLookup, CompositionBodyId, QualifiedField, Row, RowTail, TailVarId,

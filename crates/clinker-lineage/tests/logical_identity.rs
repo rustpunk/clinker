@@ -1,3 +1,7 @@
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use clinker_lineage::dataset::resource_dataset_identity;
 use clinker_lineage::logical_identity::{
     DatasetIdentifierType, DatasetSubset, ExternalDatasetIdentity, LineageIdentityContext,
     LineageIdentityError, LineageNodeBinding, SymlinkIdentifier,
@@ -8,6 +12,37 @@ use clinker_lineage::{
 };
 use clinker_plan::CompileContext;
 use clinker_plan::config::parse_config;
+use clinker_plan::resources::{
+    CatalogConfig, CatalogResourceConfig, FileResourceAccess, LogicalResourceId, WorkspaceCatalog,
+};
+
+static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
+
+struct TestWorkspace {
+    path: PathBuf,
+}
+
+impl TestWorkspace {
+    fn new(label: &str) -> Self {
+        let sequence = NEXT_WORKSPACE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "clinker-lineage-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("unique test workspace");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestWorkspace {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).expect("remove test workspace");
+    }
+}
 
 fn lifecycle_facts() -> RunLifecycleFacts {
     RunLifecycleFacts {
@@ -25,6 +60,58 @@ fn lifecycle_facts() -> RunLifecycleFacts {
             stats: Some(RunStats::default()),
         },
     }
+}
+
+#[test]
+fn resource_kind_file_has_stable_logical_dataset_identity() {
+    let workspace = TestWorkspace::new("stable-resource");
+    std::fs::write(workspace.path().join("orders.csv"), "id\n1\n").expect("resource file");
+    let config = CatalogConfig {
+        resources: std::collections::BTreeMap::from([(
+            "shared.orders".to_string(),
+            CatalogResourceConfig::File {
+                path: "orders.csv".into(),
+                access: FileResourceAccess::Read,
+            },
+        )]),
+        ..CatalogConfig::default()
+    };
+    let catalog = WorkspaceCatalog::load(workspace.path(), &config).expect("catalog");
+    let id = LogicalResourceId::parse("shared.orders").expect("logical id");
+    let dataset = resource_dataset_identity(catalog.resolve_resource(&id).expect("resource"))
+        .expect("file resource is external");
+    assert_eq!(dataset.namespace, "clinker-resource:file");
+    assert_eq!(dataset.name, "shared.orders");
+}
+
+#[test]
+fn resource_kind_identity_omits_descriptor_and_secret_material() {
+    let first = TestWorkspace::new("first-resource");
+    let second = TestWorkspace::new("second-resource");
+    std::fs::write(first.path().join("first.csv"), "id\n1\n").expect("first file");
+    std::fs::write(second.path().join("second.csv"), "id\n2\n").expect("second file");
+    let build = |root: &std::path::Path, path: &str| {
+        let config = CatalogConfig {
+            resources: std::collections::BTreeMap::from([(
+                "shared.orders".to_string(),
+                CatalogResourceConfig::File {
+                    path: path.into(),
+                    access: FileResourceAccess::Read,
+                },
+            )]),
+            ..CatalogConfig::default()
+        };
+        let catalog = WorkspaceCatalog::load(root, &config).expect("catalog");
+        let id = LogicalResourceId::parse("shared.orders").expect("logical id");
+        resource_dataset_identity(catalog.resolve_resource(&id).expect("resource"))
+            .expect("external identity")
+    };
+    let first = build(first.path(), "first.csv");
+    let second = build(second.path(), "second.csv");
+    assert_eq!(first, second, "physical relocation is not identity");
+    let rendered = format!("{first:?}");
+    assert!(!rendered.contains("first.csv"));
+    assert!(!rendered.contains("credential"));
 }
 
 #[test]

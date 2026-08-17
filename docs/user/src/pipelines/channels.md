@@ -8,7 +8,8 @@ against one pipeline, with strict validation and per-value provenance.
 
 A channel is a tenant. A **group** is a reusable overlay shared by many
 channels — selected automatically from a channel's labels, or invoked by name.
-Groups and target files can contribute **value clobber** (`config:` / `vars:`)
+Groups and target files can contribute **value clobber** (`config:` / `vars:` /
+`resources:`)
 and an ordered **op list** (`overrides:`). A channel-wide manifest is narrower:
 it may contain only labels plus declared config and variables.
 
@@ -53,8 +54,9 @@ scheme, so `shard` never changes resolution semantics.
 
 ### Typed workspace catalog
 
-The same `clinker.toml` may declare stable logical identities for five resource
-kinds: `rules`, `schemas`, `compositions`, `pipelines`, and `channels`.
+The same `clinker.toml` declares stable logical identities in separate catalog
+namespaces for rules, schemas, compositions, pipelines, channels, and typed
+composition resources.
 
 ```toml
 [catalog]
@@ -74,12 +76,23 @@ rules_root = "rules"
 
 [catalog.channels]
 "tenant.globex" = "channel/globex"
+
+[catalog.resources.shared_orders]
+kind = "file"
+path = "data/orders.csv"
+access = "read"
 ```
 
 Logical identities are kind-scoped. The rule and schema named `shared.dates`
 above are distinct typed resources; asking for one kind never substitutes an
 entry from another kind. A missing identity or a reference through the wrong
 kind fails planning and names the catalog table that must contain it.
+
+`catalog.resources` is additionally descriptor-typed. The current `file` kind
+accepts only `path` and `access` (`read`, `write`, or `read-write`), is admitted
+under fixed catalog entry and descriptor-byte caps, and contains no credential
+fields. Resource bindings use the logical key (`shared_orders` above), never
+the path.
 
 Every catalog path and rules root is anchored to the selected workspace (from
 `--base-dir` or workspace discovery). Parent traversal, an absolute path outside
@@ -137,13 +150,13 @@ winning config map enter executable compilation. Scoped `vars:` are likewise
 validated before executor initialization. One invocation produces one validated
 effective plan.
 
-## Value clobber: `config` and `vars`
+## Value clobber: `config`, `vars`, and `resources`
 
 The value-clobber surface carries scalar overrides. It appears identically on a
 group, a channel manifest, and a per-target overlay.
 
-`config:` overrides composition **config knobs**, keyed by `alias.param` dotted
-paths (the composition node's alias, then the parameter name):
+`config:` overrides composition **config knobs**, keyed by `node.param` dotted
+paths (the composition node's `name`, then the parameter name):
 
 ```yaml
 config:
@@ -160,6 +173,32 @@ the value.
 A `config:` key that matches no parameter in the compiled plan is a hard error
 ([E113](#diagnostics)) — a misspelled or stale key aborts the run rather than
 silently doing nothing.
+
+### Rebinding a composition resource
+
+`resources:` changes which logical catalog resource supplies one declared
+composition slot. The key is `composition-node.slot`; the leaf uses the same
+`{ value, fixed }` shape as other clobbers:
+
+```yaml
+# channel.cfg.yaml, a group file, or a per-target file
+resources:
+  lookup.orders: { value: tenant_orders }
+```
+
+The base composition call must already declare `orders` under
+`_compose.resources_schema`, and `tenant_orders` must exist under
+`[catalog.resources]` with the required kind and capabilities. Group,
+channel-wide, and per-target candidates use the ordinary precedence order and
+retain every attempted layer plus the winner. `fixed: true` locks a lower
+binding against higher layers just as it does for config values.
+
+Only a scalar logical identity is accepted as `value`. Inline descriptors and
+credential/profile/secret/token selectors are rejected at the strict YAML
+leaf. An overlay cannot introduce a slot, address an internal nested slot, or
+change ports, composition names, or config through this surface. Resource
+rebinding changes the semantic plan fingerprint but does not resolve
+credentials or open runtime handles.
 
 ### Locking a value: `fixed`
 
@@ -512,7 +551,7 @@ before execution. Overlay flags shared across `run` and `explain`:
 | `--no-auto-groups` | Suppress selector-derived group membership; only explicit `--group` overlays apply. |
 | `--channel <ID>` | Apply a logical id from `[catalog.channels]`; the selected `[catalog.pipelines]` id must appear in its manifest targets. Derives only target-admitted matching groups. |
 
-`explain --field <alias.param> --group <NAME>` reports the same overlay stack for
+`explain --field <node.param> --group <NAME>` reports the same overlay stack for
 provenance lookups, mirroring `run`.
 
 ### Inspecting overlays
@@ -727,13 +766,13 @@ lineage do not collide.
 
 | Code | Meaning |
 |------|---------|
-| **E103** | A `config:` candidate has the wrong value type or attempts to override a lower fixed value. Every candidate is checked at its own leaf, including one a later layer would shadow. |
+| **E103** | A `config:` candidate has the wrong value type or attempts to override a lower fixed value, or a resource binding names an unknown/undeclared/incompatible slot or catalog identity. Every candidate is checked at its own leaf, including one a later layer would shadow. |
 | **E107** | A channel/group variable candidate disagrees with the pipeline declaration or its default does not match the declared type. |
 | **E110** | A variable candidate shadows a reserved scoped-variable name. |
 | **E111** | A `vars.source` candidate names no source in the selected pipeline. |
 | **E113** | A `config:` / override key matches no composition parameter in the compiled plan. A misspelled or stale key aborts the run instead of silently doing nothing. |
 | **E114** | An overlay op failed to apply (missing splice anchor, duplicate node name, missing/removed `target`, invalid `set` field, invalid `bypass` node). The diagnostic is anchored to the offending op's source span, not the base pipeline. |
-| **E118** | A shorthand `alias.param` candidate is ambiguous in the selected composition closure; use the exact target-specific alias. |
+| **E118** | A shorthand `node.param` candidate is ambiguous in the selected composition closure; use the exact target-specific node path. |
 | **E230** | A source patch (`sources.<src>` or `patch_schema`) targets a source that does not exist: an unknown top-level source, an unknown composition for a qualified `<composition>.<source>` key, a `<composition>.<source>` naming no source in that composition's body, or a nested (`a.b.c`) key. |
 | **E231** | A schema `rename` / `modify` / `remove` of a column that does not exist. |
 | **E232** | A schema `add` of a column name that already exists. |

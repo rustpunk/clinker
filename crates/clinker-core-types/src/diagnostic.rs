@@ -137,6 +137,11 @@ const fn is_retired_terminal_code(code: &str) -> bool {
     bytes.len() == 4 && bytes[0] == b'E' && bytes[1] == b'3' && bytes[2] == b'7' && bytes[3] == b'6'
 }
 
+const fn is_composition_call_surface_code(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    bytes.len() == 4 && bytes[0] == b'E' && bytes[1] == b'3' && bytes[2] == b'7' && bytes[3] == b'7'
+}
+
 const fn lifecycle_for_code(code: &str) -> DiagnosticLifecycle {
     if is_retired_terminal_code(code) {
         DiagnosticLifecycle::RetiredReserved
@@ -149,7 +154,7 @@ const fn category_for_code(code: &str) -> DiagnosticCategory {
     let bytes = code.as_bytes();
     if is_retired_terminal_code(code) {
         DiagnosticCategory::TerminalAuthoring
-    } else if bytes.is_empty() {
+    } else if bytes.is_empty() || is_composition_call_surface_code(code) {
         DiagnosticCategory::Configuration
     } else if bytes[0] == b'W' {
         DiagnosticCategory::Advisory
@@ -167,6 +172,9 @@ const fn category_for_code(code: &str) -> DiagnosticCategory {
 }
 
 const fn correction_for_code(code: &str) -> &'static str {
+    if is_composition_call_surface_code(code) {
+        return "Use the composition node `name:` for its namespace, or declare `_compose.outputs` and reference `<node>.<port>` downstream.";
+    }
     match category_for_code(code) {
         DiagnosticCategory::Configuration => "Correct the source-located pipeline configuration.",
         DiagnosticCategory::Composition => {
@@ -405,6 +413,7 @@ diagnostic_registry! {
     "E374", Error, "A transform log directive requests a `fields` selector the input record does not carry";
     "E375", Error, "One `log` event name is declared with two different field sets in the same plan";
     "E376", Error, "Terminal node uses the retired `type: output` spelling";
+    "E377", Error, "Ordinary composition call uses rejected inert `alias` or `outputs` state";
     // ── Path security ───────────────────────────────────────────────────
     "E-SEC-001", Error, "Path security violation (escape, symlink, etc.)";
     // ── Warnings ────────────────────────────────────────────────────────

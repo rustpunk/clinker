@@ -238,9 +238,9 @@ fn semantic_node(
     node: &crate::config::PipelineNode,
 ) -> Result<serde_json::Value, serde_json::Error> {
     let mut value = serde_json::to_value(node)?;
-    // Resource bindings on a composition call are deployment locators; the
-    // body digest and typed call-site config carry execution meaning
-    // separately.
+    // Strip physical deployment locators while retaining logical composition
+    // resource bindings: selecting a different logical dataset changes plan
+    // semantics even though its catalog descriptor stays outside this value.
     crate::config::composition::strip_node_deployment_locators(&mut value);
     let Some(object) = value.as_object_mut() else {
         return Ok(value);

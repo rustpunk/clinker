@@ -21,7 +21,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use clinker_plan::config::ScopedVarType;
 use clinker_plan::config::SourceConfigPatch;
+use clinker_plan::config::is_reserved_credential_selector;
 use clinker_plan::overlay_ops::OverlayOp;
+use clinker_plan::resources::LogicalResourceId;
 use clinker_plan::yaml::{Location, Spanned};
 
 use crate::error::ChannelError;
@@ -52,6 +54,9 @@ pub struct ChannelManifest {
     /// Channel-wide config candidates, each written as `{ value, fixed }`.
     #[serde(default)]
     pub config: IndexMap<String, ChannelConfigValue>,
+    /// Channel-wide typed resource clobbers keyed `composition-node.slot`.
+    #[serde(default)]
+    pub resources: IndexMap<String, ResourceOverlayValue>,
     /// Channel-wide var overlays, using the same four scopes a pipeline's
     /// `vars:` block uses.
     #[serde(default)]
@@ -84,6 +89,8 @@ pub struct OverlayCandidate<T> {
 
 /// One channel config candidate with its value, lock, and authored spans.
 pub type ChannelConfigValue = OverlayCandidate<serde_json::Value>;
+/// One typed resource candidate. The value is only a logical catalog id.
+pub type ResourceOverlayValue = OverlayCandidate<LogicalResourceId>;
 
 impl<'de, T> Deserialize<'de> for OverlayCandidate<T>
 where
@@ -132,6 +139,9 @@ pub struct OverlayFile {
     /// Each leaf independently carries its `fixed` lock at the highest layer.
     #[serde(default)]
     pub config: IndexMap<String, ChannelConfigValue>,
+    /// Per-target typed resource clobbers keyed `composition-node.slot`.
+    #[serde(default)]
+    pub resources: IndexMap<String, ResourceOverlayValue>,
     /// Per-target var overlays, using the same four scopes a pipeline's
     /// `vars:` block uses.
     #[serde(default)]
@@ -250,6 +260,7 @@ impl ChannelManifest {
                     .to_string(),
             });
         }
+        validate_resource_overlay_keys(&manifest.resources)?;
         Ok(manifest)
     }
 
@@ -298,7 +309,9 @@ impl OverlayFile {
     /// only for diagnostic context — the overlay `target` comes from the YAML
     /// body, never from the filename.
     pub fn from_yaml_bytes(bytes: &[u8], source_path: PathBuf) -> Result<Self, ChannelError> {
-        parse_yaml(bytes, source_path)
+        let overlay: Self = parse_yaml(bytes, source_path)?;
+        validate_resource_overlay_keys(&overlay.resources)?;
+        Ok(overlay)
     }
 
     /// Load and parse a per-target overlay file from disk.
@@ -306,6 +319,38 @@ impl OverlayFile {
         let bytes = std::fs::read(path)?;
         Self::from_yaml_bytes(&bytes, path.to_path_buf())
     }
+}
+
+pub(crate) fn validate_resource_overlay_keys(
+    resources: &IndexMap<String, ResourceOverlayValue>,
+) -> Result<(), ChannelError> {
+    for (address, candidate) in resources {
+        let mut segments = address.split('.');
+        let node = segments.next().unwrap_or_default();
+        let slot = segments.next().unwrap_or_default();
+        if node.is_empty() || slot.is_empty() || segments.next().is_some() {
+            return Err(ChannelError::InvalidManifest {
+                line: candidate.value_span.line(),
+                reason: format!(
+                    "resource key `{address}` is malformed; resource overlays address one public composition slot"
+                ),
+                correction:
+                    "use `resources: { composition_node.slot: { value: catalog.resource } }`"
+                        .to_string(),
+            });
+        }
+        if is_reserved_credential_selector(slot) {
+            return Err(ChannelError::InvalidManifest {
+                line: candidate.value_span.line(),
+                reason: format!(
+                    "resource key `{address}` attempts to select credentials from an overlay"
+                ),
+                correction: "remove the credential/profile key; credential selection is an explicit run preflight choice"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Shared parse path for both file kinds: UTF-8 check, then the canonical
@@ -318,8 +363,59 @@ where
         path: source_path.clone(),
         source: e,
     })?;
+    validate_resource_overlay_shape(text, &source_path)?;
     clinker_plan::yaml::from_str(text).map_err(|e| ChannelError::Yaml {
         path: source_path,
         source: Box::new(e.0),
     })
+}
+
+/// Reject non-scalar resource candidates before typed deserialization can
+/// render their authored payload in a YAML type-error snippet.
+///
+/// The temporary document is bounded by the canonical YAML parser budget and
+/// is dropped before the typed manifest is parsed.
+pub(crate) fn validate_resource_overlay_shape(
+    text: &str,
+    source_path: &Path,
+) -> Result<(), ChannelError> {
+    let document: serde_json::Value =
+        clinker_plan::yaml::from_str(text).map_err(|error| ChannelError::Yaml {
+            path: source_path.to_path_buf(),
+            source: Box::new(error.0),
+        })?;
+    let Some(resources) = document.as_object().and_then(|root| root.get("resources")) else {
+        return Ok(());
+    };
+    let Some(resources) = resources.as_object() else {
+        return Err(invalid_resource_overlay_shape());
+    };
+    for candidate in resources.values() {
+        let Some(candidate) = candidate.as_object() else {
+            return Err(invalid_resource_overlay_shape());
+        };
+        let value = candidate.get("value").and_then(serde_json::Value::as_str);
+        if candidate.len() > 2
+            || candidate.keys().any(|key| key != "value" && key != "fixed")
+            || value.is_none()
+            || candidate
+                .get("fixed")
+                .is_some_and(|fixed| !fixed.is_boolean())
+            || value.is_some_and(|value| LogicalResourceId::parse(value).is_err())
+        {
+            return Err(invalid_resource_overlay_shape());
+        }
+    }
+    Ok(())
+}
+
+fn invalid_resource_overlay_shape() -> ChannelError {
+    ChannelError::InvalidManifest {
+        line: 1,
+        reason: "resource overlay values must be secret-free logical catalog identities"
+            .to_string(),
+        correction:
+            "use `resources: { composition_node.slot: { value: catalog.resource, fixed: false } }`"
+                .to_string(),
+    }
 }

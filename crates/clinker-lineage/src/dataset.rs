@@ -23,6 +23,7 @@ use std::path::Path;
 
 use clinker_plan::config::{OutputConfig, SourceConfig};
 use clinker_plan::plan::execution::PlanNode;
+use clinker_plan::resources::{CatalogResource, ResourceDescriptor};
 
 use crate::openlineage::Dataset;
 
@@ -37,6 +38,9 @@ pub const FILE_NAMESPACE: &str = "file";
 /// The dataset name is then the plan node's own name; richer network-dataset
 /// naming is intentionally outside this module's scope.
 pub const FALLBACK_NAMESPACE: &str = "clinker";
+
+/// Stable namespace for typed catalog file resources.
+pub const RESOURCE_FILE_NAMESPACE: &str = "clinker-resource:file";
 
 /// Separates a multi-record source's base dataset name from one record type id
 /// in the composed per-record-type name (`<base><sep><id>`).
@@ -112,6 +116,22 @@ impl From<DatasetId> for Dataset {
             input_facets: None,
             output_facets: None,
         }
+    }
+}
+
+/// Stable OpenLineage identity for one admitted typed catalog resource.
+///
+/// The match is intentionally exhaustive over resource descriptor kinds. A
+/// future external kind must choose its own stable identity inputs here; an
+/// internal-only kind must add an explicit documented `None` arm instead of
+/// falling through. Credentials, opened handles, and record values are not
+/// available to this function.
+pub fn resource_dataset_identity(resource: &CatalogResource) -> Option<DatasetId> {
+    match resource.descriptor() {
+        ResourceDescriptor::File { .. } => Some(DatasetId {
+            namespace: RESOURCE_FILE_NAMESPACE.to_string(),
+            name: resource.id().to_string(),
+        }),
     }
 }
 

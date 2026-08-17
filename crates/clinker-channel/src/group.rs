@@ -37,7 +37,10 @@ use clinker_plan::resources::{CatalogResourceKind, LogicalResourceId, WorkspaceC
 use clinker_plan::yaml::Spanned;
 
 use crate::error::ChannelError;
-use crate::manifest::{ChannelConfigValue, ChannelVars};
+use crate::manifest::{
+    ChannelConfigValue, ChannelVars, ResourceOverlayValue, validate_resource_overlay_keys,
+    validate_resource_overlay_shape,
+};
 
 /// Priority applied to a group that omits `priority:`.
 ///
@@ -72,6 +75,8 @@ pub struct Group {
     /// as raw strings here; dotted-path validation happens at apply time).
     /// Each leaf independently carries its `fixed` lock.
     pub config: IndexMap<String, ChannelConfigValue>,
+    /// Typed resource clobbers keyed `composition-node.slot`.
+    pub resources: IndexMap<String, ResourceOverlayValue>,
     /// Value-clobber vars surface, in the same four scopes a pipeline's `vars:`
     /// block uses (`static` / `pipeline` / `source` / `record`). Reuses the
     /// channel overlay's [`ChannelVars`](crate::manifest::ChannelVars) type.
@@ -93,6 +98,23 @@ impl Group {
             path: source_path.clone(),
             source: e,
         })?;
+        validate_resource_overlay_shape(text, &source_path).map_err(|error| match error {
+            ChannelError::InvalidManifest {
+                line,
+                reason,
+                correction,
+            } => ChannelError::InvalidGroup {
+                group: source_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("group")
+                    .to_string(),
+                line,
+                reason,
+                correction,
+            },
+            other => other,
+        })?;
         let raw: RawGroupFile =
             clinker_plan::yaml::from_str(text).map_err(|e| ChannelError::Yaml {
                 path: source_path,
@@ -108,6 +130,19 @@ impl Group {
                     .to_string(),
             });
         }
+        validate_resource_overlay_keys(&raw.resources).map_err(|error| {
+            ChannelError::InvalidGroup {
+                group: raw.group.name.clone(),
+                line: raw
+                    .resources
+                    .values()
+                    .next()
+                    .map_or(1, |candidate| candidate.value_span.line()),
+                reason: error.to_string(),
+                correction: "use `resources: { composition_node.slot: { value: catalog.resource } }`; credential/profile selectors are not resource slots"
+                    .to_string(),
+            }
+        })?;
 
         Ok(Group {
             name: raw.group.name,
@@ -115,6 +150,7 @@ impl Group {
             priority: raw.group.priority,
             targets: raw.group.targets,
             config: raw.config,
+            resources: raw.resources,
             vars: raw.vars,
             overrides: raw.overrides,
         })
@@ -135,6 +171,8 @@ struct RawGroupFile {
     group: RawGroupMeta,
     #[serde(default)]
     config: IndexMap<String, ChannelConfigValue>,
+    #[serde(default)]
+    resources: IndexMap<String, ResourceOverlayValue>,
     #[serde(default)]
     vars: ChannelVars,
     #[serde(default)]
