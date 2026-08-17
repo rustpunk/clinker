@@ -103,7 +103,7 @@ none of the D-19 seed symbols is assigned to it. In particular,
 ## Terminal Node Vocabulary
 
 The current planner and runtime use `PipelineNode::Output`, `OutputConfig`,
-Output-oriented dispatch, and public YAML `type: output`. D-56 assigns the
+Output-oriented dispatch, and public YAML `type: sink`. D-56 assigns the
 terminal-node-only migration to Sink to AUTH-09, wholly before Phase
 4.1 endpoint work. Phase 1 does not change Rust, YAML, examples, fixtures, or
 tests. Output ports, artifacts, paths, formats, stdout, machine output, writer

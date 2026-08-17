@@ -77,7 +77,7 @@ and [Streaming vs. Blocking Stages](execution-model.md#plan-admission-and-runtim
 
 ## Terminal destination vocabulary
 
-`PipelineNode::Output` and YAML `type: output` are the current terminal-writer
+`PipelineNode::Output` and YAML `type: sink` are the current terminal-writer
 surface. D-56 assigns an atomic migration of that terminal destination concept
 to `Sink` / `type: sink` under AUTH-09, before endpoint expansion. The
 migration has not landed. Output ports, produced artifacts and

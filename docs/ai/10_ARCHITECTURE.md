@@ -55,7 +55,7 @@ Verified facts:
 
 Verified end-to-end shape:
 
-1. A user-facing pipeline YAML looks like `examples/pipelines/customer_etl.yaml`: `pipeline:` metadata, a `nodes:` list with `type: source`, `type: transform`, `type: output`, and optional `error_handling:`.
+1. A user-facing pipeline YAML looks like `examples/pipelines/customer_etl.yaml`: `pipeline:` metadata, a `nodes:` list with `type: source`, `type: transform`, `type: sink`, and optional `error_handling:`.
 2. Config loading goes through `clinker-plan`. `load_config` / `load_config_with_vars` parse YAML into `PipelineConfig`, and `clinker_plan::yaml::from_str` is the parser chokepoint over `serde-saphyr` with a 32 MiB input cap and depth/node/alias budgets.
 3. `PipelineNode` deserialization is hand-written around the `type:` discriminator. It intentionally preserves per-node spans and per-variant `deny_unknown_fields` behavior.
 4. `PipelineConfig::compile_topology_only` checks duplicate names, self-loops, general cycles, undeclared input references, path validation, dotted-name restrictions, and log directive sanity.
@@ -118,7 +118,7 @@ envelope may refresh. See
 ### Current terminal node and locked target
 
 Current parser, planner, runtime, examples, and docs use `Output` and public
-YAML `type: output` for the terminal writer node. D-56 assigns one atomic,
+YAML `type: sink` for the terminal writer node. D-56 assigns one atomic,
 one-way migration of that **terminal destination concept** to Sink and
 `type: sink` under AUTH-09, before endpoint expansion. It is not
 available today. Output-port maps, produced artifacts and paths, serialization
