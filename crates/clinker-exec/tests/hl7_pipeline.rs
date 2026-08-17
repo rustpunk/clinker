@@ -115,7 +115,7 @@ nodes:
         emit seg = seg_id
         emit ctrl = set_ref
         emit mtype = $doc.transaction_set.f08
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -161,7 +161,7 @@ nodes:
       glob: ./*.hl7
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: messages
     config:
@@ -222,7 +222,7 @@ nodes:
     config:
       cxl: |
         emit seg = seg_id
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -269,7 +269,7 @@ nodes:
       glob: ./*.hl7
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: messages
     config:
@@ -336,7 +336,7 @@ nodes:
         emit ctrl = set_ref
         emit file_id = $doc.file.f07
         emit batch_id = $doc.batch.f07
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -375,7 +375,7 @@ nodes:
       glob: ./*.hl7
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: messages
     config:
@@ -409,7 +409,7 @@ nodes:
       glob: ./*.hl7
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: messages
     config:
@@ -459,7 +459,7 @@ nodes:
         emit code = f08_c1
         emit trigger = f08_c2
         emit patid = f03_c1
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -510,7 +510,7 @@ nodes:
           - { field: f03, components: 5 }
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: messages
     config:
@@ -557,7 +557,7 @@ nodes:
       cxl: |
         emit seg = seg_id
         emit f3 = f03
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -600,7 +600,7 @@ nodes:
           - { field: f08, components: 2 }
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: messages
     config:
@@ -645,7 +645,7 @@ nodes:
         emit seg = seg_id
         emit mtype = f08_c1
         emit mtrigger = f08_c2
-  - type: output
+  - type: sink
     name: out
     input: project
     config:

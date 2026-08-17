@@ -59,7 +59,7 @@ nodes:
         - { name: customer.name, type: string }
         - { name: customer.email, type: string }
         - { name: customer.address.city, type: string }
-  - type: output
+  - type: sink
     name: out
     input: orders
     config:

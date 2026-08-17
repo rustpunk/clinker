@@ -58,7 +58,7 @@ nodes:
         emit amount = amount
         emit batch = batch
         emit declared_total = $doc.Summary.total
-  - type: output
+  - type: sink
     name: out
     input: tag2
     config:
