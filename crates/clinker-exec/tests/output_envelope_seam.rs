@@ -57,7 +57,7 @@ nodes:
       cxl: |
         emit amount = amount
         emit batch = $doc.BatchInfo.batch_id
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -176,7 +176,7 @@ nodes:
       cxl: |
         emit amount = amount
         emit batch = $doc.BatchInfo.batch_id
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -307,7 +307,7 @@ nodes:
       glob: ./*.csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -340,7 +340,7 @@ nodes:
       dlq_granularity: document
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -372,7 +372,7 @@ nodes:
       correlation_key: order_id
       schema:
         - { name: order_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -413,7 +413,7 @@ nodes:
               batch_id: string
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: payments
     config:
@@ -462,7 +462,7 @@ nodes:
               checksum: string
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: payments
     config:
@@ -517,7 +517,7 @@ nodes:
               checksum: string
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: payments
     config:
@@ -579,7 +579,7 @@ nodes:
               checksum: string
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: payments
     config:
@@ -695,7 +695,7 @@ nodes:
       propagate_ck: driver
       cxl: |
         emit id = a.id
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
@@ -740,7 +740,7 @@ nodes:
       group_by: []
       cxl: |
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: totals
     config:
@@ -802,7 +802,7 @@ nodes:
               id: string
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out_a
     input: src_a
     config:
@@ -813,7 +813,7 @@ nodes:
       options:
         envelope:
           header_from_doc: HeadB
-  - type: output
+  - type: sink
     name: out_b
     input: src_b
     config:
@@ -856,7 +856,7 @@ nodes:
               batch_id: string
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: payments
     config:
@@ -902,7 +902,7 @@ nodes:
               batch_id: string
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: payments
     config:
@@ -993,7 +993,7 @@ nodes:
     inputs: [a, b]
     config:
       mode: concat
-  - type: output
+  - type: sink
     name: out
     input: both
     config:
@@ -1024,7 +1024,7 @@ nodes:
       paths: [a.csv, b.csv]
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -1065,7 +1065,7 @@ nodes:
     inputs: [a, b]
     config:
       mode: concat
-  - type: output
+  - type: sink
     name: out
     input: both
     config:
@@ -1110,7 +1110,7 @@ nodes:
     body: both
     config:
       strategy: concat
-  - type: output
+  - type: sink
     name: out
     input: one_doc
     config:
@@ -1155,7 +1155,7 @@ nodes:
     body: both
     config:
       strategy: preserve
-  - type: output
+  - type: sink
     name: out
     input: passthrough
     config:
@@ -1217,7 +1217,7 @@ nodes:
     body: joined
     config:
       strategy: concat
-  - type: output
+  - type: sink
     name: out
     input: framed
     config:
@@ -1277,7 +1277,7 @@ nodes:
     body: joined
     config:
       strategy: preserve
-  - type: output
+  - type: sink
     name: out
     input: framed
     config:
@@ -1358,7 +1358,7 @@ nodes:
     inputs: [joined, framed]
     config:
       mode: concat
-  - type: output
+  - type: sink
     name: out
     input: both
     config:
@@ -1395,7 +1395,7 @@ nodes:
       paths: [a.csv, b.csv]
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

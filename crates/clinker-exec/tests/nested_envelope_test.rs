@@ -173,7 +173,7 @@ nodes:
         emit isa = $doc.interchange.tag
         emit gs = $doc.group.tag
         emit st = $doc.transaction.tag
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:

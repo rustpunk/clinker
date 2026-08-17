@@ -102,7 +102,7 @@ nodes:
         - {{ name: key, type: int }}
         - {{ name: group, type: string }}
         - {{ name: payload, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: rows
     config:
@@ -137,7 +137,7 @@ nodes:
       type: csv
       glob: ./*.csv
       schema: [{ name: key, type: int }]
-  - type: output
+  - type: sink
     name: out
     input: rows
     config:
@@ -183,7 +183,7 @@ nodes:
       glob: ./*.csv
       dlq_granularity: document
       schema: [{ name: key, type: int }]
-  - type: output
+  - type: sink
     name: out
     input: rows
     config:
@@ -233,7 +233,7 @@ nodes:
     name: merged
     inputs: [left, right]
     config: { mode: concat }
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -395,7 +395,7 @@ nodes:
         - {{ name: key, type: int }}
         - {{ name: group, type: string }}
         - {{ name: payload, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: rows
     config:
@@ -458,7 +458,7 @@ nodes:
       schema:
         - {{ name: key, type: int }}
         - {{ name: payload, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: rows
     config:
@@ -539,7 +539,7 @@ fn writer_boundary_mode_matrix() {
 fn output_pipeline(memory_limit: &str, worker_threads: usize, fanout: bool) -> String {
     let second_output = if fanout {
         r#"
-  - type: output
+  - type: sink
     name: out_b
     input: rows
     config:
@@ -570,7 +570,7 @@ nodes:
       schema:
         - {{ name: key, type: int }}
         - {{ name: payload, type: string }}
-  - type: output
+  - type: sink
     name: out_a
     input: rows
     config:
@@ -735,7 +735,7 @@ pipeline:
         - {{ name: key, type: {{ nullable: int }} }}
         - {{ name: group, type: {{ nullable: int }} }}
         - {{ name: payload, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: rows
     config:
@@ -1076,7 +1076,7 @@ nodes:
     inputs: [left, right]
     config:
       mode: concat
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -1195,7 +1195,7 @@ nodes:
     inputs: [left, right]
     config:
       mode: {mode}
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -1273,7 +1273,7 @@ nodes:
     inputs: [left, right]
     config:
       mode: interleave
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -1352,7 +1352,7 @@ nodes:
       cxl: |
         emit sku = products.sku
         emit bracket_id = brackets.bracket_id
-  - type: output
+  - type: sink
     name: out
     input: assign_bracket
     config:
@@ -1409,7 +1409,7 @@ nodes:
       cxl: |
         emit key = key
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: totals
     config:
@@ -1499,7 +1499,7 @@ nodes:
         emit did = drivers.did
         emit tid = builds.tid
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:
@@ -1687,7 +1687,7 @@ nodes:
         emit did = drivers.id
         emit tid = builds.id
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:
@@ -2014,7 +2014,7 @@ nodes:
       schema:
         - { name: key, type: int }
       sort_order: [key]
-  - type: output
+  - type: sink
     name: out
     input: rows
     config:
@@ -2077,7 +2077,7 @@ nodes:
     inputs: [left, right]
     config:
       mode: interleave
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -2121,7 +2121,7 @@ nodes:
       schema:
         - { name: key, type: int }
         - { name: payload, type: string }
-  - type: output
+  - type: sink
     name: out
     input: rows
     config:
