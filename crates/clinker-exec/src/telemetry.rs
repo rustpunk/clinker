@@ -1669,9 +1669,49 @@ mod tests {
 
     use super::{
         AdmissionLane, AdmissionOutcome, DrainOutcome, DropReason, LogEvent, MAX_IDENTITY_BYTES,
-        RunCorrelation, Severity, SignalField, SpanFact, SpanName, SpanStatus, TRUNCATION_MARKER,
-        TelemetryArena, TelemetryProducer, TelemetryReceiver, bounded_utf8,
+        MetricKey, RunCorrelation, Severity, SignalField, SpanFact, SpanName, SpanStatus,
+        TRUNCATION_MARKER, TelemetryArena, TelemetryProducer, TelemetryReceiver, bounded_utf8,
     };
+
+    #[test]
+    fn lifecycle_metric_keys_have_one_stable_index_each() {
+        let expected = [
+            MetricKey::TransformStarted,
+            MetricKey::TransformCompleted,
+            MetricKey::TransformRecords,
+            MetricKey::TransformErrors,
+            MetricKey::CredentialResolveStarted,
+            MetricKey::CredentialResolveCompleted,
+            MetricKey::CredentialResolveFailed,
+            MetricKey::CredentialResolveInterrupted,
+            MetricKey::ResourceOpenStarted,
+            MetricKey::ResourceOpenCompleted,
+            MetricKey::ResourceOpenFailed,
+            MetricKey::ResourceOpenInterrupted,
+            MetricKey::CredentialRenewStarted,
+            MetricKey::CredentialRenewCompleted,
+            MetricKey::CredentialRenewFailed,
+            MetricKey::CredentialRenewInterrupted,
+            MetricKey::CredentialRevokeStarted,
+            MetricKey::CredentialRevokeCompleted,
+            MetricKey::CredentialRevokeFailed,
+            MetricKey::CredentialRevokeInterrupted,
+        ];
+
+        assert_eq!(MetricKey::COUNT, expected.len());
+        assert_eq!(MetricKey::ALL, expected);
+        for (index, key) in MetricKey::ALL.into_iter().enumerate() {
+            assert_eq!(key.index(), index, "{key:?} has a mismatched index");
+            assert_eq!(
+                MetricKey::ALL
+                    .iter()
+                    .filter(|candidate| **candidate == key)
+                    .count(),
+                1,
+                "{key:?} appears more than once"
+            );
+        }
+    }
 
     /// A policy whose only variable is the attribute cap under test. Declares
     /// one `allow` field and one `replace` field so both rendering paths are
