@@ -809,12 +809,41 @@ fn walk_scope(
                 cols
             }
 
-            PlanNode::Sink { .. } => {
+            PlanNode::Sink { resolved, .. } => {
                 let up = single_upstream(dag, idx);
                 let mut cols = ColumnTerminals::new();
-                for_each_output_col(node, dag, |col| {
-                    cols.insert_nonempty(col, passthrough(&lineage, up, col));
-                });
+                let output = resolved.as_deref().map(|payload| &payload.output);
+                let excluded = |col: &str| {
+                    output
+                        .and_then(|output| output.exclude.as_ref())
+                        .is_some_and(|exclude| exclude.iter().any(|name| name == col))
+                };
+                if let Some(mapping) = output.and_then(|output| output.mapping.as_ref()) {
+                    for entry in mapping.entries() {
+                        if !excluded(&entry.source) {
+                            cols.insert_nonempty(
+                                &entry.output,
+                                passthrough(&lineage, up, &entry.source),
+                            );
+                        }
+                    }
+                    if output.is_some_and(|output| output.include_unmapped) {
+                        for_each_output_col(node, dag, |col| {
+                            if !excluded(col)
+                                && !mapping.claims_source(col)
+                                && !mapping.claims_output(col)
+                            {
+                                cols.insert_nonempty(col, passthrough(&lineage, up, col));
+                            }
+                        });
+                    }
+                } else {
+                    for_each_output_col(node, dag, |col| {
+                        if !excluded(col) {
+                            cols.insert_nonempty(col, passthrough(&lineage, up, col));
+                        }
+                    });
+                }
                 cols
             }
 
@@ -2576,6 +2605,25 @@ fn node_indirect_influence(
                 );
             }
         }
+        PlanNode::Sink { resolved, .. } => {
+            let up = single_upstream(dag, idx);
+            if let Some(sort_fields) = resolved
+                .as_deref()
+                .and_then(|payload| payload.output.sort_order.as_deref())
+            {
+                for sf in sort_fields {
+                    let field = match sf {
+                        clinker_plan::config::SortFieldSpec::Short(field) => field.as_str(),
+                        clinker_plan::config::SortFieldSpec::Full(field) => field.field.as_str(),
+                    };
+                    add_upstream_influence(
+                        &mut inf,
+                        upstream_col(lineage, up, field),
+                        IndirectSub::Sort,
+                    );
+                }
+            }
+        }
         PlanNode::Reshape { compiled_rules, .. } => {
             // A `when:` trigger cannot read `$doc`: the planner rejects any
             // envelope reference in a Reshape rule (E200, see `bind_reshape`), so
@@ -2984,7 +3032,7 @@ nodes:
         emit salary = salary
         emit full = name
         emit tier = if salary.to_int() >= 90000 then "senior" else "junior"
-  - type: output
+  - type: sink
     name: out
     input: proj
     config: { name: out, type: csv, path: out/t.csv }
@@ -3088,7 +3136,7 @@ nodes:
       cxl: |
         emit a = a
         emit k = "literal"
-  - type: output
+  - type: sink
     name: out
     input: t
     config: { name: out, type: csv, path: out/k.csv }
@@ -3125,7 +3173,7 @@ nodes:
     config:
       cxl: |
         emit final = mid
-  - type: output
+  - type: sink
     name: out
     input: t2
     config: { name: out, type: csv, path: out/chain.csv }
@@ -3165,7 +3213,7 @@ nodes:
     name: t
     input: rows
     config: { cxl: "emit city = addr.city" }
-  - type: output
+  - type: sink
     name: out
     input: t
     config:
@@ -3224,7 +3272,7 @@ nodes:
       on_miss: skip
       cxl: "emit out = a.k"
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: j
     config: { name: out, type: csv, path: out/cr.csv }
@@ -3271,7 +3319,7 @@ nodes:
           let total = it
         }
         emit out = total
-  - type: output
+  - type: sink
     name: out
     input: t
     config:
@@ -3321,11 +3369,11 @@ nodes:
       mode: exclusive
       conditions: { high: "amount > 100" }
       default: low
-  - type: output
+  - type: sink
     name: hi
     input: split.high
     config: { name: hi, type: csv, path: out/hi.csv }
-  - type: output
+  - type: sink
     name: lo
     input: split.low
     config: { name: lo, type: csv, path: out/lo.csv }
@@ -3381,11 +3429,11 @@ nodes:
       rules:
         - name: drop_big
           drop_group_when: "sum(amount) > 100"
-  - type: output
+  - type: sink
     name: out
     input: trim
     config: { name: out, type: csv, path: out/c.csv }
-  - type: output
+  - type: sink
     name: audit
     input: trim.removed
     config: { name: audit, type: csv, path: out/audit.csv }
@@ -3428,7 +3476,7 @@ nodes:
       cxl: |
         emit region = region
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: agg
     config: { name: out, type: csv, path: out/a.csv }
@@ -3482,7 +3530,7 @@ nodes:
         emit order_id = orders.order_id
         emit actor = events.actor
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: joined
     config: { name: out, type: csv, path: out/c.csv }
@@ -3527,7 +3575,7 @@ nodes:
           mutate:
             set:
               plan_end: "plan_start"
-  - type: output
+  - type: sink
     name: out
     input: backfill
     config: { name: out, type: csv, path: out/r.csv }
@@ -3585,7 +3633,7 @@ nodes:
       cxl: |
         emit oid = orders.order_id
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: joined
     config: { name: out, type: csv, path: out/cs.csv }
@@ -3637,11 +3685,11 @@ nodes:
       cxl: |
         emit region = region
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: agg
     config: { name: out, type: csv, path: out/acc.csv }
-  - type: output
+  - type: sink
     name: audit
     input: trim.removed
     config: { name: audit, type: csv, path: out/audit.csv }
@@ -3685,7 +3733,7 @@ nodes:
       cxl: |
         let x = a + b
         emit y = x
-  - type: output
+  - type: sink
     name: out
     input: t
     config: { name: out, type: csv, path: out/letbind.csv }
@@ -3728,7 +3776,7 @@ nodes:
         emit each it in items {
           emit sku = it["sku"]
         }
-  - type: output
+  - type: sink
     name: out
     input: explode
     config:
@@ -3776,7 +3824,7 @@ nodes:
       cxl: |
         emit price = list_price
         emit price = sale_price
-  - type: output
+  - type: sink
     name: out
     input: t
     config: { name: out, type: csv, path: out/dup.csv }
@@ -3820,7 +3868,7 @@ nodes:
         emit region = region
         emit total = sum(amount.to_int())
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: agg
     config: { name: out, type: csv, path: out/a.csv }
@@ -3902,7 +3950,7 @@ nodes:
           mutate:
             set:
               plan_end: "plan_start"
-  - type: output
+  - type: sink
     name: out
     input: backfill
     config: { name: out, type: csv, path: out/r.csv }
@@ -3974,7 +4022,7 @@ nodes:
         emit amount = orders.amount
         emit actor = events.actor
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: joined
     config: { name: out, type: csv, path: out/c.csv }
@@ -4064,7 +4112,7 @@ nodes:
         emit product_name = products.product_name
         emit category_name = categories.category_name
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config: { name: out, type: csv, path: out/nary.csv }
@@ -4135,7 +4183,7 @@ nodes:
         emit c_val = c.c_val
         emit d_val = d.d_val
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: j
     config: { name: out, type: csv, path: out/four.csv }
@@ -4197,7 +4245,7 @@ nodes:
         emit emp_name = e.name
         emit mgr_name = m.name
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: pairs
     config: { name: out, type: csv, path: out/selfjoin.csv }
@@ -4254,7 +4302,7 @@ nodes:
     input: payments
     config:
       cxl: |
-{indented}  - type: output
+{indented}  - type: sink
     name: out
     input: tag
     config: {{ name: out, type: csv, path: out/env.csv }}
@@ -4393,7 +4441,7 @@ nodes:
         emit k = drv.k
         emit batch = $doc.BatchInfo.batch_id
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: j
     config: { name: out, type: csv, path: out/cdoc.csv }
@@ -4483,7 +4531,7 @@ nodes:
         emit tag = tag
         emit declared = $doc.basic.body
         emit ghost = $doc.nope.body
-  - type: output
+  - type: sink
     name: out
     input: tag
     config: { name: out, type: csv, path: out/swiftdoc.csv }
@@ -4570,7 +4618,7 @@ nodes:
         emit k = a.k
         emit head = $doc.Head.x
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: j
     config: { name: out, type: csv, path: out/narydoc.csv }
@@ -4626,7 +4674,7 @@ nodes:
         emit region = region
         emit total = sum(amount)
         emit batch = $doc.Head.batch_id
-  - type: output
+  - type: sink
     name: out
     input: agg
     config: { name: out, type: csv, path: out/aggdoc.csv }
@@ -4677,7 +4725,7 @@ nodes:
       cxl: |
         emit region = region
         emit weighted = sum(amount * $doc.Head.fx_rate)
-  - type: output
+  - type: sink
     name: out
     input: agg
     config: { name: out, type: csv, path: out/aggdocarg.csv }
@@ -4737,7 +4785,7 @@ nodes:
           mutate:
             set:
               tag: "$doc.Head.batch_id"
-  - type: output
+  - type: sink
     name: out
     input: tagit
     config: { name: out, type: csv, path: out/rsdoc.csv }
@@ -4784,11 +4832,11 @@ nodes:
       mode: exclusive
       conditions: { high: "amount > $doc.Head.threshold" }
       default: low
-  - type: output
+  - type: sink
     name: hi
     input: split.high
     config: { name: hi, type: csv, path: out/hi.csv }
-  - type: output
+  - type: sink
     name: lo
     input: split.low
     config: { name: lo, type: csv, path: out/lo.csv }
@@ -4856,7 +4904,7 @@ nodes:
       cxl: |
         emit k = drv.k
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: j
     config: { name: out, type: csv, path: out/cjdoc.csv }
@@ -4909,11 +4957,11 @@ nodes:
       rules:
         - name: drop_over_budget
           drop_group_when: "sum(amount) > $doc.Head.threshold"
-  - type: output
+  - type: sink
     name: out
     input: trim
     config: { name: out, type: csv, path: out/cudoc.csv }
-  - type: output
+  - type: sink
     name: audit
     input: trim.removed
     config: { name: audit, type: csv, path: out/audit.csv }
@@ -4981,7 +5029,7 @@ nodes:
         emit batch_id = batch_id
         emit id = id
         emit amount = amount
-  - type: output
+  - type: sink
     name: out
     input: project
     config: { name: out, type: csv, path: out/out.csv }
@@ -5048,7 +5096,7 @@ nodes:
         emit seq = seq
         emit a_only = a_only
         emit b_only = b_only
-  - type: output
+  - type: sink
     name: out
     input: project
     config: { name: out, type: csv, path: out/out.csv }
@@ -5108,7 +5156,7 @@ nodes:
       cxl: |
         emit id = id
         emit name = name
-  - type: output
+  - type: sink
     name: out
     input: project
     config: { name: out, type: csv, path: out/out.csv }
@@ -5145,7 +5193,7 @@ nodes:
     config:
       cxl: |
         emit seg = seg_id
-  - type: output
+  - type: sink
     name: out
     input: project
     config: { name: out, type: csv, path: out/out.csv }
@@ -5192,7 +5240,7 @@ nodes:
       cxl: |
         emit rt = record_type
         emit payload = payload
-  - type: output
+  - type: sink
     name: out
     input: project
     config: { name: out, type: csv, path: out/out.csv }

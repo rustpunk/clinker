@@ -145,11 +145,15 @@ pub enum MetricKey {
     GuessUnresolved,
     GuessFailed,
     GuessInterrupted,
+    SinkStarted,
+    SinkCompleted,
+    SinkRecords,
+    SinkErrors,
 }
 
 impl MetricKey {
     /// Every fixed metric key in stable counter-index order.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 33] = [
         Self::TransformStarted,
         Self::TransformCompleted,
         Self::TransformRecords,
@@ -179,6 +183,10 @@ impl MetricKey {
         Self::GuessUnresolved,
         Self::GuessFailed,
         Self::GuessInterrupted,
+        Self::SinkStarted,
+        Self::SinkCompleted,
+        Self::SinkRecords,
+        Self::SinkErrors,
     ];
     /// Number of entries in [`Self::ALL`].
     pub const COUNT: usize = Self::ALL.len();
@@ -216,6 +224,10 @@ impl MetricKey {
             Self::GuessUnresolved => 26,
             Self::GuessFailed => 27,
             Self::GuessInterrupted => 28,
+            Self::SinkStarted => 29,
+            Self::SinkCompleted => 30,
+            Self::SinkRecords => 31,
+            Self::SinkErrors => 32,
         }
     }
 }
@@ -231,11 +243,12 @@ pub enum SpanName {
     CredentialRevoke,
     Source,
     Guess,
+    Sink,
 }
 
 impl SpanName {
     /// Every span name in stable index order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Transform,
         Self::CredentialResolve,
         Self::ResourceOpen,
@@ -243,6 +256,7 @@ impl SpanName {
         Self::CredentialRevoke,
         Self::Source,
         Self::Guess,
+        Self::Sink,
     ];
 
     /// Return this name's stable slot in the closed span vocabulary.
@@ -256,6 +270,7 @@ impl SpanName {
             Self::CredentialRevoke => 4,
             Self::Source => 5,
             Self::Guess => 6,
+            Self::Sink => 7,
         }
     }
 }
@@ -276,8 +291,8 @@ pub enum SpanStatus {
 /// end fact, because a collector has no representation for half a span: both
 /// wall-clock boundaries are required, and independent admission of two halves
 /// lets sampling, lane routing, or a full arena deliver one without the other.
-/// The live "this work has begun" signal is the operation's started metric,
-/// which is still recorded before the work runs.
+/// The live "this work has begun" signal is the corresponding `*Started`
+/// metric, which is still recorded before the work runs.
 #[derive(Clone, Copy, Debug)]
 pub struct SpanFact<'a> {
     pub name: SpanName,
@@ -290,6 +305,111 @@ pub struct SpanFact<'a> {
     /// Span boundaries as Unix nanoseconds, `started_at <= ended_at`.
     pub started_at_unix_nanos: u64,
     pub ended_at_unix_nanos: u64,
+}
+
+/// One terminal Sink work unit's fixed-cardinality lifecycle observation.
+///
+/// Construction records the live start metric. Completion records aggregate
+/// record/error counts, one completion metric, and one closed span. Dropping
+/// an unfinished observation records a bounded error outcome and an error span,
+/// which covers `?` propagation and panic unwinding without making telemetry
+/// admission part of execution control flow.
+pub(crate) struct SinkSignal {
+    producer: TelemetryProducer,
+    logical_node: Box<str>,
+    started_at_unix_nanos: u64,
+    records: u64,
+    errors: u64,
+    closed: bool,
+}
+
+impl SinkSignal {
+    /// Begin one Sink work unit. The caller constructs this immediately before
+    /// the runtime owner starts the work, never at a dispatch placeholder whose
+    /// bytes are emitted elsewhere.
+    pub(crate) fn new(producer: TelemetryProducer, logical_node: impl Into<Box<str>>) -> Self {
+        let started_at_unix_nanos = unix_nanos_now();
+        producer.record_metric(MetricKey::SinkStarted, 1);
+        Self {
+            producer,
+            logical_node: logical_node.into(),
+            started_at_unix_nanos,
+            records: 0,
+            errors: 0,
+            closed: false,
+        }
+    }
+
+    /// Add records handled by this work unit, using saturating arithmetic so
+    /// observability cannot overflow into execution behavior.
+    pub(crate) fn record_records(&mut self, records: u64) {
+        self.records = self.records.saturating_add(records);
+    }
+
+    /// Add errors observed by this work unit.
+    pub(crate) fn record_errors(&mut self, errors: u64) {
+        self.errors = self.errors.saturating_add(errors);
+    }
+
+    /// Close a work unit that reached its runtime completion boundary.
+    pub(crate) fn complete(mut self) {
+        let status = if self.errors == 0 {
+            SpanStatus::Ok
+        } else {
+            SpanStatus::Error
+        };
+        self.emit_counts();
+        self.producer.record_metric(MetricKey::SinkCompleted, 1);
+        self.close_span(status);
+    }
+
+    /// Close a work unit that returned a failure before completion.
+    pub(crate) fn fail(mut self) {
+        if self.errors == 0 {
+            self.errors = 1;
+        }
+        self.emit_counts();
+        self.close_span(SpanStatus::Error);
+    }
+
+    fn emit_counts(&self) {
+        if self.records > 0 {
+            self.producer
+                .record_metric(MetricKey::SinkRecords, self.records);
+        }
+        if self.errors > 0 {
+            self.producer
+                .record_metric(MetricKey::SinkErrors, self.errors);
+        }
+    }
+
+    fn close_span(&mut self, status: SpanStatus) {
+        if self.closed {
+            return;
+        }
+        let ended_at_unix_nanos = unix_nanos_now().max(self.started_at_unix_nanos);
+        let _ = self.producer.emit_span(SpanFact {
+            name: SpanName::Sink,
+            status,
+            logical_node: &self.logical_node,
+            started_at_unix_nanos: self.started_at_unix_nanos,
+            ended_at_unix_nanos,
+        });
+        self.closed = true;
+    }
+}
+
+impl Drop for SinkSignal {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        if self.errors == 0 {
+            self.errors = 1;
+        }
+        self.emit_counts();
+        self.close_span(SpanStatus::Error);
+    }
 }
 
 impl Serialize for SpanFact<'_> {

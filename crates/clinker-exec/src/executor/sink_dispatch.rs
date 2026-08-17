@@ -318,12 +318,7 @@ pub(crate) fn dispatch_sink<'borrow, 'plan>(
 where
     'plan: 'borrow,
 {
-    let PlanNode::Sink {
-        ref name,
-        ref resolved,
-        ..
-    } = *node
-    else {
+    let PlanNode::Sink { ref name, .. } = *node else {
         return Err(crate::executor::invariant::dispatch_mismatch(
             "dispatch_sink",
             "sink",
@@ -337,6 +332,55 @@ where
     };
     #[cfg(not(feature = "test-utils"))]
     let SinkDispatchContext::Live(ctx) = ctx.into();
+
+    // The streaming writer thread and correlation commit own their actual
+    // terminal work and close their Sink observations there. The topo-order
+    // Sink turn is respectively a no-op or a projection/buffering handoff, so
+    // reporting it here would emit a pre-write zero-record span and then miss
+    // the outcome that establishes the external bytes.
+    if ctx.streaming_sink_nodes.contains(&node_idx) || ctx.correlation_buffers.is_some() {
+        return dispatch_sink_work(ctx, current_dag, node_idx, node);
+    }
+
+    let mut signal = ctx.telemetry_producer.clone().map(|producer| {
+        let logical_node = ctx.qualified_node_name(name);
+        crate::telemetry::SinkSignal::new(producer, logical_node.into_owned())
+    });
+    let records_before = ctx.counters.records_written;
+    let errors_before = ctx.output_errors.len();
+    let result = dispatch_sink_work(ctx, current_dag, node_idx, node);
+    if let Some(mut signal) = signal.take() {
+        signal.record_records(ctx.counters.records_written.saturating_sub(records_before));
+        let new_errors = ctx.output_errors.len().saturating_sub(errors_before);
+        signal.record_errors(u64::try_from(new_errors).unwrap_or(u64::MAX));
+        if result.is_ok() && new_errors == 0 {
+            signal.complete();
+        } else {
+            signal.fail();
+        }
+    }
+    result
+}
+
+fn dispatch_sink_work(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    node_idx: NodeIndex,
+    node: &PlanNode,
+) -> Result<(), PipelineError> {
+    let PlanNode::Sink {
+        ref name,
+        ref resolved,
+        ..
+    } = *node
+    else {
+        return Err(crate::executor::invariant::dispatch_mismatch(
+            "dispatch_sink",
+            "sink",
+            node.kind_name(),
+            node.name(),
+        ));
+    };
     let output_id = node.id();
     // Streaming-Sink short-circuit (issue #72). The executor
     // entry already moved this Sink's writer into a

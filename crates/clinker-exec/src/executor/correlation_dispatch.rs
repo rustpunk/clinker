@@ -334,8 +334,24 @@ fn flush_clean_records_to_writers(
         if slots.is_empty() {
             continue;
         }
-        let slots = order_clean_slots(ctx, current_dag, &output_name, slots)?;
+        let mut signal = ctx.telemetry_producer.clone().map(|producer| {
+            let logical_node = ctx.qualified_node_name(&output_name);
+            crate::telemetry::SinkSignal::new(producer, logical_node.into_owned())
+        });
+        let slots = match order_clean_slots(ctx, current_dag, &output_name, slots) {
+            Ok(slots) => slots,
+            Err(error) => {
+                if let Some(mut signal) = signal.take() {
+                    signal.record_errors(1);
+                    signal.fail();
+                }
+                return Err(error);
+            }
+        };
         if slots.is_empty() {
+            if let Some(signal) = signal.take() {
+                signal.complete();
+            }
             continue;
         }
         let out_cfg = ctx
@@ -347,14 +363,23 @@ fn flush_clean_records_to_writers(
         for slot in &slots {
             if let Err(err) = structured_guard.observe(&output_name, slot.projected.doc_ctx()) {
                 ctx.output_errors.push(err);
+                if let Some(mut signal) = signal.take() {
+                    signal.record_errors(1);
+                    signal.fail();
+                }
                 continue 'outputs;
             }
         }
         let output_schema = Arc::clone(slots[0].projected.schema());
 
         let Some(raw_writer) = ctx.writers.remove(&output_name) else {
+            if let Some(mut signal) = signal.take() {
+                signal.record_records(u64::try_from(slots.len()).unwrap_or(u64::MAX));
+                signal.complete();
+            }
             continue;
         };
+        let errors_before = ctx.output_errors.len();
         match build_format_writer(
             out_cfg,
             raw_writer,
@@ -363,6 +388,7 @@ fn flush_clean_records_to_writers(
         ) {
             Ok(mut writer) => {
                 let mut write_failed = false;
+                let mut flush_failed = false;
                 let mut written_slots: Vec<&CorrelationRecordSlot> = Vec::new();
                 for slot in &slots {
                     let write_result = {
@@ -391,6 +417,7 @@ fn flush_clean_records_to_writers(
                     };
                     if let Err(e) = flush_result {
                         push_write_error(&mut ctx.output_errors, e);
+                        flush_failed = true;
                     } else if out_cfg.mapping.is_some() {
                         // Correlation records were projected before their group
                         // disposition. Observe only after this clean queue is
@@ -423,8 +450,24 @@ fn flush_clean_records_to_writers(
                 ctx.counters.ok_count += newly_ok;
                 ctx.counters.records_written += written;
                 ctx.records_emitted += written;
+                if let Some(mut signal) = signal.take() {
+                    signal.record_records(written);
+                    let new_errors = ctx.output_errors.len().saturating_sub(errors_before);
+                    signal.record_errors(u64::try_from(new_errors).unwrap_or(u64::MAX));
+                    if write_failed || flush_failed {
+                        signal.fail();
+                    } else {
+                        signal.complete();
+                    }
+                }
             }
-            Err(e) => ctx.output_errors.push(e),
+            Err(e) => {
+                ctx.output_errors.push(e);
+                if let Some(mut signal) = signal.take() {
+                    signal.record_errors(1);
+                    signal.fail();
+                }
+            }
         }
     }
     Ok(())

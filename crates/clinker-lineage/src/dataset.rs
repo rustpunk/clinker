@@ -141,7 +141,7 @@ pub fn resource_dataset_identity(resource: &CatalogResource) -> Option<DatasetId
 ///
 /// `base_dir` is the workspace root — the directory containing the pipeline
 /// YAML, the same `base_dir` `clinker_plan`'s discovery layer takes. A
-/// Source/Output whose resolved payload is unavailable (e.g. after a serde
+/// Source/Sink whose resolved payload is unavailable (e.g. after a serde
 /// round-trip, since the payload is `#[serde(skip)]`) falls back to the
 /// [`FALLBACK_NAMESPACE`] plus the node name rather than inventing a path.
 pub fn dataset_identity(node: &PlanNode, base_dir: &Path) -> Option<DatasetId> {
