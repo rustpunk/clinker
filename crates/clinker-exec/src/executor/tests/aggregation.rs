@@ -201,7 +201,7 @@ nodes:
             .expect("aggregation node present");
         // Pick any other node to inject the spurious edge from. The
         // source already feeds the aggregation; add an edge from the
-        // output node back into agg as a synthetic violation.
+        // Sink node back into agg as a synthetic violation.
         let other_idx = plan
             .graph
             .node_indices()

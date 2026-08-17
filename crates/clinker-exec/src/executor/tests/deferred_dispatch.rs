@@ -651,7 +651,7 @@ identity_mode = "local_diagnostic_paths"
 /// body→parent harvest in `recurse_into_body`: the post-recompute
 /// ratio row for ENG is drained from the body's output-port slot,
 /// seeded into the parent's `node_buffers[composition_idx]`, and the
-/// parent's continuation (the Output node) runs through the same
+/// parent's continuation (the Sink node) runs through the same
 /// `dispatch_plan_node` arms with `in_deferred_dispatch=true`. The
 /// surviving (non-DLQ'd) row therefore reaches the parent Output;
 /// HR's failed contribution does not.
@@ -824,7 +824,7 @@ o6,ENG,300
     // dispatcher emits the post-recompute ratio row through the body's
     // output port; `recurse_into_body` harvests that row into the
     // parent's `node_buffers[composition_idx]` slot and drives the
-    // parent continuation (just the Output node here) on the same
+    // parent continuation (just the Sink node here) on the same
     // commit pass.
     let written = buf.as_string();
     let body_lines: Vec<&str> = written.lines().filter(|l| !l.is_empty()).collect();
@@ -868,7 +868,7 @@ o6,ENG,300
 /// passthrough wrapping the inner Composition), but the outer body's
 /// own output port surfaces those same records back to the parent's
 /// `node_buffers[outer_composition_idx]` via a second harvest, and
-/// the parent's continuation (just the Output node) runs over them.
+/// the parent's continuation (just the Sink node) runs over them.
 /// ENG's surviving row therefore reaches the parent Output; HR does
 /// not.
 #[test]
@@ -1065,7 +1065,7 @@ o6,ENG,300
     // the inner output port into the outer body's
     // `node_buffers[inner_comp_idx]`, then through the outer output
     // port into the parent's `node_buffers[outer_comp_idx]`, and the
-    // parent's continuation drives the Output node over it. ENG's
+    // parent's continuation drives the Sink node over it. ENG's
     // surviving row must land in the writer; HR was DLQ'd by the
     // inner body Transform's /0 and must NOT appear.
     let written = buf.as_string();

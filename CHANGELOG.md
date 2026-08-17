@@ -4,6 +4,22 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Changed — terminal Output nodes are now Sinks
+
+**Breaking YAML and Rust API change.** The terminal destination node is now
+authored as `type: sink`. The retired `type: output` spelling is rejected with
+E376 and a source-located `type: sink` correction; it is not retained as an
+alias.
+
+Rust callers must migrate `OutputConfig` to `SinkConfig`, `OutputBody` to
+`SinkBody`, `PipelineNode::Output` to `PipelineNode::Sink`, and
+`PipelineConfig::output_configs()` to `PipelineConfig::sink_configs()`. The
+compiled form is `PlanNode::Sink` with `PlanSinkPayload`.
+
+Only the terminal-node concept changed. Output ports, output fields and
+projections, serialized output formats, command output, writer results, and
+OpenLineage output datasets keep their established vocabulary.
+
 ### Fixed — dry-run now performs the documented compile check
 
 Bare `clinker run --dry-run` now compiles the plan and applies channel/group

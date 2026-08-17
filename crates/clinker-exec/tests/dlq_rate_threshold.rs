@@ -538,7 +538,7 @@ nodes:
     );
 }
 
-/// E322: two Output nodes writing the same path resolve to one physical file
+/// E322: two Sink nodes writing the same path resolve to one physical file
 /// and would silently overwrite each other. The exact-path case collides on
 /// every platform (no case-folding needed), so this is deterministic.
 #[test]

@@ -254,7 +254,7 @@ fn commit_one_group(
     //      single-source pipelines.
     //   2. CorrelationFanoutPolicy interpretation — Any/All/Primary
     //      operate WITHIN the failing-source's records.
-    // The resolved policy is read per-Output (per-Combine / per-Output
+    // The resolved policy is read per-Sink (per-Combine / per-Sink
     // overrides win against the pipeline default). Today the strict
     // path always resolves to `Any` so axis 2 sparing is a no-op; the
     // wire is in place for the relaxed-CK orchestrator to substitute a
@@ -362,7 +362,7 @@ fn flush_clean_records_to_writers(
             continue;
         }
         let out_cfg = ctx
-            .output_configs
+            .sink_configs
             .iter()
             .find(|o| o.name == output_name)
             .unwrap_or(ctx.primary_output);

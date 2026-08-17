@@ -49,7 +49,7 @@ fn run_pipeline(
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 

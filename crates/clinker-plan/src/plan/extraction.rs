@@ -601,7 +601,7 @@ mod tests {
     fn test_extract_boundary_zero_output_ports_warns() {
         let dag = build_4_node_dag();
         let prov = ProvenanceDb::default();
-        // Select only the output node — it has no downstream consumers.
+        // Select only the Sink node — it has no downstream consumers.
         let selected: HashSet<String> = ["out"].iter().map(|s| s.to_string()).collect();
 
         let boundary = analyze_extraction_boundary(&dag, &selected, &prov).unwrap();

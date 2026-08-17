@@ -503,9 +503,9 @@ pub fn certify_streaming_edge(
             // SortBuffer before writing. Per-source-file fan-out and split
             // writers likewise own terminal lifecycle. None can bypass the
             // Output arm through the single streaming writer task.
-            if payload.output.sort_order.is_some()
+            if payload.sink.sort_order.is_some()
                 || payload.fan_out_per_source_file
-                || payload.output.split.is_some()
+                || payload.sink.split.is_some()
             {
                 return None;
             }

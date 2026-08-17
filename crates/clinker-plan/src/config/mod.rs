@@ -56,8 +56,8 @@ pub use patch::{
 };
 pub use pipeline::*;
 pub use pipeline_node::{
-    AggregateBody, CxlBearingField, CxlFieldScope, MergeBody, OutputBody, Phase, PipelineNode,
-    RouteBody, SourceBody, TransformBody, VarScope,
+    AggregateBody, CxlBearingField, CxlFieldScope, MergeBody, Phase, PipelineNode, RouteBody,
+    SinkBody, SourceBody, TransformBody, VarScope,
 };
 pub use route::*;
 pub use scoped_var::*;

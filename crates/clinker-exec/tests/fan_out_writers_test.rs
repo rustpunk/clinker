@@ -133,7 +133,7 @@ fn fan_out_flag_set_when_template_uses_source_file_token() {
         .graph
         .node_indices()
         .find(|i| dag.graph[*i].name() == "out")
-        .expect("output node 'out' exists");
+        .expect("Sink node 'out' exists");
     use clinker_plan::plan::execution::PlanNode;
     let PlanNode::Sink { resolved, .. } = &dag.graph[out_idx] else {
         panic!("expected Sink variant");

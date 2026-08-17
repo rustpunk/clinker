@@ -288,7 +288,7 @@ fn resolve_and_hash_external_schemas(config: &mut PipelineConfig) -> Result<(), 
             crate::config::PipelineNode::Sink {
                 header,
                 config: body,
-            } => match &body.output.schema {
+            } => match &body.sink.schema {
                 Some(crate::config::SourceSchema::File(path)) => {
                     (path.clone(), format!("output {:?}", header.name))
                 }
@@ -323,7 +323,7 @@ fn resolve_and_hash_external_schemas(config: &mut PipelineConfig) -> Result<(), 
                 body.schema = inline;
             }
             crate::config::PipelineNode::Sink { config: body, .. } => {
-                body.output.schema = Some(inline);
+                body.sink.schema = Some(inline);
             }
             _ => {}
         }
@@ -480,7 +480,7 @@ mod external_schema_tests {
 
     fn output_schema(config: &PipelineConfig) -> Option<&crate::config::SourceSchema> {
         config.nodes.iter().find_map(|n| match &n.value {
-            crate::config::PipelineNode::Sink { config, .. } => config.output.schema.as_ref(),
+            crate::config::PipelineNode::Sink { config, .. } => config.sink.schema.as_ref(),
             _ => None,
         })
     }
@@ -540,7 +540,7 @@ mod external_schema_tests {
         );
     }
 
-    /// An output node's external `.schema.yaml` (`SourceSchema::File`) is
+    /// A Sink node's external `.schema.yaml` (`SourceSchema::File`) is
     /// resolved to its inline column list at config-load time, exactly like a
     /// source's. Without this the write-boundary passes that read the output
     /// schema through `as_columns()` — fixed-width column widths and the

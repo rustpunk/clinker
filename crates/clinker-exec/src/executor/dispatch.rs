@@ -1083,7 +1083,7 @@ impl NodeBufferReaderLedger {
 /// * `current_dag` — the DAG being walked. Composition body recursion will
 ///   later swap this in place to re-enter the dispatcher on a body's
 ///   mini-DAG without duplicating arm logic.
-/// * `output_configs` / `primary_output` — output sinks and the
+/// * `sink_configs` / `primary_output` — output sinks and the
 ///   declaration-order primary used as the fallback projection target.
 /// * `stable` / `source_batch_arc` / `strategy` — pipeline-stable scalars
 ///   reused at every per-record dispatch site.
@@ -1114,7 +1114,7 @@ pub(crate) struct ExecutorContext<'a> {
     /// runtime-retained slice of the former compile artifacts; resolved
     /// by `CompositionBodyId` via `composition_bodies.get(&id)`.
     pub(crate) composition_bodies: &'a CompositionBodies,
-    pub(crate) output_configs: &'a [SinkConfig],
+    pub(crate) sink_configs: &'a [SinkConfig],
     pub(crate) primary_output: &'a SinkConfig,
     pub(crate) stable: &'a StableEvalContext,
     /// Run-scoped non-blocking telemetry handle. Cloned only when enabled;
@@ -1367,7 +1367,7 @@ pub(crate) struct ExecutorContext<'a> {
     /// still fail-fast and bypass the rewind path.
     pub(crate) combine_input_snapshots: HashMap<NodeIndex, HashMap<Arc<str>, u64>>,
     pub(crate) output_errors: Vec<PipelineError>,
-    /// Per-Output `mapping:` resolution evidence, keyed by Output node name and
+    /// Per-Output `mapping:` resolution evidence, keyed by Sink node name and
     /// accumulated across every arm and every chunk. Drained once at the end of
     /// the run into the report's advisory findings.
     ///
@@ -1378,7 +1378,7 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) mapping_probes: BTreeMap<String, crate::projection::MappingProbe>,
     pub(crate) ok_source_rows: HashSet<crate::executor::stream_event::SourceRowId>,
     /// Successful writes keyed by both the source row and the stable terminal
-    /// Output node. This preserves fan-out evidence without changing
+    /// Sink node. This preserves fan-out evidence without changing
     /// `ok_count`, which remains deduplicated by `ok_source_rows`.
     pub(crate) ok_deliveries: HashSet<crate::executor::stream_event::OutputDeliveryId>,
     pub(crate) records_emitted: u64,

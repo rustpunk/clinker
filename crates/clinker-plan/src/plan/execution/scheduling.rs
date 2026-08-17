@@ -693,7 +693,7 @@ impl ExecutionPlanDag {
             else {
                 continue;
             };
-            let Some(specs) = payload.output.sort_order.as_ref() else {
+            let Some(specs) = payload.sink.sort_order.as_ref() else {
                 continue;
             };
             let authored: Vec<SortField> = specs
@@ -736,7 +736,7 @@ impl ExecutionPlanDag {
                 PlanNode::Sink {
                     resolved: Some(payload),
                     ..
-                } if payload.output.reconstruct_envelope
+                } if payload.sink.reconstruct_envelope
             )
         });
 
@@ -796,7 +796,7 @@ impl ExecutionPlanDag {
                     return Err(PipelineError::Internal {
                         op: "writer_boundary",
                         node: self.graph[output_idx].name().to_string(),
-                        detail: "consumer registry classified a non-Output node as a physical writer boundary"
+                        detail: "consumer registry classified a non-Sink node as a physical writer boundary"
                             .to_string(),
                     });
                 };
@@ -819,7 +819,7 @@ impl ExecutionPlanDag {
                     WriterBoundaryMode::CorrelationDeferred
                 } else if document_dlq_active {
                     WriterBoundaryMode::DocumentDlq
-                } else if payload.output.reconstruct_envelope {
+                } else if payload.sink.reconstruct_envelope {
                     WriterBoundaryMode::Envelope
                 } else if payload.fan_out_per_source_file {
                     WriterBoundaryMode::PerSourceFile
@@ -839,7 +839,7 @@ impl ExecutionPlanDag {
                     }
                     WriterBoundaryMode::CorrelationDeferred => WriterPartitionKey::CorrelationGroup,
                     WriterBoundaryMode::RecordsOnly | WriterBoundaryMode::Streaming => {
-                        if payload.output.split.is_some() {
+                        if payload.sink.split.is_some() {
                             WriterPartitionKey::SplitSequence
                         } else {
                             WriterPartitionKey::Single
@@ -872,9 +872,9 @@ impl ExecutionPlanDag {
                     mode,
                     partition: WriterPartitionIdentity {
                         key: partition_key,
-                        path_template: payload.output.path.clone(),
+                        path_template: payload.sink.path.clone(),
                         split_naming: payload
-                            .output
+                            .sink
                             .split
                             .as_ref()
                             .map(|split| split.naming.clone()),
@@ -1144,7 +1144,7 @@ impl ExecutionPlanDag {
             else {
                 continue;
             };
-            if payload.output.has_per_record_path_tokens() {
+            if payload.sink.has_per_record_path_tokens() {
                 payload.fan_out_per_source_file = true;
             }
         }

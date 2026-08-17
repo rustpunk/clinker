@@ -57,7 +57,7 @@ fn run_single(yaml: &str, csv_input: &str) -> (ExecutionReport, String) {
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     let report =
@@ -93,7 +93,7 @@ fn run_two_source_merge(
     ]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     let report =
@@ -119,7 +119,7 @@ fn run_single_result(
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())

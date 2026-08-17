@@ -812,7 +812,7 @@ fn walk_scope(
             PlanNode::Sink { resolved, .. } => {
                 let up = single_upstream(dag, idx);
                 let mut cols = ColumnTerminals::new();
-                let output = resolved.as_deref().map(|payload| &payload.output);
+                let output = resolved.as_deref().map(|payload| &payload.sink);
                 let excluded = |col: &str| {
                     output
                         .and_then(|output| output.exclude.as_ref())
@@ -2609,7 +2609,7 @@ fn node_indirect_influence(
             let up = single_upstream(dag, idx);
             if let Some(sort_fields) = resolved
                 .as_deref()
-                .and_then(|payload| payload.output.sort_order.as_deref())
+                .and_then(|payload| payload.sink.sort_order.as_deref())
             {
                 for sf in sort_fields {
                     let field = match sf {

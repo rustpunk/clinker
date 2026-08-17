@@ -42,7 +42,7 @@ fn multi_output_fixture(
 ) {
     let config = clinker_plan::config::parse_config(yaml).unwrap();
     let buffers: HashMap<String, SharedBuffer> = config
-        .output_configs()
+        .sink_configs()
         .map(|o| (o.name.clone(), SharedBuffer::new()))
         .collect();
     (config, buffers)

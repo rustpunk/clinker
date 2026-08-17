@@ -82,7 +82,7 @@ fn run_with_composition(
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 
@@ -116,7 +116,7 @@ fn run_source_collision_pipeline(
         })
         .collect();
     let buffers: HashMap<String, SharedBuffer> = config
-        .output_configs()
+        .sink_configs()
         .map(|output| (output.name.clone(), SharedBuffer::new()))
         .collect();
     let writers: HashMap<String, Box<dyn Write + Send>> = buffers
@@ -621,7 +621,7 @@ nodes:
     )]);
 
     let bufs: HashMap<String, SharedBuffer> = config
-        .output_configs()
+        .sink_configs()
         .map(|o| (o.name.clone(), SharedBuffer::new()))
         .collect();
     let writers: HashMap<String, Box<dyn Write + Send>> = bufs
@@ -699,7 +699,7 @@ nodes:
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 

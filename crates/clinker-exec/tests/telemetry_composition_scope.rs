@@ -157,7 +157,7 @@ fn transform_span_names() -> (Vec<String>, HashMap<String, String>) {
         ),
     ]);
     let buffers: HashMap<String, SharedBuffer> = config
-        .output_configs()
+        .sink_configs()
         .map(|output| (output.name.clone(), SharedBuffer::default()))
         .collect();
     let writers: HashMap<String, Box<dyn Write + Send>> = buffers

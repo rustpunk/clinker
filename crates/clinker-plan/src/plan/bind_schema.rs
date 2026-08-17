@@ -1459,11 +1459,11 @@ pub(crate) fn validate_output_path_collisions(
         let PipelineNode::Sink { config, .. } = &n.value else {
             continue;
         };
-        let p = config.output.path.as_str();
+        let p = config.sink.path.as_str();
         if p.is_empty() {
             continue;
         }
-        let name = config.output.name.as_str();
+        let name = config.sink.name.as_str();
         if let Some((prev_path, prev_label)) = paths.insert(
             crate::config::destination_identity(std::path::Path::new(p)),
             (p.to_string(), format!("output {name:?}")),
@@ -1591,7 +1591,7 @@ pub(crate) fn validate_log_event_shapes(
     }
 }
 
-/// The two schema-dependent `mapping:` gates on an Output node.
+/// The two schema-dependent `mapping:` gates on a Sink node.
 ///
 /// **E365** — an entry reads a column the graph does not supply at that point.
 /// The output schema is known at plan time, so a stale or mistyped column name
@@ -1624,7 +1624,7 @@ fn validate_output_mapping_columns(
     if !matches!(upstream.tail, cxl::typecheck::RowTail::Closed) {
         return;
     }
-    // An Output's upstream row carries only bare names: a Combine publishes its
+    // A Sink's upstream row carries only bare names: a Combine publishes its
     // merged row as `QualifiedField::bare`, so the qualified spelling never
     // reaches here and matching it would accept a name the record cannot carry.
     let is_available = |wanted: &str| upstream.fields().any(|(qf, _)| qf.name.as_ref() == wanted);
@@ -3008,7 +3008,7 @@ fn bind_schema_inner(
             PipelineNode::Sink { header, config } => {
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     let row = upstream.clone();
-                    validate_output_mapping_columns(&name, &config.output, &row, span, diags);
+                    validate_output_mapping_columns(&name, &config.sink, &row, span, diags);
                     schema_by_name.insert(name.clone(), row.clone());
                     artifacts.typed_insert(node_id, Arc::new(synthetic_typed_program(row)));
                 }
@@ -3452,12 +3452,12 @@ fn bind_composition(
                     }
                 }
                 PipelineNode::Sink { config, .. } => {
-                    if let crate::config::OutputFormat::Csv(Some(opts)) = &config.output.format
+                    if let crate::config::OutputFormat::Csv(Some(opts)) = &config.sink.format
                         && let Some(delimiter) = opts.delimiter.as_deref()
                     {
                         check(crate::config::pipeline::validate_csv_byte_option(
                             "output",
-                            &config.output.name,
+                            &config.sink.name,
                             "delimiter",
                             delimiter,
                         ));
@@ -3472,7 +3472,7 @@ fn bind_composition(
     }
 
     // 7e. Resolve external `.schema.yaml` (`SourceSchema::File`) references on
-    // body Source and Output nodes to their inline column form, each path
+    // body Source and Sink nodes to their inline column form, each path
     // resolved relative to the composition file's own directory. Top-level
     // nodes have their externals resolved at parse time by
     // `resolve_and_hash_external_schemas`; body files are re-read here and
@@ -3499,9 +3499,9 @@ fn bind_composition(
                     SourceSchema::File(rel) => (rel, format!("source {:?}", config.source.name)),
                     _ => continue,
                 },
-                PipelineNode::Sink { config, .. } => match &config.output.schema {
+                PipelineNode::Sink { config, .. } => match &config.sink.schema {
                     Some(SourceSchema::File(rel)) => {
-                        (rel, format!("output {:?}", config.output.name))
+                        (rel, format!("output {:?}", config.sink.name))
                     }
                     _ => continue,
                 },
@@ -3528,7 +3528,7 @@ fn bind_composition(
         for (idx, inline) in resolved {
             match &mut body_file.nodes[idx].value {
                 PipelineNode::Source { config, .. } => config.schema = inline,
-                PipelineNode::Sink { config, .. } => config.output.schema = Some(inline),
+                PipelineNode::Sink { config, .. } => config.sink.schema = Some(inline),
                 _ => {}
             }
         }
@@ -3550,7 +3550,7 @@ fn bind_composition(
     {
         let faults = crate::config::multi_value::source_node_faults(&body_file.nodes)
             .into_iter()
-            .chain(crate::config::multi_value::output_node_faults(
+            .chain(crate::config::multi_value::sink_node_faults(
                 &body_file.nodes,
             ))
             .chain(crate::config::record_path::record_path_faults(

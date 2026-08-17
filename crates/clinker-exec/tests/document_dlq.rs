@@ -1515,7 +1515,7 @@ nodes:
     // An UPSTREAM stage must actually have spilled — otherwise this guards
     // nothing about the document-context-through-spill round-trip. Per-stage
     // spill bytes are keyed by the spilling node's name; the document-DLQ
-    // driver's own bucket spill is keyed by the Output node ("out"), so a
+    // driver's own bucket spill is keyed by the Sink node ("out"), so a
     // non-"out" spilling stage is the inter-stage buffer feeding the Output
     // (the producer that drains its records to disk before the Output
     // reloads them). Pinning the upstream stage keeps a future regression in

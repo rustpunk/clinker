@@ -18,7 +18,7 @@ pub struct CsvWriterConfig {
     /// Whether engine-stamped schema columns (today: `$ck.<field>`
     /// correlation snapshots) are emitted into the CSV. Defaults to
     /// `false` — engine-internal namespaces are stripped from the
-    /// default output unless the Output node opts in via
+    /// default output unless the Sink node opts in via
     /// `include_correlation_keys: true`.
     pub include_engine_stamped: bool,
     /// Per-document envelope reconstruction. `None` (the default) renders no

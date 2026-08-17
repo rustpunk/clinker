@@ -33,7 +33,7 @@ fn run_branch_test(
         ),
     )]);
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(output_buf.clone()) as Box<dyn Write + Send>,
     )]);
 

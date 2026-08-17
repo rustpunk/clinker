@@ -5,7 +5,7 @@ use clinker_format::JoinValues;
 use clinker_record::schema_def::LineSeparator;
 use serde::{Deserialize, Serialize};
 
-/// Output destination configuration.
+/// Sink destination configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SinkConfig {
     pub name: String,
@@ -53,7 +53,7 @@ pub struct SinkConfig {
     /// multiple files based on record count or byte size limits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub split: Option<SplitConfig>,
-    /// Optional per-Output override for the correlation fan-out policy.
+    /// Optional per-Sink override for the correlation fan-out policy.
     /// Wins against the per-Combine override and the per-pipeline default
     /// because the sink has the most context for whether collateral
     /// rollback is acceptable (audit-style sinks typically opt down to
@@ -78,7 +78,7 @@ pub struct SinkConfig {
     /// body records: the writer's `begin_document` fires on a document's first
     /// record, its records stream straight through, and `end_document` fires
     /// when the document ends (its `$source.file` changes, or at end of
-    /// input). When set, the executor routes this Output through an arm that
+    /// input). When set, the executor routes this Sink through an arm that
     /// detects document boundaries from each record's document context, and
     /// excludes the Sink from the fused streaming-writer thread (which does
     /// no framing). Records still stream one at a time across the boundary —

@@ -273,9 +273,9 @@ nodes:
     // Downstream Transform reads `dept` and `total` from the producer
     // (transitively via `dept_keep` / `running_total`). `other` is
     // emitted by the producer but NEVER consumed downstream; pruning
-    // must drop it. The Output node sets `include_unmapped: false` so
+    // must drop it. The Sink node sets `include_unmapped: false` so
     // the prune analysis can isolate unconsumed producer emits — with
-    // the default `include_unmapped: true`, the Output node would
+    // the default `include_unmapped: true`, the Sink node would
     // request every upstream column and `other` would survive.
     assert!(region.buffer_schema.contains(&"dept".to_string()));
     assert!(region.buffer_schema.contains(&"total".to_string()));

@@ -2004,7 +2004,7 @@ mod tests {
     /// in expression position via the catch-all "unknown system
     /// namespace" path. The typechecker is blind to the sidecar's
     /// keys; users who need an absorbed input field at output
-    /// time set `include_unmapped: true` on the Output node and the
+    /// time set `include_unmapped: true` on the Sink node and the
     /// projection layer expands the map to top-level columns.
     #[test]
     fn test_parse_rejects_widened_in_read_position() {

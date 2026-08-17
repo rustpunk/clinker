@@ -55,7 +55,7 @@ fn run_single(yaml: &str, csv_input: &str) -> String {
     )]);
     let buf = SharedBuffer::default();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
@@ -79,7 +79,7 @@ fn run_multi(yaml: &str, inputs: &[(&str, &str)]) -> String {
     }
     let buf = SharedBuffer::default();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
@@ -334,7 +334,7 @@ nodes:
     )]);
     let buf = SharedBuffer::default();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
@@ -591,7 +591,7 @@ nodes:
     )]);
     let buf = SharedBuffer::default();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
@@ -662,7 +662,7 @@ nodes:
     )]);
     let buf = SharedBuffer::default();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     let mut static_vars = indexmap::IndexMap::new();

@@ -1156,7 +1156,7 @@ impl LineageConfig {
             return Err(ObservabilityConfigError::invalid(
                 "observability.lineage.dataset",
                 "contains too many per-node bindings",
-                "retain at most one binding per source or output node",
+                "retain at most one binding per source or Sink node",
             ));
         }
 
@@ -1191,7 +1191,7 @@ fn resolve_dataset_bindings(
     if configured.is_empty() {
         return Err(ObservabilityConfigError::invalid(
             "observability.lineage.dataset",
-            "requires one complete binding for every externally emitted source and output node",
+            "requires one complete binding for every externally emitted source and Sink node",
             "add `[[observability.lineage.dataset]]` with `node` and exactly one canonical or catalog identity",
         ));
     }

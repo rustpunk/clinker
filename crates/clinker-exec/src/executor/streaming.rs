@@ -67,7 +67,7 @@ pub(super) fn compute_streaming_sink_specs(
     config: &PipelineConfig,
     fused_transforms: &HashSet<petgraph::graph::NodeIndex>,
     init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
-    output_configs: &[SinkConfig],
+    sink_configs: &[SinkConfig],
     writers: &WriterRegistry,
 ) -> Vec<StreamingSinkSpec> {
     use clinker_plan::plan::execution::PlanNode;
@@ -85,7 +85,7 @@ pub(super) fn compute_streaming_sink_specs(
     // `begin_document` / `end_document`.
     if config.any_source_has_correlation_key()
         || config.any_source_has_document_dlq()
-        || config.any_output_reconstructs_envelope()
+        || config.any_sink_reconstructs_envelope()
     {
         return Vec::new();
     }
@@ -112,7 +112,7 @@ pub(super) fn compute_streaming_sink_specs(
         if !writers.single.contains_key(output_name) || writers.fan_out.contains_key(output_name) {
             continue;
         }
-        let Some(out_cfg) = output_configs.iter().find(|o| &o.name == output_name) else {
+        let Some(out_cfg) = sink_configs.iter().find(|o| &o.name == output_name) else {
             continue;
         };
 
@@ -594,7 +594,7 @@ impl StreamingConsumer for SinkStreamConsumer {
 
     fn on_punctuation(&mut self, _punct: Punctuation) {
         // Streaming output is terminal — it writes records straight to disk,
-        // so a document boundary needs no writer action here. An Output that
+        // so a document boundary needs no writer action here. A Sink that
         // declares `reconstruct_envelope: true` (where the boundary DOES drive
         // a writer's `begin_document` / `end_document`) is excluded from this
         // fused path at spec-build time, so no envelope-reconstructing Output

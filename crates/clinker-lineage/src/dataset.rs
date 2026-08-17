@@ -157,7 +157,7 @@ pub fn dataset_identity(node: &PlanNode, base_dir: &Path) -> Option<DatasetId> {
             None => DatasetId::fallback(name.as_str()),
         }),
         PlanNode::Sink { name, resolved, .. } => Some(match resolved {
-            Some(payload) => output_dataset_identity(&payload.output, base_dir),
+            Some(payload) => output_dataset_identity(&payload.sink, base_dir),
             None => DatasetId::fallback(name.as_str()),
         }),
         _ => None,
@@ -582,7 +582,7 @@ mod tests {
     #[test]
     fn sink_node_delegates_to_output_identity() {
         let payload = PlanSinkPayload {
-            output: output_config(json!({"name": "out", "path": "out.csv", "type": "csv"})),
+            sink: output_config(json!({"name": "out", "path": "out.csv", "type": "csv"})),
             validated_path: None,
             fan_out_per_source_file: false,
         };

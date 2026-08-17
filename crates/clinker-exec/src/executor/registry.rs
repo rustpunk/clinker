@@ -269,7 +269,7 @@ fn build_writer_factory(
     repeat_header: bool,
     field_defs: Option<Vec<clinker_format::Column>>,
 ) -> Result<WriterFactory, PipelineError> {
-    // Every per-format config field derives from the Output config; bind them
+    // Every per-format config field derives from the Sink config; bind them
     // once so the format arms below read them by their original names.
     let include_header = output.include_header;
     let include_engine_stamped = output.include_correlation_keys;

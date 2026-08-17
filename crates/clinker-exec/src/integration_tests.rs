@@ -32,7 +32,7 @@ mod tests {
         let output_buf = SharedBuffer::new();
 
         let first_source = config.source_configs().next().unwrap().name.clone();
-        let first_output = config.output_configs().next().unwrap().name.clone();
+        let first_output = config.sink_configs().next().unwrap().name.clone();
         let readers: crate::executor::SourceReaders = HashMap::from([(
             first_source.clone(),
             crate::executor::single_file_reader(

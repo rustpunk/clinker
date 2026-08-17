@@ -198,7 +198,7 @@ fn doc_json(batch: &str, amounts: &[i64]) -> String {
 
 /// Run the multi-FILE pipeline (two documents, distinct source files) through
 /// an intermediate Transform, returning bytes + counters. `reconstruct` is
-/// appended to the Output config.
+/// appended to the Sink config.
 fn run_multi_doc(reconstruct: bool) -> (String, clinker_record::PipelineCounters) {
     let yaml = if reconstruct {
         MULTI_DOC_YAML.replace(

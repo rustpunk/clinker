@@ -63,7 +63,7 @@ fn run_with_payload(yaml: &str, src_path: &str, payload: &[u8]) -> (ExecutionRep
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     let report =

@@ -332,7 +332,7 @@ pub fn render_per_record_path(path: &str, source_file: &str, source_path: &str) 
         )
 }
 
-/// Render every Output node's `path:` template in place, with `n` set
+/// Render every Sink node's `path:` template in place, with `n` set
 /// to `None` so collision counters do not appear in the resolved base
 /// path. Both the non-split file opener (in `clinker::main`) and the
 /// split file factory (in `executor::build_format_writer`) consume the
@@ -358,7 +358,7 @@ pub fn resolve_output_path_templates_in_place(
         .nodes
         .iter()
         .filter_map(|s| match &s.value {
-            PipelineNode::Sink { config: body, .. } => Some(body.output.name.clone()),
+            PipelineNode::Sink { config: body, .. } => Some(body.sink.name.clone()),
             _ => None,
         })
         .collect();
@@ -372,8 +372,8 @@ pub fn resolve_output_path_templates_in_place(
         let PipelineNode::Sink { config: body, .. } = &mut spanned.value else {
             continue;
         };
-        let output_name = body.output.name.clone();
-        let template = PathTemplate::parse(&body.output.path)
+        let output_name = body.sink.name.clone();
+        let template = PathTemplate::parse(&body.sink.path)
             .map_err(|e| ConfigError::Validation(format!("output {output_name:?}: {e}")))?;
 
         let ancestors = ancestry.get(&output_name).cloned().unwrap_or_default();
@@ -421,10 +421,10 @@ pub fn resolve_output_path_templates_in_place(
             unique_suffix_width: 0,
         };
         let resolved = template
-            .resolve_runtime(&body.output.path, &local_ctx)
+            .resolve_runtime(&body.sink.path, &local_ctx)
             .map_err(|e| ConfigError::Validation(format!("output {output_name:?}: {e}")))?;
-        body.output.path = resolved.render("source-file", "source-path");
-        body.output.resolved_path_template = Some(resolved);
+        body.sink.path = resolved.render("source-file", "source-path");
+        body.sink.resolved_path_template = Some(resolved);
     }
     Ok(())
 }

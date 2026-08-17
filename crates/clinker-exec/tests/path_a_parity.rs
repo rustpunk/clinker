@@ -140,7 +140,7 @@ fn test_path_a_output_projections_populated() {
     let dag = plan.dag();
     assert!(
         !dag.output_projections.is_empty(),
-        "output_projections must be derived from output_configs; was empty"
+        "output_projections must be derived from sink_configs; was empty"
     );
 }
 

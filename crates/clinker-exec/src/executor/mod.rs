@@ -164,7 +164,7 @@ pub(crate) struct DispatchOutcome {
     /// walk unwound early. Carried up so the report surfaces the
     /// interrupted state to the CLI.
     pub(crate) interrupted: bool,
-    /// Advisory end-of-run findings, already rendered. Today: the per-Output
+    /// Advisory end-of-run findings, already rendered. Today: the per-Sink
     /// `mapping:` report (W365 / W366). Never fatal — by the time a stream
     /// ends its sibling Outputs have written.
     pub(crate) advisories: Vec<String>,
@@ -708,7 +708,7 @@ impl PipelineExecutor {
         let auto_commit_staged = writers.auto_commit_staged;
 
         let source_configs: Vec<_> = config.source_configs().cloned().collect();
-        let mut output_configs: Vec<_> = config.output_configs().cloned().collect();
+        let mut sink_configs: Vec<_> = config.sink_configs().cloned().collect();
         if !run_policy.preview().publishes_configured_outputs() {
             if auto_commit_staged || output_staging.has_run_attempt() {
                 return Err(PipelineError::Internal {
@@ -720,7 +720,7 @@ impl PipelineExecutor {
             // Preview uses the authored format but one explicit preview
             // destination. Split policy names configured Sink paths, so it is
             // disabled on this run-local clone before writer construction.
-            for output in &mut output_configs {
+            for output in &mut sink_configs {
                 output.split = None;
             }
         }
@@ -762,7 +762,7 @@ impl PipelineExecutor {
         // Validate that all configured outputs have registered writers.
         // Either the single-writer slot or the fan-out slot must contain
         // the output's name; the dispatcher consults whichever applies.
-        for output in &output_configs {
+        for output in &sink_configs {
             let registered = writers.single.contains_key(&output.name)
                 || writers.fan_out.contains_key(&output.name);
             if !registered {
@@ -1368,9 +1368,9 @@ impl PipelineExecutor {
         // removes it on drop — the path and the liveness guard cannot diverge.
         let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
 
-        let mut output_configs: Vec<_> = config.output_configs().cloned().collect();
+        let mut sink_configs: Vec<_> = config.sink_configs().cloned().collect();
         if !run_policy.preview().publishes_configured_outputs() {
-            for output in &mut output_configs {
+            for output in &mut sink_configs {
                 output.split = None;
             }
         }
@@ -1606,7 +1606,7 @@ impl PipelineExecutor {
             config,
             streaming_contracts,
             &init_phase_set,
-            &output_configs,
+            &sink_configs,
             &writers,
         );
         let mut streaming_output_senders: HashMap<
@@ -1683,8 +1683,8 @@ impl PipelineExecutor {
         let mut ctx = dispatch::ExecutorContext {
             config,
             composition_bodies,
-            output_configs: &output_configs,
-            primary_output: &output_configs[0],
+            sink_configs: &sink_configs,
+            primary_output: &sink_configs[0],
             stable: &stable,
             telemetry_producer: params.telemetry_producer.clone(),
             sink_byte_counter: None,
@@ -2056,7 +2056,7 @@ impl PipelineExecutor {
         // the projection from several arms and several chunks, and only the
         // union distinguishes a column no record carried from one some record
         // did.
-        let advisories = collect_mapping_advisories(ctx.output_configs, &ctx.mapping_probes);
+        let advisories = collect_mapping_advisories(ctx.sink_configs, &ctx.mapping_probes);
         Ok(DispatchOutcome {
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),
@@ -2105,10 +2105,10 @@ impl PipelineExecutor {
 /// pipeline. The probe registry is keyed for lookup, not presentation; walking
 /// it directly would sort advisories by output name.
 fn collect_mapping_advisories(
-    output_configs: &[clinker_plan::config::SinkConfig],
+    sink_configs: &[clinker_plan::config::SinkConfig],
     mapping_probes: &BTreeMap<String, crate::projection::MappingProbe>,
 ) -> Vec<String> {
-    output_configs
+    sink_configs
         .iter()
         .filter_map(|output| {
             mapping_probes
@@ -2291,7 +2291,7 @@ nodes:
 "#,
         )
         .expect("pipeline parses");
-        let outputs: Vec<_> = config.output_configs().cloned().collect();
+        let outputs: Vec<_> = config.sink_configs().cloned().collect();
         let record = clinker_record::Record::new(
             clinker_record::SchemaBuilder::new()
                 .with_field("id")

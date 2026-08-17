@@ -142,7 +142,7 @@ pub enum FormatError {
     /// Routes to fix this at the user level:
     ///
     /// - If the column is the `$widened` `auto_widen` sidecar
-    ///   absorber, set `include_unmapped: true` on the Output node;
+    ///   absorber, set `include_unmapped: true` on the Sink node;
     ///   the projection layer expands the map to top-level columns
     ///   before the record reaches the writer.
     /// - If the user explicitly emitted a map (rare), call a CXL
@@ -320,7 +320,7 @@ impl fmt::Display for FormatError {
                 f,
                 "{format} writer cannot serialize a `Value::Map` payload at column {column:?}. \
                  If this is the `$widened` auto_widen sidecar, set `include_unmapped: true` on \
-                 the Output node to expand the map to top-level columns before write. If the \
+                 the Sink node to expand the map to top-level columns before write. If the \
                  user emitted a map explicitly, coerce to a scalar in CXL before the emit."
             ),
             Self::UnserializableArrayValue { format, column } => write!(

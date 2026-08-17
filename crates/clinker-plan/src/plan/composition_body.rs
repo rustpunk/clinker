@@ -143,7 +143,7 @@ pub struct BoundBody {
 
     /// Body-internal node-name → NodeIndex. Used to wire edges during
     /// bind_composition and (later) to look up the body's terminal
-    /// output node by name.
+    /// Sink node by name.
     pub name_to_idx: HashMap<String, NodeIndex>,
 
     /// Signature input-port-name → NodeIndex of the body node that

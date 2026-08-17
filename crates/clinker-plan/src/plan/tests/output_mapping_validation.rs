@@ -160,7 +160,7 @@ fn duplicate_output_name_is_rejected() {
     assert_eq!(
         d.primary.span.synthetic_line_number(),
         Some(duplicate_line),
-        "the duplicate item, not the Output node, is highlighted"
+        "the duplicate item, not the Sink node, is highlighted"
     );
 }
 
@@ -234,7 +234,7 @@ fn unknown_source_column_is_rejected_with_a_suggestion() {
     assert_eq!(
         d.primary.span.synthetic_line_number(),
         Some(item_line),
-        "the unmatched item, not the Output node, is highlighted"
+        "the unmatched item, not the Sink node, is highlighted"
     );
 }
 

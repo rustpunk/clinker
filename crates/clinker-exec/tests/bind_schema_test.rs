@@ -615,7 +615,7 @@ nodes:
         agg_row.has_field("$widened"),
         "aggregate's bound row must include `$widened` when the upstream source's auto_widen \
          policy reserves the sidecar slot — dropping it breaks composition body propagation \
-         and the dispatch canonicalize invariant for downstream Output nodes"
+         and the dispatch canonicalize invariant for downstream Sink nodes"
     );
 
     // The PlanNode::Aggregation's lowered output_schema must carry the

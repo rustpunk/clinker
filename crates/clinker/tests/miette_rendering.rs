@@ -515,7 +515,7 @@ fn test_composition_body_diagnostic_does_not_point_into_the_pipeline_file() {
     // A plan-time span is a bare line number with no file identity, and a
     // composition body's gates number lines in the *body* file. Resolving one
     // against the pipeline file underlines unrelated YAML -- here it landed on
-    // the output node -- or, past the file's end, silently nothing. A plan
+    // the Sink node -- or, past the file's end, silently nothing. A plan
     // that binds a body therefore renders without a snippet at all.
     let tmp = tempdir_path();
     std::fs::write(

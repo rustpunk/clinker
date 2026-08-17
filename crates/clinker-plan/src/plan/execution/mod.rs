@@ -703,7 +703,7 @@ pub struct PlanTransformPayload {
 /// Fully-resolved Sink payload.
 #[derive(Debug, Clone)]
 pub struct PlanSinkPayload {
-    pub output: SinkConfig,
+    pub sink: SinkConfig,
     pub validated_path: Option<crate::security::ValidatedPath>,
     /// Plan-time flag: this Sink's path template uses a per-record
     /// token (`{source_file}` / `{source_path}`) AND its parent

@@ -1297,7 +1297,7 @@ fn output_consumed_columns(
         ..
     } = &graph[out_idx]
     {
-        let cfg = &payload.output;
+        let cfg = &payload.sink;
         // `entry.source` is the column read from upstream — the right-hand side
         // of an `output_name: source_column` pair, and the whole of a bare-name
         // entry. Seeding from the output names instead would prune the columns

@@ -112,7 +112,7 @@ fn test_cross_format_csv_to_xml_shapes() {
         source.format.format_name()
     );
 
-    let output = config.output_configs().next().expect("no output node");
+    let output = config.sink_configs().next().expect("no Sink node");
     assert!(
         matches!(output.format, OutputFormat::Xml(_)),
         "expected XML output, got {}",
@@ -313,7 +313,7 @@ fn test_split_config_max_fields_mutually_exclusive() {
     // splitting_by_records: only max_records
     let yaml = fs::read_to_string(root.join("splitting_by_records.yaml")).unwrap();
     let config = parse_config(&yaml).unwrap();
-    let output = config.output_configs().next().unwrap();
+    let output = config.sink_configs().next().unwrap();
     let split = output.split.as_ref().expect("split config missing");
     assert!(
         split.max_records.is_some(),
@@ -327,7 +327,7 @@ fn test_split_config_max_fields_mutually_exclusive() {
     // splitting_by_bytes: only max_bytes
     let yaml = fs::read_to_string(root.join("splitting_by_bytes.yaml")).unwrap();
     let config = parse_config(&yaml).unwrap();
-    let output = config.output_configs().next().unwrap();
+    let output = config.sink_configs().next().unwrap();
     let split = output.split.as_ref().expect("split config missing");
     assert!(
         split.max_bytes.is_some(),
@@ -341,7 +341,7 @@ fn test_split_config_max_fields_mutually_exclusive() {
     // splitting_by_group_key: max_records + group_key
     let yaml = fs::read_to_string(root.join("splitting_by_group_key.yaml")).unwrap();
     let config = parse_config(&yaml).unwrap();
-    let output = config.output_configs().next().unwrap();
+    let output = config.sink_configs().next().unwrap();
     let split = output.split.as_ref().expect("split config missing");
     assert!(
         split.max_records.is_some(),

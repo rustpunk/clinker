@@ -41,7 +41,7 @@ use clinker_plan::plan::execution::{
 /// against the writer implementation that is about to emit bytes. Deferred
 /// boundaries reuse the executor's shared stable authored-key sorter; preserve
 /// and proven-terminal-sort boundaries retain FIFO without consulting raw
-/// Output configuration or adding a comparison key.
+/// Sink configuration or adding a comparison key.
 #[derive(Clone)]
 pub(crate) struct OrderedWriterBoundary {
     boundary: PhysicalWriterBoundary,
@@ -235,13 +235,13 @@ fn resolve_out_cfg<'a>(
     ctx: &'a ExecutorContext<'_>,
     name: &str,
 ) -> &'a clinker_plan::config::SinkConfig {
-    ctx.output_configs
+    ctx.sink_configs
         .iter()
         .find(|o| o.name == *name)
         .unwrap_or(ctx.primary_output)
 }
 
-/// The per-Output input-binding values all three Output dispatch arms derive
+/// The per-Sink input-binding values all three Output dispatch arms derive
 /// from the plan before writing: the expected input schema (for the
 /// schema-check), the upstream node name (for E314 diagnostics), and the CXL
 /// emit names (for `include_unmapped: false` projection). Owned so the caller
@@ -533,12 +533,12 @@ fn dispatch_sink_work(
     }
 
     // Inline field access (not `resolve_out_cfg`) so the borrow is scoped to
-    // `output_configs` / `primary_output`: this arm interleaves `out_cfg`'s
+    // `sink_configs` / `primary_output`: this arm interleaves `out_cfg`'s
     // borrow with `&mut ctx` on other fields (correlation buffers, writers,
     // timers), which disjoint sub-field borrows permit but a whole-`ctx`
     // helper borrow would not.
     let out_cfg = ctx
-        .output_configs
+        .sink_configs
         .iter()
         .find(|o| o.name == *name)
         .unwrap_or(ctx.primary_output);
@@ -583,7 +583,7 @@ fn dispatch_sink_work(
     // * `records_written` increments per WRITE — under
     //   inclusive Route fan-out, one input matching N
     //   branches counts N (one per Output that received
-    //   it). Aligns with per-Output throughput and the
+    //   it). Aligns with per-Sink throughput and the
     //   `records_emitted` local that drives stage-metric
     //   reporting.
     //
@@ -867,11 +867,11 @@ fn dispatch_sink_document_dlq(
     }
 
     // Inline field access (not `resolve_out_cfg`) so the borrow is scoped to
-    // `output_configs` / `primary_output`: the driver holds `out_cfg` across
+    // `sink_configs` / `primary_output`: the driver holds `out_cfg` across
     // `run`, which takes `&mut ctx` — a whole-`ctx` helper borrow would
     // conflict, but disjoint sub-field borrows coexist.
     let out_cfg = ctx
-        .output_configs
+        .sink_configs
         .iter()
         .find(|o| o.name == *name)
         .unwrap_or(ctx.primary_output);
@@ -967,7 +967,7 @@ fn dispatch_sink_envelope(
     } = resolve_sink_inputs(current_dag, node_idx);
     // Owned clone: the writer-factory closure and the projection both borrow
     // `out_cfg` across the loop's `&mut ctx` phases, so it cannot stay a
-    // borrow of `ctx.output_configs`.
+    // borrow of `ctx.sink_configs`.
     let out_cfg = resolve_out_cfg(ctx, name).clone();
     let cxl_emit_names_opt: Option<&[String]> = if cxl_emit_names.is_empty() {
         None

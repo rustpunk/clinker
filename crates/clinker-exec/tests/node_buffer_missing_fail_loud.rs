@@ -77,7 +77,7 @@ fn run_pipeline_with_context(
         ),
     )]);
     let buffers: HashMap<String, SharedBuffer> = config
-        .output_configs()
+        .sink_configs()
         .map(|output| (output.name.clone(), SharedBuffer::new()))
         .collect();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = buffers

@@ -68,7 +68,7 @@ fn run_format_test(
         clinker_exec::executor::single_file_reader("test.csv", Box::new(input_data)),
     )]);
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 

@@ -84,7 +84,7 @@ pub fn project_output_from_record(
     project_output_probed(input_record, config, cxl_emit_names, None)
 }
 
-/// [`project_output_from_record`] with the per-Output [`MappingProbe`] the
+/// [`project_output_from_record`] with the per-Sink [`MappingProbe`] the
 /// end-of-stream report is built from.
 ///
 /// Every per-record projection for one Output must feed the SAME probe, or an
@@ -121,7 +121,7 @@ pub fn project_output_probed(
     if !needs_rewrite {
         // Fast path: no exclude, no mapping — emit all Record fields in
         // natural iteration order, no intermediate allocation.
-        // Engine-stamped columns are dropped unless the Output node
+        // Engine-stamped columns are dropped unless the Sink node
         // opts in via the appropriate flag (CK → include_correlation_keys;
         // sidecar → include_unmapped, handled in the slow path because
         // expansion needs IndexMap-keyed access).
@@ -401,7 +401,7 @@ pub struct MappingProbe {
     /// Records projected through this Output. Zero means the stream was empty,
     /// which is not evidence of anything.
     records: u64,
-    /// Fixed per-Output scratch used when projection precedes a fallible write.
+    /// Fixed per-Sink scratch used when projection precedes a fallible write.
     /// These vectors are allocated with the probe, then cleared and reused for
     /// every record; they never grow with input cardinality.
     staged_resolved: Vec<bool>,
@@ -1423,7 +1423,7 @@ mod tests {
         use clinker_record::{DocumentContext, DocumentId};
         use indexmap::IndexMap as RecIndexMap;
 
-        // The default Output config (no mapping/exclude, include_unmapped
+        // The default Sink config (no mapping/exclude, include_unmapped
         // false, cxl_emit_names None) takes the fast path. A document-
         // reconstructing writer downstream — e.g. EDIFACT
         // `interchange_from_doc` echoing the source `UNB` — must still
@@ -1483,7 +1483,7 @@ mod tests {
     use clinker_format::{Column, SourceSchema};
     use rust_decimal::Decimal;
 
-    /// A minimal fast-path Output config (no mapping/exclude, no correlation
+    /// A minimal fast-path Sink config (no mapping/exclude, no correlation
     /// keys) carrying an optional output `schema:`. `cxl_emit_names = None`
     /// keeps every user field, so a declared decimal column reaches the
     /// rounding pass.

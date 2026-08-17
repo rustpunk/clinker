@@ -2728,7 +2728,7 @@ schema:
 
     #[test]
     fn patch_schema_non_source_target_errors() {
-        // `sink` is an output node, not a source.
+        // `sink` is a Sink node, not a source.
         let base = schema_base();
         let op = parse_op(
             r#"

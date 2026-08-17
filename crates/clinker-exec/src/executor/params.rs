@@ -248,7 +248,7 @@ pub struct ExecutionReport {
     /// the interrupted exit code (130). A clean run leaves it `false`.
     pub interrupted: bool,
     /// Advisory end-of-run findings, already rendered, in Output declaration
-    /// order. Today: the per-Output `mapping:` report — **W365** for an entry
+    /// order. Today: the per-Sink `mapping:` report — **W365** for an entry
     /// whose column no record carried, **W366** for an upstream column a mapped
     /// output name displaced.
     ///

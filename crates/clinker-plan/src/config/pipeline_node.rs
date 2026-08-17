@@ -70,7 +70,7 @@ use clinker_core_types::{Diagnostic, LabeledSpan, Span as DiagnosticSpan};
 /// only deserialization is re-architected.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-// Variant size is dominated by `SourceBody`/`OutputBody` (large wrapped
+// Variant size is dominated by `SourceBody`/`SinkBody` (large wrapped
 // config types) and by the `Locations` field in `Spanned<NodeInput>` on
 // every consumer header. Boxing would force every consumer site to deref
 // through the box — a pervasive ergonomics regression for a value that
@@ -117,7 +117,7 @@ pub enum PipelineNode {
     Sink {
         #[serde(flatten)]
         header: NodeHeader,
-        config: OutputBody,
+        config: SinkBody,
     },
     /// Per-correlation-group record synthesis and trigger-row mutation.
     ///
@@ -430,7 +430,7 @@ impl<'de> Deserialize<'de> for PipelineNode {
                         )))
                     }
                     "sink" => {
-                        let payload = OutputPayload::deserialize(
+                        let payload = SinkPayload::deserialize(
                             de::value::MapAccessDeserializer::new(dispatch),
                         )?;
                         let (header, config) = payload.into_variant_parts();
@@ -610,18 +610,18 @@ impl RoutePayload {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OutputPayload {
+struct SinkPayload {
     name: String,
     #[serde(default)]
     description: Option<String>,
     input: crate::yaml::Spanned<crate::config::node_header::NodeInput>,
     #[serde(default, rename = "_notes")]
     notes: Option<serde_json::Value>,
-    config: OutputBody,
+    config: SinkBody,
 }
 
-impl OutputPayload {
-    fn into_variant_parts(self) -> (NodeHeader, OutputBody) {
+impl SinkPayload {
+    fn into_variant_parts(self) -> (NodeHeader, SinkBody) {
         (
             NodeHeader {
                 name: self.name,
@@ -1284,7 +1284,7 @@ pub struct SourceBody {
 ///   stamped, so the typechecker is blind to its contents — CXL
 ///   expressions cannot read or write it). Each input record's keys
 ///   that are not in the declaration land in a `Value::Map` payload
-///   on that slot. The Output node opts the contents back into
+///   on that slot. The Sink node opts the contents back into
 ///   top-level columns via `include_unmapped: true` (the default).
 ///   Pattern precedent:
 ///   Databricks Auto Loader's `_rescued_data` (single sidecar JSON
@@ -1789,25 +1789,25 @@ pub struct CombineBody {
     pub max_output_rows: Option<u64>,
 }
 
-/// Output variant body. Wraps the existing sink config.
+/// Sink variant body. Wraps the terminal destination config.
 #[derive(Debug, Clone, Serialize)]
-pub struct OutputBody {
+pub struct SinkBody {
     #[serde(flatten)]
-    pub output: crate::config::SinkConfig,
+    pub sink: crate::config::SinkConfig,
 }
 
-impl<'de> Deserialize<'de> for OutputBody {
+impl<'de> Deserialize<'de> for SinkBody {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct OutputBodyVisitor;
+        struct SinkBodyVisitor;
 
-        impl<'de> Visitor<'de> for OutputBodyVisitor {
-            type Value = OutputBody;
+        impl<'de> Visitor<'de> for SinkBodyVisitor {
+            type Value = SinkBody;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("an output configuration")
+                f.write_str("a Sink configuration")
             }
 
             fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
@@ -1818,14 +1818,14 @@ impl<'de> Deserialize<'de> for OutputBody {
                 // loses nested item locations. Delegate the native map stream
                 // directly so `OutputMapping` can retain each sequence item's
                 // span for E364/E365.
-                let output = crate::config::SinkConfig::deserialize(
+                let sink = crate::config::SinkConfig::deserialize(
                     de::value::MapAccessDeserializer::new(map),
                 )?;
-                Ok(OutputBody { output })
+                Ok(SinkBody { sink })
             }
         }
 
-        deserializer.deserialize_map(OutputBodyVisitor)
+        deserializer.deserialize_map(SinkBodyVisitor)
     }
 }
 

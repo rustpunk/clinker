@@ -276,7 +276,7 @@ fn body_output_bad_csv_delimiter_rejected_at_compile() {
 }
 
 /// A body Output with a valid single-byte delimiter compiles — the new body
-/// check must not reject more than the top level does, and body Output nodes
+/// check must not reject more than the top level does, and body Sink nodes
 /// remain a supported shape.
 #[test]
 fn body_output_valid_csv_delimiter_compiles() {
@@ -680,7 +680,7 @@ nodes:
         .as_ref()
         .expect("the full plan carries the body Sink's resolved payload");
     let columns = payload
-        .output
+        .sink
         .schema
         .as_ref()
         .and_then(|s| s.as_columns())

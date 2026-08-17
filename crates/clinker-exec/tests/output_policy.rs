@@ -282,6 +282,6 @@ error_handling:
     let mut config = clinker_plan::config::parse_config(yaml).unwrap();
     let ctx = TemplateContext::default();
     resolve_output_path_templates_in_place(&mut config, &ctx).unwrap();
-    let resolved = config.output_configs().next().unwrap().path.clone();
+    let resolved = config.sink_configs().next().unwrap().path.clone();
     assert_eq!(resolved, "/tmp/customers.csv");
 }

@@ -2,7 +2,7 @@
 //!
 //! The finalized plan graph is lowered once into stable producer and consumer
 //! identities. Runtime fan-out uses this registry instead of independently
-//! recounting Output nodes and Merge/Combine predecessor readers.
+//! recounting Sink nodes and Merge/Combine predecessor readers.
 
 use std::collections::{BTreeMap, BTreeSet};
 

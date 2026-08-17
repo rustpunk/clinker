@@ -416,7 +416,7 @@ fn execute_composition_body(
         return Err(error);
     }
 
-    // Pick the body's terminal output node. The bind-time alias
+    // Pick the body's terminal Sink node. The bind-time alias
     // resolution wrote the port → NodeIndex map onto BoundBody;
     // the first declared output port wins. Zero-output-port bodies
     // are legal (sink-only / side-effect bodies) and produce no

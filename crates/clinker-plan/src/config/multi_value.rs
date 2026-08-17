@@ -1112,7 +1112,7 @@ fn on_conflict_name(policy: OnConflict) -> &'static str {
 /// Also runs the per-output E362 gate ([`validate_join_declarations`]) over the
 /// output's `join_values` block, which — unlike E359 — applies whatever the
 /// format is, since a `csv` output legitimately carries it.
-pub fn output_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
+pub fn sink_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
     let schemas = resolved_source_schemas(nodes);
     let multi_value_by_source: HashMap<&str, Vec<String>> = schemas
         .iter()
@@ -1129,7 +1129,7 @@ pub fn output_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
         else {
             continue;
         };
-        let output = &body.output;
+        let output = &body.sink;
         // E362 — a malformed `join_values` declaration, checked before the
         // encoding gate below: `csv` (the format that consumes it) short-circuits
         // that gate, so its own per-entry checks must run here or never.

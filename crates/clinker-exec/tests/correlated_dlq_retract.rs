@@ -7,7 +7,7 @@
 //! * The zero-overhead invariant — strict pipelines short-circuit to
 //!   the `FastPath` body and the existing `correlated_dlq.rs` workload
 //!   continues to pass byte-identically.
-//! * The CorrelationFanoutPolicy precedence — per-Output > per-pipeline
+//! * The CorrelationFanoutPolicy precedence — per-Sink > per-pipeline
 //!   default > documented `Any` default.
 //! * The replay-loop iteration cap — a fixture that would loop in a
 //!   buggy implementation panics with the documented message.
@@ -56,7 +56,7 @@ fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, PipelineError>
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
@@ -201,7 +201,7 @@ nodes:
 }
 
 /// Per-Output `Primary` override should resolve through the orchestrator
-/// regardless of the pipeline-level setting. Verifies the per-Output
+/// regardless of the pipeline-level setting. Verifies the per-Sink
 /// override takes precedence over the per-pipeline default.
 #[test]
 fn fanout_policy_resolution_output_override_wins() {

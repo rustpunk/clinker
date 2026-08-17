@@ -2150,7 +2150,7 @@ nodes:
     // `Compile(Vec<Diagnostic>)` variant and inspect per-diagnostic
     // codes rather than fuzzy-matching message strings.
     //
-    // Output capture: every declared output node gets its own
+    // Output capture: every declared Sink node gets its own
     // `SharedBuffer`; the returned `CombineFixtureResult.outputs` is a
     // `HashMap<String, String>` keyed by output name. `primary_output()`
     // returns the first-declared output for single-output tests;
@@ -2199,8 +2199,8 @@ nodes:
     #[allow(dead_code)] // Fields accessed via named getters; field access is lint-silent.
     pub(crate) struct CombineFixtureResult {
         pub report: ExecutionReport,
-        /// Captured output bytes per declared output node, keyed by
-        /// output `name`. Every output node registered in the pipeline
+        /// Captured output bytes per declared Sink node, keyed by
+        /// output `name`. Every Sink node registered in the pipeline
         /// YAML gets an entry — including empty buffers for outputs that
         /// received zero records.
         pub outputs: HashMap<String, String>,
@@ -2211,7 +2211,7 @@ nodes:
 
     impl CombineFixtureResult {
         /// Single-output convenience: captured bytes from the FIRST
-        /// declared output node (by YAML declaration order). Panics if
+        /// declared Sink node (by YAML declaration order). Panics if
         /// the pipeline declared no outputs.
         #[allow(dead_code)]
         pub fn primary_output(&self) -> &str {
@@ -2272,12 +2272,12 @@ nodes:
         // pipelines (Route downstream of combine) would lose data otherwise.
         let output_names: Vec<String> = plan
             .config()
-            .output_configs()
+            .sink_configs()
             .map(|cfg| cfg.name.clone())
             .collect();
         if output_names.is_empty() {
             return Err(CombineFixtureError::Precondition(
-                "run_combine_fixture: pipeline declares no output nodes".to_string(),
+                "run_combine_fixture: pipeline declares no Sink nodes".to_string(),
             ));
         }
         let output_buffers: HashMap<String, SharedBuffer> = output_names
