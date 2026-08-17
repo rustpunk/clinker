@@ -127,7 +127,7 @@ nodes:
       emit ratio = 1 / (total - 60)
 
       '
-- type: output
+- type: sink
   name: out
   input: post_check
   config:
@@ -244,7 +244,7 @@ nodes:
       emit department = department
       emit total = total
       emit ratio = 1 / (total - 60)
-- type: output
+- type: sink
   name: out
   input: ratio
   config:
@@ -364,7 +364,7 @@ nodes:
       emit ratio = 1 / (total - 30)
 
       '
-- type: output
+- type: sink
   name: out
   input: post_check
   config:
@@ -462,7 +462,7 @@ nodes:
       emit ratio = 1 / (total - 60)
 
       '
-- type: output
+- type: sink
   name: out
   input: post_dept
   config:
@@ -548,7 +548,7 @@ nodes:
       emit ratio = 100 / (total - 30)
 
       '
-- type: output
+- type: sink
   name: out
   input: post_check
   config:

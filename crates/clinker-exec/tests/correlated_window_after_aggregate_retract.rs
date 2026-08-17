@@ -94,7 +94,7 @@ nodes:
       emit running_total = $window.sum(total)
     analytic_window:
       group_by: [department]
-- type: output
+- type: sink
   name: out
   input: running
   config:
@@ -291,7 +291,7 @@ nodes:
       emit ratio = 1 / (total - 60)
     analytic_window:
       group_by: [department]
-- type: output
+- type: sink
   name: out
   input: running
   config:

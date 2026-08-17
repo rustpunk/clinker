@@ -135,7 +135,7 @@ nodes:
     use: ../compositions/correlated_validate.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: validate_call
     config:
@@ -223,7 +223,7 @@ nodes:
     use: ../compositions/correlated_rewrite.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: rewrite_call
     config:
