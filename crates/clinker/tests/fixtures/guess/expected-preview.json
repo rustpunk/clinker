@@ -8,16 +8,21 @@
     "applied_groups": []
   },
   "limits": {
+    "max_yaml_input_bytes": 33554432,
+    "max_yaml_nodes_per_document": 100000,
+    "max_schema_leaves": 100000,
     "max_files_per_source": 4,
     "max_records_per_file": 1024,
     "max_input_bytes_per_file": 8388608,
-    "max_evidence_per_field": 8
+    "max_numeric_lexeme_evidence_bytes": 128,
+    "max_evidence_per_owner": 8
   },
   "coverage": [
     {
       "source": "csv_orders",
       "format": "csv",
       "discovered_files": 1,
+      "unreported_file_count": 0,
       "files": [
         {
           "path": "input.csv",
