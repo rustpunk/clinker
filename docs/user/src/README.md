@@ -117,7 +117,7 @@ nodes:
         emit full_name = first_name + " " + last_name
         emit tier = if lifetime_value >= 10000 then "gold" else "standard"
 
-  - type: output
+  - type: sink
     name: result
     input: enrich
     config:
