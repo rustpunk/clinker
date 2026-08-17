@@ -7,6 +7,7 @@
 // (PlanNode, PlanEdge, ExecutionPlanDag) and re-exports each submodule's
 // surface so `crate::plan::execution::*` paths resolve unchanged.
 
+mod activation;
 mod composition;
 mod consumer_registry;
 mod dag;
@@ -16,6 +17,7 @@ mod graph_util;
 mod scheduling;
 mod streaming_class;
 
+pub use activation::*;
 pub use composition::*;
 pub use consumer_registry::*;
 pub use dag::*;

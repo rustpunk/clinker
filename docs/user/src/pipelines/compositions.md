@@ -178,13 +178,35 @@ _compose:
   name: order_lookup
   inputs:
     input: { schema: [{ name: order_id, type: string }] }
-  outputs: { out: shape }
+  outputs: { out: order_reference }
   config_schema: {}
   resources_schema:
     orders:
       kind: file
       required: true
+
+nodes:
+  - type: source
+    name: order_reference
+    config:
+      name: order_reference
+      type: csv
+      resource: orders
+      schema: [{ name: order_id, type: string }]
 ```
+
+`resource:` is an explicit body-Source-to-slot link. The slot must be declared
+by the enclosing `_compose.resources_schema`; the Source name and its format do
+not select a resource implicitly. A resource-backed body Source must not also
+declare `path`, `glob`, `regex`, or `paths`, because the bound catalog resource
+is its only external target. Every authored body Source must declare
+`resource:`. Composition input ports are separate synthetic roots: to consume
+caller-provided rows, declare `_compose.inputs.<port>` and set a downstream
+node's `input: <port>` instead of authoring a Source node for that port.
+
+Top-level Sources are unchanged: they continue to require exactly one direct
+matcher. `resource:` on a top-level Source is rejected until a separate
+top-level binding surface is designed.
 
 The workspace supplies a concrete, secret-free descriptor under a logical
 identity in `clinker.toml`:
@@ -216,9 +238,12 @@ descriptor-byte limits.
 
 Planning retains the winning logical identity and every attempted overlay
 layer for each binding. That identity also participates in the semantic plan
-fingerprint. Runtime credential resolution and handle activation are separate
-future preflight work; this surface neither selects credentials nor opens the
-file.
+fingerprint. For each authored body Source, planning compiles a distinct
+call-site-scoped instance carrying only the slot, logical identity, resource
+kind, required capabilities, opener family, run lifetime, provenance, and
+stable logical dataset identity. It does not retain the catalog's physical
+path. Runtime credential resolution and handle activation are separate future
+preflight work; this surface neither selects credentials nor opens the file.
 
 Ordinary composition calls do not have `outputs:` or `alias:` fields. Either
 key fails with E377 at its authored location. Use `_compose.outputs` for the

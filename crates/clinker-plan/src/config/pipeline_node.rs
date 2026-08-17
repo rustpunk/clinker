@@ -1228,6 +1228,15 @@ impl PipelineNode {
 /// [`crate::config::PipelineConfig::compile`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceBody {
+    /// Composition resource slot that supplies this Source's external target.
+    ///
+    /// This field is valid only on a Source authored inside a composition
+    /// body. The enclosing `_compose.resources_schema` must declare the slot,
+    /// and each call site must bind it through `resources:`. Top-level Sources
+    /// continue to use exactly one direct file matcher until they gain a
+    /// separately designed binding surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<crate::yaml::Spanned<String>>,
     /// The source's unified schema. Required — missing this field is a
     /// serde parse error routed to E201 via the diagnostic layer. A
     /// [`SourceSchema`](clinker_format::SourceSchema) carrying the declared

@@ -42,6 +42,9 @@ use crate::plan::combine::{
     CombineInput, DecomposedPredicate, decompose_predicate, select_driving_input,
 };
 use crate::plan::composition_body::{BoundBody, CompositionBodyId};
+use crate::plan::execution::{
+    CompiledResourceRequirement, CompiledSourceInstance, CompiledSourceInstanceId,
+};
 use crate::plan::types::JoinSide;
 use crate::plan::{EntityRef, PlanNodeId};
 use crate::resources::WorkspaceCatalog;
@@ -1067,6 +1070,15 @@ fn span_for_node(spanned: &Spanned<PipelineNode>) -> Span {
         Span::line_only(line)
     } else {
         Span::SYNTHETIC
+    }
+}
+
+fn authored_value_span<T>(spanned: &Spanned<T>, fallback: Span) -> Span {
+    let line = spanned.referenced.line() as u32;
+    if line > 0 {
+        Span::line_only(line)
+    } else {
+        fallback
     }
 }
 
@@ -2557,6 +2569,27 @@ fn bind_schema_inner(
 
         match node {
             PipelineNode::Source { config, .. } => {
+                if bind_ctx.depth == 0
+                    && let Some(resource) = config.resource.as_ref()
+                {
+                    diags.push(
+                        Diagnostic::error(
+                            "E103",
+                            format!(
+                                "top-level source {name:?} declares `resource: {}` but top-level resource binding is not available",
+                                resource.value
+                            ),
+                            LabeledSpan::primary(
+                                authored_value_span(resource, span),
+                                "resource slots are composition-body scoped",
+                            ),
+                        )
+                        .with_help(
+                            "remove `resource:` and set exactly one of `path`, `glob`, `regex`, or `paths`; use a composition body plus `_compose.resources_schema` and call-site `resources:` for a catalog-backed Source",
+                        ),
+                    );
+                    continue;
+                }
                 // Resolve the unified `schema:` (single-record column list,
                 // multi-record superset, external file, or engine-generated)
                 // to the effective column list this source seeds its row from.
@@ -3323,7 +3356,24 @@ fn bind_composition(
         }
     }
 
-    // 7b. Body nodes never flow through top-level config validation
+    // 7b. Resolve every authored body Source through one explicit resource
+    // slot before the ordinary body bind. Synthetic input-port Sources are
+    // introduced later and deliberately do not appear in this inventory:
+    // they receive parent records and do not open an external dataset.
+    let pending_source_requirements = match compile_body_source_requirements(
+        &body_file.nodes,
+        signature,
+        call_resources,
+        bind_ctx.resource_catalog,
+        node_name,
+        &resolved_path,
+        diags,
+    ) {
+        Some(requirements) => requirements,
+        None => return,
+    };
+
+    // 7c. Body nodes never flow through top-level config validation
     // (`validate_config` sees only the call-site pipeline's own nodes),
     // so run the shared node-scoped checks here. Without this pass a
     // body Envelope with a wired `trailer:` — or a Transform with a
@@ -3353,7 +3403,7 @@ fn bind_composition(
         }
     }
 
-    // 7c. A body Source/Output CSV `delimiter` / `quote_char` is only ever
+    // 7d. A body Source/Output CSV `delimiter` / `quote_char` is only ever
     // rejected at runtime by the writer's single-byte lowering guard, because
     // top-level `validate_config` (which runs the same check) sees only the
     // call-site pipeline's own nodes. Run the shared byte-option check here so
@@ -3423,7 +3473,7 @@ fn bind_composition(
         }
     }
 
-    // 7d. Resolve external `.schema.yaml` (`SourceSchema::File`) references on
+    // 7e. Resolve external `.schema.yaml` (`SourceSchema::File`) references on
     // body Source and Output nodes to their inline column form, each path
     // resolved relative to the composition file's own directory. Top-level
     // nodes have their externals resolved at parse time by
@@ -3486,7 +3536,7 @@ fn bind_composition(
         }
     }
 
-    // 7e. The multi-value gates (E358 / E359 / E360 / E361) and the E363
+    // 7f. The multi-value gates (E358 / E359 / E360 / E361) and the E363
     // `record_path` grammar gate, which the call-site pipeline runs over its
     // OWN `nodes:` — a list that never contains a body's nodes. Without this
     // pass a body source declaring the retired `array_paths:`, a `multiple:
@@ -3693,6 +3743,18 @@ fn bind_composition(
             .entry(port_name.clone())
             .or_insert_with(|| artifacts.fresh_node_id());
     }
+
+    let source_instances = pending_source_requirements
+        .into_iter()
+        .map(|(source_name, resource)| CompiledSourceInstance {
+            id: CompiledSourceInstanceId {
+                body_scope: body_id.into(),
+                source_node: body_node_ids[&source_name],
+            },
+            source_name,
+            resource,
+        })
+        .collect();
 
     // Recursive bind_schema on body nodes.
     bind_schema_inner(
@@ -4084,6 +4146,7 @@ fn bind_composition(
     // binds, not the body the file spelled.
     bound_body.semantic_digest = body_file.semantic_digest();
     bound_body.resource_bindings = call_resources.clone();
+    bound_body.source_instances = source_instances;
     bound_body.graph = body_graph;
     bound_body.topo_order = body_topo;
     bound_body.name_to_idx = body_name_to_idx;
@@ -4112,6 +4175,162 @@ fn bind_composition(
 }
 
 // ─── Validation helpers ─────────────────────────────────────────────
+
+fn compile_body_source_requirements(
+    nodes: &[Spanned<PipelineNode>],
+    signature: &CompositionSignature,
+    call_resources: &IndexMap<String, ResourceBinding>,
+    catalog: &WorkspaceCatalog,
+    call_name: &str,
+    body_path: &Path,
+    diags: &mut Vec<Diagnostic>,
+) -> Option<Vec<(String, CompiledResourceRequirement)>> {
+    let mut requirements = Vec::new();
+    let mut valid = true;
+
+    for spanned in nodes {
+        let PipelineNode::Source { config, .. } = &spanned.value else {
+            continue;
+        };
+        let source_name = config.source.name.as_str();
+        let node_span = span_for_node(spanned);
+        let Some(authored_slot) = config.resource.as_ref() else {
+            diags.push(
+                Diagnostic::error(
+                    "E103",
+                    format!(
+                        "composition node {call_name:?}: body file {}: source {source_name:?} declares no resource slot; authored body Sources cannot use an inert direct file target",
+                        body_path.display()
+                    ),
+                    LabeledSpan::primary(node_span, "missing body Source resource slot"),
+                )
+                .with_help(
+                    "add `resource: <slot>` to this Source, declare that slot under `_compose.resources_schema`, and bind it at the composition call; if rows arrive from the caller, remove this Source and consume the declared `_compose.inputs` port directly",
+                ),
+            );
+            valid = false;
+            continue;
+        };
+        let slot = authored_slot.value.as_str();
+        let resource_span = authored_value_span(authored_slot, node_span);
+        let matchers: Vec<&str> = [
+            ("path", config.source.path.is_some()),
+            ("glob", config.source.glob.is_some()),
+            ("regex", config.source.regex.is_some()),
+            ("paths", config.source.paths.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, present)| present.then_some(name))
+        .collect();
+        if !matchers.is_empty() {
+            let remove = matchers
+                .iter()
+                .map(|matcher| format!("`{matcher}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            diags.push(
+                Diagnostic::error(
+                    "E103",
+                    format!(
+                        "composition node {call_name:?}: body file {}: source {source_name:?} declares `resource: {slot}` together with direct matcher(s) {}; a resource-backed Source has exactly one external target",
+                        body_path.display(),
+                        matchers.join(", ")
+                    ),
+                    LabeledSpan::primary(resource_span, "resource conflicts with direct matcher"),
+                )
+                .with_help(format!(
+                    "remove {remove}; the catalog resource bound through `resource: {slot}` supplies the Source target"
+                )),
+            );
+            valid = false;
+            continue;
+        }
+        if !config.source.transport.is_file() {
+            diags.push(
+                Diagnostic::error(
+                    "E103",
+                    format!(
+                        "composition node {call_name:?}: body file {}: source {source_name:?} binds file resource slot {slot:?} but declares `{}` transport",
+                        body_path.display(),
+                        config.source.transport.transport_name()
+                    ),
+                    LabeledSpan::primary(resource_span, "file resource requires file transport"),
+                )
+                .with_help("remove `transport:` so the Source uses the default file transport"),
+            );
+            valid = false;
+            continue;
+        }
+        let Some(declaration) = signature.resources_schema.get(slot) else {
+            diags.push(
+                Diagnostic::error(
+                    "E103",
+                    format!(
+                        "composition node {call_name:?}: body file {}: source {source_name:?} names resource slot {slot:?}, but `_compose.resources_schema` does not declare it",
+                        body_path.display()
+                    ),
+                    LabeledSpan::primary(resource_span, "undeclared body Source resource slot"),
+                )
+                .with_help(format!(
+                    "add `{slot}: {{ kind: file, required: true }}` under `_compose.resources_schema`"
+                )),
+            );
+            valid = false;
+            continue;
+        };
+        let Some(binding) = call_resources.get(slot) else {
+            diags.push(
+                Diagnostic::error(
+                    "E103",
+                    format!(
+                        "composition node {call_name:?}: body source {source_name:?} uses resource slot {slot:?}, but this call does not bind it"
+                    ),
+                    LabeledSpan::primary(resource_span, "unbound body Source resource slot"),
+                )
+                .with_help(format!(
+                    "add `resources: {{ {slot}: <catalog-resource-id> }}` to composition node {call_name:?}"
+                )),
+            );
+            valid = false;
+            continue;
+        };
+        let resource = match catalog.resolve_resource(binding.logical_id()) {
+            Ok(resource) => resource,
+            Err(error) => {
+                diags.push(
+                    Diagnostic::error(
+                        "E103",
+                        format!(
+                            "composition node {call_name:?}: body source {source_name:?} cannot resolve resource slot {slot:?}: {error}"
+                        ),
+                        LabeledSpan::primary(resource_span, "unresolved body Source resource"),
+                    )
+                    .with_help("bind the slot to an existing compatible catalog resource"),
+                );
+                valid = false;
+                continue;
+            }
+        };
+        requirements.push((
+            source_name.to_owned(),
+            CompiledResourceRequirement {
+                slot: slot.to_owned(),
+                binding: binding.clone(),
+                kind: declaration.kind,
+                required_capabilities: declaration
+                    .kind
+                    .required_capabilities()
+                    .to_vec()
+                    .into_boxed_slice(),
+                opener: declaration.kind.opener_kind(),
+                lifetime: declaration.kind.lifetime(),
+                dataset_identity: resource.dataset_identity(),
+            },
+        ));
+    }
+
+    valid.then_some(requirements)
+}
 
 /// Validate call-site `inputs:` against the signature's declared input ports.
 /// Returns `true` if validation passes (no errors emitted).
