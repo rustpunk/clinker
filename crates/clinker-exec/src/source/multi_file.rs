@@ -27,7 +27,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clinker_format::{FormatError, FormatReader, ReopenableSource};
+use clinker_format::{FormatError, FormatReader, ReopenableSource, RetainedFileGuard};
 use clinker_record::{Record, Schema};
 
 /// Closure that builds a [`FormatReader`] from a single file's re-openable
@@ -93,6 +93,31 @@ impl FileSlot {
             path: provenance.into(),
             source: ReopenableSource::path(read_path),
         }
+    }
+
+    /// Open a file once at capability activation and retain that exact object.
+    ///
+    /// The slot streams from cloned handles with independent logical cursors;
+    /// it never re-opens `read_path` and never buffers the file whole. The
+    /// returned opaque guard belongs to the provider session and must remain
+    /// live until its complete activation group finishes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O failure if the file cannot be opened,
+    /// cloned, or inspected at the activation boundary.
+    pub fn open_file(
+        provenance: impl Into<PathBuf>,
+        read_path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<(Self, RetainedFileGuard)> {
+        let (source, guard) = ReopenableSource::open_file(read_path)?;
+        Ok((
+            Self {
+                path: provenance.into(),
+                source,
+            },
+            guard,
+        ))
     }
 }
 

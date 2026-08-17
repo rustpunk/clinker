@@ -6,10 +6,11 @@
 //! whole input — while a one-pass reader (CSV, XML, fixed-width, EDI) consumes
 //! the bytes lazily, one streamed `Read` and no buffer.
 //!
-//! Three shapes, each honest about its memory. They are a private detail of
+//! Four shapes, each honest about its memory. They are a private detail of
 //! the type — a source is built through [`ReopenableSource::path`],
-//! [`ReopenableSource::one_shot`] or [`ReopenableSource::buffer`], so a caller
-//! cannot assemble one that bypasses the byte counting every open performs:
+//! [`ReopenableSource::open_file`], [`ReopenableSource::one_shot`] or
+//! [`ReopenableSource::buffer`], so a caller cannot assemble one that bypasses
+//! the byte counting every open performs:
 //! - A **path** source re-opens a stable on-disk path. With staging
 //!   enabled the input is a content-addressed copy held under an advisory read
 //!   lock for the run, so two opens read byte-identical content; with staging
@@ -19,6 +20,11 @@
 //!   taken at each open that fails loud if the file changed between passes,
 //!   rather than splicing a stale envelope onto a freshly-read body. Memory is
 //!   O(1) per open — no whole-file buffer is ever held.
+//! - An **open-file** source retains the file handle established by capability
+//!   activation. Each pass uses a cloned handle plus a private logical cursor,
+//!   so path removal or atomic replacement after activation cannot change the
+//!   admitted bytes. A second guard handle remains with the provider session.
+//!   Memory is O(1) per pass and the file is never buffered whole.
 //! - A **one-shot** source wraps a single pathless `Box<dyn Read>`
 //!   (a test/bench cursor, the `<empty>` slot, a network body). It is consumed
 //!   *lazily*: the first [`open`](ReopenableSource::open) hands out the reader as-is, so a
@@ -30,7 +36,7 @@
 //!   reader (JSON) needs a second open; bounded because pathless inputs are
 //!   small by construction.
 
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -102,18 +108,22 @@ impl<R: Read> Read for CountingReader<R> {
 /// Clinker's finite-batch input-stability contract — not a security boundary
 /// and not a content fingerprint.
 ///
-/// What it catches: a file replaced or truncated to a different length, or
-/// touched to a newer mtime, in the window between a reader's two opens (the
-/// body open at construction and the envelope pre-scan open in
-/// `prepare_document`). Cheap — no bytes are read.
+/// What it catches: for a `Path` source, a file replaced between opens; for
+/// both `Path` and `OpenFile`, the admitted file object truncated to a
+/// different length or touched to a newer mtime between a reader's two opens
+/// (the body open at construction and the envelope pre-scan open in
+/// `prepare_document`). An `OpenFile` source deliberately ignores later path
+/// replacement because every pass reads the already-admitted file object.
+/// Cheap — no bytes are read.
 ///
 /// What it does NOT catch (accepted residuals; inputs must stay stable for the
 /// duration of a finite batch run):
 /// - A same-length, same-mtime-*tick* in-place rewrite. On coarse-granularity
 ///   filesystems (FAT/exFAT at 2 s) or for a truncate-and-rewrite completing
 ///   inside one mtime tick, the snapshot is unchanged. Closing this would
-///   require hashing the whole file, which reintroduces the buffer this design
-///   removes, so it is deliberately left open.
+///   require a content-identity comparison and stability protocol with another
+///   full I/O pass, so the bounded `(len, mtime)` residual is deliberately
+///   accepted here.
 /// - A rewrite landing *after* the pre-scan, while the body still streams
 ///   lazily through `next_record`. The guard runs once, at the pre-scan open;
 ///   later body reads are not re-checked.
@@ -127,8 +137,8 @@ pub struct SourceIdentity {
     mtime: Option<SystemTime>,
 }
 
-/// A byte source a format reader can open, re-openably for file/buffered shapes
-/// and once-lazily for a pathless one-shot reader.
+/// A byte source a format reader can open, re-openably for path, retained-file,
+/// and buffered shapes, and once-lazily for a pathless one-shot reader.
 ///
 /// A reader needing two passes (JSON's pre-scan plus body) first calls
 /// [`into_reopenable`](Self::into_reopenable) so every [`open`](Self::open)
@@ -150,6 +160,13 @@ enum SourceKind {
     /// Re-open a stable filesystem path. Each open is a fresh `std::fs::File`;
     /// for a staged, advisory-locked source two opens read identical bytes.
     Path(PathBuf),
+    /// Read only from the file handle opened during capability activation.
+    /// Cloned handles share an OS cursor, so every reader keeps a logical
+    /// offset and serializes seek+read through the shared gate.
+    OpenFile {
+        file: std::fs::File,
+        gate: Arc<Mutex<()>>,
+    },
     /// Stream from shared in-memory bytes. Each open is a fresh cursor over the
     /// same `Arc<[u8]>`. Re-openable; bounded because such inputs are small.
     Buffered(Arc<[u8]>),
@@ -158,6 +175,43 @@ enum SourceKind {
     /// buffering, preserving a slow/paced reader's streaming timing for a
     /// one-pass format. `None` after the reader has been taken or buffered.
     OneShot(Mutex<Option<Box<dyn Read + Send>>>),
+}
+
+/// Provider/session-side guard for one already-open file resource.
+///
+/// The opaque guard exposes no file operations. Keeping it in the active
+/// capability session pins the admitted file object until the whole activation
+/// group is released, independently of the reader handle transferred to a
+/// worker.
+pub struct RetainedFileGuard {
+    _file: std::fs::File,
+}
+
+/// One logical cursor over clones of an already-open file handle.
+///
+/// `File::try_clone` shares the underlying cursor on supported platforms.
+/// Seeking and reading under the shared gate on every call makes each pass's
+/// logical offset independent even if body and pre-scan readers interleave.
+struct OpenFileReader {
+    file: std::fs::File,
+    gate: Arc<Mutex<()>>,
+    offset: u64,
+}
+
+impl Read for OpenFileReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| std::io::Error::other("open-file reader gate poisoned"))?;
+        self.file.seek(SeekFrom::Start(self.offset))?;
+        let read = self.file.read(buffer)?;
+        self.offset = self
+            .offset
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("open-file reader offset overflow"))?;
+        Ok(read)
+    }
 }
 
 impl ReopenableSource {
@@ -182,10 +236,11 @@ impl ReopenableSource {
     /// because the run cannot rely on.
     ///
     /// `None` for a one-shot reader, whose length is unknowable without
-    /// consuming it. `Buffered` and `Path` answer exactly.
+    /// consuming it. `Buffered`, `Path`, and `OpenFile` answer exactly.
     pub fn known_len(&self) -> Option<u64> {
         match &self.kind {
             SourceKind::Path(path) => std::fs::metadata(path).ok().map(|meta| meta.len()),
+            SourceKind::OpenFile { file, .. } => file.metadata().ok().map(|meta| meta.len()),
             SourceKind::Buffered(bytes) => Some(bytes.len() as u64),
             SourceKind::OneShot(_) => None,
         }
@@ -224,13 +279,41 @@ impl ReopenableSource {
         Self::of(SourceKind::Path(path.into()))
     }
 
+    /// Open and retain one file object for every later reader pass.
+    ///
+    /// The source and returned opaque guard each retain a handle to the same
+    /// admitted file object. Later path removal or replacement therefore does
+    /// not change which bytes the run reads. Every pass clones the retained
+    /// handle, rewinds it, and streams with O(1) memory.
+    ///
+    /// Windows opens include delete sharing so atomic rename/removal has the
+    /// same admitted-handle behavior as POSIX unlink/rename.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O failure if the path cannot be opened, the
+    /// guard handle cannot be cloned, or metadata cannot be read.
+    pub fn open_file(path: impl AsRef<Path>) -> std::io::Result<(Self, RetainedFileGuard)> {
+        let file = open_shared(path.as_ref())?;
+        let guard = file.try_clone()?;
+        file.metadata()?;
+        Ok((
+            Self::of(SourceKind::OpenFile {
+                file,
+                gate: Arc::new(Mutex::new(())),
+            }),
+            RetainedFileGuard { _file: guard },
+        ))
+    }
+
     /// Convert into a shape that supports repeated [`open`](Self::open) calls.
     ///
-    /// `Path` and `Buffered` are already re-openable and pass through untouched
-    /// (no read). A `OneShot` is drained once into a `Buffered` so a multi-pass
-    /// reader (JSON's pre-scan + body) can open it twice. The drain runs at the
-    /// caller's site (the executor's per-file factory for JSON), not at slot
-    /// construction, so a one-pass format never triggers it.
+    /// `Path`, `OpenFile`, and `Buffered` are already re-openable and pass
+    /// through untouched (no read). A `OneShot` is drained once into a
+    /// `Buffered` so a multi-pass reader (JSON's pre-scan + body) can open it
+    /// twice. The drain runs at the caller's site (the executor's per-file
+    /// factory for JSON), not at slot construction, so a one-pass format never
+    /// triggers it.
     ///
     /// # Errors
     ///
@@ -265,35 +348,38 @@ impl ReopenableSource {
 
     /// Open a `Read` over the source's bytes, positioned at the start.
     ///
-    /// `Path` opens a fresh file (O(1) memory); `Buffered` cursors the shared
-    /// `Arc<[u8]>`; `OneShot` hands out its lazy reader on the first call.
-    /// Multi-pass callers convert via [`into_reopenable`](Self::into_reopenable)
-    /// first so every open yields an independent `Read`.
+    /// `Path` opens a fresh file; `OpenFile` clones the retained file object;
+    /// `Buffered` cursors the shared `Arc<[u8]>`; `OneShot` hands out its lazy
+    /// reader on the first call. All file shapes use O(1) memory. Multi-pass
+    /// callers convert via [`into_reopenable`](Self::into_reopenable) first so
+    /// every open yields an independent `Read`.
     ///
     /// # Errors
     ///
     /// Returns the underlying [`std::io::Error`] if a `Path` source fails to
-    /// open, or [`std::io::ErrorKind::InvalidInput`] if a `OneShot` is opened
-    /// more than once without first converting via
+    /// open or an `OpenFile` handle cannot be cloned/rewound, or
+    /// [`std::io::ErrorKind::InvalidInput`] if a `OneShot` is opened more than
+    /// once without first converting via
     /// [`into_reopenable`](Self::into_reopenable). `Buffered` never fails.
     pub fn open(&self) -> std::io::Result<Box<dyn Read + Send>> {
         Ok(self.open_with_identity()?.0)
     }
 
     /// Open a `Read` and snapshot the content identity of the bytes it will
-    /// read, for a multi-pass reader that must detect the input changing
-    /// between passes.
+    /// read, for a multi-pass reader that must detect the admitted file object
+    /// changing between passes.
     ///
-    /// The [`SourceIdentity`] is stat-ed off the open handle for a `Path`
-    /// source, the byte length for a `Buffered` source, and an empty (always
-    /// self-consistent) snapshot for a `OneShot`. A reader captures it on its
-    /// first pass and compares it on later passes via
+    /// The [`SourceIdentity`] is stat-ed off the per-pass open handle for a
+    /// `Path` or retained `OpenFile` source, the byte length for a `Buffered`
+    /// source, and an empty (always self-consistent) snapshot for a `OneShot`.
+    /// A reader captures it on its first pass and compares it on later passes via
     /// [`SourceIdentity::ensure_matches`].
     ///
     /// # Errors
     ///
     /// Returns the underlying [`std::io::Error`] if a `Path` source fails to
-    /// open or its metadata cannot be read, or
+    /// open, an `OpenFile` handle cannot be cloned/rewound, or file metadata
+    /// cannot be read, or
     /// [`std::io::ErrorKind::InvalidInput`] if a `OneShot` is opened more than
     /// once without first converting via
     /// [`into_reopenable`](Self::into_reopenable).
@@ -327,6 +413,26 @@ impl ReopenableSource {
                 };
                 Ok((Box::new(file), identity))
             }
+            SourceKind::OpenFile { file, gate } => {
+                let _guard = gate
+                    .lock()
+                    .map_err(|_| std::io::Error::other("open-file reader gate poisoned"))?;
+                let mut cloned = file.try_clone()?;
+                cloned.rewind()?;
+                let metadata = cloned.metadata()?;
+                let identity = SourceIdentity {
+                    len: metadata.len(),
+                    mtime: metadata.modified().ok(),
+                };
+                Ok((
+                    Box::new(OpenFileReader {
+                        file: cloned,
+                        gate: Arc::clone(gate),
+                        offset: 0,
+                    }),
+                    identity,
+                ))
+            }
             SourceKind::Buffered(bytes) => {
                 let identity = SourceIdentity {
                     len: bytes.len() as u64,
@@ -359,7 +465,7 @@ impl ReopenableSource {
 
 impl SourceIdentity {
     /// Confirm this identity matches `prior`, the snapshot from the reader's
-    /// first pass. A mismatch means a path-backed input was rewritten between
+    /// first pass. A mismatch means a file-backed input was rewritten between
     /// passes — the envelope and body would otherwise be spliced from different
     /// content — so it is surfaced loud rather than silently accepted.
     ///
@@ -667,5 +773,85 @@ mod tests {
         let (_b, id_b) = src.open_with_identity().unwrap();
         assert_eq!(id_a, id_b);
         assert!(id_b.ensure_matches(&id_a).is_ok());
+    }
+
+    #[test]
+    fn an_open_file_handle_survives_path_replacement_across_interleaved_passes() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "clinker-open-handle-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let displaced = path.with_extension("original");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"original bytes")
+            .unwrap();
+
+        let (source, _session_guard) =
+            ReopenableSource::open_file(&path).expect("open retained file handle");
+        let mut body = source.open().expect("open body pass");
+        let mut body_prefix = [0_u8; 8];
+        body.read_exact(&mut body_prefix).expect("read body prefix");
+
+        std::fs::rename(&path, &displaced).expect("replace the admitted path");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"replacement")
+            .unwrap();
+
+        let mut prescan_bytes = Vec::new();
+        source
+            .open()
+            .expect("open pre-scan pass")
+            .read_to_end(&mut prescan_bytes)
+            .expect("read pre-scan pass");
+        let mut body_suffix = Vec::new();
+        body.read_to_end(&mut body_suffix)
+            .expect("finish body pass");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&displaced);
+        assert_eq!(prescan_bytes, b"original bytes");
+        assert_eq!(
+            [body_prefix.as_slice(), body_suffix.as_slice()].concat(),
+            b"original bytes"
+        );
+    }
+
+    #[test]
+    fn an_open_file_handle_detects_same_inode_mutation_between_passes() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "clinker-open-handle-mutation-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"original")
+            .unwrap();
+
+        let (source, _session_guard) =
+            ReopenableSource::open_file(&path).expect("open retained file handle");
+        let (_first, before) = source.open_with_identity().expect("first pass identity");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("open admitted inode for mutation")
+            .write_all(b"mutated to a different length")
+            .expect("mutate admitted inode");
+        let (_second, after) = source.open_with_identity().expect("later pass identity");
+
+        let _ = std::fs::remove_file(&path);
+        assert_ne!(before, after);
+        assert!(
+            after.ensure_matches(&before).is_err(),
+            "same-inode mutation must not splice bytes across format passes"
+        );
     }
 }
