@@ -1,6 +1,6 @@
 //! Read-only schema concretization preview for inference-only `numeric` leaves.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::Write;
 use std::path::Path;
@@ -8,26 +8,33 @@ use std::sync::{Arc, Mutex};
 
 use clinker_format::numeric_observation::{
     NumericAcceptance, NumericBoundary, NumericIssue, NumericObservation, NumericParserOutcome,
-    NumericVote,
+    NumericVote, observe_schema_numeric,
 };
-use clinker_format::{ByteTally, Column, NumericObserver, ReopenableSource, SourceSchema};
+use clinker_format::{
+    ByteTally, Column, FormatReader, NumericObserver, RECORD_TYPE_COLUMN, ReopenableSource,
+    SourceSchema,
+};
 use clinker_plan::config::composition::ScopedSchemaLeafAddress;
-use clinker_plan::config::{PipelineNode, SourceTransport};
+use clinker_plan::config::{PipelineNode, SourceBody, SourceTransport};
 use clinker_plan::error::PipelineError;
+use clinker_record::{Record, Value};
 use cxl::typecheck::Type;
 use indexmap::{IndexMap, IndexSet};
 use serde::Serialize;
 
 use crate::GuessArgs;
 
-const MAX_FILES_PER_SOURCE: usize = 4;
-const MAX_RECORDS_PER_FILE: u64 = 1_024;
-const MAX_INPUT_BYTES_PER_FILE: u64 = 8 * 1_024 * 1_024;
+const MAX_MANIFEST_FILES: usize = 4_096;
+const MAX_FILE_OPENS_TOTAL: usize = 4;
+const MAX_RECORDS_TOTAL: u64 = 1_024;
+const MAX_INPUT_BYTES_TOTAL: u64 = 8 * 1_024 * 1_024;
+const MAX_REPORTED_FILES_PER_SOURCE: usize = 4;
 const MAX_EVIDENCE_PER_OWNER: usize = 8;
 const MAX_SCHEMA_LEAVES: usize = clinker_plan::yaml::MAX_NODES;
 
 /// A classified `guess` failure. Selection/configuration errors are command
-/// misuse (exit 1); source I/O and reader failures are infrastructure (exit 4).
+/// misuse (exit 1), source I/O and reader failures are infrastructure (exit
+/// 4), and cooperative interruption exits 130 without a partial report.
 #[derive(Debug)]
 pub(crate) struct GuessError {
     kind: GuessErrorKind,
@@ -38,6 +45,7 @@ pub(crate) struct GuessError {
 enum GuessErrorKind {
     Configuration,
     Infrastructure,
+    Interrupted,
 }
 
 impl GuessError {
@@ -55,10 +63,18 @@ impl GuessError {
         }
     }
 
+    fn interrupted() -> Self {
+        Self {
+            kind: GuessErrorKind::Interrupted,
+            message: "interrupted before the guess report was complete".to_owned(),
+        }
+    }
+
     pub(crate) fn exit_code(&self) -> u8 {
         match self.kind {
             GuessErrorKind::Configuration => 1,
             GuessErrorKind::Infrastructure => 4,
+            GuessErrorKind::Interrupted => 130,
         }
     }
 }
@@ -84,7 +100,16 @@ struct NumericOwner {
     declared_type: Type,
     record: Option<String>,
     observed_fields: Vec<String>,
+    absence_policy: AbsencePolicy,
+    default_observation: Option<NumericObservation>,
     accumulator_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AbsencePolicy {
+    nullable: bool,
+    required: bool,
+    has_default: bool,
 }
 
 impl Candidate {
@@ -95,28 +120,62 @@ impl Candidate {
 
 #[derive(Debug, Clone, Default)]
 struct FieldAccumulator {
+    absence_policy: AbsencePolicy,
     observed: u64,
     int_votes: u64,
     float_votes: u64,
     no_value_votes: u64,
     unresolved_votes: u64,
+    accepted_absences: u64,
+    forbidden_absences: u64,
+    default_votes: u64,
     all_ints_float_safe: bool,
     unresolved: BTreeSet<&'static str>,
     evidence: Vec<EvidenceReport>,
 }
 
 impl FieldAccumulator {
-    fn new() -> Self {
-        Self {
+    fn new(owner: &NumericOwner) -> Self {
+        let mut accumulator = Self {
+            absence_policy: owner.absence_policy,
             all_ints_float_safe: true,
             ..Self::default()
+        };
+        if let Some(observation) = owner.default_observation.as_ref() {
+            accumulator.default_votes = 1;
+            accumulator.observe_with_policy(observation, "default", false);
         }
+        accumulator
     }
 
     fn observe(&mut self, observation: &NumericObservation) {
+        self.observe_with_policy(observation, "input", false);
+    }
+
+    fn observe_missing(&mut self, observation: &NumericObservation) {
+        self.observe_with_policy(observation, "missing", true);
+    }
+
+    fn observe_with_policy(
+        &mut self,
+        observation: &NumericObservation,
+        origin: &'static str,
+        missing: bool,
+    ) {
         self.observed = self.observed.saturating_add(1);
         match observation.vote() {
-            NumericVote::NoValue => self.no_value_votes = self.no_value_votes.saturating_add(1),
+            NumericVote::NoValue => {
+                self.no_value_votes = self.no_value_votes.saturating_add(1);
+                let default_applies = missing && self.absence_policy.has_default;
+                if default_applies
+                    || (self.absence_policy.nullable && !self.absence_policy.required)
+                {
+                    self.accepted_absences = self.accepted_absences.saturating_add(1);
+                } else {
+                    self.forbidden_absences = self.forbidden_absences.saturating_add(1);
+                    self.unresolved.insert("forbidden_absence");
+                }
+            }
             NumericVote::Int => {
                 self.int_votes = self.int_votes.saturating_add(1);
                 if !matches!(
@@ -135,8 +194,13 @@ impl FieldAccumulator {
             }
         }
         if self.evidence.len() < MAX_EVIDENCE_PER_OWNER {
-            self.evidence.push(EvidenceReport::from(observation));
+            self.evidence
+                .push(EvidenceReport::from_observation(observation, origin));
         }
+    }
+
+    fn missing_parser_observation(&mut self) {
+        self.unresolved.insert("missing_parser_observation");
     }
 
     fn resolution(&self) -> (Option<&'static str>, Vec<&'static str>) {
@@ -163,8 +227,12 @@ impl FieldAccumulator {
 struct GuessReport {
     schema: &'static str,
     version: u8,
+    mode: &'static str,
+    exhaustive: bool,
+    outcome: &'static str,
     target: String,
     selection: SelectionReport,
+    manifest: ManifestReport,
     limits: LimitsReport,
     coverage: Vec<SourceCoverage>,
     fields: Vec<FieldReport>,
@@ -183,9 +251,11 @@ struct LimitsReport {
     max_yaml_input_bytes: usize,
     max_yaml_nodes_per_document: usize,
     max_schema_leaves: usize,
-    max_files_per_source: usize,
-    max_records_per_file: u64,
-    max_input_bytes_per_file: u64,
+    max_manifest_files: usize,
+    preview_max_file_opens_total: usize,
+    preview_max_records_total: u64,
+    preview_max_input_bytes_total: u64,
+    max_reported_files_per_source: usize,
     max_numeric_lexeme_evidence_bytes: usize,
     max_evidence_per_owner: usize,
 }
@@ -195,7 +265,13 @@ struct SourceCoverage {
     source: String,
     format: &'static str,
     discovered_files: usize,
+    sampled_files: usize,
+    truncated_files: usize,
+    uncovered_files: usize,
     unreported_file_count: usize,
+    sampled_input_bytes: u64,
+    bytes_read: u64,
+    records_sampled: u64,
     files: Vec<FileCoverage>,
 }
 
@@ -211,6 +287,7 @@ struct FileCoverage {
 
 #[derive(Debug, Clone, Serialize)]
 struct EvidenceReport {
+    origin: &'static str,
     boundary: &'static str,
     lexeme: String,
     original_bytes: usize,
@@ -220,8 +297,8 @@ struct EvidenceReport {
     reason: Option<&'static str>,
 }
 
-impl From<&NumericObservation> for EvidenceReport {
-    fn from(observation: &NumericObservation) -> Self {
+impl EvidenceReport {
+    fn from_observation(observation: &NumericObservation, origin: &'static str) -> Self {
         let lexeme = observation.lexeme();
         let rendered = match lexeme.complete() {
             Some(complete) => complete.to_owned(),
@@ -234,6 +311,7 @@ impl From<&NumericObservation> for EvidenceReport {
             NumericVote::Unresolved(issue) => ("unresolved", Some(issue_label(issue))),
         };
         Self {
+            origin,
             boundary: boundary_label(observation.boundary()),
             lexeme: rendered,
             original_bytes: lexeme.original_bytes(),
@@ -256,6 +334,7 @@ struct OwnerReport {
     address: String,
     observations: u64,
     votes: VoteReport,
+    absence: AbsenceReport,
     evidence: Vec<EvidenceReport>,
     proposed_type: Option<&'static str>,
     unresolved_reasons: Vec<&'static str>,
@@ -269,22 +348,76 @@ struct VoteReport {
     unresolved: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct AbsenceReport {
+    accepted: u64,
+    forbidden: u64,
+    default_votes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ManifestReport {
+    schema: &'static str,
+    version: u8,
+    identity_basis: &'static str,
+    preview_strata: [&'static str; 2],
+    total_files: usize,
+    sources: Vec<ManifestSourceReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct ManifestSourceReport {
+    source: String,
+    discovered_files: usize,
+    identity: String,
+}
+
 #[derive(Debug)]
 struct EffectiveConfig {
     config: clinker_plan::config::PipelineConfig,
     selection: SelectionReport,
 }
 
-/// Execute the read-only preview and print one stable JSON document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuessMode {
+    Preview,
+    Check,
+}
+
+impl GuessMode {
+    fn from_args(args: &GuessArgs) -> Result<Self, GuessError> {
+        if args.write {
+            return Err(GuessError::configuration(
+                "--write is unavailable until compare-and-swap editing is installed; correction: run `clinker guess CONFIG --check` and apply the emitted patch manually",
+            ));
+        }
+        Ok(if args.check {
+            Self::Check
+        } else {
+            Self::Preview
+        })
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Preview => "preview",
+            Self::Check => "check",
+        }
+    }
+
+    fn exhaustive(self) -> bool {
+        matches!(self, Self::Check)
+    }
+}
+
+/// Execute a read-only preview or exhaustive check and print one stable JSON
+/// document. No mode in this module edits configuration or input files.
 pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
+    let mode = GuessMode::from_args(args)?;
     let effective = resolve_effective_config(args)?;
     let mut candidates = select_candidates(&effective.config, &args.fields)?;
-    let accumulator_count = index_numeric_owners(&mut candidates);
-    let accumulators = Arc::new(Mutex::new(
-        (0..accumulator_count)
-            .map(|_| FieldAccumulator::new())
-            .collect::<Vec<_>>(),
-    ));
+    index_numeric_owners(&mut candidates);
+    let accumulators = Arc::new(Mutex::new(build_accumulators(&candidates)));
     let config_dir = args
         .config
         .parent()
@@ -297,17 +430,49 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
                 args.config.display()
             ))
         })?;
-
-    let coverage = sample_sources(
-        &effective.config,
-        &candidates,
-        Arc::clone(&accumulators),
-        &config_dir,
-    )?;
+    let shutdown = clinker_exec::pipeline::shutdown::ShutdownToken::new();
+    let manifest = freeze_manifest(&effective.config, &candidates, &config_dir)?;
+    let manifest_report = ManifestReport {
+        schema: "clinker.guess.manifest",
+        version: 1,
+        identity_basis: "blake3-path-size-v1",
+        preview_strata: ["source", "file"],
+        total_files: manifest.iter().fold(0usize, |total, source| {
+            total.saturating_add(source.files.len())
+        }),
+        sources: manifest
+            .iter()
+            .map(|source| ManifestSourceReport {
+                source: source.source.clone(),
+                discovered_files: source.files.len(),
+                identity: source.identity.clone(),
+            })
+            .collect(),
+    };
+    let coverage = match mode {
+        GuessMode::Preview => sample_sources_fairly(
+            &manifest,
+            &candidates,
+            Arc::clone(&accumulators),
+            &config_dir,
+            &shutdown,
+        )?,
+        GuessMode::Check => check_sources_exhaustively(
+            &manifest,
+            &candidates,
+            Arc::clone(&accumulators),
+            &config_dir,
+            &shutdown,
+        )?,
+    };
+    if shutdown.is_requested() {
+        return Err(GuessError::interrupted());
+    }
     let accumulators = accumulators
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut edits = Vec::new();
+    let mut resolved = true;
     let fields = candidates
         .iter()
         .map(|candidate| {
@@ -323,6 +488,8 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
                             from_type: render_numeric_type(&owner.declared_type, "numeric"),
                             to_type: render_numeric_type(&owner.declared_type, concrete),
                         });
+                    } else {
+                        resolved = false;
                     }
                     OwnerReport {
                         address: owner.address.render(),
@@ -332,6 +499,11 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
                             float: accumulated.float_votes,
                             no_value: accumulated.no_value_votes,
                             unresolved: accumulated.unresolved_votes,
+                        },
+                        absence: AbsenceReport {
+                            accepted: accumulated.accepted_absences,
+                            forbidden: accumulated.forbidden_absences,
+                            default_votes: accumulated.default_votes,
                         },
                         evidence: accumulated.evidence.clone(),
                         proposed_type,
@@ -347,17 +519,23 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
         .collect();
     let patch = render_patch(&edits);
     let report = GuessReport {
-        schema: "clinker.guess.preview",
-        version: 1,
+        schema: "clinker.guess.report",
+        version: 2,
+        mode: mode.label(),
+        exhaustive: mode.exhaustive(),
+        outcome: if resolved { "resolved" } else { "unresolved" },
         target: effective.config.pipeline.name.clone(),
         selection: effective.selection,
+        manifest: manifest_report,
         limits: LimitsReport {
             max_yaml_input_bytes: clinker_plan::yaml::MAX_INPUT_BYTES,
             max_yaml_nodes_per_document: clinker_plan::yaml::MAX_NODES,
             max_schema_leaves: MAX_SCHEMA_LEAVES,
-            max_files_per_source: MAX_FILES_PER_SOURCE,
-            max_records_per_file: MAX_RECORDS_PER_FILE,
-            max_input_bytes_per_file: MAX_INPUT_BYTES_PER_FILE,
+            max_manifest_files: MAX_MANIFEST_FILES,
+            preview_max_file_opens_total: MAX_FILE_OPENS_TOTAL,
+            preview_max_records_total: MAX_RECORDS_TOTAL,
+            preview_max_input_bytes_total: MAX_INPUT_BYTES_TOTAL,
+            max_reported_files_per_source: MAX_REPORTED_FILES_PER_SOURCE,
             max_numeric_lexeme_evidence_bytes:
                 clinker_format::numeric_observation::MAX_NUMERIC_LEXEME_EVIDENCE_BYTES,
             max_evidence_per_owner: MAX_EVIDENCE_PER_OWNER,
@@ -375,7 +553,11 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
     stdout.write_all(b"\n").map_err(|error| {
         GuessError::infrastructure(format!("cannot finish preview on stdout: {error}"))
     })?;
-    Ok(0)
+    Ok(if matches!(mode, GuessMode::Check) && !resolved {
+        3
+    } else {
+        0
+    })
 }
 
 fn resolve_effective_config(args: &GuessArgs) -> Result<EffectiveConfig, GuessError> {
@@ -629,12 +811,44 @@ fn register_candidate_column(
         declared_type: column.ty.clone(),
         record: record.map(str::to_owned),
         observed_fields,
+        absence_policy: AbsencePolicy {
+            nullable: column.ty.is_nullable(),
+            required: column.required.unwrap_or(false),
+            has_default: column.default.is_some(),
+        },
+        default_observation: column
+            .default
+            .as_ref()
+            .map(|value| numeric_default_observation(source, &column.name, value))
+            .transpose()?,
         accumulator_index: usize::MAX,
     });
     Ok(())
 }
 
-fn index_numeric_owners(candidates: &mut [Candidate]) -> usize {
+fn numeric_default_observation(
+    source: &str,
+    field: &str,
+    value: &serde_json::Value,
+) -> Result<NumericObservation, GuessError> {
+    match value {
+        serde_json::Value::Null => Ok(observe_schema_numeric(&Value::Null)),
+        serde_json::Value::Number(number) => Ok(observe_schema_numeric(&Value::String(
+            number.to_string().into(),
+        ))),
+        serde_json::Value::String(text) => {
+            Ok(observe_schema_numeric(&Value::String(text.as_str().into())))
+        }
+        serde_json::Value::Bool(value) => Ok(observe_schema_numeric(&Value::Bool(*value))),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            Err(GuessError::configuration(format!(
+                "numeric source field {source}.{field} has a non-scalar default; correction: use an exact numeric scalar default or remove `default`"
+            )))
+        }
+    }
+}
+
+fn index_numeric_owners(candidates: &mut [Candidate]) {
     let mut next = 0;
     for candidate in candidates {
         for owner in &mut candidate.owners {
@@ -642,20 +856,41 @@ fn index_numeric_owners(candidates: &mut [Candidate]) -> usize {
             next += 1;
         }
     }
-    next
 }
 
-fn sample_sources(
-    config: &clinker_plan::config::PipelineConfig,
+fn build_accumulators(candidates: &[Candidate]) -> Vec<FieldAccumulator> {
+    let owner_count = candidates.iter().fold(0usize, |count, candidate| {
+        count.saturating_add(candidate.owners.len())
+    });
+    let mut accumulators = Vec::with_capacity(owner_count);
+    for candidate in candidates {
+        for owner in &candidate.owners {
+            debug_assert_eq!(owner.accumulator_index, accumulators.len());
+            accumulators.push(FieldAccumulator::new(owner));
+        }
+    }
+    accumulators
+}
+
+struct FrozenSource<'a> {
+    source: String,
+    format: &'static str,
+    body: &'a SourceBody,
+    files: Vec<clinker_plan::config::discovery::DiscoveredFile>,
+    identity: String,
+}
+
+fn freeze_manifest<'a>(
+    config: &'a clinker_plan::config::PipelineConfig,
     candidates: &[Candidate],
-    accumulators: Arc<Mutex<Vec<FieldAccumulator>>>,
     config_dir: &Path,
-) -> Result<Vec<SourceCoverage>, GuessError> {
+) -> Result<Vec<FrozenSource<'a>>, GuessError> {
     let selected_sources = candidates
         .iter()
         .map(|candidate| candidate.source.as_str())
         .collect::<IndexSet<_>>();
-    let mut coverage = Vec::new();
+    let mut manifest = Vec::with_capacity(selected_sources.len());
+    let mut retained_files = 0usize;
     for source_name in selected_sources {
         let body = config
             .nodes
@@ -672,19 +907,20 @@ fn sample_sources(
                 ))
             })?;
         if !matches!(&body.source.transport, SourceTransport::File) {
-            coverage.push(SourceCoverage {
+            manifest.push(FrozenSource {
                 source: source_name.to_owned(),
                 format: body.source.format.format_name(),
-                discovered_files: 0,
-                unreported_file_count: 0,
+                body,
                 files: Vec::new(),
+                identity: "non-file-source".to_owned(),
             });
             continue;
         }
+        let remaining = MAX_MANIFEST_FILES.saturating_sub(retained_files);
         let discovered = clinker_plan::config::discovery::discover_bounded(
             &body.source,
             config_dir,
-            MAX_FILES_PER_SOURCE,
+            remaining.saturating_add(1),
         )
         .map_err(|error| match error {
             clinker_plan::config::discovery::DiscoveryError::Io(_) => GuessError::infrastructure(
@@ -695,86 +931,454 @@ fn sample_sources(
             )),
         })?;
         let discovered_files = discovered.discovered_file_count();
-        let unreported_file_count = discovered_files.saturating_sub(discovered.files().len());
-        let mut files = Vec::with_capacity(discovered.files().len());
-        for discovered_file in discovered.files() {
-            let path = &discovered_file.path;
-            let display_path = stable_input_path(path, config_dir);
-            if discovered_file.size > MAX_INPUT_BYTES_PER_FILE {
-                files.push(FileCoverage {
-                    path: display_path,
-                    status: "uncovered_file_byte_limit",
-                    input_bytes: Some(discovered_file.size),
-                    bytes_read: 0,
-                    records_sampled: 0,
-                    truncated: true,
-                });
-                continue;
-            }
-
-            let field_map = observer_field_map(candidates, source_name);
-            let target = Arc::clone(&accumulators);
-            let observer = NumericObserver::new_scoped(move |scope, observation| {
-                let Some(indices) = field_map.indices(scope.record(), scope.field()) else {
-                    return;
-                };
-                let mut accumulated = target
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                for index in indices {
-                    accumulated[*index].observe(&observation);
-                }
-            });
-            let tally = ByteTally::new();
-            let source = ReopenableSource::path(path).with_tally(tally.clone());
-            let mut reader = clinker_exec::executor::build_source_format_reader(
-                &body.source,
-                &body.schema,
-                body.on_unmapped.clone(),
-                source,
-                Some(observer),
-            )
-            .map_err(reader_error)?;
-            let mut records = 0u64;
-            while records < MAX_RECORDS_PER_FILE {
-                match reader.next_record().map_err(|error| {
-                    GuessError::infrastructure(format!(
-                        "cannot sample source {source_name:?} file {display_path}: {error}"
-                    ))
-                })? {
-                    Some(_) => records = records.saturating_add(1),
-                    None => break,
-                }
-            }
-            let truncated = records == MAX_RECORDS_PER_FILE;
-            files.push(FileCoverage {
-                path: display_path,
-                status: if truncated {
-                    "truncated_record_limit"
-                } else {
-                    "sampled"
-                },
-                input_bytes: Some(discovered_file.size),
-                bytes_read: tally.read(),
-                records_sampled: records,
-                truncated,
-            });
+        if discovered_files > remaining {
+            return Err(GuessError::configuration(format!(
+                "the selected input manifest contains more than {MAX_MANIFEST_FILES} files; correction: narrow the source matcher or use `files.take_first` / `files.take_last` to admit a finite exhaustive manifest"
+            )));
         }
-        coverage.push(SourceCoverage {
+        let identity = discovered.complete_manifest_id(config_dir).ok_or_else(|| {
+            GuessError::configuration(
+                "the selected input manifest could not be retained completely within its fixed bound; correction: narrow the source matcher",
+            )
+        })?;
+        retained_files = retained_files.saturating_add(discovered_files);
+        manifest.push(FrozenSource {
             source: source_name.to_owned(),
             format: body.source.format.format_name(),
-            discovered_files,
-            unreported_file_count,
-            files,
+            body,
+            files: discovered.files().to_vec(),
+            identity,
         });
     }
+    Ok(manifest)
+}
+
+fn empty_coverage(manifest: &[FrozenSource<'_>]) -> Vec<SourceCoverage> {
+    manifest
+        .iter()
+        .map(|source| SourceCoverage {
+            source: source.source.clone(),
+            format: source.format,
+            discovered_files: source.files.len(),
+            sampled_files: 0,
+            truncated_files: 0,
+            uncovered_files: source.files.len(),
+            unreported_file_count: source.files.len(),
+            sampled_input_bytes: 0,
+            bytes_read: 0,
+            records_sampled: 0,
+            files: Vec::new(),
+        })
+        .collect()
+}
+
+struct ActiveReader {
+    source_index: usize,
+    path: String,
+    input_bytes: u64,
+    reader: Box<dyn FormatReader>,
+    tally: ByteTally,
+    observation_state: Arc<Mutex<ReaderObservationState>>,
+    field_map: Arc<ObserverFieldMap>,
+    records: u64,
+    numeric_errors: u64,
+}
+
+#[derive(Default)]
+struct ReaderObservationState {
+    seen: HashSet<usize>,
+    explainable: HashSet<usize>,
+    record: Option<String>,
+}
+
+impl ReaderObservationState {
+    fn begin_record(&mut self) {
+        self.seen.clear();
+        self.explainable.clear();
+        self.record = None;
+    }
+}
+
+enum ReaderStep {
+    Record,
+    NumericError,
+    End,
+}
+
+fn open_reader(
+    source_index: usize,
+    source: &FrozenSource<'_>,
+    file: &clinker_plan::config::discovery::DiscoveredFile,
+    candidates: &[Candidate],
+    accumulators: Arc<Mutex<Vec<FieldAccumulator>>>,
+    config_dir: &Path,
+) -> Result<ActiveReader, GuessError> {
+    let field_map = Arc::new(observer_field_map(candidates, &source.source));
+    let observation_state = Arc::new(Mutex::new(ReaderObservationState::default()));
+    let observer_map = Arc::clone(&field_map);
+    let observer_state = Arc::clone(&observation_state);
+    let target = accumulators;
+    let observer = NumericObserver::new_scoped(move |scope, observation| {
+        let Some(indices) = observer_map.indices(scope.record(), scope.field()) else {
+            return;
+        };
+        {
+            let mut accumulated = target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for index in indices {
+                accumulated[*index].observe(&observation);
+            }
+        }
+        let explains_reader_error = matches!(
+            observation.vote(),
+            NumericVote::NoValue | NumericVote::Unresolved(_)
+        );
+        let mut state = observer_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(record) = scope.record() {
+            state.record = Some(record.to_owned());
+        }
+        state.seen.extend(indices.iter().copied());
+        if explains_reader_error {
+            state.explainable.extend(indices.iter().copied());
+        }
+    });
+    let tally = ByteTally::new();
+    #[cfg(debug_assertions)]
+    let open_path = if std::env::var_os("CLINKER_TEST_GUESS_FAIL_OPEN_AFTER_DISCOVERY").is_some() {
+        file.path
+            .with_file_name(".__clinker_guess_missing_after_discovery__")
+    } else {
+        file.path.clone()
+    };
+    #[cfg(not(debug_assertions))]
+    let open_path = file.path.clone();
+    let byte_source = ReopenableSource::path(open_path).with_tally(tally.clone());
+    let reader = clinker_exec::executor::build_source_format_reader(
+        &source.body.source,
+        &source.body.schema,
+        source.body.on_unmapped.clone(),
+        byte_source,
+        Some(observer),
+    )
+    .map_err(reader_error)?;
+    Ok(ActiveReader {
+        source_index,
+        path: stable_input_path(&file.path, config_dir),
+        input_bytes: file.size,
+        reader,
+        tally,
+        observation_state,
+        field_map,
+        records: 0,
+        numeric_errors: 0,
+    })
+}
+
+fn next_observed_record(
+    active: &mut ActiveReader,
+    accumulators: &Arc<Mutex<Vec<FieldAccumulator>>>,
+) -> Result<ReaderStep, GuessError> {
+    active
+        .observation_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .begin_record();
+    match active.reader.next_record() {
+        Ok(Some(record)) => {
+            let seen = {
+                let state = active
+                    .observation_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.seen.clone()
+            };
+            complete_absence_observations(&active.field_map, &record, &seen, accumulators);
+            active.records = active.records.saturating_add(1);
+            Ok(ReaderStep::Record)
+        }
+        Ok(None) => Ok(ReaderStep::End),
+        Err(error) => {
+            if matches!(&error, clinker_format::FormatError::Interrupted) {
+                return Err(GuessError::interrupted());
+            }
+            let state = active
+                .observation_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut missing = Vec::new();
+            let mut unobserved = Vec::new();
+            let explains_reader_error = match &error {
+                clinker_format::FormatError::DeclaredType(failure) => {
+                    for owner in active.field_map.expected(&failure.original_record) {
+                        if state.seen.contains(&owner.index) {
+                            continue;
+                        }
+                        if owner
+                            .observed_fields
+                            .iter()
+                            .all(|field| failure.original_record.get(field).is_none())
+                        {
+                            missing.push(owner.index);
+                        } else {
+                            unobserved.push(owner.index);
+                        }
+                    }
+                    missing
+                        .iter()
+                        .any(|index| active.field_map.exposed_field(*index) == failure.field)
+                        || state
+                            .explainable
+                            .iter()
+                            .any(|index| active.field_map.exposed_field(*index) == failure.field)
+                }
+                // Positional readers report field coercion through their
+                // format-specific error after emitting the scoped parser
+                // observation. Accept that evidence only when exactly one
+                // authored numeric owner explains the failed row.
+                clinker_format::FormatError::FixedWidth(_) if state.explainable.len() == 1 => {
+                    unobserved.extend(
+                        active
+                            .field_map
+                            .expected_for_scope(state.record.as_deref())
+                            .iter()
+                            .filter(|owner| !state.seen.contains(&owner.index))
+                            .map(|owner| owner.index),
+                    );
+                    true
+                }
+                _ => false,
+            };
+            drop(state);
+            if explains_reader_error {
+                let observation = observe_schema_numeric(&Value::Null);
+                let mut accumulated = accumulators
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for index in missing {
+                    accumulated[index].observe_missing(&observation);
+                }
+                for index in unobserved {
+                    accumulated[index].missing_parser_observation();
+                }
+                active.records = active.records.saturating_add(1);
+                active.numeric_errors = active.numeric_errors.saturating_add(1);
+                Ok(ReaderStep::NumericError)
+            } else {
+                Err(GuessError::infrastructure(format!(
+                    "cannot read source file {}: {error}",
+                    active.path
+                )))
+            }
+        }
+    }
+}
+
+fn complete_absence_observations(
+    field_map: &ObserverFieldMap,
+    record: &Record,
+    seen: &HashSet<usize>,
+    accumulators: &Arc<Mutex<Vec<FieldAccumulator>>>,
+) {
+    let expected = field_map.expected(record);
+    if expected.is_empty() {
+        return;
+    }
+    let mut accumulated = accumulators
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for owner in expected {
+        if seen.contains(&owner.index) {
+            continue;
+        }
+        match record.get(&owner.field) {
+            None | Some(Value::Null) => {
+                accumulated[owner.index].observe_missing(&observe_schema_numeric(&Value::Null));
+            }
+            Some(_) => accumulated[owner.index].missing_parser_observation(),
+        }
+    }
+}
+
+fn finish_reader(active: ActiveReader, coverage: &mut [SourceCoverage], truncated: bool) {
+    let source = &mut coverage[active.source_index];
+    source.sampled_files = source.sampled_files.saturating_add(1);
+    source.sampled_input_bytes = source
+        .sampled_input_bytes
+        .saturating_add(active.input_bytes);
+    source.bytes_read = source.bytes_read.saturating_add(active.tally.read());
+    source.records_sampled = source.records_sampled.saturating_add(active.records);
+    if truncated {
+        source.truncated_files = source.truncated_files.saturating_add(1);
+    }
+    if source.files.len() < MAX_REPORTED_FILES_PER_SOURCE {
+        source.files.push(FileCoverage {
+            path: active.path,
+            status: if truncated {
+                "truncated_global_record_budget"
+            } else if active.numeric_errors > 0 {
+                "sampled_with_numeric_conflicts"
+            } else {
+                "sampled"
+            },
+            input_bytes: Some(active.input_bytes),
+            bytes_read: active.tally.read(),
+            records_sampled: active.records,
+            truncated,
+        });
+    }
+    source.uncovered_files = source.discovered_files.saturating_sub(source.sampled_files);
+    source.unreported_file_count = source.discovered_files.saturating_sub(source.files.len());
+}
+
+fn sample_sources_fairly(
+    manifest: &[FrozenSource<'_>],
+    candidates: &[Candidate],
+    accumulators: Arc<Mutex<Vec<FieldAccumulator>>>,
+    config_dir: &Path,
+    shutdown: &clinker_exec::pipeline::shutdown::ShutdownToken,
+) -> Result<Vec<SourceCoverage>, GuessError> {
+    let mut coverage = empty_coverage(manifest);
+    let mut pending = manifest
+        .iter()
+        .enumerate()
+        .filter(|(_, source)| !source.files.is_empty())
+        .map(|(source, _)| (source, 0usize))
+        .collect::<VecDeque<_>>();
+    let mut active = VecDeque::new();
+    let mut opened_input_bytes = 0u64;
+    while active.len() < MAX_FILE_OPENS_TOTAL {
+        let Some((source_index, file_index)) = pending.pop_front() else {
+            break;
+        };
+        let source = &manifest[source_index];
+        let file = &source.files[file_index];
+        if file.size > MAX_INPUT_BYTES_TOTAL.saturating_sub(opened_input_bytes) {
+            continue;
+        }
+        opened_input_bytes = opened_input_bytes.saturating_add(file.size);
+        if file_index + 1 < source.files.len() {
+            pending.push_back((source_index, file_index + 1));
+        }
+        active.push_back(open_reader(
+            source_index,
+            source,
+            file,
+            candidates,
+            Arc::clone(&accumulators),
+            config_dir,
+        )?);
+    }
+
+    let interrupt_after = test_interrupt_after_records();
+    let mut records = 0u64;
+    while records < MAX_RECORDS_TOTAL {
+        if shutdown.is_requested() {
+            return Err(GuessError::interrupted());
+        }
+        let Some(mut reader) = active.pop_front() else {
+            break;
+        };
+        match next_observed_record(&mut reader, &accumulators)? {
+            ReaderStep::Record | ReaderStep::NumericError => {
+                records = records.saturating_add(1);
+                maybe_inject_interruption(shutdown, interrupt_after, records);
+                active.push_back(reader);
+            }
+            ReaderStep::End => finish_reader(reader, &mut coverage, false),
+        }
+    }
+    for reader in active {
+        finish_reader(reader, &mut coverage, true);
+    }
+    if shutdown.is_requested() {
+        return Err(GuessError::interrupted());
+    }
     Ok(coverage)
+}
+
+fn check_sources_exhaustively(
+    manifest: &[FrozenSource<'_>],
+    candidates: &[Candidate],
+    accumulators: Arc<Mutex<Vec<FieldAccumulator>>>,
+    config_dir: &Path,
+    shutdown: &clinker_exec::pipeline::shutdown::ShutdownToken,
+) -> Result<Vec<SourceCoverage>, GuessError> {
+    let mut coverage = empty_coverage(manifest);
+    let interrupt_after = test_interrupt_after_records();
+    let mut total_records = 0u64;
+    for (source_index, source) in manifest.iter().enumerate() {
+        for file in &source.files {
+            if shutdown.is_requested() {
+                return Err(GuessError::interrupted());
+            }
+            let mut reader = open_reader(
+                source_index,
+                source,
+                file,
+                candidates,
+                Arc::clone(&accumulators),
+                config_dir,
+            )?;
+            loop {
+                if shutdown.is_requested() {
+                    return Err(GuessError::interrupted());
+                }
+                match next_observed_record(&mut reader, &accumulators)? {
+                    ReaderStep::Record | ReaderStep::NumericError => {
+                        total_records = total_records.saturating_add(1);
+                        maybe_inject_interruption(shutdown, interrupt_after, total_records);
+                    }
+                    ReaderStep::End => break,
+                }
+            }
+            finish_reader(reader, &mut coverage, false);
+        }
+    }
+    if shutdown.is_requested() {
+        return Err(GuessError::interrupted());
+    }
+    Ok(coverage)
+}
+
+#[cfg(debug_assertions)]
+fn test_interrupt_after_records() -> Option<u64> {
+    std::env::var("CLINKER_TEST_GUESS_INTERRUPT_AFTER_RECORDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+#[cfg(not(debug_assertions))]
+fn test_interrupt_after_records() -> Option<u64> {
+    None
+}
+
+fn maybe_inject_interruption(
+    shutdown: &clinker_exec::pipeline::shutdown::ShutdownToken,
+    interrupt_after: Option<u64>,
+    records: u64,
+) {
+    if interrupt_after.is_some_and(|limit| records >= limit) {
+        shutdown.request();
+    }
+}
+
+#[derive(Debug)]
+struct ExpectedOwner {
+    index: usize,
+    field: String,
+    observed_fields: Vec<String>,
 }
 
 #[derive(Debug, Default)]
 struct ObserverFieldMap {
     columns: HashMap<String, Vec<usize>>,
     records: HashMap<String, HashMap<String, Vec<usize>>>,
+    column_owners: Vec<ExpectedOwner>,
+    record_owners: HashMap<String, Vec<ExpectedOwner>>,
+    exposed_fields: HashMap<usize, String>,
 }
 
 impl ObserverFieldMap {
@@ -788,6 +1392,31 @@ impl ObserverFieldMap {
             None => self.columns.get(field).map(Vec::as_slice),
         }
     }
+
+    fn expected(&self, record: &Record) -> &[ExpectedOwner] {
+        match record.get(RECORD_TYPE_COLUMN) {
+            Some(Value::String(record_type)) => self.expected_for_scope(Some(record_type.as_str())),
+            _ => self.expected_for_scope(None),
+        }
+    }
+
+    fn expected_for_scope(&self, record: Option<&str>) -> &[ExpectedOwner] {
+        match record {
+            Some(record_type) => self
+                .record_owners
+                .get(record_type)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            None => &self.column_owners,
+        }
+    }
+
+    fn exposed_field(&self, index: usize) -> &str {
+        self.exposed_fields
+            .get(&index)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
 }
 
 fn observer_field_map(candidates: &[Candidate], source: &str) -> ObserverFieldMap {
@@ -797,9 +1426,30 @@ fn observer_field_map(candidates: &[Candidate], source: &str) -> ObserverFieldMa
             continue;
         }
         for owner in &candidate.owners {
+            fields
+                .exposed_fields
+                .insert(owner.accumulator_index, candidate.column.clone());
             let target = match owner.record.as_deref() {
-                Some(record) => fields.records.entry(record.to_owned()).or_default(),
-                None => &mut fields.columns,
+                Some(record) => {
+                    fields
+                        .record_owners
+                        .entry(record.to_owned())
+                        .or_default()
+                        .push(ExpectedOwner {
+                            index: owner.accumulator_index,
+                            field: candidate.column.clone(),
+                            observed_fields: owner.observed_fields.clone(),
+                        });
+                    fields.records.entry(record.to_owned()).or_default()
+                }
+                None => {
+                    fields.column_owners.push(ExpectedOwner {
+                        index: owner.accumulator_index,
+                        field: candidate.column.clone(),
+                        observed_fields: owner.observed_fields.clone(),
+                    });
+                    &mut fields.columns
+                }
             };
             for name in &owner.observed_fields {
                 let indices = target.entry(name.clone()).or_default();

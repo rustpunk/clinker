@@ -696,7 +696,7 @@ impl RunArgs {
     }
 }
 
-/// Arguments for the read-only `clinker guess` preview.
+/// Arguments for read-only `clinker guess` analysis.
 #[derive(Parser, Debug)]
 pub struct GuessArgs {
     /// Path to the pipeline YAML configuration file.
@@ -713,6 +713,14 @@ pub struct GuessArgs {
     /// Narrow the effective config's numeric leaves (repeatable).
     #[arg(long = "field", value_name = "NODE.COLUMN")]
     pub fields: Vec<String>,
+
+    /// Exhaust the frozen input manifest and exit 3 when any leaf is unresolved.
+    #[arg(long)]
+    pub check: bool,
+
+    /// Reserved for compare-and-swap editing; currently reports a correction.
+    #[arg(long, hide = true)]
+    pub write: bool,
 
     /// Workspace root holding clinker.toml and channel/group roots.
     #[arg(long, value_name = "DIR")]
@@ -1165,6 +1173,12 @@ fn main() -> ExitCode {
                 .with_writer(std::io::stderr)
                 .with_ansi(false)
                 .init();
+            if let Err(error) = clinker_exec::pipeline::shutdown::install_signal_handler() {
+                eprintln!(
+                    "clinker guess error: cannot install signal handler: {error}. Correction: run clinker as the process that owns SIGINT and SIGTERM, or relax the sandbox policy that refuses them"
+                );
+                return ExitCode::from(4);
+            }
             match guess::run(args) {
                 Ok(code) => ExitCode::from(code),
                 Err(error) => {

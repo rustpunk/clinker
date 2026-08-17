@@ -154,6 +154,38 @@ impl BoundedDiscoveryOutcome {
             Self::EmptyWarn { .. } | Self::EmptySkip => 0,
         }
     }
+
+    /// Identify a complete bounded manifest by stable normalized path, order,
+    /// and file size. Paths under `base_dir` are made relative; configured
+    /// paths outside it retain their absolute identity.
+    ///
+    /// Returns `None` when the caller's retention limit omitted any discovered
+    /// file. The identifier deliberately excludes timestamp values, although a
+    /// configured timestamp sort still determines file order. It is a
+    /// deterministic authoring manifest identifier, not a content-integrity
+    /// proof; a writer must still re-read and compare exact input snapshots
+    /// before mutation.
+    pub fn complete_manifest_id(&self, base_dir: &Path) -> Option<String> {
+        let files = self.files();
+        if files.len() != self.discovered_file_count() {
+            return None;
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"clinker-discovery-manifest-v1\0");
+        hasher.update(&(files.len() as u64).to_be_bytes());
+        for file in files {
+            let path = file
+                .path
+                .strip_prefix(base_dir)
+                .unwrap_or(&file.path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            hasher.update(&(path.len() as u64).to_be_bytes());
+            hasher.update(path.as_bytes());
+            hasher.update(&file.size.to_be_bytes());
+        }
+        Some(hasher.finalize().to_hex().to_string())
+    }
 }
 
 /// Run the full discovery pipeline against `source` rooted at `base_dir`.
@@ -746,6 +778,32 @@ mod tests {
                 "orders_11.csv",
             ]
         );
+    }
+
+    #[test]
+    fn complete_bounded_manifest_identity_is_stable_and_size_sensitive() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "orders-00.csv", "a");
+        write(tmp.path(), "orders-01.csv", "bb");
+        let mut source = cfg();
+        source.glob = Some("orders-*.csv".into());
+
+        let first = discover_bounded(&source, tmp.path(), 8).unwrap();
+        let second = discover_bounded(&source, tmp.path(), 8).unwrap();
+        assert_eq!(
+            first.complete_manifest_id(tmp.path()),
+            second.complete_manifest_id(tmp.path())
+        );
+
+        write(tmp.path(), "orders-01.csv", "changed size");
+        let changed = discover_bounded(&source, tmp.path(), 8).unwrap();
+        assert_ne!(
+            first.complete_manifest_id(tmp.path()),
+            changed.complete_manifest_id(tmp.path())
+        );
+
+        let truncated = discover_bounded(&source, tmp.path(), 1).unwrap();
+        assert_eq!(truncated.complete_manifest_id(tmp.path()), None);
     }
 
     #[test]

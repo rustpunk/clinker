@@ -72,6 +72,46 @@ fn parse_success(output: &Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("guess stdout is one JSON document")
 }
 
+fn parse_report(output: &Output) -> serde_json::Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "guess stdout is not a JSON report: {error}\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )
+    })
+}
+
+fn write_flat_json_pipeline(root: &Path, declared_type: &str, default: Option<&str>, input: &str) {
+    let default = default
+        .map(|value| format!("\n          default: {value}"))
+        .unwrap_or_default();
+    std::fs::write(
+        root.join("pipeline.yaml"),
+        format!(
+            "pipeline:\n  name: absence_policy\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: json\n      path: input.json\n      options:\n        format: array\n      schema:\n        - name: n\n          type: {declared_type}{default}\n"
+        ),
+    )
+    .expect("write JSON policy pipeline");
+    std::fs::write(root.join("input.json"), input).expect("write JSON policy input");
+}
+
+fn write_two_source_fairness_pipeline(root: &Path) {
+    std::fs::write(
+        root.join("pipeline.yaml"),
+        "pipeline:\n  name: fair_preview\nnodes:\n  - type: source\n    name: alpha\n    config:\n      name: alpha\n      type: csv\n      glob: alpha-*.csv\n      schema:\n        - { name: n, type: numeric }\n  - type: source\n    name: beta\n    config:\n      name: beta\n      type: csv\n      glob: beta-*.csv\n      schema:\n        - { name: n, type: numeric }\n",
+    )
+    .expect("write fair preview pipeline");
+    let body = format!("n\n{}", "1\n".repeat(400));
+    for source in ["alpha", "beta"] {
+        for file in 0..2 {
+            std::fs::write(root.join(format!("{source}-{file}.csv")), &body)
+                .expect("write fair preview input");
+        }
+    }
+}
+
 #[test]
 fn preview_selector_corpus_manifest_lists_every_committed_artifact_once() {
     let manifest_text =
@@ -103,6 +143,11 @@ fn preview_selector_corpus_manifest_lists_every_committed_artifact_once() {
             "preview_selector_base_csv",
             "preview_selector_channel_json",
             "preview_selector_group_xml",
+            "modes_preview_unresolved_exit_zero",
+            "modes_check_unresolved_exit_three",
+            "modes_write_unavailable_no_edit",
+            "evidence_nullable_absence_and_default",
+            "evidence_mixed_exact_votes",
         ]
     );
 }
@@ -182,6 +227,16 @@ fn preview_many_files_keeps_fixed_coverage_and_evidence_storage() {
     let coverage = &report["coverage"][0];
     assert_eq!(coverage["discovered_files"], 12);
     assert_eq!(coverage["unreported_file_count"], 8);
+    let manifest_source = &report["manifest"]["sources"][0];
+    assert_eq!(manifest_source["discovered_files"], 12);
+    assert_eq!(
+        manifest_source["identity"]
+            .as_str()
+            .expect("fixed manifest identity")
+            .len(),
+        64
+    );
+    assert!(manifest_source.get("files").is_none());
     let files = coverage["files"].as_array().expect("bounded file reports");
     assert_eq!(files.len(), 4);
     assert_eq!(files[0]["path"], "input-00.csv");
@@ -307,4 +362,310 @@ fn preview_selector_fields_deduplicate_and_reject_unknown_or_concrete_fields() {
             .expect("patch")
             .contains("from: nullable(numeric)\n    to: nullable(int)",)
     );
+}
+
+#[test]
+fn modes_preview_and_check_have_exhaustive_exit_truth() {
+    let workspace = workspace();
+    let input = workspace.path().join("input.csv");
+    std::fs::write(
+        &input,
+        "kind,order_id,amount\nD,c-1,9223372036854775808\nA,c-2,20.5\nS,c-3,30\n",
+    )
+    .expect("write unresolved numeric input");
+
+    let preview = guess(workspace.path(), &["--field", "csv_orders.amount"]);
+    assert_eq!(preview.status.code(), Some(0));
+    let preview_report = parse_report(&preview);
+    assert_eq!(preview_report["mode"], "preview");
+    assert_eq!(preview_report["exhaustive"], false);
+    assert_eq!(
+        preview_report["fields"][0]["owners"][0]["proposed_type"],
+        serde_json::Value::Null
+    );
+
+    let check = guess(
+        workspace.path(),
+        &["--check", "--field", "csv_orders.amount"],
+    );
+    assert_eq!(check.status.code(), Some(3));
+    let check_report = parse_report(&check);
+    assert_eq!(check_report["mode"], "check");
+    assert_eq!(check_report["exhaustive"], true);
+    assert_eq!(
+        check_report["fields"][0]["owners"][0]["unresolved_reasons"][0],
+        "unsafe_integer_widening"
+    );
+}
+
+#[test]
+fn modes_check_exhausts_the_frozen_manifest_beyond_preview_budget() {
+    let workspace = workspace();
+    let pipeline_path = workspace.path().join("pipeline.yaml");
+    let pipeline = std::fs::read_to_string(&pipeline_path).expect("read pipeline fixture");
+    std::fs::write(
+        &pipeline_path,
+        pipeline.replacen("path: input.csv", "glob: input-*.csv", 1),
+    )
+    .expect("select a many-file input set");
+    for index in 0..6 {
+        std::fs::write(
+            workspace.path().join(format!("input-{index:02}.csv")),
+            "kind,order_id,amount\nD,c-detail,10\nA,c-adjustment,20.5\n",
+        )
+        .expect("write exhaustive input");
+    }
+
+    let preview = parse_success(&guess(workspace.path(), &["--field", "csv_orders.amount"]));
+    assert_eq!(preview["fields"][0]["owners"][0]["observations"], 4);
+
+    let check = guess(
+        workspace.path(),
+        &["--check", "--field", "csv_orders.amount"],
+    );
+    assert_eq!(check.status.code(), Some(0));
+    let check = parse_report(&check);
+    assert_eq!(check["fields"][0]["owners"][0]["observations"], 6);
+    assert_eq!(check["coverage"][0]["discovered_files"], 6);
+    assert_eq!(check["coverage"][0]["sampled_files"], 6);
+}
+
+#[test]
+fn modes_preview_allocates_global_records_fairly_across_sources() {
+    let workspace = workspace();
+    write_two_source_fairness_pipeline(workspace.path());
+
+    let report = parse_success(&guess(workspace.path(), &[]));
+    assert_eq!(report["manifest"]["total_files"], 4);
+    assert_eq!(report["limits"]["preview_max_file_opens_total"], 4);
+    assert_eq!(report["limits"]["preview_max_records_total"], 1024);
+    let coverage = report["coverage"].as_array().expect("source coverage");
+    assert_eq!(coverage.len(), 2);
+    assert_eq!(coverage[0]["records_sampled"], 512);
+    assert_eq!(coverage[1]["records_sampled"], 512);
+    assert_eq!(
+        coverage
+            .iter()
+            .map(|source| source["records_sampled"].as_u64().expect("record count"))
+            .sum::<u64>(),
+        1024
+    );
+}
+
+#[test]
+fn modes_preview_enforces_one_global_input_byte_budget() {
+    let workspace = workspace();
+    std::fs::write(
+        workspace.path().join("pipeline.yaml"),
+        "pipeline:\n  name: byte_budget\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: csv\n      glob: input-*.csv\n      schema:\n        - { name: n, type: numeric }\n",
+    )
+    .expect("write byte-budget pipeline");
+    let body = format!("n\n{}", "1\n".repeat(5 * 1024 * 1024 / 2));
+    for file in 0..2 {
+        std::fs::write(workspace.path().join(format!("input-{file}.csv")), &body)
+            .expect("write byte-budget input");
+    }
+    std::fs::write(workspace.path().join("input-2.csv"), "n\n1\n")
+        .expect("write small file after an over-budget prefix member");
+
+    let report = parse_success(&guess(workspace.path(), &[]));
+    let coverage = &report["coverage"][0];
+    assert_eq!(coverage["discovered_files"], 3);
+    assert_eq!(coverage["sampled_files"], 1);
+    assert_eq!(coverage["uncovered_files"], 2);
+    assert_eq!(coverage["files"][0]["path"], "input-0.csv");
+    assert!(
+        coverage["sampled_input_bytes"]
+            .as_u64()
+            .expect("sampled input bytes")
+            <= report["limits"]["preview_max_input_bytes_total"]
+                .as_u64()
+                .expect("global input byte budget")
+    );
+}
+
+#[test]
+fn modes_write_is_unavailable_and_never_edits_before_cas_support() {
+    let workspace = workspace();
+    let pipeline = workspace.path().join("pipeline.yaml");
+    let before = std::fs::read(&pipeline).expect("read pipeline before write request");
+    let output = guess(workspace.path(), &["--write"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--write is unavailable"), "{stderr}");
+    assert!(stderr.contains("--check"), "{stderr}");
+    assert_eq!(
+        std::fs::read(&pipeline).expect("read pipeline after write request"),
+        before
+    );
+}
+
+#[test]
+fn modes_configuration_io_and_interruption_exits_are_distinct() {
+    let workspace = workspace();
+    let signal_install = Command::new(env!("CARGO_BIN_EXE_clinker"))
+        .current_dir(workspace.path())
+        .env("CLINKER_TEST_SIGNAL_HANDLER_FAILURE", "1")
+        .args(["guess", "pipeline.yaml"])
+        .output()
+        .expect("spawn signal-install failure");
+    assert_eq!(signal_install.status.code(), Some(4));
+    assert!(signal_install.stdout.is_empty());
+
+    let selection = guess(workspace.path(), &["--field", "missing.n"]);
+    assert_eq!(selection.status.code(), Some(1));
+
+    let disappeared = Command::new(env!("CARGO_BIN_EXE_clinker"))
+        .current_dir(workspace.path())
+        .env("CLINKER_TEST_GUESS_FAIL_OPEN_AFTER_DISCOVERY", "1")
+        .args(["guess", "pipeline.yaml", "--field", "csv_orders.amount"])
+        .output()
+        .expect("spawn post-discovery open failure");
+    assert_eq!(disappeared.status.code(), Some(4));
+
+    std::fs::remove_file(workspace.path().join("input.csv")).expect("remove selected input");
+    let io = guess(workspace.path(), &["--field", "csv_orders.amount"]);
+    assert_eq!(io.status.code(), Some(4));
+
+    write_flat_json_pipeline(workspace.path(), "numeric", None, "[{\"n\":1},{\"n\":2}]");
+    let interrupted = Command::new(env!("CARGO_BIN_EXE_clinker"))
+        .current_dir(workspace.path())
+        .env("CLINKER_TEST_GUESS_INTERRUPT_AFTER_RECORDS", "1")
+        .args(["guess", "pipeline.yaml", "--check"])
+        .output()
+        .expect("spawn interrupted guess");
+    assert_eq!(interrupted.status.code(), Some(130));
+    assert!(interrupted.stdout.is_empty());
+}
+
+#[test]
+fn evidence_absence_default_and_all_no_value_follow_authored_policy() {
+    let workspace = workspace();
+    write_flat_json_pipeline(
+        workspace.path(),
+        "{ nullable: numeric }",
+        Some("7"),
+        "[{\"n\":null},{}]",
+    );
+    let with_default = parse_success(&guess(workspace.path(), &[]));
+    let owner = &with_default["fields"][0]["owners"][0];
+    assert_eq!(owner["proposed_type"], "int");
+    assert_eq!(owner["absence"]["accepted"], 2);
+    assert_eq!(owner["absence"]["forbidden"], 0);
+    assert_eq!(owner["absence"]["default_votes"], 1);
+    assert_eq!(owner["evidence"][0]["origin"], "default");
+    assert_eq!(owner["evidence"][0]["boundary"], "schema_coerce");
+
+    write_flat_json_pipeline(
+        workspace.path(),
+        "{ nullable: numeric }",
+        None,
+        "[{\"n\":null},{}]",
+    );
+    let no_values = parse_success(&guess(workspace.path(), &[]));
+    let owner = &no_values["fields"][0]["owners"][0];
+    assert_eq!(owner["proposed_type"], serde_json::Value::Null);
+    assert_eq!(owner["unresolved_reasons"][0], "no_value_evidence");
+    let check = guess(workspace.path(), &["--check"]);
+    assert_eq!(check.status.code(), Some(3));
+}
+
+#[test]
+fn evidence_default_applies_to_missing_but_not_explicit_null() {
+    let workspace = workspace();
+    write_flat_json_pipeline(workspace.path(), "numeric", Some("7"), "[{}]");
+    let missing = parse_success(&guess(workspace.path(), &[]));
+    let owner = &missing["fields"][0]["owners"][0];
+    assert_eq!(owner["proposed_type"], "int");
+    assert_eq!(owner["absence"]["accepted"], 1);
+    assert_eq!(owner["absence"]["forbidden"], 0);
+    assert_eq!(owner["evidence"][1]["origin"], "missing");
+
+    write_flat_json_pipeline(workspace.path(), "numeric", Some("7"), "[{\"n\":null}]");
+    let explicit_null = parse_success(&guess(workspace.path(), &[]));
+    let owner = &explicit_null["fields"][0]["owners"][0];
+    assert_eq!(owner["proposed_type"], serde_json::Value::Null);
+    assert_eq!(owner["absence"]["accepted"], 0);
+    assert_eq!(owner["absence"]["forbidden"], 1);
+    assert_eq!(owner["unresolved_reasons"][0], "forbidden_absence");
+}
+
+#[test]
+fn evidence_arbitrary_precision_default_uses_the_schema_parser() {
+    let workspace = workspace();
+    write_flat_json_pipeline(
+        workspace.path(),
+        "{ nullable: numeric }",
+        Some("9223372036854775808"),
+        "[{}]",
+    );
+
+    let report = parse_success(&guess(workspace.path(), &[]));
+    let owner = &report["fields"][0]["owners"][0];
+    assert_eq!(owner["proposed_type"], serde_json::Value::Null);
+    assert_eq!(owner["evidence"][0]["origin"], "default");
+    assert_eq!(owner["evidence"][0]["boundary"], "schema_coerce");
+    assert_eq!(owner["evidence"][0]["lexeme"], "9223372036854775808");
+    assert_eq!(owner["unresolved_reasons"][0], "unsafe_integer_widening");
+}
+
+#[test]
+fn evidence_forbidden_absence_is_unresolved_not_an_io_failure() {
+    let workspace = workspace();
+    write_flat_json_pipeline(workspace.path(), "numeric", None, "[{\"n\":null}]");
+
+    let preview = guess(workspace.path(), &[]);
+    assert_eq!(preview.status.code(), Some(0));
+    let preview = parse_report(&preview);
+    let owner = &preview["fields"][0]["owners"][0];
+    assert_eq!(owner["absence"]["forbidden"], 1);
+    assert_eq!(owner["unresolved_reasons"][0], "forbidden_absence");
+
+    let check = guess(workspace.path(), &["--check"]);
+    assert_eq!(check.status.code(), Some(3));
+}
+
+#[test]
+fn evidence_mixed_votes_use_exact_integer_widening_not_confidence() {
+    let workspace = workspace();
+    std::fs::write(
+        workspace.path().join("pipeline.yaml"),
+        "pipeline:\n  name: exact_votes\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: csv\n      path: input.csv\n      schema:\n        - { name: n, type: numeric }\n",
+    )
+    .expect("write exact vote pipeline");
+    std::fs::write(
+        workspace.path().join("input.csv"),
+        "n\n9007199254740993\n1.5\n",
+    )
+    .expect("write exact vote input");
+
+    let report = parse_success(&guess(workspace.path(), &[]));
+    let owner = &report["fields"][0]["owners"][0];
+    assert_eq!(owner["votes"]["int"], 1);
+    assert_eq!(owner["votes"]["float"], 1);
+    assert_eq!(owner["proposed_type"], serde_json::Value::Null);
+    assert_eq!(owner["unresolved_reasons"][0], "unsafe_integer_widening");
+    assert!(report.get("confidence").is_none());
+}
+
+#[test]
+fn evidence_reader_error_leaves_later_numeric_fields_fail_closed() {
+    let workspace = workspace();
+    std::fs::write(
+        workspace.path().join("pipeline.yaml"),
+        "pipeline:\n  name: fail_closed_row\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: csv\n      path: input.csv\n      schema:\n        - { name: a, type: numeric }\n        - { name: b, type: numeric }\n",
+    )
+    .expect("write fail-closed pipeline");
+    std::fs::write(workspace.path().join("input.csv"), "a,b\n1,1\nbad,1.5\n")
+        .expect("write fail-closed input");
+
+    let output = guess(workspace.path(), &["--check"]);
+    assert_eq!(output.status.code(), Some(3));
+    let report = parse_report(&output);
+    assert_eq!(report["fields"][0]["owners"][0]["votes"]["unresolved"], 1);
+    let later = &report["fields"][1]["owners"][0];
+    assert_eq!(later["votes"]["int"], 1);
+    assert_eq!(later["proposed_type"], serde_json::Value::Null);
+    assert_eq!(later["unresolved_reasons"][0], "missing_parser_observation");
+    assert_eq!(report["patch"], "edits:\n");
 }

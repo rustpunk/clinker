@@ -83,8 +83,8 @@ with a new execution ID for every retry.
 
 ## clinker guess
 
-Preview concrete `int` or `float` replacements for inference-only `numeric`
-columns without editing the pipeline.
+Preview or exhaustively check concrete `int` or `float` replacements for
+inference-only `numeric` columns without editing the pipeline.
 
 ```text
 clinker guess [OPTIONS] <CONFIG>
@@ -103,6 +103,8 @@ effective configuration.
 | `--channel <ID>` | Select one cataloged channel and its derived, target-admitted groups. |
 | `--group <NAME>` | Select one explicit, target-admitted group without a channel. |
 | `--field <NODE.COLUMN>` | Narrow the preview to one `numeric` source field. Repeatable; repeated selectors are deduplicated in request order. In a multi-record schema, one selector covers every same-named literal `numeric` owner across `records:` while leaving same-named concrete declarations unchanged. Unknown, malformed, or entirely concrete fields are rejected. |
+| `--check` | Exhaust the frozen, capped manifest and exit `3` if any selected owner remains unresolved. |
+| `--write` | Reserved for compare-and-swap editing. Currently exits `1`, recommends `--check`, and changes no file. |
 | `--base-dir <DIR>` | Workspace root holding `clinker.toml` and the channel/group roots. Defaults to the pipeline file's directory. |
 
 The command constructs readers through the same CSV, JSON, and XML option and
@@ -120,24 +122,28 @@ Multi-record owners use
 same-named leaves never collapse into a fake single-record address or share a
 proposal derived from another record type.
 
-Discovery streams through the matcher and retains a deterministic sample of at
-most four files per selected source; the report includes the complete
-`discovered_files` count and one `unreported_file_count` aggregate instead of
-retaining a path/report for every omitted file. Sampling then reads at most
-1,024 records and 8 MiB per retained file. Hitting the record bound is reported
-as truncated, and a retained file over the byte bound is reported as uncovered.
+Discovery freezes the complete deterministic manifest up to 4,096 files and
+reports its fixed-size path/order/size identity without listing every path.
+Preview admits at most four files and 8 MiB of discovered file sizes globally,
+round-robin across sources while preserving each source's stable prefix, then
+reads at most 1,024 records globally. Coverage retains at most four file details
+per source and reports sampled, truncated, uncovered, and unreported aggregate
+counts for the rest. `--check` reads every file and record in that same frozen
+manifest instead of applying the preview budgets.
 
 Candidate storage is capped at 100,000 source-schema leaves, matching the
 canonical YAML parser's 100,000-node limit; each YAML document is also capped
 at 32 MiB. Each parser-owned `NumericObservation` retains at most 128 numeric
 lexeme bytes, and each exact schema owner retains at most eight evidence items.
 These limits appear in the JSON report. Candidate, observation, evidence, and
-coverage collections are therefore fixed-bounded independently of source file
-count; the preview does not register a runtime memory consumer.
+coverage collections are therefore fixed-bounded independently of input size;
+the preview does not register a runtime memory consumer.
 
-Exit `0` means a complete preview document was written, including when one or
-more fields remain unresolved. Selection, configuration, and field errors exit
-`1`; source discovery, input I/O, reader, and stdout failures exit `4`.
+Exit `0` means a complete preview was written, including an unresolved preview,
+or an exhaustive check resolved every owner. Selection, configuration,
+unavailable `--write`, and field errors exit `1`; unresolved exhaustive checks
+exit `3`; source discovery, input I/O, reader, signal-handler, and stdout
+failures exit `4`; interruption exits `130` before any report is emitted.
 
 ```bash
 # Preview every inference-only numeric leaf in the base pipeline
@@ -148,6 +154,9 @@ clinker guess pipeline.yaml --channel acme --field orders.amount
 
 # Preview one explicit group without a channel
 clinker guess pipeline.yaml --group enterprise
+
+# Exhaust the frozen manifest and make unresolved owners fail the command
+clinker guess pipeline.yaml --check
 ```
 
 ---
