@@ -49,7 +49,7 @@ nodes:
       emit running_total = $window.sum(total)
     analytic_window:
       group_by: [department, '$ck.aggregate.dept_totals']
-- type: output
+- type: sink
   name: out
   input: ck_aligned_window
   config:
@@ -133,7 +133,7 @@ nodes:
       emit running_total = $window.sum(total)
     analytic_window:
       group_by: [department]
-- type: output
+- type: sink
   name: out
   input: dept_window
   config:
@@ -200,7 +200,7 @@ nodes:
       emit order_id = order_id
       emit department = department
       emit total = sum(amount)
-- type: output
+- type: sink
   name: out
   input: order_totals
   config:

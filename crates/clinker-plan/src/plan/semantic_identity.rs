@@ -245,13 +245,22 @@ fn semantic_node(
     let Some(object) = value.as_object_mut() else {
         return Ok(value);
     };
-    if object.get("type").and_then(serde_json::Value::as_str) == Some("source")
-        && let Some(config) = object
-            .get_mut("config")
-            .and_then(serde_json::Value::as_object_mut)
+    if let Some(config) = object
+        .get_mut("config")
+        .and_then(serde_json::Value::as_object_mut)
     {
-        // The resolved schema is represented once in `bound_schemas`.
-        config.remove("schema");
+        // Match the typed variant so a renamed serialized discriminator cannot
+        // silently retain deployment-only fields in semantic identity.
+        match node {
+            crate::config::PipelineNode::Source { .. } => {
+                // The resolved schema is represented once in `bound_schemas`.
+                config.remove("schema");
+            }
+            crate::config::PipelineNode::Sink { .. } => {
+                config.remove("path");
+            }
+            _ => {}
+        }
     }
     Ok(value)
 }
@@ -348,7 +357,7 @@ nodes:
     input: src
     config:
       cxl: "emit value = id + $vars.threshold"
-  - type: output
+  - type: sink
     name: out
     input: map
     config:
@@ -481,7 +490,7 @@ nodes:
     input: drv
     use: ../compositions/enrich.comp.yaml
     inputs: { driver: drv }
-  - type: output
+  - type: sink
     name: out
     input: enrich
     config: { name: out, path: out.csv, type: csv }
@@ -590,7 +599,7 @@ nodes:
     input: src
     use: compositions/gate.comp.yaml
     inputs: { inp: src }
-  - type: output
+  - type: sink
     name: out
     input: gate_call
     config: { name: out, path: output.csv, type: csv }
@@ -629,7 +638,7 @@ nodes:
   - config: { type: csv, path: output.csv, name: out }
     input: map
     name: out
-    type: output
+    type: sink
 "#;
         assert_eq!(fingerprint(BASE), fingerprint(reordered));
     }
@@ -796,7 +805,7 @@ nodes:
     input: src
     use: compositions/increment.comp.yaml
     inputs: { inp: src }
-  - type: output
+  - type: sink
     name: out
     input: increment_call
     config: { name: out, path: output.csv, type: csv }
@@ -959,7 +968,7 @@ nodes:
     input: src
     use: ../compositions/gate.comp.yaml
     inputs: { inp: src }
-  - type: output
+  - type: sink
     name: out
     input: gate_call
     config: { name: out, path: output.csv, type: csv }
