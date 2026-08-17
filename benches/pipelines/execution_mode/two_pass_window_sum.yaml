@@ -24,7 +24,7 @@ nodes:
       analytic_window:
         group_by: [f0]
 
-  - type: output
+  - type: sink
     name: sink
     input: windowed
     config:

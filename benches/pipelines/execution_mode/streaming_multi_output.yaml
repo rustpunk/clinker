@@ -33,7 +33,7 @@ nodes:
         high: "f0 > 500000"
       default: low
 
-  - type: output
+  - type: sink
     name: high
     input: classify_route.high
     config:
@@ -42,7 +42,7 @@ nodes:
       path: bench://output_high.csv
       include_unmapped: true
 
-  - type: output
+  - type: sink
     name: low
     input: classify_route.low
     config:

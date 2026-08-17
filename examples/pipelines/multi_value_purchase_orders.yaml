@@ -61,7 +61,7 @@ nodes:
         emit unit_price = unit_price
         emit line_total = qty * unit_price
 
-  - type: output
+  - type: sink
     name: lines
     input: priced_lines
     config:

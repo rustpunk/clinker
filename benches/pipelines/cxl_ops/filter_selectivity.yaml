@@ -63,7 +63,7 @@ nodes:
         filter f0 > 900000
         emit out = f0
 
-  - type: output
+  - type: sink
     name: high_pass
     input: filter_90pct
     config:
@@ -72,7 +72,7 @@ nodes:
       path: bench://output_90.csv
       include_unmapped: true
 
-  - type: output
+  - type: sink
     name: mid_pass
     input: filter_50pct
     config:
@@ -81,7 +81,7 @@ nodes:
       path: bench://output_50.csv
       include_unmapped: true
 
-  - type: output
+  - type: sink
     name: low_pass
     input: filter_10pct
     config:

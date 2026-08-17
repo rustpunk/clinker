@@ -310,7 +310,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: int }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -359,7 +359,7 @@ nodes:
   config:
     cxl: |
       emit boom = id / 0
-- type: output
+- type: sink
   name: out
   input: fail
   config:

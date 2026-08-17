@@ -31,7 +31,7 @@ nodes:
       path: in.csv
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -237,7 +237,7 @@ nodes:
       cxl: |
         emit department = department
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: dept_totals
     config:

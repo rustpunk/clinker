@@ -102,7 +102,7 @@ nodes:
       emit b_c0 = b.c0
       emit c_c0 = c.c0
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: joined3
   config:
@@ -158,7 +158,7 @@ nodes:
       emit a_c0 = a.c0
       emit b_c0 = b.c0
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: joined2
   config:

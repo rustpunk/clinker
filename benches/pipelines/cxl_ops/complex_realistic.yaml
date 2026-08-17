@@ -54,7 +54,7 @@ nodes:
         emit c29 = f1.find("a")
         emit c30 = if f0 > 750000 then "top" else if f0 > 250000 then "mid" else "low"
 
-  - type: output
+  - type: sink
     name: sink
     input: complex
     config:

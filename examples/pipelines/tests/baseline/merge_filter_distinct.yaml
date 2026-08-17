@@ -48,7 +48,7 @@ pipeline:
           emit region = region
           emit status = status
 
-    - type: output
+  - type: sink
       name: merged
       input: uniq
       config:

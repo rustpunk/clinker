@@ -24,7 +24,7 @@ nodes:
         emit c1 = f1 ?? "default"
         emit c2 = f2 ?? f0 ?? -1
 
-  - type: output
+  - type: sink
     name: sink
     input: coalesce
     config:

@@ -53,7 +53,7 @@ nodes:
         high_priority: "not product_name.is_null() and product_name != \"UNKNOWN\""
       default: standard
 
-  - type: output
+  - type: sink
     name: high_priority_out
     input: priority_split.high_priority
     config:
@@ -62,7 +62,7 @@ nodes:
       path: bench://output_high.csv
       include_unmapped: true
 
-  - type: output
+  - type: sink
     name: standard_out
     input: priority_split.standard
     config:

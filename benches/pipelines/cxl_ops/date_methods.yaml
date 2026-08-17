@@ -24,7 +24,7 @@ nodes:
         emit d_add = f1.add_days(30)
         emit d_fmt = f1.format_date("%m/%d/%Y")
 
-  - type: output
+  - type: sink
     name: sink
     input: dates
     config:

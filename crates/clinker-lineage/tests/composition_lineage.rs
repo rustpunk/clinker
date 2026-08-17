@@ -134,7 +134,7 @@ nodes:
           static: value_field,
           [key_field]: [entry for entry in [shared] if predicate_field],
         }
-  - type: output
+  - type: sink
     name: out
     input: construct
     config: { name: out, type: json, path: out/nested-roles.json, include_unmapped: false }
@@ -182,7 +182,7 @@ nodes:
     input: src
     config:
       cxl: 'emit payload = [first_value, {static: second_value}]'
-  - type: output
+  - type: sink
     name: out
     input: construct
     config: { name: out, type: json, path: out/nested-static.json, include_unmapped: false }
@@ -689,11 +689,11 @@ nodes:
     use: ../compositions/own_source.comp.yaml
     inputs: { driver: driver }
     resources: { reference: body_ledger }
-  - type: output
+  - type: sink
     name: first_out
     input: first
     config: { name: first_out, type: csv, path: out/first.csv }
-  - type: output
+  - type: sink
     name: second_out
     input: second
     config: { name: second_out, type: csv, path: out/second.csv }

@@ -35,7 +35,7 @@ nodes:
           item: [{"@id": item, "#text": item.to_string()} for item in [first.to_int(), second.to_int()] if item > 0],
           tail: "after"
         }
-  - type: output
+  - type: sink
     name: json_out
     input: construct
     config:
@@ -45,7 +45,7 @@ nodes:
       include_unmapped: false
       options:
         format: ndjson
-  - type: output
+  - type: sink
     name: xml_out
     input: construct
     config:

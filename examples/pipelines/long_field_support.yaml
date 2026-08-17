@@ -97,7 +97,7 @@ nodes:
         emit comment_length = t.comment_length
       propagate_ck: driver
 
-  - type: output
+  - type: sink
     name: report
     input: enriched
     config:

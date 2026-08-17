@@ -59,7 +59,7 @@ nodes:
     config:
       threshold: 0.5
 
-  - type: output
+  - type: sink
     name: out
     input: risk
     config:

@@ -22,7 +22,7 @@ nodes:
       cxl: |
         emit out = f0 + f2
 
-  - type: output
+  - type: sink
     name: sink
     input: compute
     config:

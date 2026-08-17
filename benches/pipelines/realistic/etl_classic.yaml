@@ -39,7 +39,7 @@ nodes:
         emit record_count = count(*)
         emit max_derived = max(derived)
 
-  - type: output
+  - type: sink
     name: sink
     input: summarize
     config:

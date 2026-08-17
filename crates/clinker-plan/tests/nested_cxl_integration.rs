@@ -33,7 +33,7 @@ nodes:
       cxl: |
         use root
         emit payload = root.payload(value)
-  - type: output
+  - type: sink
     name: out
     input: construct
     config: { name: out, type: json, path: out.json, include_unmapped: false }
@@ -273,7 +273,7 @@ nodes:
     input: merged
     config:
       cxl: 'emit payload = {static: [entry for entry in [$source.batch_tag] if true]}'
-  - type: output
+  - type: sink
     name: out
     input: read_batch
     config: { name: out, type: json, path: out.json }
@@ -313,7 +313,7 @@ nodes:
       header:
         metadata:
           payload: '{header}'
-  - type: output
+  - type: sink
     name: out
     input: framed
     config: {{ name: out, type: json, path: out.json }}
@@ -361,7 +361,7 @@ nodes:
       where: '{where_expr}'
       cxl: 'emit payload = {body_expr}'
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: joined
     config: {{ name: out, type: json, path: out.json }}

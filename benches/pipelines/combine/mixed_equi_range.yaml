@@ -51,7 +51,7 @@ nodes:
         emit bracket = brackets.f1 ?? "UNASSIGNED"
       propagate_ck: driver
 
-  - type: output
+  - type: sink
     name: assigned_out
     input: assign_bracket
     config:

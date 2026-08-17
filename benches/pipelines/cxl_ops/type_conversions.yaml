@@ -26,7 +26,7 @@ nodes:
         emit t_try_int = f1.try_int()
         emit t_try_float = f1.try_float()
 
-  - type: output
+  - type: sink
     name: sink
     input: conversions
     config:

@@ -77,7 +77,7 @@ nodes:
     config:
       cxl: |
         __CXL__
-  - type: output
+  - type: sink
     name: out
     input: construct
     config:

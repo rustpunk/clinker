@@ -28,7 +28,7 @@ nodes:
         - account_id
         - batch_seq
 
-  - type: output
+  - type: sink
     name: ordered
     input: events
     config:

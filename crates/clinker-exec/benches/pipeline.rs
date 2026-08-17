@@ -70,7 +70,7 @@ nodes:
       emit out2 = if f0.to_int() > 500000 then "high" else "low"
 
       '
-- type: output
+- type: sink
   name: out
   input: transform
   config:
@@ -159,7 +159,7 @@ nodes:
       - f1
       sort_by:
       - field: f0
-- type: output
+- type: sink
   name: out
   input: windowed
   config:
@@ -248,21 +248,21 @@ nodes:
       medium: f0.to_int() > 333333
     default: low
     mode: exclusive
-- type: output
+- type: sink
   name: high
   input: route_transform
   config:
     name: high
     path: high.csv
     type: csv
-- type: output
+- type: sink
   name: medium
   input: route_transform
   config:
     name: medium
     path: medium.csv
     type: csv
-- type: output
+- type: sink
   name: low
   input: route_transform
   config:
@@ -357,7 +357,7 @@ nodes:
     for reader in 1..=reader_count {
         yaml.push_str(&format!(
             r#"
-- type: output
+- type: sink
   name: out_{reader}
   input: src
   config:
@@ -618,7 +618,7 @@ nodes:
       sort_by:
       - field: f0
         order: asc
-- type: output
+- type: sink
   name: out
   input: sorted_transform
   config:

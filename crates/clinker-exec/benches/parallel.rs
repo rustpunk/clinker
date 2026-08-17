@@ -94,7 +94,7 @@ nodes:
       emit out8 = f0.to_string()
 
       '
-- type: output
+- type: sink
   name: out
   input: heavy_transform
   config:
@@ -194,7 +194,7 @@ nodes:
       - f1
       sort_by:
       - field: f0
-- type: output
+- type: sink
   name: out
   input: windowed
   config:

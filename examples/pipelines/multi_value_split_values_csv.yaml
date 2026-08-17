@@ -31,7 +31,7 @@ nodes:
         - { name: order_id, type: string }
         - { name: tags, type: string, multiple: true }
 
-  - type: output
+  - type: sink
     name: tagged_orders
     input: orders
     config:

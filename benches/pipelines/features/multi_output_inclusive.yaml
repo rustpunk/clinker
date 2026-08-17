@@ -32,7 +32,7 @@ nodes:
         long_string: "f1.length() > 5"
       default: remainder
 
-  - type: output
+  - type: sink
     name: high_value
     input: classify_route.high_value
     config:
@@ -41,7 +41,7 @@ nodes:
       path: bench://output_high_value.csv
       include_unmapped: true
 
-  - type: output
+  - type: sink
     name: long_string
     input: classify_route.long_string
     config:
@@ -50,7 +50,7 @@ nodes:
       path: bench://output_long_string.csv
       include_unmapped: true
 
-  - type: output
+  - type: sink
     name: remainder
     input: classify_route.remainder
     config:

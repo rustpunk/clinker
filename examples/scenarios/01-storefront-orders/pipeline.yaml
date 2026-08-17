@@ -60,7 +60,7 @@ nodes:
         emit ship_country = ship_country
         emit status = status
 
-  - type: output
+  - type: sink
     name: billable
     input: billable_lines
     config:

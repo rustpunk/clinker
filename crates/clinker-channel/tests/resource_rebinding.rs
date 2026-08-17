@@ -21,7 +21,7 @@ nodes:
     use: ../composition/reader.comp.yaml
     inputs: { input: source }
     resources: { orders: base_orders }
-  - type: output
+  - type: sink
     name: output
     input: reader.out
     config: { name: output, type: csv, path: output.csv }

@@ -38,7 +38,7 @@ nodes:
         emit total = sum(value)
         emit n = count(*)
 
-  - type: output
+  - type: sink
     name: sink
     input: summarize
     config:

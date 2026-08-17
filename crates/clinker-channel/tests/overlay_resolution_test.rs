@@ -68,7 +68,7 @@ nodes:
     use: ../composition/risk.comp.yaml
     inputs: { inp: enrich }
     config: { threshold: 0.5 }
-  - type: output
+  - type: sink
     name: out
     input: risk
     config: { name: out, type: csv, path: out.csv }
@@ -932,7 +932,7 @@ nodes:
         records:
           - { id: detail, tag: D, columns: [ { name: amount, type: int, start: 1, width: 9 } ] }
           - { id: trailer, tag: T, columns: [ { name: count, type: int, start: 1, width: 9 } ] }
-  - type: output
+  - type: sink
     name: out
     input: ledger
     config: { name: out, type: csv, path: out.csv }
@@ -1061,11 +1061,11 @@ nodes:
           - { field: f03, components: 5 }
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out_x12
     input: interchange
     config: { name: out_x12, type: csv, path: out1.csv }
-  - type: output
+  - type: sink
     name: out_hl7
     input: messages
     config: { name: out_hl7, type: csv, path: out2.csv }

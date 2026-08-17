@@ -74,7 +74,7 @@ nodes:
         emit r40 = f40
         emit r49 = f49
 
-  - type: output
+  - type: sink
     name: sink
     input: compute
     config:

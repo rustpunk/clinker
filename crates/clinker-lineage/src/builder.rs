@@ -3086,7 +3086,7 @@ nodes:
           dept: dept,
           values: [item + amount for item in [score] if region == "west"],
         }
-  - type: output
+  - type: sink
     name: out
     input: construct
     config: { name: out, type: json, path: out/nested.json, include_unmapped: false }
