@@ -94,7 +94,7 @@ nodes:
     use: ../compositions/framed_body.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out_body
     input: body
     config:
@@ -237,7 +237,7 @@ fn body_output_bad_csv_delimiter_rejected_at_compile() {
       cxl: |
         emit id = id
         emit val = val
-  - type: output
+  - type: sink
     name: body_sink
     input: shape
     config:
@@ -288,7 +288,7 @@ fn body_output_valid_csv_delimiter_compiles() {
       cxl: |
         emit id = id
         emit val = val
-  - type: output
+  - type: sink
     name: body_sink
     input: shape
     config:
@@ -373,7 +373,7 @@ nodes:
     inputs:
       driver: drv
     resources: { reference: body_reference }
-  - type: output
+  - type: sink
     name: out
     input: enrich
     config:
@@ -455,7 +455,7 @@ nodes:
     inputs:
       driver: drv
     resources: { reference: body_reference }
-  - type: output
+  - type: sink
     name: out
     input: enrich
     config:
@@ -622,7 +622,7 @@ nodes:
       cxl: |
         emit id = id
         emit amount = amount
-  - type: output
+  - type: sink
     name: body_sink
     input: shape
     config:
@@ -656,7 +656,7 @@ nodes:
     use: ../compositions/decimal_body.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out_body
     input: body
     config:
@@ -772,7 +772,7 @@ nodes:
     inputs:
       driver: drv
     resources: { reference: body_reference }
-  - type: output
+  - type: sink
     name: out
     input: enrich
     config:
@@ -874,7 +874,7 @@ nodes:
     use: ../compositions/logging_body.comp.yaml
     inputs:
       inp: seen
-  - type: output
+  - type: sink
     name: out_body
     input: body
     config:

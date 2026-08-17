@@ -1325,7 +1325,7 @@ nodes:
     fn join_values_bare_expands() {
         let raw = "\
 nodes:
-  - type: output
+  - type: sink
     name: o
     input: s
     config:
@@ -1492,7 +1492,7 @@ nodes:
       path: in.csv
       schema:
         - { name: order_id, type: string }
-  - type: output
+  - type: sink
     name: o
     input: s
     config:
@@ -1626,7 +1626,7 @@ nodes:
           delimiter: \"|\"
       schema:
         - { name: tags, type: string, multiple: true }
-  - type: output
+  - type: sink
     name: o
     input: s
     config:

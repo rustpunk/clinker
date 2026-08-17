@@ -764,7 +764,7 @@ nodes:
       emit order_id = orders.order_id
       emit band_id = bands.band_id
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: banded
   config:
@@ -812,14 +812,14 @@ nodes:
       emit order_id = orders.order_id
       emit band_id = bands.band_id
     propagate_ck: driver
-- type: output
+- type: sink
   name: out_a
   input: banded
   config:
     name: out_a
     type: csv
     path: out_a.csv
-- type: output
+- type: sink
   name: out_b
   input: banded
   config:
@@ -869,7 +869,7 @@ nodes:
       emit amount = orders.amount
       emit lo = bands.lo
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: banded
   config:
@@ -903,7 +903,7 @@ nodes:
   inputs: [src_a, src_b]
   config:
     mode: interleave
-- type: output
+- type: sink
   name: out
   input: merged
   config:
@@ -937,14 +937,14 @@ nodes:
   inputs: [shared, exclusive]
   config:
     mode: interleave
-- type: output
+- type: sink
   name: merged_out
   input: merged
   config:
     name: merged_out
     type: csv
     path: merged.csv
-- type: output
+- type: sink
   name: sibling_out
   input: shared
   config:
@@ -991,14 +991,14 @@ nodes:
   inputs: [shared, right_only]
   config:
     mode: interleave
-- type: output
+- type: sink
   name: left_out
   input: left_merge
   config:
     name: left_out
     type: csv
     path: left.csv
-- type: output
+- type: sink
   name: right_out
   input: right_merge
   config:

@@ -205,14 +205,14 @@ nodes:
       type: csv
       path: other.csv
       schema: [{ name: id, type: string }]
-  - type: output
+  - type: sink
     name: direct
     input: shared
     config: { name: direct, type: csv, path: direct.csv }
   - type: merge
     name: joined
     inputs: [shared, other]
-  - type: output
+  - type: sink
     name: merged
     input: joined
     config: { name: merged, type: csv, path: merged.csv }
@@ -259,11 +259,11 @@ nodes:
       mode: exclusive
       conditions: { left: "side == 'left'" }
       default: right
-  - type: output
+  - type: sink
     name: left
     input: split.left
     config: { name: left, type: csv, path: left.csv }
-  - type: output
+  - type: sink
     name: right
     input: split.right
     config: { name: right, type: csv, path: right.csv }

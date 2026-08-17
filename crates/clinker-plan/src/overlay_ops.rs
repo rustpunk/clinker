@@ -2741,7 +2741,7 @@ schema:
         let err = apply_overlay_ops(base, one(op)).expect_err("not a source");
         assert!(
             matches!(err, OverlayOpError::NotSource { ref target, actual, .. }
-                if target == "sink" && actual == "output")
+                if target == "sink" && actual == "sink")
         );
     }
 
