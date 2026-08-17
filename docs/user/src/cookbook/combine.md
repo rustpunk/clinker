@@ -75,7 +75,7 @@ nodes:
         emit line_total = orders.quantity.to_float() * orders.unit_price
       propagate_ck: driver
 
-  - type: output
+  - type: sink
     name: result
     input: enrich
     config:

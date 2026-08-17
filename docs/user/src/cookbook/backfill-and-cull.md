@@ -74,12 +74,12 @@ nodes:
         - name: too_many_plans
           drop_group_when: "count(*) > 3"
 
-  - type: output
+  - type: sink
     name: out
     input: flag_large_histories         # main port — kept employees
     config: { name: out, type: csv, path: ./output/employee_plans_clean.csv }
 
-  - type: output
+  - type: sink
     name: review
     input: flag_large_histories.review  # side-output port — flagged employees
     config: { name: review, type: csv, path: ./output/employee_plans_review.csv }

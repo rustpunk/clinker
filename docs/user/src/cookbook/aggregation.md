@@ -59,7 +59,7 @@ nodes:
         emit maximum = max(amount)
         emit minimum = min(amount)
 
-  - type: output
+  - type: sink
     name: report
     input: rollup
     config:
@@ -295,7 +295,7 @@ nodes:
         emit user_id = user_id
         emit n = count(*)
 
-  - type: output
+  - type: sink
     name: results
     input: hourly_clicks
     config:
@@ -363,7 +363,7 @@ nodes:
         emit total = sum(amount)
         emit n = count(*)
 
-  - type: output
+  - type: sink
     name: results
     input: sliding_amount
     config:
@@ -448,7 +448,7 @@ nodes:
         emit user_id = user_id
         emit logins = count(*)
 
-  - type: output
+  - type: sink
     name: results
     input: user_sessions
     config:
