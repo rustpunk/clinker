@@ -85,7 +85,7 @@ nodes:
         emit amount = amount
         emit src_file = $source.file
         emit src_name = $source.name
-  - type: output
+  - type: sink
     name: out
     input: stamp
     config:

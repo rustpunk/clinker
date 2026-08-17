@@ -63,7 +63,7 @@ nodes:
         every: 1
         message: seen
         fields: [total]
-- type: output
+- type: sink
   name: out
   input: ratio
   config:

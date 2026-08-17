@@ -643,7 +643,7 @@ nodes:
     inputs:
       data: src
 
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

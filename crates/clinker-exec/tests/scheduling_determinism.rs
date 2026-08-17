@@ -79,7 +79,7 @@ nodes:
       cxl: |
         emit k = k
         emit total = sum(v)
-  - type: output
+  - type: sink
     name: out_small
     input: agg_small
     config:
@@ -87,7 +87,7 @@ nodes:
       type: csv
       path: out_small.csv
       include_unmapped: true
-  - type: output
+  - type: sink
     name: out_large
     input: agg_large
     config:

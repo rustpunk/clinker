@@ -152,7 +152,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: hourly
   config:
@@ -228,7 +228,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: hourly
   config:
@@ -315,7 +315,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: hourly
   config:
@@ -409,7 +409,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: hourly
   config:
@@ -483,7 +483,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: totals
   config:
@@ -536,7 +536,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: sliding
   config:
@@ -593,7 +593,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: sessions
   config:

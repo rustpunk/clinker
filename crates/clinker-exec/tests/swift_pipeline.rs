@@ -132,7 +132,7 @@ nodes:
         emit app = $doc.app.body
         emit user = $doc.user.body
         emit tlr = $doc.tlr.body
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -200,7 +200,7 @@ nodes:
         emit block = block
         emit tag = tag
         emit value = value
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -256,7 +256,7 @@ nodes:
         - { name: block, type: string }
         - { name: tag, type: string }
         - { name: value, type: string }
-  - type: output
+  - type: sink
     name: out
     input: message
     config:
@@ -289,7 +289,7 @@ nodes:
         - { name: block, type: string }
         - { name: tag, type: string }
         - { name: value, type: string }
-  - type: output
+  - type: sink
     name: out
     input: message
     config:
@@ -324,7 +324,7 @@ nodes:
         - { name: block, type: string }
         - { name: tag, type: string }
         - { name: value, type: string }
-  - type: output
+  - type: sink
     name: out
     input: message
     config:
@@ -372,7 +372,7 @@ nodes:
         - {{ name: block, type: string }}
         - {{ name: tag, type: string }}
         - {{ name: value, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: message
     config:
@@ -408,7 +408,7 @@ nodes:
         - { name: block, type: string }
         - { name: tag, type: string }
         - { name: value, type: string }
-  - type: output
+  - type: sink
     name: out
     input: message
     config:
@@ -623,7 +623,7 @@ nodes:
         - { name: block, type: string }
         - { name: tag, type: string }
         - { name: value, type: string }
-  - type: output
+  - type: sink
     name: out
     input: message
     config:
@@ -662,7 +662,7 @@ nodes:
         - { name: block, type: string }
         - { name: tag, type: string }
         - { name: value, type: string }
-  - type: output
+  - type: sink
     name: out
     input: message
     config:

@@ -86,7 +86,7 @@ nodes:
     inputs: [src_a, src_b]
     config:
       mode: interleave
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:

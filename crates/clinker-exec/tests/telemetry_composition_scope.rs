@@ -103,7 +103,7 @@ nodes:
     use: ../compositions/exec_transform_check.comp.yaml
     inputs:
       inp: doubler
-  - type: output
+  - type: sink
     name: eu_out
     input: enrich_eu
     config:
@@ -125,7 +125,7 @@ nodes:
     use: ../compositions/exec_transform_check.comp.yaml
     inputs:
       inp: us_orders
-  - type: output
+  - type: sink
     name: us_out
     input: enrich_us
     config:

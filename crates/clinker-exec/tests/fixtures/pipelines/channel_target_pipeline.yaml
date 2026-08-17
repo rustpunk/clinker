@@ -23,7 +23,7 @@ nodes:
       fuzzy_threshold: 0.8
       lookup_table: "default-lookup.csv"
 
-  - type: output
+  - type: sink
     name: sink
     input: enrich1
     config:
