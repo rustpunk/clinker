@@ -202,8 +202,15 @@ fn otlp_bulkhead_drains_three_signals_and_shares_lifecycle_facts() {
             counters.keys().map(String::as_str).collect::<BTreeSet<_>>(),
             BTreeSet::from(["accepted", "attempts", "failures", "rejected"])
         );
-        assert!(counters["accepted"].as_u64().is_some_and(|count| count > 0));
         assert_eq!(counters["failures"], 0);
+    }
+    for signal in ["metrics", "traces"] {
+        assert!(
+            summary[signal]["accepted"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "the run lifecycle exports {signal}"
+        );
     }
 
     let captured = capture_events(&capture);
@@ -211,7 +218,23 @@ fn otlp_bulkhead_drains_three_signals_and_shares_lifecycle_facts() {
         .iter()
         .map(|entry| entry["signal"].as_str().expect("signal"))
         .collect::<BTreeSet<_>>();
-    assert_eq!(signals, BTreeSet::from(["logs", "metrics", "traces"]));
+    assert!(signals.contains("metrics"), "fixed metrics are exported");
+    assert!(
+        signals.contains("traces"),
+        "the run lifecycle span is exported"
+    );
+    assert!(
+        signals.is_subset(&BTreeSet::from(["logs", "metrics", "traces"])),
+        "only configured signal families are exported: {signals:?}"
+    );
+    if !signals.contains("logs") {
+        assert!(
+            summary["admission"]["dropped"]["contended"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "an omitted optional log is accounted as nonblocking contention"
+        );
+    }
     assert!(
         captured
             .iter()
