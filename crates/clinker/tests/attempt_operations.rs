@@ -23,7 +23,7 @@ nodes:
       path: input.csv
       schema:
         - { name: value, type: string }
-  - type: output
+  - type: sink
     name: result
     input: source
     config:
@@ -290,7 +290,7 @@ nodes:
       path: input.csv
       schema:
         - {{ name: value, type: string }}
-  - type: output
+  - type: sink
     name: result
     input: source
     config:
@@ -681,7 +681,7 @@ nodes:
       glob: input-*.csv
       schema:
         - { name: value, type: string }
-  - type: output
+  - type: sink
     name: result
     input: source
     config:
@@ -743,7 +743,7 @@ nodes:
       glob: input-*.csv
       schema:
         - { name: value, type: string }
-  - type: output
+  - type: sink
     name: result
     input: source
     config:
@@ -800,7 +800,7 @@ nodes:
       glob: inputs/original/*.csv
       schema:
         - { name: value, type: string }
-  - type: output
+  - type: sink
     name: result
     input: source
     config:
@@ -947,7 +947,7 @@ nodes:
       cxl: |
         emit id = id
         emit value = 10 / amount
-  - type: output
+  - type: sink
     name: primary
     input: checked
     config:
@@ -955,14 +955,14 @@ nodes:
       type: csv
       path: output/primary.csv
       write_meta: true
-  - type: output
+  - type: sink
     name: fan
     input: source
     config:
       name: fan
       type: csv
       path: output/fan_{source_file}.csv
-  - type: output
+  - type: sink
     name: split
     input: checked
     config:

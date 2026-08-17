@@ -28,7 +28,7 @@ pipeline:
         emit customer_id = customer_id
         emit amount = amount
       log:
-{directives}  - type: output
+{directives}  - type: sink
     name: output
     input: observe
     config:
@@ -482,7 +482,7 @@ nodes:
         emit doubled = amount * 2
       log:
         - {{ name: transform.seen, level: info, when: per_record, every: 1, message: seen, condition: "{condition}" }}
-  - type: output
+  - type: sink
     name: output
     input: observe
     config:
@@ -583,7 +583,7 @@ nodes:
         emit doubled = amount * 2
       log:
         - {{ name: transform.seen, level: info, when: per_record, every: 1, message: seen, fields: [{field}] }}
-  - type: output
+  - type: sink
     name: output
     input: observe
     config:

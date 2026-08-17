@@ -58,7 +58,7 @@ nodes:
     schema:
       - { name: id, type: int }
       - { name: name, type: string }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -143,7 +143,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: int }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -206,7 +206,7 @@ nodes:
     cxl: |
       emit id = id
       emit boom = id / 0
-- type: output
+- type: sink
   name: out
   input: divzero
   config:
@@ -265,7 +265,7 @@ nodes:
   config:
     cxl: |
       emit boom = id / 0
-- type: output
+- type: sink
   name: out
   input: fail
   config:
@@ -312,7 +312,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: int }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -372,7 +372,7 @@ nodes:
     schema:
       - { name: id, type: int }
       - { name: group, type: string }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -425,7 +425,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: int }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -497,7 +497,7 @@ nodes:
   config:
     cxl: |
       emit boom = id / 0
-- type: output
+- type: sink
   name: out
   input: fail
   config:
@@ -543,7 +543,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: int }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -599,7 +599,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: int }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -663,14 +663,14 @@ nodes:
     type: csv
     schema:
       - { name: id, type: int }
-- type: output
+- type: sink
   name: fan
   input: src
   config:
     name: fan
     path: literal-{{source_file}}-{source_file}.csv
     type: csv
-- type: output
+- type: sink
   name: merged
   input: src
   config:
@@ -723,7 +723,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: int }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -789,7 +789,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: int }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -839,7 +839,7 @@ nodes:
     schema:
       - { name: id, type: int }
       - { name: group, type: string }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -903,7 +903,7 @@ nodes:
     cxl: |
       emit id = id
       emit value = 1 / amount
-- type: output
+- type: sink
   name: out
   input: fail_one
   config:
@@ -962,7 +962,7 @@ nodes:
     schema:
       - { name: id, type: int }
       - { name: name, type: string }
-- type: output
+- type: sink
   name: out
   input: src
   config:

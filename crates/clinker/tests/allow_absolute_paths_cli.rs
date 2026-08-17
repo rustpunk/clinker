@@ -48,7 +48,7 @@ nodes:
     schema:
       - {{ name: id, type: int }}
       - {{ name: name, type: string }}
-- type: output
+- type: sink
   name: out
   input: src
   config:

@@ -127,7 +127,7 @@ nodes:
       type: csv
       path: input.csv
       schema: [{{ name: id, type: int }}]
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

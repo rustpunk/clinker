@@ -51,14 +51,14 @@ nodes:
       conditions:
         big: '{condition}'
       default: small
-  - type: output
+  - type: sink
     name: big_out
     input: split.big
     config:
       name: big_out
       type: csv
       path: big.csv
-  - type: output
+  - type: sink
     name: small_out
     input: split.small
     config:
@@ -105,14 +105,14 @@ nodes:
       conditions:
         big: '{condition}'
       default: small
-  - type: output
+  - type: sink
     name: big_out
     input: split.big
     config:
       name: big_out
       type: csv
       path: big.csv
-  - type: output
+  - type: sink
     name: small_out
     input: split.small
     config:

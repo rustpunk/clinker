@@ -272,7 +272,7 @@ fn logical_overlay_target_matches_only_the_catalog_scope() {
 #[test]
 fn base_node_names_reads_pipelines_and_compositions() {
     let p = dom(
-        "pipeline:\n  name: p\nnodes:\n  - { type: source, name: a, config: {name: a, type: csv, path: x} }\n  - { type: output, name: b, input: a, config: {name: b, type: csv, path: y} }",
+        "pipeline:\n  name: p\nnodes:\n  - { type: source, name: a, config: {name: a, type: csv, path: x} }\n  - { type: sink, name: b, input: a, config: {name: b, type: csv, path: y} }",
     );
     let names = base_node_names(&p).unwrap();
     assert!(names.contains("a") && names.contains("b"));
@@ -313,7 +313,7 @@ fn write_fixture(root: &std::path::Path) {
 
     w(
         "pipeline/order.yaml",
-        "pipeline:\n  name: order\nnodes:\n  - type: source\n    name: orders\n    config:\n      name: orders\n      type: csv\n      path: ./orders.csv\n      schema:\n        - { name: id, type: string }\n        - { name: amt, type: float }\n  - type: source\n    name: events\n    config:\n      name: events\n      type: csv\n      path: ./events.csv\n      schema:\n        - { name: id, type: string }\n  - type: combine\n    name: joined\n    input:\n      orders: orders\n      events: events\n    config:\n      where: \"orders.id == events.id\"\n      match: first\n      on_miss: skip\n      propagate_ck: driver\n      cxl: |\n        emit id = orders.id\n        emit amt = orders.amt\n  - type: output\n    name: out\n    input: joined\n    config:\n      name: out\n      type: csv\n      path: ./out.csv\n",
+        "pipeline:\n  name: order\nnodes:\n  - type: source\n    name: orders\n    config:\n      name: orders\n      type: csv\n      path: ./orders.csv\n      schema:\n        - { name: id, type: string }\n        - { name: amt, type: float }\n  - type: source\n    name: events\n    config:\n      name: events\n      type: csv\n      path: ./events.csv\n      schema:\n        - { name: id, type: string }\n  - type: combine\n    name: joined\n    input:\n      orders: orders\n      events: events\n    config:\n      where: \"orders.id == events.id\"\n      match: first\n      on_miss: skip\n      propagate_ck: driver\n      cxl: |\n        emit id = orders.id\n        emit amt = orders.amt\n  - type: sink\n    name: out\n    input: joined\n    config:\n      name: out\n      type: csv\n      path: ./out.csv\n",
     );
 
     // Group: a structural op targeting the renamed source.
@@ -340,7 +340,7 @@ fn write_fixture(root: &std::path::Path) {
     // (per-target scoping keyed on the overlay's target).
     w(
         "pipeline/other.yaml",
-        "pipeline:\n  name: other\nnodes:\n  - type: source\n    name: orders\n    config:\n      name: orders\n      type: csv\n      path: ./orders.csv\n      schema:\n        - { name: id, type: string }\n  - type: output\n    name: sink\n    input: orders\n    config:\n      name: sink\n      type: csv\n      path: ./sink.csv\n",
+        "pipeline:\n  name: other\nnodes:\n  - type: source\n    name: orders\n    config:\n      name: orders\n      type: csv\n      path: ./orders.csv\n      schema:\n        - { name: id, type: string }\n  - type: sink\n    name: sink\n    input: orders\n    config:\n      name: sink\n      type: csv\n      path: ./sink.csv\n",
     );
     w(
         "channel/beta/channel.cfg.yaml",
