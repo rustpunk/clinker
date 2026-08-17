@@ -6,7 +6,10 @@ use clinker_core_types::span::FileId;
 use crate::config::composition::CompositionFile;
 use crate::config::{CompileContext, PipelineConfig, PipelineNode, parse_config};
 use crate::plan::CompiledPlan;
-use crate::plan::execution::PlanNode;
+use crate::plan::execution::{
+    CompiledSourceInstance, CompiledSourceRoot, PlanNode, SourceActivationCapacity,
+    SourceActivationGroupKind,
+};
 
 const BODY: &str = r#"_compose:
   name: catalog_reader
@@ -88,9 +91,7 @@ fn compile(workspace: &Path) -> CompiledPlan {
         .unwrap_or_else(|diagnostics| panic!("pipeline compiles: {diagnostics:?}"))
 }
 
-fn body_source_instances(
-    plan: &CompiledPlan,
-) -> Vec<&crate::plan::execution::CompiledSourceInstance> {
+fn body_source_instances(plan: &CompiledPlan) -> Vec<&CompiledSourceInstance> {
     plan.dag()
         .graph
         .node_weights()
@@ -108,14 +109,13 @@ fn tracer() {
     let first_plan = compile(workspace.path());
     let first_instances = body_source_instances(&first_plan);
     assert_eq!(first_instances.len(), 2);
-    assert_ne!(first_instances[0].id, first_instances[1].id);
-    assert_ne!(
-        first_instances[0].id.body_scope,
-        first_instances[1].id.body_scope
-    );
-    assert_eq!(first_instances[0].source_name, "read");
+    assert_ne!(first_instances[0].id(), first_instances[1].id());
+    assert_ne!(first_instances[0].id().scope, first_instances[1].id().scope);
+    assert_eq!(first_instances[0].source_name(), "read");
 
-    let requirement = &first_instances[0].resource;
+    let requirement = first_instances[0]
+        .resource()
+        .expect("body Source has a catalog requirement");
     assert_eq!(requirement.slot, "orders");
     assert_eq!(requirement.binding.logical_id().as_str(), "shared_orders");
     assert_eq!(requirement.kind.label(), "file");
@@ -139,10 +139,21 @@ fn tracer() {
     let second_plan = compile(workspace.path());
     let second_ids: Vec<_> = body_source_instances(&second_plan)
         .iter()
-        .map(|instance| instance.id)
+        .map(|instance| instance.id())
         .collect();
-    let first_ids: Vec<_> = first_instances.iter().map(|instance| instance.id).collect();
+    let first_ids: Vec<_> = first_instances
+        .iter()
+        .map(|instance| instance.id())
+        .collect();
     assert_eq!(first_ids, second_ids);
+
+    let activation = first_plan.dag().source_activation();
+    assert!(activation.is_sealed());
+    assert_eq!(activation.instances().len(), 3);
+    assert_eq!(activation.groups().len(), 3);
+    assert_eq!(activation.credential_requirement_ids().len(), 0);
+    let second_activation = second_plan.dag().source_activation();
+    assert_eq!(activation, second_activation);
 }
 
 #[test]
@@ -284,4 +295,339 @@ nodes:
             && diagnostic.message.contains("resource")
             && diagnostic.primary.span.synthetic_line_number().is_some()
     }));
+}
+
+fn write_composition(workspace: &Path, name: &str, body: &str) {
+    std::fs::write(
+        workspace
+            .join("compositions")
+            .join(format!("{name}.comp.yaml")),
+        body,
+    )
+    .expect("composition body");
+}
+
+fn compile_pipeline(workspace: &Path, yaml: &str) -> CompiledPlan {
+    parse_config(yaml)
+        .expect("pipeline parses")
+        .compile(&CompileContext::with_pipeline_dir(
+            workspace,
+            PathBuf::from("pipelines"),
+        ))
+        .unwrap_or_else(|diagnostics| panic!("pipeline compiles: {diagnostics:?}"))
+}
+
+fn one_call_pipeline(body: &str, call_fields: &str) -> String {
+    format!(
+        r#"pipeline: {{ name: activation_groups }}
+nodes:
+  - type: source
+    name: driver
+    config:
+      name: driver
+      type: csv
+      path: driver.csv
+      schema: [{{ name: id, type: string }}]
+  - type: composition
+    name: call
+    input: driver
+    use: ../compositions/{body}.comp.yaml
+{call_fields}"#
+    )
+}
+
+fn instance_named<'a>(plan: &'a CompiledPlan, name: &str) -> &'a CompiledSourceInstance {
+    plan.dag()
+        .source_activation()
+        .instances()
+        .iter()
+        .find(|instance| instance.source_name() == name)
+        .unwrap_or_else(|| panic!("missing activation instance {name:?}"))
+}
+
+fn group_for_instance<'a>(
+    plan: &'a CompiledPlan,
+    instance: &CompiledSourceInstance,
+) -> &'a crate::plan::execution::SourceActivationGroup {
+    plan.dag()
+        .source_activation()
+        .groups()
+        .iter()
+        .find(|group| group.members().contains(&instance.id()))
+        .unwrap_or_else(|| panic!("missing group for {:?}", instance.id()))
+}
+
+#[test]
+fn input_ports_are_explicit_roots_but_not_activation_instances() {
+    let workspace = write_workspace(BODY);
+    write_composition(
+        workspace.path(),
+        "input_only",
+        r#"_compose:
+  name: input_only
+  inputs:
+    incoming: { schema: [{ name: id, type: string }] }
+  outputs: { out: shape }
+  config_schema: {}
+  resources_schema: {}
+nodes:
+  - type: transform
+    name: shape
+    input: incoming
+    config:
+      cxl: |
+        emit id = id
+"#,
+    );
+    let yaml = one_call_pipeline("input_only", "    inputs: { incoming: driver }\n");
+    let plan = compile_pipeline(workspace.path(), &yaml);
+    let activation = plan.dag().source_activation();
+
+    assert!(activation.is_sealed());
+    assert_eq!(activation.instances().len(), 1);
+    assert_eq!(activation.groups().len(), 1);
+    assert!(activation.roots().iter().any(|root| {
+        matches!(root, CompiledSourceRoot::InputPort { port_name, .. } if port_name.as_ref() == "incoming")
+    }));
+    assert_eq!(instance_named(&plan, "driver").resource(), None);
+}
+
+#[test]
+fn nested_body_sources_form_dependency_ordered_singleton_groups() {
+    let workspace = write_workspace(BODY);
+    write_composition(
+        workspace.path(),
+        "inner",
+        r#"_compose:
+  name: inner
+  inputs:
+    incoming: { schema: [{ name: id, type: string }] }
+  outputs: { out: inner_ref }
+  config_schema: {}
+  resources_schema:
+    inner_data: { kind: file, required: true }
+nodes:
+  - type: source
+    name: inner_ref
+    config:
+      name: inner_ref
+      type: csv
+      resource: inner_data
+      schema: [{ name: id, type: string }]
+"#,
+    );
+    write_composition(
+        workspace.path(),
+        "outer",
+        r#"_compose:
+  name: outer
+  inputs: {}
+  outputs: { out: inner_call }
+  config_schema: {}
+  resources_schema:
+    outer_data: { kind: file, required: true }
+    inner_data: { kind: file, required: true }
+nodes:
+  - type: source
+    name: outer_ref
+    config:
+      name: outer_ref
+      type: csv
+      resource: outer_data
+      schema: [{ name: id, type: string }]
+  - type: composition
+    name: inner_call
+    input: outer_ref
+    use: inner.comp.yaml
+    inputs: { incoming: outer_ref }
+    resources: { inner_data: shared_orders }
+"#,
+    );
+    let yaml = one_call_pipeline(
+        "outer",
+        "    inputs: {}\n    resources: { outer_data: shared_orders, inner_data: shared_orders }\n",
+    );
+    let first = compile_pipeline(workspace.path(), &yaml);
+    let outer = instance_named(&first, "outer_ref");
+    let inner = instance_named(&first, "inner_ref");
+    let outer_group = group_for_instance(&first, outer);
+    let inner_group = group_for_instance(&first, inner);
+
+    assert_eq!(outer_group.kind(), &SourceActivationGroupKind::Ordinary);
+    assert_eq!(inner_group.kind(), &SourceActivationGroupKind::Ordinary);
+    assert!(inner_group.dependencies().contains(&outer_group.id()));
+    assert!(outer_group.id() < inner_group.id());
+
+    let second = compile_pipeline(workspace.path(), &yaml);
+    assert_eq!(
+        first.dag().source_activation(),
+        second.dag().source_activation()
+    );
+}
+
+#[test]
+fn exclusive_live_interleave_sources_share_one_atomic_group() {
+    let workspace = write_workspace(BODY);
+    write_composition(
+        workspace.path(),
+        "interleave",
+        r#"_compose:
+  name: interleave
+  inputs: {}
+  outputs: { out: mixed }
+  config_schema: {}
+  resources_schema:
+    left_data: { kind: file, required: true }
+    right_data: { kind: file, required: true }
+nodes:
+  - type: source
+    name: left
+    config:
+      name: left
+      type: csv
+      resource: left_data
+      schema: [{ name: id, type: string }]
+  - type: source
+    name: right
+    config:
+      name: right
+      type: csv
+      resource: right_data
+      schema: [{ name: id, type: string }]
+  - type: merge
+    name: mixed
+    inputs: [left, right]
+    config:
+      mode: interleave
+"#,
+    );
+    let yaml = one_call_pipeline(
+        "interleave",
+        "    inputs: {}\n    resources: { left_data: shared_orders, right_data: shared_orders }\n",
+    );
+    let plan = compile_pipeline(workspace.path(), &yaml);
+    let left = instance_named(&plan, "left");
+    let right = instance_named(&plan, "right");
+    let group = group_for_instance(&plan, left);
+
+    assert!(group.members().contains(&right.id()));
+    assert!(matches!(
+        group.kind(),
+        SourceActivationGroupKind::LiveInterleave { consumer_path }
+            if consumer_path.len() == 1
+    ));
+    assert_eq!(group.capacity().resource_units(), 2);
+    assert_eq!(group.capacity().opener_units(), 2);
+    assert_eq!(group.capacity().credential_handle_units(), 0);
+    assert!(group.credential_requirement_ids().is_empty());
+    assert_eq!(
+        left.resource().unwrap().binding.logical_id(),
+        right.resource().unwrap().binding.logical_id()
+    );
+}
+
+#[test]
+fn exclusive_source_transform_path_is_compiled_as_fused() {
+    let workspace = write_workspace(BODY);
+    write_composition(
+        workspace.path(),
+        "fused",
+        r#"_compose:
+  name: fused
+  inputs: {}
+  outputs: { out: shaped }
+  config_schema: {}
+  resources_schema:
+    data: { kind: file, required: true }
+nodes:
+  - type: source
+    name: raw
+    config:
+      name: raw
+      type: csv
+      resource: data
+      schema: [{ name: id, type: string }]
+  - type: transform
+    name: shaped
+    input: raw
+    config:
+      cxl: |
+        emit id = id
+"#,
+    );
+    let yaml = one_call_pipeline(
+        "fused",
+        "    inputs: {}\n    resources: { data: shared_orders }\n",
+    );
+    let plan = compile_pipeline(workspace.path(), &yaml);
+    let raw = instance_named(&plan, "raw");
+    let group = group_for_instance(&plan, raw);
+
+    assert!(matches!(
+        group.kind(),
+        SourceActivationGroupKind::FusedStreaming { consumer_path }
+            if !consumer_path.is_empty()
+    ));
+}
+
+#[test]
+fn activation_capacity_overflow_is_rejected() {
+    let maximum = SourceActivationCapacity::new(u32::MAX, u32::MAX, u32::MAX);
+    let one = SourceActivationCapacity::new(1, 1, 1);
+    assert_eq!(maximum.checked_add(one), None);
+}
+
+#[test]
+fn topology_cycles_and_undeclared_dependencies_keep_authored_spans() {
+    let workspace = write_workspace(BODY);
+    let cycle = r#"pipeline: { name: cycle }
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: source.csv
+      schema: [{ name: id, type: string }]
+  - type: transform
+    name: first
+    input: second
+    config: { cxl: "emit id = id" }
+  - type: transform
+    name: second
+    input: first
+    config: { cxl: "emit id = id" }
+"#;
+    let cycle_diags = parse_config(cycle)
+        .expect("cycle parses")
+        .compile(&CompileContext::with_pipeline_dir(
+            workspace.path(),
+            PathBuf::from("pipelines"),
+        ))
+        .expect_err("cycle fails");
+    let cycle_diag = cycle_diags
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E003")
+        .expect("cycle diagnostic");
+    assert!(cycle_diag.primary.span.synthetic_line_number().is_some());
+
+    let undeclared = cycle.replace("input: second", "input: missing");
+    let undeclared_diags = parse_config(&undeclared)
+        .expect("undeclared input parses")
+        .compile(&CompileContext::with_pipeline_dir(
+            workspace.path(),
+            PathBuf::from("pipelines"),
+        ))
+        .expect_err("undeclared dependency fails");
+    let undeclared_diag = undeclared_diags
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E004")
+        .expect("undeclared-input diagnostic");
+    assert!(
+        undeclared_diag
+            .primary
+            .span
+            .synthetic_line_number()
+            .is_some()
+    );
 }
