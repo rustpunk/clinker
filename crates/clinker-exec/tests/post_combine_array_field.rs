@@ -54,7 +54,7 @@ nodes:
       emit products_array = products
     analytic_window:
       group_by: [products]
-- type: output
+- type: sink
   name: out
   input: aggregate_window
   config:

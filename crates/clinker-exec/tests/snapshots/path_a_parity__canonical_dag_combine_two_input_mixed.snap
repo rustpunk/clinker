@@ -5,4 +5,4 @@ expression: shape
 [source] products
 [source] orders
 [combine] qualified <- orders, products
-[output] qualified_out <- qualified
+[sink] qualified_out <- qualified

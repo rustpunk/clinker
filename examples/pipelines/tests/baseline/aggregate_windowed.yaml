@@ -37,7 +37,7 @@ nodes:
         emit total = sum(amount.to_int())
         emit n = count(*)
 
-  - type: output
+  - type: sink
     name: dept_totals
     input: by_dept
     config:

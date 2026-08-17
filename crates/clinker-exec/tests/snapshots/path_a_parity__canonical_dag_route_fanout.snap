@@ -5,5 +5,5 @@ expression: shape
 [source] orders
 [transform] classify <- orders
 [route] classify_route <- classify
-[output] low <- classify_route
-[output] high <- classify_route
+[sink] low <- classify_route
+[sink] high <- classify_route

@@ -93,7 +93,7 @@ nodes:
   - type: merge
     name: merged
     inputs: [src_a, src_b]
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -178,7 +178,7 @@ nodes:
       schema:
         - { name: id, type: int }
         - { name: event_time, type: date_time }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -247,7 +247,7 @@ nodes:
       schema:
         - { name: id, type: int }
         - { name: event_time, type: date_time }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -314,7 +314,7 @@ nodes:
   - type: merge
     name: merged
     inputs: [src_a, src_b]
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -377,7 +377,7 @@ nodes:
       schema:
         - { name: id, type: int }
         - { name: tag, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -426,7 +426,7 @@ nodes:
       schema:
         - { name: id, type: int }
         - { name: event_time, type: date_time }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -478,7 +478,7 @@ nodes:
       schema:
         - { name: id, type: int }
         - { name: event_time, type: date_time }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

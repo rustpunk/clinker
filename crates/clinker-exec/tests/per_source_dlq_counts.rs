@@ -76,7 +76,7 @@ nodes:
       cxl: |
         emit id = id
         emit ratio = if($source.name == "src_bad") then (1 / 0) else amt
-  - type: output
+  - type: sink
     name: out
     input: tfm
     config:

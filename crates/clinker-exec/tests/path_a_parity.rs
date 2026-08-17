@@ -209,7 +209,7 @@ nodes:
       cxl: |
         emit id = id
 
-  - type: output
+  - type: sink
     name: out
     input: passthrough
     config:
@@ -416,14 +416,14 @@ nodes:
     config:
       cxl: |
         emit id = id
-  - type: output
+  - type: sink
     name: out_a
     input: passthrough_a
     config:
       name: out_a
       type: csv
       path: out_a.csv
-  - type: output
+  - type: sink
     name: out_b
     input: passthrough_b
     config:

@@ -5,4 +5,4 @@ expression: shape
 [source] products
 [source] orders
 [combine] enriched <- orders, products
-[output] enriched_out <- enriched
+[sink] enriched_out <- enriched

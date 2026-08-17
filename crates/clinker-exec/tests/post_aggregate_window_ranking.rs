@@ -47,7 +47,7 @@ nodes:
       sort_by:
         - field: score
           order: asc
-- type: output
+- type: sink
   name: out
   input: ranked
   config:
@@ -225,7 +225,7 @@ nodes:
       emit none_neg = $window.not_exists(score < 0)
     analytic_window:
       group_by: [dept]
-- type: output
+- type: sink
   name: out
   input: predicates
   config:

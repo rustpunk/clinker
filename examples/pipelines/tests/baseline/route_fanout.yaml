@@ -31,7 +31,7 @@ nodes:
         high: "amount.to_int() > 100"
       default: low
 
-  - type: output
+  - type: sink
     name: high
     input: classify_route.high
     config:
@@ -39,7 +39,7 @@ nodes:
       type: csv
       path: ./output/high.csv
 
-  - type: output
+  - type: sink
     name: low
     input: classify_route.low
     config:
