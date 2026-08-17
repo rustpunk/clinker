@@ -151,7 +151,7 @@ impl ExecutionPlanDag {
                 return Err(PipelineError::Compilation {
                     transform_name: boundary.output_name.clone(),
                     messages: vec![format!(
-                        "Output '{}' uses {} writer mode after stage '{}' but authored keys [{}] require a complete-population stable sort; materialize the Output after '{}' with:\nsort_order:\n{}\nor remove the Output `sort_order` to keep streaming",
+                        "Sink '{}' uses {} writer mode after stage '{}' but authored keys [{}] require a complete-population stable sort; materialize the Sink after '{}' with:\nsort_order:\n{}\nor remove the Sink `sort_order` to keep streaming",
                         boundary.output_name,
                         boundary.mode.as_str(),
                         broken_stage,

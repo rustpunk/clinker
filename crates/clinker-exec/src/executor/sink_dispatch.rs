@@ -66,13 +66,13 @@ impl OrderedWriterBoundary {
         let boundary = matches.next().ok_or_else(|| PipelineError::Internal {
             op: "writer_boundary",
             node: format!("{output_id:?}"),
-            detail: "compiled Output has no physical writer boundary".to_string(),
+            detail: "compiled Sink has no physical writer boundary".to_string(),
         })?;
         if matches.next().is_some() {
             return Err(PipelineError::Internal {
                 op: "writer_boundary",
                 node: boundary.output_name.clone(),
-                detail: "compiled Output has more than one physical writer boundary template"
+                detail: "compiled Sink has more than one physical writer boundary template"
                     .to_string(),
             });
         }

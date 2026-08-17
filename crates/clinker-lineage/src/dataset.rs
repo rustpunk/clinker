@@ -192,7 +192,7 @@ pub(crate) fn source_dataset_identity(source: &SourceConfig, base_dir: &Path) ->
     DatasetId::file(name)
 }
 
-/// Dataset identity of an output node from its parsed [`SinkConfig`].
+/// Dataset identity of a Sink node from its parsed [`SinkConfig`].
 ///
 /// Always [`FILE_NAMESPACE`] + the absolutized output path. The path may be a
 /// template carrying tokens (e.g. `{source_file}`) or driving per-file `split:`

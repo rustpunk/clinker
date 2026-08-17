@@ -3091,7 +3091,7 @@ pub(crate) fn stream_linear_producer_emit(
                         op: "executor",
                         node: node_name.to_string(),
                         detail: String::from(
-                            "streaming Output writer task dropped its receiver before \
+                            "streaming Sink writer task dropped its receiver before \
                              the streaming producer arm finished",
                         ),
                     })
@@ -3611,7 +3611,7 @@ pub(crate) fn merge_fused_interleave(
                             op: "executor",
                             node: merge_name.to_string(),
                             detail: String::from(
-                                "streaming Output writer task dropped its receiver \
+                                "streaming Sink writer task dropped its receiver \
                              before the Merge arm finished",
                             ),
                         })
@@ -4057,7 +4057,7 @@ pub(crate) fn transform_fused_consume(
                             op: "executor",
                             node: String::from("fused-transform-stream"),
                             detail: String::from(
-                                "streaming Output writer task dropped its receiver \
+                                "streaming Sink writer task dropped its receiver \
                                  before the fused Transform arm finished",
                             ),
                         })

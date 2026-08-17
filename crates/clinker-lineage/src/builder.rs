@@ -1222,7 +1222,7 @@ fn bound_port_sources<'a>(
         })
 }
 
-/// Visit every Source and Output node the lineage walk resolves an identity for,
+/// Visit every Source and Sink node the lineage walk resolves an identity for,
 /// paired with its [qualified name](qualified_node): the top-level dataset nodes
 /// plus those declared inside every composition body, minus each body's
 /// input-port placeholders.
@@ -2746,7 +2746,7 @@ fn add_doc_influence(
 
 /// Accumulator for one sink dataset: its authorized identity facts, per-column
 /// DIRECT terminals, and whole-dataset INDIRECT influences, merged across every
-/// Output node that resolves to the same dataset.
+/// Sink node that resolves to the same dataset.
 struct OutputAcc {
     dataset: DatasetId,
     identity_facets: DatasetIdentityFacets,
@@ -2782,9 +2782,9 @@ impl OutputAcc {
     }
 }
 
-/// Accumulate one Output node's DIRECT columns, INDIRECT influences, and
+/// Accumulate one Sink node's DIRECT columns, INDIRECT influences, and
 /// authorized identity facts into the sink dataset's entry, unioning with any
-/// prior Output node naming it.
+/// prior Sink node naming it.
 fn record_output(
     acc: &mut Vec<OutputAcc>,
     dataset: DatasetId,

@@ -5249,7 +5249,7 @@ pub(crate) fn validate_inert_metadata(
                 ),
             )
             .with_help(
-                "remove `include_provenance:` and set `write_meta: true` in each intended Output config",
+                "remove `include_provenance:` and set `write_meta: true` in each intended Sink config",
             ),
         );
     }
