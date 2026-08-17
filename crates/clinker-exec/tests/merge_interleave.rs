@@ -79,7 +79,7 @@ nodes:
   - type: merge
     name: merged
     inputs: [src_a, src_b]
-{merge_config_block}  - type: output
+{merge_config_block}  - type: sink
     name: out
     input: merged
     config:
@@ -132,14 +132,14 @@ nodes:
     inputs: [shared, right_only]
     config:
       mode: interleave
-  - type: output
+  - type: sink
     name: left_out
     input: left_merge
     config:
       name: left_out
       type: csv
       path: left_out.csv
-  - type: output
+  - type: sink
     name: right_out
     input: right_merge
     config:
@@ -557,7 +557,7 @@ nodes:
     inputs: [src_a, src_b, src_c, src_d]
     config:
       mode: interleave
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:

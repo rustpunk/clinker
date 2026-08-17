@@ -192,7 +192,7 @@ nodes:
   - type: merge
     name: merged
     inputs: [a, b]
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -232,7 +232,7 @@ nodes:
       options: { has_header: true }
       schema:
         - { name: x, type: string }
-  - type: output
+  - type: sink
     name: out
     input: a
     config:
@@ -268,7 +268,7 @@ nodes:
       options: { has_header: true }
       schema:
         - { name: x, type: string }
-  - type: output
+  - type: sink
     name: out
     input: customers
     config:

@@ -87,7 +87,7 @@ nodes:
         emit handling_fee = if priority_level == "urgent" then $vars.express_surcharge else 0.0
         emit region = $vars.region
 
-  - type: output
+  - type: sink
     name: fulfilled_orders
     input: route_priority
     config:
@@ -96,7 +96,7 @@ nodes:
       path: ./output/fulfilled_orders.csv
       include_unmapped: false
 
-  - type: output
+  - type: sink
     name: priority_report
     input: route_priority
     config:

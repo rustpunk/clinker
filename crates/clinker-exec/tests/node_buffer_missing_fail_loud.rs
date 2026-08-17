@@ -135,7 +135,7 @@ fn route_pipeline(name: &str, selected_consumer: &str) -> String {
         keep: "status == 'keep'"
       default: drop
 {selected_consumer}
-  - type: output
+  - type: sink
     name: dropped
     input: split.drop
     config:
@@ -161,7 +161,7 @@ fn cull_pipeline(name: &str, main_consumer: &str) -> String {
         - name: remove_bad
           drop_group_when: "sum(if status == 'bad' then 1 else 0) > 0"
 {main_consumer}
-  - type: output
+  - type: sink
     name: removed
     input: gate.removed
     config:
@@ -198,7 +198,7 @@ fn transform_diamond_delivers_source_to_branch_and_combine() {
         emit dept = detail.dept
         emit flag = extra.flag
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
@@ -245,7 +245,7 @@ fn aggregate_diamond_delivers_source_to_branch_and_combine() {
         emit dept = detail.dept
         emit n = summary.n
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
@@ -290,14 +290,14 @@ nodes:
     config:
       cxl: |
         emit branch = "sibling"
-  - type: output
+  - type: sink
     name: composed_out
     input: composed
     config:
       name: composed_out
       type: csv
       path: composed.csv
-  - type: output
+  - type: sink
     name: sibling_out
     input: sibling
     config:
@@ -384,14 +384,14 @@ fn two_direct_outputs(first: &str, second: &str) -> String {
     config:
       cxl: |
         emit marker = "ready"
-  - type: output
+  - type: sink
     name: {first}
     input: prepared
     config:
       name: {first}
       type: csv
       path: {first}.csv
-  - type: output
+  - type: sink
     name: {second}
     input: prepared
     config:
@@ -413,7 +413,7 @@ fn direct_outputs(outputs: &[(&str, bool)]) -> String {
                 ""
             };
             format!(
-                r#"  - type: output
+                r#"  - type: sink
     name: {name}
     input: prepared
     config:
@@ -536,7 +536,7 @@ fn output_sort_and_aggregate_share_one_materialized_predecessor() {
     config:
       cxl: |
         emit marker = "ready"
-  - type: output
+  - type: sink
     name: direct
     input: prepared
     config:
@@ -553,7 +553,7 @@ fn output_sort_and_aggregate_share_one_materialized_predecessor() {
       rules:
         - name: keep
           when: "true"
-  - type: output
+  - type: sink
     name: sorted
     input: ordered
     config:
@@ -568,7 +568,7 @@ fn output_sort_and_aggregate_share_one_materialized_predecessor() {
       cxl: |
         emit dept = dept
         emit n = count(*)
-  - type: output
+  - type: sink
     name: summarized
     input: summary
     config:
@@ -603,7 +603,7 @@ fn aggregate_sort_and_output_share_one_predecessor_in_reverse_order() {
       cxl: |
         emit dept = dept
         emit n = count(*)
-  - type: output
+  - type: sink
     name: summarized
     input: summary
     config:
@@ -620,14 +620,14 @@ fn aggregate_sort_and_output_share_one_predecessor_in_reverse_order() {
       rules:
         - name: keep
           when: "true"
-  - type: output
+  - type: sink
     name: sorted
     input: ordered
     config:
       name: sorted
       type: csv
       path: sorted.csv
-  - type: output
+  - type: sink
     name: direct
     input: prepared
     config:
@@ -656,7 +656,7 @@ fn route_to_aggregate_delivers_the_selected_branch() {
       cxl: |
         emit dept = dept
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: summarize
     config:
@@ -692,7 +692,7 @@ fn route_to_reshape_delivers_the_selected_branch() {
           mutate:
             set:
               label: "'reshaped'"
-  - type: output
+  - type: sink
     name: out
     input: relabel
     config:
@@ -730,14 +730,14 @@ fn route_to_cull_delivers_the_selected_branch() {
       rules:
         - name: remove_bad
           drop_group_when: "sum(if status == 'bad' then 1 else 0) > 0"
-  - type: output
+  - type: sink
     name: out
     input: filter_kept
     config:
       name: out
       type: csv
       path: out.csv
-  - type: output
+  - type: sink
     name: filtered
     input: filter_kept.removed
     config:
@@ -775,7 +775,7 @@ fn cull_to_aggregate_delivers_main_and_removed_ports() {
       cxl: |
         emit dept = dept
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: summarize
     config:
@@ -811,7 +811,7 @@ fn cull_to_reshape_delivers_main_and_removed_ports() {
           mutate:
             set:
               label: "'reshaped'"
-  - type: output
+  - type: sink
     name: out
     input: relabel
     config:
@@ -849,14 +849,14 @@ fn a_present_empty_materialized_buffer_remains_a_valid_input() {
       rules:
         - name: remove_bad
           drop_group_when: "sum(if status == 'bad' then 1 else 0) > 0"
-  - type: output
+  - type: sink
     name: out
     input: filter_rows
     config:
       name: out
       type: csv
       path: out.csv
-  - type: output
+  - type: sink
     name: removed
     input: filter_rows.removed
     config:
@@ -882,7 +882,7 @@ fn fused_transform_and_streaming_output_control_still_succeeds() {
     config:
       cxl: |
         emit marker = "ready"
-  - type: output
+  - type: sink
     name: out
     input: prepared
     config:

@@ -35,7 +35,7 @@ nodes:
         emit amount = amount
         emit src_file = $source.file
         emit src_row = $source.row
-  - type: output
+  - type: sink
     name: out
     input: stamp
     config:

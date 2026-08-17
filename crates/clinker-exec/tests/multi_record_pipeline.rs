@@ -80,14 +80,14 @@ nodes:
       conditions:
         big: amount > 150
       default: small
-  - type: output
+  - type: sink
     name: out_big
     input: classify.big
     config:
       name: out_big
       type: csv
       path: big.csv
-  - type: output
+  - type: sink
     name: out_small
     input: classify.small
     config:
@@ -217,7 +217,7 @@ nodes:
         records:
 {first}
 {second}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -254,7 +254,7 @@ nodes:
         records:
 {first}
 {second}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -325,7 +325,7 @@ nodes:
       schema:
         - { name: required_alias, source_name: required_wire, type: int, start: 0, width: 3 }
         - { name: nullable_alias, source_name: nullable_wire, type: { nullable: int }, start: 3, width: 3 }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -370,7 +370,7 @@ nodes:
             columns:
               - { name: required_alias, source_name: required_wire, type: int, start: 1, width: 3 }
               - { name: nullable_alias, source_name: nullable_wire, type: { nullable: int }, start: 4, width: 3 }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -418,7 +418,7 @@ nodes:
               - { name: kind, type: string }
               - { name: required_alias, source_name: required_wire, type: int }
               - { name: nullable_alias, source_name: nullable_wire, type: { nullable: int } }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -453,7 +453,7 @@ nodes:
         mode: drop
       schema:
         - { name: logical, source_name: physical, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -664,7 +664,7 @@ nodes:
       cxl: |
         emit kind = record_type
         emit amount = amount
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:

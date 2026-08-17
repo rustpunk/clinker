@@ -202,7 +202,7 @@ nodes:
           when: on_error
           message: "Customer transform failed"
           fields: [customer_id, secret]
-  - type: output
+  - type: sink
     name: output
     input: observe_customers
     config:

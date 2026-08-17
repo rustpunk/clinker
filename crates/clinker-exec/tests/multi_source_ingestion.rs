@@ -80,7 +80,7 @@ nodes:
   - type: merge
     name: merged
     inputs: [src_a, src_b]
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -183,7 +183,7 @@ nodes:
         emit id = id
         emit tag = tag
         emit origin = $source.name
-  - type: output
+  - type: sink
     name: out
     input: stamp
     config:
@@ -302,7 +302,7 @@ nodes:
         emit id = id
         emit tag = tag
         emit safe_ratio = if($source.name == "src_b") then (1 / 0) else 1
-  - type: output
+  - type: sink
     name: out
     input: tfm
     config:
@@ -402,14 +402,14 @@ nodes:
       cxl: |
         emit id = id
         emit tag = tag
-  - type: output
+  - type: sink
     name: out_a
     input: tfm_a
     config:
       name: out_a
       type: csv
       path: out_a.csv
-  - type: output
+  - type: sink
     name: out_b
     input: tfm_b
     config:
@@ -519,7 +519,7 @@ nodes:
   - type: merge
     name: merged
     inputs: [tfm_a, tfm_b]
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -627,14 +627,14 @@ nodes:
       cxl: |
         emit id = id
         emit tag = tag
-  - type: output
+  - type: sink
     name: out_a
     input: src_a
     config:
       name: out_a
       type: csv
       path: out_a.csv
-  - type: output
+  - type: sink
     name: out_b
     input: stamp_b
     config:
@@ -728,7 +728,7 @@ nodes:
       cxl: |
         emit id = id
         emit origin_file = $source.file
-  - type: output
+  - type: sink
     name: out
     input: stamp_source
     config:
