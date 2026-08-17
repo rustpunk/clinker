@@ -68,7 +68,7 @@ nodes:
         emit event_type = events.event_type
       propagate_ck: all
 
-  - type: output
+  - type: sink
     name: report
     input: enriched
     config:

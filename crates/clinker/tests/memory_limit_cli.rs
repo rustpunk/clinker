@@ -30,7 +30,7 @@ nodes:
       path: in.csv
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

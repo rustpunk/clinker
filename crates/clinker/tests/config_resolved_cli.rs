@@ -32,7 +32,7 @@ nodes:
       schema:
         - { name: order_id, type: string }
         - { name: tags, type: string, multiple: true }   # keep me
-  - type: output
+  - type: sink
     name: tagged
     input: orders
     config:
@@ -83,7 +83,7 @@ nodes:
       schema:
         - { name: order_id, type: string }
         - { name: tags, type: string, multiple: true }
-  - type: output
+  - type: sink
     name: tagged
     input: orders
     config:

@@ -79,7 +79,7 @@ nodes:
       inp: normalize
     config:
       threshold: 0.5
-  - type: output
+  - type: sink
     name: out
     input: scorer
     config:

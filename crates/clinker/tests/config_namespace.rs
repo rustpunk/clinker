@@ -79,7 +79,7 @@ nodes:
       inp: normalize
     config:
       min_amount: 0.0
-  - type: output
+  - type: sink
     name: out
     input: gate
     config:
