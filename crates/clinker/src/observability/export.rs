@@ -1649,12 +1649,32 @@ fn metric_name(key: MetricKey) -> &'static str {
         MetricKey::TransformCompleted => "clinker.transform.completed",
         MetricKey::TransformRecords => "clinker.transform.records",
         MetricKey::TransformErrors => "clinker.transform.errors",
+        MetricKey::CredentialResolveStarted => "clinker.credential.resolve.started",
+        MetricKey::CredentialResolveCompleted => "clinker.credential.resolve.completed",
+        MetricKey::CredentialResolveFailed => "clinker.credential.resolve.failed",
+        MetricKey::CredentialResolveInterrupted => "clinker.credential.resolve.interrupted",
+        MetricKey::ResourceOpenStarted => "clinker.resource.open.started",
+        MetricKey::ResourceOpenCompleted => "clinker.resource.open.completed",
+        MetricKey::ResourceOpenFailed => "clinker.resource.open.failed",
+        MetricKey::ResourceOpenInterrupted => "clinker.resource.open.interrupted",
+        MetricKey::CredentialRenewStarted => "clinker.credential.renew.started",
+        MetricKey::CredentialRenewCompleted => "clinker.credential.renew.completed",
+        MetricKey::CredentialRenewFailed => "clinker.credential.renew.failed",
+        MetricKey::CredentialRenewInterrupted => "clinker.credential.renew.interrupted",
+        MetricKey::CredentialRevokeStarted => "clinker.credential.revoke.started",
+        MetricKey::CredentialRevokeCompleted => "clinker.credential.revoke.completed",
+        MetricKey::CredentialRevokeFailed => "clinker.credential.revoke.failed",
+        MetricKey::CredentialRevokeInterrupted => "clinker.credential.revoke.interrupted",
     }
 }
 
 fn span_name(name: SpanName) -> &'static str {
     match name {
         SpanName::Transform => "clinker.transform",
+        SpanName::CredentialResolve => "clinker.credential.resolve",
+        SpanName::ResourceOpen => "clinker.resource.open",
+        SpanName::CredentialRenew => "clinker.credential.renew",
+        SpanName::CredentialRevoke => "clinker.credential.revoke",
     }
 }
 

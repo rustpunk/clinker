@@ -11,6 +11,9 @@ use std::sync::Arc;
 use clinker_exec::pipeline::memory::{
     ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
+use clinker_exec::telemetry::{
+    MetricKey, SpanFact, SpanName, SpanStatus, TelemetryProducer, unix_nanos_now,
+};
 use clinker_plan::credentials::{
     CredentialCapability, CredentialHandleUnits, CredentialLifetime, CredentialProviderKind,
     CredentialRenewal, CredentialRequirement, CredentialRequirementName, CredentialRevocation,
@@ -68,6 +71,60 @@ pub const DEFAULT_MAX_CREDENTIAL_PROVIDERS: usize = 256;
 pub const DEFAULT_MAX_CREDENTIAL_DEFINITION_BYTES: usize = 1_048_576;
 /// Default maximum number of simultaneously live credential handles.
 pub const DEFAULT_MAX_LIVE_CREDENTIAL_HANDLES: usize = 256;
+
+const CREDENTIAL_LIFECYCLE_SCOPE: &str = "credential-lifecycle";
+
+#[derive(Clone, Copy)]
+struct OperationSignals {
+    started: MetricKey,
+    completed: MetricKey,
+    failed: MetricKey,
+    span: SpanName,
+}
+
+const RESOLVE_SIGNALS: OperationSignals = OperationSignals {
+    started: MetricKey::CredentialResolveStarted,
+    completed: MetricKey::CredentialResolveCompleted,
+    failed: MetricKey::CredentialResolveFailed,
+    span: SpanName::CredentialResolve,
+};
+
+const REVOKE_SIGNALS: OperationSignals = OperationSignals {
+    started: MetricKey::CredentialRevokeStarted,
+    completed: MetricKey::CredentialRevokeCompleted,
+    failed: MetricKey::CredentialRevokeFailed,
+    span: SpanName::CredentialRevoke,
+};
+
+fn observe_operation<T, E>(
+    producer: Option<&TelemetryProducer>,
+    signals: OperationSignals,
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let Some(producer) = producer else {
+        return operation();
+    };
+
+    let started_at_unix_nanos = unix_nanos_now();
+    producer.record_metric(signals.started, 1);
+    let result = operation();
+    let status = if result.is_ok() {
+        producer.record_metric(signals.completed, 1);
+        SpanStatus::Ok
+    } else {
+        producer.record_metric(signals.failed, 1);
+        SpanStatus::Error
+    };
+    let ended_at_unix_nanos = unix_nanos_now().max(started_at_unix_nanos);
+    let _ = producer.emit_span(SpanFact {
+        name: signals.span,
+        status,
+        logical_node: CREDENTIAL_LIFECYCLE_SCOPE,
+        started_at_unix_nanos,
+        ended_at_unix_nanos,
+    });
+    result
+}
 
 /// Fixed admission limits for profile definitions and live handles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -456,6 +513,7 @@ pub struct LeasedCredentialHandle<'run> {
     retained_bytes: u64,
     lease: Box<dyn CredentialLease>,
     revoked: bool,
+    telemetry: Option<TelemetryProducer>,
     _run: PhantomData<&'run CredentialProfile<'run>>,
 }
 
@@ -483,7 +541,9 @@ impl LeasedCredentialHandle<'_> {
         if self.revoked {
             return Ok(());
         }
-        let result = self.lease.revoke();
+        let result = observe_operation(self.telemetry.as_ref(), REVOKE_SIGNALS, || {
+            self.lease.revoke()
+        });
         self.revoked = true;
         result
     }
@@ -606,15 +666,38 @@ pub fn resolve_explicit_profile<'run>(
     catalog: &CredentialProfileCatalog<'run>,
     requirement: &CredentialRequirement,
 ) -> Result<LeasedCredentialHandle<'run>, CredentialResolutionError> {
+    resolve_explicit_profile_inner(selected, catalog, requirement, None)
+}
+
+/// Resolve one supplied requirement and emit lifecycle signals when configured.
+///
+/// The emitted vocabulary is closed and carries no profile name, provider
+/// kind, logical requirement, lease payload, or record value. Signal admission
+/// is optional: a dropped completed span cannot change the returned handle or
+/// error, and revocation remains owned by the handle.
+pub fn resolve_explicit_profile_with_telemetry<'run>(
+    selected: &CredentialProfileName,
+    catalog: &CredentialProfileCatalog<'run>,
+    requirement: &CredentialRequirement,
+    producer: &TelemetryProducer,
+) -> Result<LeasedCredentialHandle<'run>, CredentialResolutionError> {
+    resolve_explicit_profile_inner(selected, catalog, requirement, Some(producer))
+}
+
+fn resolve_explicit_profile_inner<'run>(
+    selected: &CredentialProfileName,
+    catalog: &CredentialProfileCatalog<'run>,
+    requirement: &CredentialRequirement,
+    producer: Option<&TelemetryProducer>,
+) -> Result<LeasedCredentialHandle<'run>, CredentialResolutionError> {
     let provider = compatible_provider(selected, catalog, requirement)?;
     let declared_lease_bytes = provider
         .lease_retained_bytes(requirement)
         .map_err(resolution_provider_error)?;
-    let mut lease = provider
-        .resolve(requirement)
+    let mut lease = observe_operation(producer, RESOLVE_SIGNALS, || provider.resolve(requirement))
         .map_err(resolution_provider_error)?;
     if lease.retained_bytes() != declared_lease_bytes {
-        let _ = lease.revoke();
+        let _ = observe_operation(producer, REVOKE_SIGNALS, || lease.revoke());
         return Err(CredentialResolutionError::new(
             CredentialResolutionErrorKind::RetainedBytesMismatch,
         ));
@@ -629,6 +712,7 @@ pub fn resolve_explicit_profile<'run>(
         retained_bytes,
         lease,
         revoked: false,
+        telemetry: producer.cloned(),
         _run: PhantomData,
     })
 }
@@ -784,6 +868,7 @@ where
     consumer_id: Option<ConsumerId>,
     handles: Vec<LeasedCredentialHandle<'run>>,
     retained_bytes: u64,
+    telemetry: Option<TelemetryProducer>,
 }
 
 impl<'catalog, 'run> CredentialHandleRegistry<'catalog, 'run>
@@ -804,6 +889,33 @@ where
     pub fn new(
         arbitrator: &'catalog MemoryArbitrator,
         catalog: &'catalog CredentialProfileCatalog<'run>,
+    ) -> Result<Self, CredentialRegistryError> {
+        Self::new_inner(arbitrator, catalog, None)
+    }
+
+    /// Create a registry whose actual resolve and revoke calls emit lifecycle
+    /// signals through the supplied fixed arena.
+    ///
+    /// Signal admission is behavior-neutral. The producer is a fixed set of
+    /// shared handles, and each preallocated credential slot already includes
+    /// the size of its optional producer clone in registered table bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialRegistryErrorKind::AllocationFailed`] under the
+    /// same fixed-table conditions as [`Self::new`].
+    pub fn new_with_telemetry(
+        arbitrator: &'catalog MemoryArbitrator,
+        catalog: &'catalog CredentialProfileCatalog<'run>,
+        producer: TelemetryProducer,
+    ) -> Result<Self, CredentialRegistryError> {
+        Self::new_inner(arbitrator, catalog, Some(producer))
+    }
+
+    fn new_inner(
+        arbitrator: &'catalog MemoryArbitrator,
+        catalog: &'catalog CredentialProfileCatalog<'run>,
+        telemetry: Option<TelemetryProducer>,
     ) -> Result<Self, CredentialRegistryError> {
         let mut handles = Vec::new();
         handles
@@ -830,6 +942,7 @@ where
             consumer_id: Some(consumer_id),
             handles,
             retained_bytes: table_bytes,
+            telemetry,
         })
     }
 
@@ -883,7 +996,9 @@ where
             return Err(self.fail_and_close(CredentialRegistryErrorKind::MemoryLimitExceeded));
         }
 
-        let mut lease = match provider.resolve(requirement) {
+        let mut lease = match observe_operation(self.telemetry.as_ref(), RESOLVE_SIGNALS, || {
+            provider.resolve(requirement)
+        }) {
             Ok(lease) => lease,
             Err(failure) => {
                 self.memory_handle.set_bytes(self.retained_bytes);
@@ -893,7 +1008,7 @@ where
             }
         };
         if lease.retained_bytes() != lease_bytes {
-            let _ = lease.revoke();
+            let _ = observe_operation(self.telemetry.as_ref(), REVOKE_SIGNALS, || lease.revoke());
             self.memory_handle.set_bytes(self.retained_bytes);
             return Err(self.fail_and_close(CredentialRegistryErrorKind::RetainedBytesMismatch));
         }
@@ -905,6 +1020,7 @@ where
             retained_bytes: dynamic_bytes,
             lease,
             revoked: false,
+            telemetry: self.telemetry.clone(),
             _run: PhantomData,
         });
         self.retained_bytes = prospective_bytes;

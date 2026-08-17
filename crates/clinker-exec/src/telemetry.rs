@@ -120,23 +120,74 @@ pub enum MetricKey {
     TransformCompleted,
     TransformRecords,
     TransformErrors,
+    CredentialResolveStarted,
+    CredentialResolveCompleted,
+    CredentialResolveFailed,
+    CredentialResolveInterrupted,
+    ResourceOpenStarted,
+    ResourceOpenCompleted,
+    ResourceOpenFailed,
+    ResourceOpenInterrupted,
+    CredentialRenewStarted,
+    CredentialRenewCompleted,
+    CredentialRenewFailed,
+    CredentialRenewInterrupted,
+    CredentialRevokeStarted,
+    CredentialRevokeCompleted,
+    CredentialRevokeFailed,
+    CredentialRevokeInterrupted,
 }
 
 impl MetricKey {
-    const ALL: [Self; 4] = [
+    /// Every fixed metric key in stable counter-index order.
+    pub const ALL: [Self; 20] = [
         Self::TransformStarted,
         Self::TransformCompleted,
         Self::TransformRecords,
         Self::TransformErrors,
+        Self::CredentialResolveStarted,
+        Self::CredentialResolveCompleted,
+        Self::CredentialResolveFailed,
+        Self::CredentialResolveInterrupted,
+        Self::ResourceOpenStarted,
+        Self::ResourceOpenCompleted,
+        Self::ResourceOpenFailed,
+        Self::ResourceOpenInterrupted,
+        Self::CredentialRenewStarted,
+        Self::CredentialRenewCompleted,
+        Self::CredentialRenewFailed,
+        Self::CredentialRenewInterrupted,
+        Self::CredentialRevokeStarted,
+        Self::CredentialRevokeCompleted,
+        Self::CredentialRevokeFailed,
+        Self::CredentialRevokeInterrupted,
     ];
-    const COUNT: usize = Self::ALL.len();
+    /// Number of entries in [`Self::ALL`].
+    pub const COUNT: usize = Self::ALL.len();
 
-    const fn index(self) -> usize {
+    /// Stable position of this key in the fixed counter array.
+    pub const fn index(self) -> usize {
         match self {
             Self::TransformStarted => 0,
             Self::TransformCompleted => 1,
             Self::TransformRecords => 2,
             Self::TransformErrors => 3,
+            Self::CredentialResolveStarted => 4,
+            Self::CredentialResolveCompleted => 5,
+            Self::CredentialResolveFailed => 6,
+            Self::CredentialResolveInterrupted => 7,
+            Self::ResourceOpenStarted => 8,
+            Self::ResourceOpenCompleted => 9,
+            Self::ResourceOpenFailed => 10,
+            Self::ResourceOpenInterrupted => 11,
+            Self::CredentialRenewStarted => 12,
+            Self::CredentialRenewCompleted => 13,
+            Self::CredentialRenewFailed => 14,
+            Self::CredentialRenewInterrupted => 15,
+            Self::CredentialRevokeStarted => 16,
+            Self::CredentialRevokeCompleted => 17,
+            Self::CredentialRevokeFailed => 18,
+            Self::CredentialRevokeInterrupted => 19,
         }
     }
 }
@@ -146,6 +197,10 @@ impl MetricKey {
 #[serde(rename_all = "snake_case")]
 pub enum SpanName {
     Transform,
+    CredentialResolve,
+    ResourceOpen,
+    CredentialRenew,
+    CredentialRevoke,
 }
 
 /// Bounded span result fact.
