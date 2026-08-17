@@ -52,7 +52,10 @@ use clinker_record::{FieldMetadata, Record, Schema, SchemaBuilder, Value, coerci
 use cxl::typecheck::Type;
 use indexmap::IndexMap;
 
-use clinker_format::{Column, RECORD_TYPE_COLUMN, RecordType};
+use clinker_format::{
+    Column, NumericObservation, NumericObserver, RECORD_TYPE_COLUMN, RecordType,
+    observe_schema_numeric,
+};
 use clinker_plan::config::pipeline_node::{OnUnmapped, WIDENED_SIDECAR_COLUMN};
 
 /// Exhaustive admission policy for one output-schema slot.
@@ -231,6 +234,9 @@ pub struct CoercingReader {
     policy: OnUnmapped,
     /// Source identifier for diagnostics.
     source_name: Box<str>,
+    /// Optional authoring-only sink for the canonical string-to-schema numeric
+    /// boundary. It is invoked synchronously per scalar and retains no records.
+    numeric_observer: Option<NumericObserver>,
 }
 
 impl CoercingReader {
@@ -251,7 +257,36 @@ impl CoercingReader {
         source_name: &str,
         pretyped: bool,
     ) -> Result<Self, FormatError> {
-        Self::new_inner(inner, schema_decl, policy, source_name, pretyped, None)
+        Self::new_inner(
+            inner,
+            schema_decl,
+            policy,
+            source_name,
+            pretyped,
+            None,
+            None,
+        )
+    }
+
+    /// Build a coercing reader that streams numeric parser observations to an
+    /// authoring-only observer.
+    pub fn new_observing(
+        inner: Box<dyn FormatReader>,
+        schema_decl: &[Column],
+        policy: OnUnmapped,
+        source_name: &str,
+        pretyped: bool,
+        observer: NumericObserver,
+    ) -> Result<Self, FormatError> {
+        Self::new_inner(
+            inner,
+            schema_decl,
+            policy,
+            source_name,
+            pretyped,
+            None,
+            Some(observer),
+        )
     }
 
     /// Build a coercing reader for a discriminator-driven positional source.
@@ -271,6 +306,7 @@ impl CoercingReader {
             source_name,
             true,
             Some(MultiRecordProofs::new(record_types)?),
+            None,
         )
     }
 
@@ -281,6 +317,7 @@ impl CoercingReader {
         source_name: &str,
         pretyped: bool,
         multi_record_proofs: Option<MultiRecordProofs>,
+        numeric_observer: Option<NumericObserver>,
     ) -> Result<Self, FormatError> {
         // Trigger schema discovery on the inner reader so the first
         // record isn't gated behind an on-demand schema call.
@@ -405,6 +442,7 @@ impl CoercingReader {
             widened_idx,
             policy,
             source_name: source_name.into(),
+            numeric_observer,
         })
     }
 
@@ -517,6 +555,15 @@ impl CoercingReader {
                         &self.declared_types[i],
                     ),
                 };
+            let rules = DeclaredValueRules {
+                format,
+                precision,
+                scale,
+                nullable,
+                empty_is_null,
+                field: cols[i].as_ref(),
+                numeric_observer: self.numeric_observer.as_ref(),
+            };
             let conversion = if self.multiple[i] {
                 // A `multiple:` column's declared type describes each ELEMENT,
                 // so the same scalar admission rule applies element-wise. A
@@ -527,16 +574,8 @@ impl CoercingReader {
                         .iter()
                         .enumerate()
                         .map(|(index, item)| {
-                            validate_declared_value(
-                                item,
-                                target,
-                                format,
-                                precision,
-                                scale,
-                                nullable,
-                                empty_is_null,
-                            )
-                            .map_err(|message| format!("element {}: {message}", index + 1))
+                            validate_declared_value(item, target, &rules)
+                                .map_err(|message| format!("element {}: {message}", index + 1))
                         })
                         .collect::<Result<Vec<_>, _>>()
                         .map(Value::Array),
@@ -551,36 +590,12 @@ impl CoercingReader {
                     // cannot put a scalar in a slot the planner typed as an
                     // array and have every downstream array expression read it
                     // as the wrong shape.
-                    Value::Null => validate_declared_value(
-                        &raw,
-                        target,
-                        format,
-                        precision,
-                        scale,
-                        nullable,
-                        empty_is_null,
-                    ),
-                    scalar => validate_declared_value(
-                        scalar,
-                        target,
-                        format,
-                        precision,
-                        scale,
-                        nullable,
-                        empty_is_null,
-                    )
-                    .map(|value| Value::Array(vec![value])),
+                    Value::Null => validate_declared_value(&raw, target, &rules),
+                    scalar => validate_declared_value(scalar, target, &rules)
+                        .map(|value| Value::Array(vec![value])),
                 }
             } else {
-                validate_declared_value(
-                    &raw,
-                    target,
-                    format,
-                    precision,
-                    scale,
-                    nullable,
-                    empty_is_null,
-                )
+                validate_declared_value(&raw, target, &rules)
             };
             let coerced = match conversion {
                 Ok(value) => value,
@@ -691,6 +706,16 @@ fn declared_type_target(ty: &Type, pretyped: bool) -> DeclaredTypeTarget {
     }
 }
 
+struct DeclaredValueRules<'a> {
+    format: Option<&'a str>,
+    precision: Option<u8>,
+    scale: Option<u8>,
+    nullable: bool,
+    empty_is_null: bool,
+    field: &'a str,
+    numeric_observer: Option<&'a NumericObserver>,
+}
+
 /// Admit a decoded scalar according to its explicit declared-type target.
 ///
 /// This function is shared by ordinary scalar columns and every element of a
@@ -699,14 +724,20 @@ fn declared_type_target(ty: &Type, pretyped: bool) -> DeclaredTypeTarget {
 fn validate_declared_value(
     value: &Value,
     target: &DeclaredTypeTarget,
-    format: Option<&str>,
-    precision: Option<u8>,
-    scale: Option<u8>,
-    nullable: bool,
-    empty_is_null: bool,
+    rules: &DeclaredValueRules<'_>,
 ) -> Result<Value, String> {
-    if empty_is_null && matches!(value, Value::String(text) if text.is_empty()) {
+    if rules.empty_is_null && matches!(value, Value::String(text) if text.is_empty()) {
+        if matches!(target, DeclaredTypeTarget::Coerce(Type::Numeric))
+            && let Some(observer) = rules.numeric_observer
+        {
+            observer.observe(rules.field, observe_schema_numeric(&Value::Null));
+        }
         return Ok(Value::Null);
+    }
+    if matches!(target, DeclaredTypeTarget::Coerce(Type::Numeric))
+        && let Some(observer) = rules.numeric_observer
+    {
+        observer.observe(rules.field, observe_schema_numeric(value));
     }
 
     if matches!(value, Value::Null) {
@@ -717,7 +748,7 @@ fn validate_declared_value(
             }
             | DeclaredTypeTarget::AcceptAny
             | DeclaredTypeTarget::EngineManaged => Ok(Value::Null),
-            _ if nullable => Ok(Value::Null),
+            _ if rules.nullable => Ok(Value::Null),
             DeclaredTypeTarget::Coerce(declared)
             | DeclaredTypeTarget::ValidateExact(declared)
             | DeclaredTypeTarget::ReaderProven { declared, .. } => {
@@ -728,7 +759,7 @@ fn validate_declared_value(
 
     match target {
         DeclaredTypeTarget::Coerce(declared) => {
-            coerce_value(value, declared, format, precision, scale)
+            coerce_value(value, declared, rules.format, rules.precision, rules.scale)
         }
         DeclaredTypeTarget::ValidateExact(declared) => {
             if native_value_matches(value, declared) {
@@ -741,7 +772,7 @@ fn validate_declared_value(
             }
         }
         DeclaredTypeTarget::ReaderProven { declared, .. } => {
-            validate_reader_proof(value, declared, precision, scale)
+            validate_reader_proof(value, declared, rules.precision, rules.scale)
         }
         DeclaredTypeTarget::AcceptAny | DeclaredTypeTarget::EngineManaged => Ok(value.clone()),
     }
@@ -831,6 +862,59 @@ fn native_value_name(value: &Value) -> &'static str {
     }
 }
 
+/// Runtime numeric-union coercion paired with the parser-owned observation
+/// used by schema guessing.
+#[derive(Debug)]
+#[must_use]
+pub struct ObservedSchemaNumeric {
+    result: Result<Value, String>,
+    observation: NumericObservation,
+}
+
+impl ObservedSchemaNumeric {
+    pub fn result(&self) -> Result<&Value, &str> {
+        self.result.as_ref().map_err(String::as_str)
+    }
+
+    pub fn observation(&self) -> &NumericObservation {
+        &self.observation
+    }
+
+    pub fn into_result(self) -> Result<Value, String> {
+        self.result
+    }
+}
+
+/// Coerce one decoded value through the runtime `numeric` boundary and return
+/// the exact observation from that same parse.
+pub fn coerce_numeric_with_observation(value: &Value) -> ObservedSchemaNumeric {
+    let observation = observe_schema_numeric(value);
+    let result = match value {
+        Value::Null => Ok(Value::Null),
+        Value::Integer(_) => Ok(value.clone()),
+        Value::Float(number) if number.is_finite() => Ok(value.clone()),
+        Value::Float(_) => Err("non-finite float is outside the declared type".into()),
+        Value::Bool(value) => Ok(Value::Integer(i64::from(*value))),
+        Value::String(_) => match observation.parser_outcome() {
+            clinker_format::NumericParserOutcome::Integer(number) => Ok(Value::Integer(*number)),
+            clinker_format::NumericParserOutcome::Float(number) => Ok(Value::Float(*number)),
+            clinker_format::NumericParserOutcome::Rejected(
+                clinker_format::NumericIssue::NonFinite,
+            ) => Err("non-finite float is outside the declared type".into()),
+            clinker_format::NumericParserOutcome::NoValue
+            | clinker_format::NumericParserOutcome::NonNumeric
+            | clinker_format::NumericParserOutcome::Rejected(_) => {
+                Err("value cannot be parsed as Float".into())
+            }
+        },
+        other => Err(format!("cannot coerce {} to Float", other.type_name())),
+    };
+    ObservedSchemaNumeric {
+        result,
+        observation,
+    }
+}
+
 /// Coerce a value transactionally to its declared type.
 ///
 /// `format` is the column's `format:` strftime string, honored for `date` /
@@ -887,26 +971,7 @@ fn coerce_value(
         Type::Bool => coercion::coerce_to_bool(value),
         Type::Date => coercion::coerce_to_date(value, &chain),
         Type::DateTime => coercion::coerce_to_datetime(value, &chain),
-        Type::Numeric => {
-            let converted = match value {
-                Value::Integer(_) => return Ok(value.clone()),
-                Value::Float(number) if number.is_finite() => return Ok(value.clone()),
-                Value::Float(_) => {
-                    return Err("non-finite float is outside the declared type".into());
-                }
-                // Textual numeric input prefers an exact integer parse, then a
-                // finite float. Native floats never take the integer branch
-                // above, so a fractional value cannot be truncated merely
-                // because the union also admits integers.
-                _ => coercion::coerce_to_int(value)
-                    .or_else(|_| coercion::coerce_to_float(value))
-                    .map_err(coercion_failure_reason)?,
-            };
-            if matches!(converted, Value::Float(number) if !number.is_finite()) {
-                return Err("non-finite float is outside the declared type".into());
-            }
-            return Ok(converted);
-        }
+        Type::Numeric => return coerce_numeric_with_observation(value).into_result(),
         _ => return Err(format!("unsupported declared coercion target {target}")),
     };
     converted.map_err(coercion_failure_reason)

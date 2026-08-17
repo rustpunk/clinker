@@ -36,6 +36,7 @@ use crate::bom::SkipBom;
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, coerce_section_fields};
 use crate::error::FormatError;
 use crate::fixed_width::field::{self, ResolvedField};
+use crate::numeric_observation::NumericObserver;
 use crate::schema::{Column, Discriminator, RecordType, StructureConstraint};
 use crate::traits::FormatReader;
 
@@ -182,6 +183,9 @@ pub struct MultiRecordReader<R: Read> {
     /// `true` once the trailer of a constrained type has streamed; a body row
     /// after it is a structural error (content past the document's trailer).
     trailer_seen: bool,
+    /// Optional authoring-only sink for numeric observations produced by the
+    /// canonical positional coercion of each active record-type field.
+    numeric_observer: Option<NumericObserver>,
     done: bool,
 }
 
@@ -345,8 +349,17 @@ impl<R: Read> MultiRecordReader<R> {
             pending_line: None,
             last_trailer: None,
             trailer_seen: false,
+            numeric_observer: None,
             done: false,
         })
+    }
+
+    /// Stream parser-owned numeric observations while preserving ordinary
+    /// reader output and error behavior.
+    #[must_use]
+    pub fn with_numeric_observer(mut self, observer: NumericObserver) -> Self {
+        self.numeric_observer = Some(observer);
+        self
     }
 
     /// Read one non-blank physical line from the scanner, or `None` at end of
@@ -438,7 +451,13 @@ impl<R: Read> MultiRecordReader<R> {
         let mut values: Vec<Value> = vec![Value::Null; self.schema.column_count()];
         values[0] = Value::String(rt.id.as_ref().into());
         for tf in &rt.fields {
-            values[tf.column] = extract_field_value(tf, line, self.physical_row)?;
+            values[tf.column] = extract_field_value(
+                rt.id.as_ref(),
+                tf,
+                line,
+                self.physical_row,
+                self.numeric_observer.as_ref(),
+            )?;
         }
         Ok(Record::new(Arc::clone(&self.schema), values))
     }
@@ -474,6 +493,7 @@ impl<R: Read> MultiRecordReader<R> {
                 .by_tag
                 .get(&tag)
                 .expect("header tag resolved to a record type at construction");
+            observe_numeric_fields(rt, &line, self.physical_row, self.numeric_observer.as_ref())?;
             let pairs = collect_named_pairs(rt, &line, self.physical_row)?;
             self.captured_headers.insert(tag, pairs);
         }
@@ -502,11 +522,23 @@ impl<R: Read> MultiRecordReader<R> {
             };
             let id = Arc::clone(&rt.id);
             if self.header_ids.iter().any(|h| Arc::ptr_eq(h, &id)) {
+                observe_numeric_fields(
+                    rt,
+                    &line,
+                    self.physical_row,
+                    self.numeric_observer.as_ref(),
+                )?;
                 // A header type's row outside the contiguous head region: the
                 // pre-scan already captured the first occurrence.
                 continue;
             }
             if self.trailer_ids.iter().any(|t| Arc::ptr_eq(t, &id)) {
+                observe_numeric_fields(
+                    rt,
+                    &line,
+                    self.physical_row,
+                    self.numeric_observer.as_ref(),
+                )?;
                 let raw = collect_named_pairs(rt, &line, self.physical_row)?;
                 self.last_trailer = Some((id, raw.into_iter().collect()));
                 self.trailer_seen = true;
@@ -891,7 +923,13 @@ fn require_tag(tag: &str, id: &str) -> Result<String, String> {
 
 /// Extract one field's typed value from a scanned line: pull the raw text
 /// (shared with pair collection), then coerce to the declared type.
-fn extract_field_value(tf: &TypeField, line: &ScannedLine, row: u64) -> Result<Value, FormatError> {
+fn extract_field_value(
+    record: &str,
+    tf: &TypeField,
+    line: &ScannedLine,
+    row: u64,
+    numeric_observer: Option<&NumericObserver>,
+) -> Result<Value, FormatError> {
     let raw = field_raw_text(tf, line, row)?;
     if raw.is_empty() {
         if tf.ty.is_nullable() || matches!(tf.ty.unwrap_nullable(), Type::Null) {
@@ -902,17 +940,59 @@ fn extract_field_value(tf: &TypeField, line: &ScannedLine, row: u64) -> Result<V
             message: format!("field '{}': null is not a valid {}", tf.name, tf.ty),
         });
     }
-    field::coerce_scalar_with_constraints(
+    let observed = field::coerce_scalar_with_constraints_observed(
         &tf.ty,
         tf.format.as_deref(),
         tf.precision,
         tf.scale,
         &raw,
-    )
-    .map_err(|m| FormatError::InvalidRecord {
-        row,
-        message: format!("field '{}': {m}", tf.name),
-    })
+    );
+    if let Some(observation) = observed.numeric_observation()
+        && let Some(observer) = numeric_observer
+    {
+        observer.observe_record_field(record, &tf.name, observation.clone());
+    }
+    observed
+        .into_result()
+        .map_err(|m| FormatError::InvalidRecord {
+            row,
+            message: format!("field '{}': {m}", tf.name),
+        })
+}
+
+/// Observe numeric fields on a header/trailer row that is structurally
+/// consumed rather than emitted as a body record. The ordinary reader does not
+/// coerce those fields into record values, so parser rejection remains report
+/// evidence and does not change runtime success/failure behavior.
+fn observe_numeric_fields(
+    rt: &ResolvedType,
+    line: &ScannedLine,
+    row: u64,
+    numeric_observer: Option<&NumericObserver>,
+) -> Result<(), FormatError> {
+    let Some(observer) = numeric_observer else {
+        return Ok(());
+    };
+    for tf in &rt.fields {
+        if !matches!(tf.ty.unwrap_nullable(), Type::Numeric) {
+            continue;
+        }
+        let raw = field_raw_text(tf, line, row)?;
+        if raw.is_empty() {
+            continue;
+        }
+        let observed = field::coerce_scalar_with_constraints_observed(
+            &tf.ty,
+            tf.format.as_deref(),
+            tf.precision,
+            tf.scale,
+            &raw,
+        );
+        if let Some(observation) = observed.numeric_observation() {
+            observer.observe_record_field(rt.id.as_ref(), &tf.name, observation.clone());
+        }
+    }
+    Ok(())
 }
 
 /// A field's raw (un-coerced) text from a scanned line, stripped of padding

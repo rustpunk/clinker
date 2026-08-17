@@ -113,6 +113,114 @@ with a new execution ID for every retry.
 
 ---
 
+## clinker guess
+
+Preview, exhaustively check, or safely write concrete `int` or `float`
+replacements for inference-only `numeric` columns.
+
+```text
+clinker guess [OPTIONS] <CONFIG>
+```
+
+With no selector, `guess` reads the base pipeline. `--channel <ID>` selects one
+cataloged channel plus its target-admitted derived groups; `--group <NAME>`
+selects one explicit, target-admitted group without a channel. The two
+selectors conflict. A missing or ambiguous selector is an error rather than a
+fallback to the base pipeline, so the report always describes exactly one
+effective configuration.
+
+| Flag | Description |
+|------|-------------|
+| `<CONFIG>` | Pipeline YAML containing the source-schema `numeric` leaves to inspect. |
+| `--channel <ID>` | Select one cataloged channel and its derived, target-admitted groups. |
+| `--group <NAME>` | Select one explicit, target-admitted group without a channel. |
+| `--field <NODE.COLUMN>` | Narrow the preview to one `numeric` source field. Repeatable; repeated selectors are deduplicated in request order. In a multi-record schema, one selector covers every same-named literal `numeric` owner across `records:` while leaving same-named concrete declarations unchanged. Unknown, malformed, or entirely concrete fields are rejected. |
+| `--check` | Exhaust the frozen, capped manifest and exit `3` if any selected owner remains unresolved. |
+| `--write` | Exhaust evidence and edit exactly one inline, literal, single-owner `numeric` leaf after guarded compare-and-swap revalidation. Mutually exclusive with `--check`. |
+| `--base-dir <DIR>` | Workspace root holding `clinker.toml` and the channel/group roots. Defaults to the pipeline file's directory. |
+
+The command constructs readers through the same CSV, JSON, and XML option and
+schema-coercion path as runtime ingest. It emits one deterministic JSON document
+containing the selected configuration, bounded coverage, parser-owned numeric
+evidence, unresolved reasons, proposed types, and an exact semantic YAML patch.
+Preview and check never edit. Write reports `written` only after guarded
+publication completes; otherwise it reports `not_written` and leaves the patch
+for manual application. It never edits an overlay.
+
+Each field report carries an `owners` array. Every owner has its own evidence,
+votes, proposed type, unresolved reasons, and exact address. A single-record
+field has one canonical `/v1/schema/sources/.../columns/...` owner.
+Multi-record owners use
+`/v1/schema/sources/.../records/.../columns/...`, in authored record order, so
+same-named leaves never collapse into a fake single-record address or share a
+proposal derived from another record type.
+
+Discovery freezes the complete deterministic manifest up to 4,096 files and
+reports its fixed-size path/order/size identity without listing every path.
+Preview admits at most four files and 8 MiB of discovered file sizes globally,
+round-robin across sources while preserving each source's stable prefix. Every
+selected reader enforces its discovered length and fails if the file is opened
+at another size, truncates, or grows; it never hands a format reader bytes past
+the admitted boundary. Preview then reads at most 1,024 records globally.
+Coverage retains at most four file details per source and reports sampled,
+truncated, uncovered, and unreported aggregate counts for the rest. Multi-pass
+formats can report physical `bytes_read` above the admitted input size because
+each pass is counted. `--check` reads every file and record in that same frozen
+manifest instead of applying the preview budgets.
+
+Candidate storage is capped at 100,000 source-schema leaves, matching the
+canonical YAML parser's 100,000-node limit; each YAML document is also capped
+at 32 MiB. Each parser-owned `NumericObservation` retains at most 128 numeric
+lexeme bytes, and each exact schema owner retains at most eight evidence items.
+These limits appear in the JSON report. Candidate, observation, evidence,
+coverage, and write-snapshot collections are fixed-bounded independently of
+input size. Write retains one fixed-size digest per file in the 4,096-file
+manifest and hashes through a fixed 1 MiB buffer; it does not register a
+runtime memory consumer.
+
+Write is eligible only for one resolved owner in the base pipeline whose exact
+authored bytes and direct YAML provenance identify a literal inline `numeric`
+leaf. It preserves all sibling bytes and proves by canonical reparse that only
+that type leaf changed in the resolved staged configuration. Overlays,
+external/generated or synthetic ownership, aliases, interpolation, symlinks,
+non-local inputs, multiple owners, unresolved evidence, and input/config drift
+are patch-only outcomes.
+
+The CLI holds an advisory `fs4` lock on the stable sibling
+`<CONFIG>.clinker-guess.lock` file through sibling-temp flush/fsync, final
+byte/semantic/input revalidation, atomic rename, and directory fsync. The lock
+file remains beside the config so every cooperating replacement locks the same
+inode. It must remain a regular non-symlink file and is owner-only on Unix. This
+is a fail-closed compare-and-swap for cooperating writers using the same lock,
+not a kernel-enforced conditional rename against a writer that ignores advisory
+locking; such a writer can race after the final comparison.
+
+Exit `0` means a complete preview was written, including an unresolved preview,
+an exhaustive check resolved every owner, or one safe write was published.
+Selection, configuration, and field errors exit `1`; unresolved checks and
+patch-only/no-edit writes exit `3`; source discovery, input I/O, reader,
+publication, signal-handler, and stdout failures exit `4`; interruption exits
+`130` before any report is emitted or before publication begins.
+
+```bash
+# Preview every inference-only numeric leaf in the base pipeline
+clinker guess pipeline.yaml
+
+# Preview one field under a cataloged channel
+clinker guess pipeline.yaml --channel acme --field orders.amount
+
+# Preview one explicit group without a channel
+clinker guess pipeline.yaml --group enterprise
+
+# Exhaust the frozen manifest and make unresolved owners fail the command
+clinker guess pipeline.yaml --check
+
+# Exhaust evidence and edit one safe directly-authored owner
+clinker guess pipeline.yaml --field orders.amount --write
+```
+
+---
+
 ## clinker explain
 
 Inspect one compiled field's provenance or discover registry-owned diagnostic

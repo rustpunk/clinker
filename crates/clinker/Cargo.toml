@@ -47,6 +47,8 @@ tracing-subscriber = { workspace = true }
 uuid = { version = "1", features = ["v7"] }
 miette = { workspace = true }
 tempfile = { workspace = true }
+# CLI-owned advisory locking for compare-and-swap configuration writes.
+fs4 = { workspace = true }
 
 [dev-dependencies]
 clinker-exec = { workspace = true, features = ["test-utils"] }

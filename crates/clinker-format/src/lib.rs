@@ -12,6 +12,7 @@ pub mod hl7;
 pub mod json;
 pub mod multi_record;
 pub mod multi_value;
+pub mod numeric_observation;
 pub mod record_path;
 pub mod schema;
 pub(crate) mod segment_tokenizer;
@@ -33,6 +34,12 @@ pub use envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
 pub use error::FormatError;
 pub use multi_value::{
     JoinValues, OnConflict, SplitToRows, SplitToRowsMode, SplitValues, under_field_path,
+};
+pub use numeric_observation::{
+    NumericAcceptance, NumericBoundary, NumericIssue, NumericLexeme, NumericObservation,
+    NumericObservationScope, NumericObserver, NumericParserOutcome, NumericVote,
+    observe_json_number, observe_json_value, observe_positional_numeric, observe_schema_numeric,
+    observe_xml_scalar,
 };
 pub use record_path::{RecordPath, RecordPathError, RecordPathSyntax};
 pub use schema::{

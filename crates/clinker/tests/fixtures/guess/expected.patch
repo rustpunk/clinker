@@ -1,0 +1,7 @@
+edits:
+  - address: /v1/schema/sources/csv_orders/records/detail/columns/amount/attributes/type
+    from: numeric
+    to: int
+  - address: /v1/schema/sources/csv_orders/records/adjustment/columns/amount/attributes/type
+    from: nullable(numeric)
+    to: nullable(float)

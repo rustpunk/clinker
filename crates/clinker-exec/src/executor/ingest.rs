@@ -16,7 +16,7 @@ use clinker_format::swift::reader::{SwiftReader, SwiftReaderConfig};
 use clinker_format::traits::FormatReader;
 use clinker_format::x12::reader::{X12Reader, X12ReaderConfig};
 use clinker_format::xml::reader::{NamespaceMode, XmlReader, XmlReaderConfig};
-use clinker_format::{Column, SourceSchema};
+use clinker_format::{Column, NumericObserver, SourceSchema};
 use clinker_plan::config::PipelineConfig;
 use clinker_plan::error::PipelineError;
 
@@ -68,6 +68,7 @@ fn build_format_reader(
     input: &clinker_plan::config::SourceConfig,
     schema: &SourceSchema,
     source: ReopenableSource,
+    numeric_observer: Option<NumericObserver>,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     // External `.schema.yaml` (`SourceSchema::File`) references are resolved to
     // their inline form once at compile time (config load + `compile`), so the
@@ -94,6 +95,7 @@ fn build_format_reader(
                 schema,
                 MultiRecordKind::Csv(opts.as_ref()),
                 open_one_shot(&source)?,
+                numeric_observer,
             ),
             _ => {
                 let mut config = build_csv_reader_config(opts.as_ref())?;
@@ -109,11 +111,21 @@ fn build_format_reader(
         },
         clinker_plan::config::InputFormat::Json(opts) => {
             let config = build_json_reader_config(opts.as_ref(), input, schema);
-            Ok(Box::new(JsonReader::from_source(source, config)?))
+            match numeric_observer {
+                Some(observer) => Ok(Box::new(JsonReader::from_source_observing(
+                    source, config, observer,
+                )?)),
+                None => Ok(Box::new(JsonReader::from_source(source, config)?)),
+            }
         }
         clinker_plan::config::InputFormat::Xml(opts) => {
             let config = build_xml_reader_config(opts.as_ref(), input, schema);
-            Ok(Box::new(XmlReader::from_source(source, config)?))
+            match numeric_observer {
+                Some(observer) => Ok(Box::new(XmlReader::from_source_observing(
+                    source, config, observer,
+                )?)),
+                None => Ok(Box::new(XmlReader::from_source(source, config)?)),
+            }
         }
         clinker_plan::config::InputFormat::FixedWidth(opts) => match schema {
             // A multi-record `schema:` is a header/trailer/body byte-range flat
@@ -123,6 +135,7 @@ fn build_format_reader(
                 schema,
                 MultiRecordKind::FixedWidth(opts.as_ref()),
                 open_one_shot(&source)?,
+                numeric_observer,
             ),
             SourceSchema::Columns(cols) => {
                 let mut config = build_fw_reader_config(opts.as_ref());
@@ -173,14 +186,49 @@ fn build_format_reader(
     }
 }
 
+/// Build one read-only source reader from an already-resolved effective source
+/// configuration and byte source.
+///
+/// This is the shared construction seam for runtime ingest and authoring tools:
+/// format options, multi-value behavior, schema projection, and coercion all
+/// pass through the same builders. When `numeric_observer` is present, native
+/// JSON/XML scalars and positional multi-record fields are observed before
+/// record-value conversion; decoded text formats are observed at the canonical
+/// schema-coercion boundary. The callback is synchronous and must retain only
+/// bounded evidence.
+///
+/// The function performs no pipeline execution and does not retain the input.
+/// File-backed callers should pass [`ReopenableSource::path`] so JSON and XML
+/// remain streaming rather than buffering a complete document.
+pub fn build_source_format_reader(
+    input: &clinker_plan::config::SourceConfig,
+    schema: &SourceSchema,
+    policy: clinker_plan::config::pipeline_node::OnUnmapped,
+    source: ReopenableSource,
+    numeric_observer: Option<NumericObserver>,
+) -> Result<Box<dyn FormatReader>, PipelineError> {
+    let format_observer = if matches!(schema, SourceSchema::MultiRecord { .. })
+        || matches!(
+            &input.format,
+            clinker_plan::config::InputFormat::Json(_) | clinker_plan::config::InputFormat::Xml(_)
+        ) {
+        numeric_observer.clone()
+    } else {
+        None
+    };
+    let coercion_observer = if format_observer.is_some() {
+        None
+    } else {
+        numeric_observer
+    };
+    let reader = build_format_reader(input, schema, source, format_observer)?;
+    wrap_reader_with_schema_coercion(reader, input, schema, policy, coercion_observer)
+}
+
 /// Open a single `Read` from a re-openable source for a one-pass format reader,
-/// mapping an open failure to a pipeline config-validation error.
+/// preserving an open failure as structured pipeline I/O.
 fn open_one_shot(source: &ReopenableSource) -> Result<Box<dyn Read + Send>, PipelineError> {
-    source.open().map_err(|e| {
-        PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-            "failed to open source bytes: {e}"
-        )))
-    })
+    source.open().map_err(PipelineError::Io)
 }
 
 /// Build a [`MultiFileFormatReader`] wrapping every file the discovery
@@ -205,7 +253,7 @@ fn build_multi_file_reader(
     let factory: Box<FactoryFn> = Box::new(
         move |source: ReopenableSource|
               -> Result<Box<dyn FormatReader>, clinker_format::FormatError> {
-            build_format_reader(&owned_config, &owned_schema, source).map_err(|e| {
+            build_format_reader(&owned_config, &owned_schema, source, None).map_err(|e| {
                 clinker_format::FormatError::SchemaInference(format!(
                     "format reader construction failed: {e}"
                 ))
@@ -235,16 +283,16 @@ fn build_multi_file_reader(
 
 /// Wrap a format reader with schema-based type coercion if the source
 /// declares typed columns in its `schema:` block.
-fn wrap_source_body_with_schema_coercion(
+fn wrap_reader_with_schema_coercion(
     reader: Box<dyn FormatReader>,
-    body: &clinker_plan::config::pipeline_node::SourceBody,
+    input: &clinker_plan::config::SourceConfig,
+    schema: &SourceSchema,
+    policy: clinker_plan::config::pipeline_node::OnUnmapped,
+    numeric_observer: Option<NumericObserver>,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     use clinker_plan::config::pipeline_node::OnUnmapped;
-
-    let schema = &body.schema;
-    let policy = body.on_unmapped.clone();
-    let format = &body.source.format;
-    let source_name = body.source.name.as_str();
+    let source_name = input.name.as_str();
+    let format = &input.format;
 
     // The unified `schema:` is resolved to its effective column list (single-
     // record columns, or the multi-record superset). Its `File` form was
@@ -296,13 +344,25 @@ fn wrap_source_body_with_schema_coercion(
                         source_name,
                     )
                 }
-                _ => crate::pipeline::schema_coerce::CoercingReader::new(
-                    reader,
-                    &columns,
-                    policy,
-                    source_name,
-                    pretyped,
-                ),
+                _ => match numeric_observer {
+                    Some(observer) => {
+                        crate::pipeline::schema_coerce::CoercingReader::new_observing(
+                            reader,
+                            &columns,
+                            policy,
+                            source_name,
+                            pretyped,
+                            observer,
+                        )
+                    }
+                    None => crate::pipeline::schema_coerce::CoercingReader::new(
+                        reader,
+                        &columns,
+                        policy,
+                        source_name,
+                        pretyped,
+                    ),
+                },
             }
             .map_err(|e| PipelineError::Compilation {
                 transform_name: source_name.to_string(),
@@ -341,9 +401,6 @@ fn coercible_columns(
     }
 }
 
-/// Borrow a source node's unified `schema:` ([`SourceSchema`]) from the compiled
-/// plan, keyed by node identity (`header.name`) — the same key every other
-/// source lookup on the ingest path uses.
 /// Convert a record value at a declared watermark column into the
 /// canonical i64-nanoseconds event-time stamp folded into
 /// [`crate::executor::watermark::PerSourceWatermarks`].
@@ -469,7 +526,13 @@ pub(super) fn ingest_source_body(
             }
             let raw_reader =
                 build_multi_file_reader(&src_cfg, &body.schema, files, progress.clone())?;
-            let src_reader = wrap_source_body_with_schema_coercion(raw_reader, &body)?;
+            let src_reader = wrap_reader_with_schema_coercion(
+                raw_reader,
+                &src_cfg,
+                &body.schema,
+                body.on_unmapped.clone(),
+                None,
+            )?;
             // The file arm reaches the shared driver through the blanket
             // `RecordSource for Box<dyn FormatReader>` impl.
             drive_record_source(
@@ -1334,6 +1397,7 @@ fn build_multi_record_reader(
     schema: &SourceSchema,
     kind: MultiRecordKind,
     reader: Box<dyn Read + Send>,
+    numeric_observer: Option<NumericObserver>,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     let SourceSchema::MultiRecord {
         discriminator,
@@ -1368,14 +1432,16 @@ fn build_multi_record_reader(
     let built: Box<dyn FormatReader> = match kind {
         MultiRecordKind::FixedWidth(opts) => {
             let cfg = build_fw_reader_config(opts);
-            Box::new(
-                clinker_format::multi_record::MultiRecordReader::new_fixed_width(
-                    reader,
-                    spec,
-                    cfg.line_separator,
-                )
-                .map_err(to_pipeline_err)?,
+            let reader = clinker_format::multi_record::MultiRecordReader::new_fixed_width(
+                reader,
+                spec,
+                cfg.line_separator,
             )
+            .map_err(to_pipeline_err)?;
+            Box::new(match numeric_observer {
+                Some(observer) => reader.with_numeric_observer(observer),
+                None => reader,
+            })
         }
         MultiRecordKind::Csv(opts) => {
             let cfg = build_csv_reader_config(opts)?;
@@ -1393,22 +1459,24 @@ fn build_multi_record_reader(
                     )),
                 ));
             }
-            Box::new(
-                clinker_format::multi_record::MultiRecordReader::new_csv(
-                    reader,
-                    spec,
-                    clinker_format::multi_record::CsvDialect {
-                        delimiter: cfg.delimiter,
-                        quote_char: cfg.quote_char,
-                        // A multi-record CSV exported with a column-header line
-                        // (the default `has_header: true`) skips that first
-                        // physical row, so a textual header is not mistaken for
-                        // an unknown discriminator value.
-                        has_header: cfg.has_header,
-                    },
-                )
-                .map_err(to_pipeline_err)?,
+            let reader = clinker_format::multi_record::MultiRecordReader::new_csv(
+                reader,
+                spec,
+                clinker_format::multi_record::CsvDialect {
+                    delimiter: cfg.delimiter,
+                    quote_char: cfg.quote_char,
+                    // A multi-record CSV exported with a column-header line
+                    // (the default `has_header: true`) skips that first
+                    // physical row, so a textual header is not mistaken for
+                    // an unknown discriminator value.
+                    has_header: cfg.has_header,
+                },
             )
+            .map_err(to_pipeline_err)?;
+            Box::new(match numeric_observer {
+                Some(observer) => reader.with_numeric_observer(observer),
+                None => reader,
+            })
         }
     };
     Ok(built)
@@ -1740,7 +1808,7 @@ nodes:
             clinker_format::Column::bare("name", cxl::typecheck::Type::String),
         ]);
 
-        let mut reader = build_format_reader(&input, &schema, source).expect("build reader");
+        let mut reader = build_format_reader(&input, &schema, source, None).expect("build reader");
         while reader.next_record().expect("read record").is_some() {}
 
         assert_eq!(

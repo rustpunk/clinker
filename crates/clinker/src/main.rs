@@ -12,6 +12,7 @@ use clinker_plan::error::PipelineError;
 
 mod capability;
 pub mod credential_profile;
+mod guess;
 mod lifecycle;
 mod lineage;
 use lineage::*;
@@ -98,6 +99,22 @@ EXAMPLES:
   clinker run pipeline.yaml --metrics-spool-dir /var/spool/clinker"
     )]
     Run(RunArgs),
+    /// Preview, check, or safely write concrete numeric source types.
+    #[command(
+        long_about = "\
+Inspect the source bytes selected by one effective pipeline configuration and \
+preview exact `int` or `float` replacements for source columns declared \
+`numeric`. Preview and check are read-only. `--write` exhausts evidence and \
+edits only one directly-authored owner after fail-closed revalidation.",
+        after_long_help = "\
+EXAMPLES:
+  clinker guess pipeline.yaml
+  clinker guess pipeline.yaml --field orders.amount
+  clinker guess pipeline.yaml --field orders.amount --write
+  clinker guess pipeline.yaml --channel acme
+  clinker guess pipeline.yaml --group enterprise"
+    )]
+    Guess(GuessArgs),
     /// Metrics utilities
     #[command(long_about = "\
 Utilities for collecting and managing pipeline execution metrics. Clinker \
@@ -785,6 +802,37 @@ impl RunArgs {
     }
 }
 
+/// Arguments for `clinker guess` analysis and guarded concretization.
+#[derive(Parser, Debug)]
+pub struct GuessArgs {
+    /// Path to the pipeline YAML configuration file.
+    pub config: PathBuf,
+
+    /// Select one cataloged channel and its derived groups.
+    #[arg(long, value_name = "ID")]
+    pub channel: Option<String>,
+
+    /// Select one explicit, target-admitted group without a channel.
+    #[arg(long, value_name = "NAME")]
+    pub group: Option<String>,
+
+    /// Narrow the effective config's numeric leaves (repeatable).
+    #[arg(long = "field", value_name = "NODE.COLUMN")]
+    pub fields: Vec<String>,
+
+    /// Exhaust the frozen input manifest and exit 3 when any leaf is unresolved.
+    #[arg(long)]
+    pub check: bool,
+
+    /// Exhaust evidence and atomically edit one safe, directly-authored owner.
+    #[arg(long)]
+    pub write: bool,
+
+    /// Workspace root holding clinker.toml and channel/group roots.
+    #[arg(long, value_name = "DIR")]
+    pub base_dir: Option<PathBuf>,
+}
+
 /// Subcommands for `clinker metrics`.
 #[derive(Subcommand, Debug)]
 pub enum MetricsCommands {
@@ -1230,6 +1278,26 @@ fn main() -> ExitCode {
                     }
                     render_pipeline_error(&e, &args.config);
                     ExitCode::from(exit_code)
+                }
+            }
+        }
+        Commands::Guess(args) => {
+            tracing_subscriber::fmt()
+                .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .init();
+            if let Err(error) = clinker_exec::pipeline::shutdown::install_signal_handler() {
+                eprintln!(
+                    "clinker guess error: cannot install signal handler: {error}. Correction: run clinker as the process that owns SIGINT and SIGTERM, or relax the sandbox policy that refuses them"
+                );
+                return ExitCode::from(4);
+            }
+            match guess::run(args) {
+                Ok(code) => ExitCode::from(code),
+                Err(error) => {
+                    eprintln!("clinker guess error: {error}");
+                    ExitCode::from(error.exit_code())
                 }
             }
         }
@@ -1865,7 +1933,7 @@ fn resolve_overlay_config_before_compile(
 /// the pipeline file's directory. Paths are canonicalized when they exist so
 /// the result is symlink- and `..`-stable; a non-existent path falls back to
 /// its lexical form rather than failing the run.
-fn resolve_compile_anchor(
+pub(crate) fn resolve_compile_anchor(
     config: &std::path::Path,
     base_dir: Option<&std::path::Path>,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -6965,7 +7033,7 @@ fn run_channels_lint(args: &LintArgs) -> Result<u8, Box<dyn std::error::Error>> 
 
 /// Find the logical pipeline identity for a CLI path. Runtime overlay
 /// selection never derives identity from a filename or current directory.
-fn catalog_pipeline_id(
+pub(crate) fn catalog_pipeline_id(
     workspace_root: &std::path::Path,
     catalog: &clinker_plan::resources::CatalogConfig,
     pipeline_path: &std::path::Path,

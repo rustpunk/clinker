@@ -35,6 +35,9 @@ pub use serde_saphyr::{Location, Span, Spanned};
 /// pathological inputs never reach the deserializer at all.
 pub const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 
+/// Maximum number of YAML nodes admitted by one canonical parse.
+pub const MAX_NODES: usize = 100_000;
+
 /// Wrapper around [`serde_saphyr::Error`] so callers do not have to
 /// import the underlying crate. Implements `Display` / `Error` and
 /// `From<serde_saphyr::Error>`.
@@ -74,7 +77,7 @@ fn budget_options() -> serde_saphyr::Options {
             max_inclusion_depth: 0,
             // 100 000 nodes — covers the largest plausible fixture with a
             // ~10x margin.
-            max_nodes: 100_000,
+            max_nodes: MAX_NODES,
             // Reject exponential alias expansion (the canonical
             // billion-laughs defense).
             enforce_alias_anchor_ratio: true,
@@ -97,10 +100,125 @@ where
     serde_saphyr::from_str_with_options(yaml, budget_options()).map_err(YamlError)
 }
 
-/// Serialize a value back to YAML. Thin pass-through; no budget needed
-/// on the serialize side.
+/// Serialize a value back to YAML.
+///
+/// `serde_json` represents numbers through a private one-field struct when
+/// its `arbitrary_precision` feature is enabled. General-purpose serializers
+/// that do not recognize that private contract emit the struct itself instead
+/// of a numeric scalar. Detect that representation and route the value through
+/// an exact-lexeme bridge before returning YAML. The fallback holds one JSON
+/// value tree and two rendered buffers for the duration of this call.
 pub fn to_string<T: Serialize>(value: &T) -> Result<String, String> {
-    serde_saphyr::to_string(value).map_err(|e| e.to_string())
+    const JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
+
+    let rendered = serde_saphyr::to_string(value).map_err(|e| e.to_string())?;
+    if !rendered.contains(JSON_NUMBER_TOKEN) {
+        return Ok(rendered);
+    }
+
+    let json = serde_json::to_value(value)
+        .map_err(|error| format!("JSON-number YAML bridge failed: {error}"))?;
+    json_value_to_string(&json)
+}
+
+/// Serialize a JSON value to YAML while preserving every numeric lexeme.
+///
+/// The bridge replaces numbers with collision-free plain-scalar markers,
+/// delegates structure and quoting to `serde-saphyr`, then substitutes the
+/// authoritative lexemes supplied by `serde_json::Number`. It does not parse,
+/// normalize, or round numbers through a machine numeric type.
+fn json_value_to_string(value: &serde_json::Value) -> Result<String, String> {
+    let mut marker_prefix = "__clinker_json_number_".to_owned();
+    while json_contains_text(value, &marker_prefix) {
+        marker_prefix.push('_');
+    }
+
+    let mut numbers = Vec::new();
+    let bridged = bridge_json_numbers(value, &marker_prefix, &mut numbers);
+    let rendered = serde_saphyr::to_string(&bridged).map_err(|e| e.to_string())?;
+    restore_json_numbers(&rendered, &marker_prefix, &numbers)
+}
+
+fn json_contains_text(value: &serde_json::Value, needle: &str) -> bool {
+    match value {
+        serde_json::Value::String(value) => value.contains(needle),
+        serde_json::Value::Array(values) => {
+            values.iter().any(|value| json_contains_text(value, needle))
+        }
+        serde_json::Value::Object(values) => values
+            .iter()
+            .any(|(key, value)| key.contains(needle) || json_contains_text(value, needle)),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
+    }
+}
+
+fn bridge_json_numbers(
+    value: &serde_json::Value,
+    marker_prefix: &str,
+    numbers: &mut Vec<String>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Number(number) => {
+            let index = numbers.len();
+            numbers.push(number.to_string());
+            serde_json::Value::String(format!("{marker_prefix}{index}__"))
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|value| bridge_json_numbers(value, marker_prefix, numbers))
+                .collect(),
+        ),
+        serde_json::Value::Object(values) => {
+            let mut bridged = serde_json::Map::new();
+            for (key, value) in values {
+                bridged.insert(
+                    key.clone(),
+                    bridge_json_numbers(value, marker_prefix, numbers),
+                );
+            }
+            serde_json::Value::Object(bridged)
+        }
+        other => other.clone(),
+    }
+}
+
+fn restore_json_numbers(
+    rendered: &str,
+    marker_prefix: &str,
+    numbers: &[String],
+) -> Result<String, String> {
+    let mut restored = String::with_capacity(rendered.len());
+    let mut remaining = rendered;
+    let mut seen = vec![false; numbers.len()];
+
+    while let Some(marker_start) = remaining.find(marker_prefix) {
+        restored.push_str(&remaining[..marker_start]);
+        let marker = &remaining[marker_start + marker_prefix.len()..];
+        let marker_end = marker
+            .find("__")
+            .ok_or_else(|| "JSON-number YAML bridge emitted a malformed marker".to_owned())?;
+        let index = marker[..marker_end]
+            .parse::<usize>()
+            .map_err(|_| "JSON-number YAML bridge emitted a malformed index".to_owned())?;
+        let number = numbers
+            .get(index)
+            .ok_or_else(|| "JSON-number YAML bridge emitted an unknown index".to_owned())?;
+        if seen[index] {
+            return Err("JSON-number YAML bridge emitted a duplicate marker".to_owned());
+        }
+        seen[index] = true;
+        restored.push_str(number);
+        remaining = &marker[marker_end + 2..];
+    }
+    restored.push_str(remaining);
+
+    if seen.iter().any(|seen| !seen) {
+        return Err("JSON-number YAML bridge omitted a marker".to_owned());
+    }
+    Ok(restored)
 }
 
 /// Build a synthetic oversize error. `serde_saphyr::Error` does not
@@ -225,6 +343,37 @@ mod tests {
         let parsed: Trivial = from_str(yaml).expect("trivial parse");
         assert_eq!(parsed.name, "hello");
         assert_eq!(parsed.count, 7);
+    }
+
+    #[test]
+    fn arbitrary_precision_json_numbers_remain_yaml_scalars() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"priority":20,"ratio":12345678901234567890.12345678901234567890}"#,
+        )
+        .expect("parse exact JSON numbers");
+
+        let rendered = to_string(&value).expect("serialize exact numbers");
+
+        assert!(rendered.contains("priority: 20"), "{rendered}");
+        assert!(
+            rendered.contains("ratio: 12345678901234567890.12345678901234567890"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("$serde_json::private::Number"));
+        assert!(!rendered.contains("__clinker_json_number_"));
+    }
+
+    #[test]
+    fn arbitrary_precision_bridge_avoids_authored_marker_text() {
+        let source = "label: __clinker_json_number_0__\nvalue: 42\n";
+        let value: serde_json::Value = from_str(source).expect("parse marker-shaped text");
+
+        let rendered = to_string(&value).expect("serialize marker-shaped text");
+
+        assert!(rendered.contains("label: __clinker_json_number_0__"));
+        assert!(rendered.contains("value: 42"));
+        let reparsed: serde_json::Value = from_str(&rendered).expect("reparse marker-shaped text");
+        assert_eq!(reparsed, value);
     }
 
     // ---- Spike 1: Spanned<TaggedEnum> via outer wrap -----------------

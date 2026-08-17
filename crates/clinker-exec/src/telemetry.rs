@@ -140,11 +140,16 @@ pub enum MetricKey {
     SourceCompleted,
     SourceFailed,
     SourceInterrupted,
+    GuessStarted,
+    GuessCompleted,
+    GuessUnresolved,
+    GuessFailed,
+    GuessInterrupted,
 }
 
 impl MetricKey {
     /// Every fixed metric key in stable counter-index order.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 29] = [
         Self::TransformStarted,
         Self::TransformCompleted,
         Self::TransformRecords,
@@ -169,11 +174,17 @@ impl MetricKey {
         Self::SourceCompleted,
         Self::SourceFailed,
         Self::SourceInterrupted,
+        Self::GuessStarted,
+        Self::GuessCompleted,
+        Self::GuessUnresolved,
+        Self::GuessFailed,
+        Self::GuessInterrupted,
     ];
     /// Number of entries in [`Self::ALL`].
     pub const COUNT: usize = Self::ALL.len();
 
     /// Stable position of this key in the fixed counter array.
+    #[must_use]
     pub const fn index(self) -> usize {
         match self {
             Self::TransformStarted => 0,
@@ -200,6 +211,11 @@ impl MetricKey {
             Self::SourceCompleted => 21,
             Self::SourceFailed => 22,
             Self::SourceInterrupted => 23,
+            Self::GuessStarted => 24,
+            Self::GuessCompleted => 25,
+            Self::GuessUnresolved => 26,
+            Self::GuessFailed => 27,
+            Self::GuessInterrupted => 28,
         }
     }
 }
@@ -214,6 +230,34 @@ pub enum SpanName {
     CredentialRenew,
     CredentialRevoke,
     Source,
+    Guess,
+}
+
+impl SpanName {
+    /// Every span name in stable index order.
+    pub const ALL: [Self; 7] = [
+        Self::Transform,
+        Self::CredentialResolve,
+        Self::ResourceOpen,
+        Self::CredentialRenew,
+        Self::CredentialRevoke,
+        Self::Source,
+        Self::Guess,
+    ];
+
+    /// Return this name's stable slot in the closed span vocabulary.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Transform => 0,
+            Self::CredentialResolve => 1,
+            Self::ResourceOpen => 2,
+            Self::CredentialRenew => 3,
+            Self::CredentialRevoke => 4,
+            Self::Source => 5,
+            Self::Guess => 6,
+        }
+    }
 }
 
 /// Bounded span result fact.
@@ -1768,6 +1812,11 @@ mod tests {
             MetricKey::SourceCompleted,
             MetricKey::SourceFailed,
             MetricKey::SourceInterrupted,
+            MetricKey::GuessStarted,
+            MetricKey::GuessCompleted,
+            MetricKey::GuessUnresolved,
+            MetricKey::GuessFailed,
+            MetricKey::GuessInterrupted,
         ];
 
         assert_eq!(MetricKey::COUNT, expected.len());
@@ -2473,5 +2522,15 @@ replacement = "{replacement}"
     fn value_exactly_at_the_cap_is_not_marked() {
         let bounded = bounded_utf8("1234", 4);
         assert_eq!(bounded, "1234");
+    }
+
+    #[test]
+    fn closed_metric_and_span_indices_cover_each_inventory_once() {
+        for (expected, key) in MetricKey::ALL.into_iter().enumerate() {
+            assert_eq!(key.index(), expected, "metric index for {key:?}");
+        }
+        for (expected, name) in SpanName::ALL.into_iter().enumerate() {
+            assert_eq!(name.index(), expected, "span index for {name:?}");
+        }
     }
 }

@@ -51,6 +51,7 @@ use context::{SourceRuntimePolicy, build_stable_eval_context};
 pub use dispatch::DispatchFaultGuard;
 pub use dlq::DlqEntry;
 pub(crate) use dlq::TypeErrorEvent;
+pub use ingest::build_source_format_reader;
 use ingest::{IngestTaskOutcome, ingest_source};
 use params::sum_cpu_io_totals;
 pub use params::{ExecutionReport, PipelineRunParams, PreviewPolicy, RunPolicy};

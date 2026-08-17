@@ -18,6 +18,7 @@
 //!   falls back to `modified()` otherwise — mirrors `find -newer` and
 //!   Spark's `latestFirst` semantics.
 
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -115,6 +116,78 @@ impl DiscoveryOutcome {
     }
 }
 
+/// Bounded discovery result for read-only sampling tools.
+///
+/// `files()` retains at most the caller's requested limit while
+/// `discovered_file_count()` reports the complete post-filter, post-take file
+/// count. Candidate enumeration streams through the matcher and never retains
+/// a collection proportional to the number of matching filesystem entries.
+#[derive(Debug)]
+pub enum BoundedDiscoveryOutcome {
+    /// One or more files survived discovery.
+    Found {
+        files: Vec<DiscoveredFile>,
+        discovered_files: usize,
+    },
+    /// Zero files survived, and the policy is `Warn`.
+    EmptyWarn { matcher: String },
+    /// Zero files survived, and the policy is `Skip`.
+    EmptySkip,
+}
+
+impl BoundedDiscoveryOutcome {
+    /// Borrow the fixed-size deterministic sample.
+    pub fn files(&self) -> &[DiscoveredFile] {
+        match self {
+            Self::Found { files, .. } => files,
+            Self::EmptyWarn { .. } | Self::EmptySkip => &[],
+        }
+    }
+
+    /// Number of files in the complete discovered set after configured
+    /// `take_first` / `take_last` selection.
+    pub fn discovered_file_count(&self) -> usize {
+        match self {
+            Self::Found {
+                discovered_files, ..
+            } => *discovered_files,
+            Self::EmptyWarn { .. } | Self::EmptySkip => 0,
+        }
+    }
+
+    /// Identify a complete bounded manifest by stable normalized path, order,
+    /// and file size. Paths under `base_dir` are made relative; configured
+    /// paths outside it retain their absolute identity.
+    ///
+    /// Returns `None` when the caller's retention limit omitted any discovered
+    /// file. The identifier deliberately excludes timestamp values, although a
+    /// configured timestamp sort still determines file order. It is a
+    /// deterministic authoring manifest identifier, not a content-integrity
+    /// proof; a writer must still re-read and compare exact input snapshots
+    /// before mutation.
+    pub fn complete_manifest_id(&self, base_dir: &Path) -> Option<String> {
+        let files = self.files();
+        if files.len() != self.discovered_file_count() {
+            return None;
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"clinker-discovery-manifest-v1\0");
+        hasher.update(&(files.len() as u64).to_be_bytes());
+        for file in files {
+            let path = file
+                .path
+                .strip_prefix(base_dir)
+                .unwrap_or(&file.path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            hasher.update(&(path.len() as u64).to_be_bytes());
+            hasher.update(path.as_bytes());
+            hasher.update(&file.size.to_be_bytes());
+        }
+        Some(hasher.finalize().to_hex().to_string())
+    }
+}
+
 /// Run the full discovery pipeline against `source` rooted at `base_dir`.
 ///
 /// `base_dir` is the workspace root (typically the directory containing
@@ -134,50 +207,12 @@ pub fn discover(
         return Err(DiscoveryError::TakeBothSpecified);
     }
 
-    // 3. Enumerate primary candidates.
+    // 3-5. Stream primary candidates through filters and metadata loading.
     let recursive = effective_recursive(source, &matcher);
-    let mut candidates = enumerate(&matcher, base_dir, recursive)?;
-
-    // 4. Drop entries matching any `exclude` pattern.
-    if let Some(excludes) = source.exclude.as_deref() {
-        let compiled = compile_globs(excludes)?;
-        candidates.retain(|p| !matches_any(p, &compiled));
-    }
-
-    // 5. Stat each survivor. Drop those that fail size / mtime filters.
-    let now = SystemTime::now();
-    let mut discovered: Vec<DiscoveredFile> = Vec::with_capacity(candidates.len());
-    for path in candidates {
-        let meta = match std::fs::metadata(&path) {
-            Ok(m) => m,
-            Err(e) => return Err(DiscoveryError::Io(e)),
-        };
-        if !meta.is_file() {
-            continue;
-        }
-        let size = meta.len();
-        if let Some(min) = source.min_size
-            && size < min.0
-        {
-            continue;
-        }
-        if let Some(max) = source.max_size
-            && size > max.0
-        {
-            continue;
-        }
-        let modified = meta.modified().unwrap_or(now);
-        let created = meta.created().unwrap_or(modified);
-        if !time_bound_pass(modified, source.modified_after, source.modified_before) {
-            continue;
-        }
-        discovered.push(DiscoveredFile {
-            path,
-            modified,
-            created,
-            size,
-        });
-    }
+    let mut discovered = Vec::new();
+    visit_discovered_files(source, &matcher, base_dir, recursive, |file| {
+        discovered.push(file);
+    })?;
 
     // 6. Sort by configured key + direction (defaults: name ascending).
     let (sort_key, sort_dir) = sort_spec(source);
@@ -218,19 +253,87 @@ pub fn discover(
     Ok(DiscoveryOutcome::Found(discovered))
 }
 
+/// Discover a deterministic, fixed-size sample without materializing the
+/// complete candidate or discovered-file set.
+///
+/// The sample follows the configured file ordering. For `take_first` (or no
+/// take control), it retains the first `limit` files. For `take_last`, it
+/// retains the last `limit` files; these are a deterministic subset of the
+/// selected tail even when the authored take count is larger than `limit`.
+/// The complete selected count is still reported.
+pub fn discover_bounded(
+    source: &SourceConfig,
+    base_dir: &Path,
+    limit: usize,
+) -> Result<BoundedDiscoveryOutcome, DiscoveryError> {
+    let matcher = pick_matcher(source)?;
+    if let Some(controls) = source.files.as_ref()
+        && controls.take_first.is_some()
+        && controls.take_last.is_some()
+    {
+        return Err(DiscoveryError::TakeBothSpecified);
+    }
+
+    let controls = source.files.as_ref();
+    let take_limit = controls.and_then(|controls| controls.take_first.or(controls.take_last));
+    let retain_limit = limit.min(take_limit.unwrap_or(usize::MAX));
+    let retain_tail = controls.is_some_and(|controls| controls.take_last.is_some());
+    let (sort_key, sort_dir) = sort_spec(source);
+    let recursive = effective_recursive(source, &matcher);
+    let mut matched_files = 0usize;
+    let mut files = Vec::with_capacity(retain_limit);
+    visit_discovered_files(source, &matcher, base_dir, recursive, |file| {
+        let ordinal = matched_files;
+        matched_files = matched_files.saturating_add(1);
+        retain_ordered_sample(
+            &mut files,
+            OrderedDiscoveredFile { file, ordinal },
+            retain_limit,
+            sort_key,
+            sort_dir,
+            retain_tail,
+        );
+    })?;
+
+    let discovered_files = take_limit
+        .map(|take| matched_files.min(take))
+        .unwrap_or(matched_files);
+    if discovered_files == 0 {
+        let policy = controls
+            .and_then(|controls| controls.on_no_match)
+            .unwrap_or_default();
+        return Ok(match policy {
+            NoMatchPolicy::Error => {
+                return Err(DiscoveryError::NoMatch {
+                    matcher: matcher_display(&matcher),
+                });
+            }
+            NoMatchPolicy::Warn => BoundedDiscoveryOutcome::EmptyWarn {
+                matcher: matcher_display(&matcher),
+            },
+            NoMatchPolicy::Skip => BoundedDiscoveryOutcome::EmptySkip,
+        });
+    }
+
+    Ok(BoundedDiscoveryOutcome::Found {
+        files: files.into_iter().map(|selected| selected.file).collect(),
+        discovered_files,
+    })
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // internals
 // ──────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
-enum Matcher {
-    Path(String),
-    Glob(String),
-    Regex(String),
-    Paths(Vec<String>),
+#[derive(Debug, Clone, Copy)]
+enum Matcher<'a> {
+    Path(&'a str),
+    Glob(&'a str),
+    Regex(&'a str),
+    Paths(&'a [String]),
 }
 
-fn pick_matcher(source: &SourceConfig) -> Result<Matcher, DiscoveryError> {
+fn pick_matcher(source: &SourceConfig) -> Result<Matcher<'_>, DiscoveryError> {
     let mut which: Vec<&'static str> = Vec::new();
     if source.path.is_some() {
         which.push("path");
@@ -247,10 +350,10 @@ fn pick_matcher(source: &SourceConfig) -> Result<Matcher, DiscoveryError> {
     match which.as_slice() {
         [] => Err(DiscoveryError::NoMatcher),
         [one] => Ok(match *one {
-            "path" => Matcher::Path(source.path.clone().unwrap()),
-            "glob" => Matcher::Glob(source.glob.clone().unwrap()),
-            "regex" => Matcher::Regex(source.regex.clone().unwrap()),
-            "paths" => Matcher::Paths(source.paths.clone().unwrap()),
+            "path" => Matcher::Path(source.path.as_deref().unwrap()),
+            "glob" => Matcher::Glob(source.glob.as_deref().unwrap()),
+            "regex" => Matcher::Regex(source.regex.as_deref().unwrap()),
+            "paths" => Matcher::Paths(source.paths.as_deref().unwrap()),
             _ => unreachable!(),
         }),
         _ => Err(DiscoveryError::MultipleMatchers {
@@ -259,7 +362,7 @@ fn pick_matcher(source: &SourceConfig) -> Result<Matcher, DiscoveryError> {
     }
 }
 
-fn matcher_display(m: &Matcher) -> String {
+fn matcher_display(m: &Matcher<'_>) -> String {
     match m {
         Matcher::Path(p) => format!("path: {p}"),
         Matcher::Glob(g) => format!("glob: {g}"),
@@ -271,7 +374,7 @@ fn matcher_display(m: &Matcher) -> String {
 /// Decide whether to walk subdirectories. Explicit `files.recursive`
 /// wins. Otherwise: glob with `**` walks recursively, everything else
 /// stays at the configured directory level.
-fn effective_recursive(source: &SourceConfig, matcher: &Matcher) -> bool {
+fn effective_recursive(source: &SourceConfig, matcher: &Matcher<'_>) -> bool {
     if let Some(ctrl) = source.files.as_ref()
         && let Some(r) = ctrl.recursive
     {
@@ -280,22 +383,29 @@ fn effective_recursive(source: &SourceConfig, matcher: &Matcher) -> bool {
     matches!(matcher, Matcher::Glob(g) if g.contains("**")) || matches!(matcher, Matcher::Regex(_))
 }
 
-/// Resolve the matcher to an absolute candidate path list. Symlinks are
-/// not followed (mirrors composition-walk security policy).
-fn enumerate(
-    matcher: &Matcher,
+/// Visit absolute candidate paths without retaining the complete match set.
+/// Symlinks are not followed (mirrors composition-walk security policy).
+fn visit_candidates<F>(
+    matcher: &Matcher<'_>,
     base_dir: &Path,
     recursive: bool,
-) -> Result<Vec<PathBuf>, DiscoveryError> {
+    mut visit: F,
+) -> Result<(), DiscoveryError>
+where
+    F: FnMut(PathBuf) -> Result<(), DiscoveryError>,
+{
     match matcher {
         Matcher::Path(p) => {
-            let resolved = resolve(p, base_dir);
-            Ok(vec![resolved])
+            visit(resolve(p, base_dir))?;
         }
-        Matcher::Paths(ps) => Ok(ps.iter().map(|p| resolve(p, base_dir)).collect()),
+        Matcher::Paths(paths) => {
+            for path in *paths {
+                visit(resolve(path, base_dir))?;
+            }
+        }
         Matcher::Glob(pattern) => {
             let abs_pattern = if Path::new(pattern).is_absolute() {
-                pattern.clone()
+                (*pattern).to_owned()
             } else {
                 base_dir.join(pattern).to_string_lossy().into_owned()
             };
@@ -306,13 +416,12 @@ fn enumerate(
             };
             let entries =
                 glob::glob_with(&abs_pattern, opts).map_err(|e| DiscoveryError::InvalidGlob {
-                    pattern: pattern.clone(),
+                    pattern: (*pattern).to_owned(),
                     message: e.to_string(),
                 })?;
-            let mut out = Vec::new();
             for entry in entries {
                 match entry {
-                    Ok(p) => out.push(p),
+                    Ok(path) => visit(path)?,
                     Err(glob_err) => {
                         return Err(DiscoveryError::Io(std::io::Error::other(
                             glob_err.to_string(),
@@ -320,14 +429,12 @@ fn enumerate(
                     }
                 }
             }
-            Ok(out)
         }
         Matcher::Regex(pattern) => {
             let re = regex::Regex::new(pattern).map_err(|e| DiscoveryError::InvalidRegex {
-                pattern: pattern.clone(),
+                pattern: (*pattern).to_owned(),
                 message: e.to_string(),
             })?;
-            let mut out = Vec::new();
             let walker = walkdir::WalkDir::new(base_dir)
                 .follow_links(false)
                 .max_depth(if recursive { usize::MAX } else { 1 })
@@ -344,12 +451,58 @@ fn enumerate(
                 let path = entry.path();
                 let candidate = path.to_string_lossy().replace('\\', "/");
                 if re.is_match(&candidate) {
-                    out.push(path.to_path_buf());
+                    visit(path.to_path_buf())?;
                 }
             }
-            Ok(out)
         }
     }
+    Ok(())
+}
+
+/// Stream candidate paths through exclusions, metadata, and file filters.
+fn visit_discovered_files<F>(
+    source: &SourceConfig,
+    matcher: &Matcher<'_>,
+    base_dir: &Path,
+    recursive: bool,
+    mut visit: F,
+) -> Result<(), DiscoveryError>
+where
+    F: FnMut(DiscoveredFile),
+{
+    let excludes = source
+        .exclude
+        .as_deref()
+        .map(compile_globs)
+        .transpose()?
+        .unwrap_or_default();
+    let now = SystemTime::now();
+    visit_candidates(matcher, base_dir, recursive, |path| {
+        if !excludes.is_empty() && matches_any(&path, &excludes) {
+            return Ok(());
+        }
+        let metadata = std::fs::metadata(&path).map_err(DiscoveryError::Io)?;
+        if !metadata.is_file() {
+            return Ok(());
+        }
+        let size = metadata.len();
+        if source.min_size.is_some_and(|min| size < min.0)
+            || source.max_size.is_some_and(|max| size > max.0)
+        {
+            return Ok(());
+        }
+        let modified = metadata.modified().unwrap_or(now);
+        if !time_bound_pass(modified, source.modified_after, source.modified_before) {
+            return Ok(());
+        }
+        visit(DiscoveredFile {
+            path,
+            modified,
+            created: metadata.created().unwrap_or(modified),
+            size,
+        });
+        Ok(())
+    })
 }
 
 fn resolve(p: &str, base_dir: &Path) -> PathBuf {
@@ -419,13 +572,83 @@ fn sort_spec(source: &SourceConfig) -> (FileSortKey, SortDir) {
 
 fn sort_files(files: &mut [DiscoveredFile], key: FileSortKey, dir: SortDir) {
     match key {
-        FileSortKey::Name => files.sort_by(|a, b| a.path.cmp(&b.path)),
-        FileSortKey::Created => files.sort_by(|a, b| a.created.cmp(&b.created)),
-        FileSortKey::Modified => files.sort_by(|a, b| a.modified.cmp(&b.modified)),
+        FileSortKey::Name => files.sort_by(|left, right| left.path.cmp(&right.path)),
+        FileSortKey::Created => files.sort_by(|left, right| left.created.cmp(&right.created)),
+        FileSortKey::Modified => files.sort_by(|left, right| left.modified.cmp(&right.modified)),
     }
     if matches!(dir, SortDir::Desc) {
         files.reverse();
     }
+}
+
+struct OrderedDiscoveredFile {
+    file: DiscoveredFile,
+    ordinal: usize,
+}
+
+/// Compare sampled files exactly as the stable full sort plus optional reverse
+/// orders them, using streaming enumeration order as the stability key.
+fn compare_sample_files(
+    left: &OrderedDiscoveredFile,
+    right: &OrderedDiscoveredFile,
+    key: FileSortKey,
+    dir: SortDir,
+) -> Ordering {
+    let order = match key {
+        FileSortKey::Name => left
+            .file
+            .path
+            .cmp(&right.file.path)
+            .then_with(|| left.ordinal.cmp(&right.ordinal)),
+        FileSortKey::Created => left
+            .file
+            .created
+            .cmp(&right.file.created)
+            .then_with(|| left.ordinal.cmp(&right.ordinal)),
+        FileSortKey::Modified => left
+            .file
+            .modified
+            .cmp(&right.file.modified)
+            .then_with(|| left.ordinal.cmp(&right.ordinal)),
+    };
+    match dir {
+        SortDir::Asc => order,
+        SortDir::Desc => order.reverse(),
+    }
+}
+
+fn retain_ordered_sample(
+    files: &mut Vec<OrderedDiscoveredFile>,
+    file: OrderedDiscoveredFile,
+    limit: usize,
+    key: FileSortKey,
+    dir: SortDir,
+    retain_tail: bool,
+) {
+    if limit == 0 {
+        return;
+    }
+    if files.len() == limit {
+        let boundary = if retain_tail {
+            &files[0]
+        } else {
+            files.last().expect("a full sample is non-empty")
+        };
+        let order = compare_sample_files(&file, boundary, key, dir);
+        if (retain_tail && order != Ordering::Greater) || (!retain_tail && order != Ordering::Less)
+        {
+            return;
+        }
+        if retain_tail {
+            files.remove(0);
+        } else {
+            files.pop();
+        }
+    }
+    let index = files.partition_point(|existing| {
+        compare_sample_files(existing, &file, key, dir) != Ordering::Greater
+    });
+    files.insert(index, file);
 }
 
 #[cfg(test)]
@@ -497,6 +720,90 @@ mod tests {
         s.glob = Some("orders_*.csv".into());
         let out = discover(&s, tmp.path()).unwrap();
         assert_eq!(out.files().len(), 2);
+    }
+
+    #[test]
+    fn bounded_discovery_retains_only_the_limit_and_reports_the_full_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        for index in (0..12).rev() {
+            write(tmp.path(), &format!("orders_{index:02}.csv"), "");
+        }
+        let mut source = cfg();
+        source.glob = Some("orders_*.csv".into());
+
+        let outcome = discover_bounded(&source, tmp.path(), 4).unwrap();
+        assert_eq!(outcome.discovered_file_count(), 12);
+        assert_eq!(outcome.files().len(), 4);
+        assert_eq!(
+            outcome
+                .files()
+                .iter()
+                .map(|file| file.path.file_name().unwrap().to_string_lossy())
+                .collect::<Vec<_>>(),
+            [
+                "orders_00.csv",
+                "orders_01.csv",
+                "orders_02.csv",
+                "orders_03.csv",
+            ]
+        );
+    }
+
+    #[test]
+    fn bounded_discovery_take_last_retains_a_fixed_selected_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        for index in 0..12 {
+            write(tmp.path(), &format!("orders_{index:02}.csv"), "");
+        }
+        let mut source = cfg();
+        source.glob = Some("orders_*.csv".into());
+        source.files = Some(FileListingControls {
+            take_last: Some(7),
+            ..Default::default()
+        });
+
+        let outcome = discover_bounded(&source, tmp.path(), 4).unwrap();
+        assert_eq!(outcome.discovered_file_count(), 7);
+        assert_eq!(outcome.files().len(), 4);
+        assert_eq!(
+            outcome
+                .files()
+                .iter()
+                .map(|file| file.path.file_name().unwrap().to_string_lossy())
+                .collect::<Vec<_>>(),
+            [
+                "orders_08.csv",
+                "orders_09.csv",
+                "orders_10.csv",
+                "orders_11.csv",
+            ]
+        );
+    }
+
+    #[test]
+    fn complete_bounded_manifest_identity_is_stable_and_size_sensitive() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "orders-00.csv", "a");
+        write(tmp.path(), "orders-01.csv", "bb");
+        let mut source = cfg();
+        source.glob = Some("orders-*.csv".into());
+
+        let first = discover_bounded(&source, tmp.path(), 8).unwrap();
+        let second = discover_bounded(&source, tmp.path(), 8).unwrap();
+        assert_eq!(
+            first.complete_manifest_id(tmp.path()),
+            second.complete_manifest_id(tmp.path())
+        );
+
+        write(tmp.path(), "orders-01.csv", "changed size");
+        let changed = discover_bounded(&source, tmp.path(), 8).unwrap();
+        assert_ne!(
+            first.complete_manifest_id(tmp.path()),
+            changed.complete_manifest_id(tmp.path())
+        );
+
+        let truncated = discover_bounded(&source, tmp.path(), 1).unwrap();
+        assert_eq!(truncated.complete_manifest_id(tmp.path()), None);
     }
 
     #[test]

@@ -440,6 +440,7 @@ dependencies = [
  "clinker-record",
  "clinker-scenarios",
  "cxl",
+ "fs4",
  "indexmap",
  "insta",
  "miette",

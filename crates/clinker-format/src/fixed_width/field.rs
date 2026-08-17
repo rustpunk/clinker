@@ -17,7 +17,35 @@ use clinker_record::schema_def::{Justify, LineSeparator};
 use cxl::typecheck::Type;
 
 use crate::error::FormatError;
+use crate::numeric_observation::{NumericObservation, observe_positional_numeric_with_result};
 use crate::schema::Column;
+
+/// Result of one scalar coercion together with parser-owned numeric evidence
+/// when the declared target is `numeric`.
+///
+/// Keeping the observation outside the [`Result`] makes rejected numeric text
+/// observable without parsing it a second time merely to explain why guessing
+/// stayed unresolved.
+#[derive(Debug)]
+#[must_use]
+pub struct ObservedScalarCoercion {
+    result: Result<Value, String>,
+    numeric: Option<NumericObservation>,
+}
+
+impl ObservedScalarCoercion {
+    pub fn result(&self) -> Result<&Value, &str> {
+        self.result.as_ref().map_err(String::as_str)
+    }
+
+    pub fn numeric_observation(&self) -> Option<&NumericObservation> {
+        self.numeric.as_ref()
+    }
+
+    pub fn into_result(self) -> Result<Value, String> {
+        self.result
+    }
+}
 
 /// A fixed-width field resolved to a concrete byte range and parse policy.
 ///
@@ -463,79 +491,100 @@ pub fn coerce_scalar_with_constraints(
     scale: Option<u8>,
     raw: &str,
 ) -> Result<Value, String> {
-    match ty.unwrap_nullable() {
-        Type::Int => raw
-            .parse::<i64>()
-            .map(Value::Integer)
-            .map_err(|e| format!("cannot parse '{raw}' as int: {e}")),
-        Type::Float => parse_finite_float(raw).map(Value::Float),
-        // Exact base-10 parse into `Value::Decimal`. Never route through a
-        // binary float and never round to satisfy the authored scale.
-        Type::Decimal => {
-            let parsed =
-                clinker_record::coercion::coerce_to_decimal(&Value::String(raw.into()), None)
-                    .map_err(|e| e.to_string())?;
-            let Value::Decimal(decimal) = parsed else {
-                return Err("decimal coercion returned a non-decimal value".into());
-            };
-            let mut exact = decimal;
-            if let Some(scale) = scale {
-                let rounded =
-                    clinker_record::coercion::round_decimal_to_scale(decimal, Some(scale));
-                if rounded != decimal {
-                    return Err(format!(
-                        "decimal requires rounding to declared scale {scale}"
-                    ));
+    coerce_scalar_with_constraints_observed(ty, format, precision, scale, raw).into_result()
+}
+
+/// Coerce a positional scalar and retain the canonical numeric observation.
+/// Non-numeric declared targets return `None` for the observation.
+pub fn coerce_scalar_with_constraints_observed(
+    ty: &Type,
+    format: Option<&str>,
+    precision: Option<u8>,
+    scale: Option<u8>,
+    raw: &str,
+) -> ObservedScalarCoercion {
+    let (numeric, numeric_result) = if matches!(ty.unwrap_nullable(), Type::Numeric) {
+        let (observation, result) = observe_positional_numeric_with_result(raw);
+        (Some(observation), Some(result))
+    } else {
+        (None, None)
+    };
+    let result = (|| -> Result<Value, String> {
+        if let Some(result) = numeric_result {
+            return result;
+        }
+        match ty.unwrap_nullable() {
+            Type::Int => raw
+                .parse::<i64>()
+                .map(Value::Integer)
+                .map_err(|e| format!("cannot parse '{raw}' as int: {e}")),
+            Type::Float => parse_finite_float(raw).map(Value::Float),
+            // Exact base-10 parse into `Value::Decimal`. Never route through a
+            // binary float and never round to satisfy the authored scale.
+            Type::Decimal => {
+                let parsed =
+                    clinker_record::coercion::coerce_to_decimal(&Value::String(raw.into()), None)
+                        .map_err(|e| e.to_string())?;
+                let Value::Decimal(decimal) = parsed else {
+                    return Err("decimal coercion returned a non-decimal value".into());
+                };
+                let mut exact = decimal;
+                if let Some(scale) = scale {
+                    let rounded =
+                        clinker_record::coercion::round_decimal_to_scale(decimal, Some(scale));
+                    if rounded != decimal {
+                        return Err(format!(
+                            "decimal requires rounding to declared scale {scale}"
+                        ));
+                    }
+                    exact.rescale(u32::from(scale));
                 }
-                exact.rescale(u32::from(scale));
-            }
-            if let Some(max_digits) = precision {
-                let digits = exact.mantissa().unsigned_abs().to_string().len();
-                if digits > usize::from(max_digits) {
-                    return Err(format!(
-                        "decimal uses {digits} digits, exceeding declared precision {max_digits}"
-                    ));
+                if let Some(max_digits) = precision {
+                    let digits = exact.mantissa().unsigned_abs().to_string().len();
+                    if digits > usize::from(max_digits) {
+                        return Err(format!(
+                            "decimal uses {digits} digits, exceeding declared precision {max_digits}"
+                        ));
+                    }
                 }
+                Ok(Value::Decimal(exact))
             }
-            Ok(Value::Decimal(exact))
-        }
-        Type::Numeric => raw
-            .parse::<i64>()
-            .map(Value::Integer)
-            .or_else(|_| parse_finite_float(raw).map(Value::Float)),
-        Type::Bool => match raw.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "y" => Ok(Value::Bool(true)),
-            "false" | "0" | "no" | "n" => Ok(Value::Bool(false)),
-            _ => Err(format!("cannot parse '{raw}' as bool")),
-        },
-        Type::Date => {
-            let fmt = format.unwrap_or("%Y-%m-%d");
-            NaiveDate::parse_from_str(raw, fmt)
-                .map(Value::Date)
-                .map_err(|e| format!("cannot parse '{raw}' as date with format '{fmt}': {e}"))
-        }
-        Type::DateTime => {
-            // Honor an explicit `format:` (single format); otherwise fall back
-            // to the shared default datetime chain — the same set the
-            // CSV/native coercion path uses — so a positional `date_time`
-            // column parses the common serializations (ISO-`T`, space-separated,
-            // US) it did before this became a real reader-side parse.
-            let chain: Vec<&str> = format.into_iter().collect();
-            clinker_record::coercion::coerce_to_datetime(&Value::String(raw.into()), &chain)
-                .map_err(|e| e.to_string())
-        }
-        Type::Map => Err(
-            "a positional (fixed-width / multi-record) field cannot carry a `map` value; \
+            Type::Numeric => Err("numeric parser result was not established".into()),
+            Type::Bool => match raw.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "y" => Ok(Value::Bool(true)),
+                "false" | "0" | "no" | "n" => Ok(Value::Bool(false)),
+                _ => Err(format!("cannot parse '{raw}' as bool")),
+            },
+            Type::Date => {
+                let fmt = format.unwrap_or("%Y-%m-%d");
+                NaiveDate::parse_from_str(raw, fmt)
+                    .map(Value::Date)
+                    .map_err(|e| format!("cannot parse '{raw}' as date with format '{fmt}': {e}"))
+            }
+            Type::DateTime => {
+                // Honor an explicit `format:` (single format); otherwise fall back
+                // to the shared default datetime chain — the same set the
+                // CSV/native coercion path uses — so a positional `date_time`
+                // column parses the common serializations (ISO-`T`, space-separated,
+                // US) it did before this became a real reader-side parse.
+                let chain: Vec<&str> = format.into_iter().collect();
+                clinker_record::coercion::coerce_to_datetime(&Value::String(raw.into()), &chain)
+                    .map_err(|e| e.to_string())
+            }
+            Type::Map => Err(
+                "a positional (fixed-width / multi-record) field cannot carry a `map` value; \
              declare this column on a native JSON/XML source"
-                .to_string(),
-        ),
-        Type::Array => Err(
-            "a positional (fixed-width / multi-record) field cannot carry an `array` value; \
+                    .to_string(),
+            ),
+            Type::Array => Err(
+                "a positional (fixed-width / multi-record) field cannot carry an `array` value; \
              declare this column on a native JSON/XML source"
-                .to_string(),
-        ),
-        _ => Ok(Value::String(raw.into())),
-    }
+                    .to_string(),
+            ),
+            _ => Ok(Value::String(raw.into())),
+        }
+    })();
+    ObservedScalarCoercion { result, numeric }
 }
 
 fn parse_finite_float(raw: &str) -> Result<f64, String> {

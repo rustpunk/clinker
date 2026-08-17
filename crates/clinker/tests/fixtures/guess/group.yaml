@@ -1,0 +1,9 @@
+group:
+  name: xml_preview
+  targets: { pipelines: [guess.pipeline] }
+  priority: 10
+overrides:
+  - op: patch_schema
+    target: xml_orders
+    schema:
+      total: { type: numeric }

@@ -1,0 +1,132 @@
+{
+  "schema": "clinker.guess.report",
+  "version": 2,
+  "mode": "preview",
+  "exhaustive": false,
+  "outcome": "resolved",
+  "target": "guess_preview",
+  "selection": {
+    "kind": "base",
+    "name": null,
+    "applied_groups": []
+  },
+  "manifest": {
+    "schema": "clinker.guess.manifest",
+    "version": 1,
+    "identity_basis": "blake3-path-size-v1",
+    "preview_strata": [
+      "source",
+      "file"
+    ],
+    "total_files": 1,
+    "sources": [
+      {
+        "source": "csv_orders",
+        "discovered_files": 1,
+        "identity": "443789febf8f5522b682d8002e58f382a872db8f923d5a7bb7e2eb640d3ed659"
+      }
+    ]
+  },
+  "limits": {
+    "max_yaml_input_bytes": 33554432,
+    "max_yaml_nodes_per_document": 100000,
+    "max_schema_leaves": 100000,
+    "max_manifest_files": 4096,
+    "preview_max_file_opens_total": 4,
+    "preview_max_records_total": 1024,
+    "preview_max_input_bytes_total": 8388608,
+    "max_reported_files_per_source": 4,
+    "max_numeric_lexeme_evidence_bytes": 128,
+    "max_evidence_per_owner": 8
+  },
+  "coverage": [
+    {
+      "source": "csv_orders",
+      "format": "csv",
+      "discovered_files": 1,
+      "sampled_files": 1,
+      "truncated_files": 0,
+      "uncovered_files": 0,
+      "unreported_file_count": 0,
+      "sampled_input_bytes": 50,
+      "bytes_read": 50,
+      "records_sampled": 3,
+      "files": [
+        {
+          "path": "input.csv",
+          "status": "sampled",
+          "input_bytes": 50,
+          "bytes_read": 50,
+          "records_sampled": 3,
+          "truncated": false
+        }
+      ]
+    }
+  ],
+  "fields": [
+    {
+      "field": "csv_orders.amount",
+      "owners": [
+        {
+          "address": "/v1/schema/sources/csv_orders/records/detail/columns/amount/attributes/type",
+          "observations": 1,
+          "votes": {
+            "int": 1,
+            "float": 0,
+            "no_value": 0,
+            "unresolved": 0
+          },
+          "absence": {
+            "accepted": 0,
+            "forbidden": 0,
+            "default_votes": 0
+          },
+          "evidence": [
+            {
+              "origin": "input",
+              "boundary": "positional",
+              "lexeme": "10",
+              "original_bytes": 2,
+              "truncated": false,
+              "parser_outcome": "integer",
+              "vote": "int",
+              "reason": null
+            }
+          ],
+          "proposed_type": "int",
+          "unresolved_reasons": []
+        },
+        {
+          "address": "/v1/schema/sources/csv_orders/records/adjustment/columns/amount/attributes/type",
+          "observations": 1,
+          "votes": {
+            "int": 0,
+            "float": 1,
+            "no_value": 0,
+            "unresolved": 0
+          },
+          "absence": {
+            "accepted": 0,
+            "forbidden": 0,
+            "default_votes": 0
+          },
+          "evidence": [
+            {
+              "origin": "input",
+              "boundary": "positional",
+              "lexeme": "20.5",
+              "original_bytes": 4,
+              "truncated": false,
+              "parser_outcome": "float",
+              "vote": "float",
+              "reason": null
+            }
+          ],
+          "proposed_type": "float",
+          "unresolved_reasons": []
+        }
+      ]
+    }
+  ],
+  "patch": "edits:\n  - address: /v1/schema/sources/csv_orders/records/detail/columns/amount/attributes/type\n    from: numeric\n    to: int\n  - address: /v1/schema/sources/csv_orders/records/adjustment/columns/amount/attributes/type\n    from: nullable(numeric)\n    to: nullable(float)\n"
+}
