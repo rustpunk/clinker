@@ -6,6 +6,7 @@
 //! this plan to drive a run.
 
 pub mod config;
+pub mod credentials;
 pub mod error;
 pub mod overlay_ops;
 pub mod plan;
