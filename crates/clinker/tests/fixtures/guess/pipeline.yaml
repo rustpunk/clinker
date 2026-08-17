@@ -1,0 +1,34 @@
+pipeline:
+  name: guess_preview
+nodes:
+  - type: source
+    name: csv_orders
+    config:
+      name: csv_orders
+      type: csv
+      path: input.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: amount, type: numeric }
+  - type: source
+    name: json_orders
+    config:
+      name: json_orders
+      type: json
+      path: input.json
+      options:
+        format: array
+      schema:
+        - { name: order_id, type: string }
+        - { name: ratio, type: int }
+  - type: source
+    name: xml_orders
+    config:
+      name: xml_orders
+      type: xml
+      path: input.xml
+      options:
+        record_path: root/row
+      schema:
+        - { name: order_id, type: string }
+        - { name: total, type: int }

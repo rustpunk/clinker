@@ -1,4 +1,6 @@
+use clinker_exec::executor::build_source_format_reader;
 use clinker_exec::pipeline::schema_coerce::{CoercingReader, coerce_numeric_with_observation};
+use clinker_format::ReopenableSource;
 use clinker_format::edifact::{EdifactReader, EdifactReaderConfig};
 use clinker_format::fixed_width::field::{
     coerce_scalar_with_constraints, coerce_scalar_with_constraints_observed,
@@ -572,4 +574,114 @@ fn coercing_reader_emits_schema_observation_before_accepting_csv_text() {
     assert_eq!(field, "n");
     assert_eq!(observation.boundary(), NumericBoundary::SchemaCoerce);
     assert_eq!(record.get("n"), observation.parsed_value().as_ref());
+}
+
+fn source_body<'a>(
+    config: &'a clinker_plan::config::PipelineConfig,
+    name: &str,
+) -> &'a clinker_plan::config::SourceBody {
+    config
+        .source_bodies()
+        .find(|body| body.source.name == name)
+        .unwrap_or_else(|| panic!("source {name} exists"))
+}
+
+fn observe_with_shared_source_reader(
+    body: &clinker_plan::config::SourceBody,
+    input: &str,
+) -> (Value, NumericObservation) {
+    let (observer, observations) = observation_collector();
+    let source = ReopenableSource::buffer(Cursor::new(input.as_bytes().to_vec()))
+        .expect("buffer source bytes");
+    let mut reader = build_source_format_reader(
+        &body.source,
+        &body.schema,
+        body.on_unmapped.clone(),
+        source,
+        Some(observer),
+    )
+    .expect("shared source reader builds");
+    let record = reader
+        .next_record()
+        .expect("source record parses")
+        .expect("one source record");
+    assert!(reader.next_record().expect("source reaches EOF").is_none());
+    let observations = observations.lock().expect("observation collector lock");
+    let [(field, observation)] = observations.as_slice() else {
+        panic!("expected one numeric observation, got {observations:?}");
+    };
+    assert_eq!(field, "n");
+    (
+        record.get("n").expect("n field").clone(),
+        observation.clone(),
+    )
+}
+
+#[test]
+fn shared_guess_reader_matches_runtime_csv_json_and_xml_construction() {
+    let config = clinker_plan::config::load_config_from_str(
+        r#"
+pipeline:
+  name: shared_reader_parity
+nodes:
+  - type: source
+    name: csv_source
+    config:
+      name: csv_source
+      type: csv
+      path: unused.csv
+      options:
+        delimiter: ";"
+      schema:
+        - { name: n, type: numeric }
+  - type: source
+    name: json_source
+    config:
+      name: json_source
+      type: json
+      path: unused.json
+      options:
+        format: array
+      schema:
+        - { name: n, type: numeric }
+  - type: source
+    name: xml_source
+    config:
+      name: xml_source
+      type: xml
+      path: unused.xml
+      options:
+        record_path: root/row
+      schema:
+        - { name: n, type: numeric }
+"#,
+    )
+    .expect("parse reader parity config");
+
+    let (csv_value, csv_observation) = observe_with_shared_source_reader(
+        source_body(&config, "csv_source"),
+        "n;ignored\n42.5;x\n",
+    );
+    assert_eq!(csv_value, Value::Float(42.5));
+    assert_eq!(csv_observation.boundary(), NumericBoundary::SchemaCoerce);
+    assert_eq!(csv_observation.vote(), NumericVote::Float);
+
+    let (json_value, json_observation) = observe_with_shared_source_reader(
+        source_body(&config, "json_source"),
+        r#"[{"n":0.10000000000000001}]"#,
+    );
+    assert_eq!(json_value, Value::Float(0.1));
+    assert_eq!(json_observation.boundary(), NumericBoundary::Json);
+    assert_eq!(
+        json_observation.vote(),
+        NumericVote::Unresolved(NumericIssue::PrecisionLoss)
+    );
+
+    let (xml_value, xml_observation) = observe_with_shared_source_reader(
+        source_body(&config, "xml_source"),
+        "<root><row><n>42</n></row></root>",
+    );
+    assert_eq!(xml_value, Value::Integer(42));
+    assert_eq!(xml_observation.boundary(), NumericBoundary::Xml);
+    assert_eq!(xml_observation.vote(), NumericVote::Int);
 }

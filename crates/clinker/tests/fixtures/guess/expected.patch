@@ -1,0 +1,4 @@
+edits:
+  - address: /v1/schema/sources/csv_orders/columns/amount/attributes/type
+    from: numeric
+    to: int

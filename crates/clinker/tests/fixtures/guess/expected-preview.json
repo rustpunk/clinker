@@ -1,0 +1,78 @@
+{
+  "schema": "clinker.guess.preview",
+  "version": 1,
+  "target": "guess_preview",
+  "selection": {
+    "kind": "base",
+    "name": null,
+    "applied_groups": []
+  },
+  "limits": {
+    "max_files_per_source": 4,
+    "max_records_per_file": 1024,
+    "max_input_bytes_per_file": 8388608,
+    "max_evidence_per_field": 8
+  },
+  "coverage": [
+    {
+      "source": "csv_orders",
+      "format": "csv",
+      "discovered_files": 1,
+      "files": [
+        {
+          "path": "input.csv",
+          "status": "sampled",
+          "input_bytes": 37,
+          "bytes_read": 37,
+          "records_sampled": 3,
+          "truncated": false
+        }
+      ]
+    }
+  ],
+  "fields": [
+    {
+      "field": "csv_orders.amount",
+      "address": "/v1/schema/sources/csv_orders/columns/amount/attributes/type",
+      "observations": 3,
+      "votes": {
+        "int": 3,
+        "float": 0,
+        "no_value": 0,
+        "unresolved": 0
+      },
+      "evidence": [
+        {
+          "boundary": "schema_coerce",
+          "lexeme": "10",
+          "original_bytes": 2,
+          "truncated": false,
+          "parser_outcome": "integer",
+          "vote": "int",
+          "reason": null
+        },
+        {
+          "boundary": "schema_coerce",
+          "lexeme": "20",
+          "original_bytes": 2,
+          "truncated": false,
+          "parser_outcome": "integer",
+          "vote": "int",
+          "reason": null
+        },
+        {
+          "boundary": "schema_coerce",
+          "lexeme": "30",
+          "original_bytes": 2,
+          "truncated": false,
+          "parser_outcome": "integer",
+          "vote": "int",
+          "reason": null
+        }
+      ],
+      "proposed_type": "int",
+      "unresolved_reasons": []
+    }
+  ],
+  "patch": "edits:\n  - address: /v1/schema/sources/csv_orders/columns/amount/attributes/type\n    from: numeric\n    to: int\n"
+}
