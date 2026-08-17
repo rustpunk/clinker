@@ -73,7 +73,7 @@ nodes:
           drop_group_when: "count(*) > 3"
 
   # Main output: employees with a manageable plan history.
-  - type: output
+  - type: sink
     name: out
     input: flag_large_histories
     config:
@@ -82,7 +82,7 @@ nodes:
       path: ./output/employee_plans_clean.csv
 
   # Side output: employees flagged for manual review.
-  - type: output
+  - type: sink
     name: review
     input: flag_large_histories.review
     config:

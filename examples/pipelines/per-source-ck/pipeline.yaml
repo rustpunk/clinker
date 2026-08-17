@@ -65,7 +65,7 @@ nodes:
         emit total = sum(amount)
         emit n = count(*)
 
-  - type: output
+  - type: sink
     name: report
     input: regional_totals
     config:

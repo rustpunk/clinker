@@ -30,7 +30,7 @@ nodes:
         emit user_id = user_id
         emit n = count(*)
 
-  - type: output
+  - type: sink
     name: results
     input: hourly_clicks
     config:
