@@ -1590,7 +1590,7 @@ pub fn open_source_file(path: &Path) -> io::Result<File> {
 /// Returns [`StagingError::Verify`] on a digest mismatch, or [`StagingError::Io`]
 /// when the source cannot be re-read.
 fn verify_staged(source: &Path, staged: &Path, copy_hash: String) -> Result<String, StagingError> {
-    let source_hash = hash_path(source)?;
+    let source_hash = content_digest(source)?;
     if source_hash != copy_hash {
         let _ = std::fs::remove_file(staged);
         return Err(StagingError::Verify {
@@ -1606,7 +1606,14 @@ fn verify_staged(source: &Path, staged: &Path, copy_hash: String) -> Result<Stri
 ///
 /// Reads in the same 1 MiB chunks as the copy so the verify pass has the same
 /// bounded memory footprint. Returns the hex BLAKE3 digest.
-fn hash_path(path: &Path) -> Result<String, StagingError> {
+/// Compute the exact BLAKE3 digest of a regular file with one fixed-size
+/// streaming buffer.
+///
+/// This is the read-only half of staging verification, exposed so CLI-edge
+/// compare-and-swap operations can freeze input contents without retaining
+/// source-sized byte buffers. Callers remain responsible for rejecting
+/// symlinks or non-regular files when their policy requires local ownership.
+pub fn content_digest(path: &Path) -> Result<String, StagingError> {
     let mut reader = File::open(path).map_err(|e| StagingError::Io {
         path: path.to_path_buf(),
         source: e,
@@ -1661,9 +1668,10 @@ fn advise_sequential(_file: &File) {}
 /// `fsync(dir)` equivalent anyway.
 #[cfg(unix)]
 fn fsync_parent_dir(published: &Path) -> Result<(), StagingError> {
-    let Some(parent) = published.parent() else {
-        return Ok(());
-    };
+    let parent = published
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let dir = File::open(parent).map_err(|e| StagingError::Io {
         path: parent.to_path_buf(),
         source: e,
@@ -1679,6 +1687,68 @@ fn fsync_parent_dir(published: &Path) -> Result<(), StagingError> {
 #[cfg(not(unix))]
 fn fsync_parent_dir(_published: &Path) -> Result<(), StagingError> {
     Ok(())
+}
+
+/// Make a completed sibling-temp rename durable using the same platform rules
+/// as source staging.
+pub fn sync_parent_directory(published: &Path) -> Result<(), StagingError> {
+    fsync_parent_dir(published)
+}
+
+/// Open a persistent advisory-lock sidecar without following a final symlink.
+///
+/// The file is created owner-only on Unix and an existing group/other-accessible
+/// file is rejected. Every platform also rejects a non-regular final target.
+/// The caller owns the `fs4` lock; keeping this sidecar rather than deleting it
+/// preserves one stable lock inode across atomic replacement of its sibling.
+pub fn open_owner_only_lock_file(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        options
+            .mode(0o600)
+            .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "advisory lock path is not a regular file",
+            ));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "advisory lock file is accessible by group or other users",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // winbase.h: FILE_FLAG_OPEN_REPARSE_POINT. Opening the reparse point
+        // itself, rather than its target, lets the metadata check below reject
+        // a final symlink/junction without following it.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(not(unix))]
+    {
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() || std::fs::symlink_metadata(path)?.file_type().is_symlink()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "advisory lock path is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
 }
 
 #[cfg(test)]
@@ -1706,6 +1776,31 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().ends_with(suffix))
             .count()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_lock_open_is_owner_only_and_never_follows_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join("pipeline.lock");
+        let file = open_owner_only_lock_file(&lock).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o077, 0);
+        drop(file);
+
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            open_owner_only_lock_file(&lock).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        std::fs::remove_file(&lock).unwrap();
+        let target = directory.path().join("target");
+        std::fs::write(&target, b"unchanged").unwrap();
+        symlink(&target, &lock).unwrap();
+        assert!(open_owner_only_lock_file(&lock).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"unchanged");
     }
 
     #[test]

@@ -115,8 +115,8 @@ with a new execution ID for every retry.
 
 ## clinker guess
 
-Preview or exhaustively check concrete `int` or `float` replacements for
-inference-only `numeric` columns without editing the pipeline.
+Preview, exhaustively check, or safely write concrete `int` or `float`
+replacements for inference-only `numeric` columns.
 
 ```text
 clinker guess [OPTIONS] <CONFIG>
@@ -136,15 +136,16 @@ effective configuration.
 | `--group <NAME>` | Select one explicit, target-admitted group without a channel. |
 | `--field <NODE.COLUMN>` | Narrow the preview to one `numeric` source field. Repeatable; repeated selectors are deduplicated in request order. In a multi-record schema, one selector covers every same-named literal `numeric` owner across `records:` while leaving same-named concrete declarations unchanged. Unknown, malformed, or entirely concrete fields are rejected. |
 | `--check` | Exhaust the frozen, capped manifest and exit `3` if any selected owner remains unresolved. |
-| `--write` | Reserved for compare-and-swap editing. Currently exits `1`, recommends `--check`, and changes no file. |
+| `--write` | Exhaust evidence and edit exactly one inline, literal, single-owner `numeric` leaf after guarded compare-and-swap revalidation. Mutually exclusive with `--check`. |
 | `--base-dir <DIR>` | Workspace root holding `clinker.toml` and the channel/group roots. Defaults to the pipeline file's directory. |
 
 The command constructs readers through the same CSV, JSON, and XML option and
 schema-coercion path as runtime ingest. It emits one deterministic JSON document
 containing the selected configuration, bounded coverage, parser-owned numeric
 evidence, unresolved reasons, proposed types, and an exact semantic YAML patch.
-The patch is a preview string inside the report; this command never changes the
-pipeline or an overlay.
+Preview and check never edit. Write reports `written` only after guarded
+publication completes; otherwise it reports `not_written` and leaves the patch
+for manual application. It never edits an overlay.
 
 Each field report carries an `owners` array. Every owner has its own evidence,
 votes, proposed type, unresolved reasons, and exact address. A single-record
@@ -167,15 +168,35 @@ Candidate storage is capped at 100,000 source-schema leaves, matching the
 canonical YAML parser's 100,000-node limit; each YAML document is also capped
 at 32 MiB. Each parser-owned `NumericObservation` retains at most 128 numeric
 lexeme bytes, and each exact schema owner retains at most eight evidence items.
-These limits appear in the JSON report. Candidate, observation, evidence, and
-coverage collections are therefore fixed-bounded independently of input size;
-the preview does not register a runtime memory consumer.
+These limits appear in the JSON report. Candidate, observation, evidence,
+coverage, and write-snapshot collections are fixed-bounded independently of
+input size. Write retains one fixed-size digest per file in the 4,096-file
+manifest and hashes through a fixed 1 MiB buffer; it does not register a
+runtime memory consumer.
+
+Write is eligible only for one resolved owner in the base pipeline whose exact
+authored bytes and direct YAML provenance identify a literal inline `numeric`
+leaf. It preserves all sibling bytes and proves by canonical reparse that only
+that type leaf changed in the resolved staged configuration. Overlays,
+external/generated or synthetic ownership, aliases, interpolation, symlinks,
+non-local inputs, multiple owners, unresolved evidence, and input/config drift
+are patch-only outcomes.
+
+The CLI holds an advisory `fs4` lock on the stable sibling
+`<CONFIG>.clinker-guess.lock` file through sibling-temp flush/fsync, final
+byte/semantic/input revalidation, atomic rename, and directory fsync. The lock
+file remains beside the config so every cooperating replacement locks the same
+inode. It must remain a regular non-symlink file and is owner-only on Unix. This
+is a fail-closed compare-and-swap for cooperating writers using the same lock,
+not a kernel-enforced conditional rename against a writer that ignores advisory
+locking; such a writer can race after the final comparison.
 
 Exit `0` means a complete preview was written, including an unresolved preview,
-or an exhaustive check resolved every owner. Selection, configuration,
-unavailable `--write`, and field errors exit `1`; unresolved exhaustive checks
-exit `3`; source discovery, input I/O, reader, signal-handler, and stdout
-failures exit `4`; interruption exits `130` before any report is emitted.
+an exhaustive check resolved every owner, or one safe write was published.
+Selection, configuration, and field errors exit `1`; unresolved checks and
+patch-only/no-edit writes exit `3`; source discovery, input I/O, reader,
+publication, signal-handler, and stdout failures exit `4`; interruption exits
+`130` before any report is emitted or before publication begins.
 
 ```bash
 # Preview every inference-only numeric leaf in the base pipeline
@@ -189,6 +210,9 @@ clinker guess pipeline.yaml --group enterprise
 
 # Exhaust the frozen manifest and make unresolved owners fail the command
 clinker guess pipeline.yaml --check
+
+# Exhaust evidence and edit one safe directly-authored owner
+clinker guess pipeline.yaml --field orders.amount --write
 ```
 
 ---

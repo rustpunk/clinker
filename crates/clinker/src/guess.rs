@@ -1,10 +1,12 @@
-//! Read-only schema concretization preview for inference-only `numeric` leaves.
+//! Schema concretization preview, check, and guarded write for `numeric` leaves.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::io::Write;
-use std::path::Path;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use clinker_format::numeric_observation::{
     NumericAcceptance, NumericBoundary, NumericIssue, NumericObservation, NumericParserOutcome,
@@ -19,6 +21,7 @@ use clinker_plan::config::{PipelineNode, SourceBody, SourceTransport};
 use clinker_plan::error::PipelineError;
 use clinker_record::{Record, Value};
 use cxl::typecheck::Type;
+use fs4::FileExt;
 use indexmap::{IndexMap, IndexSet};
 use serde::Serialize;
 
@@ -237,6 +240,33 @@ struct GuessReport {
     coverage: Vec<SourceCoverage>,
     fields: Vec<FieldReport>,
     patch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    write: Option<WriteReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct WriteReport {
+    status: &'static str,
+    reason: Option<&'static str>,
+    owner: Option<String>,
+}
+
+impl WriteReport {
+    fn written(owner: String) -> Self {
+        Self {
+            status: "written",
+            reason: None,
+            owner: Some(owner),
+        }
+    }
+
+    fn not_written(reason: &'static str, owner: Option<String>) -> Self {
+        Self {
+            status: "not_written",
+            reason: Some(reason),
+            owner,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -382,16 +412,19 @@ struct EffectiveConfig {
 enum GuessMode {
     Preview,
     Check,
+    Write,
 }
 
 impl GuessMode {
     fn from_args(args: &GuessArgs) -> Result<Self, GuessError> {
-        if args.write {
+        if args.check && args.write {
             return Err(GuessError::configuration(
-                "--write is unavailable until compare-and-swap editing is installed; correction: run `clinker guess CONFIG --check` and apply the emitted patch manually",
+                "--check and --write are distinct exhaustive modes; correction: remove one of the two flags",
             ));
         }
-        Ok(if args.check {
+        Ok(if args.write {
+            Self::Write
+        } else if args.check {
             Self::Check
         } else {
             Self::Preview
@@ -402,19 +435,33 @@ impl GuessMode {
         match self {
             Self::Preview => "preview",
             Self::Check => "check",
+            Self::Write => "write",
         }
     }
 
     fn exhaustive(self) -> bool {
-        matches!(self, Self::Check)
+        matches!(self, Self::Check | Self::Write)
     }
 }
 
-/// Execute a read-only preview or exhaustive check and print one stable JSON
-/// document. No mode in this module edits configuration or input files.
+/// Execute a preview, exhaustive check, or guarded single-owner write and print
+/// one stable JSON document.
 pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
     let mode = GuessMode::from_args(args)?;
+    let config_snapshot = if matches!(mode, GuessMode::Write) {
+        Some(snapshot_config(&args.config)?)
+    } else {
+        None
+    };
     let effective = resolve_effective_config(args)?;
+    let effective_digest =
+        clinker_plan::config::canonical::semantic_config_digest(&effective.config)
+            .map_err(|error| GuessError::infrastructure(error.to_string()))?;
+    let config_unchanged_for_analysis = if let Some(snapshot) = &config_snapshot {
+        snapshot_config(&args.config)?.raw == snapshot.raw
+    } else {
+        true
+    };
     let mut candidates = select_candidates(&effective.config, &args.fields)?;
     index_numeric_owners(&mut candidates);
     let accumulators = Arc::new(Mutex::new(build_accumulators(&candidates)));
@@ -432,6 +479,11 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
         })?;
     let shutdown = clinker_exec::pipeline::shutdown::ShutdownToken::new();
     let manifest = freeze_manifest(&effective.config, &candidates, &config_dir)?;
+    let input_snapshot = if matches!(mode, GuessMode::Write) {
+        Some(InputSnapshot::capture(&manifest)?)
+    } else {
+        None
+    };
     let manifest_report = ManifestReport {
         schema: "clinker.guess.manifest",
         version: 1,
@@ -464,6 +516,13 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
             &config_dir,
             &shutdown,
         )?,
+        GuessMode::Write => check_sources_exhaustively(
+            &manifest,
+            &candidates,
+            Arc::clone(&accumulators),
+            &config_dir,
+            &shutdown,
+        )?,
     };
     if shutdown.is_requested() {
         return Err(GuessError::interrupted());
@@ -483,7 +542,14 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
                     let accumulated = &accumulators[owner.accumulator_index];
                     let (proposed_type, unresolved_reasons) = accumulated.resolution();
                     if let Some(concrete) = proposed_type {
+                        let replacement = match concrete {
+                            "int" => clinker_plan::config::canonical::ConcreteNumericType::Int,
+                            "float" => clinker_plan::config::canonical::ConcreteNumericType::Float,
+                            _ => unreachable!("numeric resolution returns int or float"),
+                        };
                         edits.push(PatchEdit {
+                            owner: owner.address.clone(),
+                            replacement,
                             address: owner.address.render(),
                             from_type: render_numeric_type(&owner.declared_type, "numeric"),
                             to_type: render_numeric_type(&owner.declared_type, concrete),
@@ -518,9 +584,59 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
         })
         .collect();
     let patch = render_patch(&edits);
+    drop(accumulators);
+    let mut write_succeeded = false;
+    let write = if matches!(mode, GuessMode::Write) {
+        let Some(initial_config) = config_snapshot.as_ref() else {
+            return Err(GuessError::infrastructure(
+                "internal: write mode did not capture config bytes".to_owned(),
+            ));
+        };
+        let Some(initial_inputs) = input_snapshot.as_ref() else {
+            return Err(GuessError::infrastructure(
+                "internal: write mode did not capture input bytes".to_owned(),
+            ));
+        };
+        let report = if !resolved {
+            WriteReport::not_written("unresolved_evidence", None)
+        } else if effective.selection.kind != "base" {
+            WriteReport::not_written("effective_config_has_overlay", None)
+        } else if let Some(reason) = initial_config.ineligible_reason {
+            WriteReport::not_written(reason, None)
+        } else if let Some(reason) = initial_inputs.ineligible_reason {
+            WriteReport::not_written(reason, None)
+        } else if !config_unchanged_for_analysis {
+            WriteReport::not_written("config_changed_during_analysis", None)
+        } else if InputSnapshot::capture(&manifest)
+            .map(|snapshot| snapshot != *initial_inputs)
+            .unwrap_or(true)
+        {
+            WriteReport::not_written("input_changed_during_analysis", None)
+        } else if edits.len() != 1 {
+            WriteReport::not_written("write_requires_one_owner", None)
+        } else {
+            perform_write(
+                args,
+                initial_config,
+                initial_inputs,
+                effective_digest,
+                &edits[0],
+                &config_dir,
+                &shutdown,
+            )?
+        };
+        write_succeeded = report.status == "written";
+        Some(report)
+    } else {
+        None
+    };
     let report = GuessReport {
         schema: "clinker.guess.report",
-        version: 2,
+        version: if matches!(mode, GuessMode::Write) {
+            3
+        } else {
+            2
+        },
         mode: mode.label(),
         exhaustive: mode.exhaustive(),
         outcome: if resolved { "resolved" } else { "unresolved" },
@@ -543,6 +659,7 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
         coverage,
         fields,
         patch,
+        write,
     };
     let output = serde_json::to_string_pretty(&report)
         .map_err(|error| GuessError::infrastructure(format!("cannot render preview: {error}")))?;
@@ -553,11 +670,475 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
     stdout.write_all(b"\n").map_err(|error| {
         GuessError::infrastructure(format!("cannot finish preview on stdout: {error}"))
     })?;
-    Ok(if matches!(mode, GuessMode::Check) && !resolved {
-        3
-    } else {
-        0
+    Ok(match mode {
+        GuessMode::Preview => 0,
+        GuessMode::Check if resolved => 0,
+        GuessMode::Check => 3,
+        GuessMode::Write if write_succeeded => 0,
+        GuessMode::Write => 3,
     })
+}
+
+struct ConfigFileLock {
+    file: File,
+}
+
+enum ConfigLockAttempt {
+    Acquired(ConfigFileLock),
+    Contended,
+    Ineligible(&'static str),
+}
+
+impl ConfigFileLock {
+    fn try_acquire(config_path: &Path) -> Result<ConfigLockAttempt, GuessError> {
+        let lock_path = config_lock_path(config_path)?;
+        match std::fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Ok(ConfigLockAttempt::Ineligible("config_lock_symlink"));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Ok(ConfigLockAttempt::Ineligible(
+                    "config_lock_not_regular_file",
+                ));
+            }
+            Ok(metadata) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    if metadata.permissions().mode() & 0o077 != 0 {
+                        return Ok(ConfigLockAttempt::Ineligible("config_lock_permissions"));
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(GuessError::infrastructure(format!(
+                    "cannot inspect pipeline config lock {}: {error}",
+                    lock_path.display()
+                )));
+            }
+        }
+        let file = match clinker_channel::staging_copy::open_owner_only_lock_file(&lock_path) {
+            Ok(file) => file,
+            Err(error) => {
+                let reason = std::fs::symlink_metadata(&lock_path)
+                    .ok()
+                    .and_then(|metadata| {
+                        if metadata.file_type().is_symlink() {
+                            Some("config_lock_symlink")
+                        } else if !metadata.is_file() {
+                            Some("config_lock_not_regular_file")
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(reason) = reason {
+                    return Ok(ConfigLockAttempt::Ineligible(reason));
+                }
+                return Err(GuessError::infrastructure(format!(
+                    "cannot safely open pipeline config lock {}: {error}",
+                    lock_path.display()
+                )));
+            }
+        };
+        match FileExt::try_lock(&file) {
+            Ok(()) => Ok(ConfigLockAttempt::Acquired(Self { file })),
+            Err(fs4::TryLockError::WouldBlock) => Ok(ConfigLockAttempt::Contended),
+            Err(fs4::TryLockError::Error(error)) => Err(GuessError::infrastructure(format!(
+                "cannot lock pipeline config lock {}: {error}",
+                lock_path.display()
+            ))),
+        }
+    }
+}
+
+fn config_lock_path(config_path: &Path) -> Result<PathBuf, GuessError> {
+    let Some(file_name) = config_path.file_name() else {
+        return Err(GuessError::configuration(format!(
+            "pipeline config {} has no filename to lock",
+            config_path.display()
+        )));
+    };
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".clinker-guess.lock");
+    Ok(config_path.with_file_name(lock_name))
+}
+
+impl Drop for ConfigFileLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn perform_write(
+    args: &GuessArgs,
+    initial_config: &ConfigSnapshot,
+    initial_inputs: &InputSnapshot,
+    effective_digest: [u8; 32],
+    proposed: &PatchEdit,
+    config_dir: &Path,
+    shutdown: &clinker_exec::pipeline::shutdown::ShutdownToken,
+) -> Result<WriteReport, GuessError> {
+    use clinker_plan::config::canonical::{
+        NumericTypeEditDecision, plan_numeric_type_edit, prove_numeric_type_only_change,
+        prove_resolved_numeric_type_only_change,
+    };
+
+    let owner = proposed.address.clone();
+    let edit =
+        match plan_numeric_type_edit(&initial_config.raw, &proposed.owner, proposed.replacement)
+            .map_err(|error| GuessError::infrastructure(error.to_string()))?
+        {
+            NumericTypeEditDecision::Editable(edit) => edit,
+            NumericTypeEditDecision::Ineligible(reason) => {
+                return Ok(WriteReport::not_written(reason.as_str(), Some(owner)));
+            }
+        };
+    let edited = edit
+        .apply(&initial_config.raw)
+        .map_err(|error| GuessError::infrastructure(error.to_string()))?;
+    prove_numeric_type_only_change(
+        &initial_config.raw,
+        &edited,
+        &proposed.owner,
+        proposed.replacement,
+    )
+    .map_err(|error| GuessError::infrastructure(error.to_string()))?;
+
+    let _config_lock = match ConfigFileLock::try_acquire(&args.config)? {
+        ConfigLockAttempt::Acquired(lock) => lock,
+        ConfigLockAttempt::Contended => {
+            return Ok(WriteReport::not_written(
+                "config_lock_contended",
+                Some(owner),
+            ));
+        }
+        ConfigLockAttempt::Ineligible(reason) => {
+            return Ok(WriteReport::not_written(reason, Some(owner)));
+        }
+    };
+    let locked_metadata = std::fs::symlink_metadata(&args.config).map_err(|error| {
+        GuessError::infrastructure(format!(
+            "cannot inspect pipeline config {} after locking: {error}",
+            args.config.display()
+        ))
+    })?;
+    if !locked_metadata.is_file() {
+        return Ok(WriteReport::not_written(
+            "config_not_regular_file",
+            Some(owner),
+        ));
+    }
+    let permissions = locked_metadata.permissions();
+    let parent = args
+        .config
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        GuessError::infrastructure(format!(
+            "cannot create sibling temporary config beside {}: {error}",
+            args.config.display()
+        ))
+    })?;
+    staged
+        .as_file()
+        .set_permissions(permissions)
+        .map_err(|error| {
+            GuessError::infrastructure(format!(
+                "cannot preserve pipeline config permissions: {error}"
+            ))
+        })?;
+    staged.write_all(edited.as_bytes()).map_err(|error| {
+        GuessError::infrastructure(format!("cannot stage edited pipeline config: {error}"))
+    })?;
+    staged.flush().map_err(|error| {
+        GuessError::infrastructure(format!("cannot flush staged pipeline config: {error}"))
+    })?;
+    staged.as_file().sync_all().map_err(|error| {
+        GuessError::infrastructure(format!("cannot fsync staged pipeline config: {error}"))
+    })?;
+
+    wait_for_test_write_barrier(shutdown)?;
+    if shutdown.is_requested() {
+        return Err(GuessError::interrupted());
+    }
+
+    // This is the final compare immediately before the publication CAS. The
+    // lock coordinates cooperating writers; exact path bytes also catch a
+    // non-cooperating replace that happened before this check.
+    let path_snapshot = match snapshot_config(&args.config) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return Ok(WriteReport::not_written(
+                "config_changed_before_publication",
+                Some(owner),
+            ));
+        }
+    };
+    if path_snapshot.ineligible_reason.is_some() || path_snapshot.raw != initial_config.raw {
+        return Ok(WriteReport::not_written(
+            "config_changed_before_publication",
+            Some(owner),
+        ));
+    }
+    let fresh_effective = match resolve_effective_config(args) {
+        Ok(effective) => effective,
+        Err(_) => {
+            return Ok(WriteReport::not_written(
+                "effective_config_changed_before_publication",
+                Some(owner),
+            ));
+        }
+    };
+    let fresh_digest =
+        clinker_plan::config::canonical::semantic_config_digest(&fresh_effective.config)
+            .map_err(|error| GuessError::infrastructure(error.to_string()))?;
+    if fresh_digest != effective_digest {
+        return Ok(WriteReport::not_written(
+            "effective_config_changed_before_publication",
+            Some(owner),
+        ));
+    }
+    let fresh_candidates = match select_candidates(&fresh_effective.config, &args.fields) {
+        Ok(candidates) => candidates,
+        Err(_) => {
+            return Ok(WriteReport::not_written(
+                "effective_config_changed_before_publication",
+                Some(owner),
+            ));
+        }
+    };
+    let fresh_manifest =
+        match freeze_manifest(&fresh_effective.config, &fresh_candidates, config_dir) {
+            Ok(manifest) => manifest,
+            Err(_) => {
+                return Ok(WriteReport::not_written(
+                    "input_changed_before_publication",
+                    Some(owner),
+                ));
+            }
+        };
+    let fresh_inputs = match InputSnapshot::capture(&fresh_manifest) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return Ok(WriteReport::not_written(
+                "input_changed_before_publication",
+                Some(owner),
+            ));
+        }
+    };
+    if fresh_inputs != *initial_inputs {
+        return Ok(WriteReport::not_written(
+            "input_changed_before_publication",
+            Some(owner),
+        ));
+    }
+    // Input hashing can take longer than the config checks above. Repeat the
+    // exact config and typed-effective checks after it so the final config
+    // comparison, owner proof, and rename are adjacent.
+    let final_path_snapshot = match snapshot_config(&args.config) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return Ok(WriteReport::not_written(
+                "config_changed_before_publication",
+                Some(owner),
+            ));
+        }
+    };
+    if final_path_snapshot.ineligible_reason.is_some()
+        || final_path_snapshot.raw != initial_config.raw
+    {
+        return Ok(WriteReport::not_written(
+            "config_changed_before_publication",
+            Some(owner),
+        ));
+    }
+    let final_effective = match resolve_effective_config(args) {
+        Ok(effective) => effective,
+        Err(_) => {
+            return Ok(WriteReport::not_written(
+                "effective_config_changed_before_publication",
+                Some(owner),
+            ));
+        }
+    };
+    let final_digest =
+        clinker_plan::config::canonical::semantic_config_digest(&final_effective.config)
+            .map_err(|error| GuessError::infrastructure(error.to_string()))?;
+    if final_digest != effective_digest {
+        return Ok(WriteReport::not_written(
+            "effective_config_changed_before_publication",
+            Some(owner),
+        ));
+    }
+    let empty_patches = IndexMap::new();
+    let staged_effective =
+        clinker_plan::config::load_config_with_vars_and_patches(staged.path(), &[], &empty_patches)
+            .map_err(|error| {
+                GuessError::infrastructure(format!(
+                    "cannot resolve staged pipeline config before publication: {error}"
+                ))
+            })?;
+    prove_resolved_numeric_type_only_change(
+        &final_effective.config,
+        &staged_effective,
+        &proposed.owner,
+        proposed.replacement,
+    )
+    .map_err(|error| GuessError::infrastructure(error.to_string()))?;
+    match plan_numeric_type_edit(
+        &final_path_snapshot.raw,
+        &proposed.owner,
+        proposed.replacement,
+    )
+    .map_err(|error| GuessError::infrastructure(error.to_string()))?
+    {
+        NumericTypeEditDecision::Editable(current) if current == edit => {}
+        NumericTypeEditDecision::Editable(_) | NumericTypeEditDecision::Ineligible(_) => {
+            return Ok(WriteReport::not_written(
+                "owner_changed_before_publication",
+                Some(owner),
+            ));
+        }
+    }
+    prove_numeric_type_only_change(
+        &final_path_snapshot.raw,
+        &edited,
+        &proposed.owner,
+        proposed.replacement,
+    )
+    .map_err(|error| GuessError::infrastructure(error.to_string()))?;
+
+    // Re-hash the complete bounded input snapshot after staged semantic
+    // resolution so input equality is the last potentially long operation
+    // before publication. The stable config lock protects cooperating config
+    // writers while this pass runs; a final exact-byte check follows it.
+    let publication_candidates = match select_candidates(&final_effective.config, &args.fields) {
+        Ok(candidates) => candidates,
+        Err(_) => {
+            return Ok(WriteReport::not_written(
+                "effective_config_changed_before_publication",
+                Some(owner),
+            ));
+        }
+    };
+    let publication_manifest =
+        match freeze_manifest(&final_effective.config, &publication_candidates, config_dir) {
+            Ok(manifest) => manifest,
+            Err(_) => {
+                return Ok(WriteReport::not_written(
+                    "input_changed_before_publication",
+                    Some(owner),
+                ));
+            }
+        };
+    let publication_inputs = match InputSnapshot::capture(&publication_manifest) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return Ok(WriteReport::not_written(
+                "input_changed_before_publication",
+                Some(owner),
+            ));
+        }
+    };
+    if publication_inputs != *initial_inputs {
+        return Ok(WriteReport::not_written(
+            "input_changed_before_publication",
+            Some(owner),
+        ));
+    }
+    let publication_config = match snapshot_config(&args.config) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return Ok(WriteReport::not_written(
+                "config_changed_before_publication",
+                Some(owner),
+            ));
+        }
+    };
+    if publication_config.ineligible_reason.is_some()
+        || publication_config.raw != initial_config.raw
+    {
+        return Ok(WriteReport::not_written(
+            "config_changed_before_publication",
+            Some(owner),
+        ));
+    }
+
+    maybe_inject_write_failure()?;
+    maybe_inject_write_interruption(shutdown);
+    if !shutdown.try_begin_publication() {
+        return Err(GuessError::interrupted());
+    }
+    staged.persist(&args.config).map_err(|error| {
+        GuessError::infrastructure(format!(
+            "cannot atomically replace pipeline config {}: {}",
+            args.config.display(),
+            error.error
+        ))
+    })?;
+    clinker_channel::staging_copy::sync_parent_directory(&args.config)
+        .map_err(|error| GuessError::infrastructure(error.to_string()))?;
+    Ok(WriteReport::written(owner))
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_test_write_barrier(
+    shutdown: &clinker_exec::pipeline::shutdown::ShutdownToken,
+) -> Result<(), GuessError> {
+    let Some(directory) = std::env::var_os("CLINKER_TEST_GUESS_WRITE_BARRIER") else {
+        return Ok(());
+    };
+    let directory = PathBuf::from(directory);
+    let ready = directory.join("ready");
+    let proceed = directory.join("continue");
+    std::fs::write(&ready, b"ready").map_err(|error| {
+        GuessError::infrastructure(format!("cannot announce test write barrier: {error}"))
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !proceed.exists() {
+        if shutdown.is_requested() {
+            return Err(GuessError::interrupted());
+        }
+        if Instant::now() >= deadline {
+            return Err(GuessError::infrastructure(
+                "test write barrier timed out".to_owned(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn wait_for_test_write_barrier(
+    _shutdown: &clinker_exec::pipeline::shutdown::ShutdownToken,
+) -> Result<(), GuessError> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn maybe_inject_write_failure() -> Result<(), GuessError> {
+    if std::env::var_os("CLINKER_TEST_GUESS_WRITE_FAIL_BEFORE_RENAME").is_some() {
+        return Err(GuessError::infrastructure(
+            "injected failure before config rename".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn maybe_inject_write_failure() -> Result<(), GuessError> {
+    Ok(())
+}
+
+fn maybe_inject_write_interruption(shutdown: &clinker_exec::pipeline::shutdown::ShutdownToken) {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CLINKER_TEST_GUESS_WRITE_INTERRUPT_BEFORE_RENAME").is_some() {
+        shutdown.request();
+    }
 }
 
 fn resolve_effective_config(args: &GuessArgs) -> Result<EffectiveConfig, GuessError> {
@@ -878,6 +1459,151 @@ struct FrozenSource<'a> {
     body: &'a SourceBody,
     files: Vec<clinker_plan::config::discovery::DiscoveredFile>,
     identity: String,
+    local_file: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputSnapshot {
+    sources: Vec<InputSourceSnapshot>,
+    ineligible_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputSourceSnapshot {
+    source: String,
+    manifest_identity: String,
+    files: Vec<InputFileSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputFileSnapshot {
+    path: PathBuf,
+    size: u64,
+    digest: String,
+}
+
+impl InputSnapshot {
+    fn capture(manifest: &[FrozenSource<'_>]) -> Result<Self, GuessError> {
+        let mut ineligible_reason = None;
+        let mut sources = Vec::with_capacity(manifest.len());
+        for source in manifest {
+            if !source.local_file {
+                ineligible_reason.get_or_insert("input_not_local_file");
+            }
+            let mut files = Vec::with_capacity(source.files.len());
+            for file in &source.files {
+                let metadata = std::fs::symlink_metadata(&file.path).map_err(|error| {
+                    GuessError::infrastructure(format!(
+                        "cannot snapshot source file {}: {error}",
+                        file.path.display()
+                    ))
+                })?;
+                if metadata.file_type().is_symlink() {
+                    ineligible_reason.get_or_insert("input_symlink");
+                } else if !metadata.file_type().is_file() {
+                    ineligible_reason.get_or_insert("input_not_regular_file");
+                }
+                let digest = clinker_channel::staging_copy::content_digest(&file.path)
+                    .map_err(|error| GuessError::infrastructure(error.to_string()))?;
+                files.push(InputFileSnapshot {
+                    path: file.path.clone(),
+                    size: file.size,
+                    digest,
+                });
+            }
+            sources.push(InputSourceSnapshot {
+                source: source.source.clone(),
+                manifest_identity: source.identity.clone(),
+                files,
+            });
+        }
+        Ok(Self {
+            sources,
+            ineligible_reason,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ConfigSnapshot {
+    raw: String,
+    ineligible_reason: Option<&'static str>,
+}
+
+fn snapshot_config(path: &Path) -> Result<ConfigSnapshot, GuessError> {
+    let contains_symlink = path_contains_symlink(path)?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        GuessError::infrastructure(format!(
+            "cannot inspect pipeline config {}: {error}",
+            path.display()
+        ))
+    })?;
+    let ineligible_reason = if contains_symlink || metadata.file_type().is_symlink() {
+        Some("config_symlink")
+    } else if !metadata.file_type().is_file() {
+        Some("config_not_regular_file")
+    } else {
+        None
+    };
+    let file = File::open(path).map_err(|error| {
+        GuessError::infrastructure(format!(
+            "cannot read pipeline config {}: {error}",
+            path.display()
+        ))
+    })?;
+    let raw = read_capped_config(file).map_err(|error| {
+        GuessError::infrastructure(format!(
+            "cannot read pipeline config {}: {error}",
+            path.display()
+        ))
+    })?;
+    if raw.len() > clinker_plan::yaml::MAX_INPUT_BYTES {
+        return Err(GuessError::configuration(format!(
+            "pipeline config {} exceeds the {}-byte canonical YAML limit",
+            path.display(),
+            clinker_plan::yaml::MAX_INPUT_BYTES
+        )));
+    }
+    Ok(ConfigSnapshot {
+        raw,
+        ineligible_reason,
+    })
+}
+
+fn path_contains_symlink(path: &Path) -> Result<bool, GuessError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                GuessError::infrastructure(format!(
+                    "cannot resolve the current directory for {}: {error}",
+                    path.display()
+                ))
+            })?
+            .join(path)
+    };
+    let mut ancestors = absolute.ancestors().collect::<Vec<_>>();
+    while let Some(current) = ancestors.pop() {
+        let metadata = std::fs::symlink_metadata(current).map_err(|error| {
+            GuessError::infrastructure(format!(
+                "cannot inspect pipeline config path component {}: {error}",
+                current.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn read_capped_config(reader: impl Read) -> std::io::Result<String> {
+    let mut raw = String::new();
+    reader
+        .take((clinker_plan::yaml::MAX_INPUT_BYTES as u64).saturating_add(1))
+        .read_to_string(&mut raw)?;
+    Ok(raw)
 }
 
 fn freeze_manifest<'a>(
@@ -913,6 +1639,7 @@ fn freeze_manifest<'a>(
                 body,
                 files: Vec::new(),
                 identity: "non-file-source".to_owned(),
+                local_file: false,
             });
             continue;
         }
@@ -948,6 +1675,7 @@ fn freeze_manifest<'a>(
             body,
             files: discovered.files().to_vec(),
             identity,
+            local_file: true,
         });
     }
     Ok(manifest)
@@ -1479,6 +2207,8 @@ fn stable_input_path(path: &Path, config_dir: &Path) -> String {
 }
 
 struct PatchEdit {
+    owner: ScopedSchemaLeafAddress,
+    replacement: clinker_plan::config::canonical::ConcreteNumericType,
     address: String,
     from_type: String,
     to_type: String,

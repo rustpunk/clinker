@@ -1,4 +1,9 @@
-//! Canonical expansion of the multi-value shorthand surfaces.
+//! Canonical, byte-preserving edits of authored pipeline configuration.
+//!
+//! In addition to multi-value shorthand expansion, this module owns the narrow
+//! edit plan used by `clinker guess --write`: canonical YAML spans and typed
+//! schema addresses locate one directly-authored `numeric` leaf, and a reparsed
+//! semantic comparison proves that replacing it changes nothing else.
 //!
 //! `clinker config --resolved` prints a pipeline config with the multi-value
 //! shorthand materialized: the bare-field forms of `split_to_rows:`,
@@ -29,10 +34,14 @@
 //! written explicitly (the plan-time gates reject an implied one), so the schema
 //! block is already canonical and is left byte-identical.
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use clinker_format::{JoinValues, SplitToRows, SplitValues};
+use cxl::typecheck::Type;
 
+use super::composition::ScopedSchemaLeafAddress;
+use super::{PipelineConfig, PipelineNode, SourceSchema};
 use crate::yaml::{self, Spanned};
 
 /// Failure canonicalizing a config's multi-value shorthand.
@@ -56,6 +65,534 @@ impl std::fmt::Display for CanonicalError {
 }
 
 impl std::error::Error for CanonicalError {}
+
+/// Concrete type an authoring tool may substitute for one literal `numeric`
+/// source-schema leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcreteNumericType {
+    Int,
+    Float,
+}
+
+impl ConcreteNumericType {
+    fn token(self) -> &'static str {
+        match self {
+            Self::Int => "int",
+            Self::Float => "float",
+        }
+    }
+
+    fn ty(self) -> Type {
+        match self {
+            Self::Int => Type::Int,
+            Self::Float => Type::Float,
+        }
+    }
+}
+
+/// Why a source-schema owner cannot be edited in its authored document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericEditIneligibility {
+    /// No inline authored leaf owns the effective address.
+    MissingOwner,
+    /// More than one authored leaf resolved to the address.
+    AmbiguousOwner,
+    /// An alias or another indirect YAML provenance path owns the value.
+    IndirectProvenance,
+    /// The effective numeric value is not the exact literal token in the raw
+    /// document (for example, it came from interpolation or an anchor).
+    NonLiteralToken,
+}
+
+impl NumericEditIneligibility {
+    /// Stable report spelling for this ineligibility.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingOwner => "owner_not_inline",
+            Self::AmbiguousOwner => "owner_ambiguous",
+            Self::IndirectProvenance => "owner_indirect_provenance",
+            Self::NonLiteralToken => "owner_not_literal_numeric",
+        }
+    }
+}
+
+/// One exact byte edit for an inline, directly-authored `numeric` type leaf.
+///
+/// The range covers only the seven bytes of the `numeric` scalar, including
+/// when it is nested under `nullable:`. Applying it therefore cannot change a
+/// column's nullability or any sibling attribute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NumericTypeEdit {
+    start: usize,
+    end: usize,
+    replacement: ConcreteNumericType,
+}
+
+impl NumericTypeEdit {
+    /// Start byte of the exact authored `numeric` token.
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    /// End byte (exclusive) of the exact authored `numeric` token.
+    pub fn end(&self) -> usize {
+        self.end
+    }
+
+    /// Apply this edit only when the raw bytes still contain the token that was
+    /// planned. A changed token is rejected as a compare-and-swap mismatch.
+    pub fn apply(&self, raw: &str) -> Result<String, CanonicalError> {
+        if raw.get(self.start..self.end) != Some("numeric") {
+            return Err(CanonicalError::Internal(
+                "numeric edit token changed after it was located".to_owned(),
+            ));
+        }
+        let mut edited = raw.to_owned();
+        edited.replace_range(self.start..self.end, self.replacement.token());
+        Ok(edited)
+    }
+}
+
+/// Result of locating one exact source-schema owner in authored YAML.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NumericTypeEditDecision {
+    Editable(NumericTypeEdit),
+    Ineligible(NumericEditIneligibility),
+}
+
+#[derive(Deserialize)]
+struct NumericDocProbe {
+    #[serde(default)]
+    nodes: Vec<NumericNodeProbe>,
+}
+
+#[derive(Deserialize)]
+struct NumericNodeProbe {
+    #[serde(default, rename = "type")]
+    kind: Option<Spanned<String>>,
+    #[serde(default)]
+    name: Option<Spanned<String>>,
+    #[serde(default)]
+    config: Option<NumericConfigProbe>,
+}
+
+#[derive(Deserialize)]
+struct NumericConfigProbe {
+    #[serde(default)]
+    schema: Option<Spanned<NumericSchemaProbe>>,
+}
+
+enum NumericSchemaProbe {
+    Columns(Vec<NumericColumnProbe>),
+    Mapping(NumericMultiRecordProbe),
+    Other,
+}
+
+impl<'de> Deserialize<'de> for NumericSchemaProbe {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SchemaVisitor;
+
+        impl<'de> Visitor<'de> for SchemaVisitor {
+            type Value = NumericSchemaProbe;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a source schema")
+            }
+
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                Vec::<NumericColumnProbe>::deserialize(de::value::SeqAccessDeserializer::new(seq))
+                    .map(NumericSchemaProbe::Columns)
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                NumericMultiRecordProbe::deserialize(de::value::MapAccessDeserializer::new(map))
+                    .map(NumericSchemaProbe::Mapping)
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(NumericSchemaProbe::Other)
+            }
+        }
+
+        deserializer.deserialize_any(SchemaVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct NumericMultiRecordProbe {
+    #[serde(default, rename = "records")]
+    record_types: Vec<NumericRecordProbe>,
+}
+
+#[derive(Deserialize)]
+struct NumericRecordProbe {
+    id: Spanned<String>,
+    #[serde(default)]
+    columns: Vec<NumericColumnProbe>,
+}
+
+#[derive(Deserialize)]
+struct NumericColumnProbe {
+    name: Spanned<String>,
+    #[serde(default, rename = "type")]
+    ty: Option<Spanned<AuthoredTypeProbe>>,
+}
+
+enum AuthoredTypeProbe {
+    Atomic(String),
+    Nullable(Box<Spanned<AuthoredTypeProbe>>),
+    Other,
+}
+
+impl AuthoredTypeProbe {
+    fn numeric_leaf(&self) -> Option<&Spanned<AuthoredTypeProbe>> {
+        match self {
+            Self::Nullable(inner) => match &inner.value {
+                Self::Atomic(value) if value == "numeric" => Some(inner),
+                nested => nested.numeric_leaf(),
+            },
+            Self::Atomic(_) | Self::Other => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthoredTypeProbe {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct TypeVisitor;
+
+        impl<'de> Visitor<'de> for TypeVisitor {
+            type Value = AuthoredTypeProbe;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a source column type")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(AuthoredTypeProbe::Atomic(value.to_owned()))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut nullable = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "nullable" && nullable.is_none() {
+                        nullable = Some(map.next_value::<Spanned<AuthoredTypeProbe>>()?);
+                    } else {
+                        let _ = map.next_value::<de::IgnoredAny>()?;
+                    }
+                }
+                Ok(nullable
+                    .map(|inner| AuthoredTypeProbe::Nullable(Box::new(inner)))
+                    .unwrap_or(AuthoredTypeProbe::Other))
+            }
+        }
+
+        deserializer.deserialize_any(TypeVisitor)
+    }
+}
+
+struct LocatedNumeric<'a> {
+    kind: &'a Spanned<String>,
+    source: &'a Spanned<String>,
+    schema: &'a Spanned<NumericSchemaProbe>,
+    record: Option<&'a Spanned<String>>,
+    column: &'a Spanned<String>,
+    authored_type: &'a Spanned<AuthoredTypeProbe>,
+    leaf: &'a Spanned<AuthoredTypeProbe>,
+}
+
+/// Locate the exact directly-authored `numeric` leaf for `address`.
+///
+/// This is read-only planning: it parses through the canonical YAML boundary,
+/// retains no source-sized state beyond that parser's already-capped document,
+/// and refuses aliases, interpolation, external schemas, and ambiguous owners.
+pub fn plan_numeric_type_edit(
+    raw: &str,
+    address: &ScopedSchemaLeafAddress,
+    replacement: ConcreteNumericType,
+) -> Result<NumericTypeEditDecision, CanonicalError> {
+    let doc: NumericDocProbe =
+        yaml::from_str(raw).map_err(|error| CanonicalError::Parse(error.to_string()))?;
+    let mut located = Vec::new();
+    for node in &doc.nodes {
+        let (Some(kind), Some(source), Some(config)) = (&node.kind, &node.name, &node.config)
+        else {
+            continue;
+        };
+        if kind.value != "source" || source.value != address.source() {
+            continue;
+        }
+        let Some(schema) = &config.schema else {
+            continue;
+        };
+        match (&schema.value, address.record()) {
+            (NumericSchemaProbe::Columns(columns), None) => {
+                locate_column(kind, source, schema, None, columns, address, &mut located);
+            }
+            (NumericSchemaProbe::Mapping(mapping), Some(record_name)) => {
+                for record in &mapping.record_types {
+                    if record.id.value == record_name {
+                        locate_column(
+                            kind,
+                            source,
+                            schema,
+                            Some(&record.id),
+                            &record.columns,
+                            address,
+                            &mut located,
+                        );
+                    }
+                }
+            }
+            (NumericSchemaProbe::Columns(_), Some(_))
+            | (NumericSchemaProbe::Mapping(_), None)
+            | (NumericSchemaProbe::Other, _) => {}
+        }
+    }
+    let owner = match located.as_slice() {
+        [] => {
+            return Ok(NumericTypeEditDecision::Ineligible(
+                NumericEditIneligibility::MissingOwner,
+            ));
+        }
+        [owner] => owner,
+        _ => {
+            return Ok(NumericTypeEditDecision::Ineligible(
+                NumericEditIneligibility::AmbiguousOwner,
+            ));
+        }
+    };
+    if !is_direct(owner.kind)
+        || !is_direct(owner.source)
+        || !is_direct(owner.schema)
+        || owner.record.is_some_and(|record| !is_direct(record))
+        || !is_direct(owner.column)
+        || !is_direct(owner.authored_type)
+        || !is_direct(owner.leaf)
+    {
+        return Ok(NumericTypeEditDecision::Ineligible(
+            NumericEditIneligibility::IndirectProvenance,
+        ));
+    }
+    let Some(start) = exact_numeric_start(raw, owner.leaf) else {
+        return Ok(NumericTypeEditDecision::Ineligible(
+            NumericEditIneligibility::NonLiteralToken,
+        ));
+    };
+    Ok(NumericTypeEditDecision::Editable(NumericTypeEdit {
+        start,
+        end: start + "numeric".len(),
+        replacement,
+    }))
+}
+
+fn locate_column<'a>(
+    kind: &'a Spanned<String>,
+    source: &'a Spanned<String>,
+    schema: &'a Spanned<NumericSchemaProbe>,
+    record: Option<&'a Spanned<String>>,
+    columns: &'a [NumericColumnProbe],
+    address: &ScopedSchemaLeafAddress,
+    located: &mut Vec<LocatedNumeric<'a>>,
+) {
+    for column in columns {
+        if column.name.value != address.column_name() {
+            continue;
+        }
+        let Some(ty) = &column.ty else { continue };
+        let leaf = match &ty.value {
+            AuthoredTypeProbe::Atomic(value) if value == "numeric" => ty,
+            nested => nested.numeric_leaf().unwrap_or(ty),
+        };
+        located.push(LocatedNumeric {
+            kind,
+            source,
+            schema,
+            record,
+            column: &column.name,
+            authored_type: ty,
+            leaf,
+        });
+    }
+}
+
+fn is_direct<T>(spanned: &Spanned<T>) -> bool {
+    spanned.referenced == spanned.defined
+}
+
+fn exact_numeric_start(raw: &str, leaf: &Spanned<AuthoredTypeProbe>) -> Option<usize> {
+    let reported = leaf.referenced.span().byte_offset()? as usize;
+    if reported > raw.len() {
+        return None;
+    }
+    let line_start = raw[..reported].rfind('\n').map_or(0, |index| index + 1);
+    if raw.get(line_start..reported)?.contains('&') {
+        return None;
+    }
+    if raw.get(reported..reported + "numeric".len()) == Some("numeric") {
+        return Some(reported);
+    }
+    if raw
+        .as_bytes()
+        .get(reported)
+        .is_some_and(|byte| matches!(byte, b'\'' | b'"'))
+        && raw.get(reported + 1..reported + 1 + "numeric".len()) == Some("numeric")
+    {
+        return Some(reported + 1);
+    }
+    None
+}
+
+/// Hash the typed effective configuration while excluding source spans and the
+/// raw-byte `source_hash`. Equal digests therefore mean equal executable
+/// author semantics even when formatting differs.
+pub fn semantic_config_digest(config: &PipelineConfig) -> Result<[u8; 32], CanonicalError> {
+    let nodes = config
+        .nodes
+        .iter()
+        .map(|node| &node.value)
+        .collect::<Vec<_>>();
+    let serialized = serde_json::to_vec(&(
+        &config.pipeline,
+        nodes,
+        &config.error_handling,
+        &config.notes,
+        &config.body_source_patches,
+    ))
+    .map_err(|error| {
+        CanonicalError::Internal(format!(
+            "cannot serialize effective config semantics: {error}"
+        ))
+    })?;
+    Ok(*blake3::hash(&serialized).as_bytes())
+}
+
+/// Reparse a proposed edit and prove its only semantic change is the selected
+/// numeric leaf becoming `int` or `float`.
+pub fn prove_numeric_type_only_change(
+    original: &str,
+    edited: &str,
+    address: &ScopedSchemaLeafAddress,
+    replacement: ConcreteNumericType,
+) -> Result<(), CanonicalError> {
+    let expected =
+        super::parse_config(original).map_err(|error| CanonicalError::Parse(error.to_string()))?;
+    let actual =
+        super::parse_config(edited).map_err(|error| CanonicalError::Parse(error.to_string()))?;
+    prove_resolved_numeric_type_only_change(&expected, &actual, address, replacement)
+}
+
+/// Prove that two already-resolved effective configurations differ only at the
+/// selected numeric type leaf.
+///
+/// Callers use this after resolving a staged sibling file, immediately before
+/// publication, so external schema content and every other effective semantic
+/// field participate in the comparison while raw-byte identity remains a
+/// separate compare-and-swap check.
+pub fn prove_resolved_numeric_type_only_change(
+    original: &PipelineConfig,
+    edited: &PipelineConfig,
+    address: &ScopedSchemaLeafAddress,
+    replacement: ConcreteNumericType,
+) -> Result<(), CanonicalError> {
+    let mut expected = original.clone();
+    let changed = replace_numeric_owner(&mut expected, address, replacement.ty());
+    if changed != 1 {
+        return Err(CanonicalError::Internal(format!(
+            "expected one numeric owner for {}, found {changed}",
+            address.render()
+        )));
+    }
+    if semantic_config_digest(&expected)? != semantic_config_digest(edited)? {
+        return Err(CanonicalError::Internal(
+            "edited config changes semantics outside the intended numeric type leaf".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn replace_numeric_owner(
+    config: &mut PipelineConfig,
+    address: &ScopedSchemaLeafAddress,
+    replacement: Type,
+) -> usize {
+    let mut changed = 0;
+    for node in &mut config.nodes {
+        let PipelineNode::Source { header, config } = &mut node.value else {
+            continue;
+        };
+        if header.name != address.source() {
+            continue;
+        }
+        match (&mut config.schema, address.record()) {
+            (SourceSchema::Columns(columns), None) => {
+                changed += replace_column_type(columns, address.column_name(), &replacement);
+            }
+            (SourceSchema::MultiRecord { record_types, .. }, Some(record_name)) => {
+                for record in record_types
+                    .iter_mut()
+                    .filter(|record| record.id == record_name)
+                {
+                    changed += replace_column_type(
+                        &mut record.columns,
+                        address.column_name(),
+                        &replacement,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    changed
+}
+
+fn replace_column_type(
+    columns: &mut [clinker_format::Column],
+    column_name: &str,
+    replacement: &Type,
+) -> usize {
+    let mut changed = 0;
+    for column in columns
+        .iter_mut()
+        .filter(|column| column.name == column_name)
+    {
+        if replace_numeric_leaf(&mut column.ty, replacement) {
+            changed += 1;
+        }
+    }
+    changed
+}
+
+fn replace_numeric_leaf(ty: &mut Type, replacement: &Type) -> bool {
+    match ty {
+        Type::Numeric => {
+            *ty = replacement.clone();
+            true
+        }
+        Type::Nullable(inner) => replace_numeric_leaf(inner, replacement),
+        _ => false,
+    }
+}
 
 /// Lenient view of a pipeline document that captures only the multi-value
 /// shorthand sequences, each wrapped in [`Spanned`] to recover its byte offset.
@@ -581,6 +1118,76 @@ fn render_flow<T: Serialize>(items: &[T]) -> Result<String, CanonicalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn numeric_pipeline(type_token: &str) -> String {
+        format!(
+            "pipeline:\n  name: numeric_edit\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: csv\n      path: input.csv\n      schema:\n        - name: n\n          type: {type_token}\n"
+        )
+    }
+
+    #[test]
+    fn numeric_edit_locates_only_the_literal_leaf_and_proves_semantics() {
+        let raw = numeric_pipeline("{ nullable: numeric }");
+        let address = ScopedSchemaLeafAddress::column("values", "n", "type");
+        let NumericTypeEditDecision::Editable(edit) =
+            plan_numeric_type_edit(&raw, &address, ConcreteNumericType::Int).unwrap()
+        else {
+            panic!("literal nullable numeric leaf must be editable");
+        };
+        assert_eq!(&raw[edit.start()..edit.end()], "numeric");
+        let edited = edit.apply(&raw).unwrap();
+        assert!(edited.contains("type: { nullable: int }"));
+        prove_numeric_type_only_change(&raw, &edited, &address, ConcreteNumericType::Int).unwrap();
+    }
+
+    #[test]
+    fn numeric_edit_rejects_alias_provenance() {
+        let raw = "pipeline:\n  name: numeric_edit\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: csv\n      path: input.csv\n      schema:\n        - { name: anchor, type: &number numeric }\n        - { name: n, type: *number }\n";
+        let address = ScopedSchemaLeafAddress::column("values", "n", "type");
+        assert_eq!(
+            plan_numeric_type_edit(raw, &address, ConcreteNumericType::Float).unwrap(),
+            NumericTypeEditDecision::Ineligible(NumericEditIneligibility::IndirectProvenance)
+        );
+        let anchor = ScopedSchemaLeafAddress::column("values", "anchor", "type");
+        assert_eq!(
+            plan_numeric_type_edit(raw, &anchor, ConcreteNumericType::Int).unwrap(),
+            NumericTypeEditDecision::Ineligible(NumericEditIneligibility::NonLiteralToken)
+        );
+    }
+
+    #[test]
+    fn numeric_edit_addresses_one_multi_record_owner_exactly() {
+        let raw = "pipeline:\n  name: numeric_edit\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: csv\n      path: input.csv\n      schema:\n        discriminator: { field: kind }\n        records:\n          - id: detail\n            tag: D\n            columns: [{ name: n, type: numeric }]\n          - id: trailer\n            tag: T\n            columns: [{ name: n, type: numeric }]\n";
+        let address = ScopedSchemaLeafAddress::record_column("values", "trailer", "n", "type");
+        let NumericTypeEditDecision::Editable(edit) =
+            plan_numeric_type_edit(raw, &address, ConcreteNumericType::Float).unwrap()
+        else {
+            panic!("record owner must be editable");
+        };
+        let edited = edit.apply(raw).unwrap();
+        assert_eq!(edited.matches("type: numeric").count(), 1);
+        assert_eq!(edited.matches("type: float").count(), 1);
+        prove_numeric_type_only_change(raw, &edited, &address, ConcreteNumericType::Float).unwrap();
+    }
+
+    #[test]
+    fn semantic_proof_rejects_a_sibling_change() {
+        let raw = numeric_pipeline("numeric");
+        let address = ScopedSchemaLeafAddress::column("values", "n", "type");
+        let NumericTypeEditDecision::Editable(edit) =
+            plan_numeric_type_edit(&raw, &address, ConcreteNumericType::Int).unwrap()
+        else {
+            panic!("numeric leaf must be editable");
+        };
+        let edited = edit
+            .apply(&raw)
+            .unwrap()
+            .replace("path: input.csv", "path: other.csv");
+        assert!(
+            prove_numeric_type_only_change(&raw, &edited, &address, ConcreteNumericType::Int)
+                .is_err()
+        );
+    }
 
     /// Every normalized shorthand sequence a document declares, grouped by
     /// surface — the semantic content that must survive canonicalization.
