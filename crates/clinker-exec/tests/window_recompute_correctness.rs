@@ -161,7 +161,7 @@ nodes:
       emit region = region
       emit total = total
       emit running_total = running_total + 1 / (if region == "north" then 0 else 1)
-- type: output
+- type: sink
   name: out
   input: gate
   config:

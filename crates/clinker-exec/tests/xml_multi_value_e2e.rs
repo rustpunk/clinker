@@ -66,7 +66,7 @@ nodes:
       schema:
         - { name: order_id, type: string }
         - { name: tags, type: string, multiple: true }
-  - type: output
+  - type: sink
     name: out
     input: orders
     config:
@@ -99,7 +99,7 @@ nodes:
       schema:
         - { name: order_id, type: string }
         - { name: tags, type: string, multiple: true }
-  - type: output
+  - type: sink
     name: out
     input: orders
     config:

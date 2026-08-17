@@ -63,7 +63,7 @@ nodes:
       cxl: |
         emit department = department
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: dept_totals
     config:
@@ -161,7 +161,7 @@ nodes:
       schema:
         - {{ name: department, type: string }}
         - {{ name: amount, type: int }}
-  - type: output
+  - type: sink
     name: out
     input: orders
     config:
@@ -222,7 +222,7 @@ nodes:
       schema:
         - { name: department, type: string }
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: header_name
     config:
@@ -281,7 +281,7 @@ nodes:
       schema:
         - { name: department, type: string }
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: orders
     config:
@@ -321,7 +321,7 @@ nodes:
       schema:
         - { name: department, type: string }
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: orders
     config:
@@ -362,7 +362,7 @@ nodes:
       schema:
         - { name: department, type: string }
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: orders
     config:
@@ -423,7 +423,7 @@ nodes:
       cxl: |
         emit department = department
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: dept_totals
     config:
@@ -551,7 +551,7 @@ nodes:
         emit ht = h.total
         emit lt = l.total
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
