@@ -40,14 +40,14 @@ nodes:
       path: a.csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: direct
     input: src_a
     config:
       name: direct
       type: csv
       path: out/data.csv
-  - type: output
+  - type: sink
     name: through_pending
     input: src_a
     config:

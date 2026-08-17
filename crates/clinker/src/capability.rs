@@ -140,7 +140,7 @@ nodes:
         timeout_secs: 5
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: api
     config:
@@ -192,7 +192,7 @@ nodes:
             "the suggestion was not found in the message: {error}"
         );
         let corrected = format!(
-            "pipeline:\n  name: capability_test\nnodes:\n{suggestion}\n  - type: output\n    \
+            "pipeline:\n  name: capability_test\nnodes:\n{suggestion}\n  - type: sink\n    \
              name: out\n    input: api\n    config:\n      name: out\n      type: csv\n      \
              path: out.csv\n"
         );

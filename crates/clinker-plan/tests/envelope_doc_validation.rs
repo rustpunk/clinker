@@ -65,7 +65,7 @@ nodes:
     name: framed
     body: enrich
     config: {{ strategy: concat }}
-  - type: output
+  - type: sink
     name: out
     input: framed
     config:
