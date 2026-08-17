@@ -29,6 +29,20 @@ use crate::plan::execution::PlanNode;
 
 use super::deferred_region::{body_id_for, compile_with_dir_full};
 
+fn write_body_source_catalog(workspace: &std::path::Path) {
+    std::fs::create_dir_all(workspace.join("data")).expect("mkdir data");
+    std::fs::write(workspace.join("data/reference.csv"), "code\nA\n").expect("write resource data");
+    std::fs::write(
+        workspace.join("clinker.toml"),
+        r#"[catalog.resources.body_reference]
+kind = "file"
+path = "data/reference.csv"
+access = "read"
+"#,
+    )
+    .expect("write resource catalog");
+}
+
 /// Write a `.comp.yaml` body and a pipeline invoking it, and return the
 /// compile-ready pieces. The body's `nodes:` section is caller-supplied
 /// so each test exercises a different body-node violation.
@@ -299,6 +313,7 @@ fn body_output_valid_csv_delimiter_compiles() {
 #[test]
 fn body_source_bad_csv_quote_char_rejected_at_compile() {
     let workspace = tempfile::tempdir().expect("tempdir");
+    write_body_source_catalog(workspace.path());
     let comp_dir = workspace.path().join("compositions");
     std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
     std::fs::write(
@@ -312,6 +327,8 @@ fn body_source_bad_csv_quote_char_rejected_at_compile() {
   outputs:
     out: shape
   config_schema: {}
+  resources_schema:
+    reference: { kind: file, required: true }
 
 nodes:
   - type: source
@@ -319,7 +336,7 @@ nodes:
     config:
       name: body_src
       type: csv
-      path: body_src.csv
+      resource: reference
       schema:
         - { name: code, type: string }
       options:
@@ -355,6 +372,7 @@ nodes:
     use: ../compositions/src_body.comp.yaml
     inputs:
       driver: drv
+    resources: { reference: body_reference }
   - type: output
     name: out
     input: enrich
@@ -384,6 +402,7 @@ nodes:
 /// contains it.
 fn compile_body_source(source_node: &str) -> Vec<clinker_core_types::Diagnostic> {
     let workspace = tempfile::tempdir().expect("tempdir");
+    write_body_source_catalog(workspace.path());
     let comp_dir = workspace.path().join("compositions");
     std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
     std::fs::write(
@@ -398,6 +417,8 @@ fn compile_body_source(source_node: &str) -> Vec<clinker_core_types::Diagnostic>
   outputs:
     out: shape
   config_schema: {{}}
+  resources_schema:
+    reference: {{ kind: file, required: true }}
 
 nodes:
 {source_node}
@@ -433,6 +454,7 @@ nodes:
     use: ../compositions/mv_body.comp.yaml
     inputs:
       driver: drv
+    resources: { reference: body_reference }
   - type: output
     name: out
     input: enrich
@@ -460,7 +482,7 @@ fn body_source_retired_array_paths_rejected_with_e360() {
     config:
       name: body_src
       type: xml
-      path: body_src.xml
+      resource: reference
       array_paths:
         - path: Item
           mode: explode
@@ -490,7 +512,7 @@ fn body_source_nested_split_to_rows_rejected_with_e358() {
     config:
       name: body_src
       type: xml
-      path: body_src.xml
+      resource: reference
       split_to_rows:
         - Item
         - Item.part
@@ -517,7 +539,7 @@ fn body_source_unproducible_multi_value_column_rejected_with_e361() {
     config:
       name: body_src
       type: csv
-      path: body_src.csv
+      resource: reference
       schema:
         - { name: sku, type: string, multiple: true }"#,
     );
@@ -544,7 +566,7 @@ fn body_source_jsonpath_record_path_rejected_with_e363() {
     config:
       name: body_src
       type: json
-      path: body_src.json
+      resource: reference
       options:
         record_path: "$.data"
       schema:
@@ -688,6 +710,7 @@ nodes:
 #[test]
 fn body_source_external_schema_resolves_relative_to_comp_dir() {
     let workspace = tempfile::tempdir().expect("tempdir");
+    write_body_source_catalog(workspace.path());
     let comp_dir = workspace.path().join("compositions");
     std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
     std::fs::write(
@@ -706,6 +729,8 @@ fn body_source_external_schema_resolves_relative_to_comp_dir() {
   outputs:
     out: shape
   config_schema: {}
+  resources_schema:
+    reference: { kind: file, required: true }
 
 nodes:
   - type: source
@@ -713,7 +738,7 @@ nodes:
     config:
       name: body_src
       type: csv
-      path: body_src.csv
+      resource: reference
       schema: ref.schema.yaml
   - type: transform
     name: shape
@@ -746,6 +771,7 @@ nodes:
     use: ../compositions/src_ref_body.comp.yaml
     inputs:
       driver: drv
+    resources: { reference: body_reference }
   - type: output
     name: out
     input: enrich

@@ -855,6 +855,7 @@ mod port_tag_guard_tests {
             semantic_name: "test".to_string(),
             semantic_digest: [0; 32],
             resource_bindings: indexmap::IndexMap::new(),
+            source_instances: Vec::new(),
             graph: body_graph,
             topo_order: Vec::new(),
             name_to_idx: HashMap::new(),

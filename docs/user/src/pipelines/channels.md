@@ -753,10 +753,12 @@ file). A plain unqualified key still targets a top-level source, and a name that
 matches no top-level source still fails with E230 — now hinting at the qualified
 form when the pipeline has compositions.
 
-> **Note:** a body-declared source binds (its schema seeds the body) but is not
-> yet fed at runtime — the engine ingests only top-level sources — so a channel
-> patch to a body source is applied and observable at compile (`--explain`),
-> while a data run through a body source awaits body-source runtime support.
+> **Note:** an authored body Source must link to one declared composition
+> resource slot with `resource: <slot>`; a direct `path`, `glob`, `regex`, or
+> `paths` matcher is rejected. The source patch above changes schema/reader
+> configuration but does not select the resource. Planning binds the slot and
+> compiles a call-scoped Source instance, while a data run through that Source
+> still awaits runtime credential resolution and resource opening.
 
 When a patch changes the effective source config, the run's pipeline identity
 differs from the base and from other patched variants, so their outputs and

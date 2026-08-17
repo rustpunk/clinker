@@ -11,7 +11,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use crate::config::composition::ResourceBinding;
 
 use super::deferred_region::{DeferredRegion, ParentContinuation};
-use super::execution::{PlanEdge, PlanNode};
+use super::execution::{CompiledSourceInstance, PlanEdge, PlanNode};
 
 /// Opaque handle into `CompileArtifacts.composition_bodies`. Each
 /// `PipelineNode::Composition` in `CompiledPlan` carries one of these
@@ -122,6 +122,14 @@ pub struct BoundBody {
     /// explain tooling can report how the body was configured without
     /// retaining a descriptor, credential choice, or opened handle.
     pub resource_bindings: IndexMap<String, ResourceBinding>,
+
+    /// Scoped activation contracts for Sources authored in this body.
+    ///
+    /// Synthetic input-port roots are not entries: their records arrive from
+    /// the parent body rather than from an external resource. Entries contain
+    /// only logical, typed requirements and never physical locators, secrets,
+    /// credentials, opened handles, or runtime state.
+    pub source_instances: Vec<CompiledSourceInstance>,
 
     /// Body's mini-DAG of lowered `PlanNode`s. NodeIndices here live
     /// in their own space — they do not collide with NodeIndices in
@@ -255,6 +263,7 @@ impl BoundBody {
             semantic_name: String::new(),
             semantic_digest: [0; 32],
             resource_bindings: IndexMap::new(),
+            source_instances: Vec::new(),
             graph: DiGraph::new(),
             topo_order: Vec::new(),
             name_to_idx: HashMap::new(),

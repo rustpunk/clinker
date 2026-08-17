@@ -17,6 +17,20 @@ use indexmap::IndexMap;
 
 use crate::config::{CompileContext, PipelineConfig, SourceConfigPatch, apply_source_patches};
 
+fn write_body_source_catalog(workspace: &std::path::Path) {
+    std::fs::create_dir_all(workspace.join("data")).expect("mkdir data");
+    std::fs::write(workspace.join("data/reference.csv"), "code\nA\n").expect("write resource data");
+    std::fs::write(
+        workspace.join("clinker.toml"),
+        r#"[catalog.resources.body_reference]
+kind = "file"
+path = "data/reference.csv"
+access = "read"
+"#,
+    )
+    .expect("write resource catalog");
+}
+
 /// Build a workspace with a composition body that declares its own source
 /// `ref` and a transform reading it (`emit label = code`), plus the invoking
 /// pipeline whose composition node is named `enrich`. `ref_schema` is the body
@@ -24,6 +38,7 @@ use crate::config::{CompileContext, PipelineConfig, SourceConfigPatch, apply_sou
 /// fix it. Returns the temp workspace and the parsed pipeline config.
 fn workspace_with_body_source(ref_schema: &str) -> (tempfile::TempDir, PipelineConfig) {
     let workspace = tempfile::tempdir().expect("tempdir");
+    write_body_source_catalog(workspace.path());
     let comp_dir = workspace.path().join("compositions");
     std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
     std::fs::write(
@@ -38,6 +53,8 @@ fn workspace_with_body_source(ref_schema: &str) -> (tempfile::TempDir, PipelineC
   outputs:
     out: shape
   config_schema: {{}}
+  resources_schema:
+    reference: {{ kind: file, required: true }}
 
 nodes:
   - type: source
@@ -45,7 +62,7 @@ nodes:
     config:
       name: ref
       type: csv
-      path: ref.csv
+      resource: reference
       schema:
 {ref_schema}
   - type: transform
@@ -80,6 +97,7 @@ nodes:
     use: ../compositions/with_ref.comp.yaml
     inputs:
       driver: drv
+    resources: { reference: body_reference }
   - type: output
     name: out
     input: enrich
@@ -174,6 +192,7 @@ fn unknown_inner_source_fails_at_bind_with_e230() {
 /// `enrich` body, never the same-named nested node inside `wrap`'s body.
 fn workspace_with_shadowed_nested_enrich() -> (tempfile::TempDir, PipelineConfig) {
     let workspace = tempfile::tempdir().expect("tempdir");
+    write_body_source_catalog(workspace.path());
     let comp_dir = workspace.path().join("compositions");
     std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
 
@@ -191,6 +210,8 @@ fn workspace_with_shadowed_nested_enrich() -> (tempfile::TempDir, PipelineConfig
   outputs:
     out: shape
   config_schema: {}
+  resources_schema:
+    reference: { kind: file, required: true }
 
 nodes:
   - type: source
@@ -198,7 +219,7 @@ nodes:
     config:
       name: ref
       type: csv
-      path: ref.csv
+      resource: reference
       schema:
         - { name: raw, type: string }
   - type: transform
@@ -288,6 +309,7 @@ nodes:
     use: ../compositions/with_ref.comp.yaml
     inputs:
       driver: drv
+    resources: { reference: body_reference }
   - type: composition
     name: wrap
     input: drv

@@ -120,7 +120,7 @@ fn tracer() {
     assert_eq!(requirement.binding.logical_id().as_str(), "shared_orders");
     assert_eq!(requirement.kind.label(), "file");
     assert_eq!(
-        requirement.required_capabilities,
+        requirement.required_capabilities.as_ref(),
         requirement.kind.required_capabilities()
     );
     assert_eq!(requirement.opener, requirement.kind.opener_kind());
@@ -210,6 +210,29 @@ fn body_source_resource_must_name_a_declared_slot() {
 }
 
 #[test]
+fn body_source_resource_must_be_bound_at_the_call_site() {
+    let body = BODY.replace("required: true", "required: false");
+    let workspace = write_workspace(&body);
+    let yaml = pipeline().replace("    resources: { orders: shared_orders }\n", "");
+    let diagnostics = parse_config(&yaml)
+        .expect("pipeline parses")
+        .compile(&CompileContext::with_pipeline_dir(
+            workspace.path(),
+            PathBuf::from("pipelines"),
+        ))
+        .expect_err("a Source cannot use an unbound optional slot");
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E103"
+                && diagnostic.message.contains("body source \"read\"")
+                && diagnostic.message.contains("orders")
+                && diagnostic.message.contains("does not bind")
+        }),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
 fn authored_body_source_requires_an_explicit_resource() {
     let body = BODY.replace("      resource: orders", "      path: private.csv");
     let workspace = write_workspace(&body);
@@ -220,12 +243,19 @@ fn authored_body_source_requires_an_explicit_resource() {
             PathBuf::from("pipelines"),
         ))
         .expect_err("inert direct-path body source must fail");
-    assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "E103"
-            && diagnostic.message.contains("read")
-            && diagnostic.message.contains("resource: <slot>")
-            && diagnostic.primary.span.synthetic_line_number().is_some()
-    }));
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E103"
+                && diagnostic.message.contains("read")
+                && diagnostic.message.contains("resource slot")
+                && diagnostic
+                    .help
+                    .as_deref()
+                    .is_some_and(|help| help.contains("resource: <slot>"))
+                && diagnostic.primary.span.synthetic_line_number().is_some()
+        }),
+        "{diagnostics:?}"
+    );
 }
 
 #[test]

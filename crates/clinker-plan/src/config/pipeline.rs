@@ -4593,7 +4593,17 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         }
     }
 
-    for input in config.source_configs() {
+    for body in config.source_bodies() {
+        let input = &body.source;
+        // `resource:` replaces file discovery only for a Source authored in a
+        // composition body. Pipeline parsing cannot know that enclosing scope,
+        // so defer every resource-bearing Source to the contextual bind walk:
+        // it rejects the top-level form and validates the body slot/binding.
+        // In particular, do not let E211 mask the resource-specific diagnostic
+        // merely because the direct matcher is intentionally absent.
+        if body.resource.is_some() {
+            continue;
+        }
         // Matcher-exclusivity, gated on transport. A file transport
         // resolves its file set through the discovery layer's
         // `path`/`glob`/`regex`/`paths` matchers, so exactly one must be
