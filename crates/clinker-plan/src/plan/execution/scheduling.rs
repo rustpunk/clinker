@@ -18,6 +18,222 @@ use crate::plan::properties::{
     PartitioningProvenance,
 };
 
+/// Existing compiled topology that proves one or more external Sources share
+/// a live consumer boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceActivationFusionKind {
+    /// Exclusive Sources are selected live by one unseeded interleave Merge.
+    LiveInterleave,
+    /// One exclusive Source hands its receiver directly to a Transform.
+    FusedStreaming,
+}
+
+/// Identity-only proof consumed while sealing source activation groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceActivationFusion {
+    /// Closed fusion class proven by the scheduling predicates.
+    pub kind: SourceActivationFusionKind,
+    /// External Source node identities in runtime consumption order.
+    pub sources: Box<[PlanNodeId]>,
+    /// Compiled consumer path that owns the live handoff.
+    pub consumer_path: Box<[PlanNodeId]>,
+}
+
+/// Topologically order one finalized graph with stable node-id tie breaks.
+///
+/// [`PlanNodeId`] values are minted in authored declaration order inside each
+/// scope. Using them for the ready set makes otherwise-independent nodes
+/// deterministic without relying on petgraph storage or neighbor iteration
+/// order. The error identifies the lowest-id node left in a cycle.
+pub(crate) fn stable_topological_order(
+    graph: &petgraph::graph::DiGraph<PlanNode, PlanEdge>,
+) -> Result<Vec<NodeIndex>, NodeIndex> {
+    let mut indegree: HashMap<NodeIndex, usize> = graph
+        .node_indices()
+        .map(|idx| {
+            (
+                idx,
+                graph
+                    .edges_directed(idx, petgraph::Direction::Incoming)
+                    .count(),
+            )
+        })
+        .collect();
+    let mut ready: BTreeSet<(PlanNodeId, usize)> = indegree
+        .iter()
+        .filter_map(|(&idx, &degree)| (degree == 0).then_some((graph[idx].id(), idx.index())))
+        .collect();
+    let mut ordered = Vec::with_capacity(graph.node_count());
+
+    while let Some(&(id, raw_idx)) = ready.first() {
+        ready.remove(&(id, raw_idx));
+        let idx = NodeIndex::new(raw_idx);
+        ordered.push(idx);
+        for edge in graph.edges_directed(idx, petgraph::Direction::Outgoing) {
+            let target = edge.target();
+            let Some(remaining) = indegree.get_mut(&target) else {
+                continue;
+            };
+            *remaining -= 1;
+            if *remaining == 0 {
+                ready.insert((graph[target].id(), target.index()));
+            }
+        }
+    }
+
+    if ordered.len() == graph.node_count() {
+        return Ok(ordered);
+    }
+    let cycle = indegree
+        .into_iter()
+        .filter(|(_, degree)| *degree > 0)
+        .min_by_key(|(idx, _)| graph[*idx].id())
+        .map(|(idx, _)| idx)
+        .unwrap_or_else(|| NodeIndex::new(0));
+    Err(cycle)
+}
+
+/// Prove the Source fusion groups already implemented by the compiled graph.
+///
+/// Only caller-identified external Sources participate; composition input-port
+/// Sources are deliberately excluded even though they share the same
+/// [`PlanNode::Source`] variant. Interleave fusion is atomic per Merge and
+/// requires exclusive receiver ownership. Transform fusion reuses the same
+/// window/init/fan-out exclusions as the runtime streaming classifier.
+pub(crate) fn derive_source_activation_fusions(
+    plan: &ExecutionPlanDag,
+    external_sources: &HashSet<PlanNodeId>,
+) -> Result<Vec<SourceActivationFusion>, NodeIndex> {
+    let stable_topo = stable_topological_order(&plan.graph)?;
+    let init_phase = compute_init_phase_node_set(plan);
+    let mut claimed_sources = HashSet::new();
+    let mut interleaves = Vec::new();
+
+    for &merge_idx in &stable_topo {
+        let PlanNode::Merge {
+            mode: crate::config::MergeMode::Interleave,
+            interleave_seed: None,
+            input_order,
+            ..
+        } = &plan.graph[merge_idx]
+        else {
+            continue;
+        };
+        let mut predecessors: Vec<_> = plan
+            .graph
+            .neighbors_directed(merge_idx, petgraph::Direction::Incoming)
+            .collect();
+        if predecessors.len() < 2
+            || predecessors.iter().any(|&idx| {
+                !matches!(plan.graph[idx], PlanNode::Source { .. })
+                    || !external_sources.contains(&plan.graph[idx].id())
+                    || plan
+                        .graph
+                        .edges_directed(idx, petgraph::Direction::Outgoing)
+                        .count()
+                        != 1
+            })
+        {
+            continue;
+        }
+        predecessors.sort_by_key(|idx| {
+            let name = plan.graph[*idx].name();
+            input_order
+                .iter()
+                .position(|input| input.split('.').next() == Some(name))
+                .unwrap_or(usize::MAX)
+        });
+        let source_ids: Vec<_> = predecessors
+            .iter()
+            .map(|&idx| plan.graph[idx].id())
+            .collect();
+        let unique: HashSet<_> = source_ids.iter().copied().collect();
+        if unique.len() != source_ids.len()
+            || source_ids
+                .iter()
+                .any(|source| claimed_sources.contains(source))
+        {
+            continue;
+        }
+        claimed_sources.extend(source_ids.iter().copied());
+        interleaves.push((source_ids, merge_idx));
+    }
+
+    let mut fused_transforms = Vec::new();
+    for &transform_idx in &stable_topo {
+        let PlanNode::Transform { window_index, .. } = &plan.graph[transform_idx] else {
+            continue;
+        };
+        if window_index.is_some() || init_phase.contains(&transform_idx) {
+            continue;
+        }
+        let mut incoming = plan
+            .graph
+            .neighbors_directed(transform_idx, petgraph::Direction::Incoming);
+        let Some(source_idx) = incoming.next() else {
+            continue;
+        };
+        if incoming.next().is_some()
+            || !matches!(plan.graph[source_idx], PlanNode::Source { .. })
+            || !external_sources.contains(&plan.graph[source_idx].id())
+            || claimed_sources.contains(&plan.graph[source_idx].id())
+            || plan
+                .graph
+                .edges_directed(source_idx, petgraph::Direction::Outgoing)
+                .count()
+                != 1
+        {
+            continue;
+        }
+        claimed_sources.insert(plan.graph[source_idx].id());
+        fused_transforms.push((plan.graph[source_idx].id(), transform_idx));
+    }
+
+    let fused_transform_indices: HashSet<_> = fused_transforms
+        .iter()
+        .map(|(_, transform_idx)| *transform_idx)
+        .collect();
+    let mut proofs = Vec::with_capacity(interleaves.len() + fused_transforms.len());
+    for (sources, merge_idx) in interleaves {
+        let mut consumer_path = vec![plan.graph[merge_idx].id()];
+        let mut outgoing = plan
+            .graph
+            .neighbors_directed(merge_idx, petgraph::Direction::Outgoing);
+        if let Some(consumer_idx) = outgoing.next()
+            && outgoing.next().is_none()
+            && certify_streaming_edge(plan, consumer_idx, &fused_transform_indices, &init_phase)
+                == Some(merge_idx)
+        {
+            consumer_path.push(plan.graph[consumer_idx].id());
+        }
+        proofs.push(SourceActivationFusion {
+            kind: SourceActivationFusionKind::LiveInterleave,
+            sources: sources.into_boxed_slice(),
+            consumer_path: consumer_path.into_boxed_slice(),
+        });
+    }
+    for (source, transform_idx) in fused_transforms {
+        let mut consumer_path = vec![plan.graph[transform_idx].id()];
+        let mut outgoing = plan
+            .graph
+            .neighbors_directed(transform_idx, petgraph::Direction::Outgoing);
+        if let Some(consumer_idx) = outgoing.next()
+            && outgoing.next().is_none()
+            && certify_streaming_edge(plan, consumer_idx, &fused_transform_indices, &init_phase)
+                == Some(transform_idx)
+        {
+            consumer_path.push(plan.graph[consumer_idx].id());
+        }
+        proofs.push(SourceActivationFusion {
+            kind: SourceActivationFusionKind::FusedStreaming,
+            sources: Box::new([source]),
+            consumer_path: consumer_path.into_boxed_slice(),
+        });
+    }
+    proofs.sort_by_key(|proof| proof.sources.iter().copied().min());
+    Ok(proofs)
+}
+
 /// Scope at which an ordering fact or requirement holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

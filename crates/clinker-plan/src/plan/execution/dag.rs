@@ -54,6 +54,7 @@ impl ExecutionPlanDag {
         let mut dag = Self {
             consumer_registry: CompiledConsumerRegistry::compile(&graph),
             order_contract: ExecutionOrderContract::default(),
+            source_activation: SourceActivationPlan::default(),
             graph,
             topo_order,
             source_dag,
@@ -86,6 +87,7 @@ impl ExecutionPlanDag {
         Self {
             consumer_registry: CompiledConsumerRegistry::compile(&body.graph),
             order_contract: ExecutionOrderContract::default(),
+            source_activation: SourceActivationPlan::default(),
             graph: body.graph.clone(),
             topo_order: body.topo_order.clone(),
             source_dag: Vec::new(),
@@ -191,6 +193,22 @@ impl ExecutionPlanDag {
     /// Whether any node requires arena allocation (window functions).
     pub fn required_arena(&self) -> bool {
         !self.indices_to_build.is_empty()
+    }
+
+    /// Return the recursively sealed external Source activation inventory.
+    pub fn source_activation(&self) -> &SourceActivationPlan {
+        &self.source_activation
+    }
+
+    /// Seal Source activation after the top-level DAG and every body mini-DAG
+    /// have reached their final compiled topology.
+    pub(crate) fn seal_source_activation(
+        &mut self,
+        bodies: &crate::plan::composition_body::CompositionBodies,
+    ) -> Result<(), SourceActivationPlanError> {
+        let compiled = compile_source_activation_plan(self, bodies)?;
+        self.source_activation = compiled;
+        Ok(())
     }
 
     /// Coarse plan-time estimate, in bytes, of the disk volume the run could
@@ -738,6 +756,7 @@ mod port_tag_guard_tests {
         ExecutionPlanDag {
             consumer_registry: CompiledConsumerRegistry::default(),
             order_contract: ExecutionOrderContract::default(),
+            source_activation: SourceActivationPlan::default(),
             graph: DiGraph::new(),
             topo_order: Vec::new(),
             source_dag: Vec::new(),

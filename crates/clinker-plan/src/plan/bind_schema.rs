@@ -42,9 +42,7 @@ use crate::plan::combine::{
     CombineInput, DecomposedPredicate, decompose_predicate, select_driving_input,
 };
 use crate::plan::composition_body::{BoundBody, CompositionBodyId};
-use crate::plan::execution::{
-    CompiledResourceRequirement, CompiledSourceInstance, CompiledSourceInstanceId,
-};
+use crate::plan::execution::{CompiledResourceRequirement, CompiledSourceInstance};
 use crate::plan::types::JoinSide;
 use crate::plan::{EntityRef, PlanNodeId};
 use crate::resources::WorkspaceCatalog;
@@ -3746,13 +3744,13 @@ fn bind_composition(
 
     let source_instances = pending_source_requirements
         .into_iter()
-        .map(|(source_name, resource)| CompiledSourceInstance {
-            id: CompiledSourceInstanceId {
-                body_scope: body_id.into(),
-                source_node: body_node_ids[&source_name],
-            },
-            source_name,
-            resource,
+        .map(|(source_name, resource)| {
+            CompiledSourceInstance::composition_body(
+                body_id.into(),
+                body_node_ids[&source_name],
+                source_name,
+                resource,
+            )
         })
         .collect();
 

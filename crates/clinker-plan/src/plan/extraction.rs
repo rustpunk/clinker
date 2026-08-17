@@ -477,6 +477,7 @@ mod tests {
         let mut dag = ExecutionPlanDag {
             consumer_registry: Default::default(),
             order_contract: Default::default(),
+            source_activation: Default::default(),
             graph,
             topo_order: topo,
             source_dag: vec![SourceTier { sources }],
