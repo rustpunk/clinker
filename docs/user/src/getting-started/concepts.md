@@ -214,7 +214,7 @@ port using dot notation:
       eu: region == "EU"
     default: other
 
-- type: output
+- type: sink
   name: us_output
   input: split_by_region.us    # reads from the "us" port
 ```

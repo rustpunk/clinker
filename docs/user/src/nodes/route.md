@@ -106,7 +106,7 @@ Downstream nodes reference route branches using **port syntax**: `route_name.bra
       emit txn_id = txn_id
       emit amount = amount
 
-- type: output
+- type: sink
   name: low_value_out
   input: classify.low
   config:
@@ -152,7 +152,7 @@ nodes:
         apac: "region == \"JP\" or region == \"AU\" or region == \"SG\""
       default: other
 
-  - type: output
+  - type: sink
     name: domestic_orders
     input: by_region.domestic
     config:
@@ -160,7 +160,7 @@ nodes:
       type: csv
       path: "./output/domestic.csv"
 
-  - type: output
+  - type: sink
     name: emea_orders
     input: by_region.emea
     config:
@@ -168,7 +168,7 @@ nodes:
       type: csv
       path: "./output/emea.csv"
 
-  - type: output
+  - type: sink
     name: apac_orders
     input: by_region.apac
     config:
@@ -176,7 +176,7 @@ nodes:
       type: csv
       path: "./output/apac.csv"
 
-  - type: output
+  - type: sink
     name: other_orders
     input: by_region.other
     config:

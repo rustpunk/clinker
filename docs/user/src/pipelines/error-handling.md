@@ -301,7 +301,7 @@ nodes:
           severity: error
           message: "Order amount must be positive"
 
-  - type: output
+  - type: sink
     name: valid_orders
     input: validate_orders
     config:

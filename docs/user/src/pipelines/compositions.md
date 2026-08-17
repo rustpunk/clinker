@@ -308,7 +308,7 @@ nodes:
     config:
       threshold: 0.5
 
-  - type: output
+  - type: sink
     name: result
     input: risk
     config:
