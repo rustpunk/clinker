@@ -290,7 +290,7 @@ fn run_pipeline(yaml: &str, inputs: Vec<(&str, Vec<u8>)>) -> HashMap<String, Str
         .collect();
 
     let buffers: HashMap<String, SharedBuffer> = config
-        .output_configs()
+        .sink_configs()
         .map(|o| (o.name.clone(), SharedBuffer::new()))
         .collect();
 
@@ -643,7 +643,7 @@ nodes:
     inputs:
       data: src
 
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

@@ -3,7 +3,7 @@
 //! This crate serializes Clinker pipeline lineage as [OpenLineage] events — the
 //! vendor-neutral open standard for dataset and column-level lineage. The
 //! [`openlineage`] module owns the wire data model and an NDJSON writer; the
-//! [`dataset`] module maps each Source/Output node to its OpenLineage dataset
+//! [`dataset`] module maps each Source/Sink node to its OpenLineage dataset
 //! identity; and the [`builder`] module walks a compiled plan to compute
 //! column-level lineage from those identities.
 //!

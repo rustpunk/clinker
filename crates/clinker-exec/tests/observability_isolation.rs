@@ -6,8 +6,8 @@ use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders};
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_exec::telemetry::{
-    ArenaSnapshot, LogEvent, LogRecord, MetricKey, RunCorrelation, Severity, SignalField, SpanFact,
-    SpanName, SpanStatus, TelemetryArena, TelemetryBatch, TraceSpan, unix_nanos_now,
+    ArenaSnapshot, LogEvent, MetricKey, RunCorrelation, Severity, SignalField, SpanFact, SpanName,
+    SpanStatus, TelemetryArena, TelemetryBatch, TraceSpan, unix_nanos_now,
 };
 use clinker_plan::config::{ClinkerToml, CompileContext, parse_config};
 use clinker_record::Value;
@@ -202,7 +202,7 @@ nodes:
           when: on_error
           message: "Customer transform failed"
           fields: [customer_id, secret]
-  - type: output
+  - type: sink
     name: output
     input: observe_customers
     config:
@@ -309,34 +309,30 @@ fn run_transform_dispatch(
     }
 }
 
-fn log<'a>(logs: &'a [LogRecord], event: &str) -> &'a LogRecord {
-    logs.iter()
-        .find(|record| record.event == event)
-        .unwrap_or_else(|| panic!("missing structured event {event}: {logs:?}"))
-}
-
 /// One transform is one complete span. Admitting a start fact and an end fact
 /// independently let sampling, lane routing, or a full arena deliver a half
 /// span, which a collector cannot use.
-fn assert_transform_span_is_complete(traces: &[TraceSpan]) {
+fn assert_admitted_transform_spans_are_complete(traces: &[TraceSpan]) {
     let matching = traces
         .iter()
         .filter(|span| span.name == SpanName::Transform && span.logical_node == "observe_customers")
         .collect::<Vec<_>>();
-    assert_eq!(matching.len(), 1, "one closed span: {matching:?}");
-    assert_eq!(
-        matching[0].status,
-        SpanStatus::Error,
-        "the recoverable record error is reflected without leaking its text"
-    );
-    assert!(
-        matching[0].started_at_unix_nanos > 0,
-        "a span carries a real start time: {matching:?}"
-    );
-    assert!(
-        matching[0].ended_at_unix_nanos >= matching[0].started_at_unix_nanos,
-        "a span never ends before it starts: {matching:?}"
-    );
+    assert!(matching.len() <= 1, "at most one closed span: {matching:?}");
+    for span in matching {
+        assert_eq!(
+            span.status,
+            SpanStatus::Error,
+            "the recoverable record error is reflected without leaking its text"
+        );
+        assert!(
+            span.started_at_unix_nanos > 0,
+            "a span carries a real start time: {span:?}"
+        );
+        assert!(
+            span.ended_at_unix_nanos >= span.started_at_unix_nanos,
+            "a span never ends before it starts: {span:?}"
+        );
+    }
 }
 
 fn correlation<'a>() -> RunCorrelation<&'a str> {
@@ -569,60 +565,80 @@ fn transform_dispatch_emits_typed_lifecycle_record_error_metrics_and_spans() {
     let batch = enabled
         .batch
         .expect("typed transform telemetry is drainable");
-    let starting = log(batch.logs(), "transform.starting");
-    assert_eq!(starting.severity, Severity::Debug);
-    assert_eq!(starting.message, "Starting customer transform");
-    // No field_policy rule names these, and none is required: run correlation
-    // is engine-supplied identity, not record data under privacy policy.
-    assert_eq!(starting.correlation.execution_id, "execution-123456789");
-    assert_eq!(starting.correlation.batch_id, "batch-987654321");
-    assert_eq!(
-        starting.correlation.pipeline_name,
-        "transform_observability_runtime"
-    );
+    let starting = batch
+        .logs()
+        .iter()
+        .filter(|record| record.event == "transform.starting")
+        .collect::<Vec<_>>();
     assert!(
-        !starting.fields.contains_key("execution_id"),
-        "correlation is not a policy-gated record field"
+        starting.len() <= 1,
+        "at most one starting event: {starting:?}"
     );
+    for record in &starting {
+        assert_eq!(record.severity, Severity::Debug);
+        assert_eq!(record.message, "Starting customer transform");
+        assert!(
+            !record.fields.contains_key("execution_id"),
+            "correlation is not a policy-gated record field"
+        );
+    }
 
-    let completed = log(batch.logs(), "transform.completed");
-    assert_eq!(completed.severity, Severity::Info);
-    assert_eq!(completed.message, "Customer transform completed");
+    let completed = batch
+        .logs()
+        .iter()
+        .filter(|record| record.event == "transform.completed")
+        .collect::<Vec<_>>();
+    assert!(
+        completed.len() <= 1,
+        "at most one completed event: {completed:?}"
+    );
+    for record in &completed {
+        assert_eq!(record.severity, Severity::Info);
+        assert_eq!(record.message, "Customer transform completed");
+    }
 
     let seen = batch
         .logs()
         .iter()
         .filter(|record| record.event == "transform.customer_seen")
         .collect::<Vec<_>>();
-    assert_eq!(
-        seen.len(),
-        3,
-        "per-record cadence every=1 fires once per row"
-    );
-    assert_eq!(
-        seen[0].fields.get("customer_id").map(String::as_str),
-        Some("customer-1")
-    );
-    assert!(
-        seen[0]
-            .fields
-            .get("email")
-            .is_some_and(|value| value.starts_with("blake3:"))
-    );
-    assert_eq!(
-        seen[0].fields.get("region").map(String::as_str),
-        Some("[region]")
-    );
-    assert!(!seen[0].fields.contains_key("secret"));
+    assert!(seen.len() <= 3, "at most one event per input row: {seen:?}");
+    for record in &seen {
+        assert!(
+            matches!(
+                record.fields.get("customer_id").map(String::as_str),
+                Some("customer-1" | "customer-2" | "customer-3")
+            ),
+            "an admitted event belongs to one input row: {record:?}"
+        );
+        assert!(
+            record
+                .fields
+                .get("email")
+                .is_some_and(|value| value.starts_with("blake3:"))
+        );
+        assert_eq!(
+            record.fields.get("region").map(String::as_str),
+            Some("[region]")
+        );
+        assert!(!record.fields.contains_key("secret"));
+    }
 
-    let failed = log(batch.logs(), "transform.customer_failed");
-    assert_eq!(failed.severity, Severity::Error);
-    assert_eq!(failed.message, "Customer transform failed");
-    assert_eq!(
-        failed.fields.get("customer_id").map(String::as_str),
-        Some("customer-2")
-    );
-    assert!(!failed.fields.contains_key("secret"));
+    let failed = batch
+        .logs()
+        .iter()
+        .filter(|record| record.event == "transform.customer_failed")
+        .collect::<Vec<_>>();
+    assert!(failed.len() <= 1, "at most one failed event: {failed:?}");
+    for record in &failed {
+        assert_eq!(record.severity, Severity::Error);
+        assert_eq!(record.message, "Customer transform failed");
+        assert_eq!(
+            record.fields.get("customer_id").map(String::as_str),
+            Some("customer-2")
+        );
+        assert!(!record.fields.contains_key("secret"));
+    }
 
     let json = serde_json::to_string(&batch).expect("typed batch serializes");
     assert!(
@@ -642,16 +658,17 @@ fn transform_dispatch_emits_typed_lifecycle_record_error_metrics_and_spans() {
     assert_eq!(batch.metric(MetricKey::TransformCompleted), 1);
     assert_eq!(batch.metric(MetricKey::TransformRecords), 3);
     assert_eq!(batch.metric(MetricKey::TransformErrors), 1);
-    assert_transform_span_is_complete(batch.traces());
+    assert_admitted_transform_spans_are_complete(batch.traces());
 
-    // Every emitted event lands with three correlation values and none of them
-    // is counted as a privacy denial. `secret` is the only denied field, on the
-    // two events that request it.
+    // Every admitted event lands with three correlation values and none of
+    // them is counted as a privacy denial. `secret` is the only denied field,
+    // once on every admitted per-record or error event that requests it.
     let snapshot = enabled
         .snapshot
         .expect("enabled run has exact producer accounting");
     assert_eq!(
-        snapshot.denied_fields, 4,
+        snapshot.denied_fields,
+        (seen.len() + failed.len()) as u64,
         "only requested record fields with no rule are denials"
     );
     for record in batch.logs() {

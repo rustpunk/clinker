@@ -28,7 +28,7 @@ nodes:
         emit n_min = f0.min(500000)
         emit n_max = f0.max(100000)
 
-  - type: output
+  - type: sink
     name: sink
     input: numerics
     config:

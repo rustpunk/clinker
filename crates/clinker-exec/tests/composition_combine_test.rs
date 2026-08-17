@@ -84,7 +84,7 @@ fn run_pipeline_multi_source(
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 
@@ -133,7 +133,7 @@ nodes:
     inputs:
       orders: orders_src
       products: products_src
-  - type: output
+  - type: sink
     name: out
     input: enrich_call
     config:
@@ -198,7 +198,7 @@ nodes:
     inputs:
       orders: orders_src
       products: products_src
-  - type: output
+  - type: sink
     name: out
     input: enrich_call
     config:
@@ -279,7 +279,7 @@ nodes:
     inputs:
       orders: orders_src
       products: products_src
-  - type: output
+  - type: sink
     name: out
     input: nested_call
     config:
@@ -350,7 +350,7 @@ nodes:
     inputs:
       orders: orders_src
       products: products_src
-  - type: output
+  - type: sink
     name: out
     input: collect_call
     config:
@@ -448,7 +448,7 @@ nodes:
     inputs:
       a: a_src
       b: b_src
-  - type: output
+  - type: sink
     name: out
     input: bad_call
     config:
@@ -553,7 +553,7 @@ fn run_pipeline_collect_outputs(yaml: &str, inputs: &[(&str, &str)]) -> HashMap<
 
     let mut buffers: HashMap<String, SharedBuffer> = HashMap::new();
     let mut writers: HashMap<String, Box<dyn Write + Send>> = HashMap::new();
-    for out in config.output_configs() {
+    for out in config.sink_configs() {
         let buf = SharedBuffer::new();
         buffers.insert(out.name.clone(), buf.clone());
         writers.insert(out.name.clone(), Box::new(buf) as Box<dyn Write + Send>);
@@ -616,7 +616,7 @@ nodes:
     inputs:
       orders: orders_src
       products: products_src
-  - type: output
+  - type: sink
     name: out_a
     input: join_a
     config:
@@ -624,7 +624,7 @@ nodes:
       type: csv
       path: out_a.csv
       include_unmapped: true
-  - type: output
+  - type: sink
     name: out_b
     input: join_b
     config:

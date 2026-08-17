@@ -20,7 +20,7 @@ nodes:
     schema:
       - { name: order_id, type: string }
       - { name: amount, type: int }
-- type: output
+- type: sink
   name: out
   input: orders
   config:

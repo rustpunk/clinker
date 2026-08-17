@@ -47,14 +47,14 @@ nodes:
       rules:
         - name: drop_error_groups
           drop_group_when: "sum(if status == 'error' then 1 else 0) > 0"
-  - type: output
+  - type: sink
     name: kept
     input: drop_bad
     config:
       name: kept
       type: csv
       path: kept.csv
-  - type: output
+  - type: sink
     name: audit
     input: drop_bad.removed
     config:
@@ -80,12 +80,12 @@ nodes:
         "the removed side-output port must be rendered: {text}"
     );
     assert!(
-        text.contains("edge cull.drop_bad -> output.kept:\n  buffer: node_buffer (slot=1)"),
+        text.contains("edge cull.drop_bad -> sink.kept:\n  buffer: node_buffer (slot=1)"),
         "the unnamed main slot must retain its exact producer identity: {text}"
     );
     assert!(
         text.contains(
-            "edge cull.drop_bad -> output.audit:\n  buffer: node_buffer (slot=1, port=removed)"
+            "edge cull.drop_bad -> sink.audit:\n  buffer: node_buffer (slot=1, port=removed)"
         ),
         "the removed slot must carry its exact producer-port identity: {text}"
     );

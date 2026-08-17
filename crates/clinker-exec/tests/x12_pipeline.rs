@@ -136,7 +136,7 @@ nodes:
         emit isa13 = $doc.interchange.e13
         emit gs06 = $doc.functional_group.e06
         emit st02 = $doc.transaction_set.e02
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -208,7 +208,7 @@ nodes:
         emit gs_id = $doc.grp.e01
         emit gs_ctrl = $doc.grp.e06
         emit st_id = $doc.txn.e01
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -266,7 +266,7 @@ nodes:
         - { name: e02, type: { nullable: string } }
         - { name: e03, type: { nullable: string } }
         - { name: e04, type: { nullable: string } }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -320,7 +320,7 @@ nodes:
     config:
       cxl: |
         emit seg = seg_id
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -381,7 +381,7 @@ nodes:
         - { name: e03, type: { nullable: string } }
         - { name: e04, type: { nullable: string } }
         - { name: e05, type: { nullable: string } }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -440,7 +440,7 @@ nodes:
       cxl: |
         emit seg = seg_id
         emit ref = set_ref
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -510,7 +510,7 @@ nodes:
         emit e02 = e02
         emit e03 = e03
         emit e04 = e04
-  - type: output
+  - type: sink
     name: out
     input: regroup
     config:
@@ -562,7 +562,7 @@ nodes:
     config:
       cxl: |
         emit seg = seg_id
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -601,7 +601,7 @@ nodes:
       glob: ./*.x12
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -639,7 +639,7 @@ nodes:
       glob: ./*.x12
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -703,7 +703,7 @@ nodes:
         - { name: set_type, type: string }
         - { name: e01, type: string }
         - { name: e02, type: string }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -743,7 +743,7 @@ nodes:
       glob: ./*.x12
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -783,7 +783,7 @@ nodes:
         encoding: shift_jis
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:

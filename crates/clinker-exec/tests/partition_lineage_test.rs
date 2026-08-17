@@ -39,7 +39,7 @@ nodes:
       path: data/orders.csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -71,7 +71,7 @@ nodes:
       glob: data/orders_*.csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -110,7 +110,7 @@ nodes:
       regex: '^.*\.csv$'
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -142,7 +142,7 @@ nodes:
         - data/feb.csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -183,7 +183,7 @@ nodes:
   - type: merge
     name: m
     inputs: [a, b]
-  - type: output
+  - type: sink
     name: out
     input: m
     config:
@@ -248,7 +248,7 @@ nodes:
         emit id = orders.id
         emit dept_id = orders.dept_id
         emit dept_name = depts.dept_name
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:
@@ -289,7 +289,7 @@ nodes:
       glob: data/*.csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

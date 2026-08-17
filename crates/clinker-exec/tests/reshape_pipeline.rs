@@ -61,7 +61,7 @@ fn run_reshape_report(yaml: &str, csv_input: &str) -> Result<ReshapeReport, Pipe
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
@@ -111,7 +111,7 @@ nodes:
             copy_from: trigger
             overrides:
               status: "'synthesized'"
-  - type: output
+  - type: sink
     name: out
     input: backfill
     config:
@@ -152,7 +152,7 @@ nodes:
           mutate:
             set:
               label: "'large'"
-  - type: output
+  - type: sink
     name: out
     input: relabel
     config:
@@ -290,7 +290,7 @@ nodes:
           mutate:
             set:
               tier: "'big'"
-  - type: output
+  - type: sink
     name: out
     input: classify
     config:
@@ -372,7 +372,7 @@ nodes:
           mutate:
             set:
               note: "'was_base'"
-  - type: output
+  - type: sink
     name: out
     input: classify
     config:
@@ -426,7 +426,7 @@ nodes:
               id: "id"
               amount: "amount * 2"
               label: "'synthetic-summary'"
-  - type: output
+  - type: sink
     name: out
     input: emit_summary
     config:
@@ -531,7 +531,7 @@ nodes:
               plan_start: "plan_start"
               plan_end: "plan_start"
               status: "'synthesized'"
-  - type: output
+  - type: sink
     name: out
     input: backfill
     config:
@@ -578,7 +578,7 @@ nodes:
           mutate:
             set:
               plan_end: "plan_start"
-  - type: output
+  - type: sink
     name: out
     input: backfill
     config:
@@ -767,7 +767,7 @@ nodes:
           mutate:
             set:
               tag: "tag"
-  - type: output
+  - type: sink
     name: out
     input: backfill
     config:

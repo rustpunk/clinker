@@ -111,11 +111,11 @@ nodes:
     use: ../compositions/fixed_reader.comp.yaml
     inputs: {}
     resources: { input: shared_input }
-  - type: output
+  - type: sink
     name: first_out
     input: first
     config: { name: first_out, type: csv, path: first.csv }
-  - type: output
+  - type: sink
     name: second_out
     input: second
     config: { name: second_out, type: csv, path: second.csv }

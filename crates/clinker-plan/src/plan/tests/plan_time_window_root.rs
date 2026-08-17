@@ -42,7 +42,7 @@ nodes:
       emit running_amount = $window.sum(amount)
     analytic_window:
       group_by: [department]
-- type: output
+- type: sink
   name: out
   input: windowed
   config:
@@ -124,7 +124,7 @@ nodes:
       emit running_total = $window.sum(total)
     analytic_window:
       group_by: [department]
-- type: output
+- type: sink
   name: out
   input: running
   config:

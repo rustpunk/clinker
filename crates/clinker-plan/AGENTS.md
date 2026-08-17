@@ -23,10 +23,10 @@ schemas, typechecks CXL against row types, and produces `CompiledPlan` /
 ## Important public APIs
 
 - `config::{parse_config, load_config, load_config_with_vars, interpolate_env_vars}`.
-- `PipelineConfig::{compile_topology_only, compile, compile_with_diagnostics, source_configs, output_configs}`.
+- `PipelineConfig::{compile_topology_only, compile, compile_with_diagnostics, source_configs, sink_configs}`.
 - `config::CompileContext`.
 - `yaml::{from_str, to_string, Spanned, CxlSource, MAX_INPUT_BYTES}`.
-- `config::PipelineNode` and node bodies such as `SourceBody`, `TransformBody`, `AggregateBody`, `RouteBody`, `MergeBody`, `CombineBody`, `OutputBody`, `ReshapeBody`, `CullBody`, and `EnvelopeBody`.
+- `config::PipelineNode` and node bodies such as `SourceBody`, `TransformBody`, `AggregateBody`, `RouteBody`, `MergeBody`, `CombineBody`, `SinkBody`, `ReshapeBody`, `CullBody`, and `EnvelopeBody`.
 - `plan::{CompiledPlan, ChannelIdentity, BoundBody, CompositionBodyId}`.
 - `plan::execution::{ExecutionPlanDag, PlanNode, PlanEdge, NodeExecutionReqs}`.
 - `plan::bind_schema::{CompileArtifacts, MAX_COMPOSITION_DEPTH}`.

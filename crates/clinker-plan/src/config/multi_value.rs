@@ -33,7 +33,7 @@ use clinker_format::{Column, OnConflict, SourceSchema, SplitToRowsMode, under_fi
 use crate::config::format::{InputFormat, OutputFormat};
 use crate::config::pipeline_node::PipelineNode;
 use crate::config::source::SourceConfig;
-use crate::config::{OutputConfig, XmlOutputOptions};
+use crate::config::{SinkConfig, XmlOutputOptions};
 use crate::yaml::Spanned;
 
 /// Whether an output format can encode a `multiple: true` field.
@@ -934,7 +934,7 @@ pub fn source_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
 /// can arise at runtime (a `match: collect` combine output), so a static
 /// requirement would reject a legitimate override; an entry that never matches
 /// an array is simply an inert override.
-fn validate_join_declarations(output: &OutputConfig) -> Vec<DeclarationFault> {
+fn validate_join_declarations(output: &SinkConfig) -> Vec<DeclarationFault> {
     let mut faults = Vec::new();
     let entries = output.join_values.as_deref().unwrap_or(&[]);
     if entries.is_empty() {
@@ -1112,7 +1112,7 @@ fn on_conflict_name(policy: OnConflict) -> &'static str {
 /// Also runs the per-output E362 gate ([`validate_join_declarations`]) over the
 /// output's `join_values` block, which — unlike E359 — applies whatever the
 /// format is, since a `csv` output legitimately carries it.
-pub fn output_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
+pub fn sink_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
     let schemas = resolved_source_schemas(nodes);
     let multi_value_by_source: HashMap<&str, Vec<String>> = schemas
         .iter()
@@ -1122,14 +1122,14 @@ pub fn output_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
     let mut faults = Vec::new();
     let reachability = source_data_reachability(nodes);
     for (node_index, spanned) in nodes.iter().enumerate() {
-        let PipelineNode::Output {
+        let PipelineNode::Sink {
             header,
             config: body,
         } = &spanned.value
         else {
             continue;
         };
-        let output = &body.output;
+        let output = &body.sink;
         // E362 — a malformed `join_values` declaration, checked before the
         // encoding gate below: `csv` (the format that consumes it) short-circuits
         // that gate, so its own per-entry checks must run here or never.

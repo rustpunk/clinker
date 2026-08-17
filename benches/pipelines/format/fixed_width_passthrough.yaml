@@ -19,7 +19,7 @@ nodes:
       cxl: |
         emit f0 = f0
 
-  - type: output
+  - type: sink
     name: sink
     input: passthrough
     config:

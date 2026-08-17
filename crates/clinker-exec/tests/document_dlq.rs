@@ -56,7 +56,7 @@ nodes:
       cxl: |
         emit id = id
         emit val = value.to_int()
-  - type: output
+  - type: sink
     name: out
     input: validate
     config:
@@ -265,7 +265,7 @@ nodes:
       schema:
         - { name: id, type: string }
         - { name: value, type: int }
-  - type: output
+  - type: sink
     name: out
     input: events
     config:
@@ -489,7 +489,7 @@ nodes:
       cxl: |
         emit seg = seg_id
         emit v = e01.to_int()
-  - type: output
+  - type: sink
     name: out
     input: validate
     config:
@@ -600,7 +600,7 @@ nodes:
         - {{ name: seg_id, type: string }}
         - {{ name: set_ref, type: string }}
         - {{ name: e01, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -1149,7 +1149,7 @@ nodes:
       schema:
         - {{ name: seg_id, type: string }}
         - {{ name: {reference_field}, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: msgs
     config:
@@ -1320,7 +1320,7 @@ nodes:
       dlq_granularity: document
       schema:
         - { name: id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: events
     config:
@@ -1360,7 +1360,7 @@ nodes:
       dlq_granularity: document
       schema:
         - { name: id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: events
     config:
@@ -1398,7 +1398,7 @@ nodes:
       schema:
         - { name: account_id, type: string }
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: events
     config:
@@ -1475,7 +1475,7 @@ nodes:
         emit id = id
         emit note = note
         emit val = value.to_int()
-  - type: output
+  - type: sink
     name: out
     input: validate
     config:
@@ -1515,7 +1515,7 @@ nodes:
     // An UPSTREAM stage must actually have spilled — otherwise this guards
     // nothing about the document-context-through-spill round-trip. Per-stage
     // spill bytes are keyed by the spilling node's name; the document-DLQ
-    // driver's own bucket spill is keyed by the Output node ("out"), so a
+    // driver's own bucket spill is keyed by the Sink node ("out"), so a
     // non-"out" spilling stage is the inter-stage buffer feeding the Output
     // (the producer that drains its records to disk before the Output
     // reloads them). Pinning the upstream stage keeps a future regression in

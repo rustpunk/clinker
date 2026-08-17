@@ -1347,7 +1347,7 @@ nodes:
         - { name: key, type: int }
         - { name: payload, type: string }
       sort_order: [key]
-  - type: output
+  - type: sink
     name: out
     input: rows
     config:

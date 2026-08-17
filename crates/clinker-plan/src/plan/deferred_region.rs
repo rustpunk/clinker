@@ -459,7 +459,7 @@ fn continuation_bfs(
             continue;
         }
         match &graph[node] {
-            PlanNode::Output { .. } => {
+            PlanNode::Sink { .. } => {
                 outputs.insert(node);
             }
             PlanNode::Aggregation { .. } => {
@@ -603,7 +603,7 @@ fn pass_a_forward_bfs(
             continue;
         }
         match &graph[node] {
-            PlanNode::Output { .. } => {
+            PlanNode::Sink { .. } => {
                 outputs.insert(node);
                 // Do not recurse past Output — region exit boundary.
             }
@@ -645,7 +645,7 @@ fn walk_body_into_region(
 ) {
     for idx in body.graph.node_indices() {
         match &body.graph[idx] {
-            PlanNode::Output { .. } => {
+            PlanNode::Sink { .. } => {
                 outputs.insert(idx);
             }
             PlanNode::Composition { body: nested, .. } => {
@@ -1064,7 +1064,7 @@ fn propagate_through_node_for_body(node: &PlanNode, set: &mut HashSet<String>) {
                 set.insert(sf.field.clone());
             }
         }
-        PlanNode::Source { .. } | PlanNode::Output { .. } => {
+        PlanNode::Source { .. } | PlanNode::Sink { .. } => {
             // Sources and Outputs are region boundaries; never visited
             // as upstream in the propagation walk.
         }
@@ -1292,12 +1292,12 @@ fn output_consumed_columns(
         })
         .unwrap_or_default();
 
-    if let PlanNode::Output {
+    if let PlanNode::Sink {
         resolved: Some(payload),
         ..
     } = &graph[out_idx]
     {
-        let cfg = &payload.output;
+        let cfg = &payload.sink;
         // `entry.source` is the column read from upstream — the right-hand side
         // of an `output_name: source_column` pair, and the whole of a bare-name
         // entry. Seeding from the output names instead would prune the columns
@@ -1380,7 +1380,7 @@ nodes:
       emit order_id = order_id
       emit department = department
       emit total = sum(amount)
-- type: output
+- type: sink
   name: out
   input: order_totals
   config:

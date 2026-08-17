@@ -282,10 +282,9 @@ pub fn validate_all_config_paths(
             PipelineNode::Source { config, .. } => {
                 (Some(config.source.path_str()), config.source.name.as_str())
             }
-            PipelineNode::Output { config, .. } => (
-                Some(config.output.path.as_str()),
-                config.output.name.as_str(),
-            ),
+            PipelineNode::Sink { config, .. } => {
+                (Some(config.sink.path.as_str()), config.sink.name.as_str())
+            }
             _ => (None, ""),
         };
         if let Some(raw) = raw
@@ -537,7 +536,7 @@ nodes:
     input: src
     config:
       cxl: "emit x = a"
-  - type: output
+  - type: sink
     name: dest
     input: t1
     config:

@@ -32,7 +32,7 @@ composition.enrich1:
   buffer: materialized
   arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
-output.sink:
+sink.sink:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
@@ -46,7 +46,7 @@ edge source.ingest_src -> composition.enrich1:
   buffer: node_buffer (slot=0)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: source)
 
-edge composition.enrich1 -> output.sink:
+edge composition.enrich1 -> sink.sink:
   buffer: node_buffer (slot=1)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: composition)
 
@@ -64,4 +64,4 @@ Worker threads: 4
 
   ● [source] ingest_src (line:5)
   │ [composition:body=<ID>] enrich1 (line:16)
-  │ [output] sink (line:26)
+  │ [sink] sink (line:26)

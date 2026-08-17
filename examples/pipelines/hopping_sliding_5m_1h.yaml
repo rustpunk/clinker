@@ -42,7 +42,7 @@ nodes:
         emit total = sum(amount)
         emit n = count(*)
 
-  - type: output
+  - type: sink
     name: results
     input: sliding_amount
     config:

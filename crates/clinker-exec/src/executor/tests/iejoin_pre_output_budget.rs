@@ -146,7 +146,7 @@ nodes:
       emit amount = orders.amount
       emit band_id = bands.band_id
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: banded
   config:
@@ -488,7 +488,7 @@ nodes:
       emit order_id = orders.order_id
       emit band_id = bands.band_id
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: banded
   config:
@@ -565,7 +565,7 @@ nodes:
     cxl: |
       emit order_id = order_id
       emit band_id = band_id
-- type: output
+- type: sink
   name: out
   input: passthrough
   config:
@@ -803,7 +803,7 @@ nodes:
       emit amount = orders.amount
       emit lo = bands.lo
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: banded
   config:
@@ -1047,7 +1047,7 @@ nodes:
       emit order_id = orders.order_id
       emit q = orders.amount / bands.divisor
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: banded
   config:

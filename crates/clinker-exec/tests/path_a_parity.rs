@@ -140,7 +140,7 @@ fn test_path_a_output_projections_populated() {
     let dag = plan.dag();
     assert!(
         !dag.output_projections.is_empty(),
-        "output_projections must be derived from output_configs; was empty"
+        "output_projections must be derived from sink_configs; was empty"
     );
 }
 
@@ -209,7 +209,7 @@ nodes:
       cxl: |
         emit id = id
 
-  - type: output
+  - type: sink
     name: out
     input: passthrough
     config:
@@ -416,14 +416,14 @@ nodes:
     config:
       cxl: |
         emit id = id
-  - type: output
+  - type: sink
     name: out_a
     input: passthrough_a
     config:
       name: out_a
       type: csv
       path: out_a.csv
-  - type: output
+  - type: sink
     name: out_b
     input: passthrough_b
     config:

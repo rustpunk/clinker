@@ -74,7 +74,7 @@ fn run_pipeline(
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
@@ -215,7 +215,7 @@ nodes:
       emit total = sum(amount)
 
       '
-- type: output
+- type: sink
   name: out
   input: dept_summary
   config:
@@ -553,7 +553,7 @@ nodes:
       emit w_total = $window.sum(amount)
     analytic_window:
       group_by: [dept]
-- type: output
+- type: sink
   name: out
   input: windowed
   config:

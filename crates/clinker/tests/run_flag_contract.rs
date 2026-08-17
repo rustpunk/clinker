@@ -26,7 +26,7 @@ nodes:
       path: {source}
       schema:
         - {{ name: id, type: int }}
-  - type: output
+  - type: sink
     name: final
     input: input
     config:
@@ -86,7 +86,7 @@ nodes:
   - type: merge
     name: combined
     inputs: [a, b]
-  - type: output
+  - type: sink
     name: final
     input: combined
     config:

@@ -211,7 +211,7 @@ nodes:
     use: ../compositions/tax.comp.yaml
     inputs: { inp: orders }
     config: { threshold: 0.5 }
-  - type: output
+  - type: sink
     name: out
     input: risk
     config: { name: out, type: csv, path: out.csv }

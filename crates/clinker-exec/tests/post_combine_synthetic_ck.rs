@@ -74,7 +74,7 @@ nodes:
       emit running_total = $window.sum(total)
     analytic_window:
       group_by: [department, '$ck.aggregate.dept_totals']
-- type: output
+- type: sink
   name: out
   input: running
   config:

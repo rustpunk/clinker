@@ -30,7 +30,7 @@ nodes:
         - { name: customer_id, type: string }
         - { name: amount, type: float }
 
-  - type: output
+  - type: sink
     name: out
     input: orders
     config:

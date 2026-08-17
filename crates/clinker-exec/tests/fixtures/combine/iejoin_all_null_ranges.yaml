@@ -43,7 +43,7 @@ nodes:
         emit driver_id = drivers.driver_id
         emit build_id = builds.build_id
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: never_matches_out
     input: never_matches
     config:

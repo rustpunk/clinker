@@ -38,7 +38,7 @@ nodes:
       on_miss: null_fields
       cxl: ""
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: collected_out
     input: collected
     config:

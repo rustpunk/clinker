@@ -160,7 +160,7 @@ nodes:
       cxl: |
         emit dept_name = dept
         emit grand_total = total
-  - type: output
+  - type: sink
     name: out
     input: rename
     config:
@@ -251,7 +251,7 @@ nodes:
       cxl: |
         emit dept_keep = dept
         emit running_total = total
-  - type: output
+  - type: sink
     name: out
     input: project
     config:
@@ -273,9 +273,9 @@ nodes:
     // Downstream Transform reads `dept` and `total` from the producer
     // (transitively via `dept_keep` / `running_total`). `other` is
     // emitted by the producer but NEVER consumed downstream; pruning
-    // must drop it. The Output node sets `include_unmapped: false` so
+    // must drop it. The Sink node sets `include_unmapped: false` so
     // the prune analysis can isolate unconsumed producer emits — with
-    // the default `include_unmapped: true`, the Output node would
+    // the default `include_unmapped: true`, the Sink node would
     // request every upstream column and `other` would survive.
     assert!(region.buffer_schema.contains(&"dept".to_string()));
     assert!(region.buffer_schema.contains(&"total".to_string()));
@@ -353,7 +353,7 @@ nodes:
       cxl: |
         emit region = region
         emit grand = grand
-  - type: output
+  - type: sink
     name: out
     input: t2
     config:
@@ -463,7 +463,7 @@ nodes:
       cxl: |
         emit customer_id = customer_id
         emit name = name
-  - type: output
+  - type: sink
     name: out
     input: tail
     config:
@@ -584,7 +584,7 @@ nodes:
       cxl: |
         emit dept = dept
         emit total = total
-  - type: output
+  - type: sink
     name: out
     input: parent_t
     config:
@@ -748,7 +748,7 @@ nodes:
     use: ../compositions/outer_wrap.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: outer
     config:
@@ -899,7 +899,7 @@ nodes:
       cxl: |
         emit dept = dept
         emit total = total
-  - type: output
+  - type: sink
     name: out
     input: parent_t
     config:
@@ -1066,7 +1066,7 @@ nodes:
       cxl: |
         emit dept = dept
         emit total = total
-  - type: output
+  - type: sink
     name: out
     input: parent_t
     config:
@@ -1121,7 +1121,7 @@ nodes:
         body_cont.members
     );
     // The outer body has no Outputs of its own (body Outputs surface
-    // through `output_port_to_node_idx`, not as PlanNode::Output), so
+    // through `output_port_to_node_idx`, not as PlanNode::Sink), so
     // the continuation's `outputs` set is empty.
     assert!(
         body_cont.outputs.is_empty(),
@@ -1168,7 +1168,7 @@ nodes:
         big: total > 1000
         medium: total > 100
       default: small
-  - type: output
+  - type: sink
     name: out_big
     input: classify.big
     config:
@@ -1176,7 +1176,7 @@ nodes:
       type: csv
       path: big.csv
       include_unmapped: true
-  - type: output
+  - type: sink
     name: out_medium
     input: classify.medium
     config:
@@ -1184,7 +1184,7 @@ nodes:
       type: csv
       path: medium.csv
       include_unmapped: true
-  - type: output
+  - type: sink
     name: out_small
     input: classify.small
     config:
@@ -1293,7 +1293,7 @@ nodes:
       cxl: |
         emit dept = dept
         emit total = total
-  - type: output
+  - type: sink
     name: out
     input: parent_t
     config:
@@ -1404,7 +1404,7 @@ nodes:
       cxl: |
         emit dept = dept
         emit total = total
-  - type: output
+  - type: sink
     name: out
     input: parent_t
     config:
@@ -1543,7 +1543,7 @@ nodes:
       cxl: |
         emit dept = dept
         emit total = total
-  - type: output
+  - type: sink
     name: out
     input: parent_t
     config:
@@ -1672,7 +1672,7 @@ nodes:
     config:
       cxl: |
         emit dept = dept
-  - type: output
+  - type: sink
     name: out_a
     input: parent_a
     config:
@@ -1692,7 +1692,7 @@ nodes:
     config:
       cxl: |
         emit total = total
-  - type: output
+  - type: sink
     name: out_b
     input: parent_b
     config:
@@ -1910,7 +1910,7 @@ nodes:
       cxl: |
         emit dept = dept
         emit total = total
-  - type: output
+  - type: sink
     name: out
     input: parent_t
     config:

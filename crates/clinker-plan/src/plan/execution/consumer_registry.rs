@@ -2,7 +2,7 @@
 //!
 //! The finalized plan graph is lowered once into stable producer and consumer
 //! identities. Runtime fan-out uses this registry instead of independently
-//! recounting Output nodes and Merge/Combine predecessor readers.
+//! recounting Sink nodes and Merge/Combine predecessor readers.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -90,7 +90,7 @@ impl CompiledConsumerRegistry {
                     node: target.id(),
                     input_port: edge.weight().port.clone(),
                     slot_behavior,
-                    kind: if matches!(target, PlanNode::Output { .. }) {
+                    kind: if matches!(target, PlanNode::Sink { .. }) {
                         CompiledConsumerKind::PhysicalWriterBoundary
                     } else {
                         CompiledConsumerKind::Computational
@@ -152,7 +152,7 @@ mod tests {
             resolved: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),
         });
-        let output = graph.add_node(PlanNode::Output {
+        let output = graph.add_node(PlanNode::Sink {
             name: "direct".to_string(),
             id: output_id,
             span: Span::SYNTHETIC,
@@ -205,14 +205,14 @@ nodes:
       type: csv
       path: other.csv
       schema: [{ name: id, type: string }]
-  - type: output
+  - type: sink
     name: direct
     input: shared
     config: { name: direct, type: csv, path: direct.csv }
   - type: merge
     name: joined
     inputs: [shared, other]
-  - type: output
+  - type: sink
     name: merged
     input: joined
     config: { name: merged, type: csv, path: merged.csv }
@@ -259,11 +259,11 @@ nodes:
       mode: exclusive
       conditions: { left: "side == 'left'" }
       default: right
-  - type: output
+  - type: sink
     name: left
     input: split.left
     config: { name: left, type: csv, path: left.csv }
-  - type: output
+  - type: sink
     name: right
     input: split.right
     config: { name: right, type: csv, path: right.csv }

@@ -205,7 +205,7 @@ fn write_pipeline(dir: &Path, output_path: &str) -> PathBuf {
         "pipeline:\n  name: lineage_fixture\nnodes:\n  - type: source\n    name: src\n    \
          config:\n      name: src\n      type: csv\n      path: ./data/in.csv\n      \
          options: {{ has_header: true }}\n      schema:\n        - {{ name: id, type: string }}\n  \
-         - type: output\n    name: out\n    input: src\n    config:\n      name: out\n      \
+         - type: sink\n    name: out\n    input: src\n    config:\n      name: out\n      \
          type: csv\n      path: \"{output_path}\"\n"
     );
     let path = dir.join("pipeline.yaml");
@@ -615,7 +615,7 @@ fn write_runnable_pipeline(dir: &Path, memory_limit: Option<&str>) -> PathBuf {
     input: src
     config:
       cxl: "emit doubled = amount * 2"
-  - type: output
+  - type: sink
     name: out
     input: xf
     config:

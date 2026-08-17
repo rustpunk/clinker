@@ -388,7 +388,7 @@ fn is_relaxed_pipeline(ctx: &ExecutorContext<'_>, current_dag: &ExecutionPlanDag
 }
 
 /// Resolve the per-output [`CorrelationFanoutPolicy`] per the precedence
-/// chain: per-Output override > per-pipeline default > documented default
+/// chain: per-Sink override > per-pipeline default > documented default
 /// (`Any`). The Combine-level override surfaces through the relaxed
 /// orchestrator's recompute pass when delta records derive from a
 /// Combine; the strict path consults only Output and pipeline because
@@ -399,7 +399,7 @@ pub(crate) fn output_fanout_policy(
     output_name: &str,
 ) -> CorrelationFanoutPolicy {
     let output_override = ctx
-        .output_configs
+        .sink_configs
         .iter()
         .find(|o| o.name == output_name)
         .and_then(|o| o.correlation_fanout_policy);

@@ -42,7 +42,7 @@ fn multi_output_fixture(
 ) {
     let config = clinker_plan::config::parse_config(yaml).unwrap();
     let buffers: HashMap<String, SharedBuffer> = config
-        .output_configs()
+        .sink_configs()
         .map(|o| (o.name.clone(), SharedBuffer::new()))
         .collect();
     (config, buffers)
@@ -168,7 +168,7 @@ nodes:
       schema:
         - { name: id, type: string }
         - { name: value, type: int }
-  - type: output
+  - type: sink
     name: direct
     input: shared
     config:
@@ -178,7 +178,7 @@ nodes:
   - type: merge
     name: joined
     inputs: [shared, sibling]
-  - type: output
+  - type: sink
     name: merged
     input: joined
     config:
@@ -230,7 +230,7 @@ nodes:
       schema:
         - { name: id, type: string }
         - { name: label, type: string }
-  - type: output
+  - type: sink
     name: direct
     input: shared
     config:
@@ -253,7 +253,7 @@ nodes:
         emit value = left.value
         emit label = right.label
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: combined
     input: joined
     config:
@@ -296,14 +296,14 @@ fn shared_port_merge_yaml(memory_limit: &str, computational_first: bool) -> Stri
   - type: merge
     name: joined
     inputs: [shared, sibling]
-  - type: output
+  - type: sink
     name: direct
     input: shared
     config: { name: direct, type: csv, path: direct.csv }
 "#
     } else {
         r#"
-  - type: output
+  - type: sink
     name: direct
     input: shared
     config: { name: direct, type: csv, path: direct.csv }
@@ -337,7 +337,7 @@ nodes:
         - {{ name: id, type: string }}
         - {{ name: payload, type: string }}
 {consumers}
-  - type: output
+  - type: sink
     name: merged
     input: joined
     config: {{ name: merged, type: csv, path: merged.csv }}
@@ -370,7 +370,7 @@ nodes:
       schema:
         - {{ name: id, type: string }}
         - {{ name: label, type: string }}
-  - type: output
+  - type: sink
     name: direct
     input: shared
     config: {{ name: direct, type: csv, path: direct.csv }}
@@ -389,7 +389,7 @@ nodes:
         emit payload = left.payload
         emit label = right.label
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: combined
     input: joined
     config: {{ name: combined, type: csv, path: combined.csv }}
@@ -406,14 +406,14 @@ fn shared_port_transform_yaml(memory_limit: &str, computational_first: bool) -> 
     config:
       cxl: |
         emit copied_id = id
-  - type: output
+  - type: sink
     name: direct
     input: shared
     config: { name: direct, type: csv, path: direct.csv }
 "#
     } else {
         r#"
-  - type: output
+  - type: sink
     name: direct
     input: shared
     config: { name: direct, type: csv, path: direct.csv }
@@ -441,7 +441,7 @@ nodes:
         - {{ name: id, type: string }}
         - {{ name: payload, type: string }}
 {consumers}
-  - type: output
+  - type: sink
     name: transformed
     input: copied
     config: {{ name: transformed, type: csv, path: transformed.csv }}
@@ -678,11 +678,11 @@ nodes:
       schema:
         - { name: id, type: string }
         - { name: payload, type: string }
-  - type: output
+  - type: sink
     name: interrupting
     input: shared
     config: { name: interrupting, type: csv, path: interrupting.csv }
-  - type: output
+  - type: sink
     name: pending
     input: shared
     config: { name: pending, type: csv, path: pending.csv }
@@ -759,11 +759,11 @@ nodes:
       schema:
         - { name: id, type: string }
         - { name: payload, type: string }
-  - type: output
+  - type: sink
     name: failing
     input: shared
     config: { name: failing, type: csv, path: failing.csv }
-  - type: output
+  - type: sink
     name: pending
     input: shared
     config: { name: pending, type: csv, path: pending.csv }
@@ -818,7 +818,7 @@ fn test_multi_output_two_writers() {
     conditions:
       high: amount_val > 100
     default: low
-- type: output
+- type: sink
   name: high
   input: classify
   config:
@@ -826,7 +826,7 @@ fn test_multi_output_two_writers() {
     path: high.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: low
   input: classify
   config:
@@ -870,7 +870,7 @@ fn test_multi_output_three_writers() {
       high: amount_val > 1000
       medium: amount_val > 100
     default: low
-- type: output
+- type: sink
   name: high
   input: classify
   config:
@@ -878,7 +878,7 @@ fn test_multi_output_three_writers() {
     path: high.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: medium
   input: classify
   config:
@@ -886,7 +886,7 @@ fn test_multi_output_three_writers() {
     path: medium.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: low
   input: classify
   config:
@@ -917,7 +917,7 @@ fn test_multi_output_record_counts() {
     conditions:
       big: amount_val > 50
     default: small
-- type: output
+- type: sink
   name: big
   input: classify
   config:
@@ -925,7 +925,7 @@ fn test_multi_output_record_counts() {
     path: big.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: small
   input: classify
   config:
@@ -961,7 +961,7 @@ fn test_multi_output_order_preserved() {
     conditions:
       big: amount_val > 50
     default: small
-- type: output
+- type: sink
   name: big
   input: classify
   config:
@@ -969,7 +969,7 @@ fn test_multi_output_order_preserved() {
     path: big.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: small
   input: classify
   config:
@@ -1037,7 +1037,7 @@ fn test_multi_output_writer_error_propagated() {
     conditions:
       good: amount_val > 50
     default: bad
-- type: output
+- type: sink
   name: good
   input: classify
   config:
@@ -1045,7 +1045,7 @@ fn test_multi_output_writer_error_propagated() {
     path: good.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: bad
   input: classify
   config:
@@ -1097,7 +1097,7 @@ fn test_multi_output_inclusive_duplicate() {
       report: amount_val > 50
     default: standard
     mode: inclusive
-- type: output
+- type: sink
   name: audit
   input: classify
   config:
@@ -1105,7 +1105,7 @@ fn test_multi_output_inclusive_duplicate() {
     path: audit.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: report
   input: classify
   config:
@@ -1113,7 +1113,7 @@ fn test_multi_output_inclusive_duplicate() {
     path: report.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: standard
   input: classify
   config:
@@ -1171,7 +1171,7 @@ nodes:
     cxl: 'emit val = id
 
       '
-- type: output
+- type: sink
   name: out
   input: passthrough
   config:
@@ -1201,7 +1201,7 @@ fn test_multi_output_empty_route() {
     conditions:
       special: amount_val > 99999
     default: normal
-- type: output
+- type: sink
   name: special
   input: classify
   config:
@@ -1209,7 +1209,7 @@ fn test_multi_output_empty_route() {
     path: special.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: normal
   input: classify
   config:
@@ -1273,7 +1273,7 @@ fn test_multi_output_writer_panic_propagated() {
     conditions:
       good: amount_val > 50
     default: bad
-- type: output
+- type: sink
   name: good
   input: classify
   config:
@@ -1281,7 +1281,7 @@ fn test_multi_output_writer_panic_propagated() {
     path: good.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: bad
   input: classify
   config:
@@ -1368,7 +1368,7 @@ nodes:
     conditions:
       big: amount_val > 50
     default: small
-- type: output
+- type: sink
   name: big
   input: classify
   config:
@@ -1376,7 +1376,7 @@ nodes:
     path: big.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: small
   input: classify
   config:
@@ -1433,7 +1433,7 @@ fn test_multi_output_send_error_disconnected() {
     conditions:
       a: amount_val > 50
     default: b
-- type: output
+- type: sink
   name: a
   input: classify
   config:
@@ -1441,7 +1441,7 @@ fn test_multi_output_send_error_disconnected() {
     path: a.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: b
   input: classify
   config:
@@ -1507,7 +1507,7 @@ fn test_multi_output_multiple_errors_collected() {
     conditions:
       a: amount_val > 50
     default: b
-- type: output
+- type: sink
   name: a
   input: classify
   config:
@@ -1515,7 +1515,7 @@ fn test_multi_output_multiple_errors_collected() {
     path: a.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: b
   input: classify
   config:
@@ -1622,7 +1622,7 @@ nodes:
     conditions:
       high: amount_val > 100
     default: low
-- type: output
+- type: sink
   name: high
   input: classify
   config:
@@ -1630,7 +1630,7 @@ nodes:
     path: high.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: low
   input: classify
   config:
@@ -1693,7 +1693,7 @@ nodes:
     conditions:
       special: amount_val / divisor > 0
     default: normal
-- type: output
+- type: sink
   name: special
   input: calc
   config:
@@ -1701,7 +1701,7 @@ nodes:
     path: special.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: normal
   input: calc
   config:
@@ -1782,7 +1782,7 @@ nodes:
     conditions:
       high: amount_val > 100
     default: low
-- type: output
+- type: sink
   name: high
   input: classify
   config:
@@ -1790,7 +1790,7 @@ nodes:
     path: high.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: low
   input: classify
   config:
@@ -1882,7 +1882,7 @@ nodes:
     cxl: 'emit val = amount.to_int()
 
       '
-- type: output
+- type: sink
   name: out
   input: calc
   config:
@@ -1941,7 +1941,7 @@ nodes:
     cxl: 'emit id_val = id
 
       '
-- type: output
+- type: sink
   name: dest
   input: identity
   config:
@@ -2007,7 +2007,7 @@ nodes:
     cxl: 'emit x_val = x
 
       '
-- type: output
+- type: sink
   name: dest
   input: identity
   config:

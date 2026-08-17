@@ -94,7 +94,7 @@ nodes:
       cxl: |
         emit id = id
         emit amt = amt
-  - type: output
+  - type: sink
     name: out
     input: tfm
     config:
@@ -244,7 +244,7 @@ nodes:
       cxl: |
         emit id = id
         emit amt = amt
-  - type: output
+  - type: sink
     name: out
     input: tfm
     config:

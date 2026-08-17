@@ -85,7 +85,7 @@ nodes:
       cxl: |
         emit category = category
         emit ratio = total / (total - total)
-  - type: output
+  - type: sink
     name: out
     input: post
     config:

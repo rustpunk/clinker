@@ -98,7 +98,7 @@ nodes:
     input: src
     config:
       cxl: "emit bogus = not_a_column + 1"
-  - type: output
+  - type: sink
     name: out
     input: t
     config:
@@ -160,7 +160,7 @@ nodes:
         record_path: "$.rows"
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -416,7 +416,7 @@ nodes:
       path: missing.csv
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -473,7 +473,7 @@ nodes:
     input: src
     config:
       cxl: "emit bogus = not_a_column + 1"
-  - type: output
+  - type: sink
     name: out
     input: t
     config:
@@ -515,7 +515,7 @@ fn test_composition_body_diagnostic_does_not_point_into_the_pipeline_file() {
     // A plan-time span is a bare line number with no file identity, and a
     // composition body's gates number lines in the *body* file. Resolving one
     // against the pipeline file underlines unrelated YAML -- here it landed on
-    // the output node -- or, past the file's end, silently nothing. A plan
+    // the Sink node -- or, past the file's end, silently nothing. A plan
     // that binds a body therefore renders without a snippet at all.
     let tmp = tempdir_path();
     std::fs::write(
@@ -560,7 +560,7 @@ nodes:
     use: ./body.comp.yaml
     inputs:
       b_in: src
-  - type: output
+  - type: sink
     name: out
     input: c1
     config:
@@ -629,7 +629,7 @@ nodes:
         record_path: "$.rows"
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: src
     input: Src
     config:
@@ -697,7 +697,7 @@ nodes:
     config:
       cxl: |
         emit tripled = doubled + 1
-  - type: output
+  - type: sink
     name: out
     input: runtime_t
     config:
@@ -780,7 +780,7 @@ nodes:
     use: ./body.comp.yaml
     inputs:
       b_in: {source_name}
-  - type: output
+  - type: sink
     name: out
     input: {comp_name}
     config:
@@ -896,7 +896,7 @@ nodes:
     use: ./scoped.comp.yaml
     inputs:
       s_in: tag
-  - type: output
+  - type: sink
     name: out
     input: c1
     config:
@@ -968,7 +968,7 @@ fn test_a_resolved_env_var_never_reaches_the_rendered_snippet() {
   name: inline_secret
 nodes:
   - { type: source, name: src, config: { name: src, type: json, path: "${LEAK_TEST_URL}", options: { record_path: "$.rows" }, schema: [{ name: amount, type: int }] } }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -998,7 +998,7 @@ nodes:
         record_path: "$.rows"
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -1028,7 +1028,7 @@ nodes:
         record_path: "$.rows"
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -1142,7 +1142,7 @@ nodes:
       path: in.csv
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -1210,7 +1210,7 @@ nodes:
       path: in.csv
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

@@ -184,7 +184,7 @@ nodes:
     config:
       cxl: |
         emit x = $doc.Head.batch_id
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -225,7 +225,7 @@ nodes:
     config:
       cxl: |
         emit x = $doc.Head.batch_id
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -435,7 +435,7 @@ nodes:
     config:
       cxl: |
         emit x = $doc.Head.blob
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:

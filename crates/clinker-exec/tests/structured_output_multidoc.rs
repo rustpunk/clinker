@@ -59,7 +59,7 @@ nodes:
       schema:
         - {{ name: id, type: int }}
         - {{ name: tag, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: body
     config:
@@ -122,7 +122,7 @@ nodes:
     inputs: [left, right]
     config:
       mode: interleave
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:

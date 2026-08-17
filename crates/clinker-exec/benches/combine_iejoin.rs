@@ -89,7 +89,7 @@ nodes:
       emit income = employees.income
       emit rate = brackets.rate
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: assign_bracket
   config:
@@ -463,7 +463,7 @@ nodes:
       emit reading_id = readings.reading_id
       emit band_id = bands.band_id
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: banded
   config:

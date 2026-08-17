@@ -54,7 +54,7 @@ nodes:
         emit tracking_region = shipments.f3 ?? "unknown"
       propagate_ck: driver
 
-  - type: output
+  - type: sink
     name: matched_out
     input: match_shipment
     config:

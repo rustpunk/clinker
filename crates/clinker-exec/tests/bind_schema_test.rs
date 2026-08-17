@@ -95,7 +95,7 @@ nodes:
       schema:
         - { name: a, type: string }
         - { name: b, type: int }
-  - type: output
+  - type: sink
     name: out1
     input: source1
     config:
@@ -156,7 +156,7 @@ nodes:
     input: src
     config:
       cxl: "emit y = x"
-  - type: output
+  - type: sink
     name: out
     input: tx
     config:
@@ -191,7 +191,7 @@ nodes:
     input: s1
     config:
       cxl: "emit doubled = id"
-  - type: output
+  - type: sink
     name: o1
     input: t1
     config:
@@ -264,7 +264,7 @@ nodes:
       schema:
         - { name: employee_id, type: string }
         - { name: salary, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -334,7 +334,7 @@ nodes:
       schema:
         - { name: employee_id, type: string }
         - { name: salary, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -404,7 +404,7 @@ nodes:
         - { name: employee_id, type: string }
         - { name: tenant, type: int }
         - { name: salary, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -464,7 +464,7 @@ nodes:
     input: src
     config:
       cxl: "emit doubled = amount"
-  - type: output
+  - type: sink
     name: out
     input: tx
     config:
@@ -534,7 +534,7 @@ nodes:
   - type: merge
     name: merged
     inputs: [src_widen, src_drop]
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -596,7 +596,7 @@ nodes:
       group_by:
         - dept
       cxl: "emit total = sum(salary)"
-  - type: output
+  - type: sink
     name: out
     input: agg
     config:
@@ -615,7 +615,7 @@ nodes:
         agg_row.has_field("$widened"),
         "aggregate's bound row must include `$widened` when the upstream source's auto_widen \
          policy reserves the sidecar slot — dropping it breaks composition body propagation \
-         and the dispatch canonicalize invariant for downstream Output nodes"
+         and the dispatch canonicalize invariant for downstream Sink nodes"
     );
 
     // The PlanNode::Aggregation's lowered output_schema must carry the
@@ -665,7 +665,7 @@ nodes:
       correlation_key: nonexistent
       schema:
         - { name: employee_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -722,7 +722,7 @@ nodes:
     use: ../compositions/passthrough_check.comp.yaml
     inputs:
       data: src
-  - type: output
+  - type: sink
     name: out
     input: passthrough.data
     config:
@@ -823,7 +823,7 @@ nodes:
         emit region = c.region
         emit amount = o.amount
       propagate_ck: all
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:
@@ -873,7 +873,7 @@ nodes:
       path: in.csv
       schema:
         - { name: order_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -909,7 +909,7 @@ nodes:
       type: edifact
       path: dummy.edi
       schema: { generated: {} }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -962,7 +962,7 @@ nodes:
         split_fields:
           - { field: f08, components: 2 }
       schema: { generated: {} }
-  - type: output
+  - type: sink
     name: out
     input: messages
     config:
@@ -1002,7 +1002,7 @@ nodes:
       type: swift
       path: dummy.mt
       schema: { generated: {} }
-  - type: output
+  - type: sink
     name: out
     input: mt
     config:
@@ -1034,7 +1034,7 @@ nodes:
       type: csv
       path: dummy.csv
       schema: { generated: {} }
-  - type: output
+  - type: sink
     name: out
     input: rows
     config:

@@ -95,7 +95,7 @@ nodes:
     input: one_document
     config:
       cxl: "emit failure = 1 / 0"
-  - type: output
+  - type: sink
     name: out
     input: observe_identity
     config:
@@ -161,7 +161,7 @@ nodes:
     name: one_document
     body: interchange
     config: { strategy: concat }
-  - type: output
+  - type: sink
     name: out
     input: one_document
     config:
@@ -261,7 +261,7 @@ nodes:
     input: backfill
     config:
       cxl: "emit failure = 1 / 0"
-  - type: output
+  - type: sink
     name: out
     input: observe_identity
     config:

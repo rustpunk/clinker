@@ -181,7 +181,7 @@ nodes:
   # columns the Combine widened. `correlation_fanout_policy: any`
   # is also set on the pipeline-level `error_handling` block; the
   # explicit per-Output value teaches authors the override surface.
-  - type: output
+  - type: sink
     name: report
     input: dept_validate
     config:

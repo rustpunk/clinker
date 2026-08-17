@@ -1208,14 +1208,14 @@ nodes:
       conditions:
         positive: "combined > 0"
       default: nonpositive
-  - type: output
+  - type: sink
     name: positive_out
     input: split.positive
     config:
       name: positive_out
       type: csv
       path: positive.csv
-  - type: output
+  - type: sink
     name: nonpositive_out
     input: split.nonpositive
     config:
@@ -1646,7 +1646,7 @@ nodes:
             yaml.push_str(&format!("        emit {c}_val = {c}.{c}_val\n", c = c));
         }
         yaml.push_str("      propagate_ck: driver\n");
-        yaml.push_str("  - type: output\n    name: joined8_out\n    input: joined8\n    config:\n");
+        yaml.push_str("  - type: sink\n    name: joined8_out\n    input: joined8\n    config:\n");
         yaml.push_str("      name: joined8_out\n      type: csv\n      path: /tmp/joined8.csv\n");
 
         let config: PipelineConfig =
@@ -2150,7 +2150,7 @@ nodes:
     // `Compile(Vec<Diagnostic>)` variant and inspect per-diagnostic
     // codes rather than fuzzy-matching message strings.
     //
-    // Output capture: every declared output node gets its own
+    // Output capture: every declared Sink node gets its own
     // `SharedBuffer`; the returned `CombineFixtureResult.outputs` is a
     // `HashMap<String, String>` keyed by output name. `primary_output()`
     // returns the first-declared output for single-output tests;
@@ -2199,8 +2199,8 @@ nodes:
     #[allow(dead_code)] // Fields accessed via named getters; field access is lint-silent.
     pub(crate) struct CombineFixtureResult {
         pub report: ExecutionReport,
-        /// Captured output bytes per declared output node, keyed by
-        /// output `name`. Every output node registered in the pipeline
+        /// Captured output bytes per declared Sink node, keyed by
+        /// output `name`. Every Sink node registered in the pipeline
         /// YAML gets an entry — including empty buffers for outputs that
         /// received zero records.
         pub outputs: HashMap<String, String>,
@@ -2211,7 +2211,7 @@ nodes:
 
     impl CombineFixtureResult {
         /// Single-output convenience: captured bytes from the FIRST
-        /// declared output node (by YAML declaration order). Panics if
+        /// declared Sink node (by YAML declaration order). Panics if
         /// the pipeline declared no outputs.
         #[allow(dead_code)]
         pub fn primary_output(&self) -> &str {
@@ -2272,12 +2272,12 @@ nodes:
         // pipelines (Route downstream of combine) would lose data otherwise.
         let output_names: Vec<String> = plan
             .config()
-            .output_configs()
+            .sink_configs()
             .map(|cfg| cfg.name.clone())
             .collect();
         if output_names.is_empty() {
             return Err(CombineFixtureError::Precondition(
-                "run_combine_fixture: pipeline declares no output nodes".to_string(),
+                "run_combine_fixture: pipeline declares no Sink nodes".to_string(),
             ));
         }
         let output_buffers: HashMap<String, SharedBuffer> = output_names
@@ -2413,7 +2413,7 @@ nodes:
     config:
       cxl: |
         emit id = id
-  - type: output
+  - type: sink
     name: out
     input: pass_through
     config:
@@ -2535,7 +2535,7 @@ nodes:
         emit product_name = products.product_name
         emit quantity = orders.quantity
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: result
     input: enrich
     config:
@@ -2582,7 +2582,7 @@ nodes:
         emit employee_id = employees.employee_id
         emit rate_class = rate_bands.rate_class
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: result
     input: classify
     config:
@@ -2627,7 +2627,7 @@ nodes:
         emit order_id = orders.order_id
         emit product_name = products.product_name
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: result
     input: enrich
     config:
@@ -2673,7 +2673,7 @@ nodes:
         emit department = employees.department
         emit project = assignments.project
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: result
     input: enrich
     config:
@@ -2720,7 +2720,7 @@ nodes:
         emit department = employees.department
         emit project = assignments.project
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: result
     input: enrich
     config:
@@ -2879,7 +2879,7 @@ nodes:
       conditions:
         priority_report: 'priority_level == "urgent" or priority_level == "high"'
       default: fulfilled_orders
-  - type: output
+  - type: sink
     name: fulfilled_orders
     input: priority_split
     config:
@@ -2887,7 +2887,7 @@ nodes:
       type: csv
       path: fulfilled_orders.csv
       include_unmapped: true
-  - type: output
+  - type: sink
     name: priority_report
     input: priority_split
     config:
@@ -2954,7 +2954,7 @@ nodes:
       conditions:
         high_priority_out: 'not product_name.is_null() and product_name != "UNKNOWN"'
       default: standard_out
-  - type: output
+  - type: sink
     name: high_priority_out
     input: priority_split
     config:
@@ -2962,7 +2962,7 @@ nodes:
       type: csv
       path: high_priority_out.csv
       include_unmapped: true
-  - type: output
+  - type: sink
     name: standard_out
     input: priority_split
     config:
@@ -3302,7 +3302,7 @@ nodes:
         emit product_name = products.name
         emit amount = orders.amount
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: enriched_out
     input: enriched
     config:
@@ -3409,7 +3409,7 @@ nodes:
       on_miss: null_fields
       cxl: ""
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: collected_out
     input: collected
     config:
@@ -3486,7 +3486,7 @@ nodes:
       on_miss: null_fields
       cxl: ""
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: collected_out
     input: collected
     config:
@@ -3559,7 +3559,7 @@ nodes:
       on_miss: null_fields
       cxl: ""
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: collected_out
     input: collected
     config:
@@ -3782,7 +3782,7 @@ nodes:
         emit order_id = orders.order_id
         emit product_name = products.name
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: enriched_out
     input: enriched
     config:
@@ -3875,7 +3875,7 @@ nodes:
         emit order_id = orders.order_id
         emit product_name = products.name
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: enriched_out
     input: enriched
     config:
@@ -3961,7 +3961,7 @@ nodes:
         emit amount = orders.amount
         emit product_name = products.name
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: filtered_out
     input: filtered
     config:
@@ -4032,7 +4032,7 @@ nodes:
         emit order_id = orders.order_id
         emit product_name = products.name
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: joined_out
     input: joined
     config:
@@ -4252,7 +4252,7 @@ nodes:
         emit x = drivers.x
         emit lo = builds.lo
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: bnd_out
     input: bnd
     config:
@@ -4392,7 +4392,7 @@ nodes:
         emit x = drivers.x
         emit y = builds.y
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: pure_range_out
     input: pure_range
     config:
@@ -4462,7 +4462,7 @@ nodes:
         emit x = drivers.x
         emit bid = builds.bid
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: first_only_out
     input: first_only
     config:
@@ -4588,7 +4588,7 @@ nodes:
         emit did = drivers.did
         emit tid = builds.tid
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:
@@ -4756,7 +4756,7 @@ nodes:
         emit ax = a.x
         emit bx = b.y
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:
@@ -4840,7 +4840,7 @@ nodes:
         emit ax = a.x
         emit bx = b.y
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:
@@ -4919,7 +4919,7 @@ nodes:
         emit ax = a.x
         emit bx = b.y
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:
@@ -4971,7 +4971,7 @@ nodes:
         emit ax = a.x
         emit bx = b.y
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:
@@ -5022,7 +5022,7 @@ nodes:
         emit ax = a.x
         emit bx = b.y
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:
@@ -5074,7 +5074,7 @@ nodes:
         emit ai = a.i
         emit bx = b.y
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: banded
     config:
@@ -5129,7 +5129,7 @@ nodes:
         emit department = employees.department
         emit project = assignments.project
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: result
     input: enrich
     config:
@@ -5210,7 +5210,7 @@ nodes:
         emit price = products.price
         emit bracket_id = brackets.bracket_id
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: result
     input: assign_bracket
     config:
@@ -5294,7 +5294,7 @@ nodes:
         emit p = probe.p
         emit b = build.b
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: result
     input: joined
     config:
@@ -5584,7 +5584,7 @@ nodes:
       emit b_c0 = b.c0
       emit c_c0 = c.c0
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: joined3
   config:
@@ -5679,7 +5679,7 @@ nodes:
       emit probe_c0 = probe.c0
       emit build_c0 = build.c0
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: joined
   config:

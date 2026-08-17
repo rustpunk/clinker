@@ -44,7 +44,7 @@ nodes:
         emit bracket_id = brackets.bracket_id
         emit rate = brackets.rate
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: assign_bracket_out
     input: assign_bracket
     config:

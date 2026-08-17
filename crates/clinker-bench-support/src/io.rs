@@ -1,7 +1,7 @@
 //! I/O utilities for capturing pipeline output in tests and benchmarks.
 //!
 //! Pipelines write output through a `Box<dyn Write + Send>` registered
-//! against the output node name. Tests and benches inject a
+//! against the Sink node name. Tests and benches inject a
 //! [`SharedBuffer`] so the post-run byte stream is inspectable from the
 //! test thread without touching the filesystem.
 //!

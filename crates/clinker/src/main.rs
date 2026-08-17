@@ -727,7 +727,7 @@ fn preview_writer_registry(
     let shared = SharedPreviewWriter(std::sync::Arc::new(std::sync::Mutex::new(destination)));
     let mut single = std::collections::HashMap::new();
     let mut fan_out = std::collections::HashMap::new();
-    for output in config.output_configs() {
+    for output in config.sink_configs() {
         if output_is_fan_out(dag, &output.name) {
             let upstream = upstream_source_for_output(dag, &output.name);
             let mut per_file = std::collections::HashMap::new();
@@ -3053,7 +3053,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         tracing::info!(
             "Dry run: plan valid, {} inputs, {} outputs, {} transforms",
             pipeline_config.source_configs().count(),
-            pipeline_config.output_configs().count(),
+            pipeline_config.sink_configs().count(),
             pipeline_config.transform_node_count(),
         );
         return Ok(0);
@@ -3463,7 +3463,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         Vec<(std::sync::Arc<str>, std::path::PathBuf, std::path::PathBuf)>,
     > = std::collections::HashMap::new();
     let mut historical_source_identities = std::collections::BTreeSet::new();
-    for output in pipeline_config.output_configs() {
+    for output in pipeline_config.sink_configs() {
         if !output_is_fan_out(compiled_plan.dag(), &output.name) {
             continue;
         }
@@ -3531,7 +3531,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     // admitted below its own enforced byte ceiling could otherwise fail merely
     // because formatting expands the source representation.
     let mut publication_roots = std::collections::BTreeMap::new();
-    for output in pipeline_config.output_configs() {
+    for output in pipeline_config.sink_configs() {
         if let Some(destinations) = fan_out_destinations.get(&output.name) {
             for (_, destination, _) in destinations {
                 insert_publication_root(&mut publication_roots, destination)?;
@@ -3646,7 +3646,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         String,
         std::collections::HashMap<std::sync::Arc<str>, String>,
     > = std::collections::HashMap::new();
-    for output in pipeline_config.output_configs() {
+    for output in pipeline_config.sink_configs() {
         // Fan-out path: when the plan flagged this Output for per-
         // source-file routing, render the template once per matched
         // source file. Each rendered path gets its own writer; the
@@ -3913,7 +3913,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 .map_err(PipelineError::Format)?;
             }
         }
-        for output in pipeline_config.output_configs() {
+        for output in pipeline_config.sink_configs() {
             if !output.write_meta {
                 continue;
             }
@@ -4154,7 +4154,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         );
     }
 
-    // Advisory end-of-run findings — today the per-Output `mapping:` report
+    // Advisory end-of-run findings — today the per-Sink `mapping:` report
     // (W365 / W366). Rendered like the startup storage warnings: to stderr and
     // the tracing log, leaving stdout for the run summary, and never affecting
     // the exit code. Each describes a file that was written and is readable.
@@ -4254,7 +4254,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 .map(|i| i.path_str().to_string())
                 .collect(),
             output_files: pipeline_config
-                .output_configs()
+                .sink_configs()
                 .map(|o| o.path.clone())
                 .collect(),
             dlq_path,
@@ -4314,10 +4314,10 @@ fn apply_cli_force_policy(config: &mut clinker_plan::config::PipelineConfig, for
         return;
     }
     for node in &mut config.nodes {
-        if let clinker_plan::config::PipelineNode::Output { config: body, .. } = &mut node.value
-            && body.output.if_exists == clinker_plan::config::IfExistsPolicy::Error
+        if let clinker_plan::config::PipelineNode::Sink { config: body, .. } = &mut node.value
+            && body.sink.if_exists == clinker_plan::config::IfExistsPolicy::Error
         {
-            body.output.if_exists = clinker_plan::config::IfExistsPolicy::Overwrite;
+            body.sink.if_exists = clinker_plan::config::IfExistsPolicy::Overwrite;
         }
     }
 }
@@ -4335,9 +4335,7 @@ fn output_is_fan_out(
         .node_indices()
         .find(|i| dag.graph[*i].name() == output_name)
         .and_then(|i| match &dag.graph[i] {
-            PlanNode::Output { resolved, .. } => {
-                resolved.as_ref().map(|r| r.fan_out_per_source_file)
-            }
+            PlanNode::Sink { resolved, .. } => resolved.as_ref().map(|r| r.fan_out_per_source_file),
             _ => None,
         })
         .unwrap_or(false)
@@ -4476,7 +4474,7 @@ fn print_resolved_outputs(config: &clinker_plan::config::PipelineConfig) {
     use clinker_plan::config::IfExistsPolicy;
     println!("=== Resolved Outputs ===");
     println!();
-    for output in config.output_configs() {
+    for output in config.sink_configs() {
         let policy = match output.if_exists {
             IfExistsPolicy::Overwrite => "overwrite",
             IfExistsPolicy::Error => "error",
@@ -5786,7 +5784,7 @@ fn compile_attempt_context(
         );
     }
     let mut destination_roots = std::collections::BTreeMap::new();
-    for output in compiled_plan.config().output_configs() {
+    for output in compiled_plan.config().sink_configs() {
         if output.has_per_record_path_tokens() {
             let upstream_source = upstream_source_for_output(compiled_plan.dag(), &output.name)
                 .ok_or_else(|| {
@@ -6016,7 +6014,7 @@ fn reconstruct_historical_receipt_roots(
     local_spool_dir: Option<&std::path::Path>,
 ) -> Result<Vec<clinker_plan::security::ValidatedPath>, AttemptCommandError> {
     let mut roots = std::collections::BTreeMap::new();
-    for output in compiled_plan.config().output_configs() {
+    for output in compiled_plan.config().sink_configs() {
         if output.has_per_record_path_tokens() {
             let upstream_source = upstream_source_for_output(compiled_plan.dag(), &output.name)
                 .ok_or_else(|| {
@@ -8506,7 +8504,7 @@ nodes:
       path: orders.csv
       schema:
         - { name: a, type: string }
-  - type: output
+  - type: sink
     name: out
     input: orders
     config:
@@ -8543,7 +8541,7 @@ nodes:
       path: orders.csv
       schema:
         - { name: a, type: string }
-  - type: output
+  - type: sink
     name: out
     input: orders
     config:

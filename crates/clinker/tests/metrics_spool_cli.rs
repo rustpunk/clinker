@@ -53,7 +53,7 @@ nodes:
       cxl: |
         emit id = id
         emit v = if(amount == 0) then (1 / 0) else amount
-  - type: output
+  - type: sink
     name: out
     input: tfm
     config:

@@ -33,7 +33,7 @@ nodes:
         emit order_id = order_id
         emit amount = amount
 
-  - type: output
+  - type: sink
     name: sink
     input: enrich
     config:

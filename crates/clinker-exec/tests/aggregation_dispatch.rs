@@ -36,7 +36,7 @@ fn run_test(
         ),
     )]);
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(output_buf.clone()) as Box<dyn Write + Send>,
     )]);
 
@@ -81,7 +81,7 @@ nodes:
       emit n = count(*)
 
       '
-- type: output
+- type: sink
   name: out
   input: by_dept
   config:
@@ -131,7 +131,7 @@ nodes:
     cxl: 'emit n = count(*)
 
       '
-- type: output
+- type: sink
   name: out
   input: total
   config:

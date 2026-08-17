@@ -4,4 +4,4 @@ expression: shape
 ---
 [source] employees
 [transform] tier_flag <- employees
-[output] results <- tier_flag
+[sink] results <- tier_flag

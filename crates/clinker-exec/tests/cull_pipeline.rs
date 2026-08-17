@@ -111,14 +111,14 @@ nodes:
       rules:
         - name: drop_error_groups
           drop_group_when: "sum(if status == 'error' then 1 else 0) > 0"
-  - type: output
+  - type: sink
     name: out
     input: drop_bad
     config:
       name: out
       type: csv
       path: out.csv
-  - type: output
+  - type: sink
     name: audit
     input: drop_bad.removed
     config:
@@ -155,14 +155,14 @@ nodes:
       rules:
         - name: drop_any_error
           drop_group_when: "sum(if status == 'error' then 1 else 0) > 0"
-  - type: output
+  - type: sink
     name: out
     input: drop_bad
     config:
       name: out
       type: csv
       path: out.csv
-  - type: output
+  - type: sink
     name: audit
     input: drop_bad.removed
     config:
@@ -339,14 +339,14 @@ nodes:
       rules:
         - name: drop_error_groups
           drop_group_when: "sum(if status == 'error' then 1 else 0) > 0  # any error row in the group"
-  - type: output
+  - type: sink
     name: out
     input: drop_bad
     config:
       name: out
       type: csv
       path: out.csv
-  - type: output
+  - type: sink
     name: audit
     input: drop_bad.removed
     config:
@@ -416,14 +416,14 @@ nodes:
           drop_group_when: "sum(if status == 'error' then 1 else 0) > 0  # any error row"
         - name: drop_big_groups
           drop_group_when: "sum(amount) > 500"
-  - type: output
+  - type: sink
     name: out
     input: drop_bad
     config:
       name: out
       type: csv
       path: out.csv
-  - type: output
+  - type: sink
     name: audit
     input: drop_bad.removed
     config:
@@ -499,14 +499,14 @@ nodes:
       rules:
         - name: drop_large_groups
           drop_group_when: "count(*) > 100"
-  - type: output
+  - type: sink
     name: out
     input: drop_big
     config:
       name: out
       type: csv
       path: out.csv
-  - type: output
+  - type: sink
     name: audit
     input: drop_big.removed
     config:
@@ -641,14 +641,14 @@ nodes:
       rules:
         - name: drop_large_groups
           drop_group_when: "count(*) > 100"
-  - type: output
+  - type: sink
     name: out
     input: drop_big
     config:
       name: out
       type: csv
       path: out.csv
-  - type: output
+  - type: sink
     name: audit
     input: drop_big.removed
     config:
@@ -867,14 +867,14 @@ nodes:
         # comparison are Dates (a string literal would be a type error).
         - name: recent_hire
           drop_group_when: "max(hired) >= #2020-01-01#"
-  - type: output
+  - type: sink
     name: out
     input: drop_recent_or_late
     config:
       name: out
       type: csv
       path: out.csv
-  - type: output
+  - type: sink
     name: audit
     input: drop_recent_or_late.removed
     config:
@@ -964,14 +964,14 @@ nodes:
       rules:
         - name: any_error
           drop_group_when: "sum(if status == 'error' then 1 else 0) > 0"
-  - type: output
+  - type: sink
     name: out
     input: drop_errors
     config:
       name: out
       type: json
       path: out.json
-  - type: output
+  - type: sink
     name: audit
     input: drop_errors.removed
     config:
@@ -1082,7 +1082,7 @@ nodes:
   - type: merge
     name: recombined
     inputs: [drop_bad, drop_bad.removed]
-  - type: output
+  - type: sink
     name: out
     input: recombined
     config:

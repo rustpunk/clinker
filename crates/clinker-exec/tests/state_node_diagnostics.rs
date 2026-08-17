@@ -83,7 +83,7 @@ nodes:
       cxl: |
         emit a = a
         emit b = $pipeline.x
-  - type: output
+  - type: sink
     name: out
     input: runtime_reader
     config:
@@ -133,7 +133,7 @@ nodes:
       cxl: |
         emit a = a
         emit $pipeline.x = a + 1
-  - type: output
+  - type: sink
     name: out
     input: w2
     config:
@@ -175,7 +175,7 @@ nodes:
       cxl: |
         emit a = a
         emit b = $pipeline.x
-  - type: output
+  - type: sink
     name: out
     input: sibling_reader
     config:
@@ -231,7 +231,7 @@ nodes:
       cxl: |
         emit id = id
         emit t = $source.tag
-  - type: output
+  - type: sink
     name: out
     input: reader
     config:
@@ -277,7 +277,7 @@ nodes:
     use: ../compositions/declares_undeclared.comp.yaml
     inputs:
       data: parent_writer
-  - type: output
+  - type: sink
     name: out
     input: body
     config:
@@ -318,7 +318,7 @@ nodes:
     use: ../compositions/declares_type_mismatch.comp.yaml
     inputs:
       inp: parent_writer
-  - type: output
+  - type: sink
     name: out
     input: body
     config:
@@ -372,7 +372,7 @@ nodes:
       cxl: |
         emit b = b
         emit $pipeline.init_v = b + $pipeline.runtime_v
-  - type: output
+  - type: sink
     name: out
     input: runtime_w
     config:

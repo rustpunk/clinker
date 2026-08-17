@@ -33,7 +33,7 @@ fn run_branch_test(
         ),
     )]);
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(output_buf.clone()) as Box<dyn Write + Send>,
     )]);
 
@@ -552,7 +552,7 @@ nodes:
     cxl: 'emit doubled = name.concat("_doubled")
 
       '
-- type: output
+- type: sink
   name: dest
   input: calc
   config:
@@ -610,7 +610,7 @@ nodes:
     analytic_window:
       group_by:
       - dept
-- type: output
+- type: sink
   name: dest
   input: window_calc
   config:

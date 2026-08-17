@@ -1,4 +1,4 @@
-//! An Output node's `mapping:` block: the ordered declaration of which
+//! A Sink node's `mapping:` block: the ordered declaration of which
 //! columns the file carries, in which order, under which names.
 //!
 //! ```yaml
@@ -34,7 +34,7 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// One item of an Output node's `mapping:` sequence.
+/// One item of a Sink node's `mapping:` sequence.
 ///
 /// `output` is the column name the writer emits; `source` is the column read
 /// from upstream. A bare-name item sets both to the same string.
@@ -42,7 +42,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub struct MappingEntry {
     /// Column name in the written output.
     pub output: String,
-    /// Column name read from the record arriving at this Output.
+    /// Column name read from the record arriving at this Sink.
     pub source: String,
 }
 
@@ -70,7 +70,7 @@ impl MappingEntry {
     }
 }
 
-/// An Output node's ordered `mapping:` declaration.
+/// A Sink node's ordered `mapping:` declaration.
 ///
 /// Construct from an entry list with [`OutputMapping::new`]; every derived
 /// index is computed once there and kept in step with `entries` because all
@@ -569,10 +569,10 @@ fn quoted(names: &[&str]) -> String {
         .join(", ")
 }
 
-/// Detailed finding for an Output whose `mapping:` block is malformed or
+/// Detailed finding for a Sink whose `mapping:` block is malformed or
 /// contradicts itself (**E364**), including an internal item-line anchor.
 ///
-/// Four faults, all decidable from the Output node alone — no upstream schema
+/// Four faults, all decidable from the Sink node alone — no upstream schema
 /// needed, which is why they live here rather than in the bind walk:
 ///
 /// * the superseded map form. `mapping:` was a YAML map of column name to
@@ -603,7 +603,7 @@ pub(crate) struct OutputMappingFault {
     pub(crate) help: String,
 }
 
-/// Every Output whose `mapping:` block is malformed or contradicts itself
+/// Every Sink whose `mapping:` block is malformed or contradicts itself
 /// (**E364**), in the shared node-fault form used by public validation helpers.
 pub fn output_mapping_faults(
     nodes: &[crate::yaml::Spanned<crate::config::pipeline_node::PipelineNode>],
@@ -627,14 +627,14 @@ pub(crate) fn output_mapping_faults_spanned(
 
     let mut faults = Vec::new();
     for (node_index, spanned) in nodes.iter().enumerate() {
-        let PipelineNode::Output {
+        let PipelineNode::Sink {
             header,
             config: body,
         } = &spanned.value
         else {
             continue;
         };
-        let output = &body.output;
+        let output = &body.sink;
         let Some(mapping) = output.mapping.as_ref() else {
             continue;
         };
@@ -933,7 +933,7 @@ mod tests {
             format!(
                 "  - type: source\n    name: src\n    config:\n      name: src\n      \
                  type: csv\n      path: in.csv\n      schema:\n        - {{ name: sku, \
-                 type: string }}\n        - {{ name: qty, type: int }}\n  - type: output\n    \
+                 type: string }}\n        - {{ name: qty, type: int }}\n  - type: sink\n    \
                  name: out\n    input: src\n    config:\n      name: out\n      type: csv\n      \
                  path: out.csv\n{extra}      mapping:{mapping_value}"
             )

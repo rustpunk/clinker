@@ -114,7 +114,7 @@ nodes:
       cxl: |
         emit agent_uuid = agent_uuid
         emit ticket_count = count(*)
-  - type: output
+  - type: sink
     name: out
     input: agg
     config:
@@ -192,7 +192,7 @@ nodes:
         emit agent_uuid = t.agent_uuid
         emit agent_name = a.agent_name
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
@@ -263,7 +263,7 @@ nodes:
       cxl: |
         emit agent_uuid = agent_uuid
         distinct by agent_uuid
-  - type: output
+  - type: sink
     name: out
     input: dedup
     config:
@@ -310,7 +310,7 @@ nodes:
       path: src.csv
       schema:
         - { name: note, type: string, long_unique: true }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

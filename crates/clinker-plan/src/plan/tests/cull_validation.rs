@@ -69,14 +69,14 @@ nodes:
     input: src
     config:
 {cull_config}
-  - type: output
+  - type: sink
     name: out
     input: cd
     config:
       name: out
       type: csv
       path: out.csv
-  - type: output
+  - type: sink
     name: audit
     input: cd.removed
     config:

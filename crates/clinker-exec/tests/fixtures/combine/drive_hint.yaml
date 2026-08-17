@@ -42,7 +42,7 @@ nodes:
         emit sample_order_id = orders.order_id
         emit sample_amount = orders.amount
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: product_driven_out
     input: product_driven
     config:

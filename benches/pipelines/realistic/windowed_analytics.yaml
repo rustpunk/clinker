@@ -41,7 +41,7 @@ nodes:
         emit avg_w_sum = avg(w_sum)
         emit record_count = count(*)
 
-  - type: output
+  - type: sink
     name: sink
     input: summarize
     config:

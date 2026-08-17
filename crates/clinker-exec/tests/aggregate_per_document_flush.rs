@@ -85,7 +85,7 @@ nodes:
       cxl: |
         emit category = category
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: by_category
     config:
@@ -136,7 +136,7 @@ nodes:
         emit category = category
         emit n = count(*)
         emit sample = min(payload)
-  - type: output
+  - type: sink
     name: out
     input: by_category
     config:
@@ -354,7 +354,7 @@ nodes:
       cxl: |
         emit category = category
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: by_category
     config:
@@ -490,7 +490,7 @@ nodes:
       cxl: |
         emit category = category
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: by_category
     config:
@@ -613,7 +613,7 @@ nodes:
       cxl: |
         emit category = category
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: by_category
     config:
@@ -727,7 +727,7 @@ nodes:
       cxl: |
         emit category = category
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: by_category
     config:
@@ -843,7 +843,7 @@ nodes:
       cxl: |
         emit category = category
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: by_category
     config:
@@ -984,7 +984,7 @@ nodes:
       cxl: |
         emit category = category
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: by_category
     config:

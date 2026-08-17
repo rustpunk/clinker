@@ -21,13 +21,13 @@ pub(crate) mod invariant;
 pub(crate) mod merge_dispatch;
 pub mod node_buffer;
 pub(crate) mod node_buffer_spill;
-pub(crate) mod output_dispatch;
 mod params;
 mod registry;
 pub(crate) mod reshape_dispatch;
 mod route;
 pub(crate) mod route_dispatch;
 mod schema_check;
+pub(crate) mod sink_dispatch;
 pub(crate) mod sort_dispatch;
 pub(crate) mod source_activation;
 pub(crate) mod source_dispatch;
@@ -64,7 +64,7 @@ pub use storage_validate::{
 };
 pub use stream_event::{OutputDeliveryId, SourceRowId};
 pub(crate) use streaming::StreamingOutputTaskOutput;
-use streaming::{compute_streaming_output_specs, streaming_output};
+use streaming::{compute_streaming_sink_specs, streaming_sink};
 pub(crate) use transform::{
     WindowedEvalCtx, evaluate_single_transform, evaluate_single_transform_windowed,
 };
@@ -164,7 +164,7 @@ pub(crate) struct DispatchOutcome {
     /// walk unwound early. Carried up so the report surfaces the
     /// interrupted state to the CLI.
     pub(crate) interrupted: bool,
-    /// Advisory end-of-run findings, already rendered. Today: the per-Output
+    /// Advisory end-of-run findings, already rendered. Today: the per-Sink
     /// `mapping:` report (W365 / W366). Never fatal — by the time a stream
     /// ends its sibling Outputs have written.
     pub(crate) advisories: Vec<String>,
@@ -708,7 +708,7 @@ impl PipelineExecutor {
         let auto_commit_staged = writers.auto_commit_staged;
 
         let source_configs: Vec<_> = config.source_configs().cloned().collect();
-        let mut output_configs: Vec<_> = config.output_configs().cloned().collect();
+        let mut sink_configs: Vec<_> = config.sink_configs().cloned().collect();
         if !run_policy.preview().publishes_configured_outputs() {
             if auto_commit_staged || output_staging.has_run_attempt() {
                 return Err(PipelineError::Internal {
@@ -720,7 +720,7 @@ impl PipelineExecutor {
             // Preview uses the authored format but one explicit preview
             // destination. Split policy names configured Sink paths, so it is
             // disabled on this run-local clone before writer construction.
-            for output in &mut output_configs {
+            for output in &mut sink_configs {
                 output.split = None;
             }
         }
@@ -762,7 +762,7 @@ impl PipelineExecutor {
         // Validate that all configured outputs have registered writers.
         // Either the single-writer slot or the fan-out slot must contain
         // the output's name; the dispatcher consults whichever applies.
-        for output in &output_configs {
+        for output in &sink_configs {
             let registered = writers.single.contains_key(&output.name)
                 || writers.fan_out.contains_key(&output.name);
             if !registered {
@@ -1368,9 +1368,9 @@ impl PipelineExecutor {
         // removes it on drop — the path and the liveness guard cannot diverge.
         let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
 
-        let mut output_configs: Vec<_> = config.output_configs().cloned().collect();
+        let mut sink_configs: Vec<_> = config.sink_configs().cloned().collect();
         if !run_policy.preview().publishes_configured_outputs() {
-            for output in &mut output_configs {
+            for output in &mut sink_configs {
                 output.split = None;
             }
         }
@@ -1601,19 +1601,19 @@ impl PipelineExecutor {
         let streaming_contracts = preview_streaming_contracts
             .as_ref()
             .unwrap_or(&fused_transforms);
-        let streaming_specs = compute_streaming_output_specs(
+        let streaming_specs = compute_streaming_sink_specs(
             plan,
             config,
             streaming_contracts,
             &init_phase_set,
-            &output_configs,
+            &sink_configs,
             &writers,
         );
         let mut streaming_output_senders: HashMap<
             petgraph::graph::NodeIndex,
             crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
         > = HashMap::new();
-        let mut streaming_output_nodes: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
+        let mut streaming_sink_nodes: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
         let mut streaming_output_tasks: Vec<std::thread::JoinHandle<StreamingOutputTaskOutput>> =
             Vec::new();
         let mut streaming_charge_consumers: HashMap<
@@ -1627,7 +1627,7 @@ impl PipelineExecutor {
             let raw_writer = writers
                 .single
                 .remove(&spec.output_name)
-                .expect("compute_streaming_output_specs verified writers.single contains output");
+                .expect("compute_streaming_sink_specs verified writers.single contains output");
             // 256 is the bounded channel capacity. The writer thread
             // typically clears each record in microseconds; capacity
             // above ~256 buys no measured throughput but burns memory
@@ -1655,16 +1655,27 @@ impl PipelineExecutor {
                 crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone()),
             ));
             let writer_charge_handle = charge_handle.clone();
+            let telemetry_producer = params.telemetry_producer.clone();
+            let sink_shutdown_token = params.shutdown_token.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("clinker-output-{output_name}"))
-                .spawn(move || streaming_output(rx, raw_writer, spec, writer_charge_handle))
+                .spawn(move || {
+                    streaming_sink(
+                        rx,
+                        raw_writer,
+                        spec,
+                        writer_charge_handle,
+                        telemetry_producer,
+                        sink_shutdown_token,
+                    )
+                })
                 .map_err(|e| PipelineError::Internal {
                     op: "streaming-output-spawn",
                     node: output_name,
                     detail: format!("failed to spawn streaming output thread: {e}"),
                 })?;
             streaming_output_senders.insert(producer_idx, tx);
-            streaming_output_nodes.insert(output_idx);
+            streaming_sink_nodes.insert(output_idx);
             streaming_output_tasks.push(handle);
             streaming_charge_consumers.insert(producer_idx, (charge_consumer_id, charge_handle));
         }
@@ -1672,10 +1683,11 @@ impl PipelineExecutor {
         let mut ctx = dispatch::ExecutorContext {
             config,
             composition_bodies,
-            output_configs: &output_configs,
-            primary_output: &output_configs[0],
+            sink_configs: &sink_configs,
+            primary_output: &sink_configs[0],
             stable: &stable,
             telemetry_producer: params.telemetry_producer.clone(),
+            sink_byte_counter: None,
             source_batch_arc: &source_batch_arc,
             source_count_per_source,
             source_ingestion_timestamp,
@@ -1741,7 +1753,7 @@ impl PipelineExecutor {
                 params.telemetry_producer.clone(),
             ),
             streaming_output_senders,
-            streaming_output_nodes,
+            streaming_sink_nodes,
             streaming_aggregate_ingest_edges,
             streaming_combine_probe_edges,
             streaming_output_tasks,
@@ -1854,7 +1866,7 @@ impl PipelineExecutor {
                 Ok(out) => out.fold_into(&mut ctx),
                 Err(_panic) => {
                     ctx.output_errors.push(PipelineError::Internal {
-                        op: "streaming_output",
+                        op: "streaming_sink",
                         node: String::from("<unknown>"),
                         detail: String::from("streaming output thread panicked"),
                     });
@@ -2044,7 +2056,7 @@ impl PipelineExecutor {
         // the projection from several arms and several chunks, and only the
         // union distinguishes a column no record carried from one some record
         // did.
-        let advisories = collect_mapping_advisories(ctx.output_configs, &ctx.mapping_probes);
+        let advisories = collect_mapping_advisories(ctx.sink_configs, &ctx.mapping_probes);
         Ok(DispatchOutcome {
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),
@@ -2093,10 +2105,10 @@ impl PipelineExecutor {
 /// pipeline. The probe registry is keyed for lookup, not presentation; walking
 /// it directly would sort advisories by output name.
 fn collect_mapping_advisories(
-    output_configs: &[clinker_plan::config::OutputConfig],
+    sink_configs: &[clinker_plan::config::SinkConfig],
     mapping_probes: &BTreeMap<String, crate::projection::MappingProbe>,
 ) -> Vec<String> {
-    output_configs
+    sink_configs
         .iter()
         .filter_map(|output| {
             mapping_probes
@@ -2195,7 +2207,7 @@ nodes:
     input: orders
     config:
       cxl: "emit id = id"
-  - type: output
+  - type: sink
     name: out
     input: normalize_orders
     config:
@@ -2258,7 +2270,7 @@ nodes:
       path: input.json
       schema:
         - { name: id, type: string }
-  - type: output
+  - type: sink
     name: z_out
     input: source
     config:
@@ -2267,7 +2279,7 @@ nodes:
       path: z.csv
       mapping:
         - z_missing
-  - type: output
+  - type: sink
     name: a_out
     input: source
     config:
@@ -2279,7 +2291,7 @@ nodes:
 "#,
         )
         .expect("pipeline parses");
-        let outputs: Vec<_> = config.output_configs().cloned().collect();
+        let outputs: Vec<_> = config.sink_configs().cloned().collect();
         let record = clinker_record::Record::new(
             clinker_record::SchemaBuilder::new()
                 .with_field("id")

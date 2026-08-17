@@ -1,13 +1,13 @@
-//! Output node configuration: split policy and per-format output options.
+//! Sink node configuration: split policy and per-format output options.
 
 use super::*;
 use clinker_format::JoinValues;
 use clinker_record::schema_def::LineSeparator;
 use serde::{Deserialize, Serialize};
 
-/// Output destination configuration.
+/// Sink destination configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutputConfig {
+pub struct SinkConfig {
     pub name: String,
     pub path: String,
     /// Typed runtime path segments populated during template resolution.
@@ -53,7 +53,7 @@ pub struct OutputConfig {
     /// multiple files based on record count or byte size limits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub split: Option<SplitConfig>,
-    /// Optional per-Output override for the correlation fan-out policy.
+    /// Optional per-Sink override for the correlation fan-out policy.
     /// Wins against the per-Combine override and the per-pipeline default
     /// because the sink has the most context for whether collateral
     /// rollback is acceptable (audit-style sinks typically opt down to
@@ -78,9 +78,9 @@ pub struct OutputConfig {
     /// body records: the writer's `begin_document` fires on a document's first
     /// record, its records stream straight through, and `end_document` fires
     /// when the document ends (its `$source.file` changes, or at end of
-    /// input). When set, the executor routes this Output through an arm that
+    /// input). When set, the executor routes this Sink through an arm that
     /// detects document boundaries from each record's document context, and
-    /// excludes the Output from the fused streaming-writer thread (which does
+    /// excludes the Sink from the fused streaming-writer thread (which does
     /// no framing). Records still stream one at a time across the boundary —
     /// no document is buffered. Incompatible with per-file `split:` /
     /// fan-out, `dlq_granularity: document`, and `correlation_key` (rejected
@@ -106,7 +106,7 @@ pub struct OutputConfig {
     pub notes: Option<serde_json::Value>,
 }
 
-impl OutputConfig {
+impl SinkConfig {
     #[must_use]
     pub fn has_per_record_path_tokens(&self) -> bool {
         self.resolved_path_template.as_ref().map_or_else(
@@ -140,7 +140,7 @@ impl OutputConfig {
     }
 }
 
-/// Collision policy when an Output node's resolved path already exists.
+/// Collision policy when a Sink node's resolved path already exists.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IfExistsPolicy {
@@ -328,7 +328,7 @@ pub enum SplitOversizeGroupPolicy {
 /// Bounded memory: the header is emitted on the document's first record and
 /// the footer on its close, with the body streamed one record at a time
 /// between them — no document's records are ever buffered. Active only when
-/// the Output also sets `reconstruct_envelope: true`.
+/// the Sink also sets `reconstruct_envelope: true`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct OutputEnvelopeConfig {
@@ -371,7 +371,7 @@ pub struct CsvOutputOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delimiter: Option<String>,
     /// Per-document envelope reconstruction (header/footer sections). Active
-    /// only with `reconstruct_envelope: true` on the Output.
+    /// only with `reconstruct_envelope: true` on the Sink.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub envelope: Option<OutputEnvelopeConfig>,
 }

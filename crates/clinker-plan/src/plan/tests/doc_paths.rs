@@ -55,7 +55,7 @@ nodes:
         prev = name;
     }
     yaml.push_str(&format!(
-        "  - type: output\n    name: out\n    input: {prev}\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
+        "  - type: sink\n    name: out\n    input: {prev}\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
     ));
 
     let config = parse_config(&yaml).expect("parse doc-paths pipeline");
@@ -145,7 +145,7 @@ nodes:
       cxl: |
         emit amount = amount
         emit total = $doc.Summary.total
-  - type: output
+  - type: sink
     name: out
     input: t0
     config:
@@ -217,7 +217,7 @@ nodes:
       cxl: |
         emit amount = amount
         emit picked = $doc.Summary.total[amount]
-  - type: output
+  - type: sink
     name: out
     input: t0
     config:
@@ -285,7 +285,7 @@ nodes:
         yaml.push_str(&format!("        {line}\n"));
     }
     yaml.push_str(
-        "  - type: output\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
+        "  - type: sink\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
     );
     let config = parse_config(&yaml).expect("parse doc-validate pipeline");
     config.compile(&CompileContext::default())
@@ -376,7 +376,7 @@ nodes:
         yaml.push_str(&format!("        {line}\n"));
     }
     yaml.push_str(
-        "  - type: output\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
+        "  - type: sink\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
     );
     let config = parse_config(&yaml).expect("parse x12 pipeline");
     config.compile(&CompileContext::default())
@@ -538,7 +538,7 @@ nodes:
             yaml.push_str(&format!("        {line}\n"));
         }
         yaml.push_str(
-            "  - type: output\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
+            "  - type: sink\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
         );
         let config = parse_config(&yaml).expect("parse hl7 pipeline");
         config.compile(&CompileContext::default())
@@ -593,7 +593,7 @@ nodes:
             yaml.push_str(&format!("        {line}\n"));
         }
         yaml.push_str(
-            "  - type: output\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
+            "  - type: sink\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
         );
         let config = parse_config(&yaml).expect("parse x12 group_section pipeline");
         config.compile(&CompileContext::default())
@@ -661,7 +661,7 @@ nodes:
         yaml.push_str(&format!("        {line}\n"));
     }
     yaml.push_str(
-        "  - type: output\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
+        "  - type: sink\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
     );
     let config = parse_config(&yaml).expect("parse rest pipeline");
     config.compile(&CompileContext::default())
@@ -734,7 +734,7 @@ nodes:
               batch_id: string
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: payments
     config:
@@ -780,7 +780,7 @@ nodes:
               batch_id: string
       schema:
         - { name: amount, type: int, start: 0, width: 9 }
-  - type: output
+  - type: sink
     name: out
     input: payments
     config:
@@ -843,7 +843,7 @@ nodes:
         emit kind = record_type
         emit amount = amount
         emit batch = $doc.head.batch_id
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -894,7 +894,7 @@ nodes:
       cxl: |
         emit kind = record_type
         emit batch = $doc.head.batch_id
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -950,7 +950,7 @@ nodes:
       cxl: |
         emit kind = record_type
         emit batch = $doc.head.bath_id
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -1007,7 +1007,7 @@ nodes:
       cxl: |
         emit kind = record_type
         emit batch = $doc.hed.batch_id
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -1068,7 +1068,7 @@ nodes:
         emit kind = record_type
         emit amount = amount
         emit batch = $doc.head.batch_di
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -1108,7 +1108,7 @@ nodes:
       path: ./payments.csv
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: payments
     config:
@@ -1182,7 +1182,7 @@ nodes:
         emit id = l.id
         emit label = r.label
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
@@ -1247,14 +1247,14 @@ nodes:
       conditions:
         big: "amount > $doc.Head.cutoff"
       default: small
-  - type: output
+  - type: sink
     name: big_out
     input: split.big
     config:
       name: big_out
       type: csv
       path: big.csv
-  - type: output
+  - type: sink
     name: small_out
     input: split.small
     config:
@@ -1333,7 +1333,7 @@ nodes:
   - type: merge
     name: merged
     inputs: [tag_alpha, tag_beta]
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -1420,7 +1420,7 @@ nodes:
     use: ../compositions/doc_body.comp.yaml
     inputs:
       inp: payments
-  - type: output
+  - type: sink
     name: out
     input: body
     config:
@@ -1535,7 +1535,7 @@ nodes:
       cxl: |
         emit amount = amount
         emit tag = $doc.Shared.tag
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -1585,7 +1585,7 @@ nodes:
 {body}
       schema:
         - {{ name: amount, type: int }}
-  - type: output
+  - type: sink
     name: out
     input: payments
     config:
@@ -1660,7 +1660,7 @@ nodes:
               batch_id: string
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: docs
     config:
@@ -1704,7 +1704,7 @@ nodes:
               batch_id: string
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: docs
     config:
@@ -1754,7 +1754,7 @@ nodes:
             yaml.push_str(&format!("        {line}\n"));
         }
         yaml.push_str(
-            "  - type: output\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
+            "  - type: sink\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
         );
         let config = parse_config(&yaml).expect("parse x12 name-collision pipeline");
         config.compile(&CompileContext::default())
@@ -1805,7 +1805,7 @@ nodes:
               a: string
       schema:
         - {{ name: seg_id, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

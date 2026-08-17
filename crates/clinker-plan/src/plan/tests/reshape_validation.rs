@@ -70,7 +70,7 @@ nodes:
     input: src
     config:
 {reshape_config}
-  - type: output
+  - type: sink
     name: out
     input: rs
     config:
@@ -266,7 +266,7 @@ nodes:
       partition_by: [account]
       rules:
 {rules}
-  - type: output
+  - type: sink
     name: out
     input: rs
     config:

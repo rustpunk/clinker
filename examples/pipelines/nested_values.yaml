@@ -27,7 +27,7 @@ nodes:
           value: [item for item in [first, second] if item > 0],
         }
 
-  - type: output
+  - type: sink
     name: json_result
     input: construct_payload
     config:
@@ -38,7 +38,7 @@ nodes:
       options:
         format: ndjson
 
-  - type: output
+  - type: sink
     name: xml_result
     input: construct_payload
     config:

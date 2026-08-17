@@ -19,7 +19,7 @@ use clinker_format::traits::FormatWriter;
 use clinker_format::x12::Charset;
 use clinker_format::x12::writer::{X12Writer, X12WriterConfig};
 use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
-use clinker_plan::config::{OutputConfig, OutputFormat};
+use clinker_plan::config::{OutputFormat, SinkConfig};
 use clinker_plan::error::PipelineError;
 
 /// Output writer registry. Holds two parallel maps:
@@ -212,7 +212,7 @@ fn build_swift_writer_config(
 /// Fixed-width output requires an explicit single-record column list specifying
 /// names, widths, and optionally start positions, justification, and padding.
 fn extract_output_field_defs(
-    output: &OutputConfig,
+    output: &SinkConfig,
 ) -> Result<Vec<clinker_format::Column>, PipelineError> {
     let schema = output.schema.as_ref().ok_or_else(|| {
         PipelineError::Config(clinker_plan::config::ConfigError::Validation(
@@ -265,11 +265,11 @@ fn resolve_envelope_spec(
 }
 
 fn build_writer_factory(
-    output: &OutputConfig,
+    output: &SinkConfig,
     repeat_header: bool,
     field_defs: Option<Vec<clinker_format::Column>>,
 ) -> Result<WriterFactory, PipelineError> {
-    // Every per-format config field derives from the Output config; bind them
+    // Every per-format config field derives from the Sink config; bind them
     // once so the format arms below read them by their original names.
     let include_header = output.include_header;
     let include_engine_stamped = output.include_correlation_keys;
@@ -445,10 +445,11 @@ fn build_writer_factory(
 /// For split outputs: creates a `SplittingWriter` with a file factory and writer factory.
 /// For non-split outputs: creates a single writer wrapped in `CountedFormatWriter`.
 pub(crate) fn build_format_writer(
-    output: &OutputConfig,
+    output: &SinkConfig,
     raw_writer: Box<dyn Write + Send>,
     schema: Arc<Schema>,
     output_staging: crate::output::staging::OutputStagingRegistry,
+    sink_byte_counter: Option<SharedByteCounter>,
 ) -> Result<Box<dyn FormatWriter>, PipelineError> {
     // Extract field definitions for fixed-width output (requires explicit schema).
     let field_defs = if matches!(output.format, OutputFormat::FixedWidth(_)) {
@@ -468,6 +469,7 @@ pub(crate) fn build_format_writer(
         let if_exists = output.if_exists;
         let unique_suffix_width = output.unique_suffix_width;
         let output_name = output.name.clone();
+        let sink_byte_counter_for_files = sink_byte_counter.clone();
 
         let file_factory: clinker_format::splitting::FileFactory =
             Box::new(move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
@@ -500,7 +502,12 @@ pub(crate) fn build_format_writer(
                     output_staging.stage_output(output_name.clone(), if_exists, false, path_for_n)
                 };
                 let (_path, file) = staged.map_err(|e| std::io::Error::other(format!("{e:?}")))?;
-                Ok(Box::new(BufWriter::with_capacity(65536, file)))
+                let buffered =
+                    Box::new(BufWriter::with_capacity(65536, file)) as Box<dyn Write + Send>;
+                Ok(match &sink_byte_counter_for_files {
+                    Some(counter) => Box::new(CountingWriter::new(buffered, counter.clone())),
+                    None => buffered,
+                })
             });
 
         // SplittingWriter creates its own files; don't use raw_writer.
@@ -514,7 +521,7 @@ pub(crate) fn build_format_writer(
         )))
     } else {
         let buf_writer = BufWriter::with_capacity(65536, raw_writer);
-        let counter = SharedByteCounter::new();
+        let counter = sink_byte_counter.unwrap_or_default();
         let counting_writer = CountingWriter::new(
             Box::new(buf_writer) as Box<dyn Write + Send>,
             counter.clone(),

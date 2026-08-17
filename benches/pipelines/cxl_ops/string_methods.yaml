@@ -37,7 +37,7 @@ nodes:
         emit s_find = f1.find("e")
         emit s_split = f1.split(",").join(";")
 
-  - type: output
+  - type: sink
     name: sink
     input: strings
     config:

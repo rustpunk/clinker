@@ -49,7 +49,7 @@ nodes:
       sort_by:
         - field: region
           order: asc
-- type: output
+- type: sink
   name: out
   input: predicates
   config:

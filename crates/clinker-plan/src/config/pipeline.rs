@@ -288,14 +288,14 @@ impl PipelineConfig {
     /// envelope-reconstructing Output must take the materialized arm, which
     /// detects document boundaries from each record's context and fires the
     /// writer's `begin_document` / `end_document`.
-    pub fn any_output_reconstructs_envelope(&self) -> bool {
-        self.output_configs().any(|o| o.reconstruct_envelope)
+    pub fn any_sink_reconstructs_envelope(&self) -> bool {
+        self.sink_configs().any(|o| o.reconstruct_envelope)
     }
 
-    /// Public iterator over output nodes.
-    pub fn output_configs(&self) -> impl Iterator<Item = &OutputConfig> + '_ {
+    /// Public iterator over Sink nodes.
+    pub fn sink_configs(&self) -> impl Iterator<Item = &SinkConfig> + '_ {
         self.nodes.iter().filter_map(|n| match &n.value {
-            PipelineNode::Output { config: body, .. } => Some(&body.output),
+            PipelineNode::Sink { config: body, .. } => Some(&body.sink),
             _ => None,
         })
     }
@@ -345,8 +345,8 @@ impl PipelineConfig {
             PipelineNode::Source { config: body, .. } if body.source.name == stage_name => {
                 body.source.notes.as_ref()
             }
-            PipelineNode::Output { config: body, .. } if body.output.name == stage_name => {
-                body.output.notes.as_ref()
+            PipelineNode::Sink { config: body, .. } if body.sink.name == stage_name => {
+                body.sink.notes.as_ref()
             }
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
@@ -372,8 +372,8 @@ impl PipelineConfig {
                     body.source.notes = notes;
                     return;
                 }
-                PipelineNode::Output { config: body, .. } if body.output.name == stage_name => {
-                    body.output.notes = notes;
+                PipelineNode::Sink { config: body, .. } if body.sink.name == stage_name => {
+                    body.sink.notes = notes;
                     return;
                 }
                 PipelineNode::Transform { header, .. }
@@ -781,8 +781,7 @@ impl PipelineConfig {
         // two compile sites have converged onto this one.
         let source_configs: Vec<crate::config::SourceConfig> =
             self.source_configs().cloned().collect();
-        let output_configs: Vec<crate::config::OutputConfig> =
-            self.output_configs().cloned().collect();
+        let sink_configs: Vec<crate::config::SinkConfig> = self.sink_configs().cloned().collect();
         let primary_source: String = source_configs
             .first()
             .map(|s| s.name.clone())
@@ -820,7 +819,7 @@ impl PipelineConfig {
                     analytic_window: None,
                 }),
                 PipelineNode::Source { .. }
-                | PipelineNode::Output { .. }
+                | PipelineNode::Sink { .. }
                 | PipelineNode::Merge { .. }
                 | PipelineNode::Reshape { .. }
                 | PipelineNode::Cull { .. }
@@ -998,7 +997,7 @@ impl PipelineConfig {
             .iter()
             .map(|s| (s.name.as_str(), s))
             .collect();
-        for output in self.output_configs() {
+        for output in self.sink_configs() {
             if !output.reconstruct_envelope {
                 continue;
             }
@@ -1189,7 +1188,7 @@ impl PipelineConfig {
         // source gated only from this loop would be gated by nothing at all.
         for fault in crate::config::multi_value::source_node_faults(&self.nodes)
             .into_iter()
-            .chain(crate::config::multi_value::output_node_faults(&self.nodes))
+            .chain(crate::config::multi_value::sink_node_faults(&self.nodes))
             .chain(crate::config::record_path::record_path_faults(&self.nodes))
         {
             let primary = doc_node_line_by_name
@@ -1337,7 +1336,7 @@ impl PipelineConfig {
                 LabeledSpan::primary(Span::SYNTHETIC, String::new()),
             )]
         })?;
-        let output_projections: Vec<crate::plan::execution::OutputSpec> = output_configs
+        let output_projections: Vec<crate::plan::execution::OutputSpec> = sink_configs
             .iter()
             .map(|o| crate::plan::execution::OutputSpec {
                 name: o.name.clone(),
@@ -1438,7 +1437,7 @@ impl PipelineConfig {
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Reshape { header, .. }
                 | PipelineNode::Cull { header, .. }
-                | PipelineNode::Output { header, .. } => {
+                | PipelineNode::Sink { header, .. } => {
                     wire(&input_full_reference(&header.input.value), None);
                 }
                 PipelineNode::Composition {
@@ -2729,7 +2728,7 @@ fn resolve_all_input_references(
             | PipelineNode::Route { header, .. }
             | PipelineNode::Reshape { header, .. }
             | PipelineNode::Cull { header, .. }
-            | PipelineNode::Output { header, .. } => {
+            | PipelineNode::Sink { header, .. } => {
                 emit(consumer_name, None, &header.input);
             }
             PipelineNode::Merge { header, .. } => {
@@ -3006,7 +3005,7 @@ fn stream_cardinality<'a>(
         | PipelineNode::Route { .. }
         | PipelineNode::Cull { .. }
         | PipelineNode::Reshape { .. }
-        | PipelineNode::Output { .. } => join_input_cardinality(by_name, node, visited),
+        | PipelineNode::Sink { .. } => join_input_cardinality(by_name, node, visited),
     }
 }
 
@@ -3821,7 +3820,7 @@ pub(crate) fn lower_node_to_plan_node(
     let name = node.name();
     use crate::plan::composition_body::CompositionBodyId;
     use crate::plan::execution::{
-        NodeExecutionReqs, ParallelismClass, PartitionLookupKind, PlanNode, PlanOutputPayload,
+        NodeExecutionReqs, ParallelismClass, PartitionLookupKind, PlanNode, PlanSinkPayload,
         PlanSourcePayload, PlanTransformPayload, derive_parallelism_class, extract_has_distinct,
         extract_write_set,
     };
@@ -4011,12 +4010,12 @@ pub(crate) fn lower_node_to_plan_node(
                 output_schema: schema_from_bound(),
             })
         }
-        PipelineNode::Output { config, .. } => Some(PlanNode::Output {
+        PipelineNode::Sink { config, .. } => Some(PlanNode::Sink {
             name: name.to_string(),
             id,
             span,
-            resolved: Some(Box::new(PlanOutputPayload {
-                output: config.output.clone(),
+            resolved: Some(Box::new(PlanSinkPayload {
+                sink: config.sink.clone(),
                 validated_path: None,
                 fan_out_per_source_file: false,
             })),
@@ -4396,7 +4395,7 @@ pub struct ErrorHandlingConfig {
     /// Pipeline-level default for collateral fan-out at correlation commit.
     /// Defaults to `Any` when any source has a correlation key; pipelines
     /// without any correlation key never observe this field. Per-Combine
-    /// / per-Output overrides win against this default.
+    /// / per-Sink overrides win against this default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_fanout_policy: Option<CorrelationFanoutPolicy>,
 }
@@ -4806,7 +4805,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
     // run success. One pass over the outputs keeps these per-format
     // rejections in lockstep; a fourth single-envelope format is one match
     // arm, not a fourth copied loop.
-    for output in config.output_configs() {
+    for output in config.sink_configs() {
         if let Some(split) = &output.split {
             SplitNaming::parse(&split.naming).map_err(|error| {
                 ConfigError::Validation(format!(
@@ -4880,7 +4879,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
     // Multi-document formats (CSV/JSON/XML/fixed-width) frame a valid document
     // sequence and are unaffected. Independent of `reconstruct_envelope` so it
     // survives the later removal of that flag.
-    for output in config.output_configs() {
+    for output in config.sink_configs() {
         if !output.format.is_single_document() {
             continue;
         }
@@ -4920,7 +4919,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
     // document (the fan-out writer registry is keyed differently than the
     // single writer the document buffer flushes to).
     if config.any_source_has_document_dlq() {
-        for output in config.output_configs() {
+        for output in config.sink_configs() {
             if output.has_per_record_path_tokens() {
                 return Err(ConfigError::Validation(format!(
                     "[E343] output '{name}': a per-source-file output template \
@@ -5006,7 +5005,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
     //  * `correlation_key`: correlation buffering owns the writes through its
     //    own commit terminal, which the envelope arm bypasses — dirty groups
     //    would leak into the framed output and inflate `ok_count`.
-    if config.any_output_reconstructs_envelope() {
+    if config.any_sink_reconstructs_envelope() {
         // Source-level conflicts are pipeline-wide (any envelope Output is
         // incompatible with them), so resolve them once. The per-output loop
         // below names the offending output directly — no re-derivation.
@@ -5020,7 +5019,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
             .source_configs()
             .map(|s| (s.name.as_str(), s))
             .collect();
-        for output in config.output_configs() {
+        for output in config.sink_configs() {
             if !output.reconstruct_envelope {
                 continue;
             }
@@ -5057,7 +5056,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                 )));
             }
 
-            // Trace this Output's upstream lineage once: the sources feeding it
+            // Trace this Sink's upstream lineage once: the sources feeding it
             // (for the E346 section-name scoping) and any document-lineage
             // stripper on the path (for the guard just below).
             let lineage = trace_output_lineage(config, out);
@@ -5249,7 +5248,7 @@ pub(crate) fn validate_inert_metadata(
                 ),
             )
             .with_help(
-                "remove `include_provenance:` and set `write_meta: true` in each intended Output config",
+                "remove `include_provenance:` and set `write_meta: true` in each intended Sink config",
             ),
         );
     }
@@ -5460,7 +5459,7 @@ fn validate_hl7_split_fields(source_name: &str, opts: &Hl7InputOptions) -> Resul
 /// `"quote_char"`.
 ///
 /// `pub(crate)` so composition-body binding can apply the same check to body
-/// Source/Output nodes, which never flow through top-level `validate_config`.
+/// Source/Sink nodes, which never flow through top-level `validate_config`.
 pub(crate) fn validate_csv_byte_option(
     node_kind: &str,
     node_name: &str,
@@ -5714,7 +5713,7 @@ nodes:
         - {{ name: a, type: string }}
       options:
 {options_body}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -5741,7 +5740,7 @@ nodes:
       path: in.csv
       schema:
         - {{ name: a, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -5860,7 +5859,7 @@ nodes:
       path: in.csv
       schema:
         - {{ name: a, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -5945,7 +5944,7 @@ mod inert_metadata_tests {
 
     fn pipeline(metadata: &str) -> String {
         format!(
-            "pipeline:\n  name: inert_metadata\n{metadata}nodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: csv\n      path: in.csv\n      schema: [{{ name: id, type: int }}]\n  - type: output\n    name: out\n    input: src\n    config: {{ name: out, type: csv, path: out.csv }}\n"
+            "pipeline:\n  name: inert_metadata\n{metadata}nodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: csv\n      path: in.csv\n      schema: [{{ name: id, type: int }}]\n  - type: sink\n    name: out\n    input: src\n    config: {{ name: out, type: csv, path: out.csv }}\n"
         )
     }
 
@@ -6066,7 +6065,7 @@ nodes:
       path: in.csv
       schema:
         - {{ name: a, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

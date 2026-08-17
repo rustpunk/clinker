@@ -738,7 +738,7 @@ nodes:
       path: in.csv
       schema:
         - { name: a, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

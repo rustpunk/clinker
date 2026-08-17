@@ -32,7 +32,7 @@ nodes:
     input: src
     config:
       cxl: "{cxl}"
-  - type: output
+  - type: sink
     name: out
     input: t
     config:

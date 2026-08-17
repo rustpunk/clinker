@@ -42,7 +42,7 @@ nodes:
         emit driver_id = drivers.driver_id
         emit build_id = builds.build_id
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: single_match_out
     input: single_match
     config:

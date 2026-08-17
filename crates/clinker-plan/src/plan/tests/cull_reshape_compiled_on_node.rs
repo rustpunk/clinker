@@ -52,14 +52,14 @@ nodes:
           drop_group_when: "sum(if status == 'error' then 1 else 0) > 0"
         - name: drop_big
           drop_group_when: "sum(amount) > 100"
-  - type: output
+  - type: sink
     name: out
     input: cd
     config:
       name: out
       type: csv
       path: out.csv
-  - type: output
+  - type: sink
     name: audit
     input: cd.removed
     config:
@@ -143,14 +143,14 @@ nodes:
           drop_group_when: "sum(if status == 'error' then 1 else 0) > 0"
         - name: drop_big
           drop_group_when: "sum(amount) > 100"
-  - type: output
+  - type: sink
     name: out
     input: cd
     config:
       name: out
       type: csv
       path: out.csv
-  - type: output
+  - type: sink
     name: audit
     input: cd.removed
     config:
@@ -248,14 +248,14 @@ nodes:
           drop_group_when: "sum(if status == 'error' then 1 else 0) > 0  # any error in group"
         - name: drop_big
           drop_group_when: "sum(amount) > 100"
-  - type: output
+  - type: sink
     name: out
     input: cd
     config:
       name: out
       type: csv
       path: out.csv
-  - type: output
+  - type: sink
     name: audit
     input: cd.removed
     config:
@@ -328,14 +328,14 @@ nodes:
           drop_group_when: "sum(nonexistent) > 0  # references a missing column"
         - name: drop_big
           drop_group_when: "sum(amount) > 100"
-  - type: output
+  - type: sink
     name: out
     input: cd
     config:
       name: out
       type: csv
       path: out.csv
-  - type: output
+  - type: sink
     name: audit
     input: cd.removed
     config:
@@ -409,7 +409,7 @@ nodes:
             copy_from: trigger
             overrides:
               label: "'synthesized'"
-  - type: output
+  - type: sink
     name: out
     input: rs
     config:

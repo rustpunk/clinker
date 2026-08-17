@@ -98,7 +98,7 @@ nodes:
         emit id = d.id
         emit ratio = d.amt / b.factor
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:

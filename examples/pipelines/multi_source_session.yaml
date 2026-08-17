@@ -64,7 +64,7 @@ nodes:
         emit user_id = user_id
         emit logins = count(*)
 
-  - type: output
+  - type: sink
     name: results
     input: user_sessions
     config:

@@ -15,7 +15,7 @@ nodes:
       path: input.csv
       type: csv
       schema: [{ name: id, type: int }]
-  - type: output
+  - type: sink
     name: out
     input: src
     config: { name: out, path: output.csv, type: csv }

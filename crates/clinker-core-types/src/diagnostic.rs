@@ -361,7 +361,7 @@ diagnostic_registry! {
     "E316", Error, "Per-source DLQ rate exceeded `error_handling.dlq.per_source.<name>.max_rate`";
     "E317", Error, "`error_handling.dlq.per_source` key does not name a declared Source";
     "E318", Error, "`error_handling.dlq.*.max_rate` out of `[0.0, 1.0]` or DLQ path collides";
-    "E322", Error, "Two output destinations (Output nodes, or an Output node and a DLQ path) resolve to the same file";
+    "E322", Error, "Two output destinations (Sink nodes, or a Sink node and a DLQ path) resolve to the same file";
     "E324", Error, "`pipeline.memory.resume_threshold` does not sit below the soft/spill threshold, so the two form no hysteresis band";
     // ── Storage admission and staging ───────────────────────────────────
     "E330", Error, "Spill directory is on an in-memory filesystem";
@@ -384,11 +384,11 @@ diagnostic_registry! {
     "E348", Error, "A `$doc.<section>.<field>` access against a segment/positional source (X12 / EDIFACT / HL7) names a section the format does not synthesize, or a positional element outside the `e`/`f`-prefix pattern or beyond the configured `max_elements` / `max_fields`";
     "E349", Error, "A `$doc.<section>.<field>` access is attributed to a `rest` source (or a `rest` source declares an `envelope:` block) — a REST pull buffers no document, so the access can never resolve";
     "E344", Error, "A source declares `dlq_granularity: document` together with `error_handling.strategy: fail_fast`, which contradict each other";
-    "E346", Error, "An output's envelope references a section, or requires a `footer_from_doc`, that its feeding sources do not provide";
+    "E346", Error, "A Sink's envelope references a section, or requires a `footer_from_doc`, that its feeding sources do not provide";
     "E347", Error, "`reconstruct_envelope` combined with per-file output splitting, a per-source-file path template, or a document-granularity DLQ source";
     "E353", Error, "Envelope header section references a body column — the header is emitted before the body streams, so it may read only `$vars` / `$source` / `$pipeline` / `$doc`";
     "E354", Error, "Envelope footer section declares an aggregate a streaming footer fold cannot compute";
-    "E355", Error, "A single-document-envelope output can be fed more than one document with no consolidating node on the path, which would silently merge distinct messages into one envelope";
+    "E355", Error, "A single-document-envelope Sink can be fed more than one document with no consolidating node on the path, which would silently merge distinct messages into one envelope";
     "E357", Error, "An envelope section on a segment/positional source names a tier other than the one file-level header segment the reader resolves from its bounded pre-scan";
     "E356", Error, "A plain single-schema CSV / fixed-width source declares an `envelope:` block — a plain flat file carries no header/trailer structure to extract, so the declared sections are inert (a multi-record source declaring `discriminator:` + `records:` is unaffected)";
     "E350", Error, "Envelope concat would collapse distinct headers into one document";
@@ -396,14 +396,14 @@ diagnostic_registry! {
     "E352", Error, "Wired envelope header stream carries multiple headers for one body document";
     // ── Multi-value declarations (fan-out, split, join) ──────────────────
     "E358", Error, "Malformed `split_to_rows:` / `split_values:` source declaration (duplicate, nested, undeclared column, or a format whose reader is never handed it)";
-    "E359", Error, "A `multiple:` column reaches an output whose format has no encoding for a field holding more than one value";
+    "E359", Error, "A `multiple:` column reaches a Sink whose format has no encoding for a field holding more than one value";
     "E360", Error, "Source declares the removed `array_paths:` key, which the multi-value declarations replaced";
     "E361", Error, "`multiple: true` column on a source whose format has no way to produce more than one value";
-    "E362", Error, "Malformed `join_values:` output declaration (the write-side mirror of E358)";
+    "E362", Error, "Malformed `join_values:` Sink declaration (the write-side mirror of E358)";
     "E363", Error, "A source's `record_path` is not a path in its format's grammar — an XPath descendant step (`//`), a JSONPath root marker (`$.`), a leading `/`, an empty segment, or an XML segment no element can be named";
-    "E364", Error, "An Output `mapping:` block uses the superseded map form or declares a projection that cannot produce unique, meaningful columns";
-    "E365", Error, "An Output `mapping:` item reads a column the pipeline does not carry at that point in the graph";
-    "E367", Error, "An Output `split.naming` pattern is malformed or does not contain exactly one valid sequence token";
+    "E364", Error, "A Sink `mapping:` block uses the superseded map form or declares a projection that cannot produce unique, meaningful columns";
+    "E365", Error, "A Sink `mapping:` item reads a column the pipeline does not carry at that point in the graph";
+    "E367", Error, "A Sink `split.naming` pattern is malformed or does not contain exactly one valid sequence token";
     "E366", Error, "A declared-sorted source has nested, repeated, inherited, or otherwise non-sortable per-file framing";
     "E368", Error, "Declared source-type error fraction exceeded `error_handling.type_error_threshold`";
     "E370", Error, "A pipeline combines document-level DLQ with correlation-key rejection, whose distinct atomic populations cannot share one physical writer boundary";
@@ -425,8 +425,8 @@ diagnostic_registry! {
     "W305", Warning, "Combine where-clause has no equality conjuncts";
     "W306", Warning, "Combine planner cannot determine optimal driving input";
     "W307", Warning, "A physical source file violated its declared record order and was repaired before release";
-    "W365", Warning, "An Output `mapping:` column was present on no record";
-    "W366", Warning, "An upstream column was displaced by an Output `mapping:` name";
+    "W365", Warning, "A Sink `mapping:` column was present on no record";
+    "W366", Warning, "An upstream column was displaced by a Sink `mapping:` name";
 }
 
 /// Whether `code` is listed in [`REGISTRY`].

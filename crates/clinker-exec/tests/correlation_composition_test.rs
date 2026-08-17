@@ -82,7 +82,7 @@ fn run_with_composition(yaml: &str, csv_input: &str) -> (ExecutionReport, String
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 
@@ -135,7 +135,7 @@ nodes:
     use: ../compositions/correlated_validate.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: validate_call
     config:
@@ -223,7 +223,7 @@ nodes:
     use: ../compositions/correlated_rewrite.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: rewrite_call
     config:

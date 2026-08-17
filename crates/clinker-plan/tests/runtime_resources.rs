@@ -83,7 +83,7 @@ nodes:
     use: ../compositions/typed.comp.yaml
     inputs: {{ input: source }}
     resources: {{ orders: {binding} }}
-  - type: output
+  - type: sink
     name: output
     input: typed.out
     config: {{ name: output, type: csv, path: output.csv }}

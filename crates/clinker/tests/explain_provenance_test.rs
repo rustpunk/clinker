@@ -65,11 +65,11 @@ nodes:
     use: ./compositions/nested_caller.comp.yaml
     inputs: { raw: raw }
     config: { strict_mode: true }
-  - type: output
+  - type: sink
     name: left_out
     input: left
     config: { name: left_out, type: csv, path: left.csv }
-  - type: output
+  - type: sink
     name: right_out
     input: right
     config: { name: right_out, type: csv, path: right.csv }

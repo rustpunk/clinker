@@ -1674,6 +1674,13 @@ fn metric_name(key: MetricKey) -> &'static str {
         MetricKey::GuessUnresolved => "clinker.guess.unresolved",
         MetricKey::GuessFailed => "clinker.guess.failed",
         MetricKey::GuessInterrupted => "clinker.guess.interrupted",
+        MetricKey::SinkStarted => "clinker.sink.started",
+        MetricKey::SinkCompleted => "clinker.sink.completed",
+        MetricKey::SinkFailed => "clinker.sink.failed",
+        MetricKey::SinkInterrupted => "clinker.sink.interrupted",
+        MetricKey::SinkRecords => "clinker.sink.records",
+        MetricKey::SinkErrors => "clinker.sink.errors",
+        MetricKey::SinkBytes => "clinker.sink.bytes",
     }
 }
 
@@ -1686,6 +1693,7 @@ fn span_name(name: SpanName) -> &'static str {
         SpanName::CredentialRevoke => "clinker.credential.revoke",
         SpanName::Source => "clinker.source",
         SpanName::Guess => "clinker.guess",
+        SpanName::Sink => "clinker.sink",
     }
 }
 
@@ -2003,6 +2011,13 @@ mod tests {
             (MetricKey::GuessUnresolved, "clinker.guess.unresolved"),
             (MetricKey::GuessFailed, "clinker.guess.failed"),
             (MetricKey::GuessInterrupted, "clinker.guess.interrupted"),
+            (MetricKey::SinkStarted, "clinker.sink.started"),
+            (MetricKey::SinkCompleted, "clinker.sink.completed"),
+            (MetricKey::SinkFailed, "clinker.sink.failed"),
+            (MetricKey::SinkInterrupted, "clinker.sink.interrupted"),
+            (MetricKey::SinkRecords, "clinker.sink.records"),
+            (MetricKey::SinkErrors, "clinker.sink.errors"),
+            (MetricKey::SinkBytes, "clinker.sink.bytes"),
         ];
         assert_eq!(metric_names.len(), MetricKey::COUNT);
         for (key, expected) in metric_names {
@@ -2017,6 +2032,7 @@ mod tests {
             (SpanName::CredentialRevoke, "clinker.credential.revoke"),
             (SpanName::Source, "clinker.source"),
             (SpanName::Guess, "clinker.guess"),
+            (SpanName::Sink, "clinker.sink"),
         ];
         for (name, expected) in span_names {
             assert_eq!(span_name(name), expected, "stable name for {name:?}");
@@ -2063,6 +2079,13 @@ mod tests {
                 "clinker.guess.unresolved",
                 "clinker.guess.failed",
                 "clinker.guess.interrupted",
+                "clinker.sink.started",
+                "clinker.sink.completed",
+                "clinker.sink.failed",
+                "clinker.sink.interrupted",
+                "clinker.sink.records",
+                "clinker.sink.errors",
+                "clinker.sink.bytes",
             ]
         );
         assert_eq!(
@@ -2075,6 +2098,7 @@ mod tests {
                 "clinker.credential.revoke",
                 "clinker.source",
                 "clinker.guess",
+                "clinker.sink",
             ]
         );
     }

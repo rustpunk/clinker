@@ -1330,7 +1330,7 @@ fn reroute_single_ref(node: &mut PipelineNode, from: &str, to: &str) {
         PipelineNode::Transform { header, .. }
         | PipelineNode::Aggregate { header, .. }
         | PipelineNode::Route { header, .. }
-        | PipelineNode::Output { header, .. }
+        | PipelineNode::Sink { header, .. }
         | PipelineNode::Reshape { header, .. }
         | PipelineNode::Cull { header, .. }
         | PipelineNode::Composition { header, .. } => repoint(&mut header.input.value, from, to),
@@ -2607,7 +2607,7 @@ nodes:
         - { name: amount, type: int }
         - { name: cust_id, type: string }
         - { name: order_notes, type: string }
-  - type: output
+  - type: sink
     name: sink
     input: orders
     config:
@@ -2728,7 +2728,7 @@ schema:
 
     #[test]
     fn patch_schema_non_source_target_errors() {
-        // `sink` is an output node, not a source.
+        // `sink` is a Sink node, not a source.
         let base = schema_base();
         let op = parse_op(
             r#"
@@ -2741,7 +2741,7 @@ schema:
         let err = apply_overlay_ops(base, one(op)).expect_err("not a source");
         assert!(
             matches!(err, OverlayOpError::NotSource { ref target, actual, .. }
-                if target == "sink" && actual == "output")
+                if target == "sink" && actual == "sink")
         );
     }
 

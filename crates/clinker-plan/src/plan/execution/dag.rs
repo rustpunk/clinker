@@ -591,9 +591,9 @@ pub enum ParallelismClass {
 
 /// Per-output projection specification.
 ///
-/// A projection-shaped summary of each Output node, carried on the execution
+/// A projection-shaped summary of each Sink node, carried on the execution
 /// plan alongside the graph. The executor does not read it — it projects from
-/// the `OutputConfig` on the node's resolved payload — so the fields here exist
+/// the `SinkConfig` on the node's resolved payload — so the fields here exist
 /// to describe the plan, not to drive it; `clinker --explain` reports the count.
 /// `mapping` mirrors [`crate::config::OutputMapping::entries`] so the summary
 /// cannot disagree with the config about the block's shape or direction.

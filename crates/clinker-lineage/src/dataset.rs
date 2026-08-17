@@ -1,7 +1,7 @@
 //! Plan-time mapping from Clinker plan nodes to OpenLineage dataset identities.
 //!
 //! The first piece of the builder that walks a compiled plan: a pure,
-//! deterministic function from each [`PlanNode::Source`] / [`PlanNode::Output`]
+//! deterministic function from each [`PlanNode::Source`] / [`PlanNode::Sink`]
 //! to the `{namespace, name}` pair that names one logical dataset. Like
 //! `--explain`, it reads no data and touches no filesystem — paths are resolved
 //! *lexically* against the workspace root, never via [`std::fs::canonicalize`],
@@ -21,7 +21,7 @@
 
 use std::path::Path;
 
-use clinker_plan::config::{OutputConfig, SourceConfig};
+use clinker_plan::config::{SinkConfig, SourceConfig};
 use clinker_plan::plan::execution::PlanNode;
 use clinker_plan::resources::{CatalogResource, ResourceDescriptor};
 
@@ -137,11 +137,11 @@ pub fn resource_dataset_identity(resource: &CatalogResource) -> Option<DatasetId
 
 /// The OpenLineage dataset identity of a plan node, or `None` for nodes that are
 /// not datasets (every variant but [`Source`](PlanNode::Source) and
-/// [`Output`](PlanNode::Output)).
+/// [`Sink`](PlanNode::Sink)).
 ///
 /// `base_dir` is the workspace root — the directory containing the pipeline
 /// YAML, the same `base_dir` `clinker_plan`'s discovery layer takes. A
-/// Source/Output whose resolved payload is unavailable (e.g. after a serde
+/// Source/Sink whose resolved payload is unavailable (e.g. after a serde
 /// round-trip, since the payload is `#[serde(skip)]`) falls back to the
 /// [`FALLBACK_NAMESPACE`] plus the node name rather than inventing a path.
 pub fn dataset_identity(node: &PlanNode, base_dir: &Path) -> Option<DatasetId> {
@@ -156,8 +156,8 @@ pub fn dataset_identity(node: &PlanNode, base_dir: &Path) -> Option<DatasetId> {
             },
             None => DatasetId::fallback(name.as_str()),
         }),
-        PlanNode::Output { name, resolved, .. } => Some(match resolved {
-            Some(payload) => output_dataset_identity(&payload.output, base_dir),
+        PlanNode::Sink { name, resolved, .. } => Some(match resolved {
+            Some(payload) => output_dataset_identity(&payload.sink, base_dir),
             None => DatasetId::fallback(name.as_str()),
         }),
         _ => None,
@@ -192,13 +192,13 @@ pub(crate) fn source_dataset_identity(source: &SourceConfig, base_dir: &Path) ->
     DatasetId::file(name)
 }
 
-/// Dataset identity of an output node from its parsed [`OutputConfig`].
+/// Dataset identity of a Sink node from its parsed [`SinkConfig`].
 ///
 /// Always [`FILE_NAMESPACE`] + the absolutized output path. The path may be a
 /// template carrying tokens (e.g. `{source_file}`) or driving per-file `split:`
 /// fan-out; tokens are **not** resolved at plan time — the literal template
 /// form is kept verbatim as the dataset name.
-pub(crate) fn output_dataset_identity(output: &OutputConfig, base_dir: &Path) -> DatasetId {
+pub(crate) fn output_dataset_identity(output: &SinkConfig, base_dir: &Path) -> DatasetId {
     DatasetId::file(absolutize(base_dir, &output.path))
 }
 
@@ -326,7 +326,7 @@ mod tests {
         ResourceOpenerKind,
     };
     use clinker_plan::plan::execution::{
-        CompiledResourceRequirement, PlanOutputPayload, PlanSourcePayload,
+        CompiledResourceRequirement, PlanSinkPayload, PlanSourcePayload,
     };
     use clinker_plan::plan::{EntityRef, PlanNodeId};
     use clinker_plan::resources::{LogicalResourceId, ResourceDatasetIdentity};
@@ -345,7 +345,7 @@ mod tests {
         serde_json::from_value(value).expect("valid source body")
     }
 
-    fn output_config(value: serde_json::Value) -> OutputConfig {
+    fn output_config(value: serde_json::Value) -> SinkConfig {
         serde_json::from_value(value).expect("valid output config")
     }
 
@@ -359,8 +359,8 @@ mod tests {
         }
     }
 
-    fn output_node(name: &str, resolved: Option<PlanOutputPayload>) -> PlanNode {
-        PlanNode::Output {
+    fn sink_node(name: &str, resolved: Option<PlanSinkPayload>) -> PlanNode {
+        PlanNode::Sink {
             name: name.to_string(),
             id: PlanNodeId::new(0),
             span: Span::SYNTHETIC,
@@ -580,13 +580,13 @@ mod tests {
     }
 
     #[test]
-    fn output_node_delegates_to_output_identity() {
-        let payload = PlanOutputPayload {
-            output: output_config(json!({"name": "out", "path": "out.csv", "type": "csv"})),
+    fn sink_node_delegates_to_output_identity() {
+        let payload = PlanSinkPayload {
+            sink: output_config(json!({"name": "out", "path": "out.csv", "type": "csv"})),
             validated_path: None,
             fan_out_per_source_file: false,
         };
-        let node = output_node("out", Some(payload));
+        let node = sink_node("out", Some(payload));
         assert_eq!(
             dataset_identity(&node, base()),
             Some(DatasetId::file("/work/out.csv".to_string()))
@@ -603,8 +603,8 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_output_node_falls_back_to_node_name() {
-        let node = output_node("sink", None);
+    fn unresolved_sink_node_falls_back_to_node_name() {
+        let node = sink_node("sink", None);
         assert_eq!(
             dataset_identity(&node, base()),
             Some(DatasetId::fallback("sink"))

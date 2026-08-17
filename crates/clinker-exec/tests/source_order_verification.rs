@@ -32,7 +32,7 @@ nodes:
       schema:
         - {{ name: key, type: int }}
         - {{ name: payload, type: string }}
-{sort_order}{policy}  - type: output
+{sort_order}{policy}  - type: sink
     name: out
     input: rows
     config:
@@ -80,7 +80,7 @@ nodes:
         - {{ name: payload, type: string }}
       sort_order: [key]
       on_unsorted: {on_unsorted}
-  - type: output
+  - type: sink
     name: out
     input: rows
     config:
@@ -199,7 +199,7 @@ nodes:
       cxl: |
         emit key = key
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: totals
     config:
@@ -435,7 +435,7 @@ nodes:
         - { name: value, type: string }
       sort_order: [tag]
       on_unsorted: error
-  - type: output
+  - type: sink
     name: out
     input: rows
     config:

@@ -103,7 +103,7 @@ nodes:
   inputs:
     - branch_a
     - branch_b
-- type: output
+- type: sink
   name: out
   input: joined
   config:
@@ -265,7 +265,7 @@ nodes:
 - type: merge
   name: joined
   inputs: [branch_a, branch_b, branch_c]
-- type: output
+- type: sink
   name: out
   input: joined
   config: { name: out, type: csv, path: out.csv }
@@ -377,15 +377,15 @@ nodes:
 - type: merge
   name: high_one
   inputs: [splitter.high, empty_d]
-- type: output
+- type: sink
   name: low_out_one
   input: low_one
   config: { name: low_out_one, type: csv, path: low-one.csv }
-- type: output
+- type: sink
   name: low_out_two
   input: low_two
   config: { name: low_out_two, type: csv, path: low-two.csv }
-- type: output
+- type: sink
   name: high_out
   input: high_one
   config: { name: high_out, type: csv, path: high.csv }

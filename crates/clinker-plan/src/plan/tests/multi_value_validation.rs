@@ -32,7 +32,7 @@ nodes:
       options:
         record_path: Orders/Order
 {source_body}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -58,7 +58,7 @@ nodes:
       type: json
       path: ./in.json
 {source_body}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -406,7 +406,7 @@ nodes:
     config:
       cxl: |
         emit id = id
-  - type: output
+  - type: sink
     name: out
     input: pick
     config:
@@ -437,7 +437,7 @@ nodes:
       schema:
         - { name: id, type: string }
         - { name: tags, type: string, multiple: true }
-  - type: output
+  - type: sink
     name: out
     input: pick
     config:
@@ -479,7 +479,7 @@ nodes:
       schema:
         - { name: id, type: string }
         - { name: codes, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -516,7 +516,7 @@ nodes:
       schema:
         - { name: id, type: string }
         - { name: codes, type: string, multiple: true }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -569,7 +569,7 @@ nodes:
         emit id = orders.id
         emit tags = events.tags
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: report
     input: enriched
     config:
@@ -613,7 +613,7 @@ nodes:
             columns:
               - { name: kind, type: string }
               - { name: tags, type: string, multiple: true }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -658,7 +658,7 @@ nodes:
       schema:
         - { name: id, type: string }
         - { name: tags, type: string, multiple: true }
-  - type: output
+  - type: sink
     name: report_sink
     input: orders_src
     config:
@@ -696,7 +696,7 @@ nodes:
       type: json
       path: ./orders.json
       schema: {}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -730,7 +730,7 @@ nodes:
       split_values:
         - tags
       schema: {}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -888,7 +888,7 @@ nodes:
       type: {source_format}
       path: ./in.dat
 {source_body}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -1055,7 +1055,7 @@ nodes:
             columns:
               - { name: kind, type: string }
               - { name: tags, type: string, multiple: true }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -1189,7 +1189,7 @@ nodes:
         record_path: Orders/Order
       schema:
         - {{ name: tags, type: string, multiple: true }}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -1434,7 +1434,7 @@ nodes:
 {split_block}
       schema:
         - {{ name: tags, type: string, multiple: true }}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -1495,7 +1495,7 @@ nodes:
         - { field: tags, delimiter: "::", escape: "\\" }
       schema:
         - { name: tags, type: string, multiple: true }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -1542,7 +1542,7 @@ nodes:
         - { field: tags, json: true, delimiter: "" }
       schema:
         - { name: tags, type: string, multiple: true }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -1597,7 +1597,7 @@ nodes:
         - { field: tags, delimiter: "", escape: "\\" }
       schema:
         - { name: tags, type: string, multiple: true }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

@@ -71,7 +71,7 @@ nodes:
       emit n = count(*)
 
       '
-- type: output
+- type: sink
   name: out
   input: dept_totals
   config:
@@ -116,7 +116,7 @@ nodes:
       emit total = sum(amount)
 
       '
-- type: output
+- type: sink
   name: out
   input: dept_totals
   config:

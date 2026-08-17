@@ -254,7 +254,7 @@ fn commit_one_group(
     //      single-source pipelines.
     //   2. CorrelationFanoutPolicy interpretation — Any/All/Primary
     //      operate WITHIN the failing-source's records.
-    // The resolved policy is read per-Output (per-Combine / per-Output
+    // The resolved policy is read per-Sink (per-Combine / per-Sink
     // overrides win against the pipeline default). Today the strict
     // path always resolves to `Any` so axis 2 sparing is a no-op; the
     // wire is in place for the relaxed-CK orchestrator to substitute a
@@ -334,12 +334,35 @@ fn flush_clean_records_to_writers(
         if slots.is_empty() {
             continue;
         }
-        let slots = order_clean_slots(ctx, current_dag, &output_name, slots)?;
+        let mut signal = ctx.telemetry_producer.clone().map(|producer| {
+            let logical_node = ctx.qualified_node_name(&output_name);
+            crate::telemetry::SinkSignal::new(producer, logical_node.into_owned())
+        });
+        let sink_byte_counter = signal
+            .as_ref()
+            .map(|_| clinker_format::SharedByteCounter::new());
+        let slots = match order_clean_slots(ctx, current_dag, &output_name, slots) {
+            Ok(slots) => slots,
+            Err(error) => {
+                if let Some(mut signal) = signal.take() {
+                    signal.record_errors(1);
+                    if matches!(&error, PipelineError::Interrupted) {
+                        signal.interrupt();
+                    } else {
+                        signal.fail();
+                    }
+                }
+                return Err(error);
+            }
+        };
         if slots.is_empty() {
+            if let Some(signal) = signal.take() {
+                signal.complete();
+            }
             continue;
         }
         let out_cfg = ctx
-            .output_configs
+            .sink_configs
             .iter()
             .find(|o| o.name == output_name)
             .unwrap_or(ctx.primary_output);
@@ -347,22 +370,33 @@ fn flush_clean_records_to_writers(
         for slot in &slots {
             if let Err(err) = structured_guard.observe(&output_name, slot.projected.doc_ctx()) {
                 ctx.output_errors.push(err);
+                if let Some(mut signal) = signal.take() {
+                    signal.record_errors(1);
+                    signal.fail();
+                }
                 continue 'outputs;
             }
         }
         let output_schema = Arc::clone(slots[0].projected.schema());
 
         let Some(raw_writer) = ctx.writers.remove(&output_name) else {
+            if let Some(mut signal) = signal.take() {
+                signal.record_records(u64::try_from(slots.len()).unwrap_or(u64::MAX));
+                signal.complete();
+            }
             continue;
         };
+        let errors_before = ctx.output_errors.len();
         match build_format_writer(
             out_cfg,
             raw_writer,
             Arc::clone(&output_schema),
             ctx.output_staging.clone(),
+            sink_byte_counter.clone(),
         ) {
             Ok(mut writer) => {
                 let mut write_failed = false;
+                let mut flush_failed = false;
                 let mut written_slots: Vec<&CorrelationRecordSlot> = Vec::new();
                 for slot in &slots {
                     let write_result = {
@@ -391,6 +425,7 @@ fn flush_clean_records_to_writers(
                     };
                     if let Err(e) = flush_result {
                         push_write_error(&mut ctx.output_errors, e);
+                        flush_failed = true;
                     } else if out_cfg.mapping.is_some() {
                         // Correlation records were projected before their group
                         // disposition. Observe only after this clean queue is
@@ -423,8 +458,40 @@ fn flush_clean_records_to_writers(
                 ctx.counters.ok_count += newly_ok;
                 ctx.counters.records_written += written;
                 ctx.records_emitted += written;
+                if let Some(mut signal) = signal.take() {
+                    signal.record_records(written);
+                    signal.record_bytes(
+                        sink_byte_counter
+                            .as_ref()
+                            .map_or(0, clinker_format::SharedByteCounter::bytes_written),
+                    );
+                    let new_errors = ctx.output_errors.len().saturating_sub(errors_before);
+                    signal.record_errors(u64::try_from(new_errors).unwrap_or(u64::MAX));
+                    if write_failed || flush_failed {
+                        signal.fail();
+                    } else if ctx
+                        .shutdown_token
+                        .as_ref()
+                        .is_some_and(crate::pipeline::shutdown::ShutdownToken::is_requested)
+                    {
+                        signal.interrupt();
+                    } else {
+                        signal.complete();
+                    }
+                }
             }
-            Err(e) => ctx.output_errors.push(e),
+            Err(e) => {
+                ctx.output_errors.push(e);
+                if let Some(mut signal) = signal.take() {
+                    signal.record_errors(1);
+                    signal.record_bytes(
+                        sink_byte_counter
+                            .as_ref()
+                            .map_or(0, clinker_format::SharedByteCounter::bytes_written),
+                    );
+                    signal.fail();
+                }
+            }
         }
     }
     Ok(())
@@ -459,7 +526,7 @@ fn order_clean_slots(
             detail: "correlation writer queue contains mixed physical boundaries".to_string(),
         });
     }
-    let boundary = crate::executor::output_dispatch::OrderedWriterBoundary::for_output(
+    let boundary = crate::executor::sink_dispatch::OrderedWriterBoundary::for_sink(
         current_dag,
         output_id,
         WriterBoundaryMode::CorrelationDeferred,

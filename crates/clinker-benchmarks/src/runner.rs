@@ -106,7 +106,7 @@ impl BenchPipelineRunner {
         }
 
         let mut writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::new();
-        for output in config.output_configs() {
+        for output in config.sink_configs() {
             writers.insert(output.name.clone(), Box::new(Cursor::new(Vec::new())) as _);
         }
 
@@ -136,7 +136,7 @@ fn rewrite_split_output_paths(
     config: &mut clinker_plan::config::PipelineConfig,
 ) -> Option<TempDir> {
     let has_split = config.nodes.iter().any(|n| {
-        matches!(&n.value, PipelineNode::Output { config: body, .. } if body.output.split.is_some())
+        matches!(&n.value, PipelineNode::Sink { config: body, .. } if body.sink.split.is_some())
     });
     if !has_split {
         return None;
@@ -159,14 +159,14 @@ fn rewrite_split_output_paths(
     unsafe { std::env::set_var("CLINKER_ALLOW_ABSOLUTE_PATHS", "1") };
 
     for node in &mut config.nodes {
-        if let PipelineNode::Output { config: body, .. } = &mut node.value
-            && body.output.split.is_some()
+        if let PipelineNode::Sink { config: body, .. } = &mut node.value
+            && body.sink.split.is_some()
         {
-            let filename = std::path::Path::new(&body.output.path)
+            let filename = std::path::Path::new(&body.sink.path)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("output.csv");
-            body.output.path = format!("{dir_path}/{filename}");
+            body.sink.path = format!("{dir_path}/{filename}");
         }
     }
 

@@ -251,7 +251,7 @@ impl Record {
     /// iterator so engine-internal namespaces (`$ck.<field>` source
     /// correlation, `$ck.aggregate.<name>` synthetic correlation, the
     /// `$widened` `auto_widen` sidecar) do not leak into output files
-    /// unless the Output node opts in via a specific flag.
+    /// unless the Sink node opts in via a specific flag.
     pub fn iter_user_fields(&self) -> impl Iterator<Item = (&str, &Value)> {
         self.schema
             .columns()
@@ -264,7 +264,7 @@ impl Record {
     /// Iterator over user-declared schema fields **plus** correlation-
     /// lattice columns (`$ck.<field>` source-CK shadows and
     /// `$ck.aggregate.<name>` synthetic-CK lineage), but skipping the
-    /// `auto_widen` sidecar absorber `$widened`. The Output node's
+    /// `auto_widen` sidecar absorber `$widened`. The Sink node's
     /// `include_correlation_keys: true` flag consults this iterator
     /// so a user opting into CK column visibility gets exactly the
     /// CK lattice — not the sidecar's `Value::Map` payload (which

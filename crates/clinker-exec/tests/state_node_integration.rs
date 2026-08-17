@@ -55,7 +55,7 @@ fn run_single(yaml: &str, csv_input: &str) -> String {
     )]);
     let buf = SharedBuffer::default();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
@@ -79,7 +79,7 @@ fn run_multi(yaml: &str, inputs: &[(&str, &str)]) -> String {
     }
     let buf = SharedBuffer::default();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
@@ -129,7 +129,7 @@ nodes:
       cxl: |
         emit id = id
         emit pipeline_last = $pipeline.last_amount
-  - type: output
+  - type: sink
     name: out
     input: read_back
     config:
@@ -191,7 +191,7 @@ nodes:
       cxl: |
         emit id = id
         emit src_label = $source.batch_label
-  - type: output
+  - type: sink
     name: out
     input: read_back
     config:
@@ -249,7 +249,7 @@ nodes:
       cxl: |
         emit id = id
         emit derived = $record.doubled
-  - type: output
+  - type: sink
     name: out
     input: read_back
     config:
@@ -309,7 +309,7 @@ nodes:
     use: ../compositions/declares_used.comp.yaml
     inputs:
       inp: parent_writer
-  - type: output
+  - type: sink
     name: out
     input: body
     config:
@@ -334,7 +334,7 @@ nodes:
     )]);
     let buf = SharedBuffer::default();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
@@ -407,7 +407,7 @@ nodes:
         emit id = id
         emit lt = $source.tag_left.left_label
         emit rt = $source.tag_right.right_label
-  - type: output
+  - type: sink
     name: out
     input: read_back
     config:
@@ -497,7 +497,7 @@ nodes:
       cxl: |
         emit id = id
         emit cap = $pipeline.max_amount
-  - type: output
+  - type: sink
     name: out
     input: read_back
     config:
@@ -562,7 +562,7 @@ nodes:
       cxl: |
         emit id = id
         emit label = $source.file_label
-  - type: output
+  - type: sink
     name: out
     input: read_back
     config:
@@ -591,7 +591,7 @@ nodes:
     )]);
     let buf = SharedBuffer::default();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
@@ -640,7 +640,7 @@ nodes:
         emit id = id
         emit tier = $vars.label
         emit threshold = $vars.cutoff
-  - type: output
+  - type: sink
     name: out
     input: filter_and_tag
     config:
@@ -662,7 +662,7 @@ nodes:
     )]);
     let buf = SharedBuffer::default();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     let mut static_vars = indexmap::IndexMap::new();
@@ -711,7 +711,7 @@ nodes:
         emit id = id
         emit tier = $vars.label
         emit threshold = $vars.cutoff
-  - type: output
+  - type: sink
     name: out
     input: filter_and_tag
     config:

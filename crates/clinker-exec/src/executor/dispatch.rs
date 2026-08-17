@@ -28,7 +28,7 @@ use cxl::eval::{EvalContext, ProgramEvaluator, SkipReason, StableEvalContext};
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
-use clinker_plan::config::{ErrorStrategy, OutputConfig, PipelineConfig};
+use clinker_plan::config::{ErrorStrategy, PipelineConfig, SinkConfig};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::EntityRef;
 
@@ -68,7 +68,7 @@ enum DispatchFaultKind {
     Merge,
     Sort,
     Envelope,
-    Output,
+    Sink,
     Cull,
     Reshape,
 }
@@ -86,7 +86,7 @@ impl DispatchFaultKind {
             "dispatch_merge" => Some(Self::Merge),
             "dispatch_sort" => Some(Self::Sort),
             "dispatch_envelope" => Some(Self::Envelope),
-            "dispatch_output" => Some(Self::Output),
+            "dispatch_sink" => Some(Self::Sink),
             "dispatch_cull" => Some(Self::Cull),
             "dispatch_reshape" => Some(Self::Reshape),
             _ => None,
@@ -1083,7 +1083,7 @@ impl NodeBufferReaderLedger {
 /// * `current_dag` — the DAG being walked. Composition body recursion will
 ///   later swap this in place to re-enter the dispatcher on a body's
 ///   mini-DAG without duplicating arm logic.
-/// * `output_configs` / `primary_output` — output sinks and the
+/// * `sink_configs` / `primary_output` — output sinks and the
 ///   declaration-order primary used as the fallback projection target.
 /// * `stable` / `source_batch_arc` / `strategy` — pipeline-stable scalars
 ///   reused at every per-record dispatch site.
@@ -1114,12 +1114,16 @@ pub(crate) struct ExecutorContext<'a> {
     /// runtime-retained slice of the former compile artifacts; resolved
     /// by `CompositionBodyId` via `composition_bodies.get(&id)`.
     pub(crate) composition_bodies: &'a CompositionBodies,
-    pub(crate) output_configs: &'a [OutputConfig],
-    pub(crate) primary_output: &'a OutputConfig,
+    pub(crate) sink_configs: &'a [SinkConfig],
+    pub(crate) primary_output: &'a SinkConfig,
     pub(crate) stable: &'a StableEvalContext,
     /// Run-scoped non-blocking telemetry handle. Cloned only when enabled;
     /// `None` keeps dispatch on the zero-work signal path.
     pub(crate) telemetry_producer: Option<crate::telemetry::TelemetryProducer>,
+    /// Counter shared by every physical writer opened for the Sink currently
+    /// executing on the dispatcher thread. It is installed only for that
+    /// Sink's work-unit scope and cleared before the next node dispatch.
+    pub(crate) sink_byte_counter: Option<clinker_format::SharedByteCounter>,
     /// Backing storage for `$source.batch` — per-pipeline-run UUID v7
     /// (per-source attribution is sub-issue #54). Distinct from
     /// `pipeline.batch_id`.
@@ -1363,7 +1367,7 @@ pub(crate) struct ExecutorContext<'a> {
     /// still fail-fast and bypass the rewind path.
     pub(crate) combine_input_snapshots: HashMap<NodeIndex, HashMap<Arc<str>, u64>>,
     pub(crate) output_errors: Vec<PipelineError>,
-    /// Per-Output `mapping:` resolution evidence, keyed by Output node name and
+    /// Per-Output `mapping:` resolution evidence, keyed by Sink node name and
     /// accumulated across every arm and every chunk. Drained once at the end of
     /// the run into the report's advisory findings.
     ///
@@ -1374,7 +1378,7 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) mapping_probes: BTreeMap<String, crate::projection::MappingProbe>,
     pub(crate) ok_source_rows: HashSet<crate::executor::stream_event::SourceRowId>,
     /// Successful writes keyed by both the source row and the stable terminal
-    /// Output node. This preserves fan-out evidence without changing
+    /// Sink node. This preserves fan-out evidence without changing
     /// `ok_count`, which remains deduplicated by `ok_source_rows`.
     pub(crate) ok_deliveries: HashSet<crate::executor::stream_event::OutputDeliveryId>,
     pub(crate) records_emitted: u64,
@@ -1592,7 +1596,7 @@ pub(crate) struct ExecutorContext<'a> {
     /// has already been moved into the streaming task and there is no
     /// buffered batch to drain. Empty when no streaming chain
     /// qualified.
-    pub(crate) streaming_output_nodes: HashSet<NodeIndex>,
+    pub(crate) streaming_sink_nodes: HashSet<NodeIndex>,
 
     /// `producer → Aggregate` edges whose ingest streams. Keyed by the
     /// producer's `NodeIndex`, valued by the consuming `Aggregate`'s
@@ -1748,7 +1752,7 @@ pub(crate) struct RetainedAggregatorState {
 pub(crate) fn mapping_probe<'p>(
     probes: &'p mut BTreeMap<String, crate::projection::MappingProbe>,
     output_name: &str,
-    out_cfg: &clinker_plan::config::OutputConfig,
+    out_cfg: &clinker_plan::config::SinkConfig,
 ) -> &'p mut crate::projection::MappingProbe {
     if !probes.contains_key(output_name) {
         probes.insert(
@@ -1766,7 +1770,7 @@ impl<'a> ExecutorContext<'a> {
     pub(crate) fn merge_mapping_probe(
         &mut self,
         output_name: &str,
-        out_cfg: &clinker_plan::config::OutputConfig,
+        out_cfg: &clinker_plan::config::SinkConfig,
         probe: &crate::projection::MappingProbe,
     ) {
         if out_cfg.mapping.is_some() {
@@ -3087,7 +3091,7 @@ pub(crate) fn stream_linear_producer_emit(
                         op: "executor",
                         node: node_name.to_string(),
                         detail: String::from(
-                            "streaming Output writer task dropped its receiver before \
+                            "streaming Sink writer task dropped its receiver before \
                              the streaming producer arm finished",
                         ),
                     })
@@ -3607,7 +3611,7 @@ pub(crate) fn merge_fused_interleave(
                             op: "executor",
                             node: merge_name.to_string(),
                             detail: String::from(
-                                "streaming Output writer task dropped its receiver \
+                                "streaming Sink writer task dropped its receiver \
                              before the Merge arm finished",
                             ),
                         })
@@ -3926,7 +3930,7 @@ pub(crate) fn transform_fused_consume(
     // Streaming inter-stage handoff: when a single streaming-eligible
     // Output downstream of this fused Transform installed its sender under
     // this node's index at executor entry (per `classify_stream_nodes` /
-    // `compute_streaming_output_specs`), take it here. Each flushed batch
+    // `compute_streaming_sink_specs`), take it here. Each flushed batch
     // is then sent straight to the writer thread over the bounded channel
     // — the blocking `send` is the back-pressure pivot, so peak
     // inter-stage memory is one batch plus the channel's bound, never the
@@ -4053,7 +4057,7 @@ pub(crate) fn transform_fused_consume(
                             op: "executor",
                             node: String::from("fused-transform-stream"),
                             detail: String::from(
-                                "streaming Output writer task dropped its receiver \
+                                "streaming Sink writer task dropped its receiver \
                                  before the fused Transform arm finished",
                             ),
                         })
@@ -4531,8 +4535,8 @@ pub(crate) fn dispatch_plan_node(
                 node_idx,
                 &node,
             ),
-            DispatchFaultKind::Output => {
-                crate::executor::output_dispatch::dispatch_output(ctx, current_dag, node_idx, &node)
+            DispatchFaultKind::Sink => {
+                crate::executor::sink_dispatch::dispatch_sink(ctx, current_dag, node_idx, &node)
             }
             DispatchFaultKind::Cull => {
                 crate::executor::cull_dispatch::dispatch_cull(ctx, current_dag, node_idx, &node)
@@ -4580,7 +4584,7 @@ pub(crate) fn dispatch_plan_node(
             )?;
         }
 
-        PlanNode::Output { .. } => {
+        PlanNode::Sink { .. } => {
             if matches!(
                 ctx.run_policy.preview(),
                 crate::executor::PreviewPolicy::ConfigOnly
@@ -4588,10 +4592,10 @@ pub(crate) fn dispatch_plan_node(
                 return Err(PipelineError::Internal {
                     op: "run-policy",
                     node: node.name().to_string(),
-                    detail: "config-only policy reached Output dispatch".to_string(),
+                    detail: "config-only policy reached Sink dispatch".to_string(),
                 });
             }
-            crate::executor::output_dispatch::dispatch_output(ctx, current_dag, node_idx, &node)?;
+            crate::executor::sink_dispatch::dispatch_sink(ctx, current_dag, node_idx, &node)?;
         }
 
         PlanNode::Reshape { .. } => {

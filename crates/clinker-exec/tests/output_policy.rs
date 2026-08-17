@@ -1,7 +1,7 @@
 //! End-to-end tests for the output collision policy and path templating.
 //!
 //! Covers each `if_exists` policy through `open_output`, the path-template
-//! interaction with `OutputConfig`, and a multi-threaded race test that
+//! interaction with `SinkConfig`, and a multi-threaded race test that
 //! exercises destination-local reservations under concurrent contention.
 
 use std::collections::HashMap;
@@ -192,7 +192,7 @@ nodes:
   - type: merge
     name: merged
     inputs: [a, b]
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -232,7 +232,7 @@ nodes:
       options: { has_header: true }
       schema:
         - { name: x, type: string }
-  - type: output
+  - type: sink
     name: out
     input: a
     config:
@@ -268,7 +268,7 @@ nodes:
       options: { has_header: true }
       schema:
         - { name: x, type: string }
-  - type: output
+  - type: sink
     name: out
     input: customers
     config:
@@ -282,6 +282,6 @@ error_handling:
     let mut config = clinker_plan::config::parse_config(yaml).unwrap();
     let ctx = TemplateContext::default();
     resolve_output_path_templates_in_place(&mut config, &ctx).unwrap();
-    let resolved = config.output_configs().next().unwrap().path.clone();
+    let resolved = config.sink_configs().next().unwrap().path.clone();
     assert_eq!(resolved, "/tmp/customers.csv");
 }

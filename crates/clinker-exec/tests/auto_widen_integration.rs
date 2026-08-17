@@ -57,7 +57,7 @@ fn run_single(yaml: &str, csv_input: &str) -> (ExecutionReport, String) {
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     let report =
@@ -93,7 +93,7 @@ fn run_two_source_merge(
     ]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     let report =
@@ -119,7 +119,7 @@ fn run_single_result(
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
@@ -156,7 +156,7 @@ nodes:
     cxl: |
       emit dept = dept
       emit total = sum(salary)
-- type: output
+- type: sink
   name: out
   input: agg
   config:
@@ -220,7 +220,7 @@ nodes:
       emit order_id = o.order_id
       emit product_id = o.product_id
       emit product_name = p.name
-- type: output
+- type: sink
   name: out
   input: enriched
   config:
@@ -303,7 +303,7 @@ nodes:
     on_miss: skip
     cxl: ""
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: enriched
   config:
@@ -387,7 +387,7 @@ nodes:
 - type: merge
   name: merged
   inputs: [src_a, src_b]
-- type: output
+- type: sink
   name: out
   input: merged
   config:
@@ -464,7 +464,7 @@ nodes:
     schema:
       - { name: id, type: string }
       - { name: name, type: string }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -517,7 +517,7 @@ nodes:
     path: in.csv
     schema:
       - { name: id, type: string }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -721,7 +721,7 @@ nodes:
     cxl: |
       emit id = id
       emit amount = amount.to_int()
-- type: output
+- type: sink
   name: out
   input: validate
   config:
@@ -812,7 +812,7 @@ nodes:
     schema:
       - { name: id, type: string }
       - { name: name, type: string }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -887,7 +887,7 @@ nodes:
   input: merged
   config:
     cxl: "emit id = id"
-- type: output
+- type: sink
   name: out
   input: passthrough
   config:
@@ -946,7 +946,7 @@ nodes:
 - type: merge
   name: merged
   inputs: [src_a, src_b]
-- type: output
+- type: sink
   name: out
   input: merged
   config:
@@ -1016,7 +1016,7 @@ nodes:
     schema:
       - { name: id, type: string }
       - { name: name, type: string }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -1055,7 +1055,7 @@ nodes:
     path: in.csv
     schema:
       - { name: id, type: string }
-- type: output
+- type: sink
   name: out
   input: src
   config:

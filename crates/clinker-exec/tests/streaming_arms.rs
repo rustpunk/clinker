@@ -151,7 +151,7 @@ nodes:
       conditions:
         all: "true"
       default: all
-  - type: output
+  - type: sink
     name: out
     input: r.all
     config:
@@ -254,7 +254,7 @@ nodes:
       conditions:
         all: "true"
       default: all
-  - type: output
+  - type: sink
     name: out
     input: r.all
     config:
@@ -349,7 +349,7 @@ nodes:
         emit order_id = orders.order_id
         emit product_name = products.name
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: c
     config:
@@ -444,7 +444,7 @@ nodes:
       cxl: |
         emit total = sum(amount.to_int())
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: totals
     config:
@@ -546,7 +546,7 @@ nodes:
     inputs: [ta, tb]
     config:
       mode: concat
-  - type: output
+  - type: sink
     name: out
     input: m
     config:
@@ -665,7 +665,7 @@ nodes:
     inputs: [ta, tb]
     config:
       mode: concat
-  - type: output
+  - type: sink
     name: out
     input: m
     config:
@@ -786,7 +786,7 @@ nodes:
         emit dept = dept
         emit total = sum(amount.to_int())
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: totals
     config:
@@ -899,7 +899,7 @@ nodes:
       cxl: |
         emit total = sum(amount.to_int())
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: totals
     config:
@@ -1001,7 +1001,7 @@ nodes:
       cxl: |
         emit total = sum(amount.to_int())
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: totals
     config:
@@ -1102,7 +1102,7 @@ nodes:
         emit order_id = norm.order_id
         emit product_name = products.name
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: c
     config:
@@ -1228,7 +1228,7 @@ nodes:
         emit order_id = m.order_id
         emit product_name = products.name
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: c
     config:
@@ -1346,7 +1346,7 @@ nodes:
         emit order_id = norm.order_id
         emit product_name = products.name
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: c
     config:
@@ -1455,7 +1455,7 @@ nodes:
         emit order_id = norm.order_id
         emit ratio = norm.qty / products.divisor
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: c
     config:

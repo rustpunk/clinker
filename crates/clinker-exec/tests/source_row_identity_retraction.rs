@@ -53,7 +53,7 @@ nodes:
     config:
       cxl: |
         emit parsed = value.to_int()
-  - type: output
+  - type: sink
     name: out
     input: validate
     config:
@@ -324,7 +324,7 @@ nodes:
         emit total = total
         emit n = n
         emit ratio = 1 / (total - {failing_total})
-  - type: output
+  - type: sink
     name: out
     input: post_check
     config:

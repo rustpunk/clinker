@@ -25,7 +25,7 @@ nodes:
       has_header: true
     schema:
       - { name: id, type: int }
-- type: output
+- type: sink
   name: sink
   input: src
   config:

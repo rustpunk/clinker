@@ -40,7 +40,7 @@ combine.enriched:
   buffer: materialized
   arbitration: spill_priority=10, can_back_pressure=false, predicted_peak=150K, predicted_freed=150K, predicted_subtree_reclaim=150K
 
-output.out:
+sink.out:
   ordering: <none>
   ordering_provenance: DestroyedByCombine { at_node: "enriched", confidence: Proven }
   partitioning: Single
@@ -58,7 +58,7 @@ edge source.orders -> combine.enriched:
   buffer: node_buffer (slot=0)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=90K, predicted_freed=90K (producer: source)
 
-edge combine.enriched -> output.out:
+edge combine.enriched -> sink.out:
   buffer: node_buffer (slot=2)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=150K, predicted_freed=150K (producer: combine)
 
@@ -105,4 +105,4 @@ Worker threads: 4
   ● [source] products (line:16)
   ● [source] orders (line:7)
   ◈ [combine:grace_hash] enriched drive=orders build=[products] eq=1 range=0 (line:25)
-  │ [output] out (line:39)
+  │ [sink] out (line:39)

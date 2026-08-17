@@ -134,7 +134,7 @@ nodes:
           static: value_field,
           [key_field]: [entry for entry in [shared] if predicate_field],
         }
-  - type: output
+  - type: sink
     name: out
     input: construct
     config: { name: out, type: json, path: out/nested-roles.json, include_unmapped: false }
@@ -182,7 +182,7 @@ nodes:
     input: src
     config:
       cxl: 'emit payload = [first_value, {static: second_value}]'
-  - type: output
+  - type: sink
     name: out
     input: construct
     config: { name: out, type: json, path: out/nested-static.json, include_unmapped: false }
@@ -230,7 +230,7 @@ nodes:
     use: ../compositions/rename_id.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: comp
     config: { name: out, type: csv, path: out/rename.csv }
@@ -296,7 +296,7 @@ nodes:
     use: ../compositions/outer.comp.yaml
     inputs:
       o_in: src
-  - type: output
+  - type: sink
     name: out
     input: top
     config: { name: out, type: csv, path: out/nested.csv }
@@ -360,7 +360,7 @@ nodes:
     use: ../compositions/agg_in_body.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: comp
     config: { name: out, type: csv, path: out/agg.csv }
@@ -424,7 +424,7 @@ nodes:
     inputs:
       orders: orders_src
       products: products_src
-  - type: output
+  - type: sink
     name: out
     input: comp
     config: { name: out, type: csv, path: out/join.csv }
@@ -516,7 +516,7 @@ nodes:
     use: ../compositions/doc_read.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: comp
     config: { name: out, type: csv, path: out/doc_comp.csv }
@@ -585,7 +585,7 @@ nodes:
     inputs:
       driver: ref
     resources: { reference: reference_codes }
-  - type: output
+  - type: sink
     name: out
     input: enrich
     config: { name: out, type: csv, path: out/out.csv }
@@ -689,11 +689,11 @@ nodes:
     use: ../compositions/own_source.comp.yaml
     inputs: { driver: driver }
     resources: { reference: body_ledger }
-  - type: output
+  - type: sink
     name: first_out
     input: first
     config: { name: first_out, type: csv, path: out/first.csv }
-  - type: output
+  - type: sink
     name: second_out
     input: second
     config: { name: second_out, type: csv, path: out/second.csv }
@@ -778,7 +778,7 @@ nodes:
     inputs:
       driver: drive
     resources: { reference: reference_codes }
-  - type: output
+  - type: sink
     name: enrich.ref
     input: enrich
     config: { name: enrich.ref, type: csv, path: out/out.csv }
@@ -836,7 +836,7 @@ nodes:
     inputs:
       driver: drive
     resources: {{ reference: reference_codes }}
-  - type: output
+  - type: sink
     name: out
     input: {call_site}
     config: {{ name: out, type: csv, path: out/out.csv }}
@@ -940,7 +940,7 @@ nodes:
     inputs:
       driver: drive
     resources: { reference: reference_codes }
-  - type: output
+  - type: sink
     name: out
     input: enrich
     config: { name: out, type: csv, path: out/out.csv }
@@ -1016,7 +1016,7 @@ nodes:
     inputs:
       driver: drv
     resources: { ledger: body_ledger }
-  - type: output
+  - type: sink
     name: out
     input: enrich
     config: { name: out, type: csv, path: out/out.csv }

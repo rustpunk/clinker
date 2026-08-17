@@ -79,7 +79,7 @@ nodes:
       inp: normalize
     config:
       threshold: 0.5
-  - type: output
+  - type: sink
     name: out
     input: scorer
     config:
@@ -264,7 +264,7 @@ fn run_with_group_splices_composition_into_consumed_path() {
     let tmp = tempfile::tempdir().unwrap();
     build_workspace(tmp.path(), false);
 
-    // Run from the workspace dir so the output node's relative `out.csv` path
+    // Run from the workspace dir so the Sink node's relative `out.csv` path
     // (resolved against the process cwd) lands inside the tempdir.
     let out = Command::new(clinker_bin())
         .current_dir(tmp.path())

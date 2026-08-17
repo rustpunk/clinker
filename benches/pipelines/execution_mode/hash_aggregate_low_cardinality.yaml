@@ -25,7 +25,7 @@ nodes:
         emit total = sum(f2)
         emit n = count(*)
 
-  - type: output
+  - type: sink
     name: sink
     input: agg
     config:

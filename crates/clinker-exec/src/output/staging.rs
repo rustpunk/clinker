@@ -87,7 +87,7 @@ impl PendingStage {
 /// An operator-visible partial retained after an unsuccessful run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PartialOutput {
-    /// Authored output node name.
+    /// Authored Sink node name.
     pub name: String,
     /// Final path that was never published.
     pub final_path: PathBuf,

@@ -285,10 +285,10 @@ fn resolve_and_hash_external_schemas(config: &mut PipelineConfig) -> Result<(), 
                 }
                 _ => continue,
             },
-            crate::config::PipelineNode::Output {
+            crate::config::PipelineNode::Sink {
                 header,
                 config: body,
-            } => match &body.output.schema {
+            } => match &body.sink.schema {
                 Some(crate::config::SourceSchema::File(path)) => {
                     (path.clone(), format!("output {:?}", header.name))
                 }
@@ -322,8 +322,8 @@ fn resolve_and_hash_external_schemas(config: &mut PipelineConfig) -> Result<(), 
             crate::config::PipelineNode::Source { config: body, .. } => {
                 body.schema = inline;
             }
-            crate::config::PipelineNode::Output { config: body, .. } => {
-                body.output.schema = Some(inline);
+            crate::config::PipelineNode::Sink { config: body, .. } => {
+                body.sink.schema = Some(inline);
             }
             _ => {}
         }
@@ -480,7 +480,7 @@ mod external_schema_tests {
 
     fn output_schema(config: &PipelineConfig) -> Option<&crate::config::SourceSchema> {
         config.nodes.iter().find_map(|n| match &n.value {
-            crate::config::PipelineNode::Output { config, .. } => config.output.schema.as_ref(),
+            crate::config::PipelineNode::Sink { config, .. } => config.sink.schema.as_ref(),
             _ => None,
         })
     }
@@ -493,7 +493,7 @@ mod external_schema_tests {
             "pipeline:\n  name: ext_schema_test\n\
              nodes:\n  - type: source\n    name: src\n    config:\n      \
              name: src\n      type: csv\n      path: /tmp/in.csv\n      \
-             schema: '{}'\n  - type: output\n    name: out\n    input: src\n    \
+             schema: '{}'\n  - type: sink\n    name: out\n    input: src\n    \
              config:\n      name: out\n      type: csv\n      path: /tmp/out.csv\n",
             schema_path.display()
         );
@@ -540,7 +540,7 @@ mod external_schema_tests {
         );
     }
 
-    /// An output node's external `.schema.yaml` (`SourceSchema::File`) is
+    /// A Sink node's external `.schema.yaml` (`SourceSchema::File`) is
     /// resolved to its inline column list at config-load time, exactly like a
     /// source's. Without this the write-boundary passes that read the output
     /// schema through `as_columns()` — fixed-width column widths and the
@@ -562,7 +562,7 @@ mod external_schema_tests {
              nodes:\n  - type: source\n    name: src\n    config:\n      \
              name: src\n      type: csv\n      path: /tmp/in.csv\n      \
              schema:\n        - {{ name: average, type: decimal, scale: 2 }}\n        \
-             - {{ name: name, type: string }}\n  - type: output\n    name: out\n    \
+             - {{ name: name, type: string }}\n  - type: sink\n    name: out\n    \
              input: src\n    config:\n      name: out\n      type: csv\n      \
              path: /tmp/out.csv\n      schema: '{}'\n",
             schema_path.display()
@@ -605,7 +605,7 @@ mod external_schema_tests {
         let pipeline = "pipeline:\n  name: inline\n\
              nodes:\n  - type: source\n    name: src\n    config:\n      \
              name: src\n      type: csv\n      path: /tmp/in.csv\n      \
-             schema:\n        - { name: amount, type: int }\n  - type: output\n    \
+             schema:\n        - { name: amount, type: int }\n  - type: sink\n    \
              name: out\n    input: src\n    config:\n      name: out\n      \
              type: csv\n      path: /tmp/out.csv\n";
         let p = dir.path().join("pipeline.yaml");
@@ -628,7 +628,7 @@ mod external_schema_tests {
         let yaml = "pipeline:\n  name: read_once\n\
              nodes:\n  - type: source\n    name: src\n    config:\n      \
              name: src\n      type: csv\n      path: /tmp/in.csv\n      \
-             schema:\n        - { name: amount, type: int }\n  - type: output\n    \
+             schema:\n        - { name: amount, type: int }\n  - type: sink\n    \
              name: out\n    input: src\n    config:\n      name: out\n      \
              type: csv\n      path: /tmp/out.csv\n";
         let dir = tempfile::tempdir().unwrap();

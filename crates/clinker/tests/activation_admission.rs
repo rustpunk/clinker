@@ -66,7 +66,7 @@ nodes:
       type: csv
       path: orders.csv
       schema: [{ name: id, type: string }]
-  - type: output
+  - type: sink
     name: out
     input: orders
     config:
@@ -160,7 +160,7 @@ nodes:
     use: compositions/reader.comp.yaml
     inputs: {}
     resources: { input: orders }
-  - type: output
+  - type: sink
     name: out
     input: read_orders
     config:

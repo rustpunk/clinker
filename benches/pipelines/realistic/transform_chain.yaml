@@ -49,7 +49,7 @@ nodes:
         emit final_ratio = ratio.round(2)
         filter amount > 0
 
-  - type: output
+  - type: sink
     name: sink
     input: finalize
     config:

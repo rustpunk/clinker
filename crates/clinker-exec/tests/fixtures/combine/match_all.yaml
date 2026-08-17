@@ -40,7 +40,7 @@ nodes:
         emit product_name = products.name
         emit amount = orders.amount
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: fanned_out
     input: fanned
     config:

@@ -31,7 +31,7 @@ nodes:
       schema:
         - { name: order_id, type: string }
         - { name: amount, type: float }
-  - type: output
+  - type: sink
     name: out
     input: orders
     config:
@@ -133,12 +133,12 @@ fn fan_out_flag_set_when_template_uses_source_file_token() {
         .graph
         .node_indices()
         .find(|i| dag.graph[*i].name() == "out")
-        .expect("output node 'out' exists");
+        .expect("Sink node 'out' exists");
     use clinker_plan::plan::execution::PlanNode;
-    let PlanNode::Output { resolved, .. } = &dag.graph[out_idx] else {
-        panic!("expected Output variant");
+    let PlanNode::Sink { resolved, .. } = &dag.graph[out_idx] else {
+        panic!("expected Sink variant");
     };
-    let payload = resolved.as_ref().expect("Output payload populated");
+    let payload = resolved.as_ref().expect("Sink payload populated");
     assert!(
         payload.fan_out_per_source_file,
         "Output 'out' uses {{source_file}} token + has FilePartitioned input \

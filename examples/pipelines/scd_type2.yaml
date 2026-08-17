@@ -56,7 +56,7 @@ nodes:
               plan_end: "plan_end"
               status: "'synthesized'"
 
-  - type: output
+  - type: sink
     name: out
     input: backfill
     config:

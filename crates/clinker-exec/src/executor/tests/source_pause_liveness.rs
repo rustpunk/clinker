@@ -185,7 +185,7 @@ nodes:
   inputs: [src_a, src_b]
   config:
     mode: concat
-- type: output
+- type: sink
   name: out
   input: merged
   config:
@@ -253,7 +253,7 @@ nodes:
   inputs: [src_a, src_b]
   config:
     mode: interleave
-- type: output
+- type: sink
   name: out
   input: merged
   config:
@@ -277,7 +277,7 @@ nodes:
     cxl: |
       emit region = region
       emit n = count()
-- type: output
+- type: sink
   name: out_pre
   input: agg_pre
   config:
@@ -341,7 +341,7 @@ nodes:
     cxl: |
       emit id = id
       emit region = region
-- type: output
+- type: sink
   name: out
   input: shape
   config:
@@ -365,7 +365,7 @@ nodes:
     cxl: |
       emit region = region
       emit n = count()
-- type: output
+- type: sink
   name: out_pre
   input: agg_pre
   config:

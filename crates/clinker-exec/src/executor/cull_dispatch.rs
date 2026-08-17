@@ -21,7 +21,7 @@
 //! rows and every other edge (the bare main reference, tagged `None`)
 //! receives kept rows. Both ports carry the unchanged upstream schema —
 //! Cull does not widen. Per-port output volume is counted downstream at the
-//! Output nodes each port feeds (the same place Route's branch volumes are
+//! Sink nodes each port feeds (the same place Route's branch volumes are
 //! counted), not at this arm.
 //!
 //! # Memory model

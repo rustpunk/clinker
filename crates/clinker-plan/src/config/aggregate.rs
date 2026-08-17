@@ -149,7 +149,7 @@ impl<'de> Deserialize<'de> for CorrelationKey {
 /// disposed at commit time.
 ///
 /// Resolution precedence (latter wins): per-pipeline default →
-/// per-Combine override (per-input-set fan-out shape) → per-Output override
+/// per-Combine override (per-input-set fan-out shape) → per-Sink override
 /// (per-sink fan-out shape). The override surface lets audit-style sinks
 /// keep failing-group records that an integrity-style sink would discard.
 ///

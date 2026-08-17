@@ -165,7 +165,7 @@ nodes:
       schema:
         - {{ name: id, type: int }}
         - {{ name: amount, type: int }}
-  - type: output
+  - type: sink
     name: out
     input: api
     config:
@@ -346,7 +346,7 @@ nodes:
       schema:
         - {{ name: id, type: int }}
         - {{ name: amount, type: int }}
-  - type: output
+  - type: sink
     name: out
     input: api
     config:
@@ -468,7 +468,7 @@ nodes:
       schema:
         - {{ name: id, type: int }}
         - {{ name: amount, type: int }}
-  - type: output
+  - type: sink
     name: out
     input: api
     config:

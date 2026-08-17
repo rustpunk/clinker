@@ -68,7 +68,7 @@ fn run_format_test(
         clinker_exec::executor::single_file_reader("test.csv", Box::new(input_data)),
     )]);
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
@@ -106,7 +106,7 @@ nodes:
       - { name: name, type: string }
       - { name: age, type: string }
 
-- type: output
+- type: sink
   name: dest
   input: src
   config:
@@ -150,7 +150,7 @@ nodes:
       - { name: name, type: string }
       - { name: age, type: int }
 
-- type: output
+- type: sink
   name: dest
   input: src
   config:
@@ -197,7 +197,7 @@ nodes:
     schema:
       - { name: name, type: string }
       - { name: age, type: int }
-- type: output
+- type: sink
   name: dest
   input: src
   config:
@@ -250,7 +250,7 @@ nodes:
     schema:
       - { name: name, type: string }
       - { name: age, type: int }
-- type: output
+- type: sink
   name: dest
   input: src
   config:
@@ -313,7 +313,7 @@ nodes:
     schema:
       - { name: name, type: string }
       - { name: age, type: int }
-- type: output
+- type: sink
   name: dest
   input: src
   config:
@@ -374,7 +374,7 @@ nodes:
     schema:
       - { name: name, type: string }
       - { name: age, type: int }
-- type: output
+- type: sink
   name: dest
   input: src
   config:
@@ -444,7 +444,7 @@ nodes:
       - { name: name, type: string }
       - { name: age, type: string }
 
-- type: output
+- type: sink
   name: dest
   input: src
   config:
@@ -492,7 +492,7 @@ nodes:
       - { name: name, type: string }
       - { name: age, type: string }
 
-- type: output
+- type: sink
   name: dest
   input: src
   config:
@@ -548,7 +548,7 @@ nodes:
       - { name: id, type: string }
       - { name: value, type: string }
 
-- type: output
+- type: sink
   name: dest
   input: src
   config:
@@ -593,7 +593,7 @@ nodes:
       - { name: name, type: string }
       - { name: age, type: string }
 
-- type: output
+- type: sink
   name: dest
   input: src
   config:
@@ -635,7 +635,7 @@ nodes:
       - { name: name, type: string, start: 0, width: 10 }
       - { name: age, type: int, start: 10, width: 5 }
 
-- type: output
+- type: sink
   name: dest
   input: src
   config:
@@ -673,7 +673,7 @@ nodes:
       - { name: name, type: string }
       - { name: age, type: string }
 
-- type: output
+- type: sink
   name: dest
   input: src
   config:
@@ -737,7 +737,7 @@ nodes:
       - { name: name, type: string }
       - { name: age, type: string }
 
-- type: output
+- type: sink
   name: dest
   input: src
   config:

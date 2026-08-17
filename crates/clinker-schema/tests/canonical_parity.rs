@@ -11,7 +11,7 @@ use clinker_schema::{
 fn write_pipeline(root: &Path, schema_path: &Path) -> PathBuf {
     fs::write(root.join("input.csv"), "id\n1\n").unwrap();
     let pipeline = format!(
-        "pipeline:\n  name: parity\nnodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: csv\n      path: input.csv\n      schema: '{}'\n  - type: output\n    name: out\n    input: src\n    config:\n      name: out\n      type: csv\n      path: output.csv\n",
+        "pipeline:\n  name: parity\nnodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: csv\n      path: input.csv\n      schema: '{}'\n  - type: sink\n    name: out\n    input: src\n    config:\n      name: out\n      type: csv\n      path: output.csv\n",
         schema_path.display()
     );
     let path = root.join("pipeline.yaml");

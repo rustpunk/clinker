@@ -121,7 +121,7 @@ nodes:
       emit product_c2 = products.c2 ?? "UNKNOWN"
     propagate_ck: driver
 
-- type: output
+- type: sink
   name: out
   input: enriched
   config:

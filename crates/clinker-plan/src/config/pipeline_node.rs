@@ -70,7 +70,7 @@ use clinker_core_types::{Diagnostic, LabeledSpan, Span as DiagnosticSpan};
 /// only deserialization is re-architected.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-// Variant size is dominated by `SourceBody`/`OutputBody` (large wrapped
+// Variant size is dominated by `SourceBody`/`SinkBody` (large wrapped
 // config types) and by the `Locations` field in `Spanned<NodeInput>` on
 // every consumer header. Boxing would force every consumer site to deref
 // through the box — a pervasive ergonomics regression for a value that
@@ -114,10 +114,10 @@ pub enum PipelineNode {
         header: CombineHeader,
         config: CombineBody,
     },
-    Output {
+    Sink {
         #[serde(flatten)]
         header: NodeHeader,
-        config: OutputBody,
+        config: SinkBody,
     },
     /// Per-correlation-group record synthesis and trigger-row mutation.
     ///
@@ -418,11 +418,23 @@ impl<'de> Deserialize<'de> for PipelineNode {
                         Ok(PipelineNode::Combine { header, config })
                     }
                     "output" => {
-                        let payload = OutputPayload::deserialize(
+                        let entry = clinker_core_types::diagnostic::registry_entry("E376")
+                            .ok_or_else(|| {
+                                de::Error::custom(
+                                    "internal error: reserved E376 diagnostic is missing",
+                                )
+                            })?;
+                        Err(de::Error::custom(format!(
+                            "{}: {}. Correction: {}",
+                            entry.code, entry.meaning, entry.correction
+                        )))
+                    }
+                    "sink" => {
+                        let payload = SinkPayload::deserialize(
                             de::value::MapAccessDeserializer::new(dispatch),
                         )?;
                         let (header, config) = payload.into_variant_parts();
-                        Ok(PipelineNode::Output { header, config })
+                        Ok(PipelineNode::Sink { header, config })
                     }
                     "reshape" => {
                         let payload = ReshapePayload::deserialize(
@@ -460,7 +472,7 @@ impl<'de> Deserialize<'de> for PipelineNode {
                             "route",
                             "merge",
                             "combine",
-                            "output",
+                            "sink",
                             "reshape",
                             "cull",
                             "envelope",
@@ -516,7 +528,7 @@ impl SourcePayload {
     }
 }
 
-// ---- Transform / Aggregate / Route / Output (consumer NodeHeader) ----
+// ---- Transform / Aggregate / Route / Sink (consumer NodeHeader) ----
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -598,18 +610,18 @@ impl RoutePayload {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OutputPayload {
+struct SinkPayload {
     name: String,
     #[serde(default)]
     description: Option<String>,
     input: crate::yaml::Spanned<crate::config::node_header::NodeInput>,
     #[serde(default, rename = "_notes")]
     notes: Option<serde_json::Value>,
-    config: OutputBody,
+    config: SinkBody,
 }
 
-impl OutputPayload {
-    fn into_variant_parts(self) -> (NodeHeader, OutputBody) {
+impl SinkPayload {
+    fn into_variant_parts(self) -> (NodeHeader, SinkBody) {
         (
             NodeHeader {
                 name: self.name,
@@ -1002,7 +1014,7 @@ impl PipelineNode {
             }
             PipelineNode::Source { .. }
             | PipelineNode::Merge { .. }
-            | PipelineNode::Output { .. }
+            | PipelineNode::Sink { .. }
             | PipelineNode::Composition { .. } => {}
         }
     }
@@ -1014,7 +1026,7 @@ impl PipelineNode {
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
+            | PipelineNode::Sink { header, .. }
             | PipelineNode::Reshape { header, .. }
             | PipelineNode::Cull { header, .. }
             | PipelineNode::Composition { header, .. } => &header.name,
@@ -1033,7 +1045,7 @@ impl PipelineNode {
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
+            | PipelineNode::Sink { header, .. }
             | PipelineNode::Reshape { header, .. }
             | PipelineNode::Cull { header, .. }
             | PipelineNode::Composition { header, .. } => Some(header.input.value.name()),
@@ -1051,7 +1063,7 @@ impl PipelineNode {
     ///
     /// `Source` has no inputs and yields an empty vector. The
     /// single-input consumer variants (`Transform`, `Aggregate`,
-    /// `Route`, `Output`, `Composition`) yield their one `input:`. The
+    /// `Route`, `Sink`, `Composition`) yield their one `input:`. The
     /// multi-input variants yield each entry of their input collection:
     /// `Merge` walks its ordered `inputs:` list, `Combine` walks its
     /// named `input:` map in insertion order.
@@ -1066,7 +1078,7 @@ impl PipelineNode {
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
+            | PipelineNode::Sink { header, .. }
             | PipelineNode::Reshape { header, .. }
             | PipelineNode::Cull { header, .. }
             | PipelineNode::Composition { header, .. } => vec![header.input.value.name()],
@@ -1115,7 +1127,7 @@ impl PipelineNode {
             PipelineNode::Route { .. } => "route",
             PipelineNode::Merge { .. } => "merge",
             PipelineNode::Combine { .. } => "combine",
-            PipelineNode::Output { .. } => "output",
+            PipelineNode::Sink { .. } => "sink",
             PipelineNode::Reshape { .. } => "reshape",
             PipelineNode::Cull { .. } => "cull",
             PipelineNode::Envelope { .. } => "envelope",
@@ -1124,7 +1136,7 @@ impl PipelineNode {
     }
 
     /// The single upstream input reference for the single-input consumer
-    /// variants (`Transform`, `Aggregate`, `Route`, `Output`, `Reshape`,
+    /// variants (`Transform`, `Aggregate`, `Route`, `Sink`, `Reshape`,
     /// `Cull`, `Composition`). Returns `None` for `Source` (no input) and for
     /// the multi-input / multi-port variants (`Merge`, `Combine`, `Envelope`),
     /// whose wiring the caller must walk explicitly through their own input
@@ -1138,7 +1150,7 @@ impl PipelineNode {
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
+            | PipelineNode::Sink { header, .. }
             | PipelineNode::Reshape { header, .. }
             | PipelineNode::Cull { header, .. }
             | PipelineNode::Composition { header, .. } => Some(&header.input.value),
@@ -1160,7 +1172,7 @@ impl PipelineNode {
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. }
+            | PipelineNode::Sink { header, .. }
             | PipelineNode::Reshape { header, .. }
             | PipelineNode::Cull { header, .. }
             | PipelineNode::Composition { header, .. } => {
@@ -1183,7 +1195,7 @@ impl PipelineNode {
     /// overlay op engine's `set config.cxl` uses to replace a stage's logic
     /// wholesale; the supplied [`CxlSource`] carries the op's span so a later
     /// typecheck error anchors to the override, not the base pipeline. Every
-    /// other variant (`Source`, `Route`, `Merge`, `Output`, `Reshape`, `Cull`,
+    /// other variant (`Source`, `Route`, `Merge`, `Sink`, `Reshape`, `Cull`,
     /// `Envelope`, `Composition`) has no single primary `cxl:` field and is
     /// left unchanged.
     pub fn set_primary_cxl(&mut self, cxl: CxlSource) -> bool {
@@ -1203,7 +1215,7 @@ impl PipelineNode {
             PipelineNode::Source { .. }
             | PipelineNode::Route { .. }
             | PipelineNode::Merge { .. }
-            | PipelineNode::Output { .. }
+            | PipelineNode::Sink { .. }
             | PipelineNode::Reshape { .. }
             | PipelineNode::Cull { .. }
             | PipelineNode::Envelope { .. }
@@ -1272,7 +1284,7 @@ pub struct SourceBody {
 ///   stamped, so the typechecker is blind to its contents — CXL
 ///   expressions cannot read or write it). Each input record's keys
 ///   that are not in the declaration land in a `Value::Map` payload
-///   on that slot. The Output node opts the contents back into
+///   on that slot. The Sink node opts the contents back into
 ///   top-level columns via `include_unmapped: true` (the default).
 ///   Pattern precedent:
 ///   Databricks Auto Loader's `_rescued_data` (single sidecar JSON
@@ -1777,25 +1789,25 @@ pub struct CombineBody {
     pub max_output_rows: Option<u64>,
 }
 
-/// Output variant body. Wraps the existing sink config.
+/// Sink variant body. Wraps the terminal destination config.
 #[derive(Debug, Clone, Serialize)]
-pub struct OutputBody {
+pub struct SinkBody {
     #[serde(flatten)]
-    pub output: crate::config::OutputConfig,
+    pub sink: crate::config::SinkConfig,
 }
 
-impl<'de> Deserialize<'de> for OutputBody {
+impl<'de> Deserialize<'de> for SinkBody {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct OutputBodyVisitor;
+        struct SinkBodyVisitor;
 
-        impl<'de> Visitor<'de> for OutputBodyVisitor {
-            type Value = OutputBody;
+        impl<'de> Visitor<'de> for SinkBodyVisitor {
+            type Value = SinkBody;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("an output configuration")
+                f.write_str("a Sink configuration")
             }
 
             fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
@@ -1806,14 +1818,14 @@ impl<'de> Deserialize<'de> for OutputBody {
                 // loses nested item locations. Delegate the native map stream
                 // directly so `OutputMapping` can retain each sequence item's
                 // span for E364/E365.
-                let output = crate::config::OutputConfig::deserialize(
+                let sink = crate::config::SinkConfig::deserialize(
                     de::value::MapAccessDeserializer::new(map),
                 )?;
-                Ok(OutputBody { output })
+                Ok(SinkBody { sink })
             }
         }
 
-        deserializer.deserialize_map(OutputBodyVisitor)
+        deserializer.deserialize_map(SinkBodyVisitor)
     }
 }
 
@@ -2113,7 +2125,7 @@ nodes:
     resources:
       db: shared.db
 
-  - type: output
+  - type: sink
     name: out
     input: totals
     config:
@@ -2139,7 +2151,7 @@ nodes:
             &doc.nodes[5].value,
             PipelineNode::Composition { .. }
         ));
-        assert!(matches!(&doc.nodes[6].value, PipelineNode::Output { .. }));
+        assert!(matches!(&doc.nodes[6].value, PipelineNode::Sink { .. }));
     }
 
     /// Verifies unknown node types produce a clear error naming the tag.

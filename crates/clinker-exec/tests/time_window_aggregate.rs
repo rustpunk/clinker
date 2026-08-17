@@ -82,7 +82,7 @@ fn run_pipeline(
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 
@@ -152,7 +152,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: hourly
   config:
@@ -228,7 +228,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: hourly
   config:
@@ -315,7 +315,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: hourly
   config:
@@ -409,7 +409,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: hourly
   config:
@@ -483,7 +483,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: totals
   config:
@@ -536,7 +536,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: sliding
   config:
@@ -593,7 +593,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: sessions
   config:

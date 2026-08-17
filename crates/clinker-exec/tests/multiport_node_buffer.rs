@@ -112,7 +112,7 @@ nodes:
   - type: merge
     name: recombined
     inputs: [by_region.a, by_region.b]
-  - type: output
+  - type: sink
     name: out
     input: recombined
     config:
@@ -194,7 +194,7 @@ nodes:
         emit dropped_account = dropped.account
         emit dropped_status = dropped.status
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
@@ -258,7 +258,7 @@ nodes:
   - type: merge
     name: both
     inputs: [left, right]
-  - type: output
+  - type: sink
     name: out
     input: both
     config:
@@ -319,7 +319,7 @@ nodes:
   - type: merge
     name: recombined
     inputs: [by_value.hi, by_value.big]
-  - type: output
+  - type: sink
     name: out
     input: recombined
     config:
@@ -407,7 +407,7 @@ nodes:
         emit dropped_account = dropped.account
         emit dropped_status = dropped.status
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
@@ -483,7 +483,7 @@ nodes:
         emit left_side = l.side
         emit right_side = r.side
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:
@@ -545,11 +545,11 @@ nodes:
   - type: merge
     name: m2
     inputs: [splitter.big, c]
-  - type: output
+  - type: sink
     name: out1
     input: m1
     config: { name: out1, type: csv, path: o1.csv }
-  - type: output
+  - type: sink
     name: out2
     input: m2
     config: { name: out2, type: csv, path: o2.csv }

@@ -1772,7 +1772,7 @@ nodes:
         - { name: amount, type: int }
         - { name: cust_id, type: string }
         - { name: order_notes, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -2097,7 +2097,7 @@ nodes:
         discriminator: { start: 0, width: 1 }
         records:
           - { id: detail, tag: D, columns: [ { name: amount, type: int, start: 1, width: 9 } ] }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -2143,7 +2143,7 @@ nodes:
       path: /tmp/in.csv
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: node_ident
     config:
@@ -2201,7 +2201,7 @@ nodes:
     name: comp
     input: src
     use: ./thing.comp.yaml
-  - type: output
+  - type: sink
     name: out
     input: comp
     config:
@@ -2245,7 +2245,7 @@ nodes:
     use: ./thing.comp.yaml
     inputs:
       driver: src
-  - type: output
+  - type: sink
     name: out
     input: comp
     config:
@@ -2346,7 +2346,7 @@ nodes:
       schema:
         - { name: id, type: int }
         - { name: tags, type: string, multiple: true }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -2707,7 +2707,7 @@ nodes:
             e06: string
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -2919,7 +2919,7 @@ nodes:
           - { field: f03, components: 5 }
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -3094,7 +3094,7 @@ nodes:
         records:
           - { id: detail, tag: D, columns: [ { name: amount, type: int, start: 1, width: 9 } ] }
           - { id: trailer, tag: T, columns: [ { name: count, type: int, start: 1, width: 9 } ] }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -3122,7 +3122,7 @@ nodes:
         records:
           - { id: detail, tag: D, columns: [ { name: rec_type, type: string }, { name: amount, type: float } ] }
           - { id: trailer, tag: T, columns: [ { name: rec_type, type: string }, { name: count, type: int } ] }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

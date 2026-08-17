@@ -684,7 +684,7 @@ impl ExecutionPlanDag {
 
         let mut terminals = Vec::new();
         for idx in self.graph.node_indices() {
-            let PlanNode::Output {
+            let PlanNode::Sink {
                 id,
                 name,
                 resolved: Some(payload),
@@ -693,7 +693,7 @@ impl ExecutionPlanDag {
             else {
                 continue;
             };
-            let Some(specs) = payload.output.sort_order.as_ref() else {
+            let Some(specs) = payload.sink.sort_order.as_ref() else {
                 continue;
             };
             let authored: Vec<SortField> = specs
@@ -733,10 +733,10 @@ impl ExecutionPlanDag {
         let envelope_active = self.graph.node_weights().any(|node| {
             matches!(
                 node,
-                PlanNode::Output {
+                PlanNode::Sink {
                     resolved: Some(payload),
                     ..
-                } if payload.output.reconstruct_envelope
+                } if payload.sink.reconstruct_envelope
             )
         });
 
@@ -786,7 +786,7 @@ impl ExecutionPlanDag {
                         detail: "compiled writer consumer has no live DAG node".to_string(),
                     }
                 })?;
-                let PlanNode::Output {
+                let PlanNode::Sink {
                     id,
                     name,
                     resolved: Some(payload),
@@ -796,7 +796,7 @@ impl ExecutionPlanDag {
                     return Err(PipelineError::Internal {
                         op: "writer_boundary",
                         node: self.graph[output_idx].name().to_string(),
-                        detail: "consumer registry classified a non-Output node as a physical writer boundary"
+                        detail: "consumer registry classified a non-Sink node as a physical writer boundary"
                             .to_string(),
                     });
                 };
@@ -819,7 +819,7 @@ impl ExecutionPlanDag {
                     WriterBoundaryMode::CorrelationDeferred
                 } else if document_dlq_active {
                     WriterBoundaryMode::DocumentDlq
-                } else if payload.output.reconstruct_envelope {
+                } else if payload.sink.reconstruct_envelope {
                     WriterBoundaryMode::Envelope
                 } else if payload.fan_out_per_source_file {
                     WriterBoundaryMode::PerSourceFile
@@ -839,7 +839,7 @@ impl ExecutionPlanDag {
                     }
                     WriterBoundaryMode::CorrelationDeferred => WriterPartitionKey::CorrelationGroup,
                     WriterBoundaryMode::RecordsOnly | WriterBoundaryMode::Streaming => {
-                        if payload.output.split.is_some() {
+                        if payload.sink.split.is_some() {
                             WriterPartitionKey::SplitSequence
                         } else {
                             WriterPartitionKey::Single
@@ -872,9 +872,9 @@ impl ExecutionPlanDag {
                     mode,
                     partition: WriterPartitionIdentity {
                         key: partition_key,
-                        path_template: payload.output.path.clone(),
+                        path_template: payload.sink.path.clone(),
                         split_naming: payload
-                            .output
+                            .sink
                             .split
                             .as_ref()
                             .map(|split| split.naming.clone()),
@@ -1114,7 +1114,7 @@ impl ExecutionPlanDag {
         let output_indices: Vec<NodeIndex> = self
             .graph
             .node_indices()
-            .filter(|i| matches!(self.graph[*i], PlanNode::Output { .. }))
+            .filter(|i| matches!(self.graph[*i], PlanNode::Sink { .. }))
             .collect();
         let parent_partitioning: HashMap<NodeIndex, PartitioningKind> = output_indices
             .iter()
@@ -1137,14 +1137,14 @@ impl ExecutionPlanDag {
             if !is_partitioned {
                 continue;
             }
-            let PlanNode::Output {
+            let PlanNode::Sink {
                 resolved: Some(payload),
                 ..
             } = &mut self.graph[idx]
             else {
                 continue;
             };
-            if payload.output.has_per_record_path_tokens() {
+            if payload.sink.has_per_record_path_tokens() {
                 payload.fan_out_per_source_file = true;
             }
         }
@@ -1619,7 +1619,7 @@ fn preserves_stable_arrival(node: &PlanNode) -> bool {
         node,
         PlanNode::Source { .. }
             | PlanNode::Route { .. }
-            | PlanNode::Output { .. }
+            | PlanNode::Sink { .. }
             | PlanNode::Composition { .. }
             | PlanNode::Envelope { .. }
             | PlanNode::CorrelationCommit { .. }
@@ -2016,7 +2016,7 @@ fn compute_one(
             }
         }
 
-        PlanNode::Output { name, .. } => {
+        PlanNode::Sink { name, .. } => {
             // Terminal — properties still computed for debugging. Inherit
             // parent, rewrite provenance to point at this node when ordering
             // is non-None so explain chains through. CK set is preserved at

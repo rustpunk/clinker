@@ -28,7 +28,7 @@ use clinker_plan::config::DlqConfig;
 ///   non-JSON writers' silent map-degrade did before commit
 ///   `f5ae145`. Users who need the auto_widen sidecar surfaced in
 ///   their normal output can opt into `include_unmapped: true` on
-///   the relevant Output node; the DLQ keeps a stable user-shape
+///   the relevant Sink node; the DLQ keeps a stable user-shape
 ///   schema regardless.
 pub fn write_dlq<W: Write>(
     writer: W,

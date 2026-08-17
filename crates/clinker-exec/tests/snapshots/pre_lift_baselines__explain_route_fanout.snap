@@ -45,7 +45,7 @@ route.classify_route:
   buffer: materialized
   arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
-output.low:
+sink.low:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
@@ -53,7 +53,7 @@ output.low:
   buffer: streaming
   arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
-output.high:
+sink.high:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
@@ -67,17 +67,17 @@ edge transform.classify -> route.classify_route:
   buffer: node_buffer (slot=1)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: transform)
 
-edge route.classify_route -> output.low:
+edge route.classify_route -> sink.low:
   buffer: node_buffer (slot=2, port=low)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: route)
 
-edge route.classify_route -> output.high:
+edge route.classify_route -> sink.high:
   buffer: node_buffer (slot=2, port=high)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: route)
 
 Route 'classify_route' (mode: exclusive):
-  Branch 'high' → output.high
-  Default: 'low' → output.low
+  Branch 'high' → sink.high
+  Default: 'low' → sink.low
 
 === CXL Expressions ===
 
@@ -103,5 +103,5 @@ Worker threads: 4
   ◆ FORK [route:exclusive] 'classify_route' (line:25)
   ├──> high → high
   ├──> default → low
-  │ [output] low (line:42)
-  │ [output] high (line:34)
+  │ [sink] low (line:42)
+  │ [sink] high (line:34)

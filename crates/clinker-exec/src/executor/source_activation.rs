@@ -410,7 +410,7 @@ nodes:
     use: ../compositions/memory_reader.comp.yaml
     inputs: {}
     resources: { input: shared_input }
-  - type: output
+  - type: sink
     name: out
     input: call
     config: { name: out, type: csv, path: out.csv }

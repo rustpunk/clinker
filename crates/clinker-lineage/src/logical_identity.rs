@@ -1,7 +1,7 @@
 //! Stable external dataset identities and explicitly authorized identity facts.
 //!
 //! External lineage is deliberately independent of a worker's filesystem.  A
-//! context contains one exact identity for each logical source or output node:
+//! context contains one exact identity for each logical Source or Sink node:
 //! either an independently reconstructible canonical datasource identifier or
 //! an explicit catalog namespace/name pair.  Concrete collection members and
 //! alternate identifiers are represented separately, so neither can change the
@@ -221,7 +221,7 @@ impl DatasetIdentityFacets {
 
     /// Absorb a second node's authorized facts about the same dataset.
     ///
-    /// Two source or output nodes may name one external dataset — a binding is
+    /// Two Source or Sink nodes may name one external dataset — a binding is
     /// per node, and nothing requires two nodes to carry different identities —
     /// and the emitted document carries one entry per dataset. That entry has to
     /// describe what the whole run did, so each facet combines by what it
@@ -338,7 +338,7 @@ impl LineageIdentityContext {
             })
     }
 
-    /// Prove that all source/output nodes that will be emitted have identities.
+    /// Prove that all Source/Sink nodes that will be emitted have identities.
     ///
     /// A required key outside the bound a binding key may carry is reported as
     /// [`LineageIdentityError::UnbindableNode`] rather than as a missing one.

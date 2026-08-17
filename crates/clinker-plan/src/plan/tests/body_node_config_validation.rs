@@ -94,7 +94,7 @@ nodes:
     use: ../compositions/framed_body.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out_body
     input: body
     config:
@@ -237,7 +237,7 @@ fn body_output_bad_csv_delimiter_rejected_at_compile() {
       cxl: |
         emit id = id
         emit val = val
-  - type: output
+  - type: sink
     name: body_sink
     input: shape
     config:
@@ -276,7 +276,7 @@ fn body_output_bad_csv_delimiter_rejected_at_compile() {
 }
 
 /// A body Output with a valid single-byte delimiter compiles — the new body
-/// check must not reject more than the top level does, and body Output nodes
+/// check must not reject more than the top level does, and body Sink nodes
 /// remain a supported shape.
 #[test]
 fn body_output_valid_csv_delimiter_compiles() {
@@ -288,7 +288,7 @@ fn body_output_valid_csv_delimiter_compiles() {
       cxl: |
         emit id = id
         emit val = val
-  - type: output
+  - type: sink
     name: body_sink
     input: shape
     config:
@@ -373,7 +373,7 @@ nodes:
     inputs:
       driver: drv
     resources: { reference: body_reference }
-  - type: output
+  - type: sink
     name: out
     input: enrich
     config:
@@ -455,7 +455,7 @@ nodes:
     inputs:
       driver: drv
     resources: { reference: body_reference }
-  - type: output
+  - type: sink
     name: out
     input: enrich
     config:
@@ -622,7 +622,7 @@ nodes:
       cxl: |
         emit id = id
         emit amount = amount
-  - type: output
+  - type: sink
     name: body_sink
     input: shape
     config:
@@ -656,7 +656,7 @@ nodes:
     use: ../compositions/decimal_body.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out_body
     input: body
     config:
@@ -673,14 +673,14 @@ nodes:
         .node_indices()
         .find(|&i| bound.graph[i].name() == "body_sink")
         .expect("body output `body_sink` present in the bound body");
-    let PlanNode::Output { resolved, .. } = &bound.graph[idx] else {
-        panic!("node `body_sink` is not an Output");
+    let PlanNode::Sink { resolved, .. } = &bound.graph[idx] else {
+        panic!("node `body_sink` is not a Sink");
     };
     let payload = resolved
         .as_ref()
-        .expect("the full plan carries the body Output's resolved payload");
+        .expect("the full plan carries the body Sink's resolved payload");
     let columns = payload
-        .output
+        .sink
         .schema
         .as_ref()
         .and_then(|s| s.as_columns())
@@ -772,7 +772,7 @@ nodes:
     inputs:
       driver: drv
     resources: { reference: body_reference }
-  - type: output
+  - type: sink
     name: out
     input: enrich
     config:
@@ -874,7 +874,7 @@ nodes:
     use: ../compositions/logging_body.comp.yaml
     inputs:
       inp: seen
-  - type: output
+  - type: sink
     name: out_body
     input: body
     config:

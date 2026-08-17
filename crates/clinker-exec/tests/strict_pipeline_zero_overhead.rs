@@ -47,7 +47,7 @@ nodes:
       emit order_id = order_id
       emit department = department
       emit total = sum(amount)
-- type: output
+- type: sink
   name: out
   input: order_totals
   config:

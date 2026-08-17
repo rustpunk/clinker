@@ -66,7 +66,7 @@ nodes:
     use: {use_path}
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out_body
     input: body
     config:

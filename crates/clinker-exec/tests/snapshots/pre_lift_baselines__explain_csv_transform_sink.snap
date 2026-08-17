@@ -37,7 +37,7 @@ transform.tier_flag:
   buffer: streaming
   arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
-output.results:
+sink.results:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
@@ -66,4 +66,4 @@ Worker threads: 4
 
   ● [source] employees (line:5)
   │ [transform] tier_flag (line:18)
-  │ [output] results (line:28)
+  │ [sink] results (line:28)

@@ -81,7 +81,7 @@ fn run_pipeline(
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-        config.output_configs().next().unwrap().name.clone(),
+        config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
@@ -161,7 +161,7 @@ nodes:
       emit region = region
       emit total = total
       emit running_total = running_total + 1 / (if region == "north" then 0 else 1)
-- type: output
+- type: sink
   name: out
   input: gate
   config:

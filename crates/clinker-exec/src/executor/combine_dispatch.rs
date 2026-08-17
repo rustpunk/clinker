@@ -2300,7 +2300,7 @@ fn stream_block_band_rows(
                         op: "executor",
                         node: node_name.to_string(),
                         detail: String::from(
-                            "streaming Output writer task dropped its receiver before \
+                            "streaming Sink writer task dropped its receiver before \
                              the block-band output drain finished",
                         ),
                     })

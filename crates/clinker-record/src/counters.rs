@@ -15,7 +15,7 @@
 ///   processed" metric a user typically reaches for.
 ///
 /// * `records_written` — total writes across all sinks. The same
-///   input reaching N Outputs counts N times. Aligns with per-Output
+///   input reaching N Outputs counts N times. Aligns with per-Sink
 ///   write throughput; for a single-Output exclusive pipeline this
 ///   equals `ok_count`. For inclusive Route fan-out / multi-Output
 ///   sinks it exceeds `ok_count`.

@@ -5,7 +5,7 @@
 //! slot, moving each such consumer onto its own thread fed by a bounded
 //! channel. The channel-drain + per-record-discharge skeleton
 //! ([`drain_streaming_channel`]) is parameterized over a
-//! [`StreamingConsumer`], with [`OutputStreamConsumer`] (a file-writer)
+//! [`StreamingConsumer`], with [`SinkStreamConsumer`] (a file-writer)
 //! as the sole instantiation today. The eligibility verdict comes from the
 //! plan layer's `certify_streaming_edge`, so this runtime install can never
 //! disagree with the `--explain` buffer-class annotation.
@@ -18,11 +18,11 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema};
 
 use clinker_format::traits::FormatWriter;
-use clinker_plan::config::{ErrorStrategy, OutputConfig, PipelineConfig};
+use clinker_plan::config::{ErrorStrategy, PipelineConfig, SinkConfig};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::certify_streaming_edge;
 
-use super::output_dispatch::OrderedWriterBoundary;
+use super::sink_dispatch::OrderedWriterBoundary;
 use super::stream_event::{OutputDeliveryId, Punctuation, StreamEvent};
 use super::structured_output_guard::StructuredOutputDocumentGuard;
 use super::{DlqEntry, WriterRegistry, build_format_writer, dispatch, stage_metrics};
@@ -36,10 +36,10 @@ use super::{DlqEntry, WriterRegistry, build_format_writer, dispatch, stage_metri
 /// it; the authoritative rate check still runs at join for what did accumulate.
 const STREAMING_DLQ_BUFFER_CAP: u64 = 65_536;
 
-/// Identify fused producer → single `Output` chains eligible for
-/// streaming writes and build a [`StreamingOutputSpec`] for each.
+/// Identify fused producer → single `Sink` chains eligible for
+/// streaming writes and build a [`StreamingSinkSpec`] for each.
 ///
-/// The buffered Output arm waits until its producer has emitted every
+/// The buffered Sink arm waits until its producer has emitted every
 /// record before invoking the writer; under a slow upstream Source this
 /// defeats the live back-pressure the Source ingest channel delivers,
 /// because every record sits in the producer's `node_buffers` slot until
@@ -59,17 +59,17 @@ const STREAMING_DLQ_BUFFER_CAP: u64 = 65_536;
 /// `out_cfg`, and projection metadata are all Output-specific.
 ///
 /// Returns the list of streaming specs (one per qualifying Output). Empty
-/// for pipelines that don't match the topology, leaving every Output on
+/// for pipelines that don't match the topology, leaving every Sink on
 /// the existing buffered path. See
 /// https://github.com/rustpunk/clinker/issues/72 for the rationale.
-pub(super) fn compute_streaming_output_specs(
+pub(super) fn compute_streaming_sink_specs(
     plan: &clinker_plan::plan::execution::ExecutionPlanDag,
     config: &PipelineConfig,
     fused_transforms: &HashSet<petgraph::graph::NodeIndex>,
     init_phase_set: &HashSet<petgraph::graph::NodeIndex>,
-    output_configs: &[OutputConfig],
+    sink_configs: &[SinkConfig],
     writers: &WriterRegistry,
-) -> Vec<StreamingOutputSpec> {
+) -> Vec<StreamingSinkSpec> {
     use clinker_plan::plan::execution::PlanNode;
 
     // Pipeline-wide correlation buffering disables streaming for every
@@ -85,14 +85,14 @@ pub(super) fn compute_streaming_output_specs(
     // `begin_document` / `end_document`.
     if config.any_source_has_correlation_key()
         || config.any_source_has_document_dlq()
-        || config.any_output_reconstructs_envelope()
+        || config.any_sink_reconstructs_envelope()
     {
         return Vec::new();
     }
 
-    let mut specs: Vec<StreamingOutputSpec> = Vec::new();
+    let mut specs: Vec<StreamingSinkSpec> = Vec::new();
     for output_idx in plan.graph.node_indices() {
-        let PlanNode::Output {
+        let PlanNode::Sink {
             name: output_name, ..
         } = &plan.graph[output_idx]
         else {
@@ -112,7 +112,7 @@ pub(super) fn compute_streaming_output_specs(
         if !writers.single.contains_key(output_name) || writers.fan_out.contains_key(output_name) {
             continue;
         }
-        let Some(out_cfg) = output_configs.iter().find(|o| &o.name == output_name) else {
+        let Some(out_cfg) = sink_configs.iter().find(|o| &o.name == output_name) else {
             continue;
         };
 
@@ -124,7 +124,7 @@ pub(super) fn compute_streaming_output_specs(
             .expected_input_schema_in(plan)
             .cloned();
         let cxl_emit_names: Vec<String> = plan.graph[output_idx].cxl_emit_names_in(plan);
-        let Ok(writer_boundary) = OrderedWriterBoundary::for_output(
+        let Ok(writer_boundary) = OrderedWriterBoundary::for_sink(
             plan,
             plan.graph[output_idx].id(),
             clinker_plan::plan::execution::WriterBoundaryMode::Streaming,
@@ -135,7 +135,7 @@ pub(super) fn compute_streaming_output_specs(
             continue;
         };
 
-        specs.push(StreamingOutputSpec {
+        specs.push(StreamingSinkSpec {
             producer_idx,
             output_idx,
             consumer: plan.graph[output_idx].id(),
@@ -155,25 +155,25 @@ pub(super) fn compute_streaming_output_specs(
 /// entry. Carries every field the thread needs in owned form so it can run
 /// independently of the borrowed `&PipelineConfig` / `&ExecutionPlanDag`
 /// references that anchor the dispatcher's `ExecutorContext`.
-pub(crate) struct StreamingOutputSpec {
+pub(crate) struct StreamingSinkSpec {
     /// `NodeIndex` of the upstream producer node whose arm writes records
     /// into the streaming channel — either a fused `Merge.interleave` or
     /// a fused `Source → Transform`. The producer arm looks up its sender
     /// in [`dispatch::ExecutorContext::streaming_output_senders`] keyed by
     /// this index.
     pub(crate) producer_idx: petgraph::graph::NodeIndex,
-    /// `NodeIndex` of the downstream `Output` node. The Output arm
+    /// `NodeIndex` of the downstream `Sink` node. The Sink arm
     /// short-circuits when its index appears in
-    /// [`dispatch::ExecutorContext::streaming_output_nodes`].
+    /// [`dispatch::ExecutorContext::streaming_sink_nodes`].
     pub(crate) output_idx: petgraph::graph::NodeIndex,
-    /// Stable compiled identity of the terminal Output consumer.
+    /// Stable compiled identity of the terminal Sink consumer.
     pub(crate) consumer: clinker_plan::plan::PlanNodeId,
     pub(crate) output_name: String,
     /// Name of the upstream producer (`Merge` or fused `Transform`), used
     /// as the upstream-node label in the streaming task's E314
     /// schema-mismatch diagnostics.
     pub(crate) producer_name: String,
-    pub(crate) out_cfg: OutputConfig,
+    pub(crate) out_cfg: SinkConfig,
     /// Compile-time input schema for the Output; used by the streaming
     /// task to run the same `check_input_schema` invariant the buffered
     /// path enforces (E314 SchemaMismatch diagnostics).
@@ -224,10 +224,10 @@ pub(crate) struct StreamingOutputTaskOutput {
     /// The Output this task wrote, so the fold can key the probe without
     /// reaching back into the consumer's `spec`.
     pub(crate) output_name: String,
-    /// This Output's config, so the fold can size a probe entry the dispatcher
+    /// This Sink's config, so the fold can size a probe entry the dispatcher
     /// arms never created. Owned for the same reason the rest of
-    /// [`StreamingOutputSpec`] is: the thread outlives the borrow.
-    pub(crate) out_cfg: OutputConfig,
+    /// [`StreamingSinkSpec`] is: the thread outlives the borrow.
+    pub(crate) out_cfg: SinkConfig,
 }
 
 impl StreamingOutputTaskOutput {
@@ -380,9 +380,13 @@ pub(super) fn drain_streaming_channel<C: StreamingConsumer>(
 /// record, and flushes at channel close. Errors are accumulated into
 /// `out` rather than aborting so the dispatcher can surface them alongside
 /// any sibling `output_errors`.
-struct OutputStreamConsumer {
-    spec: StreamingOutputSpec,
+struct SinkStreamConsumer {
+    spec: StreamingSinkSpec,
     out: StreamingOutputTaskOutput,
+    /// Set only when channel disconnect reached the writer-finalization hook.
+    /// A fatal record error drains the channel without closing the writer work
+    /// unit, so its Sink observation must omit the completed metric.
+    closed_cleanly: bool,
     /// Pending `SchemaScan` timer, finished on the first writer build (or
     /// on close for the empty-stream case).
     scan_timer_slot: Option<stage_metrics::StageTimer>,
@@ -390,11 +394,16 @@ struct OutputStreamConsumer {
     writer: Option<Box<dyn FormatWriter>>,
     /// Holds the raw sink until the first record triggers the lazy build.
     raw_writer_slot: Option<Box<dyn Write + Send>>,
+    sink_byte_counter: Option<clinker_format::SharedByteCounter>,
     structured_guard: StructuredOutputDocumentGuard,
 }
 
-impl OutputStreamConsumer {
-    fn new(raw_writer: Box<dyn Write + Send>, spec: StreamingOutputSpec) -> Self {
+impl SinkStreamConsumer {
+    fn new(
+        raw_writer: Box<dyn Write + Send>,
+        spec: StreamingSinkSpec,
+        sink_byte_counter: Option<clinker_format::SharedByteCounter>,
+    ) -> Self {
         debug_assert!(spec.writer_boundary.is_incremental_streaming());
         let structured_guard = StructuredOutputDocumentGuard::new(&spec.out_cfg.format);
         let mapping_probe = crate::projection::MappingProbe::for_config(&spec.out_cfg);
@@ -416,17 +425,19 @@ impl OutputStreamConsumer {
                 output_name,
                 out_cfg,
             },
+            closed_cleanly: false,
             scan_timer_slot: Some(stage_metrics::StageTimer::new(
                 stage_metrics::StageName::SchemaScan,
             )),
             writer: None,
             raw_writer_slot: Some(raw_writer),
+            sink_byte_counter,
             structured_guard,
         }
     }
 }
 
-impl StreamingConsumer for OutputStreamConsumer {
+impl StreamingConsumer for SinkStreamConsumer {
     fn on_record(
         &mut self,
         record: Record,
@@ -443,7 +454,7 @@ impl StreamingConsumer for OutputStreamConsumer {
                 expected,
                 record.schema(),
                 &self.spec.output_name,
-                "output",
+                "sink",
                 &self.spec.producer_name,
             )
         {
@@ -493,6 +504,7 @@ impl StreamingConsumer for OutputStreamConsumer {
                 raw,
                 schema,
                 crate::output::staging::OutputStagingRegistry::default(),
+                self.sink_byte_counter.clone(),
             ) {
                 Ok(w) => {
                     self.writer = Some(w);
@@ -560,7 +572,7 @@ impl StreamingConsumer for OutputStreamConsumer {
                     // scale with the stream.
                     if self.out.dlq_pending.len() as u64 >= STREAMING_DLQ_BUFFER_CAP {
                         self.out.errors.push(PipelineError::Internal {
-                            op: "streaming_output",
+                            op: "streaming_sink",
                             node: self.spec.output_name.clone(),
                             detail: format!(
                                 "more than {STREAMING_DLQ_BUFFER_CAP} `join_values` collisions \
@@ -582,7 +594,7 @@ impl StreamingConsumer for OutputStreamConsumer {
 
     fn on_punctuation(&mut self, _punct: Punctuation) {
         // Streaming output is terminal — it writes records straight to disk,
-        // so a document boundary needs no writer action here. An Output that
+        // so a document boundary needs no writer action here. A Sink that
         // declares `reconstruct_envelope: true` (where the boundary DOES drive
         // a writer's `begin_document` / `end_document`) is excluded from this
         // fused path at spec-build time, so no envelope-reconstructing Output
@@ -609,23 +621,62 @@ impl StreamingConsumer for OutputStreamConsumer {
                 self.out.errors.push(PipelineError::from(e));
             }
         }
+        self.closed_cleanly = true;
     }
 }
 
-/// Streaming-output writer thread body — the `Output` instantiation of the
+/// Streaming-output writer thread body — the `Sink` instantiation of the
 /// generalized streaming-consumer substrate. Builds an
-/// [`OutputStreamConsumer`] over the writer lifecycle and drives it with
+/// [`SinkStreamConsumer`] over the writer lifecycle and drives it with
 /// [`drain_streaming_channel`], returning the folded-back per-task
-/// counters. See [`StreamingOutputSpec`] for the eligibility predicate and
+/// counters. See [`StreamingSinkSpec`] for the eligibility predicate and
 /// https://github.com/rustpunk/clinker/issues/72 for the rationale.
-pub(super) fn streaming_output(
+pub(super) fn streaming_sink(
     rx: crossbeam_channel::Receiver<StreamEvent>,
     raw_writer: Box<dyn Write + Send>,
-    spec: StreamingOutputSpec,
+    spec: StreamingSinkSpec,
     charge_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
+    telemetry_producer: Option<crate::telemetry::TelemetryProducer>,
+    shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
 ) -> StreamingOutputTaskOutput {
-    let mut consumer = OutputStreamConsumer::new(raw_writer, spec);
+    let mut signal = telemetry_producer
+        .map(|producer| crate::telemetry::SinkSignal::new(producer, spec.output_name.clone()));
+    let sink_byte_counter = signal
+        .as_ref()
+        .map(|_| clinker_format::SharedByteCounter::new());
+    let mut consumer = SinkStreamConsumer::new(raw_writer, spec, sink_byte_counter.clone());
     drain_streaming_channel(&rx, &charge_handle, &mut consumer);
+    if let Some(mut signal) = signal.take() {
+        signal.record_records(consumer.out.records_written);
+        signal.record_bytes(
+            sink_byte_counter
+                .as_ref()
+                .map_or(0, clinker_format::SharedByteCounter::bytes_written),
+        );
+        let errors = consumer.out.errors.len();
+        signal.record_errors(u64::try_from(errors).unwrap_or(u64::MAX));
+        let has_interrupted_error = consumer
+            .out
+            .errors
+            .iter()
+            .any(|error| matches!(error, PipelineError::Interrupted));
+        let has_failure = consumer
+            .out
+            .errors
+            .iter()
+            .any(|error| !matches!(error, PipelineError::Interrupted));
+        let interrupted = has_interrupted_error
+            || shutdown_token
+                .as_ref()
+                .is_some_and(crate::pipeline::shutdown::ShutdownToken::is_requested);
+        if has_failure || (!consumer.closed_cleanly && !interrupted) {
+            signal.fail();
+        } else if interrupted {
+            signal.interrupt();
+        } else {
+            signal.complete();
+        }
+    }
     consumer.out
 }
 

@@ -118,7 +118,7 @@ nodes:
       emit probe_c0 = probe.c0
       emit build_c0 = build.c0
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: joined
   config:
@@ -171,7 +171,7 @@ nodes:
       emit probe_c0 = probe.c0
       emit build_c0 = build.c0
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: joined
   config:

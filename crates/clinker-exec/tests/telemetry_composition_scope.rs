@@ -103,7 +103,7 @@ nodes:
     use: ../compositions/exec_transform_check.comp.yaml
     inputs:
       inp: doubler
-  - type: output
+  - type: sink
     name: eu_out
     input: enrich_eu
     config:
@@ -125,7 +125,7 @@ nodes:
     use: ../compositions/exec_transform_check.comp.yaml
     inputs:
       inp: us_orders
-  - type: output
+  - type: sink
     name: us_out
     input: enrich_us
     config:
@@ -157,7 +157,7 @@ fn transform_span_names() -> (Vec<String>, HashMap<String, String>) {
         ),
     ]);
     let buffers: HashMap<String, SharedBuffer> = config
-        .output_configs()
+        .sink_configs()
         .map(|output| (output.name.clone(), SharedBuffer::default()))
         .collect();
     let writers: HashMap<String, Box<dyn Write + Send>> = buffers
