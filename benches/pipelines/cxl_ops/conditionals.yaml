@@ -29,7 +29,7 @@ nodes:
           _ => "low"
         }
 
-  - type: output
+  - type: sink
     name: sink
     input: conditionals
     config:

@@ -54,7 +54,7 @@ nodes:
         emit total = sum(value)
         emit n = count(*)
 
-  - type: output
+  - type: sink
     name: high_out
     input: agg_high
     config:
@@ -63,7 +63,7 @@ nodes:
       path: bench://output_high.csv
       include_unmapped: true
 
-  - type: output
+  - type: sink
     name: medium_out
     input: split.medium
     config:
@@ -72,7 +72,7 @@ nodes:
       path: bench://output_medium.csv
       include_unmapped: true
 
-  - type: output
+  - type: sink
     name: low_out
     input: agg_low
     config:

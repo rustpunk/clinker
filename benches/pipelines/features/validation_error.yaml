@@ -25,7 +25,7 @@ nodes:
           severity: error
           message: "f0 must be positive"
 
-  - type: output
+  - type: sink
     name: sink
     input: validated
     config:

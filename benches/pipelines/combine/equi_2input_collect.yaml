@@ -52,7 +52,7 @@ nodes:
       cxl: ""
       propagate_ck: driver
 
-  - type: output
+  - type: sink
     name: drivers_with_trips_out
     input: gather_trips
     config:

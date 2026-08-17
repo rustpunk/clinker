@@ -22,7 +22,7 @@ nodes:
         emit out = f0
         distinct by f0
 
-  - type: output
+  - type: sink
     name: sink
     input: dedup_by
     config:

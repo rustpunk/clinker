@@ -25,7 +25,7 @@ nodes:
           severity: warn
           message: "f0 should be positive"
 
-  - type: output
+  - type: sink
     name: sink
     input: validated
     config:
