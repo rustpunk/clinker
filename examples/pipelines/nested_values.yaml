@@ -1,0 +1,48 @@
+pipeline:
+  name: nested_values
+
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: ./data/nested_values.csv
+      options:
+        has_header: true
+      schema:
+        - { name: event_id, type: string }
+        - { name: first, type: int }
+        - { name: second, type: int }
+
+  - type: transform
+    name: construct_payload
+    input: rows
+    config:
+      cxl: |
+        emit event_id = event_id
+        emit payload = {
+          "@kind": "sample",
+          "#text": "values:",
+          value: [item for item in [first, second] if item > 0],
+        }
+
+  - type: output
+    name: json_result
+    input: construct_payload
+    config:
+      name: json_result
+      type: json
+      path: ./output/nested_values.json
+      include_unmapped: false
+      options:
+        format: ndjson
+
+  - type: output
+    name: xml_result
+    input: construct_payload
+    config:
+      name: xml_result
+      type: xml
+      path: ./output/nested_values.xml
+      include_unmapped: false

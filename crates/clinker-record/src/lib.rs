@@ -7,6 +7,7 @@ pub mod field_path;
 pub mod field_str;
 pub mod group_key;
 pub mod minimal;
+pub mod nested_key;
 pub mod provenance;
 pub mod record;
 pub mod record_view;

@@ -306,6 +306,20 @@ mod tests {
     }
 
     #[test]
+    fn nested_constructors_keep_all_value_dependencies_visible() {
+        let typed = compile(
+            "emit payload = {dept: dept, values: [item + amount for item in [score] if region == \"west\"]}",
+        );
+        let analysis = analyze_transform("test", &typed);
+        for field in ["dept", "amount", "score", "region"] {
+            assert!(
+                analysis.accessed_fields.contains(field),
+                "nested value dependency {field:?} must remain visible"
+            );
+        }
+    }
+
+    #[test]
     fn test_analyzer_aggregate_window() {
         let typed = compile("emit total = $window.sum(amount)");
         let analysis = analyze_transform("test", &typed);

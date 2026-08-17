@@ -499,11 +499,9 @@ impl Parser {
                 ));
             }
         };
-        // The `in` separator is an identifier (CXL has no `in` keyword);
-        // accept the literal text "in" to keep the grammar surface from
-        // adding another reserved word.
+        // `in` is shared by emit_each and collection comprehensions.
         match self.peek().clone() {
-            Token::Ident(name) if name.as_ref() == "in" => {
+            Token::In => {
                 self.advance();
             }
             other => {
@@ -805,6 +803,8 @@ impl Parser {
                     | Token::FatArrow
                     | Token::Then
                     | Token::Else
+                    | Token::For
+                    | Token::If
             ) {
                 break;
             }
@@ -1002,6 +1002,9 @@ impl Parser {
                 self.expect_token(&Token::RParen, "')'")?;
                 Ok(expr)
             }
+
+            Token::LBracket => self.parse_array_expr(),
+            Token::LBrace => self.parse_map_expr(),
 
             // if/then/else
             Token::If => self.parse_if_expr(),
@@ -1252,6 +1255,153 @@ impl Parser {
                 "Check for missing operands or mismatched delimiters",
             )),
         }
+    }
+
+    fn parse_array_expr(&mut self) -> Result<Expr, ParseError> {
+        let node_id = self.alloc_id();
+        let start = self.current_span();
+        self.advance();
+        self.skip_newlines();
+
+        if *self.peek() == Token::RBracket {
+            self.advance();
+            let end = self.prev_span();
+            return Ok(Expr::ArrayLiteral {
+                node_id,
+                elements: Vec::new(),
+                span: Span::new(start.start as usize, end.end as usize),
+            });
+        }
+
+        let first = self.parse_expr(0)?;
+        self.skip_newlines();
+        if *self.peek() == Token::For {
+            self.advance();
+            self.skip_newlines();
+            let binding = self.expect_ident("array-comprehension binding")?;
+            self.expect_token(&Token::In, "'in'")?;
+            self.skip_newlines();
+            let source = self.parse_expr(0)?;
+            self.skip_newlines();
+            let predicate = if *self.peek() == Token::If {
+                self.advance();
+                self.skip_newlines();
+                let predicate = self.parse_expr(0)?;
+                self.skip_newlines();
+                Some(Box::new(predicate))
+            } else {
+                None
+            };
+            self.expect_token(&Token::RBracket, "']'")?;
+            let end = self.prev_span();
+            return Ok(Expr::ArrayComprehension {
+                node_id,
+                item: Box::new(first),
+                binding: binding.into(),
+                source: Box::new(source),
+                predicate,
+                span: Span::new(start.start as usize, end.end as usize),
+            });
+        }
+
+        let mut elements = vec![first];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            self.skip_newlines();
+            if *self.peek() == Token::RBracket {
+                break;
+            }
+            elements.push(self.parse_expr(0)?);
+            self.skip_newlines();
+        }
+        self.expect_token(&Token::RBracket, "']'")?;
+        let end = self.prev_span();
+        Ok(Expr::ArrayLiteral {
+            node_id,
+            elements,
+            span: Span::new(start.start as usize, end.end as usize),
+        })
+    }
+
+    fn parse_map_expr(&mut self) -> Result<Expr, ParseError> {
+        let node_id = self.alloc_id();
+        let start = self.current_span();
+        self.advance();
+        self.skip_newlines();
+        let mut entries = Vec::new();
+        let mut static_keys = Vec::<String>::new();
+
+        while *self.peek() != Token::RBrace {
+            let entry_start = self.current_span();
+            let key = match self.peek().clone() {
+                Token::Ident(key) | Token::StringLit(key) => {
+                    self.advance();
+                    let decoded = clinker_record::nested_key::NestedKey::decode(&key).map_err(
+                        |error| {
+                            self.error(
+                                &error.to_string(),
+                                "nested map keys use one canonical backslash escape grammar",
+                                "use `\\@name`, `\\#text`, or `\\\\name` only when escaping a reserved-looking literal key",
+                            )
+                        },
+                    )?;
+                    if static_keys
+                        .iter()
+                        .any(|existing| existing == decoded.text.as_ref())
+                    {
+                        return Err(self.error(
+                            &format!("duplicate map key {:?}", decoded.text),
+                            "static map keys must be unique after canonical escape decoding",
+                            "remove or rename the duplicate key",
+                        ));
+                    }
+                    static_keys.push(decoded.text.into_owned());
+                    MapKey::Static(key)
+                }
+                Token::LBracket => {
+                    self.advance();
+                    self.skip_newlines();
+                    let key = self.parse_expr(0)?;
+                    self.skip_newlines();
+                    self.expect_token(&Token::RBracket, "']'")?;
+                    MapKey::Computed(Box::new(key))
+                }
+                _ => {
+                    return Err(self.error(
+                        "map keys must be identifiers, strings, or computed string expressions",
+                        "CXL maps use `{ name: value }`, `{ \"name\": value }`, or `{ [expr]: value }`",
+                        "quote the key or wrap a string-valued expression in brackets",
+                    ));
+                }
+            };
+            self.skip_newlines();
+            self.expect_token(&Token::Colon, "':'")?;
+            self.skip_newlines();
+            let value = self.parse_expr(0)?;
+            let value_span = value.span();
+            entries.push(MapEntry {
+                key,
+                value,
+                span: Span::new(entry_start.start as usize, value_span.end as usize),
+            });
+            self.skip_newlines();
+            if *self.peek() != Token::Comma {
+                break;
+            }
+            self.advance();
+            self.skip_newlines();
+            if *self.peek() == Token::RBrace {
+                break;
+            }
+        }
+
+        self.expect_token(&Token::RBrace, "'}'")?;
+        let end = self.prev_span();
+        Ok(Expr::MapLiteral {
+            node_id,
+            entries,
+            span: Span::new(start.start as usize, end.end as usize),
+        })
     }
 
     fn parse_if_expr(&mut self) -> Result<Expr, ParseError> {
@@ -1688,6 +1838,109 @@ mod tests {
             }
             _ => panic!("expected Emit"),
         }
+    }
+
+    #[test]
+    fn parses_nested_array_and_map_literals() {
+        let r = parse_ok("let payload = [{name: \"Ada\", scores: [10, 20]}, null]");
+        let Expr::ArrayLiteral { elements, .. } = let_expr(&r) else {
+            panic!("expected array literal");
+        };
+        assert_eq!(elements.len(), 2);
+        let Expr::MapLiteral { entries, .. } = &elements[0] else {
+            panic!("expected nested map literal");
+        };
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(&entries[0].key, MapKey::Static(key) if &**key == "name"));
+        assert!(
+            matches!(&entries[1].value, Expr::ArrayLiteral { elements, .. } if elements.len() == 2)
+        );
+    }
+
+    #[test]
+    fn parses_multiline_nested_constructors_for_yaml_block_scalars() {
+        let r = parse_ok(
+            r##"let payload = {
+  "@kind": "event",
+  items: [
+    {"#text": "first"},
+    {"#text": "second"},
+  ],
+}"##,
+        );
+        let Expr::MapLiteral { entries, .. } = let_expr(&r) else {
+            panic!("expected map literal");
+        };
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            &entries[1].value,
+            Expr::ArrayLiteral { elements, .. } if elements.len() == 2
+        ));
+    }
+
+    #[test]
+    fn parses_computed_map_keys_in_author_order() {
+        let r = parse_ok("let payload = {first: 1, [prefix + suffix]: 2, \"last\": 3}");
+        let Expr::MapLiteral { entries, .. } = let_expr(&r) else {
+            panic!("expected map literal");
+        };
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(&entries[1].key, MapKey::Computed(_)));
+    }
+
+    #[test]
+    fn parses_single_clause_array_comprehension() {
+        let r = parse_ok("let doubled = [item * 2 for item in values if item > 0]");
+        let Expr::ArrayComprehension {
+            binding, predicate, ..
+        } = let_expr(&r)
+        else {
+            panic!("expected array comprehension");
+        };
+        assert_eq!(&**binding, "item");
+        assert!(predicate.is_some());
+    }
+
+    #[test]
+    fn rejects_noncanonical_map_key_syntax() {
+        let result = Parser::parse("let payload = {1: \"nope\"}");
+        assert!(result.errors.iter().any(|error| {
+            error
+                .message
+                .contains("map keys must be identifiers, strings, or computed string expressions")
+        }));
+    }
+
+    #[test]
+    fn canonical_map_key_escapes_are_preserved_for_format_roles() {
+        let r = parse_ok(r#"let payload = {"\\@literal": 1, "\\#text": 2}"#);
+        let Expr::MapLiteral { entries, .. } = let_expr(&r) else {
+            panic!("expected map literal");
+        };
+        assert!(matches!(&entries[0].key, MapKey::Static(key) if &**key == "\\@literal"));
+        assert!(matches!(&entries[1].key, MapKey::Static(key) if &**key == "\\#text"));
+    }
+
+    #[test]
+    fn duplicate_static_keys_are_rejected_after_escape_decoding() {
+        let result = Parser::parse(r#"let payload = {"@id": 1, "\\@id": 2}"#);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.message.contains("duplicate map key \"@id\""))
+        );
+    }
+
+    #[test]
+    fn noncanonical_map_key_escape_is_rejected() {
+        let result = Parser::parse(r#"let payload = {"\\ordinary": 1}"#);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.message.contains("non-canonical nested key escape"))
+        );
     }
 
     #[test]

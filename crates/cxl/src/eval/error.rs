@@ -70,6 +70,19 @@ pub enum EvalErrorKind {
         size: usize,
         limit: usize,
     },
+    DuplicateMapKey {
+        key: String,
+    },
+    InvalidNestedKey {
+        key: String,
+        message: String,
+    },
+    ConstructionLimitExceeded {
+        limit: usize,
+    },
+    ConstructionDepthExceeded {
+        limit: usize,
+    },
     /// `emit each` produced more records from a single input than the
     /// transform's `max_expansion` ceiling allows. The originating
     /// record is routed to DLQ; the fan-out is aborted at the
@@ -114,6 +127,20 @@ impl std::fmt::Display for EvalErrorKind {
                 f,
                 "string output exceeds maximum size ({} bytes, limit {})",
                 size, limit
+            ),
+            Self::DuplicateMapKey { key } => {
+                write!(f, "duplicate map key '{key}'")
+            }
+            Self::InvalidNestedKey { key, message } => {
+                write!(f, "invalid nested map key {key:?}: {message}")
+            }
+            Self::ConstructionLimitExceeded { limit } => write!(
+                f,
+                "nested value construction exceeds the per-record memory limit ({limit} bytes)"
+            ),
+            Self::ConstructionDepthExceeded { limit } => write!(
+                f,
+                "nested value construction exceeds the maximum depth ({limit})"
             ),
             Self::ExpansionLimitExceeded { limit } => write!(
                 f,
@@ -222,6 +249,10 @@ pub fn extract_triggering_value(kind: &EvalErrorKind) -> Option<Value> {
         | EvalErrorKind::InvariantViolation { .. }
         | EvalErrorKind::IntegerOverflow { .. }
         | EvalErrorKind::StringTooLarge { .. }
+        | EvalErrorKind::DuplicateMapKey { .. }
+        | EvalErrorKind::InvalidNestedKey { .. }
+        | EvalErrorKind::ConstructionLimitExceeded { .. }
+        | EvalErrorKind::ConstructionDepthExceeded { .. }
         | EvalErrorKind::ExpansionLimitExceeded { .. } => None,
     }
 }
@@ -238,6 +269,14 @@ impl miette::Diagnostic for EvalError {
             EvalErrorKind::InvariantViolation { .. } => "cxl::eval::internal_invariant",
             EvalErrorKind::IntegerOverflow { .. } => "cxl::eval::integer_overflow",
             EvalErrorKind::StringTooLarge { .. } => "cxl::eval::string_too_large",
+            EvalErrorKind::DuplicateMapKey { .. } => "cxl::eval::duplicate_map_key",
+            EvalErrorKind::InvalidNestedKey { .. } => "cxl::eval::invalid_nested_key",
+            EvalErrorKind::ConstructionLimitExceeded { .. } => {
+                "cxl::eval::construction_limit_exceeded"
+            }
+            EvalErrorKind::ConstructionDepthExceeded { .. } => {
+                "cxl::eval::construction_depth_exceeded"
+            }
             EvalErrorKind::ExpansionLimitExceeded { .. } => "cxl::eval::expansion_limit_exceeded",
         };
         Some(Box::new(s))

@@ -96,6 +96,143 @@ fn eval_single(src: &str, fields: &[&str], record: HashMap<String, Value>) -> Va
     output.into_values().next().unwrap_or(Value::Null)
 }
 
+fn eval_error(src: &str, fields: &[&str], record: HashMap<String, Value>) -> EvalError {
+    let parsed = Parser::parse(src);
+    assert!(
+        parsed.errors.is_empty(),
+        "Parse errors: {:?}",
+        parsed.errors
+    );
+    let resolved = resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
+    let typed = type_check(resolved, &empty_row()).unwrap();
+    let stable = StableEvalContext::test_default();
+    let ctx = EvalContext::test_default_borrowed(&stable);
+    let resolver = HashMapResolver::new(record);
+    run_fields::<NullStorage>(typed, &ctx, &resolver, None).expect_err("expected eval error")
+}
+
+#[test]
+fn nested_literals_evaluate_in_author_order() {
+    let value = eval_single(
+        "emit payload = {first: [1, 2], [key]: {active: true}, last: null}",
+        &["key"],
+        HashMap::from([("key".into(), Value::String("computed".into()))]),
+    );
+    let Value::Map(map) = value else {
+        panic!("expected map");
+    };
+    assert_eq!(
+        map.keys().map(|key| key.as_ref()).collect::<Vec<_>>(),
+        vec!["first", "computed", "last"]
+    );
+    assert_eq!(
+        map["first"],
+        Value::Array(vec![Value::Integer(1), Value::Integer(2)])
+    );
+    assert!(matches!(map["computed"], Value::Map(_)));
+    assert_eq!(map["last"], Value::Null);
+}
+
+#[test]
+fn array_comprehension_filters_and_preserves_order() {
+    let value = eval_single(
+        "emit doubled = [item * 2 for item in values if item > 0]",
+        &["values"],
+        HashMap::from([(
+            "values".into(),
+            Value::Array(vec![
+                Value::Integer(3),
+                Value::Integer(-1),
+                Value::Integer(2),
+            ]),
+        )]),
+    );
+    assert_eq!(
+        value,
+        Value::Array(vec![Value::Integer(6), Value::Integer(4)])
+    );
+}
+
+#[test]
+fn duplicate_map_key_fails_at_first_duplicate() {
+    let error = eval_error(
+        "emit payload = {name: 1, [key]: 2}",
+        &["key"],
+        HashMap::from([("key".into(), Value::String("name".into()))]),
+    );
+    assert!(matches!(
+        error.kind,
+        EvalErrorKind::DuplicateMapKey { ref key } if key == "name"
+    ));
+}
+
+#[test]
+fn null_computed_key_and_null_comprehension_source_fail() {
+    let key_error = eval_error(
+        "emit payload = {[key]: 1}",
+        &["key"],
+        HashMap::from([("key".into(), Value::Null)]),
+    );
+    assert!(matches!(
+        key_error.kind,
+        EvalErrorKind::TypeMismatch {
+            expected: "non-null String map key",
+            got: "null"
+        }
+    ));
+
+    let source_error = eval_error(
+        "emit values = [item for item in source]",
+        &["source"],
+        HashMap::from([("source".into(), Value::Null)]),
+    );
+    assert!(matches!(
+        source_error.kind,
+        EvalErrorKind::TypeMismatch {
+            expected: "Array comprehension source",
+            got: "null"
+        }
+    ));
+}
+
+#[test]
+fn computed_map_keys_use_the_same_canonical_escape_grammar() {
+    let error = eval_error(
+        "emit payload = {[key]: 1}",
+        &["key"],
+        HashMap::from([("key".into(), Value::String("\\ordinary".into()))]),
+    );
+    assert!(matches!(
+        error.kind,
+        EvalErrorKind::InvalidNestedKey { ref key, .. } if key == "\\ordinary"
+    ));
+}
+
+#[test]
+fn constructed_nested_values_accept_the_depth_cap_and_reject_cap_plus_one() {
+    let source_at_depth = |depth: usize| {
+        format!(
+            "emit payload = {}null{}",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        )
+    };
+
+    let at_cap = source_at_depth(clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH);
+    assert!(matches!(
+        eval_single(&at_cap, &[], HashMap::new()),
+        Value::Array(_)
+    ));
+
+    let over_cap = source_at_depth(clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH + 1);
+    let error = eval_error(&over_cap, &[], HashMap::new());
+    assert!(matches!(
+        error.kind,
+        EvalErrorKind::ConstructionDepthExceeded { limit }
+            if limit == clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH
+    ));
+}
+
 fn dec(mantissa: i64, scale: u32) -> Value {
     Value::Decimal(rust_decimal::Decimal::new(mantissa, scale))
 }

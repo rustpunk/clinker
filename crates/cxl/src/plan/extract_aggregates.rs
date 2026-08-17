@@ -17,7 +17,7 @@ use std::fmt::Write as _;
 use clinker_record::accumulator::AggregateType;
 
 use super::{AggregateBinding, BindingArg, CompiledAggregate, CompiledEmit};
-use crate::ast::{BinOp, Expr, LiteralValue, NodeId, Statement};
+use crate::ast::{BinOp, Expr, LiteralValue, MapKey, NodeId, Statement};
 use crate::lexer::Span;
 use crate::typecheck::{TypeDiagnostic, TypedProgram};
 
@@ -166,6 +166,31 @@ fn extract_aggs_from_expr(
         }
         Expr::Unary { operand, .. } => {
             extract_aggs_from_expr(operand, bindings, dedup, input_schema)?;
+        }
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                extract_aggs_from_expr(element, bindings, dedup, input_schema)?;
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let MapKey::Computed(key) = &mut entry.key {
+                    extract_aggs_from_expr(key, bindings, dedup, input_schema)?;
+                }
+                extract_aggs_from_expr(&mut entry.value, bindings, dedup, input_schema)?;
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            extract_aggs_from_expr(source, bindings, dedup, input_schema)?;
+            extract_aggs_from_expr(item, bindings, dedup, input_schema)?;
+            if let Some(predicate) = predicate {
+                extract_aggs_from_expr(predicate, bindings, dedup, input_schema)?;
+            }
         }
         Expr::MethodCall { receiver, args, .. } => {
             extract_aggs_from_expr(receiver, bindings, dedup, input_schema)?;
@@ -322,6 +347,31 @@ fn rewrite_group_key_refs(
         Expr::Unary { operand, .. } => {
             rewrite_group_key_refs(operand, group_by_set, group_by_fields);
         }
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                rewrite_group_key_refs(element, group_by_set, group_by_fields);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let MapKey::Computed(key) = &mut entry.key {
+                    rewrite_group_key_refs(key, group_by_set, group_by_fields);
+                }
+                rewrite_group_key_refs(&mut entry.value, group_by_set, group_by_fields);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            rewrite_group_key_refs(source, group_by_set, group_by_fields);
+            rewrite_group_key_refs(item, group_by_set, group_by_fields);
+            if let Some(predicate) = predicate {
+                rewrite_group_key_refs(predicate, group_by_set, group_by_fields);
+            }
+        }
         Expr::MethodCall { receiver, args, .. } => {
             rewrite_group_key_refs(receiver, group_by_set, group_by_fields);
             for a in args {
@@ -414,6 +464,31 @@ fn substitute_let_bindings(expr: &mut Expr, let_bindings: &HashMap<Box<str>, Exp
             substitute_let_bindings(rhs, let_bindings);
         }
         Expr::Unary { operand, .. } => substitute_let_bindings(operand, let_bindings),
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                substitute_let_bindings(element, let_bindings);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let MapKey::Computed(key) = &mut entry.key {
+                    substitute_let_bindings(key, let_bindings);
+                }
+                substitute_let_bindings(&mut entry.value, let_bindings);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            substitute_let_bindings(source, let_bindings);
+            substitute_let_bindings(item, let_bindings);
+            if let Some(predicate) = predicate {
+                substitute_let_bindings(predicate, let_bindings);
+            }
+        }
         Expr::MethodCall { receiver, args, .. } => {
             substitute_let_bindings(receiver, let_bindings);
             for a in args {
@@ -491,6 +566,21 @@ fn contains_agg_call(expr: &Expr) -> bool {
             contains_agg_call(lhs) || contains_agg_call(rhs)
         }
         Expr::Unary { operand, .. } => contains_agg_call(operand),
+        Expr::ArrayLiteral { elements, .. } => elements.iter().any(contains_agg_call),
+        Expr::MapLiteral { entries, .. } => entries.iter().any(|entry| {
+            matches!(&entry.key, MapKey::Computed(key) if contains_agg_call(key))
+                || contains_agg_call(&entry.value)
+        }),
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            contains_agg_call(source)
+                || contains_agg_call(item)
+                || predicate.as_deref().map(contains_agg_call).unwrap_or(false)
+        }
         Expr::MethodCall { receiver, args, .. } => {
             contains_agg_call(receiver) || args.iter().any(contains_agg_call)
         }
@@ -575,6 +665,54 @@ fn write_struct_form(buf: &mut String, expr: &Expr) {
         },
         Expr::FieldRef { name, .. } => {
             let _ = write!(buf, "f:{name}");
+        }
+        Expr::ArrayLiteral { elements, .. } => {
+            buf.push('[');
+            for (index, element) in elements.iter().enumerate() {
+                if index > 0 {
+                    buf.push(',');
+                }
+                write_struct_form(buf, element);
+            }
+            buf.push(']');
+        }
+        Expr::MapLiteral { entries, .. } => {
+            buf.push('{');
+            for (index, entry) in entries.iter().enumerate() {
+                if index > 0 {
+                    buf.push(',');
+                }
+                match &entry.key {
+                    MapKey::Static(key) => {
+                        let _ = write!(buf, "{:?}", key);
+                    }
+                    MapKey::Computed(key) => {
+                        buf.push('[');
+                        write_struct_form(buf, key);
+                        buf.push(']');
+                    }
+                }
+                buf.push(':');
+                write_struct_form(buf, &entry.value);
+            }
+            buf.push('}');
+        }
+        Expr::ArrayComprehension {
+            item,
+            binding,
+            source,
+            predicate,
+            ..
+        } => {
+            buf.push_str("[comp ");
+            write_struct_form(buf, item);
+            let _ = write!(buf, " for {binding} in ");
+            write_struct_form(buf, source);
+            if let Some(predicate) = predicate {
+                buf.push_str(" if ");
+                write_struct_form(buf, predicate);
+            }
+            buf.push(']');
         }
         Expr::QualifiedFieldRef { parts, .. } => {
             buf.push_str("qf:");

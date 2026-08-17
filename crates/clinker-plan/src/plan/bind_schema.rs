@@ -1082,6 +1082,31 @@ fn collect_scope_reads_in_expr(expr: &Expr, out: &mut Vec<(crate::config::VarSco
             collect_scope_reads_in_expr(rhs, out);
         }
         Expr::Unary { operand, .. } => collect_scope_reads_in_expr(operand, out),
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                collect_scope_reads_in_expr(element, out);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let cxl::ast::MapKey::Computed(key) = &entry.key {
+                    collect_scope_reads_in_expr(key, out);
+                }
+                collect_scope_reads_in_expr(&entry.value, out);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            collect_scope_reads_in_expr(source, out);
+            collect_scope_reads_in_expr(item, out);
+            if let Some(predicate) = predicate {
+                collect_scope_reads_in_expr(predicate, out);
+            }
+        }
         Expr::IfThenElse {
             condition,
             then_branch,
@@ -5441,6 +5466,22 @@ fn first_body_field_ref(expr: &Expr) -> Option<String> {
             first_body_field_ref(lhs).or_else(|| first_body_field_ref(rhs))
         }
         Expr::Unary { operand, .. } => first_body_field_ref(operand),
+        Expr::ArrayLiteral { elements, .. } => elements.iter().find_map(first_body_field_ref),
+        Expr::MapLiteral { entries, .. } => entries.iter().find_map(|entry| {
+            match &entry.key {
+                cxl::ast::MapKey::Computed(key) => first_body_field_ref(key),
+                cxl::ast::MapKey::Static(_) => None,
+            }
+            .or_else(|| first_body_field_ref(&entry.value))
+        }),
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => first_body_field_ref(source)
+            .or_else(|| first_body_field_ref(item))
+            .or_else(|| predicate.as_deref().and_then(first_body_field_ref)),
         Expr::IfThenElse {
             condition,
             then_branch,
@@ -6232,6 +6273,31 @@ fn walk_expr_for_qualified_refs(
         Expr::Unary { operand, .. } => {
             walk_expr_for_qualified_refs(Some(operand), inputs, driver_qualifier, out);
         }
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                walk_expr_for_qualified_refs(Some(element), inputs, driver_qualifier, out);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let cxl::ast::MapKey::Computed(key) = &entry.key {
+                    walk_expr_for_qualified_refs(Some(key), inputs, driver_qualifier, out);
+                }
+                walk_expr_for_qualified_refs(Some(&entry.value), inputs, driver_qualifier, out);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            walk_expr_for_qualified_refs(Some(source), inputs, driver_qualifier, out);
+            walk_expr_for_qualified_refs(Some(item), inputs, driver_qualifier, out);
+            if let Some(predicate) = predicate {
+                walk_expr_for_qualified_refs(Some(predicate), inputs, driver_qualifier, out);
+            }
+        }
         Expr::MethodCall { receiver, args, .. } => {
             walk_expr_for_qualified_refs(Some(receiver), inputs, driver_qualifier, out);
             for a in args {
@@ -6445,6 +6511,31 @@ fn walk_for_unknown_refs(expr: &Expr, cx: CombineWalkContext<'_>, diags: &mut Ve
             walk_for_unknown_refs(rhs, cx, diags);
         }
         Expr::Unary { operand, .. } => walk_for_unknown_refs(operand, cx, diags),
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                walk_for_unknown_refs(element, cx, diags);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let cxl::ast::MapKey::Computed(key) = &entry.key {
+                    walk_for_unknown_refs(key, cx, diags);
+                }
+                walk_for_unknown_refs(&entry.value, cx, diags);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            walk_for_unknown_refs(source, cx, diags);
+            walk_for_unknown_refs(item, cx, diags);
+            if let Some(predicate) = predicate {
+                walk_for_unknown_refs(predicate, cx, diags);
+            }
+        }
         Expr::Coalesce { lhs, rhs, .. } => {
             walk_for_unknown_refs(lhs, cx, diags);
             walk_for_unknown_refs(rhs, cx, diags);

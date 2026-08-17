@@ -188,6 +188,7 @@ single array (`format: array`, the default) or one object per line
     name: enriched
     type: json
     path: "./output/enriched.json"
+    preserve_nulls: false  # omit null columns; native map/array nulls remain values
     options:
       format: ndjson     # array | ndjson
       pretty: false      # indent the emitted objects
@@ -220,6 +221,47 @@ in full on [Field Paths](../cxl/field-paths.md):
 - **Values are untouched.** A column holding a map or an array still serializes
   as that map or array. Expansion adds structure above the value, never inside
   it.
+
+### Native map and array values
+
+CXL can construct maps, arrays, and array comprehensions directly; a JSON
+output writes those values recursively as native objects and arrays. Map key
+insertion order and array item order are preserved:
+
+```cxl
+emit payload = {
+  customer: customer_name,
+  items: [{sku: item.sku, quantity: item.quantity} for item in line_items],
+}
+```
+
+The output contains `"payload"` as an object with an `"items"` array. Native
+maps and arrays are values, so the default `preserve_nulls: false` does not remove null map
+entries or array items inside them; it controls null output columns and null
+leaves created by dotted-column expansion.
+
+JSON and XML share one neutral-map key grammar. After CXL has decoded the string
+literal, an unescaped key is its ordinary logical spelling. Exactly one leading
+backslash marks a literal reserved-looking key only in these three forms:
+`\@name`, `\#text`, or `\\name`. The neutral decoder removes that one marker.
+In CXL source, where the string literal itself must escape the backslash, write
+`"\\@name"`, `"\\#text"`, or `"\\\\name"`. Other leading-backslash
+forms are non-canonical and fail. JSON assigns no structural role to `@name` or
+`#text`, but it still uses this same decoder: `"\\@literal"` writes the JSON
+key `"@literal"`.
+
+Static and computed map keys follow the same rule. Two authored spellings that
+decode to the same logical key are a duplicate and fail rather than selecting a
+winner. Before writing any bytes for a record, the writer validates the entire
+neutral tree. Scalars have depth zero and each map or array adds one container;
+depth 64 is accepted and depth 65 is rejected. A failed nested value therefore
+cannot leave a partial JSON record in the output.
+
+This recursive behavior is native to JSON/NDJSON and XML. Flat, positional, and
+message formats do not silently turn a map or array into JSON text. Use an
+explicit encoding the destination format declares—such as `join_values` for a
+multi-value flat field—or reshape the value before that output. Without one,
+the structured value is rejected before bytes for that record are written.
 
 ### Keeping a literal `.` in a key
 

@@ -724,6 +724,31 @@ fn collect_qualifier_ranges_expr(
         Expr::Unary { operand, .. } => {
             collect_qualifier_ranges_expr(operand, old, offset, src_len, out)
         }
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                collect_qualifier_ranges_expr(element, old, offset, src_len, out);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let cxl::ast::MapKey::Computed(key) = &entry.key {
+                    collect_qualifier_ranges_expr(key, old, offset, src_len, out);
+                }
+                collect_qualifier_ranges_expr(&entry.value, old, offset, src_len, out);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            collect_qualifier_ranges_expr(source, old, offset, src_len, out);
+            collect_qualifier_ranges_expr(item, old, offset, src_len, out);
+            if let Some(predicate) = predicate {
+                collect_qualifier_ranges_expr(predicate, old, offset, src_len, out);
+            }
+        }
         Expr::MethodCall { receiver, args, .. } => {
             collect_qualifier_ranges_expr(receiver, old, offset, src_len, out);
             for a in args {

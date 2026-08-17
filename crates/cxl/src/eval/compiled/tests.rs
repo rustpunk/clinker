@@ -27,7 +27,7 @@ use std::sync::Arc;
 use clinker_record::{RecordStorage, Value};
 use proptest::prelude::*;
 
-use super::program_has_distinct;
+use super::{ConstructionBudget, MAX_CONSTRUCTED_BYTES, program_has_distinct};
 use crate::eval::context::{EvalContext, StableEvalContext};
 use crate::eval::error::EvalError;
 use crate::eval::{EvalResult, ProgramEvaluator, SkipReason};
@@ -58,6 +58,41 @@ impl RecordStorage for NullStorage {
 
 fn empty_row() -> Row {
     Row::closed(indexmap::IndexMap::new(), crate::lexer::Span::new(0, 0))
+}
+
+#[test]
+fn construction_budget_checks_limits_before_committing_growth() {
+    let span = crate::lexer::Span::new(0, 1);
+    let mut budget = ConstructionBudget {
+        retained_bytes: 0,
+        depth: 0,
+    };
+    budget.charge(MAX_CONSTRUCTED_BYTES, span).unwrap();
+    let error = budget.charge(1, span).unwrap_err();
+    assert!(matches!(
+        error.kind,
+        crate::eval::error::EvalErrorKind::ConstructionLimitExceeded { limit }
+            if limit == MAX_CONSTRUCTED_BYTES
+    ));
+    assert_eq!(budget.retained_bytes, MAX_CONSTRUCTED_BYTES);
+
+    let mut depth = ConstructionBudget {
+        retained_bytes: 0,
+        depth: 0,
+    };
+    for _ in 0..clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH {
+        depth.enter(span).unwrap();
+    }
+    let error = depth.enter(span).unwrap_err();
+    assert!(matches!(
+        error.kind,
+        crate::eval::error::EvalErrorKind::ConstructionDepthExceeded { limit }
+            if limit == clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH
+    ));
+    assert_eq!(
+        depth.depth,
+        clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH
+    );
 }
 
 /// Parse → resolve → typecheck a CXL program against the given input

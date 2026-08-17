@@ -273,6 +273,7 @@ fn build_writer_factory(
     // once so the format arms below read them by their original names.
     let include_header = output.include_header;
     let include_engine_stamped = output.include_correlation_keys;
+    let preserve_nulls = output.preserve_nulls.unwrap_or(false);
     let reconstruct_envelope = output.reconstruct_envelope;
     let include_unmapped = output.include_unmapped;
     let join_values = output.join_values.clone().unwrap_or_default();
@@ -333,6 +334,7 @@ fn build_writer_factory(
         OutputFormat::Json(opts) => {
             let mut json_config = build_json_writer_config(opts.as_ref());
             json_config.include_engine_stamped = include_engine_stamped;
+            json_config.preserve_nulls = preserve_nulls;
             json_config.envelope = resolve_envelope_spec(
                 reconstruct_envelope,
                 opts.as_ref().and_then(|o| o.envelope.as_ref()),
@@ -348,6 +350,7 @@ fn build_writer_factory(
         OutputFormat::Xml(opts) => {
             let mut xml_config = build_xml_writer_config(opts.as_ref());
             xml_config.include_engine_stamped = include_engine_stamped;
+            xml_config.preserve_nulls = preserve_nulls;
             // Per-field repeated-element overrides (`repeat_as` / `wrap_in`); a
             // `multiple:` field with no entry emits bare repeats named after the
             // field. The plan-time E362 gate has already validated the block, so

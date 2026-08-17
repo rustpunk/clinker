@@ -76,7 +76,9 @@ Existing dev/bench dependencies are expected: `criterion` and
 - JSON/XML envelope pre-scans retain only declared `$doc.*` paths and enforce `max_index_bytes`.
 - Reader/writer wrappers must delegate hooks such as `current_source_file`, `prepare_document`, `take_envelope_events`, `advance_to_next_file`, `begin_document`, `end_document`, and `bytes_written`.
 - `FormatError::StructuralCount` is the only format error class marked for document-DLQ reclassification; other corruption remains fatal.
-- Non-JSON writers reject `Value::Map` payloads instead of inventing scalar encodings.
+- JSON and XML write `Value::Map` payloads recursively with their documented
+  native key rules; scalar-only writers reject maps instead of inventing an
+  encoding.
 - EDI/HL7 positional ceilings re-exported from readers must stay aligned with planner validation.
 - `SplittingWriter` is a rotation orchestrator; format-specific headers, preambles, and footers belong in writer factories and concrete writers.
 

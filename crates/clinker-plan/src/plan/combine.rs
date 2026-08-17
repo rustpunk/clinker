@@ -458,6 +458,31 @@ fn collect_qualifiers_inner(expr: &Expr, out: &mut HashSet<Arc<str>>) {
             collect_qualifiers_inner(rhs, out);
         }
         Expr::Unary { operand, .. } => collect_qualifiers_inner(operand, out),
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                collect_qualifiers_inner(element, out);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let cxl::ast::MapKey::Computed(key) = &entry.key {
+                    collect_qualifiers_inner(key, out);
+                }
+                collect_qualifiers_inner(&entry.value, out);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            source,
+            predicate,
+            ..
+        } => {
+            collect_qualifiers_inner(source, out);
+            collect_qualifiers_inner(item, out);
+            if let Some(predicate) = predicate {
+                collect_qualifiers_inner(predicate, out);
+            }
+        }
         Expr::Coalesce { lhs, rhs, .. } => {
             collect_qualifiers_inner(lhs, out);
             collect_qualifiers_inner(rhs, out);

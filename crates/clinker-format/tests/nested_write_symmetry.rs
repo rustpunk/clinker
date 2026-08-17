@@ -12,6 +12,7 @@ use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
 use clinker_format::{FormatError, FormatWriter};
 use clinker_record::schema::FieldMetadata;
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
+use indexmap::IndexMap;
 
 fn schema_of(columns: &[&str]) -> Arc<Schema> {
     columns.iter().copied().collect::<SchemaBuilder>().build()
@@ -211,4 +212,101 @@ fn both_writers_refuse_a_malformed_escape() {
         let err = err.expect("a malformed escape is refused by both writers");
         assert!(matches!(err, FormatError::FieldPath { .. }), "{err:?}");
     }
+}
+
+#[test]
+fn native_nested_values_keep_order_and_format_specific_xml_roles() {
+    let schema = schema_of(&["payload"]);
+    let mut first = IndexMap::new();
+    first.insert("@id".into(), Value::Integer(1));
+    first.insert("#text".into(), Value::String("alpha".into()));
+    let mut second = IndexMap::new();
+    second.insert("@id".into(), Value::Integer(2));
+    second.insert("#text".into(), Value::String("beta".into()));
+    let mut payload = IndexMap::new();
+    payload.insert("@kind".into(), Value::String("event".into()));
+    payload.insert("#text".into(), Value::String("before".into()));
+    payload.insert(
+        "item".into(),
+        Value::Array(vec![
+            Value::Map(Box::new(first)),
+            Value::Map(Box::new(second)),
+        ]),
+    );
+    payload.insert("tail".into(), Value::String("after".into()));
+    let value = Value::Map(Box::new(payload));
+
+    assert_eq!(
+        write_json(&schema, vec![value.clone()], false),
+        r##"{"payload":{"@kind":"event","#text":"before","item":[{"@id":1,"#text":"alpha"},{"@id":2,"#text":"beta"}],"tail":"after"}}"##
+    );
+    assert_eq!(
+        write_xml(&schema, vec![value], false),
+        "<Root><Record><payload kind=\"event\">before<item id=\"1\">alpha</item><item id=\"2\">beta</item><tail>after</tail></payload></Record></Root>"
+    );
+}
+
+#[test]
+fn escaped_nested_keys_decode_for_json_and_are_validated_before_output() {
+    let schema = schema_of(&["payload"]);
+    let mut payload = IndexMap::new();
+    payload.insert("\\@literal".into(), Value::Integer(1));
+    assert_eq!(
+        write_json(&schema, vec![Value::Map(Box::new(payload))], false),
+        r#"{"payload":{"@literal":1}}"#
+    );
+
+    let mut duplicate = IndexMap::new();
+    duplicate.insert("@id".into(), Value::Integer(1));
+    duplicate.insert("\\@id".into(), Value::Integer(2));
+    let record = Record::new(Arc::clone(&schema), vec![Value::Map(Box::new(duplicate))]);
+    let mut json_buf = Vec::new();
+    let mut json = JsonWriter::new(
+        &mut json_buf,
+        Arc::clone(&schema),
+        JsonWriterConfig::default(),
+    );
+    assert!(json.write_record(&record).is_err());
+    drop(json);
+    assert!(json_buf.is_empty());
+
+    let mut xml_buf = Vec::new();
+    let mut xml = XmlWriter::new(
+        &mut xml_buf,
+        Arc::clone(&schema),
+        XmlWriterConfig::default(),
+    );
+    assert!(xml.write_record(&record).is_err());
+    drop(xml);
+    assert!(xml_buf.is_empty());
+}
+
+#[test]
+fn both_recursive_writers_reject_depth_cap_plus_one_before_output() {
+    let schema = schema_of(&["payload"]);
+    let mut value = Value::Null;
+    for _ in 0..=clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH {
+        value = Value::Array(vec![value]);
+    }
+    let record = Record::new(Arc::clone(&schema), vec![value]);
+
+    let mut json_buf = Vec::new();
+    let mut json = JsonWriter::new(
+        &mut json_buf,
+        Arc::clone(&schema),
+        JsonWriterConfig::default(),
+    );
+    assert!(json.write_record(&record).is_err());
+    drop(json);
+    assert!(json_buf.is_empty());
+
+    let mut xml_buf = Vec::new();
+    let mut xml = XmlWriter::new(
+        &mut xml_buf,
+        Arc::clone(&schema),
+        XmlWriterConfig::default(),
+    );
+    assert!(xml.write_record(&record).is_err());
+    drop(xml);
+    assert!(xml_buf.is_empty());
 }

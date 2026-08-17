@@ -46,11 +46,17 @@ When `include_unmapped: true` (the default), fields the source absorbed into `$w
 
 `include_unmapped` composes independently with `include_correlation_keys`; the two flags are orthogonal — `include_correlation_keys` does not surface `$widened`. Because expansion is a projection-layer operation, a CSV source under `auto_widen` feeding a JSON output under `include_unmapped: true` produces JSON objects whose top-level keys include both declared columns and absorbed input columns, with no sidecar key remaining.
 
-## Writer rejection of `Value::Map` payloads
+## Writer handling of `Value::Map` payloads
 
-CSV, XML, and fixed-width writers refuse any record carrying a `Value::Map` payload at any column slot, raising `FormatError::UnserializableMapValue { format, column }`. The rejection lives in **each writer's value-to-string helper** — a single point of truth, with no defensive prechecks scattered ahead of it. JSON serializes `Value::Map` natively as a nested object and never raises.
+CSV and fixed-width writers refuse a user-visible `Value::Map` column, raising
+`FormatError::UnserializableMapValue { format, column }`. JSON writes a map as
+a native object; XML recursively maps it to elements, attributes, and text.
 
-The common trigger is the `$widened` sidecar reaching one of those three writers because the Output node set `include_unmapped: false` (which suppresses the projection-layer expansion that would otherwise have flattened the map to top-level scalars). Two remediations exist, and the error message names both: leave `include_unmapped` at its default `true` so projection expands the map before write, or coerce the map to a scalar in CXL before the emit.
+The `$widened` map is different from a user-visible nested value: Output
+projection expands it to top-level fields under `include_unmapped: true`, or
+strips it under `include_unmapped: false`. It is never passed through as the
+author's JSON/XML nested structure. That projection rule keeps schema-drift
+handling separate from the recursive writer vocabulary.
 
 ### DLQ filtering
 

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::levenshtein::best_match;
 use super::scoped_vars::ScopedVarsRegistry;
-use crate::ast::{Expr, MatchArm, NodeId, Program, Statement};
+use crate::ast::{Expr, MapKey, MatchArm, NodeId, Program, Statement};
 use crate::lexer::Span;
 
 /// What a resolved identifier binds to.
@@ -543,6 +543,47 @@ impl<'a> Resolver<'a> {
             }
             Expr::Literal { .. } => {
                 // Literals don't need resolution
+            }
+            Expr::ArrayLiteral { elements, .. } => {
+                for element in elements {
+                    self.resolve_expr(element);
+                }
+            }
+            Expr::MapLiteral { entries, .. } => {
+                for entry in entries {
+                    if let MapKey::Computed(key) = &entry.key {
+                        self.resolve_expr(key);
+                    }
+                    self.resolve_expr(&entry.value);
+                }
+            }
+            Expr::ArrayComprehension {
+                item,
+                binding,
+                source,
+                predicate,
+                span,
+                ..
+            } => {
+                self.resolve_expr(source);
+                if self.let_vars.iter().any(|name| name == binding.as_ref())
+                    || self.fields.contains(&binding.as_ref())
+                {
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!(
+                            "array-comprehension binding '{binding}' shadows an existing name"
+                        ),
+                        help: Some("choose a fresh binding name for the comprehension".into()),
+                    });
+                }
+                let saved_len = self.let_vars.len();
+                self.let_vars.push(binding.to_string());
+                self.resolve_expr(item);
+                if let Some(predicate) = predicate {
+                    self.resolve_expr(predicate);
+                }
+                self.let_vars.truncate(saved_len);
             }
             Expr::Binary { lhs, rhs, .. } => {
                 self.resolve_expr(lhs);
@@ -1127,6 +1168,36 @@ mod tests {
             .iter()
             .any(|b| matches!(b, Some(ResolvedBinding::LetVar(0))));
         assert!(has_let, "Expected LetVar(0) — let should shadow field");
+    }
+
+    #[test]
+    fn array_comprehension_binding_resolves_only_inside_body() {
+        let resolved = resolve_ok(
+            "emit values = [element * 2 for element in items if element > 0]",
+            &["items"],
+        );
+        let let_bindings = resolved
+            .bindings
+            .iter()
+            .filter(|binding| matches!(binding, Some(ResolvedBinding::LetVar(_))))
+            .count();
+        assert_eq!(
+            let_bindings, 2,
+            "item and predicate should resolve to the binder"
+        );
+    }
+
+    #[test]
+    fn array_comprehension_rejects_shadowing() {
+        let diagnostics = resolve_err(
+            "let element = 1\nemit values = [element for element in items]",
+            &["items"],
+        );
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("array-comprehension binding 'element' shadows an existing name")
+        }));
     }
 
     #[test]

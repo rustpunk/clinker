@@ -42,6 +42,7 @@ pub use spill::{AggSpillFile, SpillState};
 
 pub(crate) use hash::{empty_global_fold_row, finalize_group_inner, group_by_sort_fields};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -50,7 +51,7 @@ use clinker_record::accumulator::{AccumulatorEnum, AccumulatorRow};
 use clinker_record::group_key::value_to_group_key;
 use clinker_record::schema::Schema;
 use clinker_record::{GroupByKey, Record, Value};
-use cxl::ast::{BinOp, Expr, LiteralValue, UnaryOp};
+use cxl::ast::{BinOp, Expr, LiteralValue, MapKey, UnaryOp};
 use cxl::eval::{CompiledScalar, EvalContext, EvalError, ProgramEvaluator, compare_values};
 use cxl::plan::{AggregateBinding, BindingArg, CompiledAggregate};
 
@@ -99,6 +100,55 @@ pub fn eval_expr_in_agg_scope(
     expr: &Expr,
     scope: &AggregateEvalScope<'_>,
 ) -> Result<Value, AggregateEvalError> {
+    let mut env = HashMap::new();
+    let mut constructed_bytes = 0;
+    let mut construction_depth = 0;
+    eval_expr_in_agg_scope_inner(
+        expr,
+        scope,
+        &mut env,
+        &mut constructed_bytes,
+        &mut construction_depth,
+    )
+}
+
+const MAX_AGG_CONSTRUCTED_BYTES: usize = 10 * 1024 * 1024;
+
+fn charge_aggregate_construction(
+    constructed_bytes: &mut usize,
+    bytes: usize,
+) -> Result<(), AggregateEvalError> {
+    let next = constructed_bytes.checked_add(bytes).ok_or(
+        AggregateEvalError::ConstructionLimitExceeded {
+            limit: MAX_AGG_CONSTRUCTED_BYTES,
+        },
+    )?;
+    if next > MAX_AGG_CONSTRUCTED_BYTES {
+        return Err(AggregateEvalError::ConstructionLimitExceeded {
+            limit: MAX_AGG_CONSTRUCTED_BYTES,
+        });
+    }
+    *constructed_bytes = next;
+    Ok(())
+}
+
+fn enter_aggregate_construction(depth: &mut usize) -> Result<(), AggregateEvalError> {
+    if *depth >= clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH {
+        return Err(AggregateEvalError::ConstructionDepthExceeded {
+            limit: clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH,
+        });
+    }
+    *depth += 1;
+    Ok(())
+}
+
+fn eval_expr_in_agg_scope_inner(
+    expr: &Expr,
+    scope: &AggregateEvalScope<'_>,
+    env: &mut HashMap<String, Value>,
+    constructed_bytes: &mut usize,
+    construction_depth: &mut usize,
+) -> Result<Value, AggregateEvalError> {
     match expr {
         Expr::AggSlot { slot, .. } => {
             scope
@@ -119,19 +169,206 @@ pub fn eval_expr_in_agg_scope(
                 key_count: scope.key.len(),
             }),
         Expr::Literal { value, .. } => Ok(literal_to_value(value)),
+        Expr::ArrayLiteral { elements, .. } => {
+            enter_aggregate_construction(construction_depth)?;
+            let result = (|| {
+                charge_aggregate_construction(
+                    constructed_bytes,
+                    elements.len() * std::mem::size_of::<Value>(),
+                )?;
+                let mut values = Vec::with_capacity(elements.len());
+                for element in elements {
+                    let value = eval_expr_in_agg_scope_inner(
+                        element,
+                        scope,
+                        env,
+                        constructed_bytes,
+                        construction_depth,
+                    )?;
+                    charge_aggregate_construction(constructed_bytes, value.heap_size())?;
+                    values.push(value);
+                }
+                Ok(Value::Array(values))
+            })();
+            *construction_depth -= 1;
+            result
+        }
+        Expr::MapLiteral { entries, .. } => {
+            enter_aggregate_construction(construction_depth)?;
+            let result = (|| {
+                let entry_bytes = std::mem::size_of::<Box<str>>()
+                    + std::mem::size_of::<Value>()
+                    + std::mem::size_of::<u64>()
+                    + std::mem::size_of::<usize>();
+                charge_aggregate_construction(constructed_bytes, entries.len() * entry_bytes)?;
+                let mut values: indexmap::IndexMap<Box<str>, Value> =
+                    indexmap::IndexMap::with_capacity(entries.len());
+                for entry in entries {
+                    let key: Box<str> = match &entry.key {
+                        MapKey::Static(key) => key.clone(),
+                        MapKey::Computed(key) => match eval_expr_in_agg_scope_inner(
+                            key,
+                            scope,
+                            env,
+                            constructed_bytes,
+                            construction_depth,
+                        )? {
+                            Value::String(key) => key.as_str().into(),
+                            other => {
+                                return Err(AggregateEvalError::TypeMismatch {
+                                    expected: "non-null String map key",
+                                    got: other.type_name(),
+                                });
+                            }
+                        },
+                    };
+                    charge_aggregate_construction(constructed_bytes, key.len())?;
+                    let decoded =
+                        clinker_record::nested_key::NestedKey::decode(&key).map_err(|error| {
+                            AggregateEvalError::InvalidNestedKey {
+                                key: key.to_string(),
+                                message: error.to_string(),
+                            }
+                        })?;
+                    let logical_key = decoded.text.as_ref();
+                    if values.keys().any(|prior| {
+                        clinker_record::nested_key::NestedKey::decode(prior)
+                            .expect("previous keys were validated before insertion")
+                            .text
+                            == logical_key
+                    }) {
+                        return Err(AggregateEvalError::DuplicateMapKey {
+                            key: logical_key.to_string(),
+                        });
+                    }
+                    let value = eval_expr_in_agg_scope_inner(
+                        &entry.value,
+                        scope,
+                        env,
+                        constructed_bytes,
+                        construction_depth,
+                    )?;
+                    charge_aggregate_construction(constructed_bytes, value.heap_size())?;
+                    values.insert(key, value);
+                }
+                Ok(Value::Map(Box::new(values)))
+            })();
+            *construction_depth -= 1;
+            result
+        }
+        Expr::ArrayComprehension {
+            item,
+            binding,
+            source,
+            predicate,
+            ..
+        } => {
+            enter_aggregate_construction(construction_depth)?;
+            let source = eval_expr_in_agg_scope_inner(
+                source,
+                scope,
+                env,
+                constructed_bytes,
+                construction_depth,
+            );
+            let source = match source {
+                Ok(source) => source,
+                Err(error) => {
+                    *construction_depth -= 1;
+                    return Err(error);
+                }
+            };
+            let Value::Array(source_values) = source else {
+                *construction_depth -= 1;
+                return Err(AggregateEvalError::TypeMismatch {
+                    expected: "Array comprehension source",
+                    got: source.type_name(),
+                });
+            };
+            charge_aggregate_construction(
+                constructed_bytes,
+                source_values.len() * std::mem::size_of::<Value>(),
+            )?;
+            let previous = env.remove(binding.as_ref());
+            let result = (|| {
+                let mut values = Vec::with_capacity(source_values.len());
+                for source_value in source_values {
+                    env.insert(binding.to_string(), source_value);
+                    if let Some(predicate) = predicate {
+                        match eval_expr_in_agg_scope_inner(
+                            predicate,
+                            scope,
+                            env,
+                            constructed_bytes,
+                            construction_depth,
+                        )? {
+                            Value::Bool(true) => {}
+                            Value::Bool(false) => continue,
+                            other => {
+                                return Err(AggregateEvalError::TypeMismatch {
+                                    expected: "Bool comprehension predicate",
+                                    got: other.type_name(),
+                                });
+                            }
+                        }
+                    }
+                    let value = eval_expr_in_agg_scope_inner(
+                        item,
+                        scope,
+                        env,
+                        constructed_bytes,
+                        construction_depth,
+                    )?;
+                    charge_aggregate_construction(constructed_bytes, value.heap_size())?;
+                    values.push(value);
+                }
+                Ok(Value::Array(values))
+            })();
+            if let Some(previous) = previous {
+                env.insert(binding.to_string(), previous);
+            } else {
+                env.remove(binding.as_ref());
+            }
+            *construction_depth -= 1;
+            result
+        }
         Expr::Binary { op, lhs, rhs, .. } => {
-            let l = eval_expr_in_agg_scope(lhs, scope)?;
-            let r = eval_expr_in_agg_scope(rhs, scope)?;
+            let l = eval_expr_in_agg_scope_inner(
+                lhs,
+                scope,
+                env,
+                constructed_bytes,
+                construction_depth,
+            )?;
+            let r = eval_expr_in_agg_scope_inner(
+                rhs,
+                scope,
+                env,
+                constructed_bytes,
+                construction_depth,
+            )?;
             eval_binary(*op, l, r)
         }
         Expr::Unary { op, operand, .. } => {
-            let v = eval_expr_in_agg_scope(operand, scope)?;
+            let v = eval_expr_in_agg_scope_inner(
+                operand,
+                scope,
+                env,
+                constructed_bytes,
+                construction_depth,
+            )?;
             eval_unary(*op, v)
         }
         Expr::Coalesce { lhs, rhs, .. } => {
-            let l = eval_expr_in_agg_scope(lhs, scope)?;
+            let l = eval_expr_in_agg_scope_inner(
+                lhs,
+                scope,
+                env,
+                constructed_bytes,
+                construction_depth,
+            )?;
             if matches!(l, Value::Null) {
-                eval_expr_in_agg_scope(rhs, scope)
+                eval_expr_in_agg_scope_inner(rhs, scope, env, constructed_bytes, construction_depth)
             } else {
                 Ok(l)
             }
@@ -142,17 +379,33 @@ pub fn eval_expr_in_agg_scope(
             else_branch,
             ..
         } => {
-            let c = eval_expr_in_agg_scope(condition, scope)?;
+            let c = eval_expr_in_agg_scope_inner(
+                condition,
+                scope,
+                env,
+                constructed_bytes,
+                construction_depth,
+            )?;
             if matches!(c, Value::Bool(true)) {
-                eval_expr_in_agg_scope(then_branch, scope)
+                eval_expr_in_agg_scope_inner(
+                    then_branch,
+                    scope,
+                    env,
+                    constructed_bytes,
+                    construction_depth,
+                )
             } else if let Some(e) = else_branch {
-                eval_expr_in_agg_scope(e, scope)
+                eval_expr_in_agg_scope_inner(e, scope, env, constructed_bytes, construction_depth)
             } else {
                 Ok(Value::Null)
             }
         }
         Expr::Now { .. } => Err(AggregateEvalError::UnsupportedResidual { what: "now" }),
-        Expr::FieldRef { .. } | Expr::QualifiedFieldRef { .. } => {
+        Expr::FieldRef { name, .. } => env
+            .get(name.as_ref())
+            .cloned()
+            .ok_or(AggregateEvalError::UnsupportedResidual { what: "field-ref" }),
+        Expr::QualifiedFieldRef { .. } => {
             Err(AggregateEvalError::UnsupportedResidual { what: "field-ref" })
         }
         Expr::PipelineAccess { .. }
@@ -1170,9 +1423,99 @@ impl<Op: AccumulatorOp> StreamingAggregator<Op> {
 mod accumulator_op_tests {
     use super::*;
     use clinker_record::accumulator::{AccumulatorEnum, AggregateType};
+    use cxl::ast::Statement;
+    use cxl::parser::Parser;
+
+    fn parsed_emit_expr(source: &str) -> Expr {
+        let parsed = Parser::parse(source);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let Statement::Emit { expr, .. } = parsed.ast.statements.into_iter().next().unwrap() else {
+            panic!("expected emit statement");
+        };
+        expr
+    }
 
     fn state_with_row(row: AccumulatorRow) -> AggregatorGroupState {
         AggregatorGroupState::new(row)
+    }
+
+    #[test]
+    fn aggregate_residual_nested_constructors_preserve_order_and_bindings() {
+        let expr = parsed_emit_expr(
+            "emit payload = {items: [item * 2 for item in [3, -1, 2] if item > 0], tail: null}",
+        );
+        let value = eval_expr_in_agg_scope(
+            &expr,
+            &AggregateEvalScope {
+                key: &[],
+                slots: &[],
+            },
+        )
+        .unwrap();
+        let Value::Map(map) = value else {
+            panic!("expected map");
+        };
+        assert_eq!(
+            map.keys().map(|key| key.as_ref()).collect::<Vec<_>>(),
+            vec!["items", "tail"]
+        );
+        assert_eq!(
+            map["items"],
+            Value::Array(vec![Value::Integer(6), Value::Integer(4)])
+        );
+    }
+
+    #[test]
+    fn aggregate_residual_rejects_duplicate_logical_computed_key() {
+        let expr = parsed_emit_expr(r#"emit payload = {"@id": 1, ["\\@id"]: 2}"#);
+        let error = eval_expr_in_agg_scope(
+            &expr,
+            &AggregateEvalScope {
+                key: &[],
+                slots: &[],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AggregateEvalError::DuplicateMapKey { ref key } if key == "@id"
+        ));
+    }
+
+    #[test]
+    fn aggregate_residual_enforces_construction_depth_and_byte_caps() {
+        let source = format!(
+            "emit payload = {}null{}",
+            "[".repeat(clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH + 1),
+            "]".repeat(clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH + 1)
+        );
+        let expr = parsed_emit_expr(&source);
+        let error = eval_expr_in_agg_scope(
+            &expr,
+            &AggregateEvalScope {
+                key: &[],
+                slots: &[],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AggregateEvalError::ConstructionDepthExceeded { limit }
+                if limit == clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH
+        ));
+
+        let mut bytes = 0;
+        charge_aggregate_construction(&mut bytes, MAX_AGG_CONSTRUCTED_BYTES).unwrap();
+        assert!(matches!(
+            charge_aggregate_construction(&mut bytes, 1),
+            Err(AggregateEvalError::ConstructionLimitExceeded { limit })
+                if limit == MAX_AGG_CONSTRUCTED_BYTES
+        ));
+        assert_eq!(bytes, MAX_AGG_CONSTRUCTED_BYTES);
     }
 
     // ----- merge_group_sidecars -----
