@@ -63,7 +63,7 @@ nodes:
   use: ../compositions/issue_123_nested_hard_fail.comp.yaml
   inputs:
     records: events
-- type: output
+- type: sink
   name: out
   input: enrich_call
   config:

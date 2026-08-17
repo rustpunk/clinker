@@ -68,7 +68,7 @@ nodes:
       cxl: |
         emit k = k
         emit total = sum(v)
-  - type: output
+  - type: sink
     name: out_small
     input: agg_small
     config:
@@ -76,7 +76,7 @@ nodes:
       type: csv
       path: out_small.csv
       include_unmapped: true
-  - type: output
+  - type: sink
     name: out_large
     input: agg_large
     config:
@@ -281,7 +281,7 @@ nodes:
       cxl: |
         emit k = k
         emit total = sum(v)
-  - type: output
+  - type: sink
     name: out_heavy
     input: agg_heavy
     config:
@@ -289,7 +289,7 @@ nodes:
       type: csv
       path: out_heavy.csv
       include_unmapped: true
-  - type: output
+  - type: sink
     name: out_light
     input: agg_light
     config:
@@ -510,7 +510,7 @@ nodes:
       cxl: |
         emit k = k
         emit items = collect(v)
-  - type: output
+  - type: sink
     name: out
     input: agg
     config:
@@ -612,7 +612,7 @@ nodes:
       cxl: |
         emit k = k
         emit items = collect(v)
-  - type: output
+  - type: sink
     name: out
     input: agg
     config:
@@ -694,7 +694,7 @@ nodes:
         emit ratio = 1 / (total - 30)
       analytic_window:
         group_by: [department]
-  - type: output
+  - type: sink
     name: out
     input: running
     config:

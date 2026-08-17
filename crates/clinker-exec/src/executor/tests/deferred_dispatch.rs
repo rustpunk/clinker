@@ -48,7 +48,7 @@ nodes:
       emit department = department
       emit total = total
       emit scaled = total * 2
-- type: output
+- type: sink
   name: out
   input: scaled
   config:
@@ -266,7 +266,7 @@ nodes:
       emit department = department
       emit total = total
       emit budget = budget
-- type: output
+- type: sink
   name: out
   input: tail
   config:
@@ -427,7 +427,7 @@ nodes:
       emit department = department
       emit total = total
       emit ratio = 1 / (total - 60)
-- type: output
+- type: sink
   name: out
   input: ratio
   config:
@@ -521,7 +521,7 @@ nodes:
       emit department = department
       emit total = total
       emit ratio = 1 / (total - 60)
-- type: output
+- type: sink
   name: out
   input: ratio
   config:
@@ -720,7 +720,7 @@ nodes:
     use: ../compositions/relaxed_ratio.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: body
     config:
@@ -966,7 +966,7 @@ nodes:
     use: ../compositions/outer_wrap.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: outer
     config:
