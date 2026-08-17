@@ -85,6 +85,7 @@ pub use provenance::{
     LayerKind, ProvenanceDb, ProvenanceField, ProvenanceKey, ProvenanceLayer,
     ProvenanceLookupError, ProvenanceMatch, ProvenanceQuery, ProvenanceQueryParseError,
     ResolvedValue, ScopedNodeAddress, ScopedNodeAddressParseError, ScopedSchemaAddress,
+    ScopedSchemaLeafAddress,
 };
 pub use resource::Resource;
 pub use schema_provenance::{

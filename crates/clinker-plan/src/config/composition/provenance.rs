@@ -299,6 +299,22 @@ pub struct ScopedSchemaAddress {
     attribute: String,
 }
 
+/// Exact owner address for one authored source-schema leaf.
+///
+/// A single-record column uses the existing [`ScopedSchemaAddress`] shape. A
+/// discriminator-driven schema adds the authored `records:` id before the
+/// column, keeping two same-named columns in distinct record types distinct.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ScopedSchemaLeafAddress {
+    Column(ScopedSchemaAddress),
+    RecordColumn {
+        source: String,
+        record: String,
+        column: String,
+        attribute: String,
+    },
+}
+
 impl ScopedSchemaAddress {
     pub fn new(
         source: impl Into<String>,
@@ -357,6 +373,113 @@ impl ScopedSchemaAddress {
 
     pub fn attribute(&self) -> &str {
         &self.attribute
+    }
+}
+
+impl ScopedSchemaLeafAddress {
+    pub fn column(
+        source: impl Into<String>,
+        column: impl Into<String>,
+        attribute: impl Into<String>,
+    ) -> Self {
+        Self::Column(ScopedSchemaAddress::new(source, column, attribute))
+    }
+
+    pub fn record_column(
+        source: impl Into<String>,
+        record: impl Into<String>,
+        column: impl Into<String>,
+        attribute: impl Into<String>,
+    ) -> Self {
+        Self::RecordColumn {
+            source: source.into(),
+            record: record.into(),
+            column: column.into(),
+            attribute: attribute.into(),
+        }
+    }
+
+    pub fn parse(input: &str) -> Result<Self, ScopedNodeAddressParseError> {
+        if let Ok(address) = ScopedSchemaAddress::parse(input) {
+            return Ok(Self::Column(address));
+        }
+        let raw_segments: Vec<&str> = input
+            .strip_prefix('/')
+            .ok_or_else(|| ScopedNodeAddressParseError::Malformed(input.to_owned()))?
+            .split('/')
+            .collect();
+        let segments: Vec<String> = raw_segments
+            .into_iter()
+            .map(decode_pointer_segment)
+            .collect::<Result<_, _>>()?;
+        if segments.len() != 10
+            || segments[0] != "v1"
+            || segments[1] != "schema"
+            || segments[2] != "sources"
+            || segments[4] != "records"
+            || segments[6] != "columns"
+            || segments[8] != "attributes"
+        {
+            return Err(ScopedNodeAddressParseError::Malformed(input.to_owned()));
+        }
+        Ok(Self::record_column(
+            segments[3].clone(),
+            segments[5].clone(),
+            segments[7].clone(),
+            segments[9].clone(),
+        ))
+    }
+
+    pub fn render(&self) -> String {
+        match self {
+            Self::Column(address) => address.render(),
+            Self::RecordColumn {
+                source,
+                record,
+                column,
+                attribute,
+            } => format!(
+                "/v1/schema/sources/{}/records/{}/columns/{}/attributes/{}",
+                encode_pointer_segment(source),
+                encode_pointer_segment(record),
+                encode_pointer_segment(column),
+                encode_pointer_segment(attribute),
+            ),
+        }
+    }
+
+    pub fn source(&self) -> &str {
+        match self {
+            Self::Column(address) => address.source(),
+            Self::RecordColumn { source, .. } => source,
+        }
+    }
+
+    pub fn record(&self) -> Option<&str> {
+        match self {
+            Self::Column(_) => None,
+            Self::RecordColumn { record, .. } => Some(record),
+        }
+    }
+
+    pub fn column_name(&self) -> &str {
+        match self {
+            Self::Column(address) => address.column(),
+            Self::RecordColumn { column, .. } => column,
+        }
+    }
+
+    pub fn attribute(&self) -> &str {
+        match self {
+            Self::Column(address) => address.attribute(),
+            Self::RecordColumn { attribute, .. } => attribute,
+        }
+    }
+}
+
+impl From<ScopedSchemaAddress> for ScopedSchemaLeafAddress {
+    fn from(address: ScopedSchemaAddress) -> Self {
+        Self::Column(address)
     }
 }
 
@@ -1155,6 +1278,28 @@ mod tests {
         assert_ne!(left.render(), right.render());
         assert_eq!(ScopedNodeAddress::parse(&left.render()).unwrap(), left);
         assert_eq!(ScopedNodeAddress::parse(&right.render()).unwrap(), right);
+    }
+
+    #[test]
+    fn schema_leaf_addresses_round_trip_flat_and_record_column_owners() {
+        let flat = ScopedSchemaLeafAddress::column("orders/~", "amount/paid", "type");
+        assert_eq!(
+            ScopedSchemaLeafAddress::parse(&flat.render()).unwrap(),
+            flat
+        );
+
+        let record = ScopedSchemaLeafAddress::record_column(
+            "orders/~",
+            "detail/foreign~",
+            "amount/paid",
+            "type",
+        );
+        let rendered = record.render();
+        assert_eq!(
+            rendered,
+            "/v1/schema/sources/orders~1~0/records/detail~1foreign~0/columns/amount~1paid/attributes/type"
+        );
+        assert_eq!(ScopedSchemaLeafAddress::parse(&rendered).unwrap(), record);
     }
 
     #[test]

@@ -102,7 +102,7 @@ effective configuration.
 | `<CONFIG>` | Pipeline YAML containing the source-schema `numeric` leaves to inspect. |
 | `--channel <ID>` | Select one cataloged channel and its derived, target-admitted groups. |
 | `--group <NAME>` | Select one explicit, target-admitted group without a channel. |
-| `--field <NODE.COLUMN>` | Narrow the preview to one `numeric` source column. Repeatable; repeated selectors are deduplicated in request order. Unknown, malformed, or already-concrete fields are rejected. |
+| `--field <NODE.COLUMN>` | Narrow the preview to one `numeric` source field. Repeatable; repeated selectors are deduplicated in request order. In a multi-record schema, one selector covers every same-named literal `numeric` owner across `records:` while leaving same-named concrete declarations unchanged. Unknown, malformed, or entirely concrete fields are rejected. |
 | `--base-dir <DIR>` | Workspace root holding `clinker.toml` and the channel/group roots. Defaults to the pipeline file's directory. |
 
 The command constructs readers through the same CSV, JSON, and XML option and
@@ -111,6 +111,14 @@ containing the selected configuration, bounded coverage, parser-owned numeric
 evidence, unresolved reasons, proposed types, and an exact semantic YAML patch.
 The patch is a preview string inside the report; this command never changes the
 pipeline or an overlay.
+
+Each field report carries an `owners` array. Every owner has its own evidence,
+votes, proposed type, unresolved reasons, and exact address. A single-record
+field has one canonical `/v1/schema/sources/.../columns/...` owner.
+Multi-record owners use
+`/v1/schema/sources/.../records/.../columns/...`, in authored record order, so
+same-named leaves never collapse into a fake single-record address or share a
+proposal derived from another record type.
 
 Sampling is bounded to four discovered files per selected source, 1,024 records
 per sampled file, 8 MiB per file, and eight retained evidence items per field.

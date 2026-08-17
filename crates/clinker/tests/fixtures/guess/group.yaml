@@ -4,10 +4,6 @@ group:
   priority: 10
 overrides:
   - op: patch_schema
-    target: csv_orders
-    schema:
-      amount: { type: int }
-  - op: patch_schema
     target: xml_orders
     schema:
       total: { type: numeric }

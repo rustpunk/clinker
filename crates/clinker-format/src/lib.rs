@@ -37,8 +37,9 @@ pub use multi_value::{
 };
 pub use numeric_observation::{
     NumericAcceptance, NumericBoundary, NumericIssue, NumericLexeme, NumericObservation,
-    NumericObserver, NumericParserOutcome, NumericVote, observe_json_number, observe_json_value,
-    observe_positional_numeric, observe_schema_numeric, observe_xml_scalar,
+    NumericObservationScope, NumericObserver, NumericParserOutcome, NumericVote,
+    observe_json_number, observe_json_value, observe_positional_numeric, observe_schema_numeric,
+    observe_xml_scalar,
 };
 pub use record_path::{RecordPath, RecordPathError, RecordPathSyntax};
 pub use schema::{

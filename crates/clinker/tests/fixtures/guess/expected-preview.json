@@ -22,8 +22,8 @@
         {
           "path": "input.csv",
           "status": "sampled",
-          "input_bytes": 37,
-          "bytes_read": 37,
+          "input_bytes": 50,
+          "bytes_read": 50,
           "records_sampled": 3,
           "truncated": false
         }
@@ -33,46 +33,55 @@
   "fields": [
     {
       "field": "csv_orders.amount",
-      "address": "/v1/schema/sources/csv_orders/columns/amount/attributes/type",
-      "observations": 3,
-      "votes": {
-        "int": 3,
-        "float": 0,
-        "no_value": 0,
-        "unresolved": 0
-      },
-      "evidence": [
+      "owners": [
         {
-          "boundary": "schema_coerce",
-          "lexeme": "10",
-          "original_bytes": 2,
-          "truncated": false,
-          "parser_outcome": "integer",
-          "vote": "int",
-          "reason": null
+          "address": "/v1/schema/sources/csv_orders/records/detail/columns/amount/attributes/type",
+          "observations": 1,
+          "votes": {
+            "int": 1,
+            "float": 0,
+            "no_value": 0,
+            "unresolved": 0
+          },
+          "evidence": [
+            {
+              "boundary": "positional",
+              "lexeme": "10",
+              "original_bytes": 2,
+              "truncated": false,
+              "parser_outcome": "integer",
+              "vote": "int",
+              "reason": null
+            }
+          ],
+          "proposed_type": "int",
+          "unresolved_reasons": []
         },
         {
-          "boundary": "schema_coerce",
-          "lexeme": "20",
-          "original_bytes": 2,
-          "truncated": false,
-          "parser_outcome": "integer",
-          "vote": "int",
-          "reason": null
-        },
-        {
-          "boundary": "schema_coerce",
-          "lexeme": "30",
-          "original_bytes": 2,
-          "truncated": false,
-          "parser_outcome": "integer",
-          "vote": "int",
-          "reason": null
+          "address": "/v1/schema/sources/csv_orders/records/adjustment/columns/amount/attributes/type",
+          "observations": 1,
+          "votes": {
+            "int": 0,
+            "float": 1,
+            "no_value": 0,
+            "unresolved": 0
+          },
+          "evidence": [
+            {
+              "boundary": "positional",
+              "lexeme": "20.5",
+              "original_bytes": 4,
+              "truncated": false,
+              "parser_outcome": "float",
+              "vote": "float",
+              "reason": null
+            }
+          ],
+          "proposed_type": "float",
+          "unresolved_reasons": []
         }
-      ],
-      "proposed_type": "int",
-      "unresolved_reasons": []
+      ]
     }
   ],
-  "patch": "edits:\n  - address: /v1/schema/sources/csv_orders/columns/amount/attributes/type\n    from: numeric\n    to: int\n"
+  "patch": "edits:\n  - address: /v1/schema/sources/csv_orders/records/detail/columns/amount/attributes/type\n    from: numeric\n    to: int\n  - address: /v1/schema/sources/csv_orders/records/adjustment/columns/amount/attributes/type\n    from: nullable(numeric)\n    to: nullable(float)\n"
 }

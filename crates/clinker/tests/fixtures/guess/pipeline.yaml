@@ -8,8 +8,26 @@ nodes:
       type: csv
       path: input.csv
       schema:
-        - { name: order_id, type: string }
-        - { name: amount, type: numeric }
+        discriminator: { field: kind }
+        records:
+          - id: detail
+            tag: D
+            columns:
+              - { name: kind, type: string }
+              - { name: order_id, type: string }
+              - { name: amount, type: numeric }
+          - id: adjustment
+            tag: A
+            columns:
+              - { name: kind, type: string }
+              - { name: order_id, type: string }
+              - { name: amount, type: { nullable: numeric } }
+          - id: summary
+            tag: S
+            columns:
+              - { name: kind, type: string }
+              - { name: order_id, type: string }
+              - { name: amount, type: int }
   - type: source
     name: json_orders
     config:

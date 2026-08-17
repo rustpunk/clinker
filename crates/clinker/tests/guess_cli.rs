@@ -126,6 +126,37 @@ fn preview_selector_base_is_deterministic_and_matches_byte_goldens() {
 }
 
 #[test]
+fn preview_selector_multi_record_field_reports_each_literal_numeric_owner() {
+    let workspace = workspace();
+    let report = parse_success(&guess(workspace.path(), &["--field", "csv_orders.amount"]));
+    let owners = report["fields"][0]["owners"]
+        .as_array()
+        .expect("exact owner reports");
+    assert_eq!(owners.len(), 2);
+    assert_eq!(
+        owners[0]["address"],
+        "/v1/schema/sources/csv_orders/records/detail/columns/amount/attributes/type"
+    );
+    assert_eq!(owners[0]["observations"], 1);
+    assert_eq!(owners[0]["proposed_type"], "int");
+    assert_eq!(owners[0]["evidence"][0]["lexeme"], "10");
+    assert_eq!(
+        owners[1]["address"],
+        "/v1/schema/sources/csv_orders/records/adjustment/columns/amount/attributes/type"
+    );
+    assert_eq!(owners[1]["observations"], 1);
+    assert_eq!(owners[1]["proposed_type"], "float");
+    assert_eq!(owners[1]["evidence"][0]["lexeme"], "20.5");
+    let patch = report["patch"].as_str().expect("patch");
+    assert!(patch.contains("records/detail/columns/amount/attributes/type"));
+    assert!(patch.contains("records/adjustment/columns/amount/attributes/type"));
+    assert!(
+        !patch.contains("records/summary/columns/amount/attributes/type"),
+        "the concrete summary declaration must not be proposed as an edit: {patch}"
+    );
+}
+
+#[test]
 fn preview_selector_channel_uses_effective_json_schema_and_parser() {
     let workspace = workspace();
     let output = guess(
@@ -141,8 +172,11 @@ fn preview_selector_channel_uses_effective_json_schema_and_parser() {
     );
     let report = parse_success(&output);
     assert_eq!(report["selection"]["kind"], "channel");
-    assert_eq!(report["fields"][0]["proposed_type"], "float");
-    assert_eq!(report["fields"][0]["evidence"][0]["boundary"], "json");
+    assert_eq!(report["fields"][0]["owners"][0]["proposed_type"], "float");
+    assert_eq!(
+        report["fields"][0]["owners"][0]["evidence"][0]["boundary"],
+        "json"
+    );
     assert_eq!(report["coverage"][0]["files"][0]["path"], "input.json");
 }
 
@@ -162,8 +196,11 @@ fn preview_selector_group_uses_effective_xml_schema_and_parser() {
     );
     let report = parse_success(&output);
     assert_eq!(report["selection"]["kind"], "group");
-    assert_eq!(report["fields"][0]["proposed_type"], "int");
-    assert_eq!(report["fields"][0]["evidence"][0]["boundary"], "xml");
+    assert_eq!(report["fields"][0]["owners"][0]["proposed_type"], "int");
+    assert_eq!(
+        report["fields"][0]["owners"][0]["evidence"][0]["boundary"],
+        "xml"
+    );
     assert_eq!(report["coverage"][0]["files"][0]["path"], "input.xml");
 }
 

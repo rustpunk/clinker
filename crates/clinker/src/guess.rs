@@ -10,12 +10,12 @@ use clinker_format::numeric_observation::{
     NumericAcceptance, NumericBoundary, NumericIssue, NumericObservation, NumericParserOutcome,
     NumericVote,
 };
-use clinker_format::{ByteTally, NumericObserver, ReopenableSource};
-use clinker_plan::config::composition::ScopedSchemaAddress;
+use clinker_format::{ByteTally, Column, NumericObserver, ReopenableSource, SourceSchema};
+use clinker_plan::config::composition::ScopedSchemaLeafAddress;
 use clinker_plan::config::{PipelineNode, SourceTransport};
 use clinker_plan::error::PipelineError;
 use cxl::typecheck::Type;
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use serde::Serialize;
 
 use crate::GuessArgs;
@@ -74,9 +74,16 @@ impl std::error::Error for GuessError {}
 struct Candidate {
     source: String,
     column: String,
-    physical_column: String,
-    address: String,
+    owners: Vec<NumericOwner>,
+}
+
+#[derive(Debug, Clone)]
+struct NumericOwner {
+    address: ScopedSchemaLeafAddress,
     declared_type: Type,
+    record: Option<String>,
+    observed_fields: Vec<String>,
+    accumulator_index: usize,
 }
 
 impl Candidate {
@@ -235,6 +242,11 @@ impl From<&NumericObservation> for EvidenceReport {
 #[derive(Debug, Serialize)]
 struct FieldReport {
     field: String,
+    owners: Vec<OwnerReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct OwnerReport {
     address: String,
     observations: u64,
     votes: VoteReport,
@@ -260,9 +272,10 @@ struct EffectiveConfig {
 /// Execute the read-only preview and print one stable JSON document.
 pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
     let effective = resolve_effective_config(args)?;
-    let candidates = select_candidates(&effective.config, &args.fields)?;
+    let mut candidates = select_candidates(&effective.config, &args.fields)?;
+    let accumulator_count = index_numeric_owners(&mut candidates);
     let accumulators = Arc::new(Mutex::new(
-        (0..candidates.len())
+        (0..accumulator_count)
             .map(|_| FieldAccumulator::new())
             .collect::<Vec<_>>(),
     ));
@@ -291,29 +304,38 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
     let mut edits = Vec::new();
     let fields = candidates
         .iter()
-        .zip(accumulators.iter())
-        .map(|(candidate, accumulated)| {
-            let (proposed_type, unresolved_reasons) = accumulated.resolution();
-            if let Some(concrete) = proposed_type {
-                edits.push(PatchEdit {
-                    address: candidate.address.clone(),
-                    from_type: render_numeric_type(&candidate.declared_type, "numeric"),
-                    to_type: render_numeric_type(&candidate.declared_type, concrete),
-                });
-            }
+        .map(|candidate| {
+            let owners = candidate
+                .owners
+                .iter()
+                .map(|owner| {
+                    let accumulated = &accumulators[owner.accumulator_index];
+                    let (proposed_type, unresolved_reasons) = accumulated.resolution();
+                    if let Some(concrete) = proposed_type {
+                        edits.push(PatchEdit {
+                            address: owner.address.render(),
+                            from_type: render_numeric_type(&owner.declared_type, "numeric"),
+                            to_type: render_numeric_type(&owner.declared_type, concrete),
+                        });
+                    }
+                    OwnerReport {
+                        address: owner.address.render(),
+                        observations: accumulated.observed,
+                        votes: VoteReport {
+                            int: accumulated.int_votes,
+                            float: accumulated.float_votes,
+                            no_value: accumulated.no_value_votes,
+                            unresolved: accumulated.unresolved_votes,
+                        },
+                        evidence: accumulated.evidence.clone(),
+                        proposed_type,
+                        unresolved_reasons,
+                    }
+                })
+                .collect();
             FieldReport {
                 field: candidate.selector(),
-                address: candidate.address.clone(),
-                observations: accumulated.observed,
-                votes: VoteReport {
-                    int: accumulated.int_votes,
-                    float: accumulated.float_votes,
-                    no_value: accumulated.no_value_votes,
-                    unresolved: accumulated.unresolved_votes,
-                },
-                evidence: accumulated.evidence.clone(),
-                proposed_type,
-                unresolved_reasons,
+                owners,
             }
         })
         .collect();
@@ -457,8 +479,8 @@ fn select_candidates(
     config: &clinker_plan::config::PipelineConfig,
     requested: &[String],
 ) -> Result<Vec<Candidate>, GuessError> {
-    let mut candidates = Vec::new();
-    let mut all_fields = HashMap::new();
+    let mut candidates = IndexMap::new();
+    let mut all_fields: HashMap<String, Vec<Type>> = HashMap::new();
     for node in &config.nodes {
         let PipelineNode::Source {
             header,
@@ -467,21 +489,34 @@ fn select_candidates(
         else {
             continue;
         };
-        let Some(columns) = body.schema.as_columns() else {
-            continue;
-        };
-        for column in columns {
-            let selector = format!("{}.{}", header.name, column.name);
-            all_fields.insert(selector.clone(), column.ty.clone());
-            if contains_numeric_leaf(&column.ty) {
-                candidates.push(Candidate {
-                    source: header.name.clone(),
-                    column: column.name.clone(),
-                    physical_column: column.physical_name().to_owned(),
-                    address: ScopedSchemaAddress::new(&header.name, &column.name, "type").render(),
-                    declared_type: column.ty.clone(),
-                });
+        match &body.schema {
+            SourceSchema::Columns(columns) => {
+                for column in columns {
+                    register_candidate_column(
+                        &mut candidates,
+                        &mut all_fields,
+                        &header.name,
+                        None,
+                        column,
+                        true,
+                    );
+                }
             }
+            SourceSchema::MultiRecord { record_types, .. } => {
+                for record_type in record_types {
+                    for column in &record_type.columns {
+                        register_candidate_column(
+                            &mut candidates,
+                            &mut all_fields,
+                            &header.name,
+                            Some(&record_type.id),
+                            column,
+                            false,
+                        );
+                    }
+                }
+            }
+            SourceSchema::Generated(_) | SourceSchema::File(_) => {}
         }
     }
     if candidates.is_empty() {
@@ -490,7 +525,7 @@ fn select_candidates(
         ));
     }
     if requested.is_empty() {
-        return Ok(candidates);
+        return Ok(candidates.into_values().collect());
     }
 
     let mut requested_once = IndexSet::new();
@@ -502,10 +537,7 @@ fn select_candidates(
         }
         requested_once.insert(field.clone());
     }
-    let by_selector = candidates
-        .into_iter()
-        .map(|candidate| (candidate.selector(), candidate))
-        .collect::<HashMap<_, _>>();
+    let by_selector = candidates;
     requested_once
         .into_iter()
         .map(|field| {
@@ -513,8 +545,15 @@ fn select_candidates(
                 return Ok(candidate.clone());
             }
             if let Some(concrete) = all_fields.get(&field) {
+                let concrete = concrete
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 Err(GuessError::configuration(format!(
-                    "--field {field:?} is {concrete}, not `numeric`; correction: remove that selector or point it at a literal `numeric` source column"
+                    "--field {field:?} has only concrete declaration(s) ({concrete}), not `numeric`; correction: remove that selector or point it at a literal `numeric` source column"
                 )))
             } else {
                 Err(GuessError::configuration(format!(
@@ -528,6 +567,60 @@ fn select_candidates(
             }
         })
         .collect()
+}
+
+fn register_candidate_column(
+    candidates: &mut IndexMap<String, Candidate>,
+    all_fields: &mut HashMap<String, Vec<Type>>,
+    source: &str,
+    record: Option<&str>,
+    column: &Column,
+    observe_physical_name: bool,
+) {
+    let selector = format!("{source}.{}", column.name);
+    all_fields
+        .entry(selector.clone())
+        .or_default()
+        .push(column.ty.clone());
+    if !contains_numeric_leaf(&column.ty) {
+        return;
+    }
+    let address = match record {
+        Some(record) => {
+            ScopedSchemaLeafAddress::record_column(source, record, &column.name, "type")
+        }
+        None => ScopedSchemaLeafAddress::column(source, &column.name, "type"),
+    };
+    let candidate = candidates.entry(selector).or_insert_with(|| Candidate {
+        source: source.to_owned(),
+        column: column.name.clone(),
+        owners: Vec::new(),
+    });
+    let mut observed_fields = vec![column.name.clone()];
+    if observe_physical_name {
+        let physical = column.physical_name();
+        if !observed_fields.iter().any(|name| name == physical) {
+            observed_fields.push(physical.to_owned());
+        }
+    }
+    candidate.owners.push(NumericOwner {
+        address,
+        declared_type: column.ty.clone(),
+        record: record.map(str::to_owned),
+        observed_fields,
+        accumulator_index: usize::MAX,
+    });
+}
+
+fn index_numeric_owners(candidates: &mut [Candidate]) -> usize {
+    let mut next = 0;
+    for candidate in candidates {
+        for owner in &mut candidate.owners {
+            owner.accumulator_index = next;
+            next += 1;
+        }
+    }
+    next
 }
 
 fn sample_sources(
@@ -615,8 +708,8 @@ fn sample_sources(
 
             let field_map = observer_field_map(candidates, source_name);
             let target = Arc::clone(&accumulators);
-            let observer = NumericObserver::new(move |field, observation| {
-                let Some(indices) = field_map.get(field) else {
+            let observer = NumericObserver::new_scoped(move |scope, observation| {
+                let Some(indices) = field_map.indices(scope.record(), scope.field()) else {
                     return;
                 };
                 let mut accumulated = target
@@ -671,16 +764,41 @@ fn sample_sources(
     Ok(coverage)
 }
 
-fn observer_field_map(candidates: &[Candidate], source: &str) -> HashMap<String, Vec<usize>> {
-    let mut fields: HashMap<String, Vec<usize>> = HashMap::new();
-    for (index, candidate) in candidates.iter().enumerate() {
+#[derive(Debug, Default)]
+struct ObserverFieldMap {
+    columns: HashMap<String, Vec<usize>>,
+    records: HashMap<String, HashMap<String, Vec<usize>>>,
+}
+
+impl ObserverFieldMap {
+    fn indices(&self, record: Option<&str>, field: &str) -> Option<&[usize]> {
+        match record {
+            Some(record) => self
+                .records
+                .get(record)
+                .and_then(|fields| fields.get(field))
+                .map(Vec::as_slice),
+            None => self.columns.get(field).map(Vec::as_slice),
+        }
+    }
+}
+
+fn observer_field_map(candidates: &[Candidate], source: &str) -> ObserverFieldMap {
+    let mut fields = ObserverFieldMap::default();
+    for candidate in candidates {
         if candidate.source != source {
             continue;
         }
-        for name in [&candidate.column, &candidate.physical_column] {
-            let indices = fields.entry(name.clone()).or_default();
-            if !indices.contains(&index) {
-                indices.push(index);
+        for owner in &candidate.owners {
+            let target = match owner.record.as_deref() {
+                Some(record) => fields.records.entry(record.to_owned()).or_default(),
+                None => &mut fields.columns,
+            };
+            for name in &owner.observed_fields {
+                let indices = target.entry(name.clone()).or_default();
+                if !indices.contains(&owner.accumulator_index) {
+                    indices.push(owner.accumulator_index);
+                }
             }
         }
     }
