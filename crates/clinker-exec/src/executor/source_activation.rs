@@ -11,6 +11,7 @@ use clinker_plan::plan::execution::{
 };
 
 use super::capabilities::{ActiveActivationGroup, AdmittedRunCapabilities, RunCapabilityError};
+use super::context::SourceRuntimePolicy;
 use super::ingest::{IngestTaskOutcome, ingest_source_body};
 use super::source_stream::{SourceConsumer, SourceIngestChannel, SourceStreamEvent};
 use crate::pipeline::memory::{ConsumerHandle, ConsumerId, MemoryArbitrator};
@@ -43,15 +44,25 @@ pub(crate) struct SourceActivationController {
     plan: SourceActivationPlan,
     capabilities: AdmittedRunCapabilities,
     active: BTreeMap<SourceActivationGroupId, ActiveGroupRuntime>,
+    source_runtime: SourceRuntimePolicy,
 }
 
 impl SourceActivationController {
-    pub(crate) fn new(plan: SourceActivationPlan, capabilities: AdmittedRunCapabilities) -> Self {
+    pub(crate) fn new(
+        plan: SourceActivationPlan,
+        capabilities: AdmittedRunCapabilities,
+        source_runtime: SourceRuntimePolicy,
+    ) -> Self {
         Self {
             plan,
             capabilities,
             active: BTreeMap::new(),
+            source_runtime,
         }
+    }
+
+    pub(crate) fn source_runtime(&self) -> SourceRuntimePolicy {
+        self.source_runtime.clone()
     }
 
     /// Activate the complete group containing `instance`, exactly once.
@@ -133,11 +144,18 @@ impl SourceActivationController {
                 .consumers
                 .push((source_name.clone(), (consumer_id, handle)));
             let worker_shutdown = shutdown.clone();
+            let source_runtime = self.source_runtime.clone();
             let spawn = std::thread::Builder::new()
                 .name(format!("clinker-body-source-{source_name}"))
                 .spawn(move || {
-                    let mut outcome =
-                        ingest_source_body(body, input, stream, worker_shutdown, None)?;
+                    let mut outcome = ingest_source_body(
+                        body,
+                        input,
+                        stream,
+                        worker_shutdown,
+                        None,
+                        source_runtime,
+                    )?;
                     outcome.source_name = logical_source_name;
                     Ok(outcome)
                 });

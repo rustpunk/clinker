@@ -508,6 +508,28 @@ pub enum MachineFormat {
     NdjsonV1,
 }
 
+/// Closed logging levels accepted by `clinker run`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl From<LogLevel> for tracing_subscriber::filter::LevelFilter {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Error => Self::ERROR,
+            LogLevel::Warn => Self::WARN,
+            LogLevel::Info => Self::INFO,
+            LogLevel::Debug => Self::DEBUG,
+            LogLevel::Trace => Self::TRACE,
+        }
+    }
+}
+
 /// Arguments for `clinker run`.
 #[derive(Parser, Debug)]
 pub struct RunArgs {
@@ -518,13 +540,9 @@ pub struct RunArgs {
     #[arg(long = "memory-limit", help_heading = "Execution")]
     pub mem_limit: Option<String>,
 
-    /// Thread pool size, default num_cpus
+    /// CPU-kernel and Source-read capacity (independent caps), default CPUs
     #[arg(long, help_heading = "Execution")]
-    pub threads: Option<usize>,
-
-    /// Max DLQ records before abort, 0 = unlimited
-    #[arg(long, default_value = "0", help_heading = "Execution")]
-    pub error_threshold: u64,
+    pub threads: Option<std::num::NonZeroUsize>,
 
     /// Pipeline batch_id, default generated UUID v7
     #[arg(long, help_heading = "Execution")]
@@ -575,15 +593,30 @@ pub struct RunArgs {
     pub lineage_events: Option<PathBuf>,
 
     /// Validate config and CXL without processing data
-    #[arg(long, help_heading = "Validation")]
+    #[arg(
+        long,
+        help_heading = "Validation",
+        conflicts_with_all = ["machine", "explain", "lineage", "lineage_events"]
+    )]
     pub dry_run: bool,
 
     /// Process only first N records per input (requires --dry-run)
-    #[arg(short = 'n', long, help_heading = "Validation")]
-    pub dry_run_n: Option<u64>,
+    #[arg(
+        short = 'n',
+        long,
+        help_heading = "Validation",
+        requires = "dry_run",
+        conflicts_with_all = ["machine", "explain", "lineage", "lineage_events"]
+    )]
+    pub dry_run_n: Option<std::num::NonZeroU64>,
 
     /// Write dry-run output to file instead of stdout
-    #[arg(long, help_heading = "Validation")]
+    #[arg(
+        long,
+        help_heading = "Validation",
+        requires = "dry_run_n",
+        conflicts_with_all = ["machine", "explain", "lineage", "lineage_events"]
+    )]
     pub dry_run_output: Option<PathBuf>,
 
     /// CXL module search path
@@ -611,8 +644,8 @@ pub struct RunArgs {
     pub force: bool,
 
     /// Log level: error, warn, info, debug, trace
-    #[arg(long, default_value = "info", help_heading = "Output")]
-    pub log_level: String,
+    #[arg(long, default_value = "info", value_enum, help_heading = "Output")]
+    pub log_level: LogLevel,
 
     /// Directory to spool per-execution JSON metrics files.
     /// Overrides CLINKER_METRICS_SPOOL_DIR env var and pipeline.metrics.spool_dir in YAML.
@@ -637,6 +670,76 @@ pub struct RunArgs {
     /// overlays apply.
     #[arg(long = "no-auto-groups", help_heading = "Configuration")]
     pub no_auto_groups: bool,
+}
+
+/// Cloneable handle to the one explicit preview destination.
+///
+/// Multiple terminal nodes may format into the preview stream, but no handle
+/// points at an authored output path. The mutex is bounded run state (one
+/// writer regardless of input volume) and serialization keeps preview bytes in
+/// deterministic dispatch order.
+#[derive(Clone)]
+struct SharedPreviewWriter(std::sync::Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>);
+
+impl std::io::Write for SharedPreviewWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flush()
+    }
+}
+
+fn preview_writer_registry(
+    destination: Option<&std::path::Path>,
+    config: &clinker_plan::config::PipelineConfig,
+    dag: &clinker_plan::plan::execution::ExecutionPlanDag,
+    source_files: &std::collections::HashMap<String, Vec<std::path::PathBuf>>,
+) -> Result<clinker_exec::executor::WriterRegistry, PipelineError> {
+    let destination: Box<dyn std::io::Write + Send> = match destination {
+        Some(path) => Box::new(std::fs::File::create(path).map_err(PipelineError::Io)?),
+        None => Box::new(std::io::stdout()),
+    };
+    let shared = SharedPreviewWriter(std::sync::Arc::new(std::sync::Mutex::new(destination)));
+    let mut single = std::collections::HashMap::new();
+    let mut fan_out = std::collections::HashMap::new();
+    for output in config.output_configs() {
+        if output_is_fan_out(dag, &output.name) {
+            let upstream = upstream_source_for_output(dag, &output.name);
+            let mut per_file = std::collections::HashMap::new();
+            for path in upstream
+                .as_ref()
+                .and_then(|source| source_files.get(source))
+                .into_iter()
+                .flatten()
+            {
+                per_file.insert(
+                    std::sync::Arc::from(path.to_string_lossy().into_owned()),
+                    Box::new(shared.clone()) as Box<dyn std::io::Write + Send>,
+                );
+            }
+            fan_out.insert(output.name.clone(), per_file);
+        } else {
+            single.insert(
+                output.name.clone(),
+                Box::new(shared.clone()) as Box<dyn std::io::Write + Send>,
+            );
+        }
+    }
+    Ok(clinker_exec::executor::WriterRegistry {
+        single,
+        fan_out,
+        fan_out_paths: std::collections::HashMap::new(),
+        output_staging: Default::default(),
+        auto_commit_staged: false,
+    })
 }
 
 impl RunArgs {
@@ -1010,16 +1113,23 @@ fn main() -> ExitCode {
                 u8::try_from(error.exit_code()).unwrap_or(1)
             };
             let _ = error.print();
+            if std::env::args_os().any(|arg| {
+                arg == "--error-threshold"
+                    || arg
+                        .to_str()
+                        .is_some_and(|value| value.starts_with("--error-threshold="))
+            }) {
+                eprintln!(
+                    "Correction: configure `error_handling.type_error_threshold` in pipeline YAML:\nerror_handling:\n  type_error_threshold: 0.05"
+                );
+            }
             return ExitCode::from(exit_code);
         }
     };
 
     match &cli.command {
         Commands::Run(args) => {
-            let filter = args
-                .log_level
-                .parse::<tracing_subscriber::filter::LevelFilter>()
-                .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO);
+            let filter = tracing_subscriber::filter::LevelFilter::from(args.log_level);
             // Diagnostics move to stderr exactly when standard output is
             // carrying data a consumer parses: the machine stream, a lineage
             // export addressed to `-`, or an explain document in one of the
@@ -1028,6 +1138,7 @@ fn main() -> ExitCode {
             // stdout, where the run's own completion summary is reported and
             // where callers already expect to read it.
             let stdout_carries_data = args.machine.is_some()
+                || (args.dry_run_n.is_some() && args.dry_run_output.is_none())
                 || matches!(args.explain, Some(ExplainFormat::Json | ExplainFormat::Dot))
                 || [args.lineage.as_deref(), args.lineage_events.as_deref()]
                     .into_iter()
@@ -2294,6 +2405,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             ),
         ));
     }
+    let run_policy = resolve_run_policy(args, &pipeline_config);
 
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
@@ -2716,15 +2828,6 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         return Ok(0);
     }
 
-    // Validate -n only valid with --dry-run
-    if args.dry_run_n.is_some() && !args.dry_run {
-        return Err(PipelineError::Config(
-            clinker_plan::config::ConfigError::Validation(
-                "-n/--dry-run-n requires --dry-run flag".to_string(),
-            ),
-        ));
-    }
-
     // Resolve spool directory (CLI > env > YAML)
     let yaml_spool = pipeline_config
         .pipeline
@@ -2872,7 +2975,10 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         }
     }
 
-    if args.dry_run && args.dry_run_n.is_none() {
+    if matches!(
+        run_policy.preview(),
+        clinker_exec::executor::PreviewPolicy::ConfigOnly
+    ) {
         // Compile-validation mode (no -n): the plan and any channel/group
         // overlay are fully checked, but runtime source discovery, reader and
         // writer setup, and record processing do not begin. Compilation may
@@ -2910,6 +3016,12 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         .map(MachineEmitter::start_execution_progress)
         .transpose()
         .map_err(PipelineError::Io)?;
+    #[cfg(feature = "otlp")]
+    if run_policy.preview().records_per_source().is_some() {
+        // Preview is an authoring check, not a published pipeline run. It
+        // produces no run-lifecycle telemetry and reserves no signal arena.
+        otlp_runtime = None;
+    }
     #[cfg(feature = "otlp")]
     let telemetry_handles = otlp_runtime
         .as_ref()
@@ -3230,6 +3342,46 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             source_name,
             clinker_exec::executor::SourceInput::Files(slots),
         );
+    }
+
+    if run_policy.preview().records_per_source().is_some() {
+        // The preview registry is admitted before the normal publication
+        // branch and contains no authored destination, attempt ledger, split
+        // path, or auto-commit capability. Output dispatch can therefore use
+        // the authored formats without opening or publishing any configured
+        // Sink path.
+        let registry = preview_writer_registry(
+            args.dry_run_output.as_deref(),
+            &pipeline_config,
+            compiled_plan.dag(),
+            &source_files_by_name,
+        )?;
+        let preview_params = clinker_exec::executor::PipelineRunParams {
+            execution_id: execution_id.clone(),
+            batch_id: batch_id.clone(),
+            pipeline_vars: effective_runtime_variables.pipeline_vars.clone(),
+            static_vars: effective_runtime_variables.static_vars.clone(),
+            source_vars: effective_runtime_variables.source_vars.clone(),
+            record_vars: effective_runtime_variables.record_vars.clone(),
+            telemetry_producer: None,
+            progress: None,
+            shutdown_token: Some(shutdown_token.clone()),
+            spill_root_dir: spill_root_dir.clone(),
+            spill_disk_cap_bytes,
+            spill_compress: storage_config.spill.compress,
+        };
+        let report =
+            PipelineExecutor::run_admitted_plan_with_readers_writers_in_context_with_policy(
+                &compiled_plan,
+                admitted_run_capabilities,
+                readers,
+                registry,
+                &preview_params,
+                run_policy,
+                compile_ctx.without_overlay_ops(),
+            )?;
+        source_stager.cleanup(true);
+        return Ok(if report.dlq_entries.is_empty() { 0 } else { 2 });
     }
 
     // Every output writes to a hidden destination-local leaf admitted through
@@ -3554,14 +3706,16 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     // post-overlay config — so the context it recompiles under must NOT carry
     // the overlay ops again (they would double-apply and collide). For a plain
     // run this is identical to `compile_ctx.clone()` (the op stream is empty).
-    let execution_result = PipelineExecutor::run_admitted_plan_with_readers_writers_in_context(
-        &compiled_plan,
-        admitted_run_capabilities,
-        readers,
-        registry,
-        &run_params,
-        compile_ctx.without_overlay_ops(),
-    );
+    let execution_result =
+        PipelineExecutor::run_admitted_plan_with_readers_writers_in_context_with_policy(
+            &compiled_plan,
+            admitted_run_capabilities,
+            readers,
+            registry,
+            &run_params,
+            run_policy,
+            compile_ctx.without_overlay_ops(),
+        );
     // The periodic worker only ever writes discardable observations. A lost
     // snapshot is not run-controlling evidence: the protocol's required
     // records are the lifecycle transitions and the terminal, and those still
@@ -4027,7 +4181,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             records_null_dropped: counters.null_dropped_count,
             execution_mode: report.execution_summary.clone(),
             peak_rss_bytes: report.peak_rss_bytes,
-            thread_count: num_threads(args),
+            thread_count: run_policy.thread_capacity().get(),
             input_files: pipeline_config
                 .source_configs()
                 .map(|i| i.path_str().to_string())
@@ -4221,9 +4375,27 @@ fn run_metrics(cmd: &MetricsCommands) -> Result<(), std::io::Error> {
     }
 }
 
-/// Resolve thread count from CLI args or default to `num_cpus`.
-fn num_threads(args: &RunArgs) -> usize {
-    args.threads.unwrap_or_else(num_cpus::get)
+/// Resolve one nonzero capacity and one preview mode before runtime effects.
+fn resolve_run_policy(
+    args: &RunArgs,
+    config: &clinker_plan::config::PipelineConfig,
+) -> clinker_exec::executor::RunPolicy {
+    let yaml_capacity = config
+        .pipeline
+        .concurrency
+        .as_ref()
+        .and_then(|concurrency| concurrency.threads)
+        .and_then(std::num::NonZeroUsize::new);
+    let thread_capacity = args.threads.or(yaml_capacity).unwrap_or_else(|| {
+        std::num::NonZeroUsize::new(num_cpus::get()).unwrap_or(std::num::NonZeroUsize::MIN)
+    });
+    let preview = match (args.dry_run, args.dry_run_n) {
+        (false, None) => clinker_exec::executor::PreviewPolicy::Disabled,
+        (true, None) => clinker_exec::executor::PreviewPolicy::ConfigOnly,
+        (true, Some(limit)) => clinker_exec::executor::PreviewPolicy::RecordsPerSource(limit),
+        (false, Some(_)) => unreachable!("clap requires --dry-run with --dry-run-n"),
+    };
+    clinker_exec::executor::RunPolicy::new(thread_capacity, preview)
 }
 
 /// Render a "Resolved Outputs" block listing each output's expanded
@@ -7904,7 +8076,7 @@ mod tests {
     fn test_cli_run_log_level_default() {
         let cli = Cli::try_parse_from(["clinker", "run", "pipeline.yaml"]).unwrap();
         match cli.command {
-            Commands::Run(args) => assert_eq!(args.log_level, "info"),
+            Commands::Run(args) => assert_eq!(args.log_level, LogLevel::Info),
             _ => panic!("expected Run command"),
         }
     }
@@ -8047,12 +8219,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_run_error_threshold_zero() {
-        let cli = Cli::try_parse_from(["clinker", "run", "p.yaml"]).unwrap();
-        match cli.command {
-            Commands::Run(args) => assert_eq!(args.error_threshold, 0),
-            _ => panic!("expected Run command"),
-        }
+    fn test_cli_run_error_threshold_is_retired() {
+        let error = Cli::try_parse_from(["clinker", "run", "p.yaml", "--error-threshold", "10"])
+            .expect_err("the retired flag must not parse");
+        assert!(error.to_string().contains("--error-threshold"));
     }
 
     #[test]
@@ -8174,7 +8344,7 @@ mod tests {
         match cli.command {
             Commands::Run(args) => {
                 assert!(args.dry_run);
-                assert_eq!(args.dry_run_n, Some(10));
+                assert_eq!(args.dry_run_n.map(std::num::NonZeroU64::get), Some(10));
             }
             _ => panic!("expected Run command"),
         }
@@ -8196,7 +8366,7 @@ mod tests {
         match cli.command {
             Commands::Run(args) => {
                 assert!(args.dry_run);
-                assert_eq!(args.dry_run_n, Some(5));
+                assert_eq!(args.dry_run_n.map(std::num::NonZeroU64::get), Some(5));
                 assert_eq!(args.dry_run_output, Some(PathBuf::from("out.csv")));
             }
             _ => panic!("expected Run command"),

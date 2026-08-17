@@ -20,6 +20,8 @@ use clinker_format::{Column, SourceSchema};
 use clinker_plan::config::PipelineConfig;
 use clinker_plan::error::PipelineError;
 
+use super::context::SourceRuntimePolicy;
+
 /// Whether a format reads its input more than once.
 ///
 /// The envelope pre-scan of a multi-pass format re-opens the source, so its
@@ -404,6 +406,7 @@ pub(super) fn ingest_source(
     stream: crate::executor::source_stream::SourceIngestChannel,
     shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
     progress: Option<crate::progress::RunProgress>,
+    source_runtime: SourceRuntimePolicy,
 ) -> Result<IngestTaskOutcome, PipelineError> {
     use clinker_plan::config::PipelineNode;
 
@@ -422,7 +425,14 @@ pub(super) fn ingest_source(
                 src_cfg.name
             )))
         })?;
-    ingest_source_body(body, input, stream, shutdown_token, progress)
+    ingest_source_body(
+        body,
+        input,
+        stream,
+        shutdown_token,
+        progress,
+        source_runtime,
+    )
 }
 
 /// Ingest one retained Source body through the common finite reader path.
@@ -436,6 +446,7 @@ pub(super) fn ingest_source_body(
     stream: crate::executor::source_stream::SourceIngestChannel,
     shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
     progress: Option<crate::progress::RunProgress>,
+    source_runtime: SourceRuntimePolicy,
 ) -> Result<IngestTaskOutcome, PipelineError> {
     let src_cfg = body.source.clone();
     // Branch once on transport. The file arm builds the
@@ -461,12 +472,18 @@ pub(super) fn ingest_source_body(
             let src_reader = wrap_source_body_with_schema_coercion(raw_reader, &body)?;
             // The file arm reaches the shared driver through the blanket
             // `RecordSource for Box<dyn FormatReader>` impl.
-            drive_record_source(src_cfg, Box::new(src_reader), stream, shutdown_token)
+            drive_record_source(
+                src_cfg,
+                Box::new(src_reader),
+                stream,
+                shutdown_token,
+                source_runtime,
+            )
         }
         // A non-file transport reads no files, so it credits none. The run's
         // file denominator was already withdrawn for this shape.
         crate::source::SourceInput::Records(src_reader) => {
-            drive_record_source(src_cfg, src_reader, stream, shutdown_token)
+            drive_record_source(src_cfg, src_reader, stream, shutdown_token, source_runtime)
         }
     }
 }
@@ -481,6 +498,7 @@ fn drive_record_source(
     src_reader: Box<dyn crate::source::RecordSource>,
     stream: crate::executor::source_stream::SourceIngestChannel,
     shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
+    source_runtime: SourceRuntimePolicy,
 ) -> Result<IngestTaskOutcome, PipelineError> {
     {
         let mut src_reader = src_reader;
@@ -492,7 +510,15 @@ fn drive_record_source(
         if let Some(token) = shutdown_token {
             src_reader.set_shutdown_token(token);
         }
+        // Schema work shares the run capacity, but an already-requested
+        // shutdown is handled by the established graceful-stop check at the
+        // top of the record loop. Turning it into a schema error here would
+        // change a clean interruption into a failed run.
+        let schema_permit = source_runtime
+            .acquire(None)
+            .ok_or(PipelineError::Interrupted)?;
         let reader_schema = src_reader.schema()?;
+        drop(schema_permit);
 
         // Widen the reader schema with `$source.file`, `$source.name`,
         // and `$source.event_time` engine-stamped tail columns. The
@@ -571,6 +597,7 @@ fn drive_record_source(
         let preserve_empty_physical_files = stream.has_order_barrier();
         let mut stream = stream;
         let mut total_count: u64 = 0;
+        let mut read_attempts: u64 = 0;
         let mut watermark_observations: Vec<(Arc<str>, i64)> = Vec::new();
         // First successfully decoded body record for the current physical
         // file, kept together with the exact identity minted for it. A
@@ -613,7 +640,21 @@ fn drive_record_source(
                 interrupted = true;
                 break;
             }
-            match src_reader.next_record() {
+            if source_runtime
+                .preview()
+                .records_per_source()
+                .is_some_and(|limit| read_attempts >= limit.get())
+            {
+                break;
+            }
+            let Some(read_permit) = source_runtime.acquire(shutdown_for_poll.as_ref()) else {
+                interrupted = true;
+                break;
+            };
+            read_attempts = read_attempts.saturating_add(1);
+            let next_record = src_reader.next_record();
+            drop(read_permit);
+            match next_record {
                 Ok(Some(record)) => {
                     total_count =
                         total_count
@@ -1874,7 +1915,17 @@ nodes:
             handle,
             <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(0),
         );
-        drive_record_source(src_cfg, reader, stream, None).expect("drive");
+        drive_record_source(
+            src_cfg,
+            reader,
+            stream,
+            None,
+            SourceRuntimePolicy::new(crate::executor::RunPolicy::new(
+                std::num::NonZeroUsize::MIN,
+                crate::executor::PreviewPolicy::Disabled,
+            )),
+        )
+        .expect("drive");
         rx.iter()
             .map(|event| match event {
                 crate::executor::source_stream::SourceStreamEvent::Attempt {
@@ -1913,6 +1964,71 @@ nodes:
                 },
             })
             .collect()
+    }
+
+    #[test]
+    fn preview_stops_before_the_next_record_call_at_its_per_source_limit() {
+        struct CountingReader {
+            schema: Arc<Schema>,
+            calls: Arc<std::sync::atomic::AtomicU64>,
+        }
+
+        impl crate::source::RecordSource for CountingReader {
+            fn schema(&mut self) -> Result<Arc<Schema>, clinker_format::FormatError> {
+                Ok(Arc::clone(&self.schema))
+            }
+
+            fn next_record(
+                &mut self,
+            ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+                let value = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(clinker_record::Record::new(
+                    Arc::clone(&self.schema),
+                    vec![Value::Integer(value as i64)],
+                )))
+            }
+        }
+
+        let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let schema = SchemaBuilder::with_capacity(1).with_field("id").build();
+        let reader: Box<dyn crate::source::RecordSource> = Box::new(CountingReader {
+            schema,
+            calls: Arc::clone(&calls),
+        });
+        let src_cfg = pathless_source_config();
+        let handle = crate::pipeline::memory::ConsumerHandle::new();
+        let (stream, rx) = crate::executor::source_stream::SourceIngestChannel::new(
+            crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
+            handle,
+            <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(0),
+        );
+        drive_record_source(
+            src_cfg,
+            reader,
+            stream,
+            None,
+            SourceRuntimePolicy::new(crate::executor::RunPolicy::new(
+                std::num::NonZeroUsize::MIN,
+                crate::executor::PreviewPolicy::RecordsPerSource(
+                    std::num::NonZeroU64::new(2).unwrap(),
+                ),
+            )),
+        )
+        .expect("bounded preview");
+        let records = rx
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    crate::executor::source_stream::SourceStreamEvent::Attempt {
+                        event: crate::executor::source_stream::SourceAttemptEvent::Record(..),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(records, 2);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
