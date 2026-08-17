@@ -62,7 +62,7 @@ nodes:
       emit running_count = $window.sum(count)
     analytic_window:
       group_by: [department]
-- type: output
+- type: sink
   name: out_total
   input: total_window
   config:
@@ -70,7 +70,7 @@ nodes:
     path: total.csv
     type: csv
     include_unmapped: true
-- type: output
+- type: sink
   name: out_count
   input: count_window
   config:

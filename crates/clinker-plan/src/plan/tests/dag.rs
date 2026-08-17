@@ -62,7 +62,7 @@ nodes:
     config:
       cxl: |
         emit done = true
-  - type: output
+  - type: sink
     name: output
     input: finalize
     config:
@@ -100,7 +100,7 @@ nodes:
     config:
       cxl: |
         emit y = amount * 2
-  - type: output
+  - type: sink
     name: output
     input: step_two
     config:
@@ -196,7 +196,7 @@ nodes:
     cxl: 'emit y = amount
 
       '
-- type: output
+- type: sink
   name: output
   input: beta
   config:
@@ -287,7 +287,7 @@ nodes:
       c: amount > 0
     default: output
     mode: exclusive
-- type: output
+- type: sink
   name: output
   input: router
   config:
@@ -352,7 +352,7 @@ nodes:
     cxl: 'emit z = amount
 
       '
-- type: output
+- type: sink
   name: output
   input: merged
   config:
@@ -410,7 +410,7 @@ nodes:
     cxl: 'emit x = amount
 
       '
-- type: output
+- type: sink
   name: output
   input: only
   config:
@@ -478,7 +478,7 @@ nodes:
     cxl: 'emit x = amount
 
       '
-- type: output
+- type: sink
   name: output
   input: step
   config:
@@ -545,7 +545,7 @@ nodes:
     analytic_window:
       group_by:
       - dept
-- type: output
+- type: sink
   name: output
   input: agg
   config:
@@ -686,7 +686,7 @@ nodes:
       bad: amount + 1
     default: fallback
     mode: exclusive
-- type: output
+- type: sink
   name: bad_out
   input: router.bad
   config:
@@ -694,7 +694,7 @@ nodes:
     path: bad.csv
     include_unmapped: true
     type: csv
-- type: output
+- type: sink
   name: fallback
   input: router.fallback
   config:
@@ -739,7 +739,7 @@ nodes:
     cxl: 'emit x = amount
 
       '
-- type: output
+- type: sink
   name: output
   input: loopy
   config:
@@ -821,7 +821,7 @@ nodes:
     cxl: 'emit done = true
 
       '
-- type: output
+- type: sink
   name: output
   input: finalize
   config:
@@ -889,7 +889,7 @@ fn test_explain_json_node_ids() {
         .collect();
     assert!(slugs.contains(&"source.primary".to_string()));
     assert!(slugs.contains(&"transform.step_one".to_string()));
-    assert!(slugs.contains(&"output.output".to_string()));
+    assert!(slugs.contains(&"sink.output".to_string()));
 }
 
 /// JSON depends_on correctly reflects graph edges.

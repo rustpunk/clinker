@@ -107,14 +107,14 @@ nodes:
       inp: src
     config:
       min_amount: 100.0
-  - type: output
+  - type: sink
     name: out_low
     input: gate_low
     config:
       name: out_low
       type: csv
       path: out_low.csv
-  - type: output
+  - type: sink
     name: out_high
     input: gate_high
     config:
@@ -200,7 +200,7 @@ nodes:
     use: ../compositions/gate.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: gate
     config:
