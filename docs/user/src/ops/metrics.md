@@ -84,9 +84,9 @@ schema bump means draining the spool first.
 | `exit_code` | integer | Process exit code (see [Exit Codes](exit-codes.md)) |
 | `records_total` | integer | Total records read from the primary source |
 | `records_ok` | integer | Distinct source records that reached at least one output. Under inclusive Route fan-out one input matching N branches counts once |
-| `records_written` | integer | Total writes across all sinks. Equals `records_ok` for single-output exclusive pipelines; exceeds it under inclusive Route fan-out or multiple Output sinks |
+| `records_written` | integer | Total writes across all sinks. Equals `records_ok` for single-output exclusive pipelines; exceeds it under inclusive Route fan-out or multiple Sinks |
 | `records_dlq` | integer | Records routed to the dead-letter queue |
-| `records_null_dropped` | integer | Records excluded by an Output `null_order: drop` sort field (see [Sort order](../nodes/output.md#sort-order)). Counts exclusions, not distinct source records: like `records_written`, one source record dropped at two Outputs counts twice. Absent from spool files written before this counter existed, where it reads as `0` |
+| `records_null_dropped` | integer | Records excluded by a Sink `null_order: drop` sort field (see [Sort order](../nodes/sink.md#sort-order)). Counts exclusions, not distinct source records: like `records_written`, one source record dropped at two Sinks counts twice. Absent from spool files written before this counter existed, where it reads as `0` |
 | `execution_mode` | string | DAG-derived execution summary: `Streaming` (no full-stage materialization required) or `TwoPass` (a blocking stage forces an accumulation pass) |
 | `peak_rss_bytes` | integer/null | Peak resident set size in bytes, sampled across chunk boundaries on Linux, macOS, and Windows. `null` on platforms where RSS sampling is unavailable |
 | `thread_count` | integer | Thread pool size used |
@@ -745,7 +745,7 @@ the correlation attributes above.
 ### Lineage identity
 
 `identity_mode = "external"` is the default. Every externally emitted source
-or output node needs exactly one binding: either `canonical_datasource`, or
+or Sink node needs exactly one binding: either `canonical_datasource`, or
 the complete `catalog_namespace`/`catalog_name` pair. Missing, duplicate,
 partial, and mixed bindings fail validation; Clinker does not synthesize an
 external identity from a working directory, worker path, temporary root, URL,

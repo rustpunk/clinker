@@ -30,7 +30,7 @@ rule: first check their own `(consumer, None)` slot, which is where a `Route`
 branch or `Cull` port publishes its selected records, then require the incoming
 `(producer, producer_port)` slot. A present empty own slot is still
 authoritative; only the absence of both valid addresses is an invariant
-failure. `Transform` and `Output` also recognize successor-local slots through
+failure. `Transform` and `Sink` also recognize successor-local slots through
 their existing specialized input paths. `Merge` and `Combine` remain
 predecessor-slot readers because they select among multiple incoming edges.
 
@@ -44,8 +44,8 @@ the slot and its registration directly with O(1) bookkeeping. With several
 readers, each earlier reader opens a sequential scan over shared immutable
 backing while the original stays live for the final reader. This applies
 uniformly to materialized Transform, Aggregate,
-Sort, Reshape, Route, Cull, Envelope, Composition, Merge, Combine, and Output
-inputs, including successor-local Route/Cull slots and both Output event paths.
+Sort, Reshape, Route, Cull, Envelope, Composition, Merge, Combine, and Sink
+inputs, including successor-local Route/Cull slots and both Sink event paths.
 
 `Memory`, `Spilled`, and `Mixed` all support repeatable scans. A memory scan
 clones one event at a time; a spill scan opens one chunk at a time, preserving
@@ -153,7 +153,7 @@ covered attempts. The executor applies that population exactly once and checks
 its threshold before routing any covered attempt into the DLQ, downstream
 state or counters, or writer effects.
 
-Each `PhysicalWriterBoundary` binds one Output to the producer port, writer
+Each `PhysicalWriterBoundary` binds one Sink to the producer port, writer
 mode, partition identity, ordering guarantee, and runtime disposition selected
 from the finalized topology. The modes are `RecordsOnly`, `PerSourceFile`,
 `Envelope`, `DocumentDlq`, `CorrelationDeferred`, and `Streaming`; partition
@@ -169,7 +169,7 @@ All of this remains synchronous, single-process, finite-batch execution.
 Bounded channels provide back-pressure, `MemoryArbitrator` remains the one
 run-scoped memory authority, and source repair, terminal ordering, and shared
 fan-out reuse the existing spill and merge machinery. Runtime never recounts
-Outputs or invents a weaker order when a frozen contract and the selected path
+Sinks or invents a weaker order when a frozen contract and the selected path
 disagree; it returns `PipelineError::Internal`.
 
 ## Ordering evidence and test oracles
@@ -188,7 +188,7 @@ exact runtime path.
 | Order-preserving unary paths and `Merge` `concat` | Retain predecessor arrival; concat drains inputs in declaration order. | Exact sequence is valid for the same upstream paths. Matching per-input sorts are not promoted to global order. |
 | Seeded `Merge` interleave | Establishes a reproducible stable-arrival schedule for the seed. | Exact sequence is valid for the same seed and paths. |
 | Unseeded interleave and every current `Combine` strategy | Cross-input or matched-row arrival is incidental and the plan marks it unordered. | Compare decoded multisets, aggregate values, counters, and identities; never exact incidental row order. |
-| Terminal Output `sort_order` | Uses the shared stable resident/spill kernel and orders all records reaching that terminal by exactly the authored fields. | Exact authored-key order. Equal-key order is stable within a path, but cross-strategy exact bytes require a total authored business key. |
+| Terminal Sink `sort_order` | Uses the shared stable resident/spill kernel and orders all records reaching that terminal by exactly the authored fields. | Exact authored-key order. Equal-key order is stable within a path, but cross-strategy exact bytes require a total authored business key. |
 
 Neither source repair nor terminal sorting adds `SourceRowId`, physical-file,
 or canonical-row tie fields. Equal authored keys compare equal. Stability is
@@ -207,29 +207,29 @@ lineage, or document state have mutated.
 
 ## Which stages stream
 
-A stage streams when its output is handed straight to a single downstream consumer instead of crossing a charged inter-stage buffer. The downstream consumer is a sink `Output` writer, an `Aggregate`'s ingest, or a hash build-probe `Combine`'s probe (driver) side — see [Streaming into an Aggregate](#streaming-into-an-aggregate) and [Streaming into a Combine probe](#streaming-into-a-combine-probe) below.
+A stage streams when its output is handed straight to a single downstream consumer instead of crossing a charged inter-stage buffer. The downstream consumer is a `Sink` writer, an `Aggregate`'s ingest, or a hash build-probe `Combine`'s probe (driver) side — see [Streaming into an Aggregate](#streaming-into-an-aggregate) and [Streaming into a Combine probe](#streaming-into-a-combine-probe) below.
 
 Two stages stream *and* bound their own footprint to one batch, because they pull records off a live upstream channel and forward each batch without ever building a full result:
 
-- **Source → Transform → Output** fused chains. A non-windowed Transform whose only upstream is a single Source and whose only downstream is a single sink Output consumes that Source's records directly and hands each batch to the Output's writer thread over a back-pressured channel; neither the Transform nor the Output materializes the whole record set. A Transform that fans out to multiple consumers, feeds another operator, or roots a window keeps the buffered (materialized) path.
+- **Source → Transform → Sink** fused chains. A non-windowed Transform whose only upstream is a single Source and whose only downstream is a single Sink consumes that Source's records directly and hands each batch to the Sink's writer thread over a back-pressured channel; neither the Transform nor the Sink materializes the whole record set. A Transform that fans out to multiple consumers, feeds another operator, or roots a window keeps the buffered (materialized) path.
 - **`Merge` in `interleave` mode** fed entirely by Sources. The merge reads each Source's live stream and forwards records as they arrive.
 
 These stages stream their output to a single downstream consumer too — sparing the second copy and overlapping the consumer — but each still builds its full result first, so its own working set is not bounded to one batch:
 
-- **Single-branch `Route`**. A Route with exactly one branch feeding one sink Output streams that branch's records to the writer thread. A multi-branch Route forks records across several successor buffers and stays materialized.
-- **`Merge` in `concat` mode, or `interleave` fed by non-Source inputs**, feeding one sink Output. The merge drains its predecessors' buffers in order (concat) or round-robin (interleave) into the merged result, then streams it.
-- **`streaming`-strategy `Aggregate`** feeding one sink Output. When the planner certifies the aggregate's input is pre-sorted on the group key, it finalizes the group rows and streams them rather than buffering them for a downstream arm.
-- **`Combine` probe side** (hash build-probe strategy) feeding one sink Output. The build relation stays fully materialized in the hash table; the matched probe output streams to the writer.
+- **Single-branch `Route`**. A Route with exactly one branch feeding one Sink streams that branch's records to the writer thread. A multi-branch Route forks records across several successor buffers and stays materialized.
+- **`Merge` in `concat` mode, or `interleave` fed by non-Source inputs**, feeding one Sink. The merge drains its predecessors' buffers in order (concat) or round-robin (interleave) into the merged result, then streams it.
+- **`streaming`-strategy `Aggregate`** feeding one Sink. When the planner certifies the aggregate's input is pre-sorted on the group key, it finalizes the group rows and streams them rather than buffering them for a downstream arm.
+- **`Combine` probe side** (hash build-probe strategy) feeding one Sink. The build relation stays fully materialized in the hash table; the matched probe output streams to the writer.
 
 Each of these requires the producer to feed exactly one downstream consumer and to root no window; a producer that roots a window keeps the materialized path because the window arena needs the producer's full output to build.
 
-- **Every `Output`**. A sink writes records to its configured writer and never buffers a whole stage.
+- **Every `Sink`** writes records to its configured writer and never buffers a whole stage.
 
 Document-boundary punctuations (`DocumentOpen` / `DocumentClose`, the signals behind the `$doc.*` context) flow inline with records through streaming stages, preserving their order: a document's close always trails the document's last record, even when the document's records span several batches.
 
 ### Streaming into an Aggregate
 
-The streaming consumer above is usually a sink `Output`. It can also be an `Aggregate`'s *ingest*: when an eligible producer (a fused `Source → Transform`, a single-branch `Route`, a non-fused `Merge`, or a `streaming`-strategy `Aggregate`) feeds exactly one downstream `Aggregate`, the producer streams record-at-a-time into the aggregate's `add_record` over a back-pressured channel rather than the aggregate pre-draining the producer's whole output from a charged buffer. The producer reports `buffer: streaming` and `--explain` shows no `node_buffer` edge between it and the aggregate.
+The streaming consumer above is usually a `Sink`. It can also be an `Aggregate`'s *ingest*: when an eligible producer (a fused `Source → Transform`, a single-branch `Route`, a non-fused `Merge`, or a `streaming`-strategy `Aggregate`) feeds exactly one downstream `Aggregate`, the producer streams record-at-a-time into the aggregate's `add_record` over a back-pressured channel rather than the aggregate pre-draining the producer's whole output from a charged buffer. The producer reports `buffer: streaming` and `--explain` shows no `node_buffer` edge between it and the aggregate.
 
 This streams the aggregate's *ingest* half only — the producer no longer needs a charged inter-stage slot, and a slow aggregate (one that is spilling, say) paces the producer through the bounded channel. The aggregate's *finalize* half stays blocking by nature: a `group_by` value depends on every member, so the group table accumulates the whole input and emits only after the channel closes (end of input). Spill stays driven by RSS pressure, never by channel depth, exactly as on the materialized path.
 
@@ -248,7 +248,7 @@ A stage blocks when its result depends on records it has not seen yet:
 - **`sort`** — the full input must be present before the first sorted record is known.
 - **Hash `Aggregate`** — a group's final value depends on every member, so the group table accumulates the whole input. (A `streaming`-strategy Aggregate over a pre-sorted input is the exception: the planner certifies it can emit a group as soon as the sort key advances.)
 - **`Combine` build side** — the build relation is fully indexed before any probe record is matched. The probe side streams against the built index, but the build side materializes.
-- **`IEJoin` / sort-merge `Combine`** — both inputs are sorted before the band/merge step runs, and both are **block-spilled** so the input axis stays inside the budget, but by different mechanisms. The IEJoin — pure-range and equi+range alike, which share the one block-band path — external-sorts each side to disk on `(equality-hash, range-key, …)` and slices the sorted stream into min/max-tagged, single-equality-hash blocks, pruning block-pairs on the equality hash and the range bounds before the kernel runs (equality is an added prune axis; each surviving pair re-verifies the canonical equality key, since hashes collide). Its **output axis is spill-bounded too** — matched rows accumulate in a payload-ordered sort buffer that spills on its own byte threshold (charged through the join's consumer handle) and drains incrementally, streamed straight to a downstream Output or folded into a spillable node-buffer, so both axes are bounded with no global-pressure abort. The sort-merge Combine external-sorts each side into runs and merges matching runs; it has no min/max block tags or pruning.
+- **`IEJoin` / sort-merge `Combine`** — both inputs are sorted before the band/merge step runs, and both are **block-spilled** so the input axis stays inside the budget, but by different mechanisms. The IEJoin — pure-range and equi+range alike, which share the one block-band path — external-sorts each side to disk on `(equality-hash, range-key, …)` and slices the sorted stream into min/max-tagged, single-equality-hash blocks, pruning block-pairs on the equality hash and the range bounds before the kernel runs (equality is an added prune axis; each surviving pair re-verifies the canonical equality key, since hashes collide). Its **output axis is spill-bounded too** — matched rows accumulate in a payload-ordered sort buffer that spills on its own byte threshold (charged through the join's consumer handle) and drains incrementally, streamed straight to a downstream Sink or folded into a spillable node-buffer, so both axes are bounded with no global-pressure abort. The sort-merge Combine external-sorts each side into runs and merges matching runs; it has no min/max block tags or pruning.
 - **`CorrelationCommit`** — a correlation group is held until its commit decision (flush or dead-letter) is known.
 
 A blocking stage keeps its full-stage accumulation inside `pipeline.memory.limit` and spills to disk past the soft threshold; it does not stream batches.
@@ -258,7 +258,7 @@ A blocking stage keeps its full-stage accumulation inside `pipeline.memory.limit
 `clinker run <pipeline>.yaml --explain` annotates every node with its class in the **Physical Properties** section:
 
 ```text
-output.report:
+sink.report:
   buffer: streaming
 
 aggregation.dept_totals:

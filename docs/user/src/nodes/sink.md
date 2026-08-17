@@ -1,18 +1,20 @@
-# Output Nodes
+# Sink Nodes
 
-Output nodes write processed records to files. They are the terminal nodes of a pipeline -- every pipeline path must end at an output (or records are silently dropped).
+Sink nodes write processed records to files. They are the terminal nodes of a pipeline -- every pipeline path must end at a sink (or records are silently dropped).
 
-> **Terminal-node migration (not available yet):** The current binary accepts
-> only `type: output`, and every runnable example on this page uses that
-> spelling. Decision D-56 assigns a one-way, project-wide rename of the
-> terminal destination concept to Sink and `type: sink` under AUTH-09.
-> That atomic migration must finish before REST and SQL endpoint expansion;
-> do not write `type: sink` in current pipelines. The rename is
-> deliberately narrow: composition and node output ports, produced artifacts,
-> files and paths, serialization formats, stdout, command or machine output,
-> writer results, and OpenLineage output datasets keep the word “output.” See
-> [Production Contracts](https://github.com/rustpunk/clinker/blob/main/docs/ai/15_PRODUCTION_CONTRACTS.md#terminal-destination-vocabulary) for
-> the compatibility boundary.
+> **Terminal-node migration:** `type: output` is retired and rejected with
+> `E376`. Replace only the terminal discriminator with the paste-ready
+> correction:
+>
+> ```yaml
+> - type: sink
+> ```
+>
+> Composition and node output ports, produced artifacts, files and paths,
+> serialization formats, stdout, command or machine output, writer results,
+> and OpenLineage output datasets keep the word “output.” See [Production
+> Contracts](https://github.com/rustpunk/clinker/blob/main/docs/ai/15_PRODUCTION_CONTRACTS.md#terminal-destination-vocabulary)
+> for the compatibility boundary.
 
 ## Basic structure
 
@@ -116,7 +118,7 @@ time are omitted from the JSON rather than written as misleading zeroes.
 
 ## When two paths are the same destination
 
-Two Output nodes — or an Output node and a DLQ path — that resolve to one file
+Two Sink nodes — or a Sink node and a DLQ path — that resolve to one file
 are rejected at plan time with `E322`, before any record is read. Deciding that
 means deciding when two differently-spelled paths name one file, and that
 depends on the volume you are writing to, not on the text. Clinker measures the
@@ -160,10 +162,10 @@ Two limits are worth knowing:
 
 ## Direct broadcast to several outputs
 
-Several Output nodes may name the same input. This is a broadcast: every
-Output receives every upstream record, regardless of node declaration order.
+Several Sink nodes may name the same input. This is a broadcast: every
+Sink receives every upstream record, regardless of node declaration order.
 The run report counts one write per sink, so five input records feeding a CSV
-and a JSON Output produce `records_written: 10`.
+and a JSON Sink produce `records_written: 10`.
 
 Use a [Route](route.md) node when outputs should receive different subsets.
 Writing a field such as `_route` does not select a destination; it is an
@@ -171,7 +173,7 @@ ordinary output column unless a Route condition explicitly reads it.
 
 ## Field control
 
-Output nodes can either pass every upstream field through to the writer or restrict output to the fields the upstream transform explicitly emitted. Several options control which fields appear and how they are named.
+Sink nodes can either pass every upstream field through to the writer or restrict output to the fields the upstream transform explicitly emitted. Several options control which fields appear and how they are named.
 
 ### Unmapped input field passthrough
 
@@ -204,7 +206,7 @@ Suppose the upstream source emits records with `order_id`, `customer_id`, `amoun
       emit amount_bucket = if amount >= 1000 then "high" else "low"
 ```
 
-With `include_unmapped: true` (the default), each output record carries `order_id`, `customer_id`, `amount`, `region`, and `amount_bucket`. With `include_unmapped: false`, each output record carries only `amount_bucket`. The transform's CXL is unchanged in both cases -- the Output node decides the field set.
+With `include_unmapped: true` (the default), each output record carries `order_id`, `customer_id`, `amount`, `region`, and `amount_bucket`. With `include_unmapped: false`, each output record carries only `amount_bucket`. The transform's CXL is unchanged in both cases -- the Sink node decides the field set.
 
 ### Include correlation-key shadow columns
 
@@ -378,7 +380,7 @@ When `false`, null values are written as empty strings. When `true`, nulls are p
 
 ### Rounding decimals to a declared scale
 
-An Output node's optional `schema:` may declare a column `type: decimal` with a
+A Sink node's optional `schema:` may declare a column `type: decimal` with a
 `scale`. A `decimal` value landing in that column is rounded to the declared
 number of fractional places on write, using banker's rounding — the same
 boundary contract a `decimal` *source* column applies on read.
@@ -400,7 +402,7 @@ full-precision value. Only `decimal` values in `decimal`-declared columns are
 affected — no other type is coerced. See [Decimal — arithmetic
 rules](../cxl/types.md#arithmetic-rules) for the full boundary-contract model.
 
-The same rounding applies to an Output node declared inside a
+The same rounding applies to a Sink node declared inside a
 [composition](../pipelines/compositions.md) body. When its `schema:` names an
 external `.schema.yaml` file, the path resolves relative to the composition
 file's own directory (not the invoking pipeline's).
@@ -579,11 +581,11 @@ run that dropped any reports the number on completion:
 and the same number is written as `records_null_dropped` in the metrics spool
 when one is configured (see [Metrics](../ops/metrics.md)).
 
-Under fan-out the count is per exclusion, not per source record: two Outputs
+Under fan-out the count is per exclusion, not per source record: two Sinks
 that each declare a dropping `sort_order` each drop their own copy, so one
 source record excluded at both counts twice — the same multiplicity
 `records_written` carries. Subtracting this from `records_total` is therefore
-only sound on a pipeline with a single dropping Output.
+only sound on a pipeline with a single dropping Sink.
 
 Nothing else records these records. Unlike a DLQ entry, a dropped record
 leaves no artifact to inspect afterwards -- if you need to see which records
@@ -598,7 +600,7 @@ Shorthand: a bare string defaults to ascending with nulls last:
       - { field: "amount", order: desc }
 ```
 
-An Output `sort_order` materializes all records that reach that terminal and
+A Sink `sort_order` materializes all records that reach that terminal and
 re-establishes one order across them, including records from several physical
 files or Merge inputs. The guarantee is exactly the authored field sequence,
 direction, and null placement. `drop` is also part of the authored contract:
@@ -616,7 +618,7 @@ values instead.
 ### Physical writer boundaries
 
 Planning derives the writer boundary from the finalized graph, not from how
-many Output nodes appear in the YAML. The same ordering promise is therefore
+many Sink nodes appear in the YAML. The same ordering promise is therefore
 enforced at every physical byte-emission path:
 
 - ordinary single-file and split-file record output;
@@ -631,7 +633,7 @@ boundary using the same bounded-memory spill path. Incremental streaming
 cannot truthfully promise a terminal whole-population sort. If a finalized
 output mode is incompatible with an authored `sort_order`, planning rejects
 the pipeline instead of weakening the promise. The diagnostic names the
-Output, mode, authored keys, and last reordering stage, and includes a corrected
+Sink, mode, authored keys, and last reordering stage, and includes a corrected
 `sort_order` form that can be pasted into the source or upstream node.
 
 ## File splitting
@@ -686,7 +688,7 @@ When `group_key` is set, the split point is the first group boundary after the t
 
 ## Streaming writes after an interleave Merge
 
-When a single Output sits directly after a `Merge` with `mode: interleave` whose inputs are all Sources, records are written to disk as they arrive rather than being buffered until the merge finishes. This keeps memory flat and lets a slow writer naturally pace the upstream readers.
+When a single Sink sits directly after a `Merge` with `mode: interleave` whose inputs are all Sources, records are written to disk as they arrive rather than being buffered until the merge finishes. This keeps memory flat and lets a slow writer naturally pace the upstream readers.
 
 ```yaml
 - type: source
@@ -710,11 +712,11 @@ When a single Output sits directly after a `Merge` with `mode: interleave` whose
 ```
 
 This is automatic — there is no setting to enable it. It applies only to this
-exact shape: one interleave Merge of Sources feeding one non-splitting Output,
+exact shape: one interleave Merge of Sources feeding one non-splitting Sink,
 in a pipeline without correlation keys. Any other topology buffers as usual.
 Both paths preserve the same record multiset and writer semantics, but an
-unseeded interleave does not promise one exact cross-input row sequence. Add an
-Output `sort_order` with a total business key when exact bytes are required.
+unseeded interleave does not promise one exact cross-input row sequence. Add a
+Sink `sort_order` with a total business key when exact bytes are required.
 
 ## Complete example
 

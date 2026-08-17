@@ -32,7 +32,7 @@
 - [Reshape Nodes](nodes/reshape.md)
 - [Cull Nodes](nodes/cull.md)
 - [Envelope Nodes](nodes/envelope.md)
-- [Output Nodes](nodes/output.md)
+- [Sink Nodes](nodes/sink.md)
 
 # Source Formats
 

@@ -106,7 +106,7 @@ The source type rule is slightly wider than plain `emit each`: a statically-`nul
 
 ## Output schema
 
-The body's `emit` statements define the output record's field set, the same way `emit` does in a regular transform body. Fields the body does not emit fall under the Output node's `include_unmapped` policy (see [Output Nodes](../nodes/output.md#unmapped-input-field-passthrough)).
+The body's `emit` statements define the output record's field set, the same way `emit` does in a regular transform body. Fields the body does not emit fall under the Sink node's `include_unmapped` policy (see [Sink Nodes](../nodes/sink.md#unmapped-input-field-passthrough)).
 
 Fields written by the body shadow same-named fields on the originating input record.
 
