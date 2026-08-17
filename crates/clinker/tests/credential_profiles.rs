@@ -9,7 +9,7 @@ use clinker_exec::telemetry::{
     AdmissionOutcome, MetricKey, SpanFact, SpanName, SpanStatus, TelemetryArena, TelemetryProducer,
     TelemetryReceiver,
 };
-use clinker_plan::config::ClinkerToml;
+use clinker_plan::config::{ClinkerToml, CompileContext, PipelineConfig, parse_config};
 use clinker_plan::credentials::{
     CredentialCapability, CredentialHandleUnits, CredentialLifetime, CredentialProviderKind,
     CredentialRenewal, CredentialRequirement, CredentialRequirementName, CredentialRevocation,
@@ -23,7 +23,8 @@ use credential_profile::{
     CredentialProfile, CredentialProfileAdmissionErrorKind, CredentialProfileCatalog,
     CredentialProfileLimits, CredentialProfileName, CredentialProvider, CredentialProviderFailure,
     CredentialRegistryErrorKind, CredentialResolutionErrorKind, LeasedCredentialHandle,
-    resolve_explicit_profile, resolve_explicit_profile_with_telemetry,
+    admit_uncredentialed_run_capabilities, resolve_explicit_profile,
+    resolve_explicit_profile_with_telemetry,
 };
 
 fn requirement(capabilities: Vec<CredentialCapability>) -> CredentialRequirement {
@@ -1359,4 +1360,30 @@ fn unsupported_activation_preflight_error_is_fixed_and_sanitized() {
     assert!(!rendered.contains("orders.api"));
     assert!(!rendered.contains("saturated-profile"));
     assert!(!rendered.contains("lease-secret"));
+}
+
+#[test]
+fn credential_free_compiled_plan_enters_the_executor_owned_bundle() {
+    let config: PipelineConfig = parse_config(
+        r#"pipeline: { name: credential_free_bundle }
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: rows.csv
+      schema: [{ name: id, type: string }]
+"#,
+    )
+    .expect("fixture parses");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("fixture compiles");
+
+    let admitted =
+        admit_uncredentialed_run_capabilities(&plan).expect("empty credential inventory admits");
+
+    assert_eq!(admitted.group_count(), 1);
+    assert_eq!(admitted.remaining_group_count(), 1);
 }

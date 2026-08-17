@@ -8,6 +8,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use clinker_exec::executor::capabilities::{AdmittedRunCapabilities, RunCapabilityErrorKind};
 use clinker_exec::pipeline::memory::{
     ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
@@ -73,6 +74,51 @@ pub const DEFAULT_MAX_CREDENTIAL_DEFINITION_BYTES: usize = 1_048_576;
 pub const DEFAULT_MAX_LIVE_CREDENTIAL_HANDLES: usize = 256;
 
 const CREDENTIAL_LIFECYCLE_SCOPE: &str = "credential-lifecycle";
+
+/// Closed failure from the current CLI activation-admission boundary.
+///
+/// The binary has no credential-profile option or profile configuration table
+/// yet. It therefore admits only sealed activation inventories whose complete
+/// credential sets and credential-handle capacities are empty.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActivationAdmissionError {
+    /// The compiled activation inventory requires the absent profile preflight.
+    UnsupportedCredentialPreflight,
+    /// The compiled activation inventory was not sealed or was inconsistent.
+    InvalidCompiledActivation,
+}
+
+impl fmt::Display for ActivationAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedCredentialPreflight => formatter.write_str(
+                "credential-bearing activation is unsupported because no credential profile preflight is configured",
+            ),
+            Self::InvalidCompiledActivation => formatter
+                .write_str("the compiled activation inventory could not be admitted for execution"),
+        }
+    }
+}
+
+impl std::error::Error for ActivationAdmissionError {}
+
+/// Admit one compiled run only when its complete credential contract is empty.
+///
+/// The returned executor-owned bundle preserves each group's exact checked
+/// resource/opener capacity and owns its no-op direct-source guards. It is
+/// created without discovery, I/O, worker startup, telemetry, lineage, opener,
+/// session, or credential-provider side effects.
+pub fn admit_uncredentialed_run_capabilities(
+    plan: &clinker_plan::plan::CompiledPlan,
+) -> Result<AdmittedRunCapabilities, ActivationAdmissionError> {
+    AdmittedRunCapabilities::uncredentialed(plan.dag().source_activation()).map_err(|error| {
+        if error.kind() == RunCapabilityErrorKind::UnsupportedCredentialRequirements {
+            ActivationAdmissionError::UnsupportedCredentialPreflight
+        } else {
+            ActivationAdmissionError::InvalidCompiledActivation
+        }
+    })
+}
 
 #[derive(Clone, Copy)]
 struct OperationSignals {

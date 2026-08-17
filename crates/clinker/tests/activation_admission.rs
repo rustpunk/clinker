@@ -2,6 +2,7 @@ use std::process::Command;
 
 use clinker_plan::config::{CompileContext, PipelineConfig, parse_config};
 
+#[allow(dead_code)]
 #[path = "../src/credential_profile.rs"]
 mod credential_profile;
 
