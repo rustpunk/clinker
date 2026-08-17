@@ -30,7 +30,7 @@ use indexmap::IndexMap;
 use crate::config::compile_context::{CompileContext, ConfigOverrides};
 use crate::config::composition::{
     CompositionFile, CompositionSignature, CompositionSymbolTable, LayerKind, OutputAlias,
-    ParamType, PortDecl, ProvenanceDb, ResolvedValue,
+    ParamType, PortDecl, ProvenanceDb, ResolvedValue, ResourceBinding,
 };
 use crate::config::node_header::CombineHeader;
 use crate::config::pipeline_node::{
@@ -44,6 +44,7 @@ use crate::plan::combine::{
 use crate::plan::composition_body::{BoundBody, CompositionBodyId};
 use crate::plan::types::JoinSide;
 use crate::plan::{EntityRef, PlanNodeId};
+use crate::resources::WorkspaceCatalog;
 use crate::yaml::Spanned;
 use clinker_core_types::span::{FileId, Span};
 use clinker_core_types::{Diagnostic, LabeledSpan};
@@ -330,6 +331,8 @@ pub(crate) struct BindContext<'a> {
     /// call site. Empty for compositions that don't propagate scoped vars
     ///.
     pub scoped_vars: cxl::resolve::ScopedVarsRegistry,
+    /// Bounded typed workspace resources admitted before the bind walk.
+    pub resource_catalog: &'a WorkspaceCatalog,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────
@@ -374,6 +377,26 @@ pub fn bind_schema(
     let mut scoped_vars = scoped_vars;
     scoped_vars.module_exports = ctx.cxl_modules.module_exports();
     scoped_vars.runtime_modules = ctx.cxl_modules.runtime_modules();
+    let resource_catalog =
+        match crate::config::ClinkerToml::load_from_workspace(ctx.workspace_root())
+            .map_err(|error| error.to_string())
+            .and_then(|workspace| {
+                WorkspaceCatalog::load(ctx.workspace_root(), &workspace.catalog)
+                    .map_err(|error| error.to_string())
+            }) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                diags.push(
+                    Diagnostic::error(
+                        "E103",
+                        format!("workspace resource catalog is invalid: {error}"),
+                        LabeledSpan::primary(Span::SYNTHETIC, "invalid resource catalog"),
+                    )
+                    .with_help("correct `[catalog.resources]` in clinker.toml before compiling"),
+                );
+                return artifacts;
+            }
+        };
     let mut bind_ctx = BindContext {
         ctx,
         symbol_table,
@@ -382,6 +405,7 @@ pub fn bind_schema(
         enclosing_scope_names: HashSet::new(),
         origin_dir: pipeline_dir.to_path_buf(),
         scoped_vars,
+        resource_catalog: &resource_catalog,
     };
     bind_schema_inner(
         nodes,
@@ -3054,7 +3078,6 @@ fn bind_schema_inner(
             PipelineNode::Composition {
                 r#use,
                 inputs,
-                outputs,
                 config,
                 resources,
                 ..
@@ -3065,7 +3088,6 @@ fn bind_schema_inner(
                         node_id,
                         use_path: r#use,
                         call_inputs: inputs,
-                        call_outputs: outputs,
                         call_config: config,
                         call_resources: resources,
                         span,
@@ -3083,8 +3105,8 @@ fn bind_schema_inner(
 // ─── Composition binding ────────────────────────────────────────────
 
 /// Immutable call-site inputs to [`bind_composition`]: the node's name and
-/// `use:` path, plus the four call-site override maps (`inputs:`,
-/// `outputs:`, `config:`, `resources:`) read off the
+/// `use:` path, plus the three call-site maps (`inputs:`, `config:`,
+/// `resources:`) read off the
 /// `PipelineNode::Composition` variant. Grouped so the mutable binding
 /// accumulators (`diags`, `bind_ctx`, `artifacts`, parent scope) stay
 /// visually distinct from the read-only call-site data the function
@@ -3097,9 +3119,8 @@ struct CompositionBindParams<'a> {
     node_id: PlanNodeId,
     use_path: &'a Path,
     call_inputs: &'a IndexMap<String, String>,
-    call_outputs: &'a IndexMap<String, String>,
     call_config: &'a IndexMap<String, serde_json::Value>,
-    call_resources: &'a IndexMap<String, serde_json::Value>,
+    call_resources: &'a IndexMap<String, ResourceBinding>,
     span: Span,
 }
 
@@ -3120,7 +3141,6 @@ fn bind_composition(
         node_id,
         use_path,
         call_inputs,
-        call_outputs,
         call_config,
         call_resources,
         span,
@@ -3186,8 +3206,15 @@ fn bind_composition(
         has_errors = true;
     }
 
-    // 5. Validate resources (stub pending full Resource enum).
-    if !validate_resources(call_resources, signature, node_name, span, diags) {
+    // 5. Validate every logical resource binding against the declared slot.
+    if !validate_resources(
+        call_resources,
+        signature,
+        bind_ctx.resource_catalog,
+        node_name,
+        span,
+        diags,
+    ) {
         has_errors = true;
     }
 
@@ -3685,8 +3712,7 @@ fn bind_composition(
     bind_ctx.origin_dir = saved_origin_dir;
 
     // 9. Compute output rows from signature.outputs → body schemas.
-    let output_port_rows =
-        compute_output_rows(&signature.outputs, &body_schema_by_name, call_outputs);
+    let output_port_rows = compute_output_rows(&signature.outputs, &body_schema_by_name);
 
     // 10. W101 check: body-declared columns shadowing input port pass-throughs.
     check_w101_shadows(
@@ -4057,6 +4083,7 @@ fn bind_composition(
     // schema file they name, and the identity has to be of the body that
     // binds, not the body the file spelled.
     bound_body.semantic_digest = body_file.semantic_digest();
+    bound_body.resource_bindings = call_resources.clone();
     bound_body.graph = body_graph;
     bound_body.topo_order = body_topo;
     bound_body.name_to_idx = body_name_to_idx;
@@ -4175,16 +4202,119 @@ fn validate_config(
     ok
 }
 
-/// Validate call-site `resources:` — stub pending full Resource enum. Real validation
-/// lands when the Resource enum is fully defined.
 fn validate_resources(
-    _call_site: &IndexMap<String, serde_json::Value>,
-    _signature: &CompositionSignature,
-    _node_name: &str,
-    _span: Span,
-    _diags: &mut Vec<Diagnostic>,
+    call_site: &IndexMap<String, ResourceBinding>,
+    signature: &CompositionSignature,
+    catalog: &WorkspaceCatalog,
+    node_name: &str,
+    fallback_span: Span,
+    diags: &mut Vec<Diagnostic>,
 ) -> bool {
-    true
+    let mut valid = true;
+    for (slot, declaration) in &signature.resources_schema {
+        let Some(binding) = call_site.get(slot) else {
+            if declaration.required {
+                diags.push(
+                    Diagnostic::error(
+                        "E103",
+                        format!(
+                            "composition node {node_name:?}: required resource slot {slot:?} has no catalog binding"
+                        ),
+                        LabeledSpan::primary(fallback_span, "missing required resource binding"),
+                    )
+                    .with_help(format!(
+                        "add `resources: {{ {slot}: <catalog-resource-id> }}` to this composition call"
+                    )),
+                );
+                valid = false;
+            }
+            continue;
+        };
+        let span = binding
+            .provenance()
+            .winning_layer()
+            .map_or(fallback_span, |layer| layer.span);
+        let resource = match catalog.resolve_resource(binding.logical_id()) {
+            Ok(resource) => resource,
+            Err(error) => {
+                diags.push(
+                    Diagnostic::error(
+                        "E103",
+                        format!(
+                            "composition node {node_name:?}: resource slot {slot:?} cannot bind `{}`: {error}",
+                            binding.logical_id()
+                        ),
+                        LabeledSpan::primary(span, "unknown catalog resource"),
+                    )
+                    .with_help(format!(
+                        "add `[catalog.resources.{}]` to clinker.toml or bind {slot:?} to an existing resource",
+                        binding.logical_id()
+                    )),
+                );
+                valid = false;
+                continue;
+            }
+        };
+        if resource.descriptor().kind() != declaration.kind {
+            diags.push(
+                Diagnostic::error(
+                    "E103",
+                    format!(
+                        "composition node {node_name:?}: resource slot {slot:?} requires kind `{}`, but `{}` has kind `{}`",
+                        declaration.kind.label(),
+                        binding.logical_id(),
+                        resource.descriptor().kind().label()
+                    ),
+                    LabeledSpan::primary(span, "incompatible resource kind"),
+                )
+                .with_help(format!(
+                    "bind {slot:?} to a catalog resource with `kind = {:?}`",
+                    declaration.kind.label()
+                )),
+            );
+            valid = false;
+            continue;
+        }
+        let missing = declaration
+            .kind
+            .required_capabilities()
+            .iter()
+            .find(|required| !resource.descriptor().capabilities().contains(required));
+        if let Some(missing) = missing {
+            diags.push(
+                Diagnostic::error(
+                    "E103",
+                    format!(
+                        "composition node {node_name:?}: resource slot {slot:?} requires capability {missing:?}, but `{}` does not provide it",
+                        binding.logical_id()
+                    ),
+                    LabeledSpan::primary(span, "incompatible resource capability"),
+                )
+                .with_help("choose a compatible catalog resource or correct its `access` declaration"),
+            );
+            valid = false;
+        }
+    }
+    for (slot, binding) in call_site {
+        if !signature.resources_schema.contains_key(slot) {
+            let span = binding
+                .provenance()
+                .winning_layer()
+                .map_or(fallback_span, |layer| layer.span);
+            diags.push(
+                Diagnostic::error(
+                    "E103",
+                    format!(
+                        "composition node {node_name:?}: resource slot {slot:?} is not declared in `_compose.resources_schema`"
+                    ),
+                    LabeledSpan::primary(span, "undeclared resource slot"),
+                )
+                .with_help("remove the binding or declare the slot in the composition signature"),
+            );
+            valid = false;
+        }
+    }
+    valid
 }
 
 /// Populate [`ProvenanceDb`] entries for each resolved config param.
@@ -4470,7 +4600,6 @@ fn read_and_parse_body(
 fn compute_output_rows(
     signature_outputs: &IndexMap<String, OutputAlias>,
     body_schemas: &HashMap<String, Row>,
-    _call_outputs: &IndexMap<String, String>,
 ) -> IndexMap<String, Row> {
     let mut rows = IndexMap::new();
     for (port_name, alias) in signature_outputs {

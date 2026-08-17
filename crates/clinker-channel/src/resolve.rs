@@ -37,7 +37,7 @@ use clinker_core_types::{Diagnostic, LabeledSpan, Span};
 use clinker_plan::config::composition::LayerKind;
 use clinker_plan::config::pipeline_node::PipelineNode;
 use clinker_plan::config::{ChannelLayout, GroupLayout, PipelineConfig, SourceConfigPatch};
-use clinker_plan::overlay_ops::{LayeredOp, OverlayLayer, OverlayOp};
+use clinker_plan::overlay_ops::{BindResourceOp, LayeredOp, OverlayLayer, OverlayOp};
 use clinker_plan::plan::CompiledPlan;
 use clinker_plan::plan::compiled::{
     ChannelGroupSource, ChannelIdentity, ChannelLayerIdentity, ChannelLayerKind,
@@ -54,7 +54,7 @@ use crate::discovery::{
 };
 use crate::error::ChannelError;
 use crate::group::{Group, validate_group_targets};
-use crate::manifest::{ChannelManifest, ChannelVars};
+use crate::manifest::{ChannelManifest, ChannelVars, ResourceOverlayValue};
 use crate::overlay::{
     ChannelOverlayResult, EffectiveConfig, ResolvedChannelConfig, apply_config_candidates,
     resolve_vars_layer,
@@ -699,6 +699,22 @@ fn build_resolution(
             applied.op_layer,
             &applied.name,
         );
+        push_resource_ops(
+            &mut op_stream,
+            &applied.group.resources,
+            applied.op_layer,
+            applied.layer,
+        );
+    }
+    if let Some(context) = &channel
+        && let Some(manifest) = &context.manifest
+    {
+        push_resource_ops(
+            &mut op_stream,
+            &manifest.resources,
+            OverlayLayer::ChannelWide,
+            LayerKind::ChannelWide,
+        );
     }
     if let Some(context) = &channel
         && let Some(overlay) = &context.per_target
@@ -709,6 +725,12 @@ fn build_resolution(
             &overlay.overlay.overrides,
             OverlayLayer::ChannelPerTarget,
             &context.id,
+        );
+        push_resource_ops(
+            &mut op_stream,
+            &overlay.overlay.resources,
+            OverlayLayer::ChannelPerTarget,
+            LayerKind::ChannelPerTarget,
         );
     }
     OverlayResolution {
@@ -894,6 +916,22 @@ pub fn resolve(
             applied.op_layer,
             &applied.name,
         );
+        push_resource_ops(
+            &mut op_stream,
+            &applied.group.resources,
+            applied.op_layer,
+            applied.layer,
+        );
+    }
+    if let Some(ctx) = &channel
+        && let Some(manifest) = &ctx.manifest
+    {
+        push_resource_ops(
+            &mut op_stream,
+            &manifest.resources,
+            OverlayLayer::ChannelWide,
+            LayerKind::ChannelWide,
+        );
     }
     if let Some(ctx) = &channel
         && let Some(overlay) = &ctx.per_target
@@ -905,6 +943,12 @@ pub fn resolve(
             OverlayLayer::ChannelPerTarget,
             &ctx.id,
         );
+        push_resource_ops(
+            &mut op_stream,
+            &overlay.overlay.resources,
+            OverlayLayer::ChannelPerTarget,
+            LayerKind::ChannelPerTarget,
+        );
     }
 
     Ok(OverlayResolution {
@@ -913,6 +957,30 @@ pub fn resolve(
         injected_nodes,
         op_stream,
     })
+}
+
+fn push_resource_ops(
+    op_stream: &mut Vec<LayeredOp>,
+    resources: &indexmap::IndexMap<String, ResourceOverlayValue>,
+    layer: OverlayLayer,
+    provenance_layer: LayerKind,
+) {
+    for (address, candidate) in resources {
+        let Some((target, slot)) = address.split_once('.') else {
+            continue;
+        };
+        let operation = OverlayOp::BindResource(BindResourceOp {
+            target: target.to_string(),
+            slot: slot.to_string(),
+            binding: candidate.value.clone(),
+            provenance_layer,
+            fixed: candidate.fixed,
+        });
+        op_stream.push(LayeredOp::new(
+            layer,
+            Spanned::new(operation, candidate.value_span, candidate.value_span),
+        ));
+    }
 }
 
 /// Tag each op in `ops` with `layer`, push it onto the stream, and record any

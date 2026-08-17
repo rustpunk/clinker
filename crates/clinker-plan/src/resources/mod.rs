@@ -18,10 +18,163 @@ use clinker_core_types::span::FileId;
 use cxl::ast::{BinOp, Expr, LiteralValue, Module, UnaryOp};
 use serde::{Deserialize, Serialize};
 
+use crate::config::composition::{ResourceCapability, ResourceKind};
+
 pub const DEFAULT_MAX_MODULE_BYTES: usize = 1_048_576;
 pub const DEFAULT_MAX_MODULES: usize = 64;
 pub const DEFAULT_MAX_IMPORT_DEPTH: usize = 32;
 pub const DEFAULT_MAX_CLOSURE_BYTES: usize = 16 * 1_048_576;
+/// Maximum number of logical entries admitted by one workspace catalog.
+pub const DEFAULT_MAX_CATALOG_ENTRIES: usize = 1_024;
+/// Maximum encoded size of all typed runtime-resource descriptors.
+pub const DEFAULT_MAX_RESOURCE_DESCRIPTOR_BYTES: usize = 1_048_576;
+
+/// Fixed planning-time bounds for workspace catalog admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogLimits {
+    /// Maximum number of logical entries across every catalog namespace.
+    pub max_entries: usize,
+    /// Maximum encoded bytes retained by typed runtime-resource descriptors.
+    pub max_descriptor_bytes: usize,
+}
+
+impl Default for CatalogLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: DEFAULT_MAX_CATALOG_ENTRIES,
+            max_descriptor_bytes: DEFAULT_MAX_RESOURCE_DESCRIPTOR_BYTES,
+        }
+    }
+}
+
+/// Access capabilities supplied by a cataloged file descriptor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FileResourceAccess {
+    /// Read-only input resource.
+    #[default]
+    Read,
+    /// Write-only output resource.
+    Write,
+    /// Resource may be opened for either direction.
+    ReadWrite,
+}
+
+impl FileResourceAccess {
+    fn capabilities(self) -> &'static [ResourceCapability] {
+        match self {
+            Self::Read => &[ResourceCapability::Read],
+            Self::Write => &[ResourceCapability::Write],
+            Self::ReadWrite => &[ResourceCapability::Read, ResourceCapability::Write],
+        }
+    }
+}
+
+/// Strict, secret-free descriptor form accepted under `[catalog.resources]`.
+///
+/// No credential, profile, token, or arbitrary options map exists in this
+/// type. Unknown keys therefore fail at TOML parsing rather than surviving as
+/// inert state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CatalogResourceConfig {
+    /// File descriptor validated against the workspace root during admission.
+    File {
+        /// Authored workspace-relative path.
+        path: PathBuf,
+        /// Capabilities this descriptor supplies.
+        #[serde(default)]
+        access: FileResourceAccess,
+    },
+}
+
+impl CatalogResourceConfig {
+    fn descriptor_bytes(&self, id: &str) -> Option<usize> {
+        let base = id.len().checked_add("file".len())?;
+        match self {
+            Self::File { path, access } => base
+                .checked_add(path.to_string_lossy().len())?
+                .checked_add(match access {
+                    FileResourceAccess::Read => "read".len(),
+                    FileResourceAccess::Write => "write".len(),
+                    FileResourceAccess::ReadWrite => "read-write".len(),
+                }),
+        }
+    }
+}
+
+/// Typed descriptor retained after catalog admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceDescriptor {
+    /// Workspace-contained file target.
+    File {
+        /// Authored workspace-relative path, retained only in the catalog.
+        path: PathBuf,
+        /// Capabilities this descriptor supplies.
+        access: FileResourceAccess,
+    },
+}
+
+impl ResourceDescriptor {
+    /// Descriptor kind used for slot compatibility.
+    pub fn kind(&self) -> ResourceKind {
+        match self {
+            Self::File { .. } => ResourceKind::File,
+        }
+    }
+
+    /// Capabilities the descriptor supplies.
+    pub fn capabilities(&self) -> &'static [ResourceCapability] {
+        match self {
+            Self::File { access, .. } => access.capabilities(),
+        }
+    }
+
+    /// Secret-free logical path retained by a file descriptor.
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::File { path, .. } => path,
+        }
+    }
+}
+
+/// Stable logical dataset identity inputs supplied to the lineage crate.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResourceDatasetIdentity {
+    /// Stable per-kind namespace.
+    pub namespace: &'static str,
+    /// Logical catalog identity, independent of physical location.
+    pub name: String,
+}
+
+/// One admitted runtime resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogResource {
+    id: LogicalResourceId,
+    descriptor: ResourceDescriptor,
+}
+
+impl CatalogResource {
+    /// Logical catalog identity.
+    pub fn id(&self) -> &LogicalResourceId {
+        &self.id
+    }
+
+    /// Admitted typed descriptor.
+    pub fn descriptor(&self) -> &ResourceDescriptor {
+        &self.descriptor
+    }
+
+    /// Stable, relocation-independent dataset identity for this resource.
+    pub fn dataset_identity(&self) -> ResourceDatasetIdentity {
+        match &self.descriptor {
+            ResourceDescriptor::File { .. } => ResourceDatasetIdentity {
+                namespace: "clinker-resource:file",
+                name: self.id.to_string(),
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +191,10 @@ pub struct CatalogConfig {
     pub pipelines: BTreeMap<String, PathBuf>,
     #[serde(default)]
     pub channels: BTreeMap<String, PathBuf>,
+    /// Named runtime resources. Values are strict typed descriptors, never
+    /// untyped payload maps.
+    #[serde(default)]
+    pub resources: BTreeMap<String, CatalogResourceConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -94,6 +251,25 @@ impl fmt::Display for LogicalResourceId {
     }
 }
 
+impl Serialize for LogicalResourceId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.as_str().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LogicalResourceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceError {
     message: String,
@@ -120,16 +296,66 @@ pub struct WorkspaceCatalog {
     workspace_root: PathBuf,
     rules_root: Option<PathBuf>,
     entries: HashMap<(CatalogResourceKind, LogicalResourceId), PathBuf>,
+    resources: HashMap<LogicalResourceId, CatalogResource>,
 }
 
 impl WorkspaceCatalog {
     pub fn load(workspace_root: &Path, config: &CatalogConfig) -> Result<Self, ResourceError> {
+        Self::load_with_limits(workspace_root, config, CatalogLimits::default())
+    }
+
+    /// Load a catalog under explicit fixed bounds.
+    ///
+    /// Bounds are checked before any entry is inserted, so cap failures cannot
+    /// leave a partially admitted catalog.
+    pub fn load_with_limits(
+        workspace_root: &Path,
+        config: &CatalogConfig,
+        limits: CatalogLimits,
+    ) -> Result<Self, ResourceError> {
+        let entry_count = [
+            config.rules.len(),
+            config.schemas.len(),
+            config.compositions.len(),
+            config.pipelines.len(),
+            config.channels.len(),
+            config.resources.len(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .ok_or_else(|| ResourceError::new("catalog entry count overflow"))?;
+        if entry_count > limits.max_entries {
+            return Err(ResourceError::new(format!(
+                "catalog has {entry_count} entries, exceeding the fixed limit of {}; remove entries or split the workspace",
+                limits.max_entries
+            )));
+        }
+
+        let descriptor_bytes =
+            config
+                .resources
+                .iter()
+                .try_fold(0usize, |total, (id, descriptor)| {
+                    let bytes = descriptor.descriptor_bytes(id).ok_or_else(|| {
+                        ResourceError::new("runtime resource descriptor byte count overflow")
+                    })?;
+                    total.checked_add(bytes).ok_or_else(|| {
+                        ResourceError::new("runtime resource descriptor byte count overflow")
+                    })
+                })?;
+        if descriptor_bytes > limits.max_descriptor_bytes {
+            return Err(ResourceError::new(format!(
+                "runtime resource descriptors use {descriptor_bytes} bytes, exceeding the fixed limit of {}; shorten descriptors or split the workspace",
+                limits.max_descriptor_bytes
+            )));
+        }
+
         let workspace_root = workspace_root
             .canonicalize()
             .map_err(|error| ResourceError::new(format!("cannot open workspace root: {error}")))?;
         let mut entries = HashMap::new();
-        let mut physical_ids: HashMap<PathBuf, (CatalogResourceKind, LogicalResourceId)> =
-            HashMap::new();
+        let mut physical_ids: HashMap<PathBuf, (&'static str, LogicalResourceId)> = HashMap::new();
+        let mut resources = HashMap::new();
 
         for (kind, configured) in [
             (CatalogResourceKind::Rule, &config.rules),
@@ -145,20 +371,54 @@ impl WorkspaceCatalog {
                     return Err(ResourceError::new(format!(
                         "catalog identities `{}` ({}) and `{}` ({}) resolve to the same canonical target",
                         previous_id,
-                        previous_kind.label(),
+                        previous_kind,
                         id,
                         kind.label()
                     )));
                 }
-                physical_ids.insert(target.clone(), (kind, id.clone()));
+                physical_ids.insert(target.clone(), (kind.label(), id.clone()));
                 entries.insert((kind, id), target);
             }
+        }
+
+        for (raw_id, config) in &config.resources {
+            let id = LogicalResourceId::parse(raw_id)?;
+            let descriptor = match config {
+                CatalogResourceConfig::File { path, access } => {
+                    let target = validate_runtime_file_target(&workspace_root, path, &id)?;
+                    if let Some((previous_kind, previous_id)) = physical_ids.get(&target) {
+                        return Err(ResourceError::new(format!(
+                            "catalog identities `{}` ({}) and `{}` ({}) resolve to the same canonical target",
+                            previous_id, previous_kind, id, "runtime file"
+                        )));
+                    }
+                    physical_ids.insert(target, ("runtime file", id.clone()));
+                    ResourceDescriptor::File {
+                        path: path.clone(),
+                        access: *access,
+                    }
+                }
+            };
+            resources.insert(id.clone(), CatalogResource { id, descriptor });
         }
 
         Ok(Self {
             workspace_root,
             rules_root: config.rules_root.clone(),
             entries,
+            resources,
+        })
+    }
+
+    /// Resolve one typed runtime resource by logical identity.
+    pub fn resolve_resource(
+        &self,
+        id: &LogicalResourceId,
+    ) -> Result<&CatalogResource, ResourceError> {
+        self.resources.get(id).ok_or_else(|| {
+            ResourceError::new(format!(
+                "unknown runtime resource `{id}`; add `[catalog.resources.{id}]` to clinker.toml"
+            ))
         })
     }
 
@@ -227,6 +487,34 @@ impl WorkspaceCatalog {
         path.set_extension("cxl");
         canonical_workspace_target(&self.workspace_root, &path, CatalogResourceKind::Rule, id)
     }
+}
+
+fn validate_runtime_file_target(
+    workspace_root: &Path,
+    raw: &Path,
+    id: &LogicalResourceId,
+) -> Result<PathBuf, ResourceError> {
+    if has_parent_component(raw) {
+        return Err(ResourceError::new(format!(
+            "file resource `{id}` escapes the workspace; use a workspace-relative path without `..`"
+        )));
+    }
+    let candidate = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        workspace_root.join(raw)
+    };
+    let canonical = candidate.canonicalize().map_err(|error| {
+        ResourceError::new(format!(
+            "file resource `{id}` cannot be opened during catalog validation: {error}"
+        ))
+    })?;
+    if !canonical.starts_with(workspace_root) {
+        return Err(ResourceError::new(format!(
+            "file resource `{id}` resolves outside the workspace"
+        )));
+    }
+    Ok(canonical)
 }
 
 fn has_parent_component(path: &Path) -> bool {

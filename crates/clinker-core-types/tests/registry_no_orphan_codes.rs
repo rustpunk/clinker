@@ -67,6 +67,26 @@ fn retired_terminal_spelling_has_one_reserved_descriptor() {
 }
 
 #[test]
+fn rejected_composition_call_fields_have_one_active_descriptor() {
+    let rows: Vec<_> = REGISTRY
+        .iter()
+        .filter(|entry| entry.code == "E377")
+        .collect();
+    assert_eq!(rows.len(), 1);
+    let entry = rows[0];
+    assert_eq!(entry.lifecycle, DiagnosticLifecycle::Active);
+    assert_eq!(entry.severity, Severity::Error);
+    assert_eq!(entry.category, DiagnosticCategory::Configuration);
+    assert_eq!(entry.retry_advice, RetryAdvice::DoNotRetry);
+    assert_eq!(
+        entry.meaning,
+        "Ordinary composition call uses rejected inert `alias` or `outputs` state"
+    );
+    assert!(entry.correction.contains("name:"));
+    assert!(entry.correction.contains("_compose.outputs"));
+}
+
+#[test]
 fn registry_descriptors_are_complete_and_unique() {
     let mut codes = std::collections::BTreeSet::new();
     for entry in REGISTRY {

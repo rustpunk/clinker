@@ -79,7 +79,7 @@ nodes:
 | `_compose.outputs` | Yes | Output port aliases pointing to body nodes or route ports |
 | `_compose.config_schema` | No | Typed configuration parameters, defaults, and constraints |
 | `_compose.scoped_vars` | No | Explicit scoped-variable names the sealed body may read from its caller |
-| `_compose.resources_schema` | No | Reserved file-resource declarations; see [Resource status](#resource-status) |
+| `_compose.resources_schema` | No | Typed resource slots; see [Resource bindings](#resource-bindings) |
 | `nodes` | Yes | Unified node list for the sealed composition body |
 
 ### Reading config parameters in the body
@@ -167,19 +167,64 @@ Downstream nodes consume a composition's declared output ports using the usual
 `node.port` syntax. If there is only one output port, the bare composition node
 name selects it.
 
-### Resource status
+### Resource bindings
 
-Composition resources are reserved surface, not a working runtime facility.
-The declaration model currently recognizes only `kind: file`, and the parser
-accepts call-site `resources:`. Planner resource validation is currently a
-stub, and bindings are not resolved or consumed during execution. Connection
-strings and other resource kinds are unsupported. Do not put operational
-dependencies in `resources:` until runtime resource binding is implemented.
+A composition declares the external capabilities it needs as typed slots. The
+currently admitted kind is `file`; it requires read capability and a run-local
+file opener:
 
-The call-site parser also accepts `outputs:` and `alias:` fields, but they do
-not currently remap declared output ports or namespace expanded body nodes.
-Use `_compose.outputs` for the public output contract and the composition
-node's `name` for its caller-visible namespace.
+```yaml
+_compose:
+  name: order_lookup
+  inputs:
+    input: { schema: [{ name: order_id, type: string }] }
+  outputs: { out: shape }
+  config_schema: {}
+  resources_schema:
+    orders:
+      kind: file
+      required: true
+```
+
+The workspace supplies a concrete, secret-free descriptor under a logical
+identity in `clinker.toml`:
+
+```toml
+[catalog.resources.shared_orders]
+kind = "file"
+path = "data/orders.csv"
+access = "read"
+```
+
+The call site binds only the declared slot to that logical identity:
+
+```yaml
+- type: composition
+  name: lookup
+  input: orders
+  use: ./compositions/order_lookup.comp.yaml
+  inputs: { input: orders }
+  resources: { orders: shared_orders }
+```
+
+Resource descriptors are strict. Unknown kinds or fields, inline objects,
+unknown catalog identities, undeclared slots, missing required slots, and
+kind/capability mismatches fail planning. A call site cannot contain a path,
+credential profile, secret, token, or opened handle. File descriptors must
+remain inside the workspace and the catalog is admitted under fixed entry and
+descriptor-byte limits.
+
+Planning retains the winning logical identity and every attempted overlay
+layer for each binding. That identity also participates in the semantic plan
+fingerprint. Runtime credential resolution and handle activation are separate
+future preflight work; this surface neither selects credentials nor opens the
+file.
+
+Ordinary composition calls do not have `outputs:` or `alias:` fields. Either
+key fails with E377 at its authored location. Use `_compose.outputs` for the
+public output contract and the composition node's `name` for its
+caller-visible namespace. `add.alias` remains valid only inside an overlay
+`add` operation, where it names the inserted node.
 
 ### Call-site fields
 
@@ -189,33 +234,18 @@ node's `name` for its caller-visible namespace.
 | `use` | Yes | Path to the `.comp.yaml` definition |
 | `inputs` | Yes for declared ports | Map of composition input ports to upstream node references |
 | `config` | No | Parameter overrides (key-value pairs) |
-| `resources` | Reserved | Parsed but not validated or consumed at runtime |
-| `outputs` | Reserved | Parsed but does not override `_compose.outputs` |
-| `alias` | Reserved | Parsed but does not namespace body nodes |
+| `resources` | No | Declared slot to logical `[catalog.resources]` identity; scalar values only |
+| `outputs` | Rejected | E377: declare ports under `_compose.outputs` and use `node.port` downstream |
+| `alias` | Rejected | E377: use this composition node's `name` as the namespace |
 
-### Locked replacement contract
+### Contract status
 
-D-12 through D-16 lock the replacement for these inert surfaces, but it has
-not been implemented yet:
-
-- Resource kinds come from a bounded typed registry. Each registered kind owns
-  its descriptor schema, validation, runtime opener, capabilities, redaction,
-  provenance, tests, and documentation; unknown kinds fail closed (D-12).
-- Concrete resources live in a named catalog. `_compose.resources_schema`
-  declares typed slots, and call-site `resources:` binds those slots to catalog
-  names instead of embedding definitions or secrets (D-13).
-- Channel and group overlays may rebind a slot to another catalog name under
-  existing precedence and fixed-lock rules. Unknown slots and catalog names
-  fail before execution, and provenance records attempted and winning bindings
-  (D-14).
-- Planning validates descriptors, capabilities, bindings, and non-secret
-  compile inputs. Run preflight resolves secret references and opens run-local
-  handles before data side effects; plans never store secret values or live
-  handles (D-15).
-- Ordinary call-site `outputs:` and `alias:` are rejected. `_compose.outputs`
-  remains the public output contract, the composition node `name` remains its
-  caller-visible namespace, and the distinct channel/group insertion alias is
-  unaffected (D-16).
+The bounded catalog, typed file slot/binding, overlay provenance, stable
+logical dataset identity, and E377 call-surface rejection implement the
+planning half of D-12 through D-16. Credential references, credential
+resolution, and runtime handle activation are not implemented; a resource
+binding is therefore a validated planning contract, not permission to perform
+I/O.
 
 See the canonical
 [composition-resource and call-site contract](https://github.com/rustpunk/clinker/blob/main/docs/ai/15_PRODUCTION_CONTRACTS.md#composition-resources-and-call-site-surface)

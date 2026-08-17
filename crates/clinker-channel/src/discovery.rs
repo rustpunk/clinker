@@ -852,6 +852,7 @@ fn validate_target_file_scope(
             OverlayOp::Set(value) => Some(value.target.as_str()),
             OverlayOp::Bypass(value) => Some(value.target.as_str()),
             OverlayOp::PatchSchema(value) => Some(value.target.as_str()),
+            OverlayOp::BindResource(value) => Some(value.target.as_str()),
             OverlayOp::Add(value) => {
                 if let Some(composition) = &value.composition {
                     let path = pipeline_path

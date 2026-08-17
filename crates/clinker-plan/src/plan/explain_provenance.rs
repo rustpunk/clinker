@@ -7,8 +7,8 @@
 use std::fmt;
 
 use crate::config::composition::{
-    ProvenanceLookupError, ProvenanceQuery, ProvenanceQueryParseError, SchemaResolvedValue,
-    ScopedSchemaAddress,
+    ProvenanceLookupError, ProvenanceQuery, ProvenanceQueryParseError, ResourceBinding,
+    SchemaResolvedValue, ScopedSchemaAddress,
 };
 use crate::plan::CompiledPlan;
 use clinker_core_types::span::Span;
@@ -207,6 +207,45 @@ fn format_span(span: Span) -> String {
         // Real span with FileId — without SourceDb we can only show the offset.
         format!("offset {}", span.start)
     }
+}
+
+/// Render one compiled composition resource binding and every attempted layer.
+///
+/// The output contains logical catalog identities only. Physical descriptors,
+/// credential selectors, and runtime handles are not representable by
+/// [`ResourceBinding`], so this renderer cannot disclose them.
+pub fn explain_resource_binding(
+    node_name: &str,
+    slot_name: &str,
+    binding: &ResourceBinding,
+) -> String {
+    let resolved = binding.provenance();
+    let mut output = format!(
+        "Resource: {node_name}.{slot_name}\n\n  Resolved identity: {}\n\n  Provenance chain (outermost to innermost):\n",
+        binding.logical_id()
+    );
+    let mut layers: Vec<_> = resolved.provenance.iter().collect();
+    layers.sort_by(|a, b| b.kind.cmp(&a.kind));
+    for layer in layers {
+        let prefix = if layer.won { "[WON]" } else { "     " };
+        let suffix = if layer.won { "" } else { "  (shadowed)" };
+        let fixed = if layer.fixed { "  (fixed)" } else { "" };
+        let value = resolved
+            .layer_value(layer.kind)
+            .map(|logical_id| logical_id.as_str())
+            .unwrap_or("?");
+        let span = format_span(layer.span);
+        let span = if span.is_empty() {
+            String::new()
+        } else {
+            format!("  ({span})")
+        };
+        output.push_str(&format!(
+            "  {prefix} {:<22} →  {value}{suffix}{fixed}{span}\n",
+            layer.kind
+        ));
+    }
+    output
 }
 
 /// Render a field provenance chain as human-readable text.
@@ -443,6 +482,7 @@ pub const EXPLAIN_PAGES: &[(&str, &str)] = &[
     ("E129", include_str!("../../../../docs/explain/E129.md")),
     ("E300", include_str!("../../../../docs/explain/E300.md")),
     ("E301", include_str!("../../../../docs/explain/E301.md")),
+    ("E377", include_str!("../../../../docs/explain/E377.md")),
     ("E303", include_str!("../../../../docs/explain/E303.md")),
     ("E304", include_str!("../../../../docs/explain/E304.md")),
     ("E305", include_str!("../../../../docs/explain/E305.md")),
