@@ -159,7 +159,7 @@ nodes:
       type: csv
       glob: incoming/customers/*.csv
       schema: [{ name: id, type: int }]
-  - type: output
+  - type: sink
     name: output_customers
     input: source_customers
     config: { name: output_customers, type: csv, path: out/customers.csv }
@@ -280,7 +280,7 @@ nodes:
       type: csv
       path: /worker-a/incoming/customers.csv
       schema: [{ name: id, type: int }]
-  - type: output
+  - type: sink
     name: output_customers
     input: source_customers
     config: { name: output_customers, type: csv, path: /worker-a/out/customers.csv }
@@ -375,7 +375,7 @@ nodes:
       type: csv
       path: /different-worker/input.csv
       schema: [{ name: id, type: int }]
-  - type: output
+  - type: sink
     name: output_customers
     input: source_customers
     config: { name: output_customers, type: csv, path: /different-worker/output.csv }
@@ -449,7 +449,7 @@ nodes:
         emit kind = record_type
         emit batch_id = batch_id
         emit amount = amount
-  - type: output
+  - type: sink
     name: out
     input: project
     config: { name: out, type: csv, path: out/out.csv }
@@ -550,7 +550,7 @@ nodes:
     config:
       cxl: |
         emit id = id
-  - type: output
+  - type: sink
     name: récapitulatif
     input: shape
     config: { name: récapitulatif, type: csv, path: out/summary.csv }
@@ -658,7 +658,7 @@ nodes:
     config:
       cxl: |
         emit amount = amount
-  - type: output
+  - type: sink
     name: out
     input: project
     config: { name: out, type: csv, path: out/out.csv }
@@ -781,11 +781,11 @@ nodes:
       type: csv
       glob: incoming/us/*.csv
       schema: [{ name: id, type: int }]
-  - type: output
+  - type: sink
     name: daily_eu
     input: orders_eu
     config: { name: daily_eu, type: csv, path: out/eu.csv }
-  - type: output
+  - type: sink
     name: daily_us
     input: orders_us
     config: { name: daily_us, type: csv, path: out/us.csv }
