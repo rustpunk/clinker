@@ -11,7 +11,7 @@ The engine adds a shadow column named `$ck.<field>` (one per correlation-key fie
 Shadow columns are an internal engine namespace. You never write `$ck.<field>` in YAML or CXL — the engine manages them. They are stripped from default writer output. To surface them for debugging, set `include_correlation_keys: true` on an output node:
 
 ```yaml
-- type: output
+- type: sink
   name: debug_out
   input: validate
   config:

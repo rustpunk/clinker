@@ -250,7 +250,7 @@ The streaming path is selected **automatically** — there is no opt-in setting.
   inputs: [src_a, src_b]
   config:
     mode: interleave        # required
-- type: output
+- type: sink
   name: out
   input: merged
   config:

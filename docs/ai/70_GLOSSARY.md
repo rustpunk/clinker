@@ -82,7 +82,7 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
 
 ### Terminal vocabulary boundary
 
-`Output` and authored `type: output` are the current terminal-node names in
+`Output` and authored `type: sink` are the current terminal-node names in
 `PipelineNode`, `OutputConfig`, runtime dispatch, examples, and user docs.
 `Sink` and `type: sink` are the locked AUTH-09 target and are **not
 implemented**. AUTH-09 requires that one-way atomic migration before endpoint
@@ -102,7 +102,7 @@ machine output, writer output/results, and OpenLineage output datasets.
 | Route node | Per-record fan-out node that evaluates ordered CXL conditions and emits records to named output ports. | `docs/user/src/nodes/route.md`; `crates/clinker-plan/src/config/pipeline_node.rs`; `crates/clinker-exec/src/executor/route.rs` | RouteBody, RouteMode, ports | High |
 | Merge node | Fan-in node that concatenates or interleaves upstream streams sharing a compatible schema. | `docs/user/src/nodes/merge.md`; `crates/clinker-plan/src/config/format.rs`; `crates/clinker-exec/src/executor/merge_dispatch.rs` | MergeMode, inputs, streaming interleave | High |
 | Combine node | N-ary record-combining/join node using qualified inputs, a CXL `where:` predicate, match/on-miss policy, and output CXL. | `docs/user/src/nodes/combine.md`; `crates/clinker-plan/src/plan/combine.rs`; `crates/clinker-exec/src/pipeline/combine.rs` | driver, build side, IEJoin, grace hash | High |
-| Output node | Current terminal-destination node, authored as `type: output`, that writes records to a configured path and format with projection, splitting, correlation-key visibility, and envelope reconstruction options. | `docs/user/src/nodes/output.md`; `crates/clinker-plan/src/config/output.rs`; `crates/clinker-exec/src/executor/output_dispatch.rs` | OutputConfig, FormatWriter, split | High |
+| Output node | Current terminal-destination node, authored as `type: sink`, that writes records to a configured path and format with projection, splitting, correlation-key visibility, and envelope reconstruction options. | `docs/user/src/nodes/output.md`; `crates/clinker-plan/src/config/output.rs`; `crates/clinker-exec/src/executor/output_dispatch.rs` | OutputConfig, FormatWriter, split | High |
 | Sink | Locked target name for the terminal-destination node, authored as `type: sink` only after AUTH-09 lands. It is not current syntax or a current Rust variant. | `docs/ai/15_PRODUCTION_CONTRACTS.md` (D-56, AUTH-09) | Output node, AUTH-09, endpoint expansion | High for target; not implemented |
 | Reshape node | Blocking group operator that mutates trigger rows and/or synthesizes new rows within each `partition_by` group. | `docs/user/src/nodes/reshape.md`; `crates/clinker-plan/src/config/pipeline_node.rs`; `crates/clinker-exec/src/executor/reshape_dispatch.rs` | partition_by, `$meta.*`, synthesize | High |
 | Cull node | Blocking group operator that routes whole groups matching a group-level predicate to a side-output port instead of the main output. | `docs/user/src/nodes/cull.md`; `crates/clinker-plan/src/config/pipeline_node.rs`; `crates/clinker-exec/src/executor/cull_dispatch.rs` | removed_to, partition_by, route ports | High |
