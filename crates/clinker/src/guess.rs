@@ -444,9 +444,144 @@ impl GuessMode {
     }
 }
 
+#[derive(Clone, Copy)]
+enum GuessTerminalOutcome {
+    Completed,
+    Unresolved,
+    Failed,
+    Interrupted,
+}
+
+impl GuessTerminalOutcome {
+    #[cfg(feature = "otlp")]
+    const fn metric_key(self) -> clinker_exec::telemetry::MetricKey {
+        match self {
+            Self::Completed => clinker_exec::telemetry::MetricKey::GuessCompleted,
+            Self::Unresolved => clinker_exec::telemetry::MetricKey::GuessUnresolved,
+            Self::Failed => clinker_exec::telemetry::MetricKey::GuessFailed,
+            Self::Interrupted => clinker_exec::telemetry::MetricKey::GuessInterrupted,
+        }
+    }
+
+    #[cfg(feature = "otlp")]
+    const fn span_status(self) -> clinker_exec::telemetry::SpanStatus {
+        match self {
+            Self::Completed => clinker_exec::telemetry::SpanStatus::Ok,
+            Self::Unresolved | Self::Failed | Self::Interrupted => {
+                clinker_exec::telemetry::SpanStatus::Error
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GuessSuccess {
+    exit_code: u8,
+    outcome: GuessTerminalOutcome,
+}
+
+/// Optional delivery state for the mandatory, fixed Guess signal vocabulary.
+///
+/// A deployment with no OTLP policy retains nothing. When configured, the
+/// existing arena owns all retained bytes and the worker remains best effort:
+/// failure to resolve, reserve, start, admit, or deliver telemetry never
+/// changes the authoring command result.
+struct GuessTelemetry {
+    #[cfg(feature = "otlp")]
+    live: Option<GuessTelemetryLive>,
+}
+
+#[cfg(feature = "otlp")]
+struct GuessTelemetryLive {
+    producer: clinker_exec::telemetry::TelemetryProducer,
+    worker: crate::observability::OtlpWorker,
+}
+
+impl GuessTelemetry {
+    fn start(args: &GuessArgs, shutdown: clinker_exec::pipeline::shutdown::ShutdownToken) -> Self {
+        #[cfg(feature = "otlp")]
+        {
+            let live = Self::try_start(args, shutdown);
+            Self { live }
+        }
+        #[cfg(not(feature = "otlp"))]
+        {
+            let _ = (args, shutdown);
+            Self {}
+        }
+    }
+
+    #[cfg(feature = "otlp")]
+    fn try_start(
+        args: &GuessArgs,
+        shutdown: clinker_exec::pipeline::shutdown::ShutdownToken,
+    ) -> Option<GuessTelemetryLive> {
+        let (workspace_root, _) =
+            crate::resolve_compile_anchor(&args.config, args.base_dir.as_deref());
+        let clinker_toml =
+            clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root).ok()?;
+        let policy = clinker_toml.resolve_observability(None).ok()?;
+        let runtime = crate::observability::OtlpRuntimeBundle::admit(&policy)
+            .ok()
+            .flatten()?;
+        let (producer, receiver) = runtime.reserve_arena(&policy).ok()?;
+        let correlation = clinker_exec::telemetry::RunCorrelation::bounded(
+            "clinker.guess",
+            "clinker.guess",
+            "clinker.guess",
+        );
+        let worker =
+            crate::observability::OtlpWorker::start(runtime, receiver, shutdown, correlation)
+                .ok()?;
+        producer.record_metric(clinker_exec::telemetry::MetricKey::GuessStarted, 1);
+        Some(GuessTelemetryLive { producer, worker })
+    }
+
+    fn finish(self, outcome: GuessTerminalOutcome, started_at_unix_nanos: u64) {
+        #[cfg(feature = "otlp")]
+        if let Some(live) = self.live {
+            live.producer.record_metric(outcome.metric_key(), 1);
+            let ended_at_unix_nanos =
+                clinker_exec::telemetry::unix_nanos_now().max(started_at_unix_nanos);
+            let _ = live.producer.emit_span(clinker_exec::telemetry::SpanFact {
+                name: clinker_exec::telemetry::SpanName::Guess,
+                status: outcome.span_status(),
+                logical_node: "guess",
+                started_at_unix_nanos,
+                ended_at_unix_nanos,
+            });
+            drop(live.producer);
+            drop(live.worker);
+        }
+        #[cfg(not(feature = "otlp"))]
+        {
+            let _ = (self, outcome, started_at_unix_nanos);
+        }
+    }
+}
+
 /// Execute a preview, exhaustive check, or guarded single-owner write and print
 /// one stable JSON document.
 pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
+    let started_at_unix_nanos = clinker_exec::telemetry::unix_nanos_now();
+    let shutdown = clinker_exec::pipeline::shutdown::ShutdownToken::new();
+    let telemetry = GuessTelemetry::start(args, shutdown.clone());
+    let result = run_inner(args, &shutdown);
+    let outcome = match &result {
+        Ok(success) => success.outcome,
+        Err(error) if matches!(error.kind, GuessErrorKind::Interrupted) => {
+            GuessTerminalOutcome::Interrupted
+        }
+        Err(_) => GuessTerminalOutcome::Failed,
+    };
+    telemetry.finish(outcome, started_at_unix_nanos);
+    result.map(|success| success.exit_code)
+}
+
+fn run_inner(
+    args: &GuessArgs,
+    shutdown: &clinker_exec::pipeline::shutdown::ShutdownToken,
+) -> Result<GuessSuccess, GuessError> {
     let mode = GuessMode::from_args(args)?;
     let config_snapshot = if matches!(mode, GuessMode::Write) {
         Some(snapshot_config(&args.config)?)
@@ -477,7 +612,6 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
                 args.config.display()
             ))
         })?;
-    let shutdown = clinker_exec::pipeline::shutdown::ShutdownToken::new();
     let manifest = freeze_manifest(&effective.config, &candidates, &config_dir)?;
     let input_snapshot = if matches!(mode, GuessMode::Write) {
         Some(InputSnapshot::capture(&manifest)?)
@@ -507,21 +641,21 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
             &candidates,
             Arc::clone(&accumulators),
             &config_dir,
-            &shutdown,
+            shutdown,
         )?,
         GuessMode::Check => check_sources_exhaustively(
             &manifest,
             &candidates,
             Arc::clone(&accumulators),
             &config_dir,
-            &shutdown,
+            shutdown,
         )?,
         GuessMode::Write => check_sources_exhaustively(
             &manifest,
             &candidates,
             Arc::clone(&accumulators),
             &config_dir,
-            &shutdown,
+            shutdown,
         )?,
     };
     if shutdown.is_requested() {
@@ -622,7 +756,7 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
                 effective_digest,
                 &edits[0],
                 &config_dir,
-                &shutdown,
+                shutdown,
             )?
         };
         write_succeeded = report.status == "written";
@@ -670,12 +804,20 @@ pub(crate) fn run(args: &GuessArgs) -> Result<u8, GuessError> {
     stdout.write_all(b"\n").map_err(|error| {
         GuessError::infrastructure(format!("cannot finish preview on stdout: {error}"))
     })?;
-    Ok(match mode {
+    let exit_code = match mode {
         GuessMode::Preview => 0,
         GuessMode::Check if resolved => 0,
         GuessMode::Check => 3,
         GuessMode::Write if write_succeeded => 0,
         GuessMode::Write => 3,
+    };
+    Ok(GuessSuccess {
+        exit_code,
+        outcome: if exit_code == 3 || !resolved {
+            GuessTerminalOutcome::Unresolved
+        } else {
+            GuessTerminalOutcome::Completed
+        },
     })
 }
 

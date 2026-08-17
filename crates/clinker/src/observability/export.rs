@@ -1669,6 +1669,11 @@ fn metric_name(key: MetricKey) -> &'static str {
         MetricKey::SourceCompleted => "clinker.source.completed",
         MetricKey::SourceFailed => "clinker.source.failed",
         MetricKey::SourceInterrupted => "clinker.source.interrupted",
+        MetricKey::GuessStarted => "clinker.guess.started",
+        MetricKey::GuessCompleted => "clinker.guess.completed",
+        MetricKey::GuessUnresolved => "clinker.guess.unresolved",
+        MetricKey::GuessFailed => "clinker.guess.failed",
+        MetricKey::GuessInterrupted => "clinker.guess.interrupted",
     }
 }
 
@@ -1680,6 +1685,7 @@ fn span_name(name: SpanName) -> &'static str {
         SpanName::CredentialRenew => "clinker.credential.renew",
         SpanName::CredentialRevoke => "clinker.credential.revoke",
         SpanName::Source => "clinker.source",
+        SpanName::Guess => "clinker.guess",
     }
 }
 
@@ -1992,6 +1998,11 @@ mod tests {
             (MetricKey::SourceCompleted, "clinker.source.completed"),
             (MetricKey::SourceFailed, "clinker.source.failed"),
             (MetricKey::SourceInterrupted, "clinker.source.interrupted"),
+            (MetricKey::GuessStarted, "clinker.guess.started"),
+            (MetricKey::GuessCompleted, "clinker.guess.completed"),
+            (MetricKey::GuessUnresolved, "clinker.guess.unresolved"),
+            (MetricKey::GuessFailed, "clinker.guess.failed"),
+            (MetricKey::GuessInterrupted, "clinker.guess.interrupted"),
         ];
         assert_eq!(metric_names.len(), MetricKey::COUNT);
         for (key, expected) in metric_names {
@@ -2005,6 +2016,7 @@ mod tests {
             (SpanName::CredentialRenew, "clinker.credential.renew"),
             (SpanName::CredentialRevoke, "clinker.credential.revoke"),
             (SpanName::Source, "clinker.source"),
+            (SpanName::Guess, "clinker.guess"),
         ];
         for (name, expected) in span_names {
             assert_eq!(span_name(name), expected, "stable name for {name:?}");
@@ -2015,6 +2027,56 @@ mod tests {
         envelope["resourceSpans"][0]["scopeSpans"][0]["spans"]
             .as_array()
             .expect("spans")
+    }
+
+    #[test]
+    fn closed_metric_and_span_inventories_have_one_stable_export_name_each() {
+        assert_eq!(
+            MetricKey::ALL.map(metric_name),
+            [
+                "clinker.transform.started",
+                "clinker.transform.completed",
+                "clinker.transform.records",
+                "clinker.transform.errors",
+                "clinker.credential.resolve.started",
+                "clinker.credential.resolve.completed",
+                "clinker.credential.resolve.failed",
+                "clinker.credential.resolve.interrupted",
+                "clinker.resource.open.started",
+                "clinker.resource.open.completed",
+                "clinker.resource.open.failed",
+                "clinker.resource.open.interrupted",
+                "clinker.credential.renew.started",
+                "clinker.credential.renew.completed",
+                "clinker.credential.renew.failed",
+                "clinker.credential.renew.interrupted",
+                "clinker.credential.revoke.started",
+                "clinker.credential.revoke.completed",
+                "clinker.credential.revoke.failed",
+                "clinker.credential.revoke.interrupted",
+                "clinker.source.started",
+                "clinker.source.completed",
+                "clinker.source.failed",
+                "clinker.source.interrupted",
+                "clinker.guess.started",
+                "clinker.guess.completed",
+                "clinker.guess.unresolved",
+                "clinker.guess.failed",
+                "clinker.guess.interrupted",
+            ]
+        );
+        assert_eq!(
+            SpanName::ALL.map(span_name),
+            [
+                "clinker.transform",
+                "clinker.credential.resolve",
+                "clinker.resource.open",
+                "clinker.credential.renew",
+                "clinker.credential.revoke",
+                "clinker.source",
+                "clinker.guess",
+            ]
+        );
     }
 
     /// Flatten one OTLP `KeyValue` list into the string attributes it carries.

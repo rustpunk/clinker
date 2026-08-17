@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -78,6 +79,112 @@ fn guess_with_env(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
         command.env(name, value);
     }
     command.output().expect("spawn clinker guess")
+}
+
+fn enable_guess_telemetry(root: &Path) {
+    let path = root.join("clinker.toml");
+    let mut config = std::fs::read_to_string(&path).unwrap_or_default();
+    config.push_str(
+        r#"
+[observability]
+arena_bytes = "64KB"
+ordinary_lane_bytes = "32KB"
+high_severity_lane_bytes = "32KB"
+max_batch_bytes = "8KB"
+max_attributes_per_event = 4
+max_attribute_bytes = "64B"
+sample_every = 1
+rate_limit_per_second = 1000
+rate_limit_burst = 1000
+flush_timeout_ms = 500
+
+[observability.otlp]
+endpoint = "https://collector.invalid"
+connect_timeout_ms = 20
+request_timeout_ms = 50
+retry_max_attempts = 1
+retry_total_timeout_ms = 100
+max_response_bytes = "4KB"
+
+[observability.otlp.auth]
+mode = "none"
+"#,
+    );
+    std::fs::write(path, config).expect("write Guess observability policy");
+}
+
+fn guess_with_telemetry(
+    root: &Path,
+    args: &[&str],
+    capture: &Path,
+    envs: &[(&str, &str)],
+) -> Output {
+    enable_guess_telemetry(root);
+    let capture = capture.to_str().expect("UTF-8 capture path");
+    let mut all_envs = vec![
+        ("CLINKER_TEST_OTLP_OUTCOME", "success"),
+        ("CLINKER_TEST_OTLP_CAPTURE", capture),
+    ];
+    all_envs.extend_from_slice(envs);
+    guess_with_env(root, args, &all_envs)
+}
+
+fn telemetry_capture(path: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .expect("Guess telemetry capture")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("captured OTLP JSON"))
+        .collect()
+}
+
+fn captured_metric_counts(capture: &[serde_json::Value]) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for event in capture.iter().filter(|event| event["signal"] == "metrics") {
+        for metric in event["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array()
+            .expect("captured metrics")
+        {
+            let name = metric["name"].as_str().expect("metric name").to_owned();
+            let value = metric["sum"]["dataPoints"][0]["asInt"]
+                .as_str()
+                .expect("metric integer")
+                .parse::<u64>()
+                .expect("metric count");
+            *counts.entry(name).or_default() += value;
+        }
+    }
+    counts
+}
+
+fn captured_spans(capture: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    capture
+        .iter()
+        .filter(|event| event["signal"] == "traces")
+        .flat_map(|event| {
+            event["payload"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+                .as_array()
+                .expect("captured spans")
+        })
+        .collect()
+}
+
+fn assert_guess_telemetry(capture: &Path, terminal_metric: &str, expected_span_status: u64) {
+    let capture = telemetry_capture(capture);
+    let metrics = captured_metric_counts(&capture);
+    assert_eq!(metrics.len(), 2, "one start and one terminal metric");
+    assert_eq!(metrics.get("clinker.guess.started"), Some(&1));
+    assert_eq!(metrics.get(terminal_metric), Some(&1));
+    let spans = captured_spans(&capture);
+    assert_eq!(spans.len(), 1, "one complete Guess span");
+    assert_eq!(spans[0]["name"], "clinker.guess");
+    assert_eq!(spans[0]["status"]["code"], expected_span_status);
+    assert_eq!(
+        spans[0]["attributes"],
+        serde_json::json!([{
+            "key": "clinker.logical_node",
+            "value": { "stringValue": "guess" }
+        }])
+    );
 }
 
 fn spawn_at_write_barrier(root: &Path, barrier: &Path) -> Child {
@@ -1083,4 +1190,177 @@ fn evidence_reader_error_leaves_later_numeric_fields_fail_closed() {
     assert_eq!(later["proposed_type"], serde_json::Value::Null);
     assert_eq!(later["unresolved_reasons"][0], "missing_parser_observation");
     assert_eq!(report["patch"], "edits:\n");
+}
+
+#[test]
+fn telemetry_lifecycle_covers_preview_check_write_and_terminal_exits() {
+    let preview = workspace();
+    let preview_capture = preview.path().join("preview-telemetry.ndjson");
+    let preview_output = guess_with_telemetry(preview.path(), &[], &preview_capture, &[]);
+    assert_eq!(preview_output.status.code(), Some(0));
+    assert_guess_telemetry(&preview_capture, "clinker.guess.completed", 1);
+
+    let preview_unresolved = workspace();
+    std::fs::write(
+        preview_unresolved.path().join("input.csv"),
+        "kind,order_id,amount\nD,c-1,9223372036854775808\nA,c-2,20.5\n",
+    )
+    .expect("write unresolved preview input");
+    let preview_unresolved_capture = preview_unresolved.path().join("unresolved-preview.ndjson");
+    let preview_unresolved_output = guess_with_telemetry(
+        preview_unresolved.path(),
+        &["--field", "csv_orders.amount"],
+        &preview_unresolved_capture,
+        &[],
+    );
+    assert_eq!(preview_unresolved_output.status.code(), Some(0));
+    assert_guess_telemetry(&preview_unresolved_capture, "clinker.guess.unresolved", 2);
+
+    let check = workspace();
+    std::fs::write(
+        check.path().join("input.csv"),
+        "kind,order_id,amount\nD,c-1,9223372036854775808\nA,c-2,20.5\n",
+    )
+    .expect("write unresolved check input");
+    let check_capture = check.path().join("check-telemetry.ndjson");
+    let check_output = guess_with_telemetry(
+        check.path(),
+        &["--check", "--field", "csv_orders.amount"],
+        &check_capture,
+        &[],
+    );
+    assert_eq!(check_output.status.code(), Some(3));
+    assert_guess_telemetry(&check_capture, "clinker.guess.unresolved", 2);
+
+    let write = workspace();
+    write_flat_json_pipeline(write.path(), "numeric", None, "[{\"n\":1}]");
+    let write_capture = write.path().join("write-telemetry.ndjson");
+    let write_output = guess_with_telemetry(write.path(), &["--write"], &write_capture, &[]);
+    assert_eq!(write_output.status.code(), Some(0));
+    assert_guess_telemetry(&write_capture, "clinker.guess.completed", 1);
+
+    let configuration = workspace();
+    let configuration_capture = configuration.path().join("configuration-telemetry.ndjson");
+    let configuration_output = guess_with_telemetry(
+        configuration.path(),
+        &["--field", "missing.n"],
+        &configuration_capture,
+        &[],
+    );
+    assert_eq!(configuration_output.status.code(), Some(1));
+    assert_guess_telemetry(&configuration_capture, "clinker.guess.failed", 2);
+
+    let infrastructure = workspace();
+    let infrastructure_capture = infrastructure
+        .path()
+        .join("infrastructure-telemetry.ndjson");
+    let infrastructure_output = guess_with_telemetry(
+        infrastructure.path(),
+        &["--field", "csv_orders.amount"],
+        &infrastructure_capture,
+        &[("CLINKER_TEST_GUESS_FAIL_OPEN_AFTER_DISCOVERY", "1")],
+    );
+    assert_eq!(infrastructure_output.status.code(), Some(4));
+    assert_guess_telemetry(&infrastructure_capture, "clinker.guess.failed", 2);
+
+    let interrupted = workspace();
+    write_flat_json_pipeline(interrupted.path(), "numeric", None, "[{\"n\":1},{\"n\":2}]");
+    let interrupted_capture = interrupted.path().join("interrupted-telemetry.ndjson");
+    let interrupted_output = guess_with_telemetry(
+        interrupted.path(),
+        &["--check"],
+        &interrupted_capture,
+        &[("CLINKER_TEST_GUESS_INTERRUPT_AFTER_RECORDS", "1")],
+    );
+    assert_eq!(interrupted_output.status.code(), Some(130));
+    assert_guess_telemetry(&interrupted_capture, "clinker.guess.interrupted", 2);
+}
+
+#[test]
+fn telemetry_privacy_excludes_authored_names_paths_selectors_records_and_errors() {
+    const SECRET: &str = "secret-shaped-guess-value-7f31";
+
+    let workspace = workspace();
+    std::fs::write(
+        workspace.path().join("pipeline.yaml"),
+        format!(
+            "pipeline:\n  name: {SECRET}\nnodes:\n  - type: source\n    name: {SECRET}\n    config:\n      name: {SECRET}\n      type: csv\n      path: {SECRET}.csv\n      schema:\n        - {{ name: n, type: numeric }}\n        - {{ name: payload, type: string }}\n"
+        ),
+    )
+    .expect("write privacy pipeline");
+    std::fs::write(
+        workspace.path().join(format!("{SECRET}.csv")),
+        format!("n,payload\n1,{SECRET}\n"),
+    )
+    .expect("write privacy input");
+    let capture = workspace.path().join("privacy-telemetry.ndjson");
+    let output = guess_with_telemetry(
+        workspace.path(),
+        &["--field", &format!("{SECRET}.n")],
+        &capture,
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let captured = std::fs::read_to_string(&capture).expect("privacy telemetry capture");
+    assert!(
+        !captured.contains(SECRET),
+        "authored data reached telemetry"
+    );
+    assert!(
+        !captured.contains("resourceLogs"),
+        "Guess emits no log records"
+    );
+    assert!(captured.contains("clinker.guess.started"));
+    assert!(captured.contains("clinker.guess.completed"));
+    assert!(captured.contains("\"stringValue\":\"clinker.guess\""));
+}
+
+#[test]
+fn telemetry_admission_loss_does_not_change_write_truth_or_bytes() {
+    let baseline = workspace();
+    write_flat_json_pipeline(baseline.path(), "numeric", None, "[{\"n\":1}]");
+    let baseline_capture = baseline.path().join("baseline-telemetry.ndjson");
+    let baseline_output =
+        guess_with_telemetry(baseline.path(), &["--write"], &baseline_capture, &[]);
+
+    let rejected = workspace();
+    write_flat_json_pipeline(rejected.path(), "numeric", None, "[{\"n\":1}]");
+    let rejected_capture = rejected.path().join("rejected-telemetry.ndjson");
+    enable_guess_telemetry(rejected.path());
+    let policy_path = rejected.path().join("clinker.toml");
+    let policy = std::fs::read_to_string(&policy_path)
+        .expect("read telemetry policy")
+        .replace("max_batch_bytes = \"8KB\"", "max_batch_bytes = \"1B\"");
+    std::fs::write(&policy_path, policy).expect("force the fixed Guess span over its arena slot");
+    let rejected_capture_text = rejected_capture.to_str().expect("UTF-8 capture path");
+    let rejected_output = guess_with_env(
+        rejected.path(),
+        &["--write"],
+        &[
+            ("CLINKER_TEST_OTLP_OUTCOME", "success"),
+            ("CLINKER_TEST_OTLP_CAPTURE", rejected_capture_text),
+        ],
+    );
+
+    assert_eq!(baseline_output.status.code(), Some(0));
+    assert_eq!(rejected_output.status.code(), Some(0));
+    assert_eq!(baseline_output.stdout, rejected_output.stdout);
+    assert_eq!(
+        std::fs::read(baseline.path().join("pipeline.yaml")).expect("baseline config"),
+        std::fs::read(rejected.path().join("pipeline.yaml")).expect("rejected config")
+    );
+    assert_guess_telemetry(&baseline_capture, "clinker.guess.completed", 1);
+    let rejected_capture = telemetry_capture(&rejected_capture);
+    let metrics = captured_metric_counts(&rejected_capture);
+    assert_eq!(
+        metrics.len(),
+        2,
+        "fixed metrics survive span admission loss"
+    );
+    assert_eq!(metrics.get("clinker.guess.started"), Some(&1));
+    assert_eq!(metrics.get("clinker.guess.completed"), Some(&1));
+    assert!(
+        captured_spans(&rejected_capture).is_empty(),
+        "the one-byte arena slot must drop the complete Guess span"
+    );
 }
