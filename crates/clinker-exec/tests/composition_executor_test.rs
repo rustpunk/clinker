@@ -170,7 +170,7 @@ nodes:
     use: ../compositions/source_boundary_collision.comp.yaml
     inputs:
       collision: body_group
-  - type: output
+  - type: sink
     name: body_out
     input: body_call
     config:
@@ -196,7 +196,7 @@ nodes:
         emit id = id
         emit origin = "top-transform"
         emit $record.boundary = $record.boundary
-  - type: output
+  - type: sink
     name: top_out
     input: top_transform
     config:
@@ -257,7 +257,7 @@ nodes:
     use: ../compositions/source_boundary_collision.comp.yaml
     inputs:
       collision: body_group
-  - type: output
+  - type: sink
     name: body_out
     input: body_call
     config:
@@ -298,7 +298,7 @@ nodes:
         emit id = id
         emit origin = origin
         emit $record.boundary = $record.boundary
-  - type: output
+  - type: sink
     name: top_out
     input: top_passthrough
     config:
@@ -355,7 +355,7 @@ nodes:
     use: ../compositions/exec_transform_check.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: doubler_call
     config:
@@ -407,7 +407,7 @@ nodes:
     use: ../compositions/does_not_exist.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: missing_call
     config:
@@ -452,7 +452,7 @@ nodes:
     use: ../compositions/exec_nested_check.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: nested_call
     config:
@@ -508,7 +508,7 @@ nodes:
     use: ../compositions/exec_route_merge_check.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: split_call
     config:
@@ -581,7 +581,7 @@ nodes:
   - type: merge
     name: top_merged
     inputs: [top_hot, top_cold]
-  - type: output
+  - type: sink
     name: top_out
     input: top_merged
     config:
@@ -595,7 +595,7 @@ nodes:
     use: ../compositions/route_scope_body.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: comp_out
     input: comp
     config:
@@ -674,7 +674,7 @@ nodes:
     use: ../compositions/exec_runtime_error.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: doubler_call
     config:
@@ -738,7 +738,7 @@ nodes:
     use: ../compositions/exec_merge_interleave_check.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: split_merge
     config:

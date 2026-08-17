@@ -46,7 +46,7 @@ nodes:
         emit did = applicants.did
         emit bid = tiers.bid
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: tiered_out
     input: tiered
     config:

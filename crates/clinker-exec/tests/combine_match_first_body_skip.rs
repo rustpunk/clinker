@@ -159,7 +159,7 @@ nodes:
       propagate_ck: driver
       cxl: |
 {BODY}
-  - type: output
+  - type: sink
     name: out
     input: j
     config:
@@ -224,7 +224,7 @@ nodes:
       propagate_ck: driver
       cxl: |
 {BODY}
-  - type: output
+  - type: sink
     name: out
     input: j
     config:
@@ -278,7 +278,7 @@ nodes:
       propagate_ck: driver
       cxl: |
 {BODY}
-  - type: output
+  - type: sink
     name: out
     input: j
     config:
@@ -344,7 +344,7 @@ nodes:
       propagate_ck: driver
       cxl: |
 {BODY}
-  - type: output
+  - type: sink
     name: out
     input: j
     config:
@@ -407,7 +407,7 @@ nodes:
       propagate_ck: driver
       cxl: |
 {BODY}
-  - type: output
+  - type: sink
     name: out
     input: j
     config:
@@ -663,7 +663,7 @@ nodes:
       cxl: |
         filter builds.keep.is_null() or builds.keep == 1
         emit did = drivers.did
-  - type: output
+  - type: sink
     name: out
     input: j
     config:

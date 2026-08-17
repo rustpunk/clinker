@@ -32,7 +32,7 @@ nodes:
         emit order_id = orders.order_id
         emit bogus = products.nonexistent_field
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: bad_out
     input: bad
     config:

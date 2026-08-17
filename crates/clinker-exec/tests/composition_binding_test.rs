@@ -130,7 +130,7 @@ nodes:
       fuzzy_threshold: 0.9
       lookup_table: "customers_lookup"
 
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -216,7 +216,7 @@ nodes:
       fuzzy_threshold: 0.9
       lookup_table: "customers_lookup"
 
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -297,7 +297,7 @@ nodes:
       fuzzy_threshold: 0.9
       lookup_table: "customers_lookup"
 
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -363,7 +363,7 @@ nodes:
     config:
       strict_mode: false
 
-  - type: output
+  - type: sink
     name: final_out
     input: raw_src
     config:
@@ -430,7 +430,7 @@ nodes:
     inputs:
       data: src
 
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -518,7 +518,7 @@ nodes:
     inputs: {}
     config: {}
 
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -588,7 +588,7 @@ nodes:
       fuzzy_threshold: 0.9
       lookup_table: "customers_lookup"
 
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -687,7 +687,7 @@ nodes:
     inputs:
       data: src
 
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -768,7 +768,7 @@ nodes:
     inputs:
       data: src
 
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -836,7 +836,7 @@ nodes:
     inputs:
       data: src
 
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -944,7 +944,7 @@ nodes:
     inputs:
       data: src
 
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -1125,7 +1125,7 @@ nodes:
     input: src
     config:
       cxl: "emit total = amount"
-  - type: output
+  - type: sink
     name: out
     input: xform
     config:
@@ -1158,7 +1158,7 @@ nodes:
         active: "status == 'active'"
         inactive: "status == 'inactive'"
       default: inactive
-  - type: output
+  - type: sink
     name: out
     input: router.active
     config:
@@ -1191,7 +1191,7 @@ nodes:
                     node_types.contains(&"transform"),
                     "{name}: missing transform"
                 );
-                assert!(node_types.contains(&"output"), "{name}: missing output");
+                assert!(node_types.contains(&"sink"), "{name}: missing sink");
                 // No compositions should appear.
                 assert!(
                     !node_types.contains(&"composition"),
@@ -1201,7 +1201,7 @@ nodes:
             "source_route_output" => {
                 assert!(node_types.contains(&"source"), "{name}: missing source");
                 assert!(node_types.contains(&"route"), "{name}: missing route");
-                assert!(node_types.contains(&"output"), "{name}: missing output");
+                assert!(node_types.contains(&"sink"), "{name}: missing sink");
             }
             _ => {}
         }

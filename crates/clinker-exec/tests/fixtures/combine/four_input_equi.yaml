@@ -57,7 +57,7 @@ nodes:
         emit c_val = c.c_val
         emit d_val = d.d_val
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: joined4_out
     input: joined4
     config:

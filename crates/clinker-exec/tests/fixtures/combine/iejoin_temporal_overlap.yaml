@@ -46,7 +46,7 @@ nodes:
         emit session_start = sessions.start_ts
         emit session_end = sessions.end_ts
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: overlapping_out
     input: overlapping
     config:

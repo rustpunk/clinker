@@ -35,7 +35,7 @@ nodes:
       cxl: |
         emit order_id = orders.order_id
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: three_part_out
     input: three_part
     config:
