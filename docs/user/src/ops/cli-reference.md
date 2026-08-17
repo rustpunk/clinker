@@ -63,9 +63,12 @@ registrations across those profiles, 1 MiB of decoded profile/provider
 definition state, and 256 simultaneously retained handles. Admission checks
 all definition counts and bytes before a profile can resolve a requirement.
 Each live lease reports its exact retained bytes to the run memory arbitrator
-before provider allocation; cap, memory, provider, pause, or spill failures
-revoke and release the partial set in reverse acquisition order and unregister
-the registry.
+before provider allocation. The registry has no inbound producer and is not a
+backpressure target. An arbitrator spill callback queues a request and reports
+zero bytes freed synchronously; the next registry-owned checkpoint revokes and
+releases the partial set in reverse acquisition order and unregisters the
+registry. Cap, memory, and provider failures follow the same fail-closed
+cleanup path; an explicit run coordinator may pause acquisition until resume.
 
 These are foundation limits, not newly available command-line behavior. A
 later complete preflight surface must add the one explicit profile selector,

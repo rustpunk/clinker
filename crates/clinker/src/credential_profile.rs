@@ -721,32 +721,47 @@ impl MemoryConsumer for CredentialRegistryConsumer {
     }
 
     fn try_spill(&self, target_bytes: u64) -> Result<u64, ConsumerSpillError> {
+        // The arbitrator holds only shared access, while revocation and
+        // ordered teardown belong to the registry's run thread. Deliver the
+        // request without claiming that this callback released live state.
         self.handle.request_spill();
-        let bytes = self.handle.bytes();
-        if bytes >= target_bytes {
-            Ok(bytes)
-        } else {
-            Err(ConsumerSpillError::BelowTarget {
-                target: target_bytes,
-                freed: bytes,
-            })
-        }
+        Err(ConsumerSpillError::BelowTarget {
+            target: target_bytes,
+            freed: 0,
+        })
     }
 
     fn can_back_pressure(&self) -> bool {
-        true
+        false
     }
+}
 
-    fn pause(&self) {
-        self.handle.pause();
-    }
+#[cfg(test)]
+mod memory_consumer_contract_tests {
+    use super::*;
 
-    fn resume(&self) {
-        self.handle.resume();
-    }
+    #[test]
+    fn registered_consumer_reports_only_bytes_freed_synchronously() {
+        let handle = ConsumerHandle::new();
+        handle.set_bytes(4_096);
+        let consumer = Arc::new(CredentialRegistryConsumer::new(Arc::clone(&handle)));
+        let arbitrator =
+            MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, MemoryArbitrator::default_policy());
+        let consumer_id = arbitrator.register_consumer(consumer.clone());
 
-    fn is_paused(&self) -> bool {
-        self.handle.is_paused()
+        let result = consumer.try_spill(2_048);
+
+        assert!(matches!(
+            result,
+            Err(ConsumerSpillError::BelowTarget {
+                target: 2_048,
+                freed: 0,
+            })
+        ));
+        assert!(!consumer.can_back_pressure());
+        assert_eq!(consumer.current_usage(), 4_096);
+        assert!(handle.take_spill_request());
+        assert!(arbitrator.unregister_consumer(consumer_id).is_some());
     }
 }
 
@@ -755,8 +770,9 @@ impl MemoryConsumer for CredentialRegistryConsumer {
 /// The registry preallocates a fixed handle table, registers exactly one
 /// [`MemoryConsumer`], and charges each provider-declared lease plus its
 /// secret-free handle metadata before the provider may allocate it. Credential
-/// state is never written to spill: a spill request revokes and releases the
-/// complete preflight set before another acquisition is attempted.
+/// state is never written to spill. The consumer reports zero bytes freed when
+/// the arbitrator requests a spill, then the registry revokes and releases the
+/// complete preflight set at its next owned memory-signal checkpoint.
 pub struct CredentialHandleRegistry<'catalog, 'run>
 where
     'run: 'catalog,
@@ -764,6 +780,7 @@ where
     arbitrator: &'catalog MemoryArbitrator,
     catalog: &'catalog CredentialProfileCatalog<'run>,
     memory_handle: Arc<ConsumerHandle>,
+    consumer: Arc<CredentialRegistryConsumer>,
     consumer_id: Option<ConsumerId>,
     handles: Vec<LeasedCredentialHandle<'run>>,
     retained_bytes: u64,
@@ -803,13 +820,13 @@ where
             })?;
         let memory_handle = ConsumerHandle::new();
         memory_handle.set_bytes(table_bytes);
-        let consumer_id = arbitrator.register_consumer(Arc::new(CredentialRegistryConsumer::new(
-            Arc::clone(&memory_handle),
-        )));
+        let consumer = Arc::new(CredentialRegistryConsumer::new(Arc::clone(&memory_handle)));
+        let consumer_id = arbitrator.register_consumer(consumer.clone());
         Ok(Self {
             arbitrator,
             catalog,
             memory_handle,
+            consumer,
             consumer_id: Some(consumer_id),
             handles,
             retained_bytes: table_bytes,
@@ -833,19 +850,7 @@ where
         selected: &CredentialProfileName,
         requirement: &CredentialRequirement,
     ) -> Result<&LeasedCredentialHandle<'run>, CredentialRegistryError> {
-        if self.consumer_id.is_none() {
-            return Err(CredentialRegistryError::new(
-                CredentialRegistryErrorKind::Closed,
-            ));
-        }
-
-        if self.memory_handle.take_spill_request() {
-            return Err(self.fail_and_close(CredentialRegistryErrorKind::SpillRequested));
-        }
-        self.memory_handle.wait_while_paused();
-        if self.memory_handle.take_spill_request() {
-            return Err(self.fail_and_close(CredentialRegistryErrorKind::SpillRequested));
-        }
+        self.honor_memory_signals()?;
         if self.handles.len() >= self.catalog.limits.max_live_handles {
             return Err(self.fail_and_close(CredentialRegistryErrorKind::HandleLimitExceeded));
         }
@@ -916,7 +921,37 @@ where
 
     /// Bytes currently reported through the registry's consumer handle.
     pub fn retained_bytes(&self) -> u64 {
-        self.memory_handle.bytes()
+        self.consumer.current_usage()
+    }
+
+    /// Honor delivered pause or spill signals at a registry-owned boundary.
+    ///
+    /// The registered consumer has no inbound producer and therefore does not
+    /// advertise arbitrator backpressure. An explicit run coordinator may
+    /// still pause the shared handle before entering this checkpoint. A spill
+    /// request always fails closed: every live lease is revoked in reverse
+    /// acquisition order and the consumer is unregistered before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialRegistryErrorKind::SpillRequested`] after cleanup
+    /// when the arbitrator delivered a spill request, or
+    /// [`CredentialRegistryErrorKind::Closed`] after prior teardown.
+    pub fn honor_memory_signals(&mut self) -> Result<(), CredentialRegistryError> {
+        if self.consumer_id.is_none() {
+            return Err(CredentialRegistryError::new(
+                CredentialRegistryErrorKind::Closed,
+            ));
+        }
+
+        if self.memory_handle.take_spill_request() {
+            return Err(self.fail_and_close(CredentialRegistryErrorKind::SpillRequested));
+        }
+        self.memory_handle.wait_while_paused();
+        if self.memory_handle.take_spill_request() {
+            return Err(self.fail_and_close(CredentialRegistryErrorKind::SpillRequested));
+        }
+        Ok(())
     }
 
     /// Revoke and release every handle, then unregister the memory consumer.
@@ -943,8 +978,10 @@ where
 
     /// Borrow the non-secret memory coordination handle for run control.
     ///
-    /// Callers may use this only to observe accounting or deliver the same
-    /// pause/spill signals as the registered consumer; it exposes no lease.
+    /// Callers may use this only to observe accounting or deliver explicit
+    /// run-coordination pause/spill signals; it exposes no lease. The
+    /// registered arbitrator consumer does not advertise backpressure because
+    /// the registry has no inbound producer to pause.
     pub fn memory_handle(&self) -> &Arc<ConsumerHandle> {
         &self.memory_handle
     }
