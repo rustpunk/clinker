@@ -64,8 +64,9 @@ include:
 - Whether executor runs should consume the stored `CompiledPlan` DAG directly
   or whether re-entering compilation through `CompiledPlan::config()` is
   intentional.
-- Whether channel resource overlays are implemented behavior, reserved config,
-  or should be rejected.
+- Runtime credential resolution and handle activation for typed composition
+  resources; catalog/slot binding and group/channel/per-target rebinding are
+  implemented planning behavior.
 - The intended long-term boundary between `clinker-schema` and
   `clinker-plan`.
 - Whether `clinker-format -> cxl` is permanent layering or transitional

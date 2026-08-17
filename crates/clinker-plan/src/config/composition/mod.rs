@@ -86,7 +86,10 @@ pub use provenance::{
     ProvenanceLookupError, ProvenanceMatch, ProvenanceQuery, ProvenanceQueryParseError,
     ResolvedValue, ScopedNodeAddress, ScopedNodeAddressParseError, ScopedSchemaAddress,
 };
-pub use resource::Resource;
+pub use resource::{
+    Resource, ResourceBinding, ResourceCapability, ResourceLifetime, ResourceOpenerKind,
+    is_reserved_credential_selector,
+};
 pub use schema_provenance::{
     PRESENCE_ATTR, SchemaAttr, SchemaLayer, SchemaProvRecorder, SchemaProvenanceDb,
     SchemaResolvedValue, column_attrs,
@@ -255,7 +258,7 @@ pub struct ResourceDecl {
 ///
 /// `File` is the only variant today; additional variants will be added
 /// as the resource model grows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResourceKind {
     File,
 }
@@ -439,7 +442,6 @@ pub(crate) fn strip_node_deployment_locators(node: &mut serde_json::Value) {
         }
         Some("composition") => {
             object.remove("use");
-            object.remove("resources");
         }
         _ => {}
     }

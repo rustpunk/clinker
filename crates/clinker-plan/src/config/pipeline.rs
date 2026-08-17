@@ -452,11 +452,6 @@ impl PipelineConfig {
             };
             LabeledSpan::primary(s, String::new())
         };
-        // (a) Whole-DAG diagnostic: stage-3 cycle detection emits one
-        // diagnostic that covers the entire pipeline graph, with no
-        // single node to anchor on.
-        let synth = || LabeledSpan::primary(Span::SYNTHETIC, String::new());
-
         // ── Stage 1: duplicate names ────────────────────────────────
         // Names are case-sensitive (matches Unix FS, Airflow, Beam).
         // Exact duplicates → E001 error. Case-only duplicates → W002.
@@ -518,10 +513,17 @@ impl PipelineConfig {
         }
         if let Some(cycle) = graph.detect_cycle() {
             let path = cycle.join(" → ");
+            let cycle_span = cycle
+                .first()
+                .and_then(|name| self.nodes.iter().find(|node| node.value.name() == name))
+                .map_or_else(
+                    || LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    span_for,
+                );
             diags.push(Diagnostic::error(
                 "E003",
                 format!("cycle detected: {path} → {}", cycle[0]),
-                synth(),
+                cycle_span,
             ));
         }
 
@@ -2373,6 +2375,19 @@ impl PipelineConfig {
             return Err(diags);
         }
 
+        // Seal the complete recursive Source activation inventory at the same
+        // finalized-plan boundary. This reads only compiled topology and
+        // secret-free logical resource requirements; runtime handles and
+        // credential profiles remain outside `CompiledPlan`.
+        if let Err(error) = dag.seal_source_activation(&artifacts.composition_bodies) {
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("source activation finalization failed: {}", error.message),
+                LabeledSpan::primary(error.span, String::new()),
+            ));
+            return Err(diags);
+        }
+
         // Stamp the runtime config's source bodies with their declared
         // `$doc.*` path set. The executor's ingest path reads source configs
         // from `PipelineConfig::source_configs` (the config nodes), so the
@@ -3874,15 +3889,19 @@ pub(crate) fn lower_node_to_plan_node(
     match node {
         PipelineNode::Source { config, .. } => {
             // The `$doc` path set the reader extracts is stamped on the
-            // runtime `PipelineConfig` source body (see `compile_with_diagnostics`),
-            // which is what the executor's ingest path reads; the DAG payload
-            // does not carry it.
-            let source = config.source.clone();
+            // Retain the complete resolved body. Top-level execution can still
+            // read the same value from `PipelineConfig`; composition-body
+            // execution has no top-level config entry and consumes this DAG
+            // payload directly.
+            let body = config.clone();
+            let source = body.source.clone();
             Some(PlanNode::Source {
                 name: name.to_string(),
                 id,
                 span,
                 resolved: Some(Box::new(PlanSourcePayload {
+                    body,
+                    resource: None,
                     source,
                     validated_path: None,
                 })),
@@ -4593,7 +4612,17 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         }
     }
 
-    for input in config.source_configs() {
+    for body in config.source_bodies() {
+        let input = &body.source;
+        // `resource:` replaces file discovery only for a Source authored in a
+        // composition body. Pipeline parsing cannot know that enclosing scope,
+        // so defer every resource-bearing Source to the contextual bind walk:
+        // it rejects the top-level form and validates the body slot/binding.
+        // In particular, do not let E211 mask the resource-specific diagnostic
+        // merely because the direct matcher is intentionally absent.
+        if body.resource.is_some() {
+            continue;
+        }
         // Matcher-exclusivity, gated on transport. A file transport
         // resolves its file set through the discovery layer's
         // `path`/`glob`/`regex`/`paths` matchers, so exactly one must be

@@ -41,11 +41,13 @@ use indexmap::IndexMap;
 use serde::de::{self, IntoDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::config::composition::ResourceBinding;
 use crate::config::node_header::{
     CombineHeader, EnvelopeHeader, MergeHeader, NodeHeader, SourceHeader,
 };
 use crate::plan::index::AnalyticWindowSpec;
 use crate::yaml::CxlSource;
+use clinker_core_types::{Diagnostic, LabeledSpan, Span as DiagnosticSpan};
 
 /// Unified pipeline node taxonomy. Every node in the YAML `nodes:` list
 /// deserializes to a [`PipelineNode`] variant. The variant tag is the
@@ -173,21 +175,15 @@ pub enum PipelineNode {
         /// Path to the `.comp.yaml` file defining the composition.
         #[serde(rename = "use")]
         r#use: PathBuf,
-        /// Optional alias for namespace-mangling after expansion.
-        #[serde(default)]
-        alias: Option<String>,
         /// Port bindings: composition input port → upstream node ref.
         #[serde(default)]
         inputs: IndexMap<String, String>,
-        /// Port bindings: composition output port → downstream node ref.
-        #[serde(default)]
-        outputs: IndexMap<String, String>,
         /// Behavioural config param overrides.
         #[serde(default)]
         config: IndexMap<String, serde_json::Value>,
-        /// Resource bindings (file paths, connection strings, etc.).
+        /// Secret-free logical catalog bindings by declared slot.
         #[serde(default)]
-        resources: IndexMap<String, serde_json::Value>,
+        resources: IndexMap<String, ResourceBinding>,
         /// Populated by `bind_composition` at plan time. Serde-default to a
         /// sentinel; any consumer reading this before `bind_schema` runs
         /// gets a clear debug-panic.
@@ -453,7 +449,7 @@ impl<'de> Deserialize<'de> for PipelineNode {
                         let payload = CompositionPayload::deserialize(
                             de::value::MapAccessDeserializer::new(dispatch),
                         )?;
-                        Ok(payload.into_node())
+                        payload.into_node().map_err(de::Error::custom)
                     }
                     other => Err(de::Error::unknown_variant(
                         other,
@@ -788,20 +784,36 @@ struct CompositionPayload {
     #[serde(rename = "use")]
     r#use: PathBuf,
     #[serde(default)]
-    alias: Option<String>,
+    alias: Option<crate::yaml::Spanned<serde_json::Value>>,
     #[serde(default)]
     inputs: IndexMap<String, String>,
     #[serde(default)]
-    outputs: IndexMap<String, String>,
+    outputs: Option<crate::yaml::Spanned<serde_json::Value>>,
     #[serde(default)]
     config: IndexMap<String, serde_json::Value>,
     #[serde(default)]
-    resources: IndexMap<String, serde_json::Value>,
+    resources: IndexMap<String, ResourceBinding>,
 }
 
 impl CompositionPayload {
-    fn into_node(self) -> PipelineNode {
-        PipelineNode::Composition {
+    fn into_node(self) -> Result<PipelineNode, String> {
+        if let Some(alias) = self.alias {
+            return Err(rejected_composition_call_field(
+                "alias",
+                alias.referenced.line() as u32,
+                alias.referenced.column() as u32,
+                "replace `alias: <namespace>` with `name: <namespace>` on this composition node; `add.alias` remains valid only inside an overlay `add` operation",
+            ));
+        }
+        if let Some(outputs) = self.outputs {
+            return Err(rejected_composition_call_field(
+                "outputs",
+                outputs.referenced.line() as u32,
+                outputs.referenced.column() as u32,
+                "declare the port under `_compose.outputs`, then reference it downstream as `<composition-node-name>.<port>`",
+            ));
+        }
+        Ok(PipelineNode::Composition {
             header: NodeHeader {
                 name: self.name,
                 description: self.description,
@@ -809,14 +821,46 @@ impl CompositionPayload {
                 notes: self.notes,
             },
             r#use: self.r#use,
-            alias: self.alias,
             inputs: self.inputs,
-            outputs: self.outputs,
             config: self.config,
             resources: self.resources,
             body: crate::plan::composition_body::CompositionBodyId::default(),
-        }
+        })
     }
+}
+
+fn rejected_composition_call_field(
+    field: &str,
+    line: u32,
+    column: u32,
+    correction: &str,
+) -> String {
+    let span = if line == 0 {
+        DiagnosticSpan::SYNTHETIC
+    } else {
+        DiagnosticSpan::line_only(line)
+    };
+    let diagnostic = Diagnostic::error(
+        "E377",
+        format!(
+            "ordinary composition call field `{field}:` is rejected because it previously parsed without affecting planning or execution"
+        ),
+        LabeledSpan::primary(span, format!("remove `{field}:`")),
+    )
+    .with_help(correction);
+    let authored = if line == 0 {
+        String::new()
+    } else if column == 0 {
+        format!(" at line {line}")
+    } else {
+        format!(" at line {line}, column {column}")
+    };
+    format!(
+        "[{}] {}{authored}; help: {}",
+        diagnostic.code,
+        diagnostic.message,
+        diagnostic.help.as_deref().unwrap_or(correction)
+    )
 }
 
 impl PipelineNode {
@@ -1184,6 +1228,15 @@ impl PipelineNode {
 /// [`crate::config::PipelineConfig::compile`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceBody {
+    /// Composition resource slot that supplies this Source's external target.
+    ///
+    /// This field is valid only on a Source authored inside a composition
+    /// body. The enclosing `_compose.resources_schema` must declare the slot,
+    /// and each call site must bind it through `resources:`. Top-level Sources
+    /// continue to use exactly one direct file matcher until they gain a
+    /// separately designed binding surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<crate::yaml::Spanned<String>>,
     /// The source's unified schema. Required — missing this field is a
     /// serde parse error routed to E201 via the diagnostic layer. A
     /// [`SourceSchema`](clinker_format::SourceSchema) carrying the declared
@@ -2053,15 +2106,12 @@ nodes:
     name: norm
     input: clean
     use: ./nonexistent_comp.yaml
-    alias: norm_alias
     inputs:
       port_a: clean
-    outputs:
-      port_b: downstream
     config:
       threshold: 42
     resources:
-      db: "postgres://localhost"
+      db: shared.db
 
   - type: output
     name: out
@@ -2129,7 +2179,7 @@ nodes:
         use crate::config::PipelineNode;
         use crate::yaml::Location;
 
-        // 1. Composition with all optional fields
+        // 1. Composition with every accepted optional field
         let yaml_comp = r#"
 pipeline:
   name: spike_comp
@@ -2138,15 +2188,12 @@ nodes:
     name: my_comp
     input: upstream
     use: path/to/comp.yaml
-    alias: comp_alias
     inputs:
       port_a: upstream_a
-    outputs:
-      port_b: downstream_b
     config:
       threshold: 42
     resources:
-      db: "postgres://localhost"
+      db: shared.db
 "#;
         let doc: crate::config::PipelineConfig =
             crate::yaml::from_str(yaml_comp).expect("composition should parse");

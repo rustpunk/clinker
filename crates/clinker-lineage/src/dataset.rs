@@ -23,6 +23,7 @@ use std::path::Path;
 
 use clinker_plan::config::{OutputConfig, SourceConfig};
 use clinker_plan::plan::execution::PlanNode;
+use clinker_plan::resources::{CatalogResource, ResourceDescriptor};
 
 use crate::openlineage::Dataset;
 
@@ -37,6 +38,9 @@ pub const FILE_NAMESPACE: &str = "file";
 /// The dataset name is then the plan node's own name; richer network-dataset
 /// naming is intentionally outside this module's scope.
 pub const FALLBACK_NAMESPACE: &str = "clinker";
+
+/// Stable namespace for typed catalog file resources.
+pub const RESOURCE_FILE_NAMESPACE: &str = "clinker-resource:file";
 
 /// Separates a multi-record source's base dataset name from one record type id
 /// in the composed per-record-type name (`<base><sep><id>`).
@@ -115,6 +119,22 @@ impl From<DatasetId> for Dataset {
     }
 }
 
+/// Stable OpenLineage identity for one admitted typed catalog resource.
+///
+/// The match is intentionally exhaustive over resource descriptor kinds. A
+/// future external kind must choose its own stable identity inputs here; an
+/// internal-only kind must add an explicit documented `None` arm instead of
+/// falling through. Credentials, opened handles, and record values are not
+/// available to this function.
+pub fn resource_dataset_identity(resource: &CatalogResource) -> Option<DatasetId> {
+    match resource.descriptor() {
+        ResourceDescriptor::File { .. } => Some(DatasetId {
+            namespace: RESOURCE_FILE_NAMESPACE.to_string(),
+            name: resource.id().to_string(),
+        }),
+    }
+}
+
 /// The OpenLineage dataset identity of a plan node, or `None` for nodes that are
 /// not datasets (every variant but [`Source`](PlanNode::Source) and
 /// [`Output`](PlanNode::Output)).
@@ -127,7 +147,13 @@ impl From<DatasetId> for Dataset {
 pub fn dataset_identity(node: &PlanNode, base_dir: &Path) -> Option<DatasetId> {
     match node {
         PlanNode::Source { name, resolved, .. } => Some(match resolved {
-            Some(payload) => source_dataset_identity(&payload.source, base_dir),
+            Some(payload) => match &payload.resource {
+                Some(resource) => DatasetId {
+                    namespace: resource.dataset_identity.namespace.to_string(),
+                    name: resource.dataset_identity.name.clone(),
+                },
+                None => source_dataset_identity(&payload.source, base_dir),
+            },
             None => DatasetId::fallback(name.as_str()),
         }),
         PlanNode::Output { name, resolved, .. } => Some(match resolved {
@@ -295,8 +321,15 @@ mod tests {
     use std::sync::Arc;
 
     use clinker_core_types::span::Span;
-    use clinker_plan::plan::execution::{PlanOutputPayload, PlanSourcePayload};
+    use clinker_plan::config::{
+        LayerKind, ResourceBinding, ResourceCapability, ResourceKind, ResourceLifetime,
+        ResourceOpenerKind,
+    };
+    use clinker_plan::plan::execution::{
+        CompiledResourceRequirement, PlanOutputPayload, PlanSourcePayload,
+    };
     use clinker_plan::plan::{EntityRef, PlanNodeId};
+    use clinker_plan::resources::{LogicalResourceId, ResourceDatasetIdentity};
     use clinker_record::Schema;
     use serde_json::json;
 
@@ -306,6 +339,10 @@ mod tests {
 
     fn source_config(value: serde_json::Value) -> SourceConfig {
         serde_json::from_value(value).expect("valid source config")
+    }
+
+    fn source_body(value: serde_json::Value) -> clinker_plan::config::pipeline_node::SourceBody {
+        serde_json::from_value(value).expect("valid source body")
     }
 
     fn output_config(value: serde_json::Value) -> OutputConfig {
@@ -485,6 +522,13 @@ mod tests {
     #[test]
     fn source_node_delegates_to_source_identity() {
         let payload = PlanSourcePayload {
+            body: source_body(json!({
+                "name": "in",
+                "path": "data/in.csv",
+                "type": "csv",
+                "schema": [{ "name": "id", "type": "string" }]
+            })),
+            resource: None,
             source: source_config(json!({"name": "in", "path": "data/in.csv", "type": "csv"})),
             validated_path: None,
         };
@@ -492,6 +536,46 @@ mod tests {
         assert_eq!(
             dataset_identity(&node, base()),
             Some(DatasetId::file("/work/data/in.csv".to_string()))
+        );
+    }
+
+    #[test]
+    fn body_source_uses_the_compiled_resource_dataset_identity() {
+        let payload = PlanSourcePayload {
+            body: source_body(json!({
+                "name": "in",
+                "resource": "orders",
+                "type": "csv",
+                "schema": [{ "name": "id", "type": "string" }]
+            })),
+            resource: Some(CompiledResourceRequirement {
+                slot: "orders".to_string(),
+                binding: ResourceBinding::from_layer(
+                    LogicalResourceId::parse("shared_orders").expect("logical id"),
+                    LayerKind::PipelineDefault,
+                    Span::SYNTHETIC,
+                    false,
+                ),
+                kind: ResourceKind::File,
+                required_capabilities: Box::new([ResourceCapability::Read]),
+                opener: ResourceOpenerKind::File,
+                lifetime: ResourceLifetime::Run,
+                dataset_identity: ResourceDatasetIdentity {
+                    namespace: RESOURCE_FILE_NAMESPACE,
+                    name: "shared_orders".to_string(),
+                },
+            }),
+            source: source_config(json!({"name": "in", "type": "csv"})),
+            validated_path: None,
+        };
+        let node = source_node("in", Some(payload));
+
+        assert_eq!(
+            dataset_identity(&node, base()),
+            Some(DatasetId {
+                namespace: RESOURCE_FILE_NAMESPACE.to_string(),
+                name: "shared_orders".to_string(),
+            })
         );
     }
 

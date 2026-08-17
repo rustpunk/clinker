@@ -34,8 +34,10 @@ pub use compile_context::{CompileContext, ConfigOverrides};
 pub use composition::{
     CompositionFile, CompositionSignature, CompositionSymbolTable, LayerKind, NodeRef, OutputAlias,
     ParamDecl, ParamName, ParamType, PortDecl, PortName, ProvenanceDb, ProvenanceLayer,
-    ResolvedValue, Resource, ResourceDecl, ResourceKind, ResourceName, ScopedVarsSchema, SourceMap,
-    SpannedNodeRef, WORKSPACE_COMPOSITION_BUDGET, scan_workspace_signatures, validate_signatures,
+    ResolvedValue, Resource, ResourceBinding, ResourceCapability, ResourceDecl, ResourceKind,
+    ResourceLifetime, ResourceName, ResourceOpenerKind, ScopedVarsSchema, SourceMap,
+    SpannedNodeRef, WORKSPACE_COMPOSITION_BUDGET, is_reserved_credential_selector,
+    scan_workspace_signatures, validate_signatures,
 };
 pub use discovery::{DiscoveredFile, DiscoveryError, DiscoveryOutcome, discover};
 pub use error::*;

@@ -46,8 +46,10 @@ fn write_channel(dir: &Path, id: &str, body: &str) {
         catalog.push_str(&format!("{channel_id} = \"channel/{channel_id}\"\n"));
     }
     if dir.join("compositions/with_ref.comp.yaml").is_file() {
-        catalog
-            .push_str("\n[catalog.compositions]\nwith_ref = \"compositions/with_ref.comp.yaml\"\n");
+        catalog.push_str(
+            "\n[catalog.compositions]\nwith_ref = \"compositions/with_ref.comp.yaml\"\n\
+             \n[catalog.resources.ref_data]\nkind = \"file\"\npath = \"ref.csv\"\naccess = \"read\"\n",
+        );
     }
     std::fs::write(dir.join("clinker.toml"), catalog).expect("write catalog");
 }
@@ -701,9 +703,9 @@ nodes:
 // A channel `sources:` key qualified `<composition>.<source>` patches a source
 // declared inside that composition's body. The body is expanded only during
 // compile, so the patch is deferred and applied when the body is re-read. A
-// body-declared source binds (its schema seeds the body) but does not run
-// today, so these drive the compile-only `--explain` path — which flows through
-// the same channel resolution and body-source patch application a run would.
+// These drive the compile-only `--explain` path because the contract under
+// test is schema patching. The same channel resolution and body-source patch
+// application also feeds a real run.
 
 /// The invoking pipeline: a composition `enrich` whose body reads its own
 /// declared source `ref`.
@@ -725,6 +727,8 @@ nodes:
     use: ./compositions/with_ref.comp.yaml
     inputs:
       driver: drv
+    resources:
+      ref_data: ref_data
   - type: output
     name: out
     input: enrich
@@ -751,6 +755,8 @@ _compose:
   outputs:
     out: shape
   config_schema: {{}}
+  resources_schema:
+    ref_data: {{ kind: file, required: true }}
 
 nodes:
   - type: source
@@ -758,7 +764,7 @@ nodes:
     config:
       name: ref
       type: csv
-      path: ref.csv
+      resource: ref_data
       schema:
 {ref_schema}
   - type: transform
@@ -770,6 +776,7 @@ nodes:
 "
     );
     std::fs::write(comp_dir.join("with_ref.comp.yaml"), yaml).expect("write comp");
+    std::fs::write(dir.join("ref.csv"), "raw\nfixture\n").expect("write resource fixture");
 }
 
 /// A channel `sources:` patch qualified `enrich.ref` reaches the source inside

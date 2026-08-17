@@ -59,43 +59,40 @@ evidence.
 should extend beyond file resources — the same declaration-only subsystem.
 The per-value `fixed`-lock half of this entry is resolved; see the archive.)
 
-- Open (resources fork): A `resources:` overlay surface is still absent, and
-  restoring it is a genuine scope fork. The retired file-based `resources:` split
-  was parsed into `ChannelBinding.resources_default` / `resources_fixed` but
-  **never applied** — it took effect in no version. The broader composition
-  resource subsystem is declaration-only: `_compose.resources_schema` and the
-  call-site node `resources:` field parse, but `validate_resources`
-  (`bind_schema.rs`) is a stub, resources get no `ProvenanceDb` entry,
-  `Resource::File` is constructed at parse (`config/composition/raw.rs`) but
-  never consumed at runtime. So a `resources:` overlay that merely round-trips
-  would be an inert authoring surface, while making it "take effect" means
-  building a new supply→resolution→consumption subsystem — a scope decision,
-  not a wiring task.
-- Why it matters: Deciding requires choosing between (a) deferring resources to a
-  dedicated issue that designs the resource runtime, (b) restoring a parse-only /
-  validated surface that does not affect execution, or (c) building the full
-  subsystem now. These have materially different scope. The same decision should
-  fix the intended resource-kind breadth (file-only versus a typed model) —
-  agents must not invent new resource kinds by inference in the meantime.
+- Resolution: The planning fork is implemented. A bounded, strict
+  `[catalog.resources]` admits the typed `file` kind; composition signatures
+  declare slots, scalar call sites bind logical identities, and group,
+  channel-wide, and per-target `resources:` leaves rebind those slots through
+  the existing fixed/provenance rules. Unknown kinds, names, slots,
+  capability mismatches, inline objects, and credential-like selectors fail
+  closed. Runtime credential resolution and opener activation remain the
+  deliberately separate, partially implemented half of D-12/D-15.
+- Why it matters: Future work may add a resource kind only by extending the
+  closed descriptor/capability/opener/identity matches with tests and docs. It
+  must not infer schemas or add credentials to reusable catalog, call-site, or
+  overlay content.
 - Files/modules involved: `crates/clinker-channel/src/manifest.rs`,
   `crates/clinker-channel/src/resolve.rs`,
   `crates/clinker-plan/src/config/composition/resource.rs`,
-  `crates/clinker-plan/src/config/composition/raw.rs`,
-  `crates/clinker-plan/src/plan/bind_schema.rs` (`validate_resources` stub),
+  `crates/clinker-plan/src/resources/mod.rs`,
+  `crates/clinker-plan/src/plan/bind_schema.rs`,
   `docs/user/src/pipelines/compositions.md`.
-- Suggested way to resolve it: Route the `resources:` surface and resource-kind
-  breadth through one Decision Gate.
+- Resolution evidence: `crates/clinker-plan/tests/runtime_resources.rs`,
+  `crates/clinker-channel/tests/resource_rebinding.rs`, and
+  `crates/clinker-lineage/tests/logical_identity.rs` pin the typed planning,
+  overlay, bounds, redaction, fingerprint, and dataset-identity contracts.
 - Priority: Medium
 - Filed: 2026-06-15; updated 2026-07-03 (fixed-lock half landed) and 2026-07-24
   (merged question 9).
-- Documentation status: The user guide now labels composition resource
-  declarations and call-site bindings as reserved and non-operational. This
-  warning does not resolve the runtime or overlay design choice.
+- Documentation status: The user guide documents the planning syntax and the
+  implemented credential-free file-resource activation path. It states
+  explicitly that credential-profile selection and credential-bearing
+  activation have not landed.
 - Status: Resolved
 - Decision: D-12 through D-15
-- Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` defines the typed catalog-and-slot model; `crates/clinker-plan/src/plan/bind_schema.rs` still contains the current `validate_resources` stub.
+- Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` records D-13/D-14 as implemented and D-12/D-15 as partial; the three focused targets named above exercise current source.
 - Implementation owner: AUTH-01
-- Verified: 2026-07-29
+- Verified: 2026-08-16
 
 ### 3. Should pipeline-target channel config keys be validated before overlay application?
 
@@ -606,29 +603,32 @@ see the Resolved Archive. This entry keeps the one remaining follow-on.)
 
 ### 32. Should reserved composition call-site `outputs:` and `alias:` be removed or implemented?
 
-- Question: The composition node parser accepts call-site `outputs:` and
-  `alias:`, but binding computes output rows exclusively from
-  `_compose.outputs` and does not consume the call-site output map, while the
-  stored alias does not namespace body nodes. Should these fields be rejected,
-  assigned concrete semantics, or retained as explicitly reserved syntax?
-- Why it matters: These are strict, user-authored YAML fields. Accepting them
-  without an effect invites authors to believe output remapping or collision
-  avoidance occurred when it did not.
+- Resolution: Ordinary composition call-site `outputs:` and `alias:` are
+  rejected at their authored locations with E377 and cannot enter
+  `PipelineNode::Composition`. `_compose.outputs` remains the port contract,
+  downstream consumers use `node.port`, the composition node `name` supplies
+  its namespace, and overlay `add.alias` remains valid only in that distinct
+  operation.
+- Why it matters: The strict surface no longer accepts either successful
+  no-op, and future changes must not revive a second spelling for ports or
+  composition names.
 - Files/modules involved:
   `crates/clinker-plan/src/config/pipeline_node.rs`,
   `crates/clinker-plan/src/plan/bind_schema.rs` (`compute_output_rows`),
   `docs/user/src/pipelines/compositions.md`.
-- Suggested way to resolve it: Decide the intended call-site output and
-  namespacing model. Remove the fields with a diagnostic if no second spelling
-  is needed, or implement and test their exact binding, collision, provenance,
-  and downstream-port behavior.
+- Resolution evidence: `crates/clinker-plan/tests/runtime_resources.rs` covers
+  top-level and nested negatives plus accepted `_compose.outputs`;
+  `crates/clinker-core-types/tests/registry_no_orphan_codes.rs` and
+  `crates/clinker/tests/diagnostics_cli.rs` pin the sole active E377 descriptor,
+  detail page, and list/code discovery. The existing overlay add test preserves
+  `add.alias`.
 - Priority: Medium
-- Filed: 2026-07-26. The user guide currently marks both fields reserved.
+- Filed: 2026-07-26. Resolved by rejection on 2026-08-16.
 - Status: Resolved
 - Decision: D-16
-- Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` rejects ordinary call-site `outputs:` and `alias:` while preserving `_compose.outputs` and overlay insertion aliases; `crates/clinker-plan/src/config/pipeline_node.rs` shows the currently parsed fields.
+- Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` records D-16 as implemented; `crates/clinker-plan/src/config/pipeline_node.rs` retains only rejection-only deserialization fields and no plan representation.
 - Implementation owner: AUTH-01
-- Verified: 2026-07-29
+- Verified: 2026-08-16
 
 ### 33. Should parsed `PipelineMeta` specification stubs remain accepted YAML?
 

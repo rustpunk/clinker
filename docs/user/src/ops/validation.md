@@ -27,6 +27,18 @@ with code 1 for a configuration, schema, or plan diagnostic. Admission does not
 prove that later input decoding or I/O will succeed, and the rendered plan does
 not prove output correctness.
 
+Composition resource descriptors and bindings are part of this admission. The
+planner checks the bounded `[catalog.resources]` table, declared
+`_compose.resources_schema` slots, call-site and overlay logical identities,
+kind/capability compatibility, required slots, fixed locks, and recursive
+composition bodies without resolving credentials or opening handles.
+
+An ordinary composition call containing `alias:` or `outputs:` fails during
+strict YAML parsing with E377 at the authored location. Replace `alias:` with
+the composition node's `name:`. Declare ports under `_compose.outputs` and
+refer to them downstream as `<composition-node-name>.<port>`. The separate
+`add.alias` field remains valid only within an overlay `add` operation.
+
 Bare `--dry-run` performs the same planner compilation without rendering the
 plan:
 

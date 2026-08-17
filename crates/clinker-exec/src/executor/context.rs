@@ -2,13 +2,120 @@
 //! `StableEvalContext` and the static/source-scoped var maps it carries.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use clinker_record::{PipelineCounters, Value};
 use indexmap::IndexMap;
 
 use clinker_plan::config::PipelineConfig;
 use cxl::eval::{StableEvalContext, WallClock};
+
+use super::{PreviewPolicy, RunPolicy};
+
+/// One run's shared Source limiter and preview policy.
+///
+/// Requiring this pair at Source activation and top-level ingestion keeps the
+/// same limiter and preview decision on every real Source work path.
+#[derive(Clone)]
+pub(crate) struct SourceRuntimePolicy {
+    work: SourceWorkCapacity,
+    preview: PreviewPolicy,
+}
+
+impl SourceRuntimePolicy {
+    pub(super) fn new(run_policy: RunPolicy) -> Self {
+        Self {
+            work: SourceWorkCapacity::new(run_policy.thread_capacity()),
+            preview: run_policy.preview(),
+        }
+    }
+
+    pub(super) const fn preview(&self) -> PreviewPolicy {
+        self.preview
+    }
+
+    pub(super) fn acquire(
+        &self,
+        shutdown: Option<&crate::pipeline::shutdown::ShutdownToken>,
+    ) -> Option<SourceWorkPermit> {
+        self.work.acquire(shutdown)
+    }
+}
+
+/// Run-scoped permit pool for actual Source read work.
+///
+/// Source threads remain independently owned so bounded channel backpressure
+/// and deterministic drain order are unchanged. A permit is held only across
+/// `RecordSource::schema` or `RecordSource::next_record`, never across a
+/// channel send, which prevents a full later-source channel from blocking an
+/// earlier source from acquiring capacity. The pool stores two counters
+/// regardless of the configured limit; it retains no input-sized state.
+#[derive(Clone)]
+struct SourceWorkCapacity {
+    state: Arc<SourceWorkState>,
+}
+
+struct SourceWorkState {
+    available: Mutex<usize>,
+    wake: Condvar,
+}
+
+impl SourceWorkCapacity {
+    pub(super) fn new(capacity: NonZeroUsize) -> Self {
+        Self {
+            state: Arc::new(SourceWorkState {
+                available: Mutex::new(capacity.get()),
+                wake: Condvar::new(),
+            }),
+        }
+    }
+
+    pub(super) fn acquire(
+        &self,
+        shutdown: Option<&crate::pipeline::shutdown::ShutdownToken>,
+    ) -> Option<SourceWorkPermit> {
+        let mut available = self
+            .state
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if shutdown.is_some_and(crate::pipeline::shutdown::ShutdownToken::is_requested) {
+                return None;
+            }
+            if *available > 0 {
+                *available -= 1;
+                return Some(SourceWorkPermit {
+                    state: Arc::clone(&self.state),
+                });
+            }
+            let (next, _) = self
+                .state
+                .wake
+                .wait_timeout(available, Duration::from_millis(25))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            available = next;
+        }
+    }
+}
+
+pub(super) struct SourceWorkPermit {
+    state: Arc<SourceWorkState>,
+}
+
+impl Drop for SourceWorkPermit {
+    fn drop(&mut self) {
+        let mut available = self
+            .state
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *available = available.saturating_add(1);
+        self.state.wake.notify_one();
+    }
+}
 
 /// Build the pipeline-stable evaluation context.
 ///
@@ -174,6 +281,38 @@ fn arcs_reachable_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_work_capacity_one_blocks_a_second_and_two_admits_it() {
+        let capacity = SourceWorkCapacity::new(NonZeroUsize::MIN);
+        let first = capacity.acquire(None).expect("first permit");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let contender = capacity.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).expect("announce acquire");
+            let permit = contender.acquire(None).expect("third permit");
+            acquired_tx.send(()).expect("announce permit");
+            permit
+        });
+
+        started_rx.recv().expect("contender started");
+        assert!(
+            acquired_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "a second Source work unit must wait at capacity one"
+        );
+        drop(first);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("released capacity wakes one waiter");
+        drop(worker.join().expect("join contender"));
+
+        let capacity = SourceWorkCapacity::new(NonZeroUsize::new(2).unwrap());
+        let first = capacity.acquire(None).expect("first of two permits");
+        let second = capacity.acquire(None).expect("second of two permits");
+        drop((first, second));
+    }
 
     /// Pipeline `src(in.csv) -> body(transform) -> framed(envelope) -> m(merge)`.
     /// The Merge consumes the Envelope's output. The qualified-source arc map

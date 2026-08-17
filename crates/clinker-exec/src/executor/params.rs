@@ -2,12 +2,73 @@
 //! execution report.
 
 use std::collections::BTreeMap;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use chrono::{DateTime, Utc};
 use clinker_record::{PipelineCounters, Value};
 use indexmap::IndexMap;
 
 use super::{DlqEntry, stage_metrics};
+
+/// Whether an admitted run executes normally or reads a bounded preview.
+///
+/// The per-source bound is nonzero by construction and is checked immediately
+/// before each `RecordSource::next_record` call. This keeps a preview from
+/// reading one row ahead of the limit, including for composition-body Sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewPolicy {
+    /// Execute the complete finite pipeline and publish configured outputs.
+    Disabled,
+    /// Compile and preflight only. This mode never enters the executor.
+    ConfigOnly,
+    /// Execute at most this many records from each declared Source.
+    RecordsPerSource(NonZeroU64),
+}
+
+impl PreviewPolicy {
+    /// Return the read bound for a bounded preview.
+    pub fn records_per_source(self) -> Option<NonZeroU64> {
+        match self {
+            Self::RecordsPerSource(limit) => Some(limit),
+            Self::Disabled | Self::ConfigOnly => None,
+        }
+    }
+
+    /// Whether configured output publication is permitted.
+    pub fn publishes_configured_outputs(self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+}
+
+/// Fully resolved execution policy shared by scheduler, readers, and report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunPolicy {
+    thread_capacity: NonZeroUsize,
+    preview: PreviewPolicy,
+}
+
+impl RunPolicy {
+    /// Construct a policy from already-validated, nonzero CLI/config values.
+    pub const fn new(thread_capacity: NonZeroUsize, preview: PreviewPolicy) -> Self {
+        Self {
+            thread_capacity,
+            preview,
+        }
+    }
+
+    /// Independent cap for CPU workers and concurrent Source read calls.
+    ///
+    /// This is not a combined operating-system thread limit: Source workers
+    /// remain distinct from the Rayon kernel pool.
+    pub const fn thread_capacity(self) -> NonZeroUsize {
+        self.thread_capacity
+    }
+
+    /// Preview/publication behavior for this run.
+    pub const fn preview(self) -> PreviewPolicy {
+        self.preview
+    }
+}
 
 /// Runtime parameters for a pipeline execution (not derived from config YAML).
 #[derive(Default)]

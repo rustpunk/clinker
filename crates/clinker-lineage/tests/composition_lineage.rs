@@ -3,8 +3,9 @@
 //! Compositions are referenced by an on-disk `use:` path, so these tests compile
 //! inline parent pipelines against fixture `.comp.yaml` bodies under
 //! `tests/fixtures/compositions/`. Like the unit tests in `builder.rs`, no source
-//! data is read — lineage is derived statically from the compiled plan — so the
-//! `data/src.csv` paths need not exist.
+//! data is read — lineage is derived statically from the compiled plan. Direct
+//! source paths need not exist; catalog-backed body Source descriptors do,
+//! because catalog admission validates their workspace targets.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -67,6 +68,12 @@ fn direct(name: &str, field: &str, subtype: TransformationSubtype) -> InputField
             masking: None,
         }],
     }
+}
+
+fn resource_direct(name: &str, field: &str, subtype: TransformationSubtype) -> InputField {
+    let mut field = direct(name, field, subtype);
+    field.namespace = "clinker-resource:file".to_string();
+    field
 }
 
 fn indirect(name: &str, field: &str, subtypes: &[TransformationSubtype]) -> InputField {
@@ -577,6 +584,7 @@ nodes:
     use: ../compositions/own_source.comp.yaml
     inputs:
       driver: ref
+    resources: { reference: reference_codes }
   - type: output
     name: out
     input: enrich
@@ -652,6 +660,87 @@ nodes:
         );
     }
 
+    /// Two calls of the same body keep each compiled resource binding on its
+    /// own scoped Source. The first output must not inherit the second call's
+    /// dataset edge (or vice versa) merely because both body nodes are named
+    /// `ref`.
+    #[test]
+    fn two_calls_keep_distinct_body_source_dataset_edges() {
+        let lineage = lineage_of(
+            r#"
+pipeline: { name: two_body_source_identities }
+nodes:
+  - type: source
+    name: driver
+    config:
+      name: driver
+      type: csv
+      path: data/top.csv
+      schema: [{ name: x, type: int }]
+  - type: composition
+    name: first
+    input: driver
+    use: ../compositions/own_source.comp.yaml
+    inputs: { driver: driver }
+    resources: { reference: reference_codes }
+  - type: composition
+    name: second
+    input: driver
+    use: ../compositions/own_source.comp.yaml
+    inputs: { driver: driver }
+    resources: { reference: body_ledger }
+  - type: output
+    name: first_out
+    input: first
+    config: { name: first_out, type: csv, path: out/first.csv }
+  - type: output
+    name: second_out
+    input: second
+    config: { name: second_out, type: csv, path: out/second.csv }
+"#,
+        );
+
+        let first = lineage
+            .outputs
+            .iter()
+            .find(|output| output.dataset.name == file_dataset("out/first.csv"))
+            .expect("first call output dataset");
+        let second = lineage
+            .outputs
+            .iter()
+            .find(|output| output.dataset.name == file_dataset("out/second.csv"))
+            .expect("second call output dataset");
+        assert_field(
+            &first.facet.fields,
+            "label",
+            &[resource_direct(
+                "reference_codes",
+                "code",
+                TransformationSubtype::Identity,
+            )],
+        );
+        assert_field(
+            &second.facet.fields,
+            "label",
+            &[resource_direct(
+                "body_ledger",
+                "code",
+                TransformationSubtype::Identity,
+            )],
+        );
+
+        let names: Vec<_> = lineage
+            .inputs
+            .iter()
+            .map(|dataset| (dataset.namespace.as_str(), dataset.name.as_str()))
+            .collect();
+        assert!(
+            names.contains(&("clinker-resource:file", "reference_codes"))
+                && names.contains(&("clinker-resource:file", "body_ledger")),
+            "both call-scoped datasets are inventoried distinctly: {names:?}"
+        );
+    }
+
     /// A top-level node named `enrich.ref` once compiled: `.` was reserved in a
     /// transform, aggregate, and route name, but not in a source, output, or
     /// composition one. Joining a call site to a body node with a bare `.`
@@ -688,6 +777,7 @@ nodes:
     use: ../compositions/own_source.comp.yaml
     inputs:
       driver: drive
+    resources: { reference: reference_codes }
   - type: output
     name: enrich.ref
     input: enrich
@@ -745,6 +835,7 @@ nodes:
     use: ../compositions/own_source.comp.yaml
     inputs:
       driver: drive
+    resources: {{ reference: reference_codes }}
   - type: output
     name: out
     input: {call_site}
@@ -791,7 +882,8 @@ nodes:
     }
 
     /// The same pipeline under local diagnostic paths — the mode that already
-    /// walked body sources — resolves both to distinct path-derived datasets.
+    /// walked body sources — resolves both to distinct datasets using the
+    /// direct top-level path and compiled catalog identity respectively.
     /// External mode now reaches the same node set rather than aborting.
     #[test]
     fn local_diagnostic_paths_resolve_the_same_node_set() {
@@ -799,8 +891,8 @@ nodes:
         let names: Vec<&str> = lineage.inputs.iter().map(|id| id.name.as_str()).collect();
         assert!(
             names.contains(&file_dataset("data/top.csv").as_str())
-                && names.contains(&file_dataset("data/ref.csv").as_str()),
-            "both sources are inputs under their declared paths: {names:?}"
+                && names.contains(&"reference_codes"),
+            "both sources are inputs under their compiled identities: {names:?}"
         );
     }
 }
@@ -847,6 +939,7 @@ nodes:
     use: ../compositions/own_source.comp.yaml
     inputs:
       driver: drive
+    resources: { reference: reference_codes }
   - type: output
     name: out
     input: enrich
@@ -864,10 +957,10 @@ nodes:
         let lineage = lineage_of(TOP_LEVEL_MULTI_RECORD);
         let names: Vec<&str> = lineage.inputs.iter().map(|id| id.name.as_str()).collect();
 
-        let body = file_dataset("data/ref.csv");
+        let body = "reference_codes".to_string();
         assert!(
             names.contains(&body.as_str()),
-            "the body source is an input under its own path: {names:?}"
+            "the body source is an input under its catalog identity: {names:?}"
         );
         assert!(
             !names
@@ -889,15 +982,20 @@ nodes:
         assert_field(
             &only_output(&lineage).facet.fields,
             "label",
-            &[direct(&body, "code", TransformationSubtype::Identity)],
+            &[resource_direct(
+                &body,
+                "code",
+                TransformationSubtype::Identity,
+            )],
         );
     }
 
     /// A multi-record source declared inside a body keeps every column on its
-    /// container dataset. The plan retains no resolved schema for a body node,
-    /// so there is nothing to split by — the builder's documented limitation.
-    /// The columns still land on a dataset the run declares as an input, which
-    /// is what a consumer resolves a column edge against.
+    /// catalog resource's container dataset. The lineage schema lookup is
+    /// top-level-only, so there is nothing to split by — the builder's
+    /// documented limitation. The columns still land on a dataset the run
+    /// declares as an input, which is what a consumer resolves a column edge
+    /// against.
     #[test]
     fn a_body_multi_record_source_is_attributed_to_its_container() {
         let lineage = lineage_of(
@@ -917,6 +1015,7 @@ nodes:
     use: ../compositions/own_multi_record.comp.yaml
     inputs:
       driver: drv
+    resources: { ledger: body_ledger }
   - type: output
     name: out
     input: enrich
@@ -924,7 +1023,7 @@ nodes:
 "#,
         );
 
-        let ledger = file_dataset("data/ledger.txt");
+        let ledger = "body_ledger".to_string();
         let names: Vec<&str> = lineage.inputs.iter().map(|id| id.name.as_str()).collect();
         assert!(
             names.contains(&ledger.as_str()),
@@ -941,12 +1040,20 @@ nodes:
         assert_field(
             fields,
             "batch",
-            &[direct(&ledger, "batch_id", TransformationSubtype::Identity)],
+            &[resource_direct(
+                &ledger,
+                "batch_id",
+                TransformationSubtype::Identity,
+            )],
         );
         assert_field(
             fields,
             "total",
-            &[direct(&ledger, "amount", TransformationSubtype::Identity)],
+            &[resource_direct(
+                &ledger,
+                "amount",
+                TransformationSubtype::Identity,
+            )],
         );
     }
 }

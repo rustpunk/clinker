@@ -238,9 +238,9 @@ fn semantic_node(
     node: &crate::config::PipelineNode,
 ) -> Result<serde_json::Value, serde_json::Error> {
     let mut value = serde_json::to_value(node)?;
-    // Resource bindings on a composition call are deployment locators; the
-    // body digest and typed call-site config carry execution meaning
-    // separately.
+    // Strip physical deployment locators while retaining logical composition
+    // resource bindings: selecting a different logical dataset changes plan
+    // semantics even though its catalog descriptor stays outside this value.
     crate::config::composition::strip_node_deployment_locators(&mut value);
     let Some(object) = value.as_object_mut() else {
         return Ok(value);
@@ -442,6 +442,18 @@ nodes:
         let pipelines = workspace.path().join("pipelines");
         std::fs::create_dir_all(&compositions).expect("create compositions");
         std::fs::create_dir_all(&pipelines).expect("create pipelines");
+        std::fs::create_dir_all(workspace.path().join("data")).expect("create data");
+        std::fs::write(workspace.path().join("data/reference.csv"), "code\nA\n")
+            .expect("write resource data");
+        std::fs::write(
+            workspace.path().join("clinker.toml"),
+            r#"[catalog.resources.body_reference]
+kind = "file"
+path = "data/reference.csv"
+access = "read"
+"#,
+        )
+        .expect("write resource catalog");
         std::fs::write(
             compositions.join("enrich.comp.yaml"),
             r#"_compose:
@@ -450,13 +462,15 @@ nodes:
     driver:
       schema: [{ name: x, type: int }]
   outputs: { out: shape }
+  resources_schema:
+    reference: { kind: file, required: true }
 nodes:
   - type: source
     name: ref
     config:
       name: ref
       type: csv
-      path: ref.csv
+      resource: reference
       schema: [{ name: code, type: string }]
   - type: transform
     name: shape
@@ -481,6 +495,7 @@ nodes:
     input: drv
     use: ../compositions/enrich.comp.yaml
     inputs: { driver: drv }
+    resources: { reference: body_reference }
   - type: output
     name: out
     input: enrich

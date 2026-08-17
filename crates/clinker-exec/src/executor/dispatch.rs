@@ -1141,6 +1141,8 @@ pub(crate) struct ExecutorContext<'a> {
     /// time when the pipeline run began.
     pub(crate) source_ingestion_timestamp: chrono::NaiveDateTime,
     pub(crate) strategy: ErrorStrategy,
+    /// One resolved policy shared with Source readers and the final report.
+    pub(crate) run_policy: crate::executor::RunPolicy,
 
     // Owned mutable per-walk state.
     pub(crate) node_buffers: HashMap<NodeBufferKey, NodeBuffer>,
@@ -1207,11 +1209,11 @@ pub(crate) struct ExecutorContext<'a> {
     /// via [`Self::release_source_consumer`] at receiver disconnect,
     /// zeroing the mirrored queue charge and unregistering the wrapper so
     /// the drained channel stops counting toward `sum_consumer_usage`.
-    /// Body-scope walks (composition / commit) swap `source_records` to an
-    /// empty map, so no body arm can reach a live receiver — this map
-    /// therefore never needs the body-scope save/restore its sibling
-    /// consumer-id maps get. Entries still present after the walk (error
-    /// unwind, interrupt before dispatch) are swept at top-scope teardown.
+    /// Body-scope walks save/restore this map with `source_records`, install
+    /// registrations for activated body Sources, and sweep every residual
+    /// entry before joining that scope's ingest workers. Entries still present
+    /// after the top-level walk (error unwind, interrupt before dispatch) are
+    /// swept at top-scope teardown.
     pub(crate) source_consumers: HashMap<
         String,
         (
@@ -1219,6 +1221,13 @@ pub(crate) struct ExecutorContext<'a> {
             std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
         ),
     >,
+    /// Sealed run-local capability owner for composition-body Sources.
+    ///
+    /// `None` is retained only by crate-internal legacy test seams that do not
+    /// execute external body Sources. Production compiled-plan entry points
+    /// install the matching controller before any source work begins.
+    pub(crate) source_activation:
+        Option<crate::executor::source_activation::SourceActivationController>,
     /// Top-level Source-node names whose receivers have been moved out of
     /// `source_records` by a downstream Merge.interleave or Transform fusion.
     /// The Source dispatch arm returns cleanly without consuming when its name
@@ -3534,7 +3543,7 @@ pub(crate) fn merge_fused_interleave(
             .map(build_engine_stamped_tail)
             .unwrap_or_default();
         states.push(PredState {
-            source_name_arc: Arc::from(name.as_str()),
+            source_name_arc: Arc::from(ctx.qualified_node_name(name).into_owned()),
             source_name_string: name.clone(),
             source_schema,
             engine_stamped,
@@ -4572,6 +4581,16 @@ pub(crate) fn dispatch_plan_node(
         }
 
         PlanNode::Output { .. } => {
+            if matches!(
+                ctx.run_policy.preview(),
+                crate::executor::PreviewPolicy::ConfigOnly
+            ) {
+                return Err(PipelineError::Internal {
+                    op: "run-policy",
+                    node: node.name().to_string(),
+                    detail: "config-only policy reached Output dispatch".to_string(),
+                });
+            }
             crate::executor::output_dispatch::dispatch_output(ctx, current_dag, node_idx, &node)?;
         }
 

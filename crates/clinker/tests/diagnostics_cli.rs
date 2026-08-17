@@ -164,3 +164,22 @@ fn registered_code_without_detail_page_still_succeeds() {
     assert!(output.contains("Detail page: none"));
     assert!(!output.contains("unknown diagnostic"));
 }
+
+#[test]
+fn e377_list_code_and_detail_page_are_in_parity() {
+    let list = success(&["explain", "--list", "--category", "configuration"]);
+    let listed = listed_descriptors(&list);
+    let entry = listed
+        .iter()
+        .find(|entry| entry["Code"] == "E377")
+        .expect("E377 appears in configuration list");
+    assert_eq!(entry["Status"], "active");
+    assert_eq!(entry["Severity"], "error");
+    assert_eq!(entry["Retryability"], "do-not-retry");
+
+    let code = success(&["explain", "--code", "E377"]);
+    assert_eq!(descriptor(&code), *entry);
+    assert!(code.contains("Detail page:"));
+    assert!(code.contains("ordinary composition call"));
+    assert!(code.contains("_compose.outputs"));
+}

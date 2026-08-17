@@ -21,32 +21,61 @@ clinker run [OPTIONS] <CONFIG>
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--memory-limit <SIZE>` | YAML `memory.limit`, else `512M` | Memory budget for the execution. Uses the same grammar as the YAML `memory.limit`: a byte count with an optional binary (1024-based) `K`/`M`/`G` suffix (`K` = 1024 bytes, `M` = 1024², `G` = 1024³), where a bare integer is bytes. Other forms — a decimal `GB`, an explicit `GiB`, or a fractional value such as `1.5G` — are rejected. When the limit is approached, aggregation operators spill to disk rather than crashing. When passed, this value overrides any `memory.limit` set in the pipeline YAML; when omitted, the YAML value applies (or the `512M` default when the YAML is also silent). An empty or whitespace-only value — as an ops wrapper produces when it forwards an unset variable, e.g. `--memory-limit "$CLINKER_MEM"` with `CLINKER_MEM` unset — is treated the same as omitting the flag. A non-empty malformed value (for example the decimal `4GB` rather than the binary `4G`) is rejected at the CLI boundary with an error naming `--memory-limit` and echoing the value, so a typo fails loudly instead of silently falling back to the default and shrinking a larger YAML budget. Because the flag simply populates `pipeline.memory.limit`, a startup budget error (`E312`) for a value you passed via `--memory-limit` refers to that same limit. |
-| `--threads <N>` | number of CPUs | Size of the executor thread pool. The selected value is also recorded in execution metrics. |
-| `--error-threshold <N>` | `0` | **Accepted but not enforced in the current binary.** Parsing this flag does not stop a run after that many DLQ records. AUTH-05 and D-45 require the CLI audit to wire it or replace it with a nonzero tombstone. |
+| `--threads <N>` | YAML `pipeline.concurrency.threads`, else number of CPUs | Positive capacity applied independently to the Rayon CPU-kernel pool and to concurrent Source schema/read work across top-level and composition-body Sources. It is not a total operating-system thread limit: Source workers and the Rayon pool remain distinct. The selected value is recorded in execution metrics. Zero is rejected before the config is opened. |
 | `--batch-id <ID>` | UUID v7 | Logical-batch correlation available as `pipeline.batch_id`, in `{batch_id}` output-path templates, machine events, and opt-in output provenance sidecars. Supplying it does not override the fresh UUIDv7 execution ID and does not provide deduplication, resume, or exactly-once behavior. It is not currently a field in the metrics-spool payload. |
 | `--machine ndjson-v1` | -- | Opt into the `clinker.run` schema-1 lifecycle on stdout. Requires a non-empty `--batch-id`; conflicts with plan/dry-run output and with `--lineage -` or `--lineage-events -`. File-based lineage remains compatible: a plan-only `--lineage <FILE>` export shares this stream's identity and closes it with an explicit empty publication inventory, since it runs no attempt. Every line is one compact JSON object; human diagnostics move to stderr. Consumers must concurrently drain both pipes, reject unsupported schema majors, accept only additive schema-1 fields, and reconcile exactly one supported terminal with the actual process status and current-attempt artifact evidence. EOF, malformed output, forced termination, or a missing/duplicate terminal is incomplete, never success. See [Running Clinker Directly or Under a Supervisor](orchestrator-contract.md). |
 | `--explain [FORMAT]` | `text` | Print the execution plan and exit without processing data. Accepted formats: `text`, `json`, `dot`. With `json` or `dot`, standard output carries only the document and human diagnostics move to stderr, so a consumer can redirect stdout straight into a parser; with `text` they stay together on stdout. See [Explain Plans](explain.md). |
 | `--lineage <PATH>` | -- | Preflight the workspace lineage identity policy, build column lineage, and write it as OpenLineage NDJSON, then exit without processing data. Give a file path, or `-` for stdout. The export is the whole invocation, so one that cannot be delivered exits non-zero rather than reporting success: a destination the exporter cannot write exits `4`, and an event the `[observability.lineage]` byte caps reject exits `1`. Each diagnostic names the destination, states which of the two failed, and prints the configuration change where one applies. A failed export leaves no partial file behind, so a following upload step cannot pick up a stale one. Both this flag and `--lineage-events` need the `lineage` capability, which the released binary has; a build compiled without it refuses the flag at validation rather than exiting zero having emitted nothing (see [Optional capabilities](../getting-started/installation.md#optional-capabilities)). See [Column Lineage](lineage.md). |
 | `--lineage-events <PATH>` | -- | Preflight the workspace lineage identity policy, run the pipeline, and emit live OpenLineage run events (a `START` at run begin, then a terminal `COMPLETE` / `FAIL` / `ABORT` with real timing and row counts) as NDJSON to a file path, or `-` for stdout. Cannot be combined with `--lineage`, `--explain`, `--dry-run`, or `-n`. With `-`, normal run output can interleave with the event stream; use a file for clean NDJSON. See [Live run events](lineage.md#live-run-events). |
-| `--dry-run` | -- | With no `-n`, loads and validates the pipeline configuration, prints resolved outputs, and exits before full plan compilation or data access. It does **not** currently type-check CXL or validate DAG wiring; use `--explain` for the current no-data compile check. |
-| `-n, --dry-run-n <N>` | -- | **Current limitation:** requires an explicit `--dry-run`, but the current binary does not apply the `N` limit and instead continues into a normal full run. Do not use this as a bounded preview. AUTH-05 and D-45 require this behavior to be wired or rejected. |
-| `--dry-run-output <FILE>` | -- | **Accepted but unused in the current binary.** It does not redirect output. AUTH-05 requires it to be wired or replaced with a nonzero tombstone. |
+| `--dry-run` | -- | With no `-n`, performs complete config, overlay, CXL, schema, DAG, resource, and publication-configuration validation, prints resolved outputs, and exits without opening or reading a Source and without opening or publishing a Sink. |
+| `-n, --dry-run-n <N>` | -- | Bounded preview. Requires `--dry-run` and a positive `N`. Clinker checks the limit before every read and reads at most `N` records from each declared Source, including Sources inside composition bodies. Records drain in stable plan order to the explicit preview stream; configured Sink paths are never opened or published. Preview emits no live run telemetry or lineage lifecycle. |
+| `--dry-run-output <FILE>` | stdout | Destination for bounded-preview bytes. Requires `--dry-run-n`; without it, the option is rejected before config access. All preview Sinks write through this one explicit destination using their configured formats. |
 | `--rules-path <DIR>` | selected workspace's `rules/` | Select the CXL module rules root for this run. Precedence is explicit CLI value, then `pipeline.rules_path`, then `[catalog].rules_root`, then the workspace-relative `rules/` default. A relative value is anchored to the workspace selected by `--base-dir` or workspace discovery, not the process working directory. One root is selected; Clinker does not search multiple roots. See [Modules and `use`](../cxl/modules.md#rules-root-selection) and the [typed workspace catalog](../pipelines/channels.md#typed-workspace-catalog). |
 | `--base-dir <DIR>` | -- | Base directory for resolving relative paths in the YAML config. Defaults to the directory containing the config file. |
 | `--allow-absolute-paths` | -- | Permit absolute file paths in the pipeline YAML. By default, absolute paths are rejected to encourage portable configs. |
 | `--env <NAME>` | -- | Sets `CLINKER_ENV` in the current process before the pipeline loads. The current run path does not otherwise consume that value for channel selection; select a channel explicitly with `--channel`. |
 | `--quiet` | -- | Suppresses the “applied overlay” summary. Other stdout, tracing, warnings, and errors are not uniformly silenced. |
 | `--force` | -- | Overrides an output's `if_exists: error` policy and permits overwrite. Outputs using the default `if_exists: overwrite` already overwrite without this flag; `unique_suffix` keeps its own collision behavior. |
-| `--log-level <LEVEL>` | `info` | Logging verbosity: `error`, `warn`, `info`, `debug`, or `trace`. **Current limitation:** an unrecognized value is silently treated as `info` instead of being rejected; AUTH-05 requires strict CLI typing. |
+| `--log-level <LEVEL>` | `info` | Closed logging level: `error`, `warn`, `info`, `debug`, or `trace`. Any other spelling is rejected. |
 | `--metrics-spool-dir <DIR>` | -- | Directory for per-execution metrics files. See [Metrics & Monitoring](metrics.md). |
 | `--channel <ID>` | -- | Apply a logical id from `[catalog.channels]`. The selected file must also have a `[catalog.pipelines]` id listed in the channel manifest. Matching groups are target-bounded before labels narrow them. |
 | `--group <NAME>` | -- | Force-include a group overlay by name (repeatable). The selected pipeline or one of its admitted compositions must appear in the group's explicit `targets:` set. Use `clinker channels resolve` to preview the effective plan. |
 | `--no-auto-groups` | -- | Suppress selector-derived group membership; only groups named with `--group` apply. |
 
-The limitations called out above are the current parser/runtime behavior, not
-recommended contracts. Decision D-45 requires every visible option to be
-wired and behavior-tested, or replaced by a nonzero tombstone with a
-paste-ready alternative under AUTH-05.
+`--error-threshold` is retired and rejected. Configure the typed pipeline
+policy instead; the CLI diagnostic prints this paste-ready replacement:
+
+```yaml
+error_handling:
+  type_error_threshold: 0.05
+```
+
+### Credential profile foundation
+
+The current binary does **not** yet accept a credential-profile option or a
+credential-profile configuration table. Referenced credentials therefore do
+not activate a source, destination, or observability exporter through this
+surface. Do not pass an environment, channel, or group as a substitute: those
+selectors never choose credentials, and there is no default or sentinel
+profile.
+
+The run-local foundation that later preflight wiring will call is already
+bounded. Its default ceilings are 64 named profiles, 256 provider
+registrations across those profiles, 1 MiB of decoded profile/provider
+definition state, and 256 simultaneously retained handles. Admission checks
+all definition counts and bytes before a profile can resolve a requirement.
+Each live lease reports its exact retained bytes to the run memory arbitrator
+before provider allocation. The registry has no inbound producer and is not a
+backpressure target. An arbitrator spill callback queues a request and reports
+zero bytes freed synchronously; the next registry-owned checkpoint revokes and
+releases the partial set in reverse acquisition order and unregisters the
+registry. Cap, memory, and provider failures follow the same fail-closed
+cleanup path; an explicit run coordinator may pause acquisition until resume.
+
+These are foundation limits, not newly available command-line behavior. A
+later complete preflight surface must add the one explicit profile selector,
+credential-required omission checks, and consumer activation together before
+the option can appear in the options table above.
 
 ### Examples
 
@@ -59,6 +88,9 @@ clinker run pipeline.yaml --memory-limit 512M --force --log-level warn
 
 # Validate without processing
 clinker run pipeline.yaml --dry-run
+
+# Preview at most 25 records from each declared Source without publishing Sinks
+clinker run pipeline.yaml --dry-run -n 25 --dry-run-output preview.csv
 
 # Compile and explain without reading data
 clinker run pipeline.yaml --explain text

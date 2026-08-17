@@ -1,3 +1,4 @@
+pub mod capabilities;
 pub mod stage_metrics;
 
 pub(crate) mod aggregate_dispatch;
@@ -28,6 +29,7 @@ mod route;
 pub(crate) mod route_dispatch;
 mod schema_check;
 pub(crate) mod sort_dispatch;
+pub(crate) mod source_activation;
 pub(crate) mod source_dispatch;
 pub mod source_stream;
 pub mod spill_purge;
@@ -43,7 +45,7 @@ pub(crate) mod watermark;
 pub(crate) mod window_runtime;
 
 pub use batch_handoff::DEFAULT_BATCH_SIZE;
-use context::build_stable_eval_context;
+use context::{SourceRuntimePolicy, build_stable_eval_context};
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
 pub use dispatch::DispatchFaultGuard;
@@ -51,7 +53,7 @@ pub use dlq::DlqEntry;
 pub(crate) use dlq::TypeErrorEvent;
 use ingest::{IngestTaskOutcome, ingest_source};
 use params::sum_cpu_io_totals;
-pub use params::{ExecutionReport, PipelineRunParams};
+pub use params::{ExecutionReport, PipelineRunParams, PreviewPolicy, RunPolicy};
 pub use registry::WriterRegistry;
 pub(crate) use registry::build_format_writer;
 pub(crate) use route::CompiledRoute;
@@ -191,6 +193,14 @@ struct DagExecInputs<'a> {
     /// Per-run parameters: execution / batch ids, channel variable
     /// overrides, shutdown token.
     params: &'a PipelineRunParams,
+    /// Resolved scheduler/preview policy for this run.
+    run_policy: RunPolicy,
+}
+
+struct RunExecutionContext<'a> {
+    params: &'a PipelineRunParams,
+    run_policy: RunPolicy,
+    compile_ctx: clinker_plan::config::CompileContext,
 }
 
 /// Owned, run-scoped resources moved through `execute_dag` into
@@ -199,6 +209,8 @@ struct DagExecInputs<'a> {
 /// [`DagExecInputs`] because every field here transfers ownership into
 /// the walk rather than being borrowed for its duration.
 struct DagExecResources {
+    /// Executor-owned sealed Source capabilities for body activation.
+    source_activation: Option<source_activation::SourceActivationController>,
     /// One live crossbeam `Receiver` per declared Source, drained by
     /// the Source dispatch arm.
     source_records: HashMap<
@@ -272,7 +284,35 @@ impl RecordStorage for NullStorage {
 /// - TwoPass (arena + indices) when windows are present
 pub struct PipelineExecutor;
 
+fn run_capability_error(error: capabilities::RunCapabilityError) -> PipelineError {
+    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+        "activation admission failed: {error}"
+    )))
+}
+
+fn build_kernel_pool(
+    run_policy: RunPolicy,
+) -> Result<std::sync::Arc<rayon::ThreadPool>, PipelineError> {
+    let builder = rayon::ThreadPoolBuilder::new().num_threads(run_policy.thread_capacity().get());
+    Ok(std::sync::Arc::new(builder.build().map_err(|error| {
+        PipelineError::ThreadPool(error.to_string())
+    })?))
+}
+
 impl PipelineExecutor {
+    fn configured_run_policy(config: &PipelineConfig) -> RunPolicy {
+        let configured = config
+            .pipeline
+            .concurrency
+            .as_ref()
+            .and_then(|concurrency| concurrency.threads)
+            .and_then(std::num::NonZeroUsize::new);
+        let capacity = configured.unwrap_or_else(|| {
+            std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::MIN)
+        });
+        RunPolicy::new(capacity, PreviewPolicy::Disabled)
+    }
+
     /// `&CompiledPlan`-consuming public entry point.
     ///
     /// Accepts the typed `CompiledPlan` handle returned by
@@ -310,19 +350,36 @@ impl PipelineExecutor {
         writers: W,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
-        if plan.cxl_modules().is_empty() {
-            return Self::run_with_readers_writers(plan.config(), readers, writers.into(), params);
-        }
-        let compile_ctx = clinker_plan::config::CompileContext {
-            cxl_modules: plan.cxl_modules().clone(),
-            ..clinker_plan::config::CompileContext::default()
-        };
-        Self::run_with_readers_writers_in_context(
-            plan.config(),
+        let capabilities =
+            capabilities::AdmittedRunCapabilities::uncredentialed(plan.dag().source_activation())
+                .map_err(run_capability_error)?;
+        Self::run_admitted_plan_with_readers_writers(plan, capabilities, readers, writers, params)
+    }
+
+    /// Run a compiled plan while retaining its sealed activation contract.
+    ///
+    /// The bundle is validated against this exact compiled activation inventory
+    /// before the executor recompiles the effective config or begins ingest and
+    /// dispatch. This slice still receives caller-constructed `SourceReaders`
+    /// and writers; it retains the matching opener/group contract for the full
+    /// run. Composition-body Sources consume their opaque openers and complete
+    /// group leases; top-level Sources continue to use caller-supplied readers.
+    /// The controller retains every opened session until its composition scope
+    /// finishes, and unwinding releases every remaining lease and session.
+    pub fn run_admitted_plan_with_readers_writers<W: Into<WriterRegistry>>(
+        plan: &clinker_plan::plan::CompiledPlan,
+        capabilities: capabilities::AdmittedRunCapabilities,
+        readers: SourceReaders,
+        writers: W,
+        params: &PipelineRunParams,
+    ) -> Result<ExecutionReport, PipelineError> {
+        Self::run_admitted_plan_with_readers_writers_in_context(
+            plan,
+            capabilities,
             readers,
-            writers.into(),
+            writers,
             params,
-            compile_ctx,
+            clinker_plan::config::CompileContext::default(),
         )
     }
 
@@ -350,15 +407,121 @@ impl PipelineExecutor {
         readers: SourceReaders,
         writers: W,
         params: &PipelineRunParams,
+        compile_ctx: clinker_plan::config::CompileContext,
+    ) -> Result<ExecutionReport, PipelineError> {
+        let capabilities =
+            capabilities::AdmittedRunCapabilities::uncredentialed(plan.dag().source_activation())
+                .map_err(run_capability_error)?;
+        Self::run_admitted_plan_with_readers_writers_in_context(
+            plan,
+            capabilities,
+            readers,
+            writers,
+            params,
+            compile_ctx,
+        )
+    }
+
+    /// Run a compiled plan with a retained activation contract and anchor.
+    ///
+    /// Capability ownership and cleanup match
+    /// [`Self::run_admitted_plan_with_readers_writers`]; this variant only
+    /// supplies the runtime compile context used for file-size estimates.
+    pub fn run_admitted_plan_with_readers_writers_in_context<W: Into<WriterRegistry>>(
+        plan: &clinker_plan::plan::CompiledPlan,
+        capabilities: capabilities::AdmittedRunCapabilities,
+        readers: SourceReaders,
+        writers: W,
+        params: &PipelineRunParams,
+        compile_ctx: clinker_plan::config::CompileContext,
+    ) -> Result<ExecutionReport, PipelineError> {
+        let run_policy = Self::configured_run_policy(plan.config());
+        Self::run_admitted_plan_with_readers_writers_in_context_with_policy(
+            plan,
+            capabilities,
+            readers,
+            writers,
+            params,
+            run_policy,
+            compile_ctx,
+        )
+    }
+
+    /// Run with one already-resolved scheduler and preview policy.
+    ///
+    /// CLI callers use this entry so the capacity reported after execution is
+    /// the same nonzero value that sizes real kernel and Source-read work.
+    pub fn run_admitted_plan_with_readers_writers_in_context_with_policy<
+        W: Into<WriterRegistry>,
+    >(
+        plan: &clinker_plan::plan::CompiledPlan,
+        capabilities: capabilities::AdmittedRunCapabilities,
+        readers: SourceReaders,
+        writers: W,
+        params: &PipelineRunParams,
+        run_policy: RunPolicy,
         mut compile_ctx: clinker_plan::config::CompileContext,
     ) -> Result<ExecutionReport, PipelineError> {
+        if matches!(run_policy.preview(), PreviewPolicy::ConfigOnly) {
+            return Err(PipelineError::Internal {
+                op: "run-policy",
+                node: "pipeline".to_string(),
+                detail: "config-only policy must stop before executor entry".to_string(),
+            });
+        }
+        capabilities
+            .ensure_matches(plan.dag().source_activation())
+            .map_err(run_capability_error)?;
         compile_ctx.cxl_modules = plan.cxl_modules().clone();
-        Self::run_with_readers_writers_in_context(
+        let source_runtime = SourceRuntimePolicy::new(run_policy);
+        let source_activation = source_activation::SourceActivationController::new(
+            plan.dag().source_activation().clone(),
+            capabilities,
+            source_runtime,
+        );
+        Self::run_with_readers_writers_in_context_and_activation(
             plan.config(),
             readers,
             writers.into(),
             params,
+            run_policy,
             compile_ctx,
+            Some(source_activation),
+        )
+    }
+
+    #[cfg(test)]
+    fn run_admitted_plan_with_readers_writers_and_arbitrator(
+        plan: &clinker_plan::plan::CompiledPlan,
+        capabilities: capabilities::AdmittedRunCapabilities,
+        readers: SourceReaders,
+        writers: WriterRegistry,
+        params: &PipelineRunParams,
+        mut compile_ctx: clinker_plan::config::CompileContext,
+        memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
+    ) -> Result<ExecutionReport, PipelineError> {
+        capabilities
+            .ensure_matches(plan.dag().source_activation())
+            .map_err(run_capability_error)?;
+        compile_ctx.cxl_modules = plan.cxl_modules().clone();
+        let run_policy = Self::configured_run_policy(plan.config());
+        let source_runtime = SourceRuntimePolicy::new(run_policy);
+        let source_activation = source_activation::SourceActivationController::new(
+            plan.dag().source_activation().clone(),
+            capabilities,
+            source_runtime,
+        );
+        Self::run_with_readers_writers_with_arbitrator_and_activation(
+            plan.config(),
+            readers,
+            writers,
+            RunExecutionContext {
+                params,
+                run_policy,
+                compile_ctx,
+            },
+            memory_budget,
+            Some(source_activation),
         )
     }
 
@@ -383,6 +546,7 @@ impl PipelineExecutor {
     ///
     /// Returns an [`ExecutionReport`] containing record counts, DLQ entries,
     /// execution mode, peak RSS, and wall-clock start/finish timestamps.
+    #[cfg(test)]
     pub(crate) fn run_with_readers_writers(
         config: &PipelineConfig,
         readers: SourceReaders,
@@ -412,12 +576,34 @@ impl PipelineExecutor {
     /// production call sites free of any test-only seam.
     ///
     /// [`MemoryArbitrator`]: crate::pipeline::memory::MemoryArbitrator
+    #[cfg(test)]
     pub(crate) fn run_with_readers_writers_in_context(
         config: &PipelineConfig,
         readers: SourceReaders,
         writers: WriterRegistry,
         params: &PipelineRunParams,
         compile_ctx: clinker_plan::config::CompileContext,
+    ) -> Result<ExecutionReport, PipelineError> {
+        let run_policy = Self::configured_run_policy(config);
+        Self::run_with_readers_writers_in_context_and_activation(
+            config,
+            readers,
+            writers,
+            params,
+            run_policy,
+            compile_ctx,
+            None,
+        )
+    }
+
+    fn run_with_readers_writers_in_context_and_activation(
+        config: &PipelineConfig,
+        readers: SourceReaders,
+        writers: WriterRegistry,
+        params: &PipelineRunParams,
+        run_policy: RunPolicy,
+        compile_ctx: clinker_plan::config::CompileContext,
+        source_activation: Option<source_activation::SourceActivationController>,
     ) -> Result<ExecutionReport, PipelineError> {
         // Reject an unsatisfiable memory budget before building the run.
         // A `memory.limit` below the process's live baseline RSS can never
@@ -455,13 +641,17 @@ impl PipelineExecutor {
             arbitrator.set_max_spill_bytes(cap);
         }
         let memory_budget = std::sync::Arc::new(arbitrator);
-        Self::run_with_readers_writers_with_arbitrator(
+        Self::run_with_readers_writers_with_arbitrator_and_activation(
             config,
             readers,
             writers,
-            params,
-            compile_ctx,
+            RunExecutionContext {
+                params,
+                run_policy,
+                compile_ctx,
+            },
             memory_budget,
+            source_activation,
         )
     }
 
@@ -475,20 +665,64 @@ impl PipelineExecutor {
     /// arbitrator from `config` and delegates.
     ///
     /// [`MemoryArbitrator`]: crate::pipeline::memory::MemoryArbitrator
+    #[cfg(test)]
     pub(crate) fn run_with_readers_writers_with_arbitrator(
         config: &PipelineConfig,
-        mut readers: SourceReaders,
+        readers: SourceReaders,
         writers: WriterRegistry,
         params: &PipelineRunParams,
         compile_ctx: clinker_plan::config::CompileContext,
         memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
     ) -> Result<ExecutionReport, PipelineError> {
+        let run_policy = Self::configured_run_policy(config);
+        Self::run_with_readers_writers_with_arbitrator_and_activation(
+            config,
+            readers,
+            writers,
+            RunExecutionContext {
+                params,
+                run_policy,
+                compile_ctx,
+            },
+            memory_budget,
+            None,
+        )
+    }
+
+    fn run_with_readers_writers_with_arbitrator_and_activation(
+        config: &PipelineConfig,
+        mut readers: SourceReaders,
+        writers: WriterRegistry,
+        run: RunExecutionContext<'_>,
+        memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
+        source_activation: Option<source_activation::SourceActivationController>,
+    ) -> Result<ExecutionReport, PipelineError> {
+        let RunExecutionContext {
+            params,
+            run_policy,
+            compile_ctx,
+        } = run;
         let started_at = Utc::now();
         let output_staging = writers.output_staging.clone();
         let auto_commit_staged = writers.auto_commit_staged;
 
         let source_configs: Vec<_> = config.source_configs().cloned().collect();
-        let output_configs: Vec<_> = config.output_configs().cloned().collect();
+        let mut output_configs: Vec<_> = config.output_configs().cloned().collect();
+        if !run_policy.preview().publishes_configured_outputs() {
+            if auto_commit_staged || output_staging.has_run_attempt() {
+                return Err(PipelineError::Internal {
+                    op: "run-policy",
+                    node: "pipeline".to_string(),
+                    detail: "preview received a publication-capable writer registry".to_string(),
+                });
+            }
+            // Preview uses the authored format but one explicit preview
+            // destination. Split policy names configured Sink paths, so it is
+            // disabled on this run-local clone before writer construction.
+            for output in &mut output_configs {
+                output.split = None;
+            }
+        }
         if source_configs.is_empty() {
             return Err(PipelineError::Config(
                 clinker_plan::config::ConfigError::Validation(
@@ -670,6 +904,10 @@ impl PipelineExecutor {
         // twice, so the count would overrun the total.
         let mut files_total: Option<u64> = Some(0);
         let mut bytes_total: Option<u64> = Some(0);
+        let source_runtime = source_activation.as_ref().map_or_else(
+            || SourceRuntimePolicy::new(run_policy),
+            source_activation::SourceActivationController::source_runtime,
+        );
         for src_cfg in &source_configs {
             let Some(source_input) = readers.get(&src_cfg.name) else {
                 continue; // The loop below reports the missing reader.
@@ -822,7 +1060,10 @@ impl PipelineExecutor {
             // within the documented shutdown bound; the file arm ignores
             // it (dropped-receiver stop suffices).
             let ingest_shutdown = params.shutdown_token.clone();
+            let lifecycle_shutdown = ingest_shutdown.clone();
+            let lifecycle_telemetry = params.telemetry_producer.clone();
             let ingest_progress = params.progress.clone();
+            let ingest_source_runtime = source_runtime.clone();
             // One OS thread per Source. Spawned before the DAG dispatch
             // drains so the producers fill the bounded channels while the
             // consumer dispatch loop runs concurrently. Joined after
@@ -830,13 +1071,20 @@ impl PipelineExecutor {
             let handle = std::thread::Builder::new()
                 .name(format!("clinker-ingest-{}", src_cfg.name))
                 .spawn(move || {
-                    ingest_source(
-                        src_cfg_owned,
-                        source_input,
-                        config_clone,
-                        stream,
-                        ingest_shutdown,
-                        ingest_progress,
+                    source_activation::observe_source(
+                        lifecycle_telemetry.as_ref(),
+                        lifecycle_shutdown.as_ref(),
+                        || {
+                            ingest_source(
+                                src_cfg_owned,
+                                source_input,
+                                config_clone,
+                                stream,
+                                ingest_shutdown,
+                                ingest_progress,
+                                ingest_source_runtime,
+                            )
+                        },
                     )
                 })
                 .map_err(|e| PipelineError::Internal {
@@ -855,8 +1103,10 @@ impl PipelineExecutor {
                 composition_bodies: validated_plan.composition_bodies(),
                 statistics: validated_plan.statistics(),
                 params,
+                run_policy,
             },
             DagExecResources {
+                source_activation,
                 source_records,
                 source_consumers,
                 writers,
@@ -1098,8 +1348,10 @@ impl PipelineExecutor {
             composition_bodies,
             statistics,
             params,
+            run_policy,
         } = inputs;
         let DagExecResources {
+            source_activation,
             source_records,
             source_consumers,
             mut writers,
@@ -1115,7 +1367,12 @@ impl PipelineExecutor {
         // removes it on drop — the path and the liveness guard cannot diverge.
         let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
 
-        let output_configs: Vec<_> = config.output_configs().cloned().collect();
+        let mut output_configs: Vec<_> = config.output_configs().cloned().collect();
+        if !run_policy.preview().publishes_configured_outputs() {
+            for output in &mut output_configs {
+                output.split = None;
+            }
+        }
         let pipeline_start_time = chrono::Local::now().naive_local();
 
         // Pipeline-stable evaluation context. Built once here, reused
@@ -1249,13 +1506,24 @@ impl PipelineExecutor {
         // matching Transform `NodeIndex`es so the Transform arm can
         // dispatch into the streaming branch instead of consuming a
         // pre-drained Vec from `node_buffers`.
-        let (extra_fused_sources, fused_transforms) =
+        let (extra_fused_sources, mut fused_transforms) =
             clinker_plan::plan::execution::compute_transform_fused_sources(
                 plan,
                 &fused_sources,
                 &init_phase_set,
             );
         fused_sources.extend(extra_fused_sources);
+        let preview_streaming_contracts = run_policy
+            .preview()
+            .records_per_source()
+            .map(|_| fused_transforms.clone());
+        if run_policy.preview().records_per_source().is_some() {
+            // Preview drains Sources in deterministic DAG/declaration order.
+            // Interleave/fused receivers deliberately race ready inputs, which
+            // is correct for a real run but not for a reproducible preview.
+            fused_sources.clear();
+            fused_transforms.clear();
+        }
 
         // Streaming Aggregate-ingest edges (issue #299). Each entry is a
         // `producer → Aggregate` edge whose ingest streams: the producer
@@ -1269,7 +1537,10 @@ impl PipelineExecutor {
         let streaming_aggregate_ingest_edges: HashMap<
             petgraph::graph::NodeIndex,
             petgraph::graph::NodeIndex,
-        > = if config.any_source_has_correlation_key() || any_document_dlq {
+        > = if config.any_source_has_correlation_key()
+            || any_document_dlq
+            || run_policy.preview().records_per_source().is_some()
+        {
             HashMap::new()
         } else {
             clinker_plan::plan::execution::compute_streaming_aggregate_ingest_edges(
@@ -1291,7 +1562,10 @@ impl PipelineExecutor {
         let streaming_combine_probe_edges: HashMap<
             petgraph::graph::NodeIndex,
             petgraph::graph::NodeIndex,
-        > = if config.any_source_has_correlation_key() || any_document_dlq {
+        > = if config.any_source_has_correlation_key()
+            || any_document_dlq
+            || run_policy.preview().records_per_source().is_some()
+        {
             HashMap::new()
         } else {
             clinker_plan::plan::execution::compute_streaming_combine_probe_edges(
@@ -1303,23 +1577,10 @@ impl PipelineExecutor {
 
         // Shared Rayon pool for the CPU-bound owned-input kernels (sort,
         // grace-hash partition build, IEJoin, sort-merge). Sized off the
-        // pipeline's `concurrency.threads` knob; `0`/absent defers to
-        // Rayon's default (one worker per logical CPU). Built once per
+        // run's resolved nonzero thread capacity. Built once per
         // run and shared via `Arc` so every kernel `install` reuses the
         // same worker set rather than spinning up a pool per operator.
-        let kernel_pool = {
-            let mut builder = rayon::ThreadPoolBuilder::new();
-            if let Some(n) = config.pipeline.concurrency.as_ref().and_then(|c| c.threads)
-                && n > 0
-            {
-                builder = builder.num_threads(n);
-            }
-            std::sync::Arc::new(
-                builder
-                    .build()
-                    .map_err(|e| PipelineError::ThreadPool(e.to_string()))?,
-            )
-        };
+        let kernel_pool = build_kernel_pool(run_policy)?;
 
         // Streaming-Output setup (issue #72). For every fused
         // `Merge.interleave → single Output` chain that satisfies the
@@ -1331,10 +1592,18 @@ impl PipelineExecutor {
         // `JoinHandle`s are stored on the context so the dispatcher can
         // join them at end-of-DAG and fold the per-thread counter /
         // timer / error accounting back into the context.
+        // Preview preserves the plan's compiled writer boundary even though it
+        // disables race-driven producer fusion above. A certified streaming
+        // writer then drains the producer's deterministic materialized order;
+        // treating that boundary as records-only would violate the compiled
+        // plan instead of making the preview deterministic.
+        let streaming_contracts = preview_streaming_contracts
+            .as_ref()
+            .unwrap_or(&fused_transforms);
         let streaming_specs = compute_streaming_output_specs(
             plan,
             config,
-            &fused_transforms,
+            streaming_contracts,
             &init_phase_set,
             &output_configs,
             &writers,
@@ -1410,6 +1679,7 @@ impl PipelineExecutor {
             source_count_per_source,
             source_ingestion_timestamp,
             strategy,
+            run_policy,
 
             node_buffers: HashMap::new(),
             node_buffer_consumer_ids: HashMap::new(),
@@ -1418,6 +1688,7 @@ impl PipelineExecutor {
             window_arena_consumer_ids: HashMap::new(),
             source_records,
             source_consumers,
+            source_activation,
             fused_sources,
             fused_transforms,
             record_var_seed: &record_var_seed,
@@ -1888,6 +2159,18 @@ mod tests {
     //! in-crate symbols.
 
     use super::*;
+
+    #[test]
+    fn run_policy_capacity_sizes_the_kernel_pool() {
+        for capacity in [1, 2] {
+            let policy = RunPolicy::new(
+                std::num::NonZeroUsize::new(capacity).unwrap(),
+                PreviewPolicy::Disabled,
+            );
+            let pool = build_kernel_pool(policy).expect("build kernel pool");
+            assert_eq!(pool.current_num_threads(), policy.thread_capacity().get());
+        }
+    }
 
     #[test]
     fn route_dispatch_mismatch_returns_typed_error() {

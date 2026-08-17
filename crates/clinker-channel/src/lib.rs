@@ -81,7 +81,7 @@ pub use error::ChannelError;
 pub use group::{Group, GroupTargetSet, ValidatedGroupTargets, validate_group_targets};
 pub use manifest::{
     ChannelConfigValue, ChannelManifest, ChannelVarValue, ChannelVars, ManifestHeader,
-    OverlayCandidate, OverlayFile, OverlayHeader, PipelineChannelFile,
+    OverlayCandidate, OverlayFile, OverlayHeader, PipelineChannelFile, ResourceOverlayValue,
 };
 pub use overlay::{ChannelOverlayResult, ResolvedChannelConfig};
 pub use resolve::{
