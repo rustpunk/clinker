@@ -95,6 +95,7 @@ fn build_format_reader(
                 schema,
                 MultiRecordKind::Csv(opts.as_ref()),
                 open_one_shot(&source)?,
+                numeric_observer,
             ),
             _ => {
                 let mut config = build_csv_reader_config(opts.as_ref())?;
@@ -134,6 +135,7 @@ fn build_format_reader(
                 schema,
                 MultiRecordKind::FixedWidth(opts.as_ref()),
                 open_one_shot(&source)?,
+                numeric_observer,
             ),
             SourceSchema::Columns(cols) => {
                 let mut config = build_fw_reader_config(opts.as_ref());
@@ -190,9 +192,10 @@ fn build_format_reader(
 /// This is the shared construction seam for runtime ingest and authoring tools:
 /// format options, multi-value behavior, schema projection, and coercion all
 /// pass through the same builders. When `numeric_observer` is present, native
-/// JSON/XML scalars are observed before record-value conversion and decoded
-/// text formats are observed at the canonical schema-coercion boundary. The
-/// callback is synchronous and must retain only bounded evidence.
+/// JSON/XML scalars and positional multi-record fields are observed before
+/// record-value conversion; decoded text formats are observed at the canonical
+/// schema-coercion boundary. The callback is synchronous and must retain only
+/// bounded evidence.
 ///
 /// The function performs no pipeline execution and does not retain the input.
 /// File-backed callers should pass [`ReopenableSource::path`] so JSON and XML
@@ -204,10 +207,11 @@ pub fn build_source_format_reader(
     source: ReopenableSource,
     numeric_observer: Option<NumericObserver>,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
-    let format_observer = if matches!(
-        &input.format,
-        clinker_plan::config::InputFormat::Json(_) | clinker_plan::config::InputFormat::Xml(_)
-    ) {
+    let format_observer = if matches!(schema, SourceSchema::MultiRecord { .. })
+        || matches!(
+            &input.format,
+            clinker_plan::config::InputFormat::Json(_) | clinker_plan::config::InputFormat::Xml(_)
+        ) {
         numeric_observer.clone()
     } else {
         None
@@ -1397,6 +1401,7 @@ fn build_multi_record_reader(
     schema: &SourceSchema,
     kind: MultiRecordKind,
     reader: Box<dyn Read + Send>,
+    numeric_observer: Option<NumericObserver>,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     let SourceSchema::MultiRecord {
         discriminator,
@@ -1431,14 +1436,16 @@ fn build_multi_record_reader(
     let built: Box<dyn FormatReader> = match kind {
         MultiRecordKind::FixedWidth(opts) => {
             let cfg = build_fw_reader_config(opts);
-            Box::new(
-                clinker_format::multi_record::MultiRecordReader::new_fixed_width(
-                    reader,
-                    spec,
-                    cfg.line_separator,
-                )
-                .map_err(to_pipeline_err)?,
+            let reader = clinker_format::multi_record::MultiRecordReader::new_fixed_width(
+                reader,
+                spec,
+                cfg.line_separator,
             )
+            .map_err(to_pipeline_err)?;
+            Box::new(match numeric_observer {
+                Some(observer) => reader.with_numeric_observer(observer),
+                None => reader,
+            })
         }
         MultiRecordKind::Csv(opts) => {
             let cfg = build_csv_reader_config(opts)?;
@@ -1456,22 +1463,24 @@ fn build_multi_record_reader(
                     )),
                 ));
             }
-            Box::new(
-                clinker_format::multi_record::MultiRecordReader::new_csv(
-                    reader,
-                    spec,
-                    clinker_format::multi_record::CsvDialect {
-                        delimiter: cfg.delimiter,
-                        quote_char: cfg.quote_char,
-                        // A multi-record CSV exported with a column-header line
-                        // (the default `has_header: true`) skips that first
-                        // physical row, so a textual header is not mistaken for
-                        // an unknown discriminator value.
-                        has_header: cfg.has_header,
-                    },
-                )
-                .map_err(to_pipeline_err)?,
+            let reader = clinker_format::multi_record::MultiRecordReader::new_csv(
+                reader,
+                spec,
+                clinker_format::multi_record::CsvDialect {
+                    delimiter: cfg.delimiter,
+                    quote_char: cfg.quote_char,
+                    // A multi-record CSV exported with a column-header line
+                    // (the default `has_header: true`) skips that first
+                    // physical row, so a textual header is not mistaken for
+                    // an unknown discriminator value.
+                    has_header: cfg.has_header,
+                },
             )
+            .map_err(to_pipeline_err)?;
+            Box::new(match numeric_observer {
+                Some(observer) => reader.with_numeric_observer(observer),
+                None => reader,
+            })
         }
     };
     Ok(built)

@@ -184,9 +184,30 @@ impl NumericObservation {
     }
 }
 
+/// Authored field identity at the parser boundary that produced an
+/// observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NumericObservationScope<'a> {
+    field: &'a str,
+    record: Option<&'a str>,
+}
+
+impl<'a> NumericObservationScope<'a> {
+    pub fn field(self) -> &'a str {
+        self.field
+    }
+
+    /// Record-type id for a multi-record field, or `None` for an ordinary
+    /// source column.
+    pub fn record(self) -> Option<&'a str> {
+        self.record
+    }
+}
+
 /// Cloneable callback used by streaming readers to publish one observation at
 /// a time without retaining document-sized evidence.
-type NumericObservationCallback = dyn Fn(&str, NumericObservation) + Send + Sync;
+type NumericObservationCallback =
+    dyn for<'a> Fn(NumericObservationScope<'a>, NumericObservation) + Send + Sync;
 
 #[derive(Clone)]
 pub struct NumericObserver {
@@ -199,12 +220,39 @@ impl NumericObserver {
         F: Fn(&str, NumericObservation) + Send + Sync + 'static,
     {
         Self {
+            callback: Arc::new(move |scope, observation| callback(scope.field(), observation)),
+        }
+    }
+
+    /// Build an observer that retains the record-type identity emitted by a
+    /// multi-record parser boundary.
+    pub fn new_scoped<F>(callback: F) -> Self
+    where
+        F: for<'a> Fn(NumericObservationScope<'a>, NumericObservation) + Send + Sync + 'static,
+    {
+        Self {
             callback: Arc::new(callback),
         }
     }
 
     pub fn observe(&self, field: &str, observation: NumericObservation) {
-        (self.callback)(field, observation);
+        (self.callback)(
+            NumericObservationScope {
+                field,
+                record: None,
+            },
+            observation,
+        );
+    }
+
+    pub fn observe_record_field(&self, record: &str, field: &str, observation: NumericObservation) {
+        (self.callback)(
+            NumericObservationScope {
+                field,
+                record: Some(record),
+            },
+            observation,
+        );
     }
 }
 

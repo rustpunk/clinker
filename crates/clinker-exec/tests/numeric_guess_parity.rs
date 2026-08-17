@@ -685,3 +685,100 @@ nodes:
     assert_eq!(xml_observation.boundary(), NumericBoundary::Xml);
     assert_eq!(xml_observation.vote(), NumericVote::Int);
 }
+
+#[test]
+fn shared_guess_reader_observes_only_literal_numeric_multi_record_owners() {
+    let config = clinker_plan::config::load_config_from_str(
+        r#"
+pipeline:
+  name: multi_record_reader_parity
+nodes:
+  - type: source
+    name: csv_source
+    config:
+      name: csv_source
+      type: csv
+      path: unused.csv
+      options:
+        has_header: false
+      schema:
+        discriminator: { field: kind }
+        records:
+          - id: detail
+            tag: D
+            columns:
+              - { name: kind, type: string }
+              - { name: amount, type: numeric }
+          - id: adjustment
+            tag: A
+            columns:
+              - { name: kind, type: string }
+              - { name: amount, type: { nullable: numeric } }
+          - id: summary
+            tag: S
+            columns:
+              - { name: kind, type: string }
+              - { name: amount, type: int }
+"#,
+    )
+    .expect("parse multi-record reader parity config");
+    let body = source_body(&config, "csv_source");
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&observations);
+    let observer = NumericObserver::new_scoped(move |scope, observation| {
+        sink.lock()
+            .expect("scoped observation collector lock")
+            .push((
+                scope.record().map(str::to_owned),
+                scope.field().to_owned(),
+                observation,
+            ));
+    });
+    let source = ReopenableSource::buffer(Cursor::new(b"D,10\nA,20.5\nS,30\n".to_vec()))
+        .expect("buffer multi-record bytes");
+    let mut reader = build_source_format_reader(
+        &body.source,
+        &body.schema,
+        body.on_unmapped.clone(),
+        source,
+        Some(observer),
+    )
+    .expect("shared multi-record reader builds");
+    let mut records = Vec::new();
+    while let Some(record) = reader.next_record().expect("multi-record row parses") {
+        records.push(record);
+    }
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[2].get("amount"), Some(&Value::Integer(30)));
+
+    let observations = observations.lock().expect("observation collector lock");
+    assert_eq!(observations.len(), 2, "concrete int owner must not vote");
+    assert_eq!(
+        observations
+            .iter()
+            .map(|(record, field, observation)| (
+                record.as_deref(),
+                field.as_str(),
+                observation.boundary(),
+                observation.lexeme().complete(),
+                observation.vote(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                Some("detail"),
+                "amount",
+                NumericBoundary::Positional,
+                Some("10"),
+                NumericVote::Int,
+            ),
+            (
+                Some("adjustment"),
+                "amount",
+                NumericBoundary::Positional,
+                Some("20.5"),
+                NumericVote::Float,
+            ),
+        ]
+    );
+}

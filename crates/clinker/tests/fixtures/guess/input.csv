@@ -1,4 +1,4 @@
-order_id,amount
-c-1,10
-c-2,20
-c-3,30
+kind,order_id,amount
+D,c-1,10
+A,c-2,20.5
+S,c-3,30
