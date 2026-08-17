@@ -440,7 +440,8 @@ fn execute_composition_body(
         &mut ctx.planned_node_buffer_readers,
         planned_materialized_reader_counts(&body_dag),
     );
-    let saved_combine = std::mem::take(&mut ctx.source_records);
+    let saved_source_records = std::mem::take(&mut ctx.source_records);
+    let saved_source_consumers = std::mem::take(&mut ctx.source_consumers);
     // Window-arena consumer ids key by slot index, which the body
     // re-uses from zero alongside its window-runtime overlay. Swap to a
     // fresh map so a body arena registration at slot N does not clobber
@@ -549,7 +550,42 @@ fn execute_composition_body(
     ctx.node_buffer_consumer_ids = saved_consumer_ids;
     ctx.node_buffer_readers = saved_readers;
     ctx.planned_node_buffer_readers = saved_planned_readers;
-    ctx.source_records = saved_combine;
+    // Drop every residual body receiver before joining its finite ingest
+    // workers. This unblocks a producer whose downstream body failed before
+    // draining the bounded channel. Source arms that reached EOF already
+    // removed and unregistered their own consumer; the sweep covers only
+    // early-return residue.
+    drop(std::mem::take(&mut ctx.source_records));
+    for (_, (id, handle)) in std::mem::take(&mut ctx.source_consumers) {
+        handle.resume();
+        handle.clear_active();
+        handle.set_bytes(0);
+        ctx.memory_budget.unregister_consumer(id);
+    }
+    let activation_cleanup = match ctx.source_activation.as_mut() {
+        Some(controller) => controller.finish_scope(bound_body.body_scope),
+        None => Ok(Vec::new()),
+    };
+    let activation_cleanup = activation_cleanup.and_then(|outcomes| {
+        for outcome in outcomes {
+            ctx.counters.total_count = ctx
+                .counters
+                .total_count
+                .checked_add(outcome.total_count)
+                .ok_or_else(|| PipelineError::Internal {
+                    op: "body-source-count",
+                    node: outcome.source_name.clone(),
+                    detail: "body Source record count overflowed u64".to_string(),
+                })?;
+            for (file, timestamp) in outcome.watermark_observations {
+                ctx.watermarks
+                    .observe(&outcome.source_name, &file, timestamp);
+            }
+        }
+        Ok(())
+    });
+    ctx.source_records = saved_source_records;
+    ctx.source_consumers = saved_source_consumers;
     ctx.current_body_node_input_refs = saved_body_refs;
     // Unregister body-local window-arena consumers and restore the
     // parent map. The body's node-rooted arenas drop when its window-
@@ -563,5 +599,9 @@ fn execute_composition_body(
     ctx.composition_call_sites.pop();
     ctx.window_runtime.remove_body_scope(bound_body.body_scope);
 
-    walk_and_harvest
+    match (walk_and_harvest, activation_cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(output), Ok(())) => Ok(output),
+    }
 }

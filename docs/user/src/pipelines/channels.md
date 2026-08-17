@@ -757,8 +757,11 @@ form when the pipeline has compositions.
 > resource slot with `resource: <slot>`; a direct `path`, `glob`, `regex`, or
 > `paths` matcher is rejected. The source patch above changes schema/reader
 > configuration but does not select the resource. Planning binds the slot and
-> compiles a call-scoped Source instance, while a data run through that Source
-> still awaits runtime credential resolution and resource opening.
+> compiles a call-scoped Source instance. On a data run, a credential-free
+> `file` binding opens through the CLI-prepared catalog factory and streams via
+> the executor's bounded Source path. Credential-bearing bindings remain
+> unsupported and fail before opening because no profile-selection surface is
+> available.
 
 When a patch changes the effective source config, the run's pipeline identity
 differs from the base and from other patched variants, so their outputs and

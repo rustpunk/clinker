@@ -84,9 +84,10 @@ The per-value `fixed`-lock half of this entry is resolved; see the archive.)
 - Priority: Medium
 - Filed: 2026-06-15; updated 2026-07-03 (fixed-lock half landed) and 2026-07-24
   (merged question 9).
-- Documentation status: The user guide documents the implemented planning
-  syntax and states explicitly that credentials and runtime activation have
-  not landed.
+- Documentation status: The user guide documents the planning syntax and the
+  implemented credential-free file-resource activation path. It states
+  explicitly that credential-profile selection and credential-bearing
+  activation have not landed.
 - Status: Resolved
 - Decision: D-12 through D-15
 - Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` records D-13/D-14 as implemented and D-12/D-15 as partial; the three focused targets named above exercise current source.

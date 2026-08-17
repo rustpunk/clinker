@@ -2802,18 +2802,30 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     // Validate and retain the runtime activation contract immediately after the
     // effective plan exists and before lineage construction, machine lifecycle
     // writes, worker startup, discovery, staging, or the caller-owned reader /
-    // writer setup below. Runtime opener/group consumption lands separately;
-    // this binary does not yet expose a credential-profile surface, so any
-    // nonempty logical credential set or credential-handle capacity fails
-    // closed here.
-    let admitted_run_capabilities = credential_profile::admit_uncredentialed_run_capabilities(
-        &compiled_plan,
+    // writer setup below. Composition-body file-resource openers are prepared
+    // here and consumed later through the opaque executor bundle. This binary
+    // does not yet expose a credential-profile surface, so any nonempty logical
+    // credential set or credential-handle capacity fails closed here.
+    let activation_catalog = clinker_plan::resources::WorkspaceCatalog::load(
+        compile_ctx.workspace_root(),
+        &catalog_config,
     )
     .map_err(|error| {
-        PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-            "activation admission failed: {error}"
-        )))
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+            error.to_string(),
+        ))
     })?;
+    let admitted_run_capabilities =
+        credential_profile::admit_uncredentialed_run_capabilities_with_catalog(
+            &compiled_plan,
+            compile_ctx.workspace_root(),
+            &activation_catalog,
+        )
+        .map_err(|error| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                "activation admission failed: {error}"
+            )))
+        })?;
 
     // Resolve every emitted source/output identity before discovery, staging,
     // publication-attempt creation, or lineage-sink opening. A missing or

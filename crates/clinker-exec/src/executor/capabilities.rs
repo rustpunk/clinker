@@ -19,7 +19,16 @@ use clinker_plan::plan::execution::{
 ///
 /// The executor never serializes or formats this value. Implementations use
 /// `Drop` to release local and provider-side state.
-pub trait CapabilitySession: Send {}
+pub trait CapabilitySession: Send {
+    /// Transfer this session's finite Source input exactly once.
+    ///
+    /// The session remains owned by its active group until execution finishes,
+    /// so provider-side authority outlives the reader it supplied. Sessions
+    /// that do not represent a body Source return the closed failure.
+    fn take_source_input(&mut self) -> Result<crate::source::SourceInput, CapabilityOpenError> {
+        Err(CapabilityOpenError::Unavailable)
+    }
+}
 
 /// A provider-neutral, single-use session factory.
 ///
@@ -180,6 +189,12 @@ impl AdmittedSourceOpener {
             opener: Some(opener),
         }
     }
+
+    /// Build the inert capability paired with an existing caller-supplied
+    /// top-level Source reader.
+    pub fn caller_supplied(instance: CompiledSourceInstanceId) -> Self {
+        Self::new(instance, Box::new(UncredentialedOpener))
+    }
 }
 
 /// Unsealed input for one complete activation group.
@@ -203,6 +218,16 @@ impl AdmittedActivationGroup {
         reservation: Box<dyn GroupCapacityReservation>,
     ) -> Self {
         Self::with_credentials(id, capacity, Vec::new(), sources, reservation)
+    }
+
+    /// Describe a credential-free group using the executor's no-op capacity
+    /// reservation.
+    pub fn uncredentialed(
+        id: SourceActivationGroupId,
+        capacity: SourceActivationCapacity,
+        sources: Vec<AdmittedSourceOpener>,
+    ) -> Self {
+        Self::new(id, capacity, sources, Box::new(UncredentialedReservation))
     }
 
     /// Describe a credential-bearing group without exposing provider state.
@@ -249,6 +274,11 @@ struct OwnedActivationGroup {
     contract: GroupContract,
     sources: Vec<AdmittedSourceOpener>,
     capacity_lease: Option<Box<dyn GroupCapacityLease>>,
+}
+
+struct OpenedCapabilitySession {
+    instance: CompiledSourceInstanceId,
+    session: Box<dyn CapabilitySession>,
 }
 
 impl Drop for OwnedActivationGroup {
@@ -504,7 +534,7 @@ impl Drop for AdmittedRunCapabilities {
 pub struct ActiveActivationGroup {
     contract: GroupContract,
     sources: Vec<AdmittedSourceOpener>,
-    sessions: Vec<Box<dyn CapabilitySession>>,
+    sessions: Vec<OpenedCapabilitySession>,
     capacity_lease: Option<Box<dyn GroupCapacityLease>>,
 }
 
@@ -538,15 +568,45 @@ impl ActiveActivationGroup {
         let session = opener
             .open()
             .map_err(|_| RunCapabilityError::new(RunCapabilityErrorKind::OpenFailed))?;
-        self.sessions.push(session);
+        self.sessions
+            .push(OpenedCapabilitySession { instance, session });
         Ok(())
+    }
+
+    /// Open every member in compiled group order before downstream work starts.
+    ///
+    /// On failure, the caller must drop this active group; its `Drop` closes
+    /// already-opened sessions and unopened factories in reverse order before
+    /// releasing the complete group lease.
+    pub fn open_all(&mut self) -> Result<(), RunCapabilityError> {
+        let members: Box<[_]> = self.contract.members.clone();
+        for member in members {
+            self.open(member)?;
+        }
+        Ok(())
+    }
+
+    /// Transfer one opened member's finite input exactly once.
+    pub fn take_source_input(
+        &mut self,
+        instance: CompiledSourceInstanceId,
+    ) -> Result<crate::source::SourceInput, RunCapabilityError> {
+        let opened = self
+            .sessions
+            .iter_mut()
+            .find(|opened| opened.instance == instance)
+            .ok_or_else(|| RunCapabilityError::new(RunCapabilityErrorKind::SourceUnavailable))?;
+        opened
+            .session
+            .take_source_input()
+            .map_err(|_| RunCapabilityError::new(RunCapabilityErrorKind::SourceUnavailable))
     }
 }
 
 impl Drop for ActiveActivationGroup {
     fn drop(&mut self) {
-        while let Some(session) = self.sessions.pop() {
-            drop(session);
+        while let Some(opened) = self.sessions.pop() {
+            drop(opened.session);
         }
         while let Some(source) = self.sources.pop() {
             drop(source);

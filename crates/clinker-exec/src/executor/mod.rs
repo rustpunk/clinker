@@ -29,6 +29,7 @@ mod route;
 pub(crate) mod route_dispatch;
 mod schema_check;
 pub(crate) mod sort_dispatch;
+pub(crate) mod source_activation;
 pub(crate) mod source_dispatch;
 pub mod source_stream;
 pub mod spill_purge;
@@ -200,6 +201,8 @@ struct DagExecInputs<'a> {
 /// [`DagExecInputs`] because every field here transfers ownership into
 /// the walk rather than being borrowed for its duration.
 struct DagExecResources {
+    /// Executor-owned sealed Source capabilities for body activation.
+    source_activation: Option<source_activation::SourceActivationController>,
     /// One live crossbeam `Receiver` per declared Source, drained by
     /// the Source dispatch arm.
     source_records: HashMap<
@@ -329,9 +332,10 @@ impl PipelineExecutor {
     /// before the executor recompiles the effective config or begins ingest and
     /// dispatch. This slice still receives caller-constructed `SourceReaders`
     /// and writers; it retains the matching opener/group contract for the full
-    /// run but does not consume those openers or groups yet. The bundle remains
-    /// owned by this stack frame until success, failure, or interruption
-    /// unwinds the run.
+    /// run. Composition-body Sources consume their opaque openers and complete
+    /// group leases; top-level Sources continue to use caller-supplied readers.
+    /// The controller retains every opened session until its composition scope
+    /// finishes, and unwinding releases every remaining lease and session.
     pub fn run_admitted_plan_with_readers_writers<W: Into<WriterRegistry>>(
         plan: &clinker_plan::plan::CompiledPlan,
         capabilities: capabilities::AdmittedRunCapabilities,
@@ -339,22 +343,13 @@ impl PipelineExecutor {
         writers: W,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
-        capabilities
-            .ensure_matches(plan.dag().source_activation())
-            .map_err(run_capability_error)?;
-        if plan.cxl_modules().is_empty() {
-            return Self::run_with_readers_writers(plan.config(), readers, writers.into(), params);
-        }
-        let compile_ctx = clinker_plan::config::CompileContext {
-            cxl_modules: plan.cxl_modules().clone(),
-            ..clinker_plan::config::CompileContext::default()
-        };
-        Self::run_with_readers_writers_in_context(
-            plan.config(),
+        Self::run_admitted_plan_with_readers_writers_in_context(
+            plan,
+            capabilities,
             readers,
-            writers.into(),
+            writers,
             params,
-            compile_ctx,
+            clinker_plan::config::CompileContext::default(),
         )
     }
 
@@ -414,12 +409,46 @@ impl PipelineExecutor {
             .ensure_matches(plan.dag().source_activation())
             .map_err(run_capability_error)?;
         compile_ctx.cxl_modules = plan.cxl_modules().clone();
-        Self::run_with_readers_writers_in_context(
+        let source_activation = source_activation::SourceActivationController::new(
+            plan.dag().source_activation().clone(),
+            capabilities,
+        );
+        Self::run_with_readers_writers_in_context_and_activation(
             plan.config(),
             readers,
             writers.into(),
             params,
             compile_ctx,
+            Some(source_activation),
+        )
+    }
+
+    #[cfg(test)]
+    fn run_admitted_plan_with_readers_writers_and_arbitrator(
+        plan: &clinker_plan::plan::CompiledPlan,
+        capabilities: capabilities::AdmittedRunCapabilities,
+        readers: SourceReaders,
+        writers: WriterRegistry,
+        params: &PipelineRunParams,
+        mut compile_ctx: clinker_plan::config::CompileContext,
+        memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
+    ) -> Result<ExecutionReport, PipelineError> {
+        capabilities
+            .ensure_matches(plan.dag().source_activation())
+            .map_err(run_capability_error)?;
+        compile_ctx.cxl_modules = plan.cxl_modules().clone();
+        let source_activation = source_activation::SourceActivationController::new(
+            plan.dag().source_activation().clone(),
+            capabilities,
+        );
+        Self::run_with_readers_writers_with_arbitrator_and_activation(
+            plan.config(),
+            readers,
+            writers,
+            params,
+            compile_ctx,
+            memory_budget,
+            Some(source_activation),
         )
     }
 
@@ -444,6 +473,7 @@ impl PipelineExecutor {
     ///
     /// Returns an [`ExecutionReport`] containing record counts, DLQ entries,
     /// execution mode, peak RSS, and wall-clock start/finish timestamps.
+    #[cfg(test)]
     pub(crate) fn run_with_readers_writers(
         config: &PipelineConfig,
         readers: SourceReaders,
@@ -473,12 +503,31 @@ impl PipelineExecutor {
     /// production call sites free of any test-only seam.
     ///
     /// [`MemoryArbitrator`]: crate::pipeline::memory::MemoryArbitrator
+    #[cfg(test)]
     pub(crate) fn run_with_readers_writers_in_context(
         config: &PipelineConfig,
         readers: SourceReaders,
         writers: WriterRegistry,
         params: &PipelineRunParams,
         compile_ctx: clinker_plan::config::CompileContext,
+    ) -> Result<ExecutionReport, PipelineError> {
+        Self::run_with_readers_writers_in_context_and_activation(
+            config,
+            readers,
+            writers,
+            params,
+            compile_ctx,
+            None,
+        )
+    }
+
+    fn run_with_readers_writers_in_context_and_activation(
+        config: &PipelineConfig,
+        readers: SourceReaders,
+        writers: WriterRegistry,
+        params: &PipelineRunParams,
+        compile_ctx: clinker_plan::config::CompileContext,
+        source_activation: Option<source_activation::SourceActivationController>,
     ) -> Result<ExecutionReport, PipelineError> {
         // Reject an unsatisfiable memory budget before building the run.
         // A `memory.limit` below the process's live baseline RSS can never
@@ -516,13 +565,14 @@ impl PipelineExecutor {
             arbitrator.set_max_spill_bytes(cap);
         }
         let memory_budget = std::sync::Arc::new(arbitrator);
-        Self::run_with_readers_writers_with_arbitrator(
+        Self::run_with_readers_writers_with_arbitrator_and_activation(
             config,
             readers,
             writers,
             params,
             compile_ctx,
             memory_budget,
+            source_activation,
         )
     }
 
@@ -536,13 +586,34 @@ impl PipelineExecutor {
     /// arbitrator from `config` and delegates.
     ///
     /// [`MemoryArbitrator`]: crate::pipeline::memory::MemoryArbitrator
+    #[cfg(test)]
     pub(crate) fn run_with_readers_writers_with_arbitrator(
+        config: &PipelineConfig,
+        readers: SourceReaders,
+        writers: WriterRegistry,
+        params: &PipelineRunParams,
+        compile_ctx: clinker_plan::config::CompileContext,
+        memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
+    ) -> Result<ExecutionReport, PipelineError> {
+        Self::run_with_readers_writers_with_arbitrator_and_activation(
+            config,
+            readers,
+            writers,
+            params,
+            compile_ctx,
+            memory_budget,
+            None,
+        )
+    }
+
+    fn run_with_readers_writers_with_arbitrator_and_activation(
         config: &PipelineConfig,
         mut readers: SourceReaders,
         writers: WriterRegistry,
         params: &PipelineRunParams,
         compile_ctx: clinker_plan::config::CompileContext,
         memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
+        source_activation: Option<source_activation::SourceActivationController>,
     ) -> Result<ExecutionReport, PipelineError> {
         let started_at = Utc::now();
         let output_staging = writers.output_staging.clone();
@@ -918,6 +989,7 @@ impl PipelineExecutor {
                 params,
             },
             DagExecResources {
+                source_activation,
                 source_records,
                 source_consumers,
                 writers,
@@ -1161,6 +1233,7 @@ impl PipelineExecutor {
             params,
         } = inputs;
         let DagExecResources {
+            source_activation,
             source_records,
             source_consumers,
             mut writers,
@@ -1479,6 +1552,7 @@ impl PipelineExecutor {
             window_arena_consumer_ids: HashMap::new(),
             source_records,
             source_consumers,
+            source_activation,
             fused_sources,
             fused_transforms,
             record_var_seed: &record_var_seed,

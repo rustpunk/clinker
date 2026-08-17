@@ -233,36 +233,16 @@ fn build_multi_file_reader(
 
 /// Wrap a format reader with schema-based type coercion if the source
 /// declares typed columns in its `schema:` block.
-fn wrap_with_schema_coercion(
+fn wrap_source_body_with_schema_coercion(
     reader: Box<dyn FormatReader>,
-    config: &PipelineConfig,
-    source_name: &str,
+    body: &clinker_plan::config::pipeline_node::SourceBody,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
-    use clinker_plan::config::PipelineNode;
     use clinker_plan::config::pipeline_node::OnUnmapped;
 
-    // Find the source node's schema + on_unmapped policy + format. Format is
-    // needed for the auto_widen-on-fixed-width structural-inertness diagnostic
-    // below.
-    let body_data = config.nodes.iter().find_map(|s| {
-        if let PipelineNode::Source {
-            header,
-            config: body,
-        } = &s.value
-            && header.name == source_name
-        {
-            return Some((
-                &body.schema,
-                body.on_unmapped.clone(),
-                body.source.format.clone(),
-            ));
-        }
-        None
-    });
-
-    let Some((schema, policy, format)) = body_data else {
-        return Ok(reader);
-    };
+    let schema = &body.schema;
+    let policy = body.on_unmapped.clone();
+    let format = &body.source.format;
+    let source_name = body.source.name.as_str();
 
     // The unified `schema:` is resolved to its effective column list (single-
     // record columns, or the multi-record superset). Its `File` form was
@@ -362,17 +342,6 @@ fn coercible_columns(
 /// Borrow a source node's unified `schema:` ([`SourceSchema`]) from the compiled
 /// plan, keyed by node identity (`header.name`) — the same key every other
 /// source lookup on the ingest path uses.
-fn source_schema<'a>(config: &'a PipelineConfig, source_name: &str) -> Option<&'a SourceSchema> {
-    use clinker_plan::config::PipelineNode;
-    config.nodes.iter().find_map(|s| match &s.value {
-        PipelineNode::Source {
-            header,
-            config: body,
-        } if header.name == source_name => Some(&body.schema),
-        _ => None,
-    })
-}
-
 /// Convert a record value at a declared watermark column into the
 /// canonical i64-nanoseconds event-time stamp folded into
 /// [`crate::executor::watermark::PerSourceWatermarks`].
@@ -436,6 +405,39 @@ pub(super) fn ingest_source(
     shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
     progress: Option<crate::progress::RunProgress>,
 ) -> Result<IngestTaskOutcome, PipelineError> {
+    use clinker_plan::config::PipelineNode;
+
+    let body = config
+        .nodes
+        .iter()
+        .find_map(|node| match &node.value {
+            PipelineNode::Source { header, config } if header.name == src_cfg.name => {
+                Some(config.clone())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                "source '{}' not found in the compiled plan while building its reader",
+                src_cfg.name
+            )))
+        })?;
+    ingest_source_body(body, input, stream, shutdown_token, progress)
+}
+
+/// Ingest one retained Source body through the common finite reader path.
+///
+/// Composition bodies call this entry because their Sources do not appear in
+/// the top-level [`PipelineConfig`]. The caller must supply the planner-retained
+/// resolved body; this function never reconstructs schema or reader policy.
+pub(super) fn ingest_source_body(
+    body: clinker_plan::config::pipeline_node::SourceBody,
+    input: crate::source::SourceInput,
+    stream: crate::executor::source_stream::SourceIngestChannel,
+    shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
+    progress: Option<crate::progress::RunProgress>,
+) -> Result<IngestTaskOutcome, PipelineError> {
+    let src_cfg = body.source.clone();
     // Branch once on transport. The file arm builds the
     // MultiFileFormatReader + schema-coercion stack and hands the
     // resulting `Box<dyn FormatReader>` to the shared driver as a
@@ -454,14 +456,9 @@ pub(super) fn ingest_source(
                     )),
                 ));
             }
-            let schema = source_schema(&config, &src_cfg.name).ok_or_else(|| {
-                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                    "source '{}' not found in the compiled plan while building its reader",
-                    src_cfg.name
-                )))
-            })?;
-            let raw_reader = build_multi_file_reader(&src_cfg, schema, files, progress.clone())?;
-            let src_reader = wrap_with_schema_coercion(raw_reader, &config, &src_cfg.name)?;
+            let raw_reader =
+                build_multi_file_reader(&src_cfg, &body.schema, files, progress.clone())?;
+            let src_reader = wrap_source_body_with_schema_coercion(raw_reader, &body)?;
             // The file arm reaches the shared driver through the blanket
             // `RecordSource for Box<dyn FormatReader>` impl.
             drive_record_source(src_cfg, Box::new(src_reader), stream, shutdown_token)
