@@ -1735,7 +1735,7 @@ fn dot_escape(s: &str) -> String {
 /// across recompiles where `NodeIndex` values change.
 impl Serialize for ExecutionPlanDag {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(3))?;
+        let mut map = serializer.serialize_map(Some(4))?;
         map.serialize_entry("schema_version", "1")?;
 
         // Build node list in topo order
@@ -1782,6 +1782,7 @@ impl Serialize for ExecutionPlanDag {
             }
         }
         map.serialize_entry("node_properties", &PropsMap(self))?;
+        map.serialize_entry("source_activation", &self.source_activation.summary())?;
         map.end()
     }
 }

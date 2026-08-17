@@ -452,11 +452,6 @@ impl PipelineConfig {
             };
             LabeledSpan::primary(s, String::new())
         };
-        // (a) Whole-DAG diagnostic: stage-3 cycle detection emits one
-        // diagnostic that covers the entire pipeline graph, with no
-        // single node to anchor on.
-        let synth = || LabeledSpan::primary(Span::SYNTHETIC, String::new());
-
         // ── Stage 1: duplicate names ────────────────────────────────
         // Names are case-sensitive (matches Unix FS, Airflow, Beam).
         // Exact duplicates → E001 error. Case-only duplicates → W002.
@@ -518,10 +513,17 @@ impl PipelineConfig {
         }
         if let Some(cycle) = graph.detect_cycle() {
             let path = cycle.join(" → ");
+            let cycle_span = cycle
+                .first()
+                .and_then(|name| self.nodes.iter().find(|node| node.value.name() == name))
+                .map_or_else(
+                    || LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    span_for,
+                );
             diags.push(Diagnostic::error(
                 "E003",
                 format!("cycle detected: {path} → {}", cycle[0]),
-                synth(),
+                cycle_span,
             ));
         }
 
@@ -2369,6 +2371,19 @@ impl PipelineConfig {
                 "E003",
                 format!("order-contract finalization failed: {error}"),
                 LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diags);
+        }
+
+        // Seal the complete recursive Source activation inventory at the same
+        // finalized-plan boundary. This reads only compiled topology and
+        // secret-free logical resource requirements; runtime handles and
+        // credential profiles remain outside `CompiledPlan`.
+        if let Err(error) = dag.seal_source_activation(&artifacts.composition_bodies) {
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("source activation finalization failed: {}", error.message),
+                LabeledSpan::primary(error.span, String::new()),
             ));
             return Err(diags);
         }

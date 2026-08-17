@@ -1380,6 +1380,11 @@ pub struct ExecutionPlanDag {
     /// Runtime source verification and downstream strategy checks borrow this
     /// value rather than reconstructing typed proof from raw configuration.
     pub(crate) order_contract: ExecutionOrderContract,
+    /// Sealed recursive inventory of external Source activation groups.
+    ///
+    /// Hand-built test DAGs start unsealed; the production compile path seals
+    /// this only after every structural rewrite and bound body is final.
+    pub(crate) source_activation: SourceActivationPlan,
     /// Topologically sorted node indices.
     pub topo_order: Vec<NodeIndex>,
     /// Topologically sorted source tiers for Phase 1 ordering.

@@ -3085,6 +3085,7 @@ mod tests {
         let mut plan = ExecutionPlanDag {
             consumer_registry: Default::default(),
             order_contract: Default::default(),
+            source_activation: Default::default(),
             graph,
             topo_order: Vec::new(),
             source_dag: Vec::new(),
@@ -3435,6 +3436,7 @@ mod tests {
         let mut plan = ExecutionPlanDag {
             consumer_registry: Default::default(),
             order_contract: Default::default(),
+            source_activation: Default::default(),
             graph,
             topo_order: Vec::new(),
             source_dag: Vec::new(),

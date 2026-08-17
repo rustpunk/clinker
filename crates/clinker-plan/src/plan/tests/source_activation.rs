@@ -152,6 +152,14 @@ fn tracer() {
     assert_eq!(activation.instances().len(), 3);
     assert_eq!(activation.groups().len(), 3);
     assert_eq!(activation.credential_requirement_ids().len(), 0);
+    assert_eq!(
+        activation
+            .instances()
+            .iter()
+            .map(CompiledSourceInstance::source_name)
+            .collect::<Vec<_>>(),
+        vec!["driver", "read", "read"]
+    );
     let second_activation = second_plan.dag().source_activation();
     assert_eq!(activation, second_activation);
 }
@@ -387,9 +395,34 @@ nodes:
     assert_eq!(activation.instances().len(), 1);
     assert_eq!(activation.groups().len(), 1);
     assert!(activation.roots().iter().any(|root| {
-        matches!(root, CompiledSourceRoot::InputPort { port_name, .. } if port_name.as_ref() == "incoming")
+        matches!(
+            root,
+            CompiledSourceRoot::InputPort {
+                port_name,
+                dependency_groups,
+                ..
+            } if port_name.as_ref() == "incoming" && dependency_groups.len() == 1
+        )
     }));
     assert_eq!(instance_named(&plan, "driver").resource(), None);
+}
+
+#[test]
+fn explain_projects_only_fixed_cardinality_activation_counts() {
+    let workspace = write_workspace(BODY);
+    let plan = compile(workspace.path());
+    let explain = serde_json::to_value(plan.dag()).expect("plan serializes");
+    let activation = &explain["source_activation"];
+
+    assert_eq!(activation["sealed"], true);
+    assert_eq!(activation["instance_count"], 3);
+    assert_eq!(activation["group_count"], 3);
+    assert_eq!(activation["credential_requirement_count"], 0);
+    let rendered = activation.to_string();
+    assert!(!rendered.contains("shared_orders"));
+    assert!(!rendered.contains("orders.csv"));
+    assert!(!rendered.contains("driver"));
+    assert!(!rendered.contains("read"));
 }
 
 #[test]
