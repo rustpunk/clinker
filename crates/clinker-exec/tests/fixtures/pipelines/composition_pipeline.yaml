@@ -44,7 +44,7 @@ nodes:
     config:
       strict_mode: true
 
-  - type: output
+  - type: sink
     name: enriched_out
     input: enrich1
     config:
