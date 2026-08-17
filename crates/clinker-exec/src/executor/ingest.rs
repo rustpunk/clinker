@@ -1769,7 +1769,7 @@ nodes:
       schema:
         - {{ name: id, type: string }}
         - {{ name: name, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: probe
     config:
@@ -1949,7 +1949,7 @@ nodes:
       path: placeholder.csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: edi
     config:
