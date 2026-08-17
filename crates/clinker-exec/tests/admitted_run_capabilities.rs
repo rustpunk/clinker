@@ -5,6 +5,7 @@ use clinker_exec::executor::capabilities::{
     CapabilityOpener, CapabilityReservationError, CapabilitySession, GroupCapacityLease,
     GroupCapacityReservation, RunCapabilityErrorKind,
 };
+use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, WriterRegistry};
 use clinker_plan::config::{CompileContext, PipelineConfig, parse_config};
 use clinker_plan::plan::execution::{
     CompiledSourceInstanceId, SourceActivationCapacity, SourceActivationGroup,
@@ -80,9 +81,7 @@ struct FixtureReservation {
 }
 
 impl GroupCapacityReservation for FixtureReservation {
-    fn reserve(
-        self: Box<Self>,
-    ) -> Result<Box<dyn GroupCapacityLease>, CapabilityReservationError> {
+    fn reserve(self: Box<Self>) -> Result<Box<dyn GroupCapacityLease>, CapabilityReservationError> {
         self.events.push(format!("reserve:{}", self.label));
         if self.fail {
             Err(CapabilityReservationError::Unavailable)
@@ -165,12 +164,13 @@ fn group_request(
     group: &SourceActivationGroup,
     label: &'static str,
     events: &Events,
+    capacity: SourceActivationCapacity,
     fail_reservation: bool,
     fail_open: bool,
 ) -> AdmittedActivationGroup {
     AdmittedActivationGroup::new(
         group.id(),
-        group.capacity(),
+        capacity,
         group
             .members()
             .iter()
@@ -195,7 +195,14 @@ fn exact_contract_reserves_then_transfers_each_group_once() {
 
     let mut admitted = AdmittedRunCapabilities::admit(
         activation,
-        vec![group_request(group, "orders", &events, false, false)],
+        vec![group_request(
+            group,
+            "orders",
+            &events,
+            group.capacity(),
+            false,
+            false,
+        )],
     )
     .expect("exact contract admits");
     assert_eq!(admitted.group_count(), 1);
@@ -236,12 +243,18 @@ fn required_plus_one_capacity_is_rejected_before_reservation() {
     let activation = plan.dag().source_activation();
     let group = &activation.groups()[0];
     let events = Events::new();
-    let mut request = group_request(group, "orders", &events, false, false);
-    request.set_capacity_for_test(SourceActivationCapacity::new(
-        group.capacity().resource_units() + 1,
-        group.capacity().opener_units(),
-        group.capacity().credential_handle_units(),
-    ));
+    let request = group_request(
+        group,
+        "orders",
+        &events,
+        SourceActivationCapacity::new(
+            group.capacity().resource_units() + 1,
+            group.capacity().opener_units(),
+            group.capacity().credential_handle_units(),
+        ),
+        false,
+        false,
+    );
 
     let error = AdmittedRunCapabilities::admit(activation, vec![request]).unwrap_err();
     assert_eq!(error.kind(), RunCapabilityErrorKind::CapacityMismatch);
@@ -255,8 +268,22 @@ fn partial_reservation_failure_releases_prior_groups_in_reverse_order() {
     assert_eq!(activation.groups().len(), 2, "fixture needs two groups");
     let events = Events::new();
     let requests = vec![
-        group_request(&activation.groups()[0], "first", &events, false, false),
-        group_request(&activation.groups()[1], "second", &events, true, false),
+        group_request(
+            &activation.groups()[0],
+            "first",
+            &events,
+            activation.groups()[0].capacity(),
+            false,
+            false,
+        ),
+        group_request(
+            &activation.groups()[1],
+            "second",
+            &events,
+            activation.groups()[1].capacity(),
+            true,
+            false,
+        ),
     ];
 
     let error = AdmittedRunCapabilities::admit(activation, requests).unwrap_err();
@@ -276,8 +303,22 @@ fn dropping_unconsumed_bundle_releases_group_leases_in_reverse_order() {
     let admitted = AdmittedRunCapabilities::admit(
         activation,
         vec![
-            group_request(&activation.groups()[0], "first", &events, false, false),
-            group_request(&activation.groups()[1], "second", &events, false, false),
+            group_request(
+                &activation.groups()[0],
+                "first",
+                &events,
+                activation.groups()[0].capacity(),
+                false,
+                false,
+            ),
+            group_request(
+                &activation.groups()[1],
+                "second",
+                &events,
+                activation.groups()[1].capacity(),
+                false,
+                false,
+            ),
         ],
     )
     .expect("all reservations succeed");
@@ -303,7 +344,14 @@ fn opener_failure_and_downstream_error_release_active_group() {
     let events = Events::new();
     let mut admitted = AdmittedRunCapabilities::admit(
         activation,
-        vec![group_request(group, "orders", &events, false, true)],
+        vec![group_request(
+            group,
+            "orders",
+            &events,
+            group.capacity(),
+            false,
+            true,
+        )],
     )
     .expect("group reserves");
 
@@ -323,6 +371,71 @@ fn opener_failure_and_downstream_error_release_active_group() {
 }
 
 #[test]
+fn executor_error_releases_the_unconsumed_bundle() {
+    let plan = one_source_plan();
+    let activation = plan.dag().source_activation();
+    let group = &activation.groups()[0];
+    let events = Events::new();
+    let admitted = AdmittedRunCapabilities::admit(
+        activation,
+        vec![group_request(
+            group,
+            "orders",
+            &events,
+            group.capacity(),
+            false,
+            false,
+        )],
+    )
+    .expect("group admits");
+
+    let result = PipelineExecutor::run_admitted_plan_with_readers_writers(
+        &plan,
+        admitted,
+        std::collections::HashMap::new(),
+        WriterRegistry::default(),
+        &PipelineRunParams::default(),
+    );
+
+    assert!(result.is_err(), "missing Source reader must fail the run");
+    assert_eq!(events.snapshot(), ["reserve:orders", "lease_drop:orders"]);
+}
+
+#[test]
+fn interruption_drop_releases_opened_session_before_group_capacity() {
+    let plan = one_source_plan();
+    let activation = plan.dag().source_activation();
+    let group = &activation.groups()[0];
+    let member = group.members()[0];
+    let events = Events::new();
+    let mut admitted = AdmittedRunCapabilities::admit(
+        activation,
+        vec![group_request(
+            group,
+            "orders",
+            &events,
+            group.capacity(),
+            false,
+            false,
+        )],
+    )
+    .expect("group admits");
+    let mut active = admitted.take_group(group.id()).expect("group transfers");
+    active.open(member).expect("session opens");
+
+    drop(active);
+    assert_eq!(
+        events.snapshot(),
+        [
+            "reserve:orders",
+            "open:orders",
+            "session_drop:orders",
+            "lease_drop:orders",
+        ]
+    );
+}
+
+#[test]
 fn debug_and_errors_never_render_opaque_payloads() {
     let plan = one_source_plan();
     let activation = plan.dag().source_activation();
@@ -330,7 +443,14 @@ fn debug_and_errors_never_render_opaque_payloads() {
     let events = Events::new();
     let admitted = AdmittedRunCapabilities::admit(
         activation,
-        vec![group_request(group, "orders", &events, false, false)],
+        vec![group_request(
+            group,
+            "orders",
+            &events,
+            group.capacity(),
+            false,
+            false,
+        )],
     )
     .expect("group admits");
 
@@ -338,8 +458,14 @@ fn debug_and_errors_never_render_opaque_payloads() {
     assert!(debug.contains("AdmittedRunCapabilities"));
     assert!(!debug.contains("opener-secret-must-not-escape"));
 
-    let mut mismatched = group_request(group, "orders", &events, false, false);
-    mismatched.set_capacity_for_test(SourceActivationCapacity::default());
+    let mismatched = group_request(
+        group,
+        "orders",
+        &events,
+        SourceActivationCapacity::default(),
+        false,
+        false,
+    );
     let error = AdmittedRunCapabilities::admit(activation, vec![mismatched]).unwrap_err();
     let rendered = format!("{error:?} {error}");
     assert!(!rendered.contains("orders"));
