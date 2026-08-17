@@ -32,6 +32,7 @@ use clinker_record::{
     coerce_to_string,
 };
 use indexmap::IndexMap;
+use serde::Deserialize;
 
 use cxl::analyzer::doc_paths::DocPath;
 
@@ -42,6 +43,7 @@ use crate::error::FormatError;
 use crate::json::body_stream::{JsonArrayStream, is_json_ws};
 use crate::json::streaming::{SectionTarget, extract_sections};
 use crate::multi_value::{SplitToRows, SplitToRowsMode, SplitValues};
+use crate::numeric_observation::{NumericObserver, observe_json_number, observe_json_value};
 use crate::record_path::{RecordPath, RecordPathSyntax};
 use crate::source::{ReopenableSource, SourceIdentity};
 use crate::traits::FormatReader;
@@ -104,6 +106,9 @@ pub struct JsonReader {
     /// sees the same content, so a path-backed input rewritten between the two
     /// passes fails loud instead of splicing a stale envelope onto a new body.
     body_identity: SourceIdentity,
+    /// Optional authoring-only sink. Observations are emitted one scalar at a
+    /// time before `serde_json::Number` becomes a record [`Value`].
+    numeric_observer: Option<NumericObserver>,
 }
 
 enum InnerReader {
@@ -150,6 +155,31 @@ impl JsonReader {
         source: ReopenableSource,
         config: JsonReaderConfig,
     ) -> Result<Self, FormatError> {
+        Self::from_source_with_observer(source, config, None)
+    }
+
+    /// Build a streaming reader that publishes exact parser-owned numeric
+    /// evidence before record-value conversion.
+    ///
+    /// The observer is called synchronously and must retain only bounded
+    /// evidence; the reader itself continues to hold at most one record.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`from_source`](Self::from_source).
+    pub fn from_source_observing(
+        source: ReopenableSource,
+        config: JsonReaderConfig,
+        observer: NumericObserver,
+    ) -> Result<Self, FormatError> {
+        Self::from_source_with_observer(source, config, Some(observer))
+    }
+
+    fn from_source_with_observer(
+        source: ReopenableSource,
+        config: JsonReaderConfig,
+        numeric_observer: Option<NumericObserver>,
+    ) -> Result<Self, FormatError> {
         // JSON runs two passes (envelope pre-scan + body stream), so the source
         // must be re-openable. A `Path`/`Buffered` source passes through; a
         // pathless `OneShot` is buffered here, on the reader-building thread —
@@ -164,6 +194,7 @@ impl JsonReader {
             deferred_first: None,
             source,
             body_identity,
+            numeric_observer,
         })
     }
 
@@ -186,6 +217,21 @@ impl JsonReader {
     ) -> Result<Self, FormatError> {
         let source = ReopenableSource::buffer(reader).map_err(FormatError::Io)?;
         Self::from_source(source, config)
+    }
+
+    /// Buffer a pathless source and publish exact numeric observations while
+    /// it streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`from_reader`](Self::from_reader).
+    pub fn from_reader_observing<R: Read + Send + 'static>(
+        reader: R,
+        config: JsonReaderConfig,
+        observer: NumericObserver,
+    ) -> Result<Self, FormatError> {
+        let source = ReopenableSource::buffer(reader).map_err(FormatError::Io)?;
+        Self::from_source_observing(source, config, observer)
     }
 
     /// Open a fresh `BufReader` from the source with a leading UTF-8 BOM
@@ -522,7 +568,12 @@ impl JsonReader {
         self.apply_multi_value(&mut flat);
         let columns: Vec<Box<str>> = flat.keys().map(|k| k.clone().into_boxed_str()).collect();
         let schema = Arc::new(Schema::new(columns));
-        let values: Vec<Value> = flat.values().map(json_to_value).collect();
+        let values: Vec<Value> = flat
+            .iter()
+            .map(|(field, value)| {
+                json_to_value_observing(value, Some(field), self.numeric_observer.as_ref(), false)
+            })
+            .collect();
         Ok(Record::new(schema, values))
     }
 }
@@ -850,24 +901,71 @@ fn split_text_value(value: &serde_json::Value, delimiter: &str) -> serde_json::V
 /// reuses it to recover a cell a sink wrote under `join_values`
 /// `on_conflict: encode_json`.
 pub(crate) fn json_to_value(v: &serde_json::Value) -> Value {
+    json_to_value_observing(v, None, None, false)
+}
+
+fn selective_stream_json_to_value(v: &serde_json::Value) -> Value {
+    json_to_value_observing(v, None, None, true)
+}
+
+fn json_to_value_observing(
+    v: &serde_json::Value,
+    field: Option<&str>,
+    observer: Option<&NumericObserver>,
+    recover_streamed_number: bool,
+) -> Value {
+    // The streaming selective-deserialization visitor represents an
+    // arbitrary-precision number through serde_json's reserved tagged map.
+    // Ask Number's own Deserializer to recover it rather than recognizing the
+    // private tag or reparsing its payload ourselves.
+    if recover_streamed_number
+        && v.is_object()
+        && let Ok(number) = serde_json::Number::deserialize(v)
+    {
+        let observation = observe_json_number(&number);
+        let value = observation
+            .parsed_value()
+            .unwrap_or_else(|| Value::String(number.to_string().into()));
+        if let (Some(field), Some(observer)) = (field, observer) {
+            observer.observe(field, observation);
+        }
+        return value;
+    }
     match v {
-        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Null => {
+            if let (Some(field), Some(observer), Some(observation)) =
+                (field, observer, observe_json_value(v))
+            {
+                observer.observe(field, observation);
+            }
+            Value::Null
+        }
         serde_json::Value::Bool(b) => Value::Bool(*b),
         serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Integer(i)
-            } else if let Some(f) = n.as_f64() {
-                Value::Float(f)
-            } else {
-                Value::String(n.to_string().into())
+            let observation = observe_json_number(n);
+            let value = observation
+                .parsed_value()
+                .unwrap_or_else(|| Value::String(n.to_string().into()));
+            if let (Some(field), Some(observer)) = (field, observer) {
+                observer.observe(field, observation);
             }
+            value
         }
         serde_json::Value::String(s) => Value::String(s.clone().into()),
-        serde_json::Value::Array(arr) => Value::Array(arr.iter().map(json_to_value).collect()),
+        serde_json::Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|value| {
+                    json_to_value_observing(value, field, observer, recover_streamed_number)
+                })
+                .collect(),
+        ),
         serde_json::Value::Object(obj) => {
             let mut map: IndexMap<Box<str>, Value> = IndexMap::with_capacity(obj.len());
             for (k, val) in obj {
-                map.insert(k.as_str().into(), json_to_value(val));
+                map.insert(
+                    k.as_str().into(),
+                    json_to_value_observing(val, field, observer, recover_streamed_number),
+                );
             }
             Value::Map(Box::new(map))
         }
@@ -930,7 +1028,7 @@ fn coerce_json_section_fields(
             Some(v) if !v.is_null() => v,
             _ => continue,
         };
-        let intermediate = json_to_value(json_val);
+        let intermediate = selective_stream_json_to_value(json_val);
         let coerced = match ty {
             EnvelopeFieldType::String => coerce_to_string(&intermediate),
             EnvelopeFieldType::Int => coerce_to_int(&intermediate),
