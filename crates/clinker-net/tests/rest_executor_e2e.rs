@@ -118,7 +118,7 @@ nodes:
         emit label = label
         emit src_file = $source.file
         emit src_name = $source.name
-  - type: output
+  - type: sink
     name: out
     input: stamp
     config:
@@ -255,7 +255,7 @@ nodes:
       cxl: |
         emit id = id
         emit doubled = amount.to_int() * 2
-  - type: output
+  - type: sink
     name: out
     input: doubler
     config:
