@@ -48,7 +48,7 @@ nodes:
         emit salary = salary
         emit level = if salary >= 90000 then "senior" else "junior"
 
-  - type: output
+  - type: sink
     name: report
     input: classify
     config:

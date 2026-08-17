@@ -17,7 +17,7 @@ Output nodes write processed records to files. They are the terminal nodes of a 
 ## Basic structure
 
 ```yaml
-- type: output
+- type: sink
   name: result
   input: transform_node
   config:
@@ -404,7 +404,7 @@ file's own directory (not the invoking pipeline's).
 ### CSV
 
 ```yaml
-- type: output
+- type: sink
   name: csv_out
   input: processed
   config:
@@ -423,7 +423,7 @@ to its first byte.
 ### JSON
 
 ```yaml
-- type: output
+- type: sink
   name: json_out
   input: processed
   config:
@@ -445,7 +445,7 @@ an infinity fails the write with a JSON error instead of silently becoming
 ### XML
 
 ```yaml
-- type: output
+- type: sink
   name: xml_out
   input: processed
   config:
@@ -466,7 +466,7 @@ round-trip. See [XML Format](../formats/xml.md#writing-xml) for details.
 ### Fixed-width
 
 ```yaml
-- type: output
+- type: sink
   name: fw_out
   input: processed
   config:
@@ -486,7 +486,7 @@ for the layout semantics.
 ### EDIFACT
 
 ```yaml
-- type: output
+- type: sink
   name: edi_out
   input: messages
   config:
@@ -513,7 +513,7 @@ full option reference, the record schema, and the round-trip semantics.
 ### HL7 v2
 
 ```yaml
-- type: output
+- type: sink
   name: hl7_out
   input: messages
   config:
@@ -633,7 +633,7 @@ Output, mode, authored keys, and last reordering stage, and includes a corrected
 Split output into multiple files based on record count, byte size, or group boundaries:
 
 ```yaml
-- type: output
+- type: sink
   name: split_output
   input: processed
   config:
@@ -694,7 +694,7 @@ When a single Output sits directly after a `Merge` with `mode: interleave` whose
   inputs: [src_a, src_b]
   config:
     mode: interleave        # required
-- type: output
+- type: sink
   name: out
   input: merged
   config:
@@ -713,7 +713,7 @@ Output `sort_order` with a total business key when exact bytes are required.
 ## Complete example
 
 ```yaml
-- type: output
+- type: sink
   name: department_reports
   input: enriched_employees
   config:

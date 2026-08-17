@@ -167,7 +167,7 @@ A composition's body operates on records flowing in from the parent pipeline; co
 Correlation grouping is tracked on internal columns you never write in YAML or CXL, and they are hidden from writer output by default. To surface them for debugging, set `include_correlation_keys: true` on an output node:
 
 ```yaml
-- type: output
+- type: sink
   name: debug
   input: any_node
   config:

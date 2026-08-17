@@ -322,7 +322,7 @@ nodes:
         emit user_id = user_id
         emit logins = count(*)
 
-  - type: output
+  - type: sink
     name: results
     input: user_sessions
     config:
@@ -376,7 +376,7 @@ cargo run -p clinker -- run examples/pipelines/multi_source_session.yaml
       emit max_amount = max(amount)
       emit categories = collect(category)
 
-- type: output
+- type: sink
   name: summary_output
   input: account_summary
   config:

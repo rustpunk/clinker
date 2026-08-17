@@ -117,7 +117,7 @@ sibling `<a>` elements for that column set, which this reader then refused on
 the way back in.
 
 ```yaml
-- type: output
+- type: sink
   name: xml_out
   input: processed
   config:
@@ -184,7 +184,7 @@ reads, sharing the `field` key. The XML writer reads two keys from it and ignore
 the CSV-only `delimiter` / `on_conflict` / `escape`:
 
 ```yaml
-- type: output
+- type: sink
   name: xml_out
   input: processed
   config:

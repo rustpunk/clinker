@@ -353,7 +353,7 @@ nodes:
         emit amount = orders.amount
       propagate_ck: driver
 
-  - type: output
+  - type: sink
     name: result
     input: enrich
     config:

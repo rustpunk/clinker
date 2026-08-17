@@ -38,7 +38,7 @@ The `inputs:` field is a list of upstream node references. These can be bare nod
 Downstream nodes wire to the merge as a normal single-input reference:
 
 ```yaml
-- type: output
+- type: sink
   name: final_output
   input: rejoin
   config:
@@ -161,7 +161,7 @@ The most common pattern is routing records through different processing paths an
     - process_standard
   config: {}
 
-- type: output
+- type: sink
   name: result
   input: all_orders
   config:

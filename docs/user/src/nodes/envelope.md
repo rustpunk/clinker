@@ -95,7 +95,7 @@ nodes:
     name: framed
     body: both
     config: { strategy: concat }
-  - type: output
+  - type: sink
     name: out
     input: framed
     config:
@@ -187,7 +187,7 @@ nodes:
     name: framed
     body: merged
     config: { strategy: preserve }
-  - type: output
+  - type: sink
     name: out
     input: framed
     config:
