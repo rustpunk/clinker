@@ -50,6 +50,7 @@ struct FixtureProvider {
     revocation: bool,
     capacity: CredentialHandleUnits,
     secret: String,
+    failure: Option<CredentialProviderFailure>,
     resolve_calls: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
 }
@@ -84,6 +85,9 @@ impl CredentialProvider for FixtureProvider {
         _requirement: &CredentialRequirement,
     ) -> Result<Box<dyn CredentialLease>, CredentialProviderFailure> {
         self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(failure) = self.failure {
+            return Err(failure);
+        }
         Ok(Box::new(FixtureLease {
             _secret: self.secret.clone(),
             drops: Arc::clone(&self.drops),
@@ -108,9 +112,45 @@ fn provider(
             NonZeroU32::new(capacity).expect("fixture capacity must be non-zero"),
         ),
         secret: "lease-secret-must-not-escape".to_owned(),
+        failure: None,
         resolve_calls: Arc::new(AtomicUsize::new(0)),
         drops: Arc::new(AtomicUsize::new(0)),
     }
+}
+
+fn provider_failure_kind(failure: CredentialProviderFailure) -> CredentialResolutionErrorKind {
+    let mut provider = provider(
+        vec![CredentialCapability::AuthenticateRequest],
+        vec![CredentialLifetime::Run],
+        true,
+        true,
+        2,
+    );
+    provider.failure = Some(failure);
+    let providers: [&dyn CredentialProvider; 1] = [&provider];
+    let profiles = [CredentialProfile::new(
+        CredentialProfileName::parse("release").expect("valid explicit profile"),
+        &providers,
+    )];
+    resolve_explicit_profile(
+        &CredentialProfileName::parse("release").expect("valid explicit profile"),
+        &profiles,
+        &requirement(vec![CredentialCapability::AuthenticateRequest]),
+    )
+    .expect_err("provider failure must remain typed")
+    .kind()
+}
+
+#[test]
+fn low_level_provider_failures_are_closed_and_sanitized() {
+    assert_eq!(
+        provider_failure_kind(CredentialProviderFailure::Unavailable),
+        CredentialResolutionErrorKind::ProviderUnavailable
+    );
+    assert_eq!(
+        provider_failure_kind(CredentialProviderFailure::Refused),
+        CredentialResolutionErrorKind::ProviderRefused
+    );
 }
 
 #[test]

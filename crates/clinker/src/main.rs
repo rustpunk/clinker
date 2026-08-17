@@ -11,6 +11,7 @@ use clinker_plan::config::utils::parse_memory_limit_bytes_strict;
 use clinker_plan::error::PipelineError;
 
 mod capability;
+pub mod credential_profile;
 mod lifecycle;
 mod lineage;
 use lineage::*;
