@@ -175,7 +175,7 @@ pipeline:
         emit all_reps = collect(sales_rep)
 
     - name: output
-      type: output
+      type: sink
       input: monthly_summary
       format: json
       path: summary.json

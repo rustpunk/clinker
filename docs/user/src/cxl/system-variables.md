@@ -206,7 +206,7 @@ pipeline:
         emit pipeline_run = $pipeline.execution_id
 
     - name: output
-      type: output
+      type: sink
       input: enrich
       format: csv
       path: enriched_orders.csv

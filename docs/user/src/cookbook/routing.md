@@ -48,7 +48,7 @@ nodes:
         high: "amount >= $vars.high_value_threshold"
       default: standard
 
-  - type: output
+  - type: sink
     name: high_value_output
     input: split_by_value.high
     config:
@@ -56,7 +56,7 @@ nodes:
       type: csv
       path: "./output/high_value.csv"
 
-  - type: output
+  - type: sink
     name: standard_output
     input: split_by_value.standard
     config:
@@ -128,7 +128,7 @@ Route nodes can have any number of named branches:
         apac: "region == \"APAC\""
       default: other
 
-  - type: output
+  - type: sink
     name: us_output
     input: split_by_region.us
     config:
@@ -136,7 +136,7 @@ Route nodes can have any number of named branches:
       type: csv
       path: "./output/us_orders.csv"
 
-  - type: output
+  - type: sink
     name: eu_output
     input: split_by_region.eu
     config:
@@ -163,7 +163,7 @@ Insert a transform between the route and output to shape the data differently pe
         emit priority = "URGENT"
         emit review_required = true
 
-  - type: output
+  - type: sink
     name: high_value_output
     input: enrich_high_value
     config:

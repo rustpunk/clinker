@@ -174,7 +174,7 @@ as records — they ride the document context.
 
 ```yaml
 nodes:
-  - type: output
+  - type: sink
     name: out
     input: messages
     config:

@@ -76,7 +76,7 @@ nodes:
           emit line_total = it["price"] * it["qty"]
         }
 
-  - type: output
+  - type: sink
     name: lines_out
     input: explode
     config:

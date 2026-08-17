@@ -275,7 +275,7 @@ dropped upstream) is written with the conventional `|^~\&` set.
 
 ```yaml
 nodes:
-  - type: output
+  - type: sink
     name: out
     input: messages
     config:
