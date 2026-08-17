@@ -242,8 +242,14 @@ fingerprint. For each authored body Source, planning compiles a distinct
 call-site-scoped instance carrying only the slot, logical identity, resource
 kind, required capabilities, opener family, run lifetime, provenance, and
 stable logical dataset identity. It does not retain the catalog's physical
-path. Runtime credential resolution and handle activation are separate future
-preflight work; this surface neither selects credentials nor opens the file.
+path. During `clinker run`, the CLI resolves that credential-free `file`
+requirement at the workspace edge and transfers an opaque single-use reader
+factory to the executor. The executor acquires the complete compiled group,
+opens all of its Sources before starting any of them, and streams their finite
+records through the ordinary bounded Source path. An open/read failure or
+interruption closes every opened session and releases the group. This surface
+still does not select credentials: a group requiring credentials fails before
+runtime effects because no credential-profile option exists yet.
 
 Ordinary composition calls do not have `outputs:` or `alias:` fields. Either
 key fails with E377 at its authored location. Use `_compose.outputs` for the

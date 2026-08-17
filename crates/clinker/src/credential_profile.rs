@@ -8,7 +8,10 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use clinker_exec::executor::capabilities::{AdmittedRunCapabilities, RunCapabilityErrorKind};
+use clinker_exec::executor::capabilities::{
+    AdmittedActivationGroup, AdmittedRunCapabilities, AdmittedSourceOpener, CapabilityOpenError,
+    CapabilityOpener, CapabilitySession, RunCapabilityErrorKind,
+};
 use clinker_exec::pipeline::memory::{
     ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
@@ -118,6 +121,171 @@ pub fn admit_uncredentialed_run_capabilities(
             ActivationAdmissionError::InvalidCompiledActivation
         }
     })
+}
+
+/// Admit a credential-free run with real file-resource factories for every
+/// composition-body Source.
+///
+/// The workspace catalog remains at this application edge. Physical paths are
+/// captured inside opaque single-use factories and never enter `CompiledPlan`
+/// or executor topology.
+#[cfg_attr(test, allow(dead_code))]
+pub fn admit_uncredentialed_run_capabilities_with_catalog(
+    plan: &clinker_plan::plan::CompiledPlan,
+    workspace_root: &std::path::Path,
+    catalog: &clinker_plan::resources::WorkspaceCatalog,
+) -> Result<AdmittedRunCapabilities, ActivationAdmissionError> {
+    let activation = plan.dag().source_activation();
+    if !activation.credential_requirement_ids().is_empty()
+        || activation.groups().iter().any(|group| {
+            !group.credential_requirement_ids().is_empty()
+                || group.capacity().credential_handle_units() != 0
+        })
+    {
+        return Err(ActivationAdmissionError::UnsupportedCredentialPreflight);
+    }
+
+    let groups = activation
+        .groups()
+        .iter()
+        .map(|group| {
+            let sources = group
+                .members()
+                .iter()
+                .copied()
+                .map(|member| {
+                    let instance = activation
+                        .instances()
+                        .iter()
+                        .find(|instance| instance.id() == member)
+                        .ok_or(ActivationAdmissionError::InvalidCompiledActivation)?;
+                    let Some(requirement) = instance.resource() else {
+                        return Ok(AdmittedSourceOpener::caller_supplied(member));
+                    };
+                    let resource = catalog
+                        .resolve_resource(requirement.binding.logical_id())
+                        .map_err(|_| ActivationAdmissionError::InvalidCompiledActivation)?;
+                    let descriptor = resource.descriptor();
+                    let compatible = descriptor.kind() == requirement.kind
+                        && requirement
+                            .required_capabilities
+                            .iter()
+                            .all(|required| descriptor.capabilities().contains(required))
+                        && requirement.opener == requirement.kind.opener_kind()
+                        && requirement.lifetime == requirement.kind.lifetime()
+                        && requirement.dataset_identity == resource.dataset_identity();
+                    if !compatible {
+                        return Err(ActivationAdmissionError::InvalidCompiledActivation);
+                    }
+                    let path = workspace_root.join(descriptor.path());
+                    let provenance = format!(
+                        "{}/{}",
+                        requirement.dataset_identity.namespace, requirement.dataset_identity.name
+                    );
+                    Ok(AdmittedSourceOpener::new(
+                        member,
+                        Box::new(FileResourceOpener { path, provenance }),
+                    ))
+                })
+                .collect::<Result<Vec<_>, ActivationAdmissionError>>()?;
+            Ok(AdmittedActivationGroup::uncredentialed(
+                group.id(),
+                group.capacity(),
+                sources,
+            ))
+        })
+        .collect::<Result<Vec<_>, ActivationAdmissionError>>()?;
+
+    AdmittedRunCapabilities::admit(activation, groups)
+        .map_err(|_| ActivationAdmissionError::InvalidCompiledActivation)
+}
+
+struct FileResourceOpener {
+    path: std::path::PathBuf,
+    provenance: String,
+}
+
+impl CapabilityOpener for FileResourceOpener {
+    fn open(self: Box<Self>) -> Result<Box<dyn CapabilitySession>, CapabilityOpenError> {
+        let (slot, guard) =
+            clinker_exec::source::multi_file::FileSlot::open_file(self.provenance, &self.path)
+                .map_err(|_| CapabilityOpenError::Unavailable)?;
+        Ok(Box::new(FileResourceSession {
+            input: Some(clinker_exec::executor::SourceInput::Files(vec![slot])),
+            _guard: guard,
+        }))
+    }
+}
+
+struct FileResourceSession {
+    input: Option<clinker_exec::executor::SourceInput>,
+    // ActiveActivationGroup retains the session until every member worker has
+    // joined, pinning the admitted file object even after its input transfers.
+    _guard: clinker_format::RetainedFileGuard,
+}
+
+impl CapabilitySession for FileResourceSession {
+    fn take_source_input(
+        &mut self,
+    ) -> Result<clinker_exec::executor::SourceInput, CapabilityOpenError> {
+        self.input.take().ok_or(CapabilityOpenError::Unavailable)
+    }
+}
+
+#[cfg(test)]
+mod file_resource_opener_tests {
+    use std::io::{Read, Write};
+
+    use super::*;
+
+    #[test]
+    fn opened_session_keeps_the_admitted_file_after_path_replacement() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let path = workspace.path().join("orders.csv");
+        let displaced = workspace.path().join("orders.admitted.csv");
+        std::fs::File::create(&path)
+            .expect("create admitted file")
+            .write_all(b"id\noriginal\n")
+            .expect("write admitted file");
+
+        let mut session = Box::new(FileResourceOpener {
+            path: path.clone(),
+            provenance: "clinker-resource:file/orders".to_string(),
+        })
+        .open()
+        .expect("group opener establishes the file session");
+
+        std::fs::rename(&path, &displaced).expect("replace path after group open");
+        std::fs::File::create(&path)
+            .expect("create replacement")
+            .write_all(b"id\nreplacement\n")
+            .expect("write replacement");
+
+        let clinker_exec::executor::SourceInput::Files(mut slots) = session
+            .take_source_input()
+            .expect("transfer admitted source input")
+        else {
+            panic!("file resource session must return file slots");
+        };
+        let slot = slots.pop().expect("one admitted file slot");
+        let mut first_pass = String::new();
+        let mut second_pass = String::new();
+        slot.source
+            .open()
+            .expect("first pass")
+            .read_to_string(&mut first_pass)
+            .expect("read first pass");
+        slot.source
+            .open()
+            .expect("second pass")
+            .read_to_string(&mut second_pass)
+            .expect("read second pass");
+
+        assert_eq!(first_pass, "id\noriginal\n");
+        assert_eq!(second_pass, first_pass);
+        assert_ne!(second_pass, "id\nreplacement\n");
+        drop(session);
+    }
 }
 
 #[derive(Clone, Copy)]

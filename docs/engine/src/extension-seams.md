@@ -132,10 +132,17 @@ run-local lifetime, and stable logical dataset identity. It deliberately drops
 the catalog's physical path and cannot contain a credential choice, secret,
 live handle, I/O state, or thread state. Separate calls to the same composition
 therefore share immutable logical descriptor semantics but have distinct
-Source identities for later activation.
+Source identities at activation.
 
-Runtime credential resolution and opening are still future preflight work; a
-compiled activation requirement is not an opened Source. See the
+For a data run, the CLI resolves each credential-free `file` requirement back
+to the admitted workspace catalog and captures its validated path inside an
+opaque, single-use factory. The executor receives only the sealed activation
+bundle, takes each complete group lease before opening any member, opens every
+member before publishing a bounded Source channel, and retains the sessions
+until that composition scope ends. A partial open, reader failure, shutdown,
+or ordinary completion closes sessions, releases leases, and unregisters the
+channels' memory consumers. Credential-bearing groups still fail preflight:
+there is no credential-profile selection surface yet. See the
 [composition resources and call-site surface contract](https://github.com/rustpunk/clinker/blob/main/docs/ai/15_PRODUCTION_CONTRACTS.md#composition-resources-and-call-site-surface).
 
 ## Approved transitional exceptions

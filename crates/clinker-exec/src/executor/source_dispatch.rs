@@ -71,7 +71,13 @@ pub(crate) fn dispatch_source<'borrow, 'plan>(
 where
     'plan: 'borrow,
 {
-    let PlanNode::Source { ref name, .. } = *node else {
+    let PlanNode::Source {
+        ref name,
+        id,
+        ref resolved,
+        ..
+    } = *node
+    else {
         return Err(crate::executor::invariant::dispatch_mismatch(
             "dispatch_source",
             "source",
@@ -85,6 +91,89 @@ where
     };
     #[cfg(not(feature = "test-utils"))]
     let SourceDispatchContext::Live(ctx) = ctx.into();
+
+    // An authored body Source carries a resolved reader contract; a synthetic
+    // input-port Source does not. Activate the exact sealed group on the first
+    // authored member encountered. Group activation may install receivers for
+    // several fused members, but it opens every session before publishing any
+    // receiver to this body scope.
+    if resolved.is_some()
+        && let Some(body_id) = ctx.window_runtime.active_stack.last().copied()
+    {
+        let body_scope = ctx
+            .composition_bodies
+            .get(&body_id)
+            .ok_or_else(|| PipelineError::compose_body_missing(name.clone()))?
+            .body_scope;
+        let instance = clinker_plan::plan::execution::CompiledSourceInstanceId {
+            scope: clinker_plan::plan::execution::CompiledSourceScope::CompositionBody(body_scope),
+            source_node: id,
+        };
+        let mut controller =
+            ctx.source_activation
+                .take()
+                .ok_or_else(|| PipelineError::Internal {
+                    op: "source-activation",
+                    node: ctx.qualified_node_name(name).into_owned(),
+                    detail: "body Source reached execution without admitted capabilities"
+                        .to_string(),
+                })?;
+        let logical_prefix = ctx.composition_call_sites.join(".");
+        let activated = controller.activate(
+            instance,
+            current_dag,
+            &logical_prefix,
+            &ctx.memory_budget,
+            ctx.shutdown_token.clone(),
+            ctx.telemetry_producer.as_ref(),
+        );
+        ctx.source_activation = Some(controller);
+        if let Some(activated) = activated? {
+            for (source_name, receiver) in activated.receivers {
+                if ctx
+                    .source_records
+                    .insert(source_name.clone(), receiver)
+                    .is_some()
+                {
+                    return Err(PipelineError::Internal {
+                        op: "source-activation",
+                        node: source_name,
+                        detail: "body Source receiver was activated more than once".to_string(),
+                    });
+                }
+            }
+            for (source_name, registration) in activated.consumers {
+                if let Some((id, handle)) = ctx
+                    .source_consumers
+                    .insert(source_name.clone(), registration)
+                {
+                    handle.resume();
+                    handle.set_bytes(0);
+                    ctx.memory_budget.unregister_consumer(id);
+                    return Err(PipelineError::Internal {
+                        op: "source-activation",
+                        node: source_name,
+                        detail: "body Source memory consumer was activated more than once"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+    }
+    let source_identity: Arc<str> = if !ctx.window_runtime.active_stack.is_empty() {
+        Arc::from(ctx.qualified_node_name(name).into_owned())
+    } else {
+        Arc::from(name.as_str())
+    };
+    ctx.source_count_per_source
+        .entry(Arc::clone(&source_identity))
+        .or_insert(None);
+    ctx.total_per_source
+        .entry(Arc::clone(&source_identity))
+        .or_insert(0);
+    ctx.dlq_per_source
+        .entry(Arc::clone(&source_identity))
+        .or_insert(0);
     // Three input paths feed a Source's emit:
     //
     // 1. Records already seeded into `ctx.node_buffers[node_idx]`
@@ -205,7 +294,7 @@ where
         // wherever the executor task scheduler interleaves.
         let timeout = ctx.idle_timeouts.get(name.as_str()).copied();
         let has_record_seed = !ctx.record_var_seed.is_empty();
-        let source_name_arc: Arc<str> = Arc::from(name.as_str());
+        let source_name_arc = Arc::clone(&source_identity);
         let mut drained: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
         let mut drained_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
         // Tracked so an idle-timeout flips THAT file's
@@ -241,7 +330,8 @@ where
                         // to `Idle`. The next record un-
                         // idles via `observe`. Idempotent on
                         // repeat timeouts.
-                        ctx.watermarks.mark_idle(name.as_str(), &last_file);
+                        ctx.watermarks
+                            .mark_idle(source_identity.as_ref(), &last_file);
                         continue;
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
@@ -290,7 +380,7 @@ where
         }
         ctx.finalize_source_count(&source_name_arc, count);
         ctx.release_source_consumer(name.as_str());
-        if timeout.is_some() && ctx.watermarks.is_idle(name.as_str()) {
+        if timeout.is_some() && ctx.watermarks.is_idle(source_identity.as_ref()) {
             tracing::debug!(
                 target: "clinker::watermark",
                 source = %name,
