@@ -22,7 +22,7 @@
 
 - [Combine Join Strategies](combine-internals.md)
 - [Merge & Back-pressure](merge-internals.md)
-- [Streaming Output Writes](output-internals.md)
+- [Sink Internals](sink-internals.md)
 - [Schema Drift & the `$widened` Sidecar](auto-widen-internals.md)
 
 # Storage Internals

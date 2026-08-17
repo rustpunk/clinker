@@ -259,7 +259,7 @@ The per-source `on_unmapped` policy decides what to do with input fields the sou
 
 See [Auto-Widen & Schema Drift](../formats/auto-widen.md) for the full
 specification: how undeclared columns flow through each downstream node
-type, the `include_unmapped` Output flag, **E315** merge-policy
+type, the `include_unmapped` Sink flag, **E315** merge-policy
 mismatch, and fixed-width behavior.
 
 ## Sort order
@@ -317,7 +317,7 @@ nested or repeated framing cannot be reordered losslessly fails during
 planning with a correction to remove `sort_order` or normalize the input.
 
 If a downstream consumer needs one global order across all files, declare
-`sort_order` on the terminal [Output](output.md#sort-order). Use enough output
+`sort_order` on the terminal [Sink](sink.md#sort-order). Use enough output
 fields to define a total business order when byte-identical output matters.
 
 The shorthand form is also accepted -- a bare string defaults to ascending:
