@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -12,7 +12,9 @@ use clinker_exec::executor::capabilities::{
 use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceInput};
 use clinker_exec::pipeline::shutdown::ShutdownToken;
 use clinker_exec::source::multi_file::FileSlot;
-use clinker_exec::telemetry::{MetricKey, SpanName, SpanStatus, TelemetryArena};
+use clinker_exec::telemetry::{
+    MetricKey, SpanName, SpanStatus, TelemetryArena, TelemetryReceiver, TraceSpan,
+};
 use clinker_plan::config::{ClinkerToml, CompileContext, PipelineConfig, parse_config};
 use clinker_plan::plan::execution::{CompiledSourceInstanceId, CompiledSourceScope};
 
@@ -196,6 +198,7 @@ struct FixtureOpener {
     events: Events,
     body: Option<Vec<u8>>,
     fail: bool,
+    fail_read: bool,
     request_shutdown: Option<ShutdownToken>,
 }
 
@@ -208,16 +211,30 @@ impl CapabilityOpener for FixtureOpener {
         if let Some(token) = &self.request_shutdown {
             token.request();
         }
+        let fail_read = self.fail_read;
         Ok(Box::new(FixtureSession {
             label: self.label,
             events: self.events,
             input: self.body.map(|body| {
+                let reader: Box<dyn Read + Send> = if fail_read {
+                    Box::new(FailingReader)
+                } else {
+                    Box::new(Cursor::new(body))
+                };
                 SourceInput::Files(vec![FileSlot::new(
                     PathBuf::from("logical-input.txt"),
-                    Box::new(Cursor::new(body)),
+                    reader,
                 )])
             }),
         }))
+    }
+}
+
+struct FailingReader;
+
+impl Read for FailingReader {
+    fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::other("fixture body Source read failed"))
     }
 }
 
@@ -244,6 +261,7 @@ fn admitted(
     events: &Events,
     body_input: &[u8],
     failing_source: Option<&str>,
+    failing_read_source: Option<&str>,
     shutdown_on_open: Option<(&str, &ShutdownToken)>,
 ) -> AdmittedRunCapabilities {
     let activation = plan.dag().source_activation();
@@ -271,6 +289,7 @@ fn admitted(
                             events: events.clone(),
                             body,
                             fail: failing_source == Some(source_name),
+                            fail_read: failing_read_source == Some(source_name),
                             request_shutdown: shutdown_on_open
                                 .filter(|(name, _)| *name == source_name)
                                 .map(|(_, token)| token.clone()),
@@ -293,7 +312,13 @@ fn admitted(
 }
 
 fn telemetry_policy() -> clinker_plan::config::ResolvedObservabilityPolicy {
-    ClinkerToml::parse(
+    telemetry_policy_sampling(1)
+}
+
+fn telemetry_policy_sampling(
+    sample_every: u32,
+) -> clinker_plan::config::ResolvedObservabilityPolicy {
+    ClinkerToml::parse(&format!(
         r#"
 [observability]
 arena_bytes = "64KB"
@@ -303,15 +328,42 @@ max_batch_bytes = "8KB"
 max_attributes_per_event = 8
 max_attribute_bytes = "256B"
 drop_policy = "drop_newest"
-sample_every = 1
+sample_every = {sample_every}
 rate_limit_per_second = 100000
 rate_limit_burst = 100000
 flush_timeout_ms = 1000
-"#,
-    )
+"#
+    ))
     .expect("telemetry policy parses")
     .resolve_observability(None)
     .expect("telemetry policy resolves")
+}
+
+#[derive(Default)]
+struct SourceSignals {
+    started: u64,
+    completed: u64,
+    failed: u64,
+    interrupted: u64,
+    spans: Vec<TraceSpan>,
+}
+
+fn drain_source_signals(receiver: &TelemetryReceiver) -> SourceSignals {
+    let mut signals = SourceSignals::default();
+    while let Some(batch) = receiver.try_recv_batch() {
+        signals.started += batch.metric(MetricKey::SourceStarted);
+        signals.completed += batch.metric(MetricKey::SourceCompleted);
+        signals.failed += batch.metric(MetricKey::SourceFailed);
+        signals.interrupted += batch.metric(MetricKey::SourceInterrupted);
+        signals.spans.extend(
+            batch
+                .traces()
+                .iter()
+                .filter(|span| span.name == SpanName::Source)
+                .cloned(),
+        );
+    }
+    signals
 }
 
 fn instance_label(instance: CompiledSourceInstanceId) -> String {
@@ -326,7 +378,7 @@ fn tracer_two_calls_open_distinct_finite_body_source_sessions() {
     let workspace = workspace(BODY);
     let plan = compile(workspace.path());
     let events = Events::default();
-    let capabilities = admitted(&plan, &events, b"H0001\nD0002\n", None, None);
+    let capabilities = admitted(&plan, &events, b"H0001\nD0002\n", None, None, None);
     let (producer, receiver) =
         TelemetryArena::reserve(&telemetry_policy()).expect("telemetry arena reserves");
     let readers = HashMap::from([(
@@ -380,34 +432,64 @@ fn tracer_two_calls_open_distinct_finite_body_source_sessions() {
         "call sites must keep distinct identities"
     );
 
-    let mut started = 0;
-    let mut completed = 0;
-    let mut spans = Vec::new();
+    let mut resource_started = 0;
+    let mut resource_completed = 0;
+    let mut resource_spans = Vec::new();
+    let mut source_signals = SourceSignals::default();
     while let Some(batch) = receiver.try_recv_batch() {
-        started += batch.metric(MetricKey::ResourceOpenStarted);
-        completed += batch.metric(MetricKey::ResourceOpenCompleted);
-        spans.extend(
+        resource_started += batch.metric(MetricKey::ResourceOpenStarted);
+        resource_completed += batch.metric(MetricKey::ResourceOpenCompleted);
+        resource_spans.extend(
             batch
                 .traces()
                 .iter()
                 .filter(|span| span.name == SpanName::ResourceOpen)
                 .cloned(),
         );
+        source_signals.started += batch.metric(MetricKey::SourceStarted);
+        source_signals.completed += batch.metric(MetricKey::SourceCompleted);
+        source_signals.failed += batch.metric(MetricKey::SourceFailed);
+        source_signals.interrupted += batch.metric(MetricKey::SourceInterrupted);
+        source_signals.spans.extend(
+            batch
+                .traces()
+                .iter()
+                .filter(|span| span.name == SpanName::Source)
+                .cloned(),
+        );
     }
-    assert_eq!(started, 2);
-    assert_eq!(completed, 2);
-    assert_eq!(spans.len(), 2);
-    assert!(spans.iter().all(|span| span.status == SpanStatus::Ok));
-    let mut logical_nodes: Vec<_> = spans
+    assert_eq!(resource_started, 2);
+    assert_eq!(resource_completed, 2);
+    assert_eq!(resource_spans.len(), 2);
+    assert!(
+        resource_spans
+            .iter()
+            .all(|span| span.status == SpanStatus::Ok)
+    );
+    let mut logical_nodes: Vec<_> = resource_spans
         .iter()
         .map(|span| span.logical_node.as_str())
         .collect();
     logical_nodes.sort_unstable();
     assert_eq!(logical_nodes, ["first.read", "second.read"]);
-    let rendered = format!("{spans:?}");
+    assert_eq!(source_signals.started, 2);
+    assert_eq!(source_signals.completed, 2);
+    assert_eq!(source_signals.failed, 0);
+    assert_eq!(source_signals.interrupted, 0);
+    assert_eq!(source_signals.spans.len(), 2);
+    assert!(
+        source_signals
+            .spans
+            .iter()
+            .all(|span| span.status == SpanStatus::Ok && span.logical_node == "source")
+    );
+    let rendered = format!("{:?}{:?}", resource_spans, source_signals.spans);
     assert!(!rendered.contains("shared_input"));
     assert!(!rendered.contains("logical-input"));
     assert!(!rendered.contains("H0001"));
+    let source_rendered = format!("{:?}", source_signals.spans);
+    assert!(!source_rendered.contains("first.read"));
+    assert!(!source_rendered.contains("second.read"));
 }
 
 fn run_with_fixture(
@@ -455,6 +537,7 @@ fn body_source_honors_the_retained_unmapped_drop_policy() {
         b"id,extra\none,hidden\ntwo,private\n",
         None,
         None,
+        None,
     );
 
     let (result, first, second) = run_with_fixture(
@@ -483,7 +566,7 @@ fn partial_group_open_failure_closes_sessions_without_starting_downstream() {
     let workspace = workspace(INTERLEAVE_BODY);
     let plan = compile(workspace.path());
     let events = Events::default();
-    let capabilities = admitted(&plan, &events, b"id\n1\n", Some("right"), None);
+    let capabilities = admitted(&plan, &events, b"id\n1\n", Some("right"), None, None);
     let (producer, receiver) =
         TelemetryArena::reserve(&telemetry_policy()).expect("telemetry arena reserves");
     let params = PipelineRunParams {
@@ -530,6 +613,9 @@ fn partial_group_open_failure_closes_sessions_without_starting_downstream() {
     let mut completed = 0;
     let mut failed = 0;
     let mut spans = Vec::new();
+    let mut source_started = 0;
+    let mut source_terminal = 0;
+    let mut source_spans = 0;
     while let Some(batch) = receiver.try_recv_batch() {
         started += batch.metric(MetricKey::ResourceOpenStarted);
         completed += batch.metric(MetricKey::ResourceOpenCompleted);
@@ -541,10 +627,63 @@ fn partial_group_open_failure_closes_sessions_without_starting_downstream() {
                 .filter(|span| span.name == SpanName::ResourceOpen)
                 .cloned(),
         );
+        source_started += batch.metric(MetricKey::SourceStarted);
+        source_terminal += batch.metric(MetricKey::SourceCompleted)
+            + batch.metric(MetricKey::SourceFailed)
+            + batch.metric(MetricKey::SourceInterrupted);
+        source_spans += batch
+            .traces()
+            .iter()
+            .filter(|span| span.name == SpanName::Source)
+            .count();
     }
     assert_eq!((started, completed, failed), (2, 1, 1));
     assert_eq!(spans.len(), 2);
     assert!(spans.iter().any(|span| span.status == SpanStatus::Error));
+    assert_eq!((source_started, source_terminal, source_spans), (0, 0, 0));
+}
+
+#[test]
+fn read_failure_after_open_emits_one_failed_terminal_per_started_source() {
+    let workspace = workspace(CSV_DROP_BODY);
+    let plan = compile(workspace.path());
+    let events = Events::default();
+    let capabilities = admitted(&plan, &events, b"id\none\n", None, Some("read"), None);
+    let (producer, receiver) =
+        TelemetryArena::reserve(&telemetry_policy()).expect("telemetry arena reserves");
+    let params = PipelineRunParams {
+        telemetry_producer: Some(producer),
+        ..Default::default()
+    };
+
+    let (result, _, _) = run_with_fixture(&plan, workspace.path(), capabilities, &params);
+    result.expect_err("the admitted reader fails after its group opens");
+
+    let signals = drain_source_signals(&receiver);
+    assert!(signals.started > 0);
+    assert_eq!(signals.failed, signals.started);
+    assert_eq!(signals.completed, 0);
+    assert_eq!(signals.interrupted, 0);
+    assert_eq!(signals.spans.len() as u64, signals.started);
+    assert!(
+        signals
+            .spans
+            .iter()
+            .all(|span| span.status == SpanStatus::Error && span.logical_node == "source")
+    );
+
+    let events = events.snapshot();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("open:body-"))
+            .count(),
+        events
+            .iter()
+            .filter(|event| event.starts_with("close:body-"))
+            .count(),
+        "every opened session closes after worker failure: {events:?}"
+    );
 }
 
 #[test]
@@ -552,7 +691,7 @@ fn simultaneous_group_opens_every_member_before_body_records_flow() {
     let workspace = workspace(INTERLEAVE_BODY);
     let plan = compile(workspace.path());
     let events = Events::default();
-    let capabilities = admitted(&plan, &events, b"id\n1\n", None, None);
+    let capabilities = admitted(&plan, &events, b"id\n1\n", None, None, None);
 
     let (result, first, second) = run_with_fixture(
         &plan,
@@ -598,10 +737,14 @@ fn cancellation_after_open_closes_the_active_session_and_group_lease() {
         &events,
         b"id\none\ntwo\n",
         None,
+        None,
         Some(("read", &shutdown)),
     );
+    let (producer, receiver) =
+        TelemetryArena::reserve(&telemetry_policy()).expect("telemetry arena reserves");
     let params = PipelineRunParams {
         shutdown_token: Some(shutdown),
+        telemetry_producer: Some(producer),
         ..Default::default()
     };
 
@@ -618,5 +761,62 @@ fn cancellation_after_open_closes_the_active_session_and_group_lease() {
             .count(),
         plan.dag().source_activation().groups().len(),
         "all leases release on cancellation: {events:?}"
+    );
+
+    let signals = drain_source_signals(&receiver);
+    assert!(signals.started > 0);
+    assert_eq!(signals.interrupted, signals.started);
+    assert_eq!(signals.completed, 0);
+    assert_eq!(signals.failed, 0);
+    assert_eq!(signals.spans.len() as u64, signals.started);
+    assert!(
+        signals
+            .spans
+            .iter()
+            .all(|span| span.status == SpanStatus::Unset && span.logical_node == "source")
+    );
+}
+
+#[test]
+fn source_span_admission_loss_does_not_change_execution_or_cleanup() {
+    let workspace = workspace(BODY);
+    let plan = compile(workspace.path());
+    let events = Events::default();
+    let capabilities = admitted(&plan, &events, b"H0001\nD0002\n", None, None, None);
+    let (producer, receiver) = TelemetryArena::reserve(&telemetry_policy_sampling(2))
+        .expect("sampled telemetry arena reserves");
+    let observer = producer.clone();
+    let params = PipelineRunParams {
+        telemetry_producer: Some(producer),
+        ..Default::default()
+    };
+
+    let (result, first, second) = run_with_fixture(&plan, workspace.path(), capabilities, &params);
+    let report = result.expect("telemetry admission cannot change Source work");
+
+    assert_eq!(report.counters.ok_count, 4);
+    assert!(first.as_string().contains("0001"));
+    assert!(second.as_string().contains("0001"));
+    assert!(observer.snapshot().sampled_drops > 0);
+    let signals = drain_source_signals(&receiver);
+    assert_eq!((signals.started, signals.completed), (2, 2));
+    assert_eq!((signals.failed, signals.interrupted), (0, 0));
+
+    let events = events.snapshot();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("open:body-"))
+            .count(),
+        2,
+        "both Sources still open: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("close:body-"))
+            .count(),
+        2,
+        "both Sources still close: {events:?}"
     );
 }

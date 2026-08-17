@@ -660,6 +660,87 @@ nodes:
         );
     }
 
+    /// Two calls of the same body keep each compiled resource binding on its
+    /// own scoped Source. The first output must not inherit the second call's
+    /// dataset edge (or vice versa) merely because both body nodes are named
+    /// `ref`.
+    #[test]
+    fn two_calls_keep_distinct_body_source_dataset_edges() {
+        let lineage = lineage_of(
+            r#"
+pipeline: { name: two_body_source_identities }
+nodes:
+  - type: source
+    name: driver
+    config:
+      name: driver
+      type: csv
+      path: data/top.csv
+      schema: [{ name: x, type: int }]
+  - type: composition
+    name: first
+    input: driver
+    use: ../compositions/own_source.comp.yaml
+    inputs: { driver: driver }
+    resources: { reference: reference_codes }
+  - type: composition
+    name: second
+    input: driver
+    use: ../compositions/own_source.comp.yaml
+    inputs: { driver: driver }
+    resources: { reference: body_ledger }
+  - type: output
+    name: first_out
+    input: first
+    config: { name: first_out, type: csv, path: out/first.csv }
+  - type: output
+    name: second_out
+    input: second
+    config: { name: second_out, type: csv, path: out/second.csv }
+"#,
+        );
+
+        let first = lineage
+            .outputs
+            .iter()
+            .find(|output| output.dataset.name == file_dataset("out/first.csv"))
+            .expect("first call output dataset");
+        let second = lineage
+            .outputs
+            .iter()
+            .find(|output| output.dataset.name == file_dataset("out/second.csv"))
+            .expect("second call output dataset");
+        assert_field(
+            &first.facet.fields,
+            "label",
+            &[resource_direct(
+                "reference_codes",
+                "code",
+                TransformationSubtype::Identity,
+            )],
+        );
+        assert_field(
+            &second.facet.fields,
+            "label",
+            &[resource_direct(
+                "body_ledger",
+                "code",
+                TransformationSubtype::Identity,
+            )],
+        );
+
+        let names: Vec<_> = lineage
+            .inputs
+            .iter()
+            .map(|dataset| (dataset.namespace.as_str(), dataset.name.as_str()))
+            .collect();
+        assert!(
+            names.contains(&("clinker-resource:file", "reference_codes"))
+                && names.contains(&("clinker-resource:file", "body_ledger")),
+            "both call-scoped datasets are inventoried distinctly: {names:?}"
+        );
+    }
+
     /// A top-level node named `enrich.ref` once compiled: `.` was reserved in a
     /// transform, aggregate, and route name, but not in a source, output, or
     /// composition one. Joining a call site to a body node with a bare `.`

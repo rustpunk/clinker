@@ -136,11 +136,15 @@ pub enum MetricKey {
     CredentialRevokeCompleted,
     CredentialRevokeFailed,
     CredentialRevokeInterrupted,
+    SourceStarted,
+    SourceCompleted,
+    SourceFailed,
+    SourceInterrupted,
 }
 
 impl MetricKey {
     /// Every fixed metric key in stable counter-index order.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 24] = [
         Self::TransformStarted,
         Self::TransformCompleted,
         Self::TransformRecords,
@@ -161,6 +165,10 @@ impl MetricKey {
         Self::CredentialRevokeCompleted,
         Self::CredentialRevokeFailed,
         Self::CredentialRevokeInterrupted,
+        Self::SourceStarted,
+        Self::SourceCompleted,
+        Self::SourceFailed,
+        Self::SourceInterrupted,
     ];
     /// Number of entries in [`Self::ALL`].
     pub const COUNT: usize = Self::ALL.len();
@@ -188,6 +196,10 @@ impl MetricKey {
             Self::CredentialRevokeCompleted => 17,
             Self::CredentialRevokeFailed => 18,
             Self::CredentialRevokeInterrupted => 19,
+            Self::SourceStarted => 20,
+            Self::SourceCompleted => 21,
+            Self::SourceFailed => 22,
+            Self::SourceInterrupted => 23,
         }
     }
 }
@@ -201,6 +213,7 @@ pub enum SpanName {
     ResourceOpen,
     CredentialRenew,
     CredentialRevoke,
+    Source,
 }
 
 /// Bounded span result fact.
@@ -219,17 +232,16 @@ pub enum SpanStatus {
 /// end fact, because a collector has no representation for half a span: both
 /// wall-clock boundaries are required, and independent admission of two halves
 /// lets sampling, lane routing, or a full arena deliver one without the other.
-/// The live "this transform has begun" signal is the `TransformStarted`
-/// metric, which is still recorded before the work runs.
+/// The live "this work has begun" signal is the operation's started metric,
+/// which is still recorded before the work runs.
 #[derive(Clone, Copy, Debug)]
 pub struct SpanFact<'a> {
     pub name: SpanName,
     pub status: SpanStatus,
-    /// The authored pipeline node this span covers, verbatim — prefixed with
-    /// the composition call sites it sits under when it is a body node, since a
-    /// body name identifies a node only within its own scope. Configuration
-    /// applies no grammar to a node name, so neither does this: the name is
-    /// carried whole under a fixed identity ceiling and nothing else.
+    /// The bounded logical scope this span covers. Node-scoped spans carry the
+    /// authored pipeline node verbatim, prefixed with composition call sites
+    /// for body nodes. Lifecycle spans that must not disclose authored or
+    /// resource identity use a fixed operation scope instead.
     pub logical_node: &'a str,
     /// Span boundaries as Unix nanoseconds, `started_at <= ended_at`.
     pub started_at_unix_nanos: u64,
@@ -537,14 +549,15 @@ impl TelemetryProducer {
 
     /// Admit one closed trace fact without accepting arbitrary attributes.
     ///
-    /// A span carries no identity grammar. Its `logical_node` is an authored
-    /// pipeline node name, and configuration constrains those only for
-    /// duplication — so any rule imposed here would reject names the planner
-    /// accepts and compiles, leaving that transform's metrics and authored log
-    /// events in the collector with its span missing and nothing to explain the
-    /// hole. Serialization instead bounds the name to the same identity ceiling
-    /// the run correlation ids use, and marks it when that ceiling bites — which
-    /// keeps the fixed arena budget without discarding the fact.
+    /// A span carries no identity grammar. Its `logical_node` is either an
+    /// authored pipeline node name or a closed operation-scope literal. The
+    /// planner constrains authored names only for duplication, so any grammar
+    /// imposed here would reject names the planner accepts and compiles,
+    /// leaving metrics and authored log events in the collector with their span
+    /// missing and nothing to explain the hole. Serialization instead bounds
+    /// the name to the same identity ceiling the run correlation ids use, and
+    /// marks it when that ceiling bites — which keeps the fixed arena budget
+    /// without discarding the fact.
     pub fn emit_span(&self, span: SpanFact<'_>) -> AdmissionOutcome {
         let lane = if span.status == SpanStatus::Error {
             AdmissionLane::HighSeverity
@@ -1751,6 +1764,10 @@ mod tests {
             MetricKey::CredentialRevokeCompleted,
             MetricKey::CredentialRevokeFailed,
             MetricKey::CredentialRevokeInterrupted,
+            MetricKey::SourceStarted,
+            MetricKey::SourceCompleted,
+            MetricKey::SourceFailed,
+            MetricKey::SourceInterrupted,
         ];
 
         assert_eq!(MetricKey::COUNT, expected.len());

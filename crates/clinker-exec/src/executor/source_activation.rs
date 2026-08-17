@@ -21,6 +21,7 @@ use crate::telemetry::{
 
 type SourceReceiver = crossbeam_channel::Receiver<SourceStreamEvent>;
 type SourceConsumerRegistration = (ConsumerId, Arc<ConsumerHandle>);
+const SOURCE_LIFECYCLE_SCOPE: &str = "source";
 
 struct ActiveGroupRuntime {
     scope: BodyScopeId,
@@ -144,20 +145,28 @@ impl SourceActivationController {
                 .consumers
                 .push((source_name.clone(), (consumer_id, handle)));
             let worker_shutdown = shutdown.clone();
+            let lifecycle_shutdown = worker_shutdown.clone();
+            let lifecycle_telemetry = telemetry.cloned();
             let source_runtime = self.source_runtime.clone();
             let spawn = std::thread::Builder::new()
                 .name(format!("clinker-body-source-{source_name}"))
                 .spawn(move || {
-                    let mut outcome = ingest_source_body(
-                        body,
-                        input,
-                        stream,
-                        worker_shutdown,
-                        None,
-                        source_runtime,
-                    )?;
-                    outcome.source_name = logical_source_name;
-                    Ok(outcome)
+                    observe_source(
+                        lifecycle_telemetry.as_ref(),
+                        lifecycle_shutdown.as_ref(),
+                        || {
+                            let mut outcome = ingest_source_body(
+                                body,
+                                input,
+                                stream,
+                                worker_shutdown,
+                                None,
+                                source_runtime,
+                            )?;
+                            outcome.source_name = logical_source_name;
+                            Ok(outcome)
+                        },
+                    )
                 });
             match spawn {
                 Ok(worker) => workers.push(worker),
@@ -309,6 +318,37 @@ fn observe_open<T>(
         ended_at_unix_nanos,
     });
     result.map_err(capability_error)
+}
+
+fn observe_source<T>(
+    producer: Option<&TelemetryProducer>,
+    shutdown: Option<&crate::pipeline::shutdown::ShutdownToken>,
+    operation: impl FnOnce() -> Result<T, PipelineError>,
+) -> Result<T, PipelineError> {
+    let Some(producer) = producer else {
+        return operation();
+    };
+    let started_at_unix_nanos = unix_nanos_now();
+    producer.record_metric(MetricKey::SourceStarted, 1);
+    let result = operation();
+    let (metric, status) = match &result {
+        Err(PipelineError::Interrupted) => (MetricKey::SourceInterrupted, SpanStatus::Unset),
+        Err(_) => (MetricKey::SourceFailed, SpanStatus::Error),
+        Ok(_) if shutdown.is_some_and(crate::pipeline::shutdown::ShutdownToken::is_requested) => {
+            (MetricKey::SourceInterrupted, SpanStatus::Unset)
+        }
+        Ok(_) => (MetricKey::SourceCompleted, SpanStatus::Ok),
+    };
+    producer.record_metric(metric, 1);
+    let ended_at_unix_nanos = unix_nanos_now().max(started_at_unix_nanos);
+    let _ = producer.emit_span(SpanFact {
+        name: SpanName::Source,
+        status,
+        logical_node: SOURCE_LIFECYCLE_SCOPE,
+        started_at_unix_nanos,
+        ended_at_unix_nanos,
+    });
+    result
 }
 
 fn capability_error(error: RunCapabilityError) -> PipelineError {

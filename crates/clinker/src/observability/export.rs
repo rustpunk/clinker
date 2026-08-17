@@ -1665,6 +1665,10 @@ fn metric_name(key: MetricKey) -> &'static str {
         MetricKey::CredentialRevokeCompleted => "clinker.credential.revoke.completed",
         MetricKey::CredentialRevokeFailed => "clinker.credential.revoke.failed",
         MetricKey::CredentialRevokeInterrupted => "clinker.credential.revoke.interrupted",
+        MetricKey::SourceStarted => "clinker.source.started",
+        MetricKey::SourceCompleted => "clinker.source.completed",
+        MetricKey::SourceFailed => "clinker.source.failed",
+        MetricKey::SourceInterrupted => "clinker.source.interrupted",
     }
 }
 
@@ -1675,6 +1679,7 @@ fn span_name(name: SpanName) -> &'static str {
         SpanName::ResourceOpen => "clinker.resource.open",
         SpanName::CredentialRenew => "clinker.credential.renew",
         SpanName::CredentialRevoke => "clinker.credential.revoke",
+        SpanName::Source => "clinker.source",
     }
 }
 
@@ -1983,6 +1988,10 @@ mod tests {
                 MetricKey::CredentialRevokeInterrupted,
                 "clinker.credential.revoke.interrupted",
             ),
+            (MetricKey::SourceStarted, "clinker.source.started"),
+            (MetricKey::SourceCompleted, "clinker.source.completed"),
+            (MetricKey::SourceFailed, "clinker.source.failed"),
+            (MetricKey::SourceInterrupted, "clinker.source.interrupted"),
         ];
         assert_eq!(metric_names.len(), MetricKey::COUNT);
         for (key, expected) in metric_names {
@@ -1995,6 +2004,7 @@ mod tests {
             (SpanName::ResourceOpen, "clinker.resource.open"),
             (SpanName::CredentialRenew, "clinker.credential.renew"),
             (SpanName::CredentialRevoke, "clinker.credential.revoke"),
+            (SpanName::Source, "clinker.source"),
         ];
         for (name, expected) in span_names {
             assert_eq!(span_name(name), expected, "stable name for {name:?}");
