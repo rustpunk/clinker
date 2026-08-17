@@ -385,6 +385,10 @@ fn walk_scope(
         // Set by the Composition arm to the body's output-port INDIRECT influence,
         // merged into this node's influence below.
         let mut comp_body_influence: Option<InfluenceMap> = None;
+        // Structural reads inside nested constructors/comprehensions are
+        // collected while their value terms are resolved, then merged with the
+        // node's ordinary predicate influence below.
+        let mut nested_influence = InfluenceMap::new();
         let cols: ColumnTerminals = match node {
             PlanNode::Source { .. } => {
                 let mut cols = ColumnTerminals::new();
@@ -483,6 +487,7 @@ fn walk_scope(
                         &payload.typed.program.statements,
                         &mut env,
                         &mut emitted,
+                        &mut nested_influence,
                         &resolve_unbound,
                         &node_doc_srcs,
                         ctx.declared_sections,
@@ -513,6 +518,15 @@ fn walk_scope(
                     {
                         merge_terminals(&mut terms, upstream_col(&lineage, up, &col), st);
                     }
+                    for (col, role) in
+                        aggregate_emit_influence(&emit.residual, compiled, input_schema)
+                    {
+                        add_upstream_influence(
+                            &mut nested_influence,
+                            upstream_col(&lineage, up, &col),
+                            role,
+                        );
+                    }
                     // Envelope reads in this emit, attributed against the feeding
                     // sources. A `$doc` left in the residual (outside any aggregate
                     // call) survives as a passthrough leaf and keeps the emit's own
@@ -524,23 +538,49 @@ fn walk_scope(
                     // feeds this node.
                     if !node_doc_srcs.is_empty() {
                         let mut residual_docs = Vec::new();
-                        collect_doc_paths_in_expr(&emit.residual, &mut residual_docs);
-                        merge_doc_read_terms(
-                            &mut terms,
-                            &residual_docs,
-                            field_ref_subtype(&emit.residual),
-                            &node_doc_srcs,
-                            ctx.declared_sections,
+                        collect_doc_paths_with_role(
+                            &emit.residual,
+                            ExprRole::Direct,
+                            &mut residual_docs,
                         );
+                        for (path, role) in residual_docs {
+                            match role {
+                                ExprRole::Direct => merge_doc_read_terms(
+                                    &mut terms,
+                                    std::slice::from_ref(&path),
+                                    field_ref_subtype(&emit.residual),
+                                    &node_doc_srcs,
+                                    ctx.declared_sections,
+                                ),
+                                ExprRole::Indirect(subtype) => add_doc_influence(
+                                    &mut nested_influence,
+                                    std::slice::from_ref(&path),
+                                    &node_doc_srcs,
+                                    ctx.declared_sections,
+                                    subtype,
+                                ),
+                            }
+                        }
                         let mut agg_docs = Vec::new();
                         aggregate_binding_doc_paths(&emit.residual, compiled, &mut agg_docs);
-                        merge_doc_read_terms(
-                            &mut terms,
-                            &agg_docs,
-                            Subtype::Aggregation,
-                            &node_doc_srcs,
-                            ctx.declared_sections,
-                        );
+                        for (path, role) in agg_docs {
+                            match role {
+                                ExprRole::Direct => merge_doc_read_terms(
+                                    &mut terms,
+                                    std::slice::from_ref(&path),
+                                    Subtype::Aggregation,
+                                    &node_doc_srcs,
+                                    ctx.declared_sections,
+                                ),
+                                ExprRole::Indirect(subtype) => add_doc_influence(
+                                    &mut nested_influence,
+                                    std::slice::from_ref(&path),
+                                    &node_doc_srcs,
+                                    ctx.declared_sections,
+                                    subtype,
+                                ),
+                            }
+                        }
                     }
                     cols.insert_nonempty(&emit.output_name, terms);
                 }
@@ -618,6 +658,7 @@ fn walk_scope(
                             &tp.program.statements,
                             &mut env,
                             &mut emitted,
+                            &mut nested_influence,
                             &resolve_unbound,
                             &node_doc_srcs,
                             ctx.declared_sections,
@@ -802,6 +843,7 @@ fn walk_scope(
             &node_doc_srcs,
             ctx.declared_sections,
         );
+        merge_influence(&mut node_influence, nested_influence);
         // A composition's in-body INDIRECT influence (filters / joins / group-bys
         // inside the body), harvested at its output port, joins the inherited
         // upstream influence. Set-union, so the parent influence carried through
@@ -963,6 +1005,15 @@ enum IndirectSub {
     Conditional,
 }
 
+/// How one expression child contributes to lineage. Value-producing reads stay
+/// per-column DIRECT edges; children that choose membership or output structure
+/// become whole-dataset INDIRECT influence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExprRole {
+    Direct,
+    Indirect(IndirectSub),
+}
+
 impl IndirectSub {
     fn to_openlineage(self) -> TransformationSubtype {
         match self {
@@ -979,6 +1030,15 @@ impl IndirectSub {
 /// to the set of influence subtypes through which it reaches the dataset. The
 /// `BTreeMap`/`BTreeSet` keep the emitted `dataset[]` order deterministic.
 type InfluenceMap = BTreeMap<Terminal, BTreeSet<IndirectSub>>;
+
+/// DIRECT terminals and INDIRECT influence retained for an expression or one
+/// lexical binding. Keeping both in the lexical environment prevents a `let`
+/// from losing structural influence when the binding is emitted later.
+#[derive(Clone, Default)]
+struct ResolvedExprLineage {
+    terms: TermMap,
+    influence: InfluenceMap,
+}
 
 /// One Source dataset column: the terminal of a DIRECT lineage path.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1061,7 +1121,7 @@ fn upstream_ids(dag: &ExecutionPlanDag, idx: NodeIndex) -> Vec<PlanNodeId> {
 /// This returns the sources whose document *could* carry the read; the final
 /// per-section narrowing — attribute a `$doc.<section>` read only to sources
 /// whose envelope declares `<section>` — happens at attribution time
-/// (`resolve_expr_terms`), so a multi-source fan-in never emits a false edge to
+/// (`resolve_expr_lineage`), so a multi-source fan-in never emits a false edge to
 /// a source whose document lacks the section.
 fn node_doc_sources(
     node: &PlanNode,
@@ -1336,8 +1396,9 @@ fn program_field_ref_subtype(program: &Program) -> Subtype {
 /// land in `env` and expand at the binding's use site.
 fn collect_field_emits(
     statements: &[Statement],
-    env: &mut HashMap<String, TermMap>,
+    env: &mut HashMap<String, ResolvedExprLineage>,
     emitted: &mut HashMap<String, TermMap>,
+    nested_influence: &mut InfluenceMap,
     resolve_unbound: &impl Fn(&QualifiedField) -> Option<TermMap>,
     doc_sources: &BTreeSet<DatasetId>,
     declared_sections: &HashMap<DatasetId, BTreeSet<String>>,
@@ -1345,9 +1406,14 @@ fn collect_field_emits(
     for stmt in statements {
         match stmt {
             Statement::Let { name, expr, .. } => {
-                let terms =
-                    resolve_expr_terms(expr, env, resolve_unbound, doc_sources, declared_sections);
-                env.insert(name.to_string(), terms);
+                let resolved = resolve_expr_lineage(
+                    expr,
+                    env,
+                    resolve_unbound,
+                    doc_sources,
+                    declared_sections,
+                );
+                env.insert(name.to_string(), resolved);
             }
             Statement::Emit {
                 name,
@@ -1358,9 +1424,15 @@ fn collect_field_emits(
                 if name.starts_with('$') {
                     continue;
                 }
-                let terms =
-                    resolve_expr_terms(expr, env, resolve_unbound, doc_sources, declared_sections);
-                emitted.insert(name.to_string(), terms);
+                let resolved = resolve_expr_lineage(
+                    expr,
+                    env,
+                    resolve_unbound,
+                    doc_sources,
+                    declared_sections,
+                );
+                merge_influence(nested_influence, resolved.influence);
+                emitted.insert(name.to_string(), resolved.terms);
             }
             Statement::EmitEach {
                 binding,
@@ -1374,7 +1446,7 @@ fn collect_field_emits(
                 body,
                 ..
             } => {
-                let src = resolve_expr_terms(
+                let src = resolve_expr_lineage(
                     source,
                     env,
                     resolve_unbound,
@@ -1382,16 +1454,23 @@ fn collect_field_emits(
                     declared_sections,
                 );
                 let mut tagged = TermMap::new();
-                merge_terminals(&mut tagged, Some(&src), Subtype::Transformation);
+                merge_terminals(&mut tagged, Some(&src.terms), Subtype::Transformation);
                 // The body is a lexical block: save the scope, bind the loop
                 // variable, recurse, then restore — body-local `let`s and the
                 // loop binding both fall out of scope here.
                 let saved = env.clone();
-                env.insert(binding.to_string(), tagged);
+                env.insert(
+                    binding.to_string(),
+                    ResolvedExprLineage {
+                        terms: tagged,
+                        influence: src.influence,
+                    },
+                );
                 collect_field_emits(
                     body,
                     env,
                     emitted,
+                    nested_influence,
                     resolve_unbound,
                     doc_sources,
                     declared_sections,
@@ -1403,36 +1482,289 @@ fn collect_field_emits(
     }
 }
 
-/// Resolve the source terminals an emit/let RHS expression derives from. The
-/// whole expression's [`field_ref_subtype`] (IDENTITY for a bare copy/rename,
-/// else TRANSFORMATION) is composed onto every leaf it reads — a record column
-/// (via `resolve_unbound`) or an envelope `$doc` read (attributed to each
-/// feeding `doc_sources` dataset whose envelope declares the read section, with
-/// the rendered doc path as its `field`).
-fn resolve_expr_terms(
+/// Resolve one emit/let RHS into its value terminals and structural influence.
+/// Array items and map values inherit DIRECT; a comprehension source/predicate
+/// becomes FILTER influence and a computed map key becomes CONDITIONAL
+/// influence. Once a subtree is already indirect, all of its children keep that
+/// role. Static map keys are text, not expressions, and add no dependency.
+fn resolve_expr_lineage(
     expr: &Expr,
-    env: &HashMap<String, TermMap>,
+    env: &HashMap<String, ResolvedExprLineage>,
     resolve_unbound: &impl Fn(&QualifiedField) -> Option<TermMap>,
     doc_sources: &BTreeSet<DatasetId>,
     declared_sections: &HashMap<DatasetId, BTreeSet<String>>,
-) -> TermMap {
+) -> ResolvedExprLineage {
     let local = field_ref_subtype(expr);
-    let mut out = TermMap::new();
+    let mut out = ResolvedExprLineage::default();
+    resolve_expr_role(
+        expr,
+        ExprRole::Direct,
+        local,
+        env,
+        resolve_unbound,
+        doc_sources,
+        declared_sections,
+        &mut out,
+    );
+    out
+}
 
-    let mut refs = Vec::new();
-    collect_field_refs(expr, &mut refs);
-    for qf in &refs {
-        let base = resolve_leaf_terms(qf, env, resolve_unbound);
-        merge_terminals(&mut out, base.as_ref(), local);
+#[allow(clippy::too_many_arguments)]
+fn resolve_expr_role(
+    expr: &Expr,
+    role: ExprRole,
+    local: Subtype,
+    env: &HashMap<String, ResolvedExprLineage>,
+    resolve_unbound: &impl Fn(&QualifiedField) -> Option<TermMap>,
+    doc_sources: &BTreeSet<DatasetId>,
+    declared_sections: &HashMap<DatasetId, BTreeSet<String>>,
+    out: &mut ResolvedExprLineage,
+) {
+    let recurse = |child: &Expr, child_role: ExprRole, out: &mut ResolvedExprLineage| {
+        resolve_expr_role(
+            child,
+            child_role,
+            local,
+            env,
+            resolve_unbound,
+            doc_sources,
+            declared_sections,
+            out,
+        );
+    };
+
+    if let Expr::IndexAccess { .. } = expr
+        && let Some(Ok(path)) = classify_doc_index_chain(expr)
+    {
+        merge_doc_role(out, &path, role, local, doc_sources, declared_sections);
+        return;
+    }
+    if let Expr::DocAccess { section, field, .. } = expr {
+        merge_doc_role(
+            out,
+            &DocPath {
+                section: section.clone(),
+                field: field.clone(),
+                indices: Vec::new(),
+            },
+            role,
+            local,
+            doc_sources,
+            declared_sections,
+        );
+        return;
     }
 
-    // Envelope reads resolve to the feeding source datasets, not through the
-    // upstream column map (a `$doc` access names a section/field, not a column).
-    let mut doc_paths = Vec::new();
-    collect_doc_paths_in_expr(expr, &mut doc_paths);
-    merge_doc_read_terms(&mut out, &doc_paths, local, doc_sources, declared_sections);
+    match expr {
+        Expr::FieldRef { name, .. } if !name.starts_with('$') => {
+            merge_leaf_role(
+                out,
+                &QualifiedField::bare(name.as_ref()),
+                role,
+                local,
+                env,
+                resolve_unbound,
+            );
+        }
+        Expr::QualifiedFieldRef { parts, .. }
+            if parts.first().is_some_and(|part| !part.starts_with('$')) =>
+        {
+            let qf = if parts.len() >= 2 {
+                QualifiedField::qualified(parts[0].as_ref(), parts[1].as_ref())
+            } else {
+                QualifiedField::bare(parts[0].as_ref())
+            };
+            merge_leaf_role(out, &qf, role, local, env, resolve_unbound);
+        }
+        Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
+            recurse(lhs, role, out);
+            recurse(rhs, role, out);
+        }
+        Expr::Unary { operand, .. } => recurse(operand, role, out),
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                recurse(element, role, out);
+            }
+        }
+        Expr::MapLiteral { entries, .. } => {
+            for entry in entries {
+                if let cxl::ast::MapKey::Computed(key) = &entry.key {
+                    let key_role = match role {
+                        ExprRole::Direct => ExprRole::Indirect(IndirectSub::Conditional),
+                        indirect => indirect,
+                    };
+                    recurse(key, key_role, out);
+                }
+                recurse(&entry.value, role, out);
+            }
+        }
+        Expr::ArrayComprehension {
+            item,
+            binding,
+            source,
+            predicate,
+            ..
+        } => {
+            let structural_role = match role {
+                ExprRole::Direct => ExprRole::Indirect(IndirectSub::Filter),
+                indirect => indirect,
+            };
+            recurse(source, structural_role, out);
 
-    out
+            // The lexical item binding represents values drawn from `source`.
+            // Resolve the source once as a value solely to seed that binding;
+            // its role-carrying walk above is the only contribution made by the
+            // source expression itself.
+            let source_value =
+                resolve_expr_lineage(source, env, resolve_unbound, doc_sources, declared_sections);
+            let mut binding_terms = TermMap::new();
+            merge_terminals(
+                &mut binding_terms,
+                Some(&source_value.terms),
+                Subtype::Transformation,
+            );
+            let mut nested_env = env.clone();
+            nested_env.insert(
+                binding.to_string(),
+                ResolvedExprLineage {
+                    terms: binding_terms,
+                    influence: InfluenceMap::new(),
+                },
+            );
+            resolve_expr_role(
+                item,
+                role,
+                local,
+                &nested_env,
+                resolve_unbound,
+                doc_sources,
+                declared_sections,
+                out,
+            );
+            if let Some(predicate) = predicate {
+                resolve_expr_role(
+                    predicate,
+                    structural_role,
+                    local,
+                    &nested_env,
+                    resolve_unbound,
+                    doc_sources,
+                    declared_sections,
+                    out,
+                );
+            }
+        }
+        Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            recurse(condition, role, out);
+            recurse(then_branch, role, out);
+            if let Some(branch) = else_branch {
+                recurse(branch, role, out);
+            }
+        }
+        Expr::Match { subject, arms, .. } => {
+            if let Some(subject) = subject {
+                recurse(subject, role, out);
+            }
+            for arm in arms {
+                recurse(&arm.pattern, role, out);
+                recurse(&arm.body, role, out);
+            }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            recurse(receiver, role, out);
+            for argument in args {
+                recurse(argument, role, out);
+            }
+        }
+        Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
+            for argument in args {
+                recurse(argument, role, out);
+            }
+        }
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
+            recurse(receiver, role, out);
+            recurse(index, role, out);
+        }
+        Expr::Closure { body, .. } => recurse(body, role, out),
+        Expr::Literal { .. }
+        | Expr::FieldRef { .. }
+        | Expr::QualifiedFieldRef { .. }
+        | Expr::PipelineAccess { .. }
+        | Expr::VarsAccess { .. }
+        | Expr::ConfigAccess { .. }
+        | Expr::SourceAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
+        | Expr::RecordAccess { .. }
+        | Expr::DocAccess { .. }
+        | Expr::Now { .. }
+        | Expr::Wildcard { .. }
+        | Expr::AggSlot { .. }
+        | Expr::GroupKey { .. } => {}
+    }
+}
+
+fn merge_leaf_role(
+    out: &mut ResolvedExprLineage,
+    qf: &QualifiedField,
+    role: ExprRole,
+    local: Subtype,
+    env: &HashMap<String, ResolvedExprLineage>,
+    resolve_unbound: &impl Fn(&QualifiedField) -> Option<TermMap>,
+) {
+    let first = qf.qualifier.as_deref().unwrap_or(qf.name.as_ref());
+    if let Some(binding) = env.get(first) {
+        match role {
+            ExprRole::Direct => {
+                merge_terminals(&mut out.terms, Some(&binding.terms), local);
+                merge_influence(&mut out.influence, binding.influence.clone());
+            }
+            ExprRole::Indirect(subtype) => {
+                add_upstream_influence(&mut out.influence, Some(&binding.terms), subtype);
+                merge_influence(&mut out.influence, binding.influence.clone());
+            }
+        }
+        return;
+    }
+    let base = resolve_unbound(qf);
+    match role {
+        ExprRole::Direct => merge_terminals(&mut out.terms, base.as_ref(), local),
+        ExprRole::Indirect(subtype) => {
+            add_upstream_influence(&mut out.influence, base.as_ref(), subtype);
+        }
+    }
+}
+
+fn merge_doc_role(
+    out: &mut ResolvedExprLineage,
+    path: &DocPath,
+    role: ExprRole,
+    local: Subtype,
+    doc_sources: &BTreeSet<DatasetId>,
+    declared_sections: &HashMap<DatasetId, BTreeSet<String>>,
+) {
+    match role {
+        ExprRole::Direct => merge_doc_read_terms(
+            &mut out.terms,
+            std::slice::from_ref(path),
+            local,
+            doc_sources,
+            declared_sections,
+        ),
+        ExprRole::Indirect(subtype) => add_doc_influence(
+            &mut out.influence,
+            std::slice::from_ref(path),
+            doc_sources,
+            declared_sections,
+            subtype,
+        ),
+    }
 }
 
 /// Merge the DIRECT terminals a set of `$doc` envelope reads derives from into
@@ -1444,7 +1776,7 @@ fn resolve_expr_terms(
 /// read is itself a verbatim copy of the envelope value); `local` then dominates
 /// it, so a bare `$doc` emit stays IDENTITY while a `$doc` inside an expression
 /// composes to TRANSFORMATION. Shared by the Transform/Combine body walk
-/// (`resolve_expr_terms`) and the Aggregate emit arm.
+/// (`resolve_expr_lineage`) and the Aggregate emit arm.
 fn merge_doc_read_terms(
     out: &mut TermMap,
     doc_paths: &[DocPath],
@@ -1484,21 +1816,6 @@ fn doc_read_terminals<'a>(
         .map(move |ds| Terminal::new(&ds.namespace, &ds.name, &rendered))
 }
 
-/// Resolve one leaf field reference to its source terminals: an in-scope binding
-/// (`let` or `emit each` loop variable, matched by the reference's first segment)
-/// wins, then `resolve_unbound` (the operator input).
-fn resolve_leaf_terms(
-    qf: &QualifiedField,
-    env: &HashMap<String, TermMap>,
-    resolve_unbound: &impl Fn(&QualifiedField) -> Option<TermMap>,
-) -> Option<TermMap> {
-    let first = qf.qualifier.as_deref().unwrap_or(qf.name.as_ref());
-    if let Some(terms) = env.get(first) {
-        return Some(terms.clone());
-    }
-    resolve_unbound(qf)
-}
-
 /// The input column(s) and DIRECT subtype each contributing to one aggregate
 /// output column, read off the post-extraction `residual`.
 fn aggregate_emit_sources(
@@ -1510,11 +1827,14 @@ fn aggregate_emit_sources(
     // any expression the group-key contribution becomes a transformation.
     let bare_leaf = matches!(residual, Expr::GroupKey { .. } | Expr::AggSlot { .. });
     let mut leaves = Vec::new();
-    collect_agg_leaves(residual, &mut leaves);
+    collect_agg_leaves(residual, ExprRole::Direct, &mut leaves);
 
     let mut out = Vec::new();
-    for leaf in leaves {
-        match leaf {
+    for read in leaves {
+        if read.role != ExprRole::Direct {
+            continue;
+        }
+        match read.leaf {
             AggLeaf::Group(slot) => {
                 if let Some(name) = compiled.group_by_fields.get(slot as usize) {
                     let st = if bare_leaf {
@@ -1545,6 +1865,43 @@ fn aggregate_emit_sources(
     out
 }
 
+/// Aggregate residual inputs that choose comprehension membership or computed
+/// map structure. They affect the output dataset without becoming inputs to the
+/// emitted column value.
+fn aggregate_emit_influence(
+    residual: &Expr,
+    compiled: &cxl::plan::CompiledAggregate,
+    input_schema: Option<&Schema>,
+) -> Vec<(String, IndirectSub)> {
+    let mut leaves = Vec::new();
+    collect_agg_leaves(residual, ExprRole::Direct, &mut leaves);
+
+    let mut out = Vec::new();
+    for read in leaves {
+        let ExprRole::Indirect(subtype) = read.role else {
+            continue;
+        };
+        match read.leaf {
+            AggLeaf::Group(slot) => {
+                if let Some(name) = compiled.group_by_fields.get(slot as usize) {
+                    out.push((name.clone(), subtype));
+                }
+            }
+            AggLeaf::Agg(slot) => {
+                if let Some(binding) = compiled.bindings.get(slot as usize) {
+                    out.extend(
+                        binding_arg_input_names(&binding.arg, input_schema)
+                            .into_iter()
+                            .map(|name| (name, subtype)),
+                    );
+                }
+            }
+            AggLeaf::Field(name) => out.push((name.to_string(), subtype)),
+        }
+    }
+    out
+}
+
 /// Leaf of an aggregate emit residual that carries column provenance.
 enum AggLeaf<'a> {
     /// `GroupKey { slot }` — passthrough of a group-by column.
@@ -1556,13 +1913,27 @@ enum AggLeaf<'a> {
     Field(&'a str),
 }
 
-fn collect_agg_leaves<'a>(expr: &'a Expr, out: &mut Vec<AggLeaf<'a>>) {
+struct AggRead<'a> {
+    leaf: AggLeaf<'a>,
+    role: ExprRole,
+}
+
+fn collect_agg_leaves<'a>(expr: &'a Expr, role: ExprRole, out: &mut Vec<AggRead<'a>>) {
     match expr {
-        Expr::GroupKey { slot, .. } => out.push(AggLeaf::Group(*slot)),
-        Expr::AggSlot { slot, .. } => out.push(AggLeaf::Agg(*slot)),
+        Expr::GroupKey { slot, .. } => out.push(AggRead {
+            leaf: AggLeaf::Group(*slot),
+            role,
+        }),
+        Expr::AggSlot { slot, .. } => out.push(AggRead {
+            leaf: AggLeaf::Agg(*slot),
+            role,
+        }),
         Expr::FieldRef { name, .. } => {
             if !name.starts_with('$') {
-                out.push(AggLeaf::Field(name));
+                out.push(AggRead {
+                    leaf: AggLeaf::Field(name),
+                    role,
+                });
             }
         }
         Expr::QualifiedFieldRef { parts, .. } => {
@@ -1571,25 +1942,32 @@ fn collect_agg_leaves<'a>(expr: &'a Expr, out: &mut Vec<AggLeaf<'a>>) {
             if let Some(first) = parts.first()
                 && !first.starts_with('$')
             {
-                out.push(AggLeaf::Field(first.as_ref()));
+                out.push(AggRead {
+                    leaf: AggLeaf::Field(first.as_ref()),
+                    role,
+                });
             }
         }
         Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
-            collect_agg_leaves(lhs, out);
-            collect_agg_leaves(rhs, out);
+            collect_agg_leaves(lhs, role, out);
+            collect_agg_leaves(rhs, role, out);
         }
-        Expr::Unary { operand, .. } => collect_agg_leaves(operand, out),
+        Expr::Unary { operand, .. } => collect_agg_leaves(operand, role, out),
         Expr::ArrayLiteral { elements, .. } => {
             for element in elements {
-                collect_agg_leaves(element, out);
+                collect_agg_leaves(element, role, out);
             }
         }
         Expr::MapLiteral { entries, .. } => {
             for entry in entries {
                 if let cxl::ast::MapKey::Computed(key) = &entry.key {
-                    collect_agg_leaves(key, out);
+                    let key_role = match role {
+                        ExprRole::Direct => ExprRole::Indirect(IndirectSub::Conditional),
+                        indirect => indirect,
+                    };
+                    collect_agg_leaves(key, key_role, out);
                 }
-                collect_agg_leaves(&entry.value, out);
+                collect_agg_leaves(&entry.value, role, out);
             }
         }
         Expr::ArrayComprehension {
@@ -1598,10 +1976,14 @@ fn collect_agg_leaves<'a>(expr: &'a Expr, out: &mut Vec<AggLeaf<'a>>) {
             predicate,
             ..
         } => {
-            collect_agg_leaves(source, out);
-            collect_agg_leaves(item, out);
+            let structural_role = match role {
+                ExprRole::Direct => ExprRole::Indirect(IndirectSub::Filter),
+                indirect => indirect,
+            };
+            collect_agg_leaves(source, structural_role, out);
+            collect_agg_leaves(item, role, out);
             if let Some(predicate) = predicate {
-                collect_agg_leaves(predicate, out);
+                collect_agg_leaves(predicate, structural_role, out);
             }
         }
         Expr::IfThenElse {
@@ -1610,39 +1992,39 @@ fn collect_agg_leaves<'a>(expr: &'a Expr, out: &mut Vec<AggLeaf<'a>>) {
             else_branch,
             ..
         } => {
-            collect_agg_leaves(condition, out);
-            collect_agg_leaves(then_branch, out);
+            collect_agg_leaves(condition, role, out);
+            collect_agg_leaves(then_branch, role, out);
             if let Some(eb) = else_branch {
-                collect_agg_leaves(eb, out);
+                collect_agg_leaves(eb, role, out);
             }
         }
         Expr::Match { subject, arms, .. } => {
             if let Some(s) = subject {
-                collect_agg_leaves(s, out);
+                collect_agg_leaves(s, role, out);
             }
             for arm in arms {
-                collect_agg_leaves(&arm.pattern, out);
-                collect_agg_leaves(&arm.body, out);
+                collect_agg_leaves(&arm.pattern, role, out);
+                collect_agg_leaves(&arm.body, role, out);
             }
         }
         Expr::MethodCall { receiver, args, .. } => {
-            collect_agg_leaves(receiver, out);
+            collect_agg_leaves(receiver, role, out);
             for a in args {
-                collect_agg_leaves(a, out);
+                collect_agg_leaves(a, role, out);
             }
         }
         Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
             for a in args {
-                collect_agg_leaves(a, out);
+                collect_agg_leaves(a, role, out);
             }
         }
         Expr::IndexAccess {
             receiver, index, ..
         } => {
-            collect_agg_leaves(receiver, out);
-            collect_agg_leaves(index, out);
+            collect_agg_leaves(receiver, role, out);
+            collect_agg_leaves(index, role, out);
         }
-        Expr::Closure { body, .. } => collect_agg_leaves(body, out),
+        Expr::Closure { body, .. } => collect_agg_leaves(body, role, out),
         _ => {}
     }
 }
@@ -1676,15 +2058,15 @@ fn binding_arg_input_names(arg: &BindingArg, schema: Option<&Schema>) -> Vec<Str
 fn aggregate_binding_doc_paths(
     residual: &Expr,
     compiled: &cxl::plan::CompiledAggregate,
-    out: &mut Vec<DocPath>,
+    out: &mut Vec<(DocPath, ExprRole)>,
 ) {
     let mut leaves = Vec::new();
-    collect_agg_leaves(residual, &mut leaves);
-    for leaf in leaves {
-        if let AggLeaf::Agg(slot) = leaf
+    collect_agg_leaves(residual, ExprRole::Direct, &mut leaves);
+    for read in leaves {
+        if let AggLeaf::Agg(slot) = read.leaf
             && let Some(binding) = compiled.bindings.get(slot as usize)
         {
-            binding_arg_doc_paths(&binding.arg, out);
+            binding_arg_doc_paths(&binding.arg, read.role, out);
         }
     }
 }
@@ -1692,12 +2074,12 @@ fn aggregate_binding_doc_paths(
 /// `$doc` paths read by a single aggregate argument — the envelope analogue of
 /// [`binding_arg_input_names`], which sees only record columns (`support_into`
 /// excludes the `$doc` namespace).
-fn binding_arg_doc_paths(arg: &BindingArg, out: &mut Vec<DocPath>) {
+fn binding_arg_doc_paths(arg: &BindingArg, role: ExprRole, out: &mut Vec<(DocPath, ExprRole)>) {
     match arg {
-        BindingArg::Expr(e) => collect_doc_paths_in_expr(e, out),
+        BindingArg::Expr(e) => collect_doc_paths_with_role(e, role, out),
         BindingArg::Pair(a, b) => {
-            binding_arg_doc_paths(a, out);
-            binding_arg_doc_paths(b, out);
+            binding_arg_doc_paths(a, role, out);
+            binding_arg_doc_paths(b, role, out);
         }
         BindingArg::Field(_) | BindingArg::Wildcard => {}
     }
@@ -1818,6 +2200,12 @@ fn collect_field_refs(expr: &Expr, out: &mut Vec<QualifiedField>) {
 /// carries an unresolvable chain; the `Err` arm is descended defensively only so
 /// a nested `$doc` is never silently lost.
 fn collect_doc_paths_in_expr(expr: &Expr, out: &mut Vec<DocPath>) {
+    let mut reads = Vec::new();
+    collect_doc_paths_with_role(expr, ExprRole::Direct, &mut reads);
+    out.extend(reads.into_iter().map(|(path, _)| path));
+}
+
+fn collect_doc_paths_with_role(expr: &Expr, role: ExprRole, out: &mut Vec<(DocPath, ExprRole)>) {
     // A `$doc` index chain is one path — classify before the generic descent so
     // its index expressions are not walked as separate references. Anything else
     // (a non-`$doc` index access, or an unreachable dynamic-index `Err`) falls
@@ -1826,34 +2214,41 @@ fn collect_doc_paths_in_expr(expr: &Expr, out: &mut Vec<DocPath>) {
     if let Expr::IndexAccess { .. } = expr
         && let Some(Ok(path)) = classify_doc_index_chain(expr)
     {
-        out.push(path);
+        out.push((path, role));
         return;
     }
     if let Expr::DocAccess { section, field, .. } = expr {
-        out.push(DocPath {
-            section: section.clone(),
-            field: field.clone(),
-            indices: Vec::new(),
-        });
+        out.push((
+            DocPath {
+                section: section.clone(),
+                field: field.clone(),
+                indices: Vec::new(),
+            },
+            role,
+        ));
         return;
     }
     match expr {
         Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
-            collect_doc_paths_in_expr(lhs, out);
-            collect_doc_paths_in_expr(rhs, out);
+            collect_doc_paths_with_role(lhs, role, out);
+            collect_doc_paths_with_role(rhs, role, out);
         }
-        Expr::Unary { operand, .. } => collect_doc_paths_in_expr(operand, out),
+        Expr::Unary { operand, .. } => collect_doc_paths_with_role(operand, role, out),
         Expr::ArrayLiteral { elements, .. } => {
             for element in elements {
-                collect_doc_paths_in_expr(element, out);
+                collect_doc_paths_with_role(element, role, out);
             }
         }
         Expr::MapLiteral { entries, .. } => {
             for entry in entries {
                 if let cxl::ast::MapKey::Computed(key) = &entry.key {
-                    collect_doc_paths_in_expr(key, out);
+                    let key_role = match role {
+                        ExprRole::Direct => ExprRole::Indirect(IndirectSub::Conditional),
+                        indirect => indirect,
+                    };
+                    collect_doc_paths_with_role(key, key_role, out);
                 }
-                collect_doc_paths_in_expr(&entry.value, out);
+                collect_doc_paths_with_role(&entry.value, role, out);
             }
         }
         Expr::ArrayComprehension {
@@ -1862,10 +2257,14 @@ fn collect_doc_paths_in_expr(expr: &Expr, out: &mut Vec<DocPath>) {
             predicate,
             ..
         } => {
-            collect_doc_paths_in_expr(source, out);
-            collect_doc_paths_in_expr(item, out);
+            let structural_role = match role {
+                ExprRole::Direct => ExprRole::Indirect(IndirectSub::Filter),
+                indirect => indirect,
+            };
+            collect_doc_paths_with_role(source, structural_role, out);
+            collect_doc_paths_with_role(item, role, out);
             if let Some(predicate) = predicate {
-                collect_doc_paths_in_expr(predicate, out);
+                collect_doc_paths_with_role(predicate, structural_role, out);
             }
         }
         Expr::IfThenElse {
@@ -1874,39 +2273,39 @@ fn collect_doc_paths_in_expr(expr: &Expr, out: &mut Vec<DocPath>) {
             else_branch,
             ..
         } => {
-            collect_doc_paths_in_expr(condition, out);
-            collect_doc_paths_in_expr(then_branch, out);
+            collect_doc_paths_with_role(condition, role, out);
+            collect_doc_paths_with_role(then_branch, role, out);
             if let Some(eb) = else_branch {
-                collect_doc_paths_in_expr(eb, out);
+                collect_doc_paths_with_role(eb, role, out);
             }
         }
         Expr::Match { subject, arms, .. } => {
             if let Some(s) = subject {
-                collect_doc_paths_in_expr(s, out);
+                collect_doc_paths_with_role(s, role, out);
             }
             for arm in arms {
-                collect_doc_paths_in_expr(&arm.pattern, out);
-                collect_doc_paths_in_expr(&arm.body, out);
+                collect_doc_paths_with_role(&arm.pattern, role, out);
+                collect_doc_paths_with_role(&arm.body, role, out);
             }
         }
         Expr::MethodCall { receiver, args, .. } => {
-            collect_doc_paths_in_expr(receiver, out);
+            collect_doc_paths_with_role(receiver, role, out);
             for a in args {
-                collect_doc_paths_in_expr(a, out);
+                collect_doc_paths_with_role(a, role, out);
             }
         }
         Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
             for a in args {
-                collect_doc_paths_in_expr(a, out);
+                collect_doc_paths_with_role(a, role, out);
             }
         }
         Expr::IndexAccess {
             receiver, index, ..
         } => {
-            collect_doc_paths_in_expr(receiver, out);
-            collect_doc_paths_in_expr(index, out);
+            collect_doc_paths_with_role(receiver, role, out);
+            collect_doc_paths_with_role(index, role, out);
         }
-        Expr::Closure { body, .. } => collect_doc_paths_in_expr(body, out),
+        Expr::Closure { body, .. } => collect_doc_paths_with_role(body, role, out),
         _ => {}
     }
 }
@@ -2267,6 +2666,12 @@ fn add_upstream_influence(inf: &mut InfluenceMap, up_terms: Option<&TermMap>, su
     }
 }
 
+fn merge_influence(target: &mut InfluenceMap, source: InfluenceMap) {
+    for (terminal, subtypes) in source {
+        target.entry(terminal).or_default().extend(subtypes);
+    }
+}
+
 /// Add each `$doc` envelope read in `doc_paths` to `inf` as an INDIRECT influence
 /// of subtype `sub`. A `$doc` read names a section/field, not a record column, so
 /// it resolves directly to each feeding `doc_srcs` dataset whose envelope
@@ -2609,7 +3014,7 @@ nodes:
     }
 
     #[test]
-    fn transform_nested_constructor_dependencies_are_direct_lineage() {
+    fn transform_nested_constructor_dependencies_keep_value_and_selection_roles() {
         let yaml = r#"
 pipeline: { name: nested_lineage }
 nodes:
@@ -2640,7 +3045,8 @@ nodes:
 "#;
         let lineage = lineage_of(yaml);
         let source = "/w/data/rows.csv";
-        let fields = &only_output(&lineage).facet.fields;
+        let output = only_output(&lineage);
+        let fields = &output.facet.fields;
         use TransformationSubtype::Transformation;
         assert_field(
             fields,
@@ -2648,8 +3054,15 @@ nodes:
             &[
                 direct(source, "amount", Transformation),
                 direct(source, "dept", Transformation),
-                direct(source, "region", Transformation),
                 direct(source, "score", Transformation),
+            ],
+        );
+        use TransformationSubtype::Filter;
+        assert_eq!(
+            output.facet.dataset,
+            vec![
+                indirect(source, "region", &[Filter]),
+                indirect(source, "score", &[Filter]),
             ],
         );
     }
@@ -3444,9 +3857,15 @@ nodes:
             span: Span::default(),
         };
         let mut leaves = Vec::new();
-        collect_agg_leaves(&expr, &mut leaves);
+        collect_agg_leaves(&expr, ExprRole::Direct, &mut leaves);
         assert!(
-            matches!(leaves.as_slice(), [AggLeaf::Field("amount")]),
+            matches!(
+                leaves.as_slice(),
+                [AggRead {
+                    leaf: AggLeaf::Field("amount"),
+                    role: ExprRole::Direct,
+                }]
+            ),
             "qualified ref base column must contribute a leaf"
         );
     }

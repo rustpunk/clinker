@@ -102,6 +102,103 @@ fn assert_field(fields: &BTreeMap<String, FieldLineage>, col: &str, expected: &[
     assert_eq!(actual.input_fields, expected, "lineage for column {col:?}");
 }
 
+#[test]
+fn nested_value_and_structural_reads_keep_distinct_lineage_roles() {
+    let yaml = r#"
+pipeline: { name: nested_roles }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: data/src.csv
+      schema:
+        - { name: value_field, type: string }
+        - { name: key_field, type: string }
+        - { name: shared, type: string }
+        - { name: predicate_field, type: bool }
+  - type: transform
+    name: construct
+    input: src
+    config:
+      cxl: |
+        emit payload = {
+          static: value_field,
+          [key_field]: [entry for entry in [shared] if predicate_field],
+        }
+  - type: output
+    name: out
+    input: construct
+    config: { name: out, type: json, path: out/nested-roles.json, include_unmapped: false }
+"#;
+    let lineage = lineage_of(yaml);
+    let src = src_name();
+    let out = only_output(&lineage);
+
+    use TransformationSubtype::{Conditional, Filter, Transformation};
+    assert_field(
+        &out.facet.fields,
+        "payload",
+        &[
+            direct(&src, "shared", Transformation),
+            direct(&src, "value_field", Transformation),
+        ],
+    );
+    assert_eq!(
+        out.facet.dataset,
+        vec![
+            indirect(&src, "key_field", &[Conditional]),
+            indirect(&src, "predicate_field", &[Filter]),
+            indirect(&src, "shared", &[Filter]),
+        ],
+        "computed keys and comprehension selection affect structure/membership without becoming value edges",
+    );
+}
+
+#[test]
+fn nested_static_keys_add_no_dependency_and_literal_items_stay_direct() {
+    let yaml = r#"
+pipeline: { name: nested_static_keys }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: data/src.csv
+      schema:
+        - { name: first_value, type: string }
+        - { name: second_value, type: string }
+  - type: transform
+    name: construct
+    input: src
+    config:
+      cxl: 'emit payload = [first_value, {static: second_value}]'
+  - type: output
+    name: out
+    input: construct
+    config: { name: out, type: json, path: out/nested-static.json, include_unmapped: false }
+"#;
+    let lineage = lineage_of(yaml);
+    let src = src_name();
+    let out = only_output(&lineage);
+
+    use TransformationSubtype::Transformation;
+    assert_field(
+        &out.facet.fields,
+        "payload",
+        &[
+            direct(&src, "first_value", Transformation),
+            direct(&src, "second_value", Transformation),
+        ],
+    );
+    assert!(
+        out.facet.dataset.is_empty(),
+        "authored static key text carries no source-field dependency",
+    );
+}
+
 /// A single-boundary composition whose body renames a port column. The renamed
 /// output column must resolve to the TRUE source column (not the coarse
 /// all-to-all fan-out the opaque approximation produced), and the placeholder
