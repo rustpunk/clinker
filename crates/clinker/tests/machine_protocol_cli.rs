@@ -33,7 +33,7 @@ nodes:
       schema:
         - {{ name: id, type: int }}
         - {{ name: name, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -86,7 +86,7 @@ nodes:
 {pagination}
       schema:
         - {{ name: id, type: int }}
-  - type: output
+  - type: sink
     name: out
     input: api
     config: {{ name: out, path: out.csv, type: csv }}
@@ -834,7 +834,7 @@ nodes:
     input: src
     config:
       cxl: "emit amount = if(amount == 0) then (1 / 0) else amount"
-  - type: output
+  - type: sink
     name: out
     input: map
     config: { name: out, path: out.csv, type: csv }

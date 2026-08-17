@@ -31,7 +31,7 @@ nodes:
     config:
       cxl: |
         emit marker = "ready"
-  - type: output
+  - type: sink
     name: alpha
     input: prepared
     config:
@@ -39,7 +39,7 @@ nodes:
       type: csv
       path: alpha.csv
       include_unmapped: true
-  - type: output
+  - type: sink
     name: beta
     input: prepared
     config:

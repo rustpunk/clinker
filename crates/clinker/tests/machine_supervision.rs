@@ -72,7 +72,7 @@ nodes:
       schema:
         - {{ name: id, type: int }}
         - {{ name: name, type: string }}
-{ordering}  - type: output
+{ordering}  - type: sink
     name: out
     input: src
     config:
@@ -117,11 +117,11 @@ nodes:
       type: csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: src
     config: { name: out, path: out.csv, type: csv }
-  - type: output
+  - type: sink
     name: absent_out
     input: absent
     config: { name: absent_out, path: absent-out.csv, type: csv }
@@ -153,7 +153,7 @@ nodes:
     input: src
     config:
       cxl: "emit amount = if(amount == 0) then (1 / 0) else amount"
-  - type: output
+  - type: sink
     name: out
     input: map
     config: { name: out, path: out.csv, type: csv }
@@ -182,7 +182,7 @@ nodes:
         timeout_secs: 60
       schema:
         - {{ name: id, type: int }}
-  - type: output
+  - type: sink
     name: out
     input: api
     config: {{ name: out, path: out.csv, type: csv }}

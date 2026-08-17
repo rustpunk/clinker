@@ -75,7 +75,7 @@ pipeline:
     config:
       cxl: |
 {}
-  - type: output
+  - type: sink
     name: output
     input: transform
     config:
@@ -944,7 +944,7 @@ nodes:
           condition: "admitted.is_large(value)"
           message: "large value"
           fields: [value]
-  - type: output
+  - type: sink
     name: output
     input: transform
     config:

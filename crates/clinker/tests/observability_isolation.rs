@@ -50,7 +50,7 @@ nodes:
           message: customer processed
           fields: [customer_id]
           every: 1
-  - type: output
+  - type: sink
     name: published_customers
     input: normalize
     config:
@@ -319,7 +319,7 @@ nodes:
           message: customer flagged
           fields: [customer_id]
           every: 1
-  - type: output
+  - type: sink
     name: published_customers
     input: normalize
     config:
@@ -800,7 +800,7 @@ nodes:
           fields: [customer_id]
           every: 1
           condition: "amount > 1000"
-  - type: output
+  - type: sink
     name: published_customers
     input: normalize
     config:
@@ -1036,7 +1036,7 @@ nodes:
           message: customer processed
           fields: [customer_id, secret_note]
           every: 1
-  - type: output
+  - type: sink
     name: published_customers
     input: normalize
     config:
@@ -1118,7 +1118,7 @@ nodes:
       type: csv
       path: retained-source.csv
       schema: [{ name: value, type: string }]
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

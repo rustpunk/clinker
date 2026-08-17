@@ -92,7 +92,7 @@ nodes:
         emit doubled = amount * 2
         emit customer = customer_id
         emit zone = region
-  - type: output
+  - type: sink
     name: out
     input: calc
     config:
@@ -192,7 +192,7 @@ nodes:
     config:
       cxl: |
         emit customer = customer_id
-  - type: output
+  - type: sink
     name: out
     input: calc
     config:
@@ -273,7 +273,7 @@ nodes:
         - { name: id, type: string }
         - { name: tags, type: string }
         - { name: tag_no, type: { nullable: int } }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -357,7 +357,7 @@ nodes:
       schema:
         - { name: id, type: string }
         - { name: codes, type: string, multiple: true }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -426,7 +426,7 @@ nodes:
       schema:
         - { name: id, type: string }
         - { name: tags, type: string, multiple: true }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -525,7 +525,7 @@ nodes:
         record_path: small.rows
       schema:
         - { name: id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -572,7 +572,7 @@ nodes:
       schema:
         - { name: id, type: string }
         - { name: amount, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -664,7 +664,7 @@ nodes:
       schema:
         - { name: id, type: string }
         - { name: amount, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -725,7 +725,7 @@ nodes:
     use: ./compositions/with_ref.comp.yaml
     inputs:
       driver: drv
-  - type: output
+  - type: sink
     name: out
     input: enrich
     config:
