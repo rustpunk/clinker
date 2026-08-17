@@ -841,7 +841,7 @@ fn cleanup_provider_failure_releases_prior_handles_and_unregisters() {
 }
 
 #[test]
-fn cleanup_spill_request_releases_before_another_acquisition() {
+fn cleanup_registered_spill_request_releases_at_next_checkpoint() {
     let provider = provider(
         vec![CredentialCapability::AuthenticateRequest],
         vec![CredentialLifetime::Run],
@@ -868,11 +868,15 @@ fn cleanup_spill_request_releases_before_another_acquisition() {
     registry
         .acquire(&selected, &requirement)
         .expect("second handle");
-    registry.memory_handle().request_spill();
+    let retained_before = registry.retained_bytes();
+    arbitrator.spill_reclaimable(retained_before);
+    assert_eq!(registry.retained_bytes(), retained_before);
+    assert_eq!(registry.live_handle_count(), 2);
+    assert_eq!(arbitrator.consumer_count(), 1);
 
     let error = registry
-        .acquire(&selected, &requirement)
-        .expect_err("spill request must stop further acquisition");
+        .honor_memory_signals()
+        .expect_err("spill checkpoint must close the registry");
 
     assert_eq!(error.kind(), CredentialRegistryErrorKind::SpillRequested);
     assert_eq!(provider.resolve_calls.load(Ordering::SeqCst), 2);
