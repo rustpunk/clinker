@@ -1920,7 +1920,7 @@ nodes:
     input: orders
     config:
       cxl: "emit id = id"
-  - type: output
+  - type: sink
     name: out
     input: normalize_orders
     config:
@@ -1983,7 +1983,7 @@ nodes:
       path: input.json
       schema:
         - { name: id, type: string }
-  - type: output
+  - type: sink
     name: z_out
     input: source
     config:
@@ -1992,7 +1992,7 @@ nodes:
       path: z.csv
       mapping:
         - z_missing
-  - type: output
+  - type: sink
     name: a_out
     input: source
     config:

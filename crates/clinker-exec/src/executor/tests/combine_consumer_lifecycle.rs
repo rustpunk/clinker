@@ -155,7 +155,7 @@ nodes:
       emit amount = orders.amount
       emit bracket_id = tax_brackets.bracket_id
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: bracketed
   config:
@@ -254,7 +254,7 @@ nodes:
       emit price = products.price
       emit bracket_id = brackets.bracket_id
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: assign_bracket
   config:
@@ -349,7 +349,7 @@ nodes:
       emit product_id = orders.product_id
       emit name = products.name
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: enriched
   config:
@@ -441,7 +441,7 @@ nodes:
       emit amount = orders.amount
       emit bracket_id = tax_brackets.bracket_id
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: bracketed
   config:
@@ -522,7 +522,7 @@ nodes:
       emit product_id = orders.product_id
       emit name = products.name
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: enriched
   config:
@@ -622,7 +622,7 @@ nodes:
       emit product_id = orders.product_id
       emit name = products.name
     propagate_ck: driver
-- type: output
+- type: sink
   name: out
   input: enriched
   config:
