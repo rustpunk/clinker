@@ -85,7 +85,7 @@ nodes:
       cxl: |
         emit k = k
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: by_key
     config:

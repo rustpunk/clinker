@@ -194,7 +194,7 @@ nodes:
       type: csv
       path: src.csv
       schema: [ { name: id, type: string } ]
-  - type: output
+  - type: sink
     name: sibling
     input: src
     config: { name: sibling, type: csv, path: sibling.csv }
@@ -204,7 +204,7 @@ nodes:
     use: ../compositions/passthrough_check.comp.yaml
     inputs:
       data: src
-  - type: output
+  - type: sink
     name: out
     input: passthrough_call
     config: { name: out, type: csv, path: out.csv }
@@ -267,11 +267,11 @@ nodes:
   - type: merge
     name: m2
     inputs: [shared, c]
-  - type: output
+  - type: sink
     name: out1
     input: m1
     config: { name: out1, type: csv, path: out1.csv }
-  - type: output
+  - type: sink
     name: out2
     input: m2
     config: { name: out2, type: csv, path: out2.csv }
@@ -325,11 +325,11 @@ nodes:
     config:
       cxl: |
         emit marker = "ready"
-  - type: output
+  - type: sink
     name: alpha
     input: prepared
     config: { name: alpha, type: csv, path: alpha.csv }
-  - type: output
+  - type: sink
     name: beta
     input: prepared
     config: { name: beta, type: csv, path: beta.csv }
@@ -382,7 +382,7 @@ nodes:
     use: ../compositions/exec_transform_check.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: composition_out
     input: doubled_call
     config: { name: composition_out, type: csv, path: composition.csv, include_unmapped: true }
@@ -462,7 +462,7 @@ nodes:
     use: ../compositions/source_boundary_collision.comp.yaml
     inputs:
       collision: body_feed
-  - type: output
+  - type: sink
     name: body_out
     input: body_call
     config: { name: body_out, type: csv, path: body-out.csv, include_unmapped: false }
@@ -479,7 +479,7 @@ nodes:
         emit id = id
         emit origin = "top-transform"
         emit $record.boundary = $record.boundary
-  - type: output
+  - type: sink
     name: top_out
     input: top_transform
     config: { name: top_out, type: csv, path: top-out.csv, include_unmapped: false }
@@ -614,7 +614,7 @@ nodes:
     use: ../compositions/exec_runtime_error.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: composition_out
     input: failing_call
     config: { name: composition_out, type: csv, path: composition.csv }
@@ -661,7 +661,7 @@ nodes:
     use: ../compositions/transient_clone_harvest_error.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: harvest_call
     config: { name: out, type: csv, path: out.csv }

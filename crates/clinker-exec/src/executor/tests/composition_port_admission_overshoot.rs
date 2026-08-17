@@ -77,7 +77,7 @@ nodes:
   use: ../compositions/port_passthrough.comp.yaml
   inputs:
     data: src
-- type: output
+- type: sink
   name: out
   input: port_enrich_call
   config:

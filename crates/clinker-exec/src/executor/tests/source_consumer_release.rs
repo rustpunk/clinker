@@ -102,7 +102,7 @@ nodes:
     schema:
       - { name: id, type: string }
       - { name: region, type: string }
-- type: output
+- type: sink
   name: out
   input: events
   config:
@@ -173,7 +173,7 @@ nodes:
   inputs: [src_a, src_b]
   config:
     mode: interleave
-- type: output
+- type: sink
   name: out
   input: merged
   config:
@@ -232,7 +232,7 @@ nodes:
     cxl: |
       emit id = id
       emit region = region
-- type: output
+- type: sink
   name: out
   input: shape
   config:
@@ -317,7 +317,7 @@ nodes:
     schema:
       - { name: id, type: string }
       - { name: region, type: string }
-- type: output
+- type: sink
   name: out
   input: events
   config:
@@ -413,7 +413,7 @@ nodes:
     schema:
       - { name: id, type: string }
       - { name: region, type: string }
-- type: output
+- type: sink
   name: out
   input: events
   config:

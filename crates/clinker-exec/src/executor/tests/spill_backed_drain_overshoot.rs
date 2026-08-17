@@ -118,7 +118,7 @@ nodes:
     cxl: |
       emit id = id
       emit amount = amount
-- type: output
+- type: sink
   name: out
   input: stage_two
   config:
@@ -150,7 +150,7 @@ nodes:
     cxl: |
       emit dept = dept
       emit lo = min(amount)
-- type: output
+- type: sink
   name: out
   input: rollup
   config:

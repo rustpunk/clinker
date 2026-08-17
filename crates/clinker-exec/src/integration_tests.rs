@@ -140,7 +140,7 @@ nodes:
       - { name: name, type: string }
       - { name: age, type: int }
 
-- type: output
+- type: sink
   name: dest
   input: src
   config:
@@ -191,7 +191,7 @@ nodes:
     cxl: 'emit result = value.to_int() * 2
 
       '
-- type: output
+- type: sink
   name: dest
   input: will_fail_some
   config:
@@ -229,7 +229,7 @@ nodes:
     cxl: 'emit result = value.to_int() + 1
 
       '
-- type: output
+- type: sink
   name: dest
   input: will_fail
   config:
@@ -275,7 +275,7 @@ nodes:
     cxl: 'emit dept_upper = department.upper()
 
       '
-- type: output
+- type: sink
   name: transformed
   input: compute_upper_dept
   config:
@@ -371,7 +371,7 @@ nodes:
     - {{ name: first_name, type: string }}
     - {{ name: last_name, type: string }}
     - {{ name: department, type: string }}
-- type: output
+- type: sink
   name: out
   input: employees
   config:
@@ -479,7 +479,7 @@ nodes:
     options:
       has_header: true
     schema:
-{schema}- type: output
+{schema}- type: sink
   name: out
   input: orders
   config:
@@ -525,7 +525,7 @@ nodes:
       has_header: true
     schema:
     - { name: first_name, type: string }
-- type: output
+- type: sink
   name: out
   input: people
   config:
@@ -584,7 +584,7 @@ nodes:
     cxl: |
       emit employee_id = employee_id
       emit parsed_value = value.to_int()
-- type: output
+- type: sink
   name: out
   input: parse_value
   config:
@@ -652,7 +652,7 @@ nodes:
     cxl: |
       emit employee_id = employee_id
       emit value = value
-- type: output
+- type: sink
   name: out
   input: passthrough
   config:
@@ -719,7 +719,7 @@ nodes:
     path: test.json
     schema:
     - { name: first_name, type: string }
-- type: output
+- type: sink
   name: out
   input: people
   config:
@@ -786,7 +786,7 @@ nodes:
     schema:
     - { name: order_id, type: string }
     - { name: customer_id, type: string }
-- type: output
+- type: sink
   name: out
   input: orders
   config:
@@ -837,7 +837,7 @@ nodes:
     schema:
     - { name: first_name, type: string }
     - { name: nickname, type: string }
-- type: output
+- type: sink
   name: out
   input: people
   config:
@@ -890,7 +890,7 @@ nodes:
   input: src
   config:
     cxl: emit x = 1
-- type: output
+- type: sink
   name: dest
   input: t1
   config:
@@ -958,7 +958,7 @@ nodes:
   input: src
   config:
     cxl: emit id = id
-- type: output
+- type: sink
   name: dest
   input: t1
   config:
@@ -1051,7 +1051,7 @@ nodes:
             .collect::<Vec<_>>()
             .join("\n");
         format!(
-            "pipeline:\n  name: filter_test\nnodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: csv\n      path: input.csv\n      schema:\n        - {{ name: id, type: any }}\n        - {{ name: name, type: any }}\n        - {{ name: status, type: any }}\n        - {{ name: value, type: any }}\n        - {{ name: amount, type: any }}\n        - {{ name: category, type: any }}\n        - {{ name: code, type: any }}\n        - {{ name: dept, type: any }}\n        - {{ name: department, type: any }}\n        - {{ name: priority, type: any }}\n        - {{ name: optional, type: any }}\n        - {{ name: required, type: any }}\n        - {{ name: active, type: any }}\n        - {{ name: first, type: any }}\n        - {{ name: last, type: any }}\n        - {{ name: first_name, type: any }}\n  - type: transform\n    name: t1\n    input: src\n    config:\n      cxl: |\n{indented}\n  - type: output\n    name: dest\n    input: t1\n    config:\n      name: dest\n      type: csv\n      path: output.csv\n"
+            "pipeline:\n  name: filter_test\nnodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: csv\n      path: input.csv\n      schema:\n        - {{ name: id, type: any }}\n        - {{ name: name, type: any }}\n        - {{ name: status, type: any }}\n        - {{ name: value, type: any }}\n        - {{ name: amount, type: any }}\n        - {{ name: category, type: any }}\n        - {{ name: code, type: any }}\n        - {{ name: dept, type: any }}\n        - {{ name: department, type: any }}\n        - {{ name: priority, type: any }}\n        - {{ name: optional, type: any }}\n        - {{ name: required, type: any }}\n        - {{ name: active, type: any }}\n        - {{ name: first, type: any }}\n        - {{ name: last, type: any }}\n        - {{ name: first_name, type: any }}\n  - type: transform\n    name: t1\n    input: src\n    config:\n      cxl: |\n{indented}\n  - type: sink\n    name: dest\n    input: t1\n    config:\n      name: dest\n      type: csv\n      path: output.csv\n"
         )
     }
 
@@ -1428,7 +1428,7 @@ nodes:
       emit out_name = name
 
       '
-- type: output
+- type: sink
   name: dest
   input: t1
   config:
@@ -1510,7 +1510,7 @@ nodes:
   input: src
   config:
     cxl: 'emit id = id'
-- type: output
+- type: sink
   name: dest
   input: identity
   config:
@@ -1600,7 +1600,7 @@ nodes:
         emit quantity = orders.quantity
       propagate_ck: driver
 
-  - type: output
+  - type: sink
     name: result
     input: enrich
     config:

@@ -725,7 +725,7 @@ nodes:
           every: 1
           message: seen
           fields: [amount]{gate}
-  - type: output
+  - type: sink
     name: output
     input: observe
     config:
@@ -776,7 +776,7 @@ nodes:
     config:
       cxl: |
         emit amount = amount
-  - type: output
+  - type: sink
     name: output
     input: "{node_name}"
     config:
