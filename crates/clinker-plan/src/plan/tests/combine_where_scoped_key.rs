@@ -117,7 +117,7 @@ nodes:
     inputs:
       orders: orders_src
       products: products_src
-  - type: output
+  - type: sink
     name: out_top
     input: join_x
     config:
@@ -125,7 +125,7 @@ nodes:
       type: csv
       path: out_top.csv
       include_unmapped: true
-  - type: output
+  - type: sink
     name: out_body
     input: body
     config:

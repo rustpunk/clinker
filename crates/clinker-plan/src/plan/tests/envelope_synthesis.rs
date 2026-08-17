@@ -46,7 +46,7 @@ nodes:
         yaml.push_str(&format!("      {line}\n"));
     }
     yaml.push_str(
-        "  - type: output\n    name: out\n    input: framed\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
+        "  - type: sink\n    name: out\n    input: framed\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
     );
     yaml
 }

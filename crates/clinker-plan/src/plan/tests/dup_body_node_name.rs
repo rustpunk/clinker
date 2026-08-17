@@ -79,7 +79,7 @@ nodes:
     use: ../compositions/dup_body.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out_body
     input: body
     config:

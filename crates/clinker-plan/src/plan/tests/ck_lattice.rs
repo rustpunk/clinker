@@ -78,7 +78,7 @@ nodes:
       group_by: [order_id]
       cxl: |
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: per_order
     config:
@@ -135,7 +135,7 @@ nodes:
       group_by: [department]
       cxl: |
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: dept_totals
     config:
@@ -210,7 +210,7 @@ nodes:
       group_by: [order_id]
       cxl: |
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: per_order
     config:
@@ -306,7 +306,7 @@ nodes:
       group_by: [bucket]
       cxl: |
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: bucket_totals
     config:
@@ -378,7 +378,7 @@ nodes:
         emit amount = o.amount
         emit name = p.name
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:
@@ -442,7 +442,7 @@ nodes:
         emit product_id = o.product_id
         emit name = p.name
       propagate_ck: all
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:
@@ -512,7 +512,7 @@ nodes:
         emit name = p.name
       propagate_ck:
         named: [order_id]
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:
@@ -560,7 +560,7 @@ nodes:
   - type: merge
     name: all_orders
     inputs: [east, west]
-  - type: output
+  - type: sink
     name: out
     input: all_orders
     config:
@@ -609,7 +609,7 @@ nodes:
       strategy: streaming
       cxl: |
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: dept_totals
     config:
@@ -659,7 +659,7 @@ nodes:
       group_by: [order_id]
       cxl: |
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: by_id
     config:
@@ -737,7 +737,7 @@ nodes:
         emit total = a.total
         emit budget = l.budget
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:
@@ -829,7 +829,7 @@ nodes:
         emit total = a.total
         emit avg_priority = b.avg_priority
       propagate_ck: all
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:
@@ -917,7 +917,7 @@ nodes:
         emit total = a.total
         emit avg_priority = b.avg_priority
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:
@@ -986,7 +986,7 @@ nodes:
       group_by: [order_id]
       cxl: |
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: out
     input: per_order
     config:

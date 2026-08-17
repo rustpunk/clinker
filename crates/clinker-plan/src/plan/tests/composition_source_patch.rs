@@ -80,7 +80,7 @@ nodes:
     use: ../compositions/with_ref.comp.yaml
     inputs:
       driver: drv
-  - type: output
+  - type: sink
     name: out
     input: enrich
     config:
@@ -294,14 +294,14 @@ nodes:
     use: ../compositions/wrap.comp.yaml
     inputs:
       driver: drv
-  - type: output
+  - type: sink
     name: out_enrich
     input: enrich
     config:
       name: out_enrich
       type: csv
       path: out_enrich.csv
-  - type: output
+  - type: sink
     name: out_wrap
     input: wrap
     config:
