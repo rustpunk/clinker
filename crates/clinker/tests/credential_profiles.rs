@@ -19,9 +19,9 @@ use clinker_plan::credentials::{
 mod credential_profile;
 
 use credential_profile::{
-    CredentialHandleRegistry, CredentialLease, CredentialLeaseFailure, CredentialProfile,
-    CredentialProfileAdmissionErrorKind, CredentialProfileCatalog, CredentialProfileLimits,
-    CredentialProfileName, CredentialProvider, CredentialProviderFailure,
+    ActivationAdmissionError, CredentialHandleRegistry, CredentialLease, CredentialLeaseFailure,
+    CredentialProfile, CredentialProfileAdmissionErrorKind, CredentialProfileCatalog,
+    CredentialProfileLimits, CredentialProfileName, CredentialProvider, CredentialProviderFailure,
     CredentialRegistryErrorKind, CredentialResolutionErrorKind, LeasedCredentialHandle,
     resolve_explicit_profile, resolve_explicit_profile_with_telemetry,
 };
@@ -1348,4 +1348,15 @@ fn admission_loss_preserves_resolution_and_reverse_cleanup() {
             SpanName::CredentialResolve | SpanName::CredentialRevoke
         )
     }));
+}
+
+#[test]
+fn unsupported_activation_preflight_error_is_fixed_and_sanitized() {
+    let error = ActivationAdmissionError::UnsupportedCredentialPreflight;
+    let rendered = format!("{error:?} {error}");
+
+    assert!(rendered.contains("credential profile preflight"));
+    assert!(!rendered.contains("orders.api"));
+    assert!(!rendered.contains("saturated-profile"));
+    assert!(!rendered.contains("lease-secret"));
 }
