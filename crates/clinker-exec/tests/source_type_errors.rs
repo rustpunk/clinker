@@ -149,7 +149,7 @@ nodes:
       schema:
 {schema}
 {source_options}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -723,7 +723,7 @@ nodes:
       cxl: |
         emit id = id
         emit quantity = quantity
-  - type: output
+  - type: sink
     name: out
     input: projected
     config:
@@ -781,7 +781,7 @@ nodes:
     inputs: [src_a, src_b]
     config:
       mode: interleave
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -837,7 +837,7 @@ nodes:
       on_unmapped:
         mode: reject
       sort_order: [id]
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -896,7 +896,7 @@ nodes:
         - { name: id, type: int }
         - { name: payload, type: string }
       sort_order: [id]
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

@@ -115,7 +115,7 @@ nodes:
     input: merged
     config:
       cxl: "emit failure = 1 / 0"
-  - type: output
+  - type: sink
     name: out
     input: observe_identity
     config:
@@ -179,14 +179,14 @@ nodes:
     input: duplicate.right
     config:
       cxl: "emit failure = 1 / 0"
-  - type: output
+  - type: sink
     name: left_out
     input: fail_left
     config:
       name: left_out
       type: csv
       path: left.csv
-  - type: output
+  - type: sink
     name: right_out
     input: fail_right
     config:
@@ -244,14 +244,14 @@ nodes:
     input: cull.removed
     config:
       cxl: "emit failure = 1 / 0"
-  - type: output
+  - type: sink
     name: kept_out
     input: fail_kept
     config:
       name: kept_out
       type: csv
       path: kept.csv
-  - type: output
+  - type: sink
     name: removed_out
     input: fail_removed
     config:
@@ -355,7 +355,7 @@ nodes:
     input: selected.yes
     config:
       cxl: "emit failure = 1 / 0"
-  - type: output
+  - type: sink
     name: out
     input: observe_identity
     config:
@@ -531,7 +531,7 @@ nodes:
     input: merged
     config:
       cxl: "emit failure = 1 / 0"
-  - type: output
+  - type: sink
     name: out
     input: observe_identity
     config:

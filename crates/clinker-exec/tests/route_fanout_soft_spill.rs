@@ -58,21 +58,21 @@ nodes:
         a: "region == \"a\""
         b: "region == \"b\""
       default: c
-  - type: output
+  - type: sink
     name: out_a
     input: by_region.a
     config:
       name: out_a
       type: csv
       path: out_a.csv
-  - type: output
+  - type: sink
     name: out_b
     input: by_region.b
     config:
       name: out_b
       type: csv
       path: out_b.csv
-  - type: output
+  - type: sink
     name: out_c
     input: by_region.c
     config:

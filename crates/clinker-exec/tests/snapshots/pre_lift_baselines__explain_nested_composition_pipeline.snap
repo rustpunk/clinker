@@ -32,7 +32,7 @@ composition.nested_process:
   buffer: materialized
   arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
-output.final_out:
+sink.final_out:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
@@ -46,7 +46,7 @@ edge source.raw_src -> composition.nested_process:
   buffer: node_buffer (slot=0)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: source)
 
-edge composition.nested_process -> output.final_out:
+edge composition.nested_process -> sink.final_out:
   buffer: node_buffer (slot=1)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: composition)
 
@@ -64,4 +64,4 @@ Worker threads: 4
 
   ● [source] raw_src (line:5)
   │ [composition:body=<ID>] nested_process (line:18)
-  │ [output] final_out (line:27)
+  │ [sink] final_out (line:27)

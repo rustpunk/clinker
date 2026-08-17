@@ -84,7 +84,7 @@ nodes:
       emit n = count(*)
 
       '
-- type: output
+- type: sink
   name: out
   input: dept_totals
   config:
@@ -119,7 +119,7 @@ nodes:
       emit amount_int = amount.to_int()
 
       '
-- type: output
+- type: sink
   name: out
   input: validate
   config:

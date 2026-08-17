@@ -66,7 +66,7 @@ aggregation.dept_totals:
   buffer: materialized
   arbitration: spill_priority=30, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
-output.out:
+sink.out:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
@@ -88,7 +88,7 @@ edge transform.windowed -> aggregation.dept_totals:
   buffer: node_buffer (slot=1)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: transform)
 
-edge aggregation.dept_totals -> output.out:
+edge aggregation.dept_totals -> sink.out:
   buffer: node_buffer (slot=2)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: aggregation)
 
@@ -143,5 +143,5 @@ Worker threads: 4
   │ [sort] __correlation_sort_orders
   │ [transform] windowed (line:19)
   ◇ [aggregation:hash] dept_totals (line:34)
-  │ [output] out (line:48)
+  │ [sink] out (line:48)
   │ [correlation_commit] __correlation_commit_terminal key=[order_id]

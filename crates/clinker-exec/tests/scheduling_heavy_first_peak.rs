@@ -110,7 +110,7 @@ nodes:
         emit heavy_total = h.total
         emit light_items = l.items
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: joined
     config:

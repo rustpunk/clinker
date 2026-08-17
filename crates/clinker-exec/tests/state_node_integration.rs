@@ -129,7 +129,7 @@ nodes:
       cxl: |
         emit id = id
         emit pipeline_last = $pipeline.last_amount
-  - type: output
+  - type: sink
     name: out
     input: read_back
     config:
@@ -191,7 +191,7 @@ nodes:
       cxl: |
         emit id = id
         emit src_label = $source.batch_label
-  - type: output
+  - type: sink
     name: out
     input: read_back
     config:
@@ -249,7 +249,7 @@ nodes:
       cxl: |
         emit id = id
         emit derived = $record.doubled
-  - type: output
+  - type: sink
     name: out
     input: read_back
     config:
@@ -309,7 +309,7 @@ nodes:
     use: ../compositions/declares_used.comp.yaml
     inputs:
       inp: parent_writer
-  - type: output
+  - type: sink
     name: out
     input: body
     config:
@@ -407,7 +407,7 @@ nodes:
         emit id = id
         emit lt = $source.tag_left.left_label
         emit rt = $source.tag_right.right_label
-  - type: output
+  - type: sink
     name: out
     input: read_back
     config:
@@ -497,7 +497,7 @@ nodes:
       cxl: |
         emit id = id
         emit cap = $pipeline.max_amount
-  - type: output
+  - type: sink
     name: out
     input: read_back
     config:
@@ -562,7 +562,7 @@ nodes:
       cxl: |
         emit id = id
         emit label = $source.file_label
-  - type: output
+  - type: sink
     name: out
     input: read_back
     config:
@@ -640,7 +640,7 @@ nodes:
         emit id = id
         emit tier = $vars.label
         emit threshold = $vars.cutoff
-  - type: output
+  - type: sink
     name: out
     input: filter_and_tag
     config:
@@ -711,7 +711,7 @@ nodes:
         emit id = id
         emit tier = $vars.label
         emit threshold = $vars.cutoff
-  - type: output
+  - type: sink
     name: out
     input: filter_and_tag
     config:

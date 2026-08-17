@@ -45,14 +45,14 @@ nodes:
       conditions:
         a: "region == \"a\""
       default: b
-  - type: output
+  - type: sink
     name: out_a
     input: by_region.a
     config:
       name: out_a
       type: csv
       path: out_a.csv
-  - type: output
+  - type: sink
     name: out_b
     input: by_region.b
     config:

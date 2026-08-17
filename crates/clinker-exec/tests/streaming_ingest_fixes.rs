@@ -153,7 +153,7 @@ nodes:
       cxl: |
         emit category = category
         emit ratio = sum(100 / divisor)
-  - type: output
+  - type: sink
     name: out
     input: by_category
     config:
@@ -260,7 +260,7 @@ nodes:
       cxl: |
         emit total = sum(amount)
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: total
     config:
@@ -301,7 +301,7 @@ nodes:
       cxl: |
         emit amount = amount
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: total
     config:
@@ -533,7 +533,7 @@ nodes:
       cxl: |
         emit category = category
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: by_category
     config:
@@ -623,7 +623,7 @@ nodes:
       cxl: |
         emit total = sum(amount)
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: total
     config:
