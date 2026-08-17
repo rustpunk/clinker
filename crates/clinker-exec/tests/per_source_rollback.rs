@@ -91,7 +91,7 @@ nodes:
       cxl: |
         emit id = id
         emit ratio = if($source.name == "src_b") then (1 / 0) else amt
-  - type: output
+  - type: sink
     name: out
     input: tfm
     config:
@@ -188,7 +188,7 @@ nodes:
       cxl: |
         emit id = id
         emit ratio = if(tag == "bad") then (1 / 0) else amt
-  - type: output
+  - type: sink
     name: out
     input: tfm
     config:
@@ -299,7 +299,7 @@ nodes:
         emit amt = d.amt
         emit dept = b.dept
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:
@@ -418,7 +418,7 @@ nodes:
         emit id = d.id
         emit ratio = d.amt / b.factor
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:
@@ -624,7 +624,7 @@ nodes:
         emit x = b.x
         emit ratio = d.amt / b.factor
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:
@@ -719,7 +719,7 @@ nodes:
         emit id = d.id
         emit ratio = d.amt / b.factor
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:
@@ -803,7 +803,7 @@ nodes:
         emit k = src_drv.k
         emit ratio = src_drv.amt / src_bld.factor
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:

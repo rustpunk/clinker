@@ -65,7 +65,7 @@ nodes:
   - type: merge
     name: m
     inputs: [src_a, src_b]
-  - type: output
+  - type: sink
     name: out
     input: m
     config:
@@ -147,7 +147,7 @@ nodes:
     inputs: [src_a, src_b]
     config:
       mode: interleave
-  - type: output
+  - type: sink
     name: out
     input: m
     config:
@@ -219,7 +219,7 @@ nodes:
       path: only.csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: only
     config:
@@ -273,7 +273,7 @@ nodes:
       path: empty.csv
       schema:
         - { name: id, type: int }
-  - type: output
+  - type: sink
     name: out
     input: empty_src
     config:
@@ -334,7 +334,7 @@ nodes:
     config:
       cxl: |
         emit id = id
-  - type: output
+  - type: sink
     name: out
     input: shape
     config:

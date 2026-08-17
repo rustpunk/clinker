@@ -25,7 +25,7 @@ nodes:
         emit salary = salary
         emit tier = if salary.to_int() >= 90000 then "senior" else "junior"
 
-  - type: output
+  - type: sink
     name: results
     input: tier_flag
     config:
