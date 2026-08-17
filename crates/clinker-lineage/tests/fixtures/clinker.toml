@@ -1,0 +1,9 @@
+[catalog.resources.reference_codes]
+kind = "file"
+path = "data/ref.csv"
+access = "read"
+
+[catalog.resources.body_ledger]
+kind = "file"
+path = "data/ledger.txt"
+access = "read"
