@@ -158,10 +158,14 @@ proposal derived from another record type.
 Discovery freezes the complete deterministic manifest up to 4,096 files and
 reports its fixed-size path/order/size identity without listing every path.
 Preview admits at most four files and 8 MiB of discovered file sizes globally,
-round-robin across sources while preserving each source's stable prefix, then
-reads at most 1,024 records globally. Coverage retains at most four file details
-per source and reports sampled, truncated, uncovered, and unreported aggregate
-counts for the rest. `--check` reads every file and record in that same frozen
+round-robin across sources while preserving each source's stable prefix. Every
+selected reader enforces its discovered length and fails if the file is opened
+at another size, truncates, or grows; it never hands a format reader bytes past
+the admitted boundary. Preview then reads at most 1,024 records globally.
+Coverage retains at most four file details per source and reports sampled,
+truncated, uncovered, and unreported aggregate counts for the rest. Multi-pass
+formats can report physical `bytes_read` above the admitted input size because
+each pass is counted. `--check` reads every file and record in that same frozen
 manifest instead of applying the preview budgets.
 
 Candidate storage is capped at 100,000 source-schema leaves, matching the

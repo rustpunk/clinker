@@ -1045,6 +1045,20 @@ fn modes_configuration_io_and_interruption_exits_are_distinct() {
         .expect("spawn post-discovery open failure");
     assert_eq!(disappeared.status.code(), Some(4));
 
+    let grew = Command::new(env!("CARGO_BIN_EXE_clinker"))
+        .current_dir(workspace.path())
+        .env("CLINKER_TEST_GUESS_GROW_AFTER_DISCOVERY", "1")
+        .args(["guess", "pipeline.yaml", "--field", "csv_orders.amount"])
+        .output()
+        .expect("spawn post-discovery input growth");
+    assert_eq!(grew.status.code(), Some(4));
+    assert!(grew.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&grew.stderr).contains("source length changed after admission"),
+        "growth must fail at the frozen reader boundary: {}",
+        String::from_utf8_lossy(&grew.stderr)
+    );
+
     std::fs::remove_file(workspace.path().join("input.csv")).expect("remove selected input");
     let io = guess(workspace.path(), &["--field", "csv_orders.amount"]);
     assert_eq!(io.status.code(), Some(4));

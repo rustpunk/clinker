@@ -100,6 +100,62 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
+/// Delivers exactly the source length admitted by a bounded caller.
+///
+/// The open-time metadata check catches a file that changed before the reader
+/// was built. This wrapper closes the remaining race while the reader is live:
+/// it rejects an early EOF and probes one byte past the admitted boundary so a
+/// concurrent append cannot silently expand the input. At most the admitted
+/// bytes are handed to the format reader; the one-byte probe is never exposed
+/// or credited to a [`ByteTally`].
+struct ExactLengthReader<R> {
+    inner: R,
+    remaining: u64,
+    finished: bool,
+}
+
+impl<R: Read> ExactLengthReader<R> {
+    fn new(inner: R, expected_len: u64) -> Self {
+        Self {
+            inner,
+            remaining: expected_len,
+            finished: false,
+        }
+    }
+}
+
+impl<R: Read> Read for ExactLengthReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() || self.finished {
+            return Ok(0);
+        }
+        if self.remaining > 0 {
+            let admitted = usize::try_from(self.remaining)
+                .unwrap_or(usize::MAX)
+                .min(buffer.len());
+            let read = self.inner.read(&mut buffer[..admitted])?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "source ended before its admitted length",
+                ));
+            }
+            self.remaining -= read as u64;
+            return Ok(read);
+        }
+
+        let mut overflow_probe = [0_u8; 1];
+        if self.inner.read(&mut overflow_probe)? != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "source grew beyond its admitted length",
+            ));
+        }
+        self.finished = true;
+        Ok(0)
+    }
+}
+
 /// A cheap `(len, mtime)` snapshot of a re-opened source's content, taken off
 /// the *open* handle (not the path) so it reflects the bytes that open will
 /// read.
@@ -150,12 +206,14 @@ pub struct ReopenableSource {
     /// Carried by the source rather than passed at each open so no call site
     /// can obtain bytes without counting them.
     tally: Option<ByteTally>,
+    /// Exact byte length each open may deliver, when a bounded caller froze
+    /// the source size before constructing its reader.
+    exact_len: Option<u64>,
 }
 
-/// The three byte-source shapes. Private: callers construct through
-/// [`ReopenableSource::path`], [`one_shot`](ReopenableSource::one_shot) and
-/// [`buffer`](ReopenableSource::buffer), so the tally cannot be dropped by
-/// building a source directly.
+/// The four byte-source shapes. Private: callers construct through the typed
+/// constructors, so the tally and optional exact-length guard cannot be
+/// dropped by building a source directly.
 enum SourceKind {
     /// Re-open a stable filesystem path. Each open is a fresh `std::fs::File`;
     /// for a staged, advisory-locked source two opens read identical bytes.
@@ -225,7 +283,11 @@ impl ReopenableSource {
     }
 
     fn of(kind: SourceKind) -> Self {
-        Self { kind, tally: None }
+        Self {
+            kind,
+            tally: None,
+            exact_len: None,
+        }
     }
 
     /// The number of bytes an open would deliver, when that is knowable.
@@ -255,6 +317,19 @@ impl ReopenableSource {
     #[must_use]
     pub fn with_tally(mut self, tally: ByteTally) -> Self {
         self.tally = Some(tally);
+        self
+    }
+
+    /// Require every open to deliver exactly `expected_len` bytes.
+    ///
+    /// Known-length sources are rejected at open time if their handle metadata
+    /// already differs. Every returned reader also rejects truncation or growth
+    /// while it is being consumed, and never hands more than the admitted
+    /// length to its format reader. The guard is preserved across
+    /// [`into_reopenable`](Self::into_reopenable).
+    #[must_use]
+    pub fn with_exact_len(mut self, expected_len: u64) -> Self {
+        self.exact_len = Some(expected_len);
         self
     }
 
@@ -324,6 +399,7 @@ impl ReopenableSource {
     /// another thread) surfaces as an opaque [`std::io::Error`].
     pub fn into_reopenable(self) -> std::io::Result<Self> {
         let tally = self.tally;
+        let exact_len = self.exact_len;
         let converted = match self.kind {
             SourceKind::OneShot(slot) => {
                 let reader = slot
@@ -333,16 +409,22 @@ impl ReopenableSource {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "one-shot reader already taken; convert via into_reopenable \
-                             before the first open",
+                            before the first open",
                         )
                     })?;
-                Self::buffer(reader)?
+                match exact_len {
+                    Some(expected_len) => {
+                        Self::buffer(ExactLengthReader::new(reader, expected_len))?
+                    }
+                    None => Self::buffer(reader)?,
+                }
             }
             already => Self::of(already),
         };
         Ok(Self {
             kind: converted.kind,
             tally,
+            exact_len,
         })
     }
 
@@ -384,7 +466,19 @@ impl ReopenableSource {
     /// once without first converting via
     /// [`into_reopenable`](Self::into_reopenable).
     pub fn open_with_identity(&self) -> std::io::Result<(Box<dyn Read + Send>, SourceIdentity)> {
-        let (reader, identity) = self.open_uncounted()?;
+        let (mut reader, identity) = self.open_uncounted()?;
+        if let Some(expected_len) = self.exact_len {
+            if !matches!(&self.kind, SourceKind::OneShot(_)) && identity.len != expected_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "source length changed after admission (expected {expected_len} bytes, opened {} bytes)",
+                        identity.len
+                    ),
+                ));
+            }
+            reader = Box::new(ExactLengthReader::new(reader, expected_len));
+        }
         let Some(tally) = self.tally.clone() else {
             return Ok((reader, identity));
         };
@@ -639,6 +733,99 @@ mod tests {
         let mut sink = Vec::new();
         src.open().unwrap().read_to_end(&mut sink).unwrap();
         assert_eq!(tally.read(), 12);
+    }
+
+    #[test]
+    fn exact_length_rejects_a_file_changed_before_open() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "clinker-exact-open-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"four").unwrap();
+        let src = ReopenableSource::path(&path).with_exact_len(4);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"!")
+            .unwrap();
+
+        let err = match src.open() {
+            Ok(_) => panic!("a changed source length must fail before reading"),
+            Err(err) => err,
+        };
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn exact_length_rejects_growth_without_handing_over_the_extra_byte() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "clinker-exact-grow-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"four").unwrap();
+        let tally = ByteTally::new();
+        let src = ReopenableSource::path(&path)
+            .with_exact_len(4)
+            .with_tally(tally.clone());
+        let mut reader = src.open().unwrap();
+        let mut admitted = [0_u8; 4];
+        reader.read_exact(&mut admitted).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"!")
+            .unwrap();
+
+        let err = reader.read_to_end(&mut Vec::new()).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(admitted, *b"four");
+        assert_eq!(tally.read(), 4, "the overflow probe is never handed over");
+    }
+
+    #[test]
+    fn exact_length_rejects_truncation_during_a_read() {
+        let path = std::env::temp_dir().join(format!(
+            "clinker-exact-shrink-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"four").unwrap();
+        let src = ReopenableSource::path(&path).with_exact_len(4);
+        let mut reader = src.open().unwrap();
+        let mut head = [0_u8; 2];
+        reader.read_exact(&mut head).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(2)
+            .unwrap();
+
+        let err = reader.read_to_end(&mut Vec::new()).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn exact_length_is_enforced_while_buffering_a_one_shot() {
+        let err = match ReopenableSource::one_shot(Box::new(Cursor::new(b"five!".to_vec())))
+            .with_exact_len(4)
+            .into_reopenable()
+        {
+            Ok(_) => panic!("buffering must not bypass the exact-length guard"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

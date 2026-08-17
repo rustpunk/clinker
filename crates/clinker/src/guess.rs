@@ -1925,7 +1925,21 @@ fn open_reader(
     };
     #[cfg(not(debug_assertions))]
     let open_path = file.path.clone();
-    let byte_source = ReopenableSource::path(open_path).with_tally(tally.clone());
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CLINKER_TEST_GUESS_GROW_AFTER_DISCOVERY").is_some() {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file.path)
+            .and_then(|mut input| input.write_all(b"\n"))
+            .map_err(|error| {
+                GuessError::infrastructure(format!(
+                    "cannot inject post-discovery input growth: {error}"
+                ))
+            })?;
+    }
+    let byte_source = ReopenableSource::path(open_path)
+        .with_exact_len(file.size)
+        .with_tally(tally.clone());
     let reader = clinker_exec::executor::build_source_format_reader(
         &source.body.source,
         &source.body.schema,

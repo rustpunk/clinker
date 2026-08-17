@@ -74,7 +74,11 @@ The default preview is deterministic, bounded, and read-only. It freezes the
 configured stable file order (name ascending by default) and reports the
 fixed-size identity of its normalized paths, order, and sizes, then allocates
 four file opens, 1,024 records, and 8 MiB of admitted file sizes globally in
-round-robin source/file order. The manifest itself is capped at 4,096 files;
+round-robin source/file order. Each selected reader is pinned to its discovered
+length: a pre-open mismatch, truncation, or growth fails instead of expanding
+the preview, and no format reader receives bytes beyond that admitted length.
+Multi-pass formats may report more physical `bytes_read` because each bounded
+pass rereads the same admitted input. The manifest itself is capped at 4,096 files;
 narrow a matcher or use `files.take_first` /
 `files.take_last` if the selected set is larger. The YAML/configuration cap
 limits candidates to 100,000 source-schema leaves. Per owner, at most eight
