@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Cursor, Write};
+#[cfg(feature = "lineage")]
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -12,9 +13,11 @@ use clinker_exec::telemetry::{
     MetricKey, SpanFact, SpanName, SpanStatus, TelemetryArena, TelemetryProducer,
     TelemetryReceiver, TraceSpan, unix_nanos_now,
 };
+#[cfg(feature = "lineage")]
 use clinker_lineage::logical_identity::{
     ExternalDatasetIdentity, LineageIdentityContext, LineageNodeBinding,
 };
+#[cfg(feature = "lineage")]
 use clinker_lineage::{
     OutputColumnLineage, TransformationSubtype, TransformationType, column_lineage_external,
     column_lineage_local_diagnostic_paths,
@@ -431,10 +434,12 @@ fn telemetry_full_arena_cannot_change_sink_bytes_or_exit_status() {
     );
 }
 
+#[cfg(feature = "lineage")]
 fn local_lineage(yaml: &str) -> clinker_lineage::PlanColumnLineage {
     column_lineage_local_diagnostic_paths(&compile(yaml), Path::new("/workspace"))
 }
 
+#[cfg(feature = "lineage")]
 fn output_named<'a>(
     lineage: &'a clinker_lineage::PlanColumnLineage,
     suffix: &str,
@@ -446,6 +451,7 @@ fn output_named<'a>(
         .unwrap_or_else(|| panic!("missing output dataset ending in {suffix:?}"))
 }
 
+#[cfg(feature = "lineage")]
 fn has_influence(
     output: &OutputColumnLineage,
     field: &str,
@@ -460,6 +466,7 @@ fn has_influence(
     })
 }
 
+#[cfg(feature = "lineage")]
 #[test]
 fn lineage_sink_mapping_reads_the_renamed_source_column_directly() {
     let lineage = local_lineage(
@@ -505,6 +512,7 @@ nodes:
     );
 }
 
+#[cfg(feature = "lineage")]
 #[test]
 fn lineage_sink_preserves_filter_and_authored_order_influence() {
     let lineage = local_lineage(
@@ -546,6 +554,7 @@ nodes:
     assert!(has_influence(output, "id", TransformationSubtype::Sort));
 }
 
+#[cfg(feature = "lineage")]
 #[test]
 fn lineage_sink_fan_out_keeps_each_branch_filter_influence() {
     let lineage = local_lineage(
@@ -588,6 +597,7 @@ nodes:
     }
 }
 
+#[cfg(feature = "lineage")]
 fn binding(node: &str, dataset: &str) -> LineageNodeBinding {
     LineageNodeBinding::new(
         node,
@@ -595,6 +605,7 @@ fn binding(node: &str, dataset: &str) -> LineageNodeBinding {
     )
 }
 
+#[cfg(feature = "lineage")]
 #[test]
 fn lineage_two_body_scoped_sinks_keep_distinct_external_identities() {
     let workspace = tempfile::tempdir().expect("workspace");
