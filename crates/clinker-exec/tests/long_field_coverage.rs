@@ -129,7 +129,7 @@ nodes:
         emit comment_upper = comment.upper()
         emit tagged = ticket_uuid.substring(0, 8).concat("|", comment)
         filter comment.length() > 4
-  - type: output
+  - type: sink
     name: out
     input: derive
     config:
@@ -195,7 +195,7 @@ nodes:
       cxl: |
         emit agent_uuid = agent_uuid
         emit ticket_count = count(*)
-  - type: output
+  - type: sink
     name: out
     input: by_agent
     config:
@@ -256,7 +256,7 @@ nodes:
       cxl: |
         emit ticket_uuid = ticket_uuid
         distinct by ticket_uuid
-  - type: output
+  - type: sink
     name: out
     input: dedup
     config:
@@ -346,7 +346,7 @@ nodes:
         emit agent_name = a.agent_name
         emit shipping_address = t.shipping_address
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:
@@ -424,7 +424,7 @@ nodes:
       conditions:
         keep: "true"
       default: drop
-  - type: output
+  - type: sink
     name: out
     input: fan.keep
     config:
@@ -507,7 +507,7 @@ nodes:
         - { name: ticket_uuid, type: string }
         - { name: shipping_address, type: string }
         - { name: comment, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:
@@ -556,7 +556,7 @@ nodes:
         - { name: ticket_uuid, type: string }
         - { name: shipping_address, type: string }
         - { name: comment, type: string }
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

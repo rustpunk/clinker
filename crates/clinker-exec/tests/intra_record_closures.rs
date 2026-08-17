@@ -97,7 +97,7 @@ nodes:
       cxl: |
         emit kept = items.filter(it => it["price"] > 5)
         emit prices = items.map(it => it["price"])
-  - type: output
+  - type: sink
     name: out
     input: derive
     config:
@@ -158,7 +158,7 @@ nodes:
           emit sku = it["sku"]
           emit price = it["price"]
         }
-  - type: output
+  - type: sink
     name: out
     input: explode
     config:
@@ -225,7 +225,7 @@ nodes:
             emit val = it
           }
         }
-  - type: output
+  - type: sink
     name: out
     input: explode
     config:
@@ -289,7 +289,7 @@ nodes:
             emit val = it
           }
         }
-  - type: output
+  - type: sink
     name: out
     input: explode
     config:
@@ -345,7 +345,7 @@ nodes:
         emit each it in items {
           emit val = it
         }
-  - type: output
+  - type: sink
     name: out
     input: explode
     config:
@@ -405,7 +405,7 @@ nodes:
         emit enriched = items.map(it => it.set("region", "us-east"))
         emit slim = items.map(it => it.remove_field("internal_id"))
         emit pruned = items.map(it => it.unset("meta.flag"))
-  - type: output
+  - type: sink
     name: out
     input: derive
     config:
@@ -511,7 +511,7 @@ nodes:
         emit best = items.find(it => it["price"] > 15)
         emit any_cheap = items.any(it => it["price"] < 10)
         emit dropped_second = items.remove(1)
-  - type: output
+  - type: sink
     name: out
     input: derive
     config:

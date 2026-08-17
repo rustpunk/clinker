@@ -151,7 +151,7 @@ nodes:
         emit seg = seg_id
         emit ref = msg_ref
         emit control = $doc.unb.e05
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -199,7 +199,7 @@ nodes:
         - { name: msg_type, type: { nullable: string } }
         - { name: e01, type: { nullable: string } }
         - { name: e02, type: { nullable: string } }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -243,7 +243,7 @@ nodes:
     config:
       cxl: |
         emit seg = seg_id
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -300,7 +300,7 @@ nodes:
         - { name: msg_type, type: { nullable: string } }
         - { name: e01, type: { nullable: string } }
         - { name: e02, type: { nullable: string } }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -357,7 +357,7 @@ nodes:
         - { name: e01, type: { nullable: string } }
         - { name: e02, type: { nullable: string } }
         - { name: e03, type: { nullable: string } }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -408,7 +408,7 @@ nodes:
     config:
       cxl: |
         emit seg = seg_id
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -450,7 +450,7 @@ nodes:
       glob: ./*.edi
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -485,7 +485,7 @@ nodes:
       glob: ./*.edi
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -527,7 +527,7 @@ nodes:
       cxl: |
         emit seg = seg_id
         emit first = e01
-  - type: output
+  - type: sink
     name: out
     input: project
     config:
@@ -597,7 +597,7 @@ nodes:
         - { name: e01, type: { nullable: string } }
         - { name: e02, type: { nullable: string } }
         - { name: e03, type: { nullable: string } }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -655,7 +655,7 @@ nodes:
       cxl: |
         emit seg = seg_id
         emit sender = $doc.unb.e02
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -705,7 +705,7 @@ nodes:
       glob: ./*.edi
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -743,7 +743,7 @@ nodes:
       glob: ./*.edi
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:
@@ -778,7 +778,7 @@ nodes:
       glob: ./*.edi
       schema:
         - { name: seg_id, type: string }
-  - type: output
+  - type: sink
     name: out
     input: interchange
     config:

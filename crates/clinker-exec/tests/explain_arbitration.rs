@@ -85,7 +85,7 @@ nodes:
         emit department = department
         emit total = sum(amount)
 
-  - type: output
+  - type: sink
     name: out
     input: dept_totals
     config:
@@ -212,11 +212,11 @@ nodes:
     name: right
     input: shared
     config: { cxl: "emit id = id" }
-  - type: output
+  - type: sink
     name: left_out
     input: left
     config: { name: left_out, type: csv, path: left.csv }
-  - type: output
+  - type: sink
     name: right_out
     input: right
     config: { name: right_out, type: csv, path: right.csv }
@@ -358,7 +358,7 @@ nodes:
       cxl: |
         emit department = department
         emit amount = amount
-  - type: output
+  - type: sink
     name: out
     input: tag
     config:
@@ -421,7 +421,7 @@ nodes:
         emit amount = orders.amount
         emit name = products.name
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: enriched
     config:
@@ -588,7 +588,7 @@ nodes:
             set:
               plan_end: "plan_start"
 
-  - type: output
+  - type: sink
     name: out
     input: backfill
     config:

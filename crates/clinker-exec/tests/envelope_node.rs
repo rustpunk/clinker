@@ -252,7 +252,7 @@ nodes:
       cxl: |
         emit id = id
         emit tag = $doc.interchange.tag
-{envelope_node}  - type: output
+{envelope_node}  - type: sink
     name: out
     input: {output_input}
     config:
@@ -652,7 +652,7 @@ nodes:
       cxl: |
         emit category = category
         emit n = count(*)
-  - type: output
+  - type: sink
     name: out
     input: by_category
     config:
@@ -764,7 +764,7 @@ nodes:
       cxl: |
         emit id = id
         emit doc_tag = $doc.interchange.tag
-  - type: output
+  - type: sink
     name: out
     input: stamp
     config:
@@ -1220,7 +1220,7 @@ nodes:
     name: framed
     body: tag
     config: { strategy: concat }
-  - type: output
+  - type: sink
     name: out
     input: framed
     config:
@@ -1416,7 +1416,7 @@ nodes:
     body: body
     header: hdr
     config: { strategy: preserve }
-  - type: output
+  - type: sink
     name: out
     input: framed
     config:
@@ -1605,7 +1605,7 @@ nodes:
     body: body
     trailer: tail
     config: { strategy: preserve }
-  - type: output
+  - type: sink
     name: out
     input: framed
     config:
@@ -1688,7 +1688,7 @@ nodes:
       footer:
         interchange:
           {footer_field}
-  - type: output
+  - type: sink
     name: out
     input: framed
     config:
