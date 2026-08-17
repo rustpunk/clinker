@@ -20,3 +20,18 @@ cases:
   - name: preview_selector_group_xml
     selector: group:xml_preview
     field: xml_orders.total
+  - name: modes_preview_unresolved_exit_zero
+    selector: base
+    field: csv_orders.amount
+  - name: modes_check_unresolved_exit_three
+    selector: base
+    field: csv_orders.amount
+  - name: modes_write_unavailable_no_edit
+    selector: base
+    field: all
+  - name: evidence_nullable_absence_and_default
+    selector: base
+    field: json_orders.ratio
+  - name: evidence_mixed_exact_votes
+    selector: base
+    field: csv_orders.amount

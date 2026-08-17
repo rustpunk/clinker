@@ -226,13 +226,9 @@ pub fn build_source_format_reader(
 }
 
 /// Open a single `Read` from a re-openable source for a one-pass format reader,
-/// mapping an open failure to a pipeline config-validation error.
+/// preserving an open failure as structured pipeline I/O.
 fn open_one_shot(source: &ReopenableSource) -> Result<Box<dyn Read + Send>, PipelineError> {
-    source.open().map_err(|e| {
-        PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-            "failed to open source bytes: {e}"
-        )))
-    })
+    source.open().map_err(PipelineError::Io)
 }
 
 /// Build a [`MultiFileFormatReader`] wrapping every file the discovery

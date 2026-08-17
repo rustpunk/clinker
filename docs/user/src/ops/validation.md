@@ -50,6 +50,69 @@ Prefer `--explain text` when reviewing a schema change because the resulting
 plan is visible evidence of what the planner admitted. See [Explain
 Plans](explain.md) for text, JSON, and DOT plan output.
 
+## Concretizing `numeric` source fields
+
+`numeric` is an authoring-only placeholder. Runtime planning still rejects it
+with E158; use `clinker guess` to collect the real readers' parser evidence and
+produce an exact patch, then review and apply that patch before compilation.
+
+```bash
+clinker guess pipeline.yaml
+clinker guess pipeline.yaml --field orders.amount --field orders.tax
+clinker guess pipeline.yaml --channel production --check
+```
+
+With no selector, the base pipeline is inspected. Exactly one `--channel ID`
+or `--group NAME` selects an effective configuration; the two options conflict.
+Repeatable `--field node.column` selectors only narrow the literal `numeric`
+leaves and preserve their first requested order. A selector can represent more
+than one authored multi-record leaf, and the report gives every exact owner
+address separately.
+
+The default preview is deterministic, bounded, and read-only. It freezes the
+configured stable file order (name ascending by default) and reports the
+fixed-size identity of its normalized paths, order, and sizes, then allocates
+four file opens, 1,024 records, and 8 MiB of admitted file sizes globally in
+round-robin source/file order. The manifest itself is capped at 4,096 files;
+narrow a matcher or use `files.take_first` /
+`files.take_last` if the selected set is larger. The YAML/configuration cap
+limits candidates to 100,000 source-schema leaves. Per owner, at most eight
+representative observations are retained, each with at most 128 bytes of
+numeric lexeme evidence. Coverage retains at most four file details per source
+and reports aggregate sampled, truncated, uncovered, and unreported counts for
+the rest. These fixed bounds are also printed in the JSON report.
+
+The manifest identity covers normalized path, configured order, and discovered
+size; it is not a content hash or a compare-and-swap proof. The future write
+mode must re-read and compare exact configuration and input snapshots before
+any edit. Preview and check perform no edit.
+
+`--check` uses the same frozen, capped manifest but reads every selected file
+and record. It is exhaustive over that manifest rather than subject to the
+preview's open/record/byte sampling budgets. `--write` is reserved for the
+compare-and-swap editor and is not available yet: it exits 1, recommends
+`--check`, and does not edit the pipeline or input.
+
+Numeric votes come only from the parser-owned observations used by the shared
+runtime reader construction. Exact integers vote `int`; finite, representation-
+safe values vote `float`. Mixed integer/float evidence resolves to `float` only
+when every integer is exactly representable there. Numeric defaults vote
+through the schema parser. Accepted missing/null/empty states abstain but remain
+reported, forbidden absence is a conflict, and all-no-value evidence remains
+unresolved. No confidence threshold or statistical guess is used.
+
+| Exit | Meaning |
+|------|---------|
+| 0 | Preview completed, including a preview with unresolved owners; or exhaustive check resolved every owner. |
+| 1 | Configuration or selection error, including unavailable `--write`. |
+| 3 | Exhaustive `--check` completed but at least one owner is unresolved. |
+| 4 | Source discovery, reader, I/O, signal-handler, or report-output failure. |
+| 130 | Interrupted before a complete report could be emitted. |
+
+Inspect `outcome`, every owner-level `unresolved_reasons` entry, coverage, and
+the emitted patch. A preview exit of 0 is not proof that every selected field
+resolved; use `--check` when the exit status must enforce that condition.
+
 ## Preview options are not yet a bounded preview
 
 The CLI accepts `--dry-run -n N` and `--dry-run-output PATH`, but those options
@@ -100,7 +163,7 @@ canonical result:
 clinker run pipeline.yaml --explain text
 ```
 
-## Recommended workflow
+## Recommended runtime-validation workflow
 
 1. Run `clinker run pipeline.yaml --explain text` for planner admission and
    inspect the compiled DAG.
