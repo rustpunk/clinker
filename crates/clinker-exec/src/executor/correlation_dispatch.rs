@@ -459,7 +459,7 @@ fn order_clean_slots(
             detail: "correlation writer queue contains mixed physical boundaries".to_string(),
         });
     }
-    let boundary = crate::executor::output_dispatch::OrderedWriterBoundary::for_output(
+    let boundary = crate::executor::sink_dispatch::OrderedWriterBoundary::for_sink(
         current_dag,
         output_id,
         WriterBoundaryMode::CorrelationDeferred,

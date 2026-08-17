@@ -68,7 +68,7 @@ enum DispatchFaultKind {
     Merge,
     Sort,
     Envelope,
-    Output,
+    Sink,
     Cull,
     Reshape,
 }
@@ -86,7 +86,7 @@ impl DispatchFaultKind {
             "dispatch_merge" => Some(Self::Merge),
             "dispatch_sort" => Some(Self::Sort),
             "dispatch_envelope" => Some(Self::Envelope),
-            "dispatch_output" => Some(Self::Output),
+            "dispatch_sink" => Some(Self::Sink),
             "dispatch_cull" => Some(Self::Cull),
             "dispatch_reshape" => Some(Self::Reshape),
             _ => None,
@@ -1592,7 +1592,7 @@ pub(crate) struct ExecutorContext<'a> {
     /// has already been moved into the streaming task and there is no
     /// buffered batch to drain. Empty when no streaming chain
     /// qualified.
-    pub(crate) streaming_output_nodes: HashSet<NodeIndex>,
+    pub(crate) streaming_sink_nodes: HashSet<NodeIndex>,
 
     /// `producer → Aggregate` edges whose ingest streams. Keyed by the
     /// producer's `NodeIndex`, valued by the consuming `Aggregate`'s
@@ -3926,7 +3926,7 @@ pub(crate) fn transform_fused_consume(
     // Streaming inter-stage handoff: when a single streaming-eligible
     // Output downstream of this fused Transform installed its sender under
     // this node's index at executor entry (per `classify_stream_nodes` /
-    // `compute_streaming_output_specs`), take it here. Each flushed batch
+    // `compute_streaming_sink_specs`), take it here. Each flushed batch
     // is then sent straight to the writer thread over the bounded channel
     // — the blocking `send` is the back-pressure pivot, so peak
     // inter-stage memory is one batch plus the channel's bound, never the
@@ -4531,8 +4531,8 @@ pub(crate) fn dispatch_plan_node(
                 node_idx,
                 &node,
             ),
-            DispatchFaultKind::Output => {
-                crate::executor::output_dispatch::dispatch_output(ctx, current_dag, node_idx, &node)
+            DispatchFaultKind::Sink => {
+                crate::executor::sink_dispatch::dispatch_sink(ctx, current_dag, node_idx, &node)
             }
             DispatchFaultKind::Cull => {
                 crate::executor::cull_dispatch::dispatch_cull(ctx, current_dag, node_idx, &node)
@@ -4580,7 +4580,7 @@ pub(crate) fn dispatch_plan_node(
             )?;
         }
 
-        PlanNode::Output { .. } => {
+        PlanNode::Sink { .. } => {
             if matches!(
                 ctx.run_policy.preview(),
                 crate::executor::PreviewPolicy::ConfigOnly
@@ -4588,10 +4588,10 @@ pub(crate) fn dispatch_plan_node(
                 return Err(PipelineError::Internal {
                     op: "run-policy",
                     node: node.name().to_string(),
-                    detail: "config-only policy reached Output dispatch".to_string(),
+                    detail: "config-only policy reached Sink dispatch".to_string(),
                 });
             }
-            crate::executor::output_dispatch::dispatch_output(ctx, current_dag, node_idx, &node)?;
+            crate::executor::sink_dispatch::dispatch_sink(ctx, current_dag, node_idx, &node)?;
         }
 
         PlanNode::Reshape { .. } => {

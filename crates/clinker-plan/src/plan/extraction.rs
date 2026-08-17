@@ -439,7 +439,7 @@ mod tests {
     }
 
     fn output(name: &str, id: usize) -> PlanNode {
-        PlanNode::Output {
+        PlanNode::Sink {
             name: name.to_owned(),
             id: PlanNodeId::new(id),
             span: Span::SYNTHETIC,

@@ -3821,7 +3821,7 @@ pub(crate) fn lower_node_to_plan_node(
     let name = node.name();
     use crate::plan::composition_body::CompositionBodyId;
     use crate::plan::execution::{
-        NodeExecutionReqs, ParallelismClass, PartitionLookupKind, PlanNode, PlanOutputPayload,
+        NodeExecutionReqs, ParallelismClass, PartitionLookupKind, PlanNode, PlanSinkPayload,
         PlanSourcePayload, PlanTransformPayload, derive_parallelism_class, extract_has_distinct,
         extract_write_set,
     };
@@ -4011,11 +4011,11 @@ pub(crate) fn lower_node_to_plan_node(
                 output_schema: schema_from_bound(),
             })
         }
-        PipelineNode::Sink { config, .. } => Some(PlanNode::Output {
+        PipelineNode::Sink { config, .. } => Some(PlanNode::Sink {
             name: name.to_string(),
             id,
             span,
-            resolved: Some(Box::new(PlanOutputPayload {
+            resolved: Some(Box::new(PlanSinkPayload {
                 output: config.output.clone(),
                 validated_path: None,
                 fan_out_per_source_file: false,

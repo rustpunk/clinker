@@ -113,7 +113,7 @@ nodes:
         audit: value > 0
         report: value > 0
       default: audit
-  - type: output
+  - type: sink
     name: audit
     input: fanout
     config:
@@ -121,7 +121,7 @@ nodes:
       type: csv
       path: audit.csv
       include_unmapped: true
-  - type: output
+  - type: sink
     name: report
     input: fanout
     config:
@@ -180,7 +180,7 @@ nodes:
   - type: merge
     name: merged
     inputs: [src_a, src_b]
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -237,7 +237,7 @@ nodes:
   - type: merge
     name: merged
     inputs: [src_a, src_b]
-  - type: output
+  - type: sink
     name: out
     input: merged
     config:
@@ -297,7 +297,7 @@ nodes:
         audit: id != ""
         report: id != ""
       default: audit
-  - type: output
+  - type: sink
     name: audit
     input: fanout
     config:
@@ -305,7 +305,7 @@ nodes:
       type: csv
       path: audit.csv
       include_unmapped: true
-  - type: output
+  - type: sink
     name: report
     input: fanout
     config:
@@ -358,7 +358,7 @@ fn deliveries_state_retains_row_and_terminal_consumer_identity() {
     let compact = |source: &str| source.split_whitespace().collect::<String>();
     let dispatch = compact(include_str!("../src/executor/dispatch.rs"));
     let streaming = compact(include_str!("../src/executor/streaming.rs"));
-    let output = compact(include_str!("../src/executor/output_dispatch.rs"));
+    let output = compact(include_str!("../src/executor/sink_dispatch.rs"));
     let correlation = compact(include_str!("../src/executor/correlation_dispatch.rs"));
 
     assert!(

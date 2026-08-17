@@ -65,7 +65,7 @@ use crate::executor::dispatch::{
     source_name_arc_of,
 };
 use crate::executor::node_buffer::NodeBuffer;
-use crate::executor::output_dispatch::OrderedWriterBoundary;
+use crate::executor::sink_dispatch::OrderedWriterBoundary;
 use crate::executor::stream_event::{SourceRowId, StreamEvent};
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
 use crate::executor::{DlqEntry, build_format_writer};

@@ -620,7 +620,7 @@ nodes:
 }
 
 #[test]
-fn test_compile_lowered_output_carries_resolved_payload() {
+fn test_compile_lowered_sink_carries_resolved_payload() {
     use clinker_plan::plan::execution::PlanNode;
     let yaml = r#"
 pipeline:
@@ -650,13 +650,13 @@ nodes:
     let has = plan.dag().graph.node_weights().any(|n| {
         matches!(
             n,
-            PlanNode::Output {
+            PlanNode::Sink {
                 resolved: Some(_),
                 ..
             }
         )
     });
-    assert!(has, "Output resolved payload missing");
+    assert!(has, "Sink resolved payload missing");
 }
 
 #[test]

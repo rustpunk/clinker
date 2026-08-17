@@ -21,13 +21,13 @@ pub(crate) mod invariant;
 pub(crate) mod merge_dispatch;
 pub mod node_buffer;
 pub(crate) mod node_buffer_spill;
-pub(crate) mod output_dispatch;
 mod params;
 mod registry;
 pub(crate) mod reshape_dispatch;
 mod route;
 pub(crate) mod route_dispatch;
 mod schema_check;
+pub(crate) mod sink_dispatch;
 pub(crate) mod sort_dispatch;
 pub(crate) mod source_activation;
 pub(crate) mod source_dispatch;
@@ -64,7 +64,7 @@ pub use storage_validate::{
 };
 pub use stream_event::{OutputDeliveryId, SourceRowId};
 pub(crate) use streaming::StreamingOutputTaskOutput;
-use streaming::{compute_streaming_output_specs, streaming_output};
+use streaming::{compute_streaming_sink_specs, streaming_sink};
 pub(crate) use transform::{
     WindowedEvalCtx, evaluate_single_transform, evaluate_single_transform_windowed,
 };
@@ -1601,7 +1601,7 @@ impl PipelineExecutor {
         let streaming_contracts = preview_streaming_contracts
             .as_ref()
             .unwrap_or(&fused_transforms);
-        let streaming_specs = compute_streaming_output_specs(
+        let streaming_specs = compute_streaming_sink_specs(
             plan,
             config,
             streaming_contracts,
@@ -1613,7 +1613,7 @@ impl PipelineExecutor {
             petgraph::graph::NodeIndex,
             crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
         > = HashMap::new();
-        let mut streaming_output_nodes: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
+        let mut streaming_sink_nodes: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
         let mut streaming_output_tasks: Vec<std::thread::JoinHandle<StreamingOutputTaskOutput>> =
             Vec::new();
         let mut streaming_charge_consumers: HashMap<
@@ -1627,7 +1627,7 @@ impl PipelineExecutor {
             let raw_writer = writers
                 .single
                 .remove(&spec.output_name)
-                .expect("compute_streaming_output_specs verified writers.single contains output");
+                .expect("compute_streaming_sink_specs verified writers.single contains output");
             // 256 is the bounded channel capacity. The writer thread
             // typically clears each record in microseconds; capacity
             // above ~256 buys no measured throughput but burns memory
@@ -1657,14 +1657,14 @@ impl PipelineExecutor {
             let writer_charge_handle = charge_handle.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("clinker-output-{output_name}"))
-                .spawn(move || streaming_output(rx, raw_writer, spec, writer_charge_handle))
+                .spawn(move || streaming_sink(rx, raw_writer, spec, writer_charge_handle))
                 .map_err(|e| PipelineError::Internal {
                     op: "streaming-output-spawn",
                     node: output_name,
                     detail: format!("failed to spawn streaming output thread: {e}"),
                 })?;
             streaming_output_senders.insert(producer_idx, tx);
-            streaming_output_nodes.insert(output_idx);
+            streaming_sink_nodes.insert(output_idx);
             streaming_output_tasks.push(handle);
             streaming_charge_consumers.insert(producer_idx, (charge_consumer_id, charge_handle));
         }
@@ -1741,7 +1741,7 @@ impl PipelineExecutor {
                 params.telemetry_producer.clone(),
             ),
             streaming_output_senders,
-            streaming_output_nodes,
+            streaming_sink_nodes,
             streaming_aggregate_ingest_edges,
             streaming_combine_probe_edges,
             streaming_output_tasks,
@@ -1854,7 +1854,7 @@ impl PipelineExecutor {
                 Ok(out) => out.fold_into(&mut ctx),
                 Err(_panic) => {
                     ctx.output_errors.push(PipelineError::Internal {
-                        op: "streaming_output",
+                        op: "streaming_sink",
                         node: String::from("<unknown>"),
                         detail: String::from("streaming output thread panicked"),
                     });
