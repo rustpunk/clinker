@@ -41,7 +41,7 @@ nodes:
     input: orders
     config:
       cxl: "emit order_id = order_id\nemit amount = amount"
-  - type: output
+  - type: sink
     name: sink
     input: normalize
     config:
@@ -401,7 +401,7 @@ nodes:
     input: orders
     config:
       cxl: "emit order_id = order_id\nemit amount = amount"
-  - type: output
+  - type: sink
     name: sink
     input: normalize
     config:
@@ -457,7 +457,7 @@ nodes:
       path: orders.csv
       schema:
         - { name: amount, type: numeric }
-  - type: output
+  - type: sink
     name: sink
     input: orders
     config:

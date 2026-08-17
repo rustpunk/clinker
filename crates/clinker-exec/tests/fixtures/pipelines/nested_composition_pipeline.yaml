@@ -24,7 +24,7 @@ nodes:
     config:
       strict_mode: false
 
-  - type: output
+  - type: sink
     name: final_out
     input: nested_process
     config:

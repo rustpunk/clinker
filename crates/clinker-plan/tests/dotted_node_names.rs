@@ -59,7 +59,7 @@ nodes:
       path: in.csv
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: out
     input: raw.orders
     config:
@@ -85,7 +85,7 @@ nodes:
       path: in.csv
       schema:
         - { name: amount, type: int }
-  - type: output
+  - type: sink
     name: enrich.ref
     input: src
     config:
@@ -146,7 +146,7 @@ nodes:
     use: ../compositions/passthrough.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: enrich.step
     config:
@@ -209,7 +209,7 @@ nodes:
     use: ../compositions/dotted_body.comp.yaml
     inputs:
       inp: src
-  - type: output
+  - type: sink
     name: out
     input: enrich
     config:
@@ -247,14 +247,14 @@ nodes:
       conditions:
         high: "amount > 100"
       default: low
-  - type: output
+  - type: sink
     name: high_out
     input: split.high
     config:
       name: high_out
       type: csv
       path: high.csv
-  - type: output
+  - type: sink
     name: low_out
     input: split.low
     config:

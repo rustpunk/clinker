@@ -59,7 +59,7 @@ nodes:
       group_by: [dept]
       cxl: |
         emit total = sum(amount)
-  - type: output
+  - type: sink
     name: output
     input: by_dept
     config:
@@ -146,7 +146,7 @@ fn test_explain_aggregate_renders_as_sibling() {
         .unwrap();
     let output_idx = topology
         .lines()
-        .position(|l| l.contains("[output] output"))
+        .position(|l| l.contains("[sink] output"))
         .unwrap();
     assert!(source_idx < agg_idx && agg_idx < output_idx);
 }
@@ -176,7 +176,7 @@ nodes:
     config:
       cxl: |
         emit x = amount + 1
-  - type: output
+  - type: sink
     name: output
     input: step_one
     config:

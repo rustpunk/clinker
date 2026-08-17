@@ -67,21 +67,21 @@ nodes:
         high: "amount > 100"
         flagged: "status == 'urgent'"
       default: low
-  - type: output
+  - type: sink
     name: high_out
     input: split.high
     config:
       name: high_out
       type: csv
       path: high.csv
-  - type: output
+  - type: sink
     name: flagged_out
     input: split.flagged
     config:
       name: flagged_out
       type: csv
       path: flagged.csv
-  - type: output
+  - type: sink
     name: low_out
     input: split.low
     config:
@@ -162,7 +162,7 @@ nodes:
         emit order_id = orders.order_id
         emit pname = products.name
       propagate_ck: driver
-  - type: output
+  - type: sink
     name: out
     input: join
     config:
@@ -222,14 +222,14 @@ nodes:
           drop_group_when: "sum(if status == 'error' then 1 else 0) > 0"
         - name: drop_big
           drop_group_when: "sum(amount) > 100"
-  - type: output
+  - type: sink
     name: out
     input: cd
     config:
       name: out
       type: csv
       path: out.csv
-  - type: output
+  - type: sink
     name: audit
     input: cd.removed
     config:
@@ -281,7 +281,7 @@ nodes:
       cxl: |
         emit id = id
         emit amount = amount
-  - type: output
+  - type: sink
     name: out
     input: passthrough
     config:

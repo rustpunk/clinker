@@ -41,7 +41,7 @@ nodes:
     schema:
       - { name: id, type: int }
       - { name: event_time, type: date_time }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -78,7 +78,7 @@ nodes:
     schema:
       - { name: id, type: int }
       - { name: event_time, type: date_time }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -115,7 +115,7 @@ nodes:
     schema:
       - { name: id, type: int }
       - { name: day, type: date }
-- type: output
+- type: sink
   name: out
   input: src
   config:
@@ -154,7 +154,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: hourly_clicks
   config:
@@ -206,7 +206,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: hourly_clicks
   config:
@@ -262,7 +262,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: hourly_clicks
   config:
@@ -311,7 +311,7 @@ nodes:
     cxl: |
       emit user_id = user_id
       emit n = count(*)
-- type: output
+- type: sink
   name: out
   input: by_user
   config:
@@ -340,7 +340,7 @@ nodes:
     schema:
       - { name: id, type: int }
       - { name: event_time, type: date_time }
-- type: output
+- type: sink
   name: out
   input: src
   config:

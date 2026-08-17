@@ -27,7 +27,7 @@ nodes:
       path: ./in.{format}
 {options}      schema:
         - {{ name: id, type: int }}
-  - type: output
+  - type: sink
     name: out
     input: src
     config:

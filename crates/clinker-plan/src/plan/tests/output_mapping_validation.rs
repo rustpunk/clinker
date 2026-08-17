@@ -39,7 +39,7 @@ nodes:
         - {{ name: first_name, type: string }}
         - {{ name: last_name, type: string }}
         - {{ name: department, type: string }}
-  - type: output
+  - type: sink
     name: out
     input: people
     config:
@@ -344,7 +344,7 @@ nodes:
       path: ./people.csv
       schema:
         - { name: first_name, type: string }
-  - type: output
+  - type: sink
     name: out
     input: people
     config:
@@ -378,7 +378,7 @@ nodes:
       path: ./people.csv
       schema:
         - { name: first_name, type: string }
-  - type: output
+  - type: sink
     name: out
     input: people
     config:
@@ -412,7 +412,7 @@ nodes:
       path: ./people.csv
       schema:
         - { name: first_name, type: string }
-  - type: output
+  - type: sink
     name: out
     input: people
     config:
