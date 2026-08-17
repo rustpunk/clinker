@@ -2799,6 +2799,20 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         channel_record_vars.extend(overlay.record_vars);
     }
 
+    // Seal the only runtime capability source immediately after the effective
+    // plan exists and before lineage construction, machine lifecycle writes,
+    // worker startup, discovery, staging, or Source/Sink construction. This
+    // binary does not yet expose a credential-profile surface, so any nonempty
+    // logical credential set or credential-handle capacity fails closed here.
+    let admitted_run_capabilities = credential_profile::admit_uncredentialed_run_capabilities(
+        &compiled_plan,
+    )
+    .map_err(|error| {
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+            "[E379] activation admission failed: {error}"
+        )))
+    })?;
+
     // Resolve every emitted source/output identity before discovery, staging,
     // publication-attempt creation, or lineage-sink opening. A missing or
     // ambiguous external binding is an admission failure, not a mid-run event.
@@ -3526,8 +3540,9 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     // post-overlay config — so the context it recompiles under must NOT carry
     // the overlay ops again (they would double-apply and collide). For a plain
     // run this is identical to `compile_ctx.clone()` (the op stream is empty).
-    let execution_result = PipelineExecutor::run_plan_with_readers_writers_in_context(
+    let execution_result = PipelineExecutor::run_admitted_plan_with_readers_writers_in_context(
         &compiled_plan,
+        admitted_run_capabilities,
         readers,
         registry,
         &run_params,
