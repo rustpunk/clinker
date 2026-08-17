@@ -44,6 +44,9 @@ use crate::doc_index::DocArenaIndex;
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, coerce_section_fields};
 use crate::error::FormatError;
 use crate::multi_value::{SplitToRows, SplitToRowsMode, SplitValues, split_text_value};
+use crate::numeric_observation::{
+    NumericObservation, NumericObserver, NumericParserOutcome, observe_xml_scalar,
+};
 use crate::record_path::{RecordPath, RecordPathSyntax};
 use crate::source::{ReopenableSource, SourceIdentity};
 use crate::traits::FormatReader;
@@ -206,6 +209,9 @@ pub struct XmlReader {
     pending: VecDeque<Vec<(String, String)>>,
     /// Whether we've finished all records.
     done: bool,
+    /// Optional authoring-only sink receiving one bounded scalar observation
+    /// before XML inference becomes a record [`Value`].
+    numeric_observer: Option<NumericObserver>,
 }
 
 impl XmlReader {
@@ -223,6 +229,28 @@ impl XmlReader {
     pub fn from_source(
         source: ReopenableSource,
         config: XmlReaderConfig,
+    ) -> Result<Self, FormatError> {
+        Self::from_source_with_observer(source, config, None)
+    }
+
+    /// Build a streaming reader that publishes parser-owned scalar numeric
+    /// evidence before record-value conversion.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`from_source`](Self::from_source).
+    pub fn from_source_observing(
+        source: ReopenableSource,
+        config: XmlReaderConfig,
+        observer: NumericObserver,
+    ) -> Result<Self, FormatError> {
+        Self::from_source_with_observer(source, config, Some(observer))
+    }
+
+    fn from_source_with_observer(
+        source: ReopenableSource,
+        config: XmlReaderConfig,
+        numeric_observer: Option<NumericObserver>,
     ) -> Result<Self, FormatError> {
         // XML runs two passes (envelope pre-scan + body stream), so the source
         // must be re-openable. A `Path`/`Buffered` source passes through; a
@@ -250,6 +278,7 @@ impl XmlReader {
             xml_depth: 0,
             pending: VecDeque::new(),
             done: false,
+            numeric_observer,
         })
     }
 
@@ -272,6 +301,21 @@ impl XmlReader {
     ) -> Result<Self, FormatError> {
         let source = ReopenableSource::buffer(reader).map_err(FormatError::Io)?;
         Self::from_source(source, config)
+    }
+
+    /// Buffer a pathless XML source and publish numeric observations while it
+    /// streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`from_reader`](Self::from_reader).
+    pub fn from_reader_observing<R: Read + Send + 'static>(
+        reader: R,
+        config: XmlReaderConfig,
+        observer: NumericObserver,
+    ) -> Result<Self, FormatError> {
+        let source = ReopenableSource::buffer(reader).map_err(FormatError::Io)?;
+        Self::from_source_observing(source, config, observer)
     }
 
     /// Open a fresh `BufReader` from the source with a leading UTF-8 BOM
@@ -700,7 +744,11 @@ impl XmlReader {
         let mut columns: Vec<Box<str>> = Vec::with_capacity(fields.len());
         let mut values: Vec<Value> = Vec::with_capacity(fields.len());
         for (key, val) in fields {
-            let value = infer_value(&val);
+            let observation = observe_xml_scalar(&val);
+            let value = inferred_xml_value(&val, &observation);
+            if let Some(observer) = &self.numeric_observer {
+                observer.observe(&key, observation);
+            }
             match slot.get(key.as_str()) {
                 Some(&i) => match &mut values[i] {
                     // A repeated key on a `multiple:` column accumulates in
@@ -1242,18 +1290,12 @@ fn strip_leading_bom(reader: &mut BufReader<Box<dyn Read + Send>>) -> Result<(),
     Ok(())
 }
 
-/// Simple type inference from string values (same rules as JSON).
-fn infer_value(s: &str) -> Value {
-    if s.is_empty() {
-        return Value::Null;
-    }
-    if let Ok(i) = s.parse::<i64>() {
-        return Value::Integer(i);
-    }
-    if let Ok(f) = s.parse::<f64>()
-        && (s.contains('.') || s.contains('e') || s.contains('E'))
-    {
-        return Value::Float(f);
+fn inferred_xml_value(s: &str, observation: &NumericObservation) -> Value {
+    match observation.parser_outcome() {
+        NumericParserOutcome::NoValue => return Value::Null,
+        NumericParserOutcome::Integer(value) => return Value::Integer(*value),
+        NumericParserOutcome::Float(value) => return Value::Float(*value),
+        NumericParserOutcome::NonNumeric | NumericParserOutcome::Rejected(_) => {}
     }
     match s {
         "true" => Value::Bool(true),
