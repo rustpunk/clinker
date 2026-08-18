@@ -12,7 +12,7 @@ schemas, typechecks CXL against row types, and produces `CompiledPlan` /
 
 ## Responsibilities
 
-- Own `PipelineConfig`, `PipelineNode`, node bodies, and source/output/format/storage/composition config.
+- Own `PipelineConfig`, `PipelineNode`, node bodies, and source/sink/format/storage/composition config.
 - Route production YAML parsing through `clinker_plan::yaml`.
 - Preserve `Spanned<PipelineNode>`, `CxlSource`, and input-reference spans for diagnostics.
 - Validate names, cycles, undeclared inputs, dotted names, log directives, and config paths.
@@ -35,7 +35,7 @@ schemas, typechecks CXL against row types, and produces `CompiledPlan` /
 
 ## Internal module map
 
-- `config/`: YAML config model, env interpolation, topology compile entry, source/output/format/storage/path-template/composition config.
+- `config/`: YAML config model, env interpolation, topology compile entry, source/sink/format/storage/path-template/composition config.
 - `config/composition/`: `.comp.yaml` signatures, scanner, provenance, resource declarations, and raw parsing tests.
 - `plan/`: schema binding, CXL artifacts, DAG lowering, combine strategy selection, composition bodies, deferred regions, explain/provenance, statistics, and streaming eligibility.
 - `plan/execution/`: `PlanNode`, `PlanEdge`, `ExecutionPlanDag`, scheduling, enforcers, explain renderers, graph utilities, and streaming classification.

@@ -97,7 +97,7 @@ For Rust source changes, also run the relevant workspace gates from the root
 
 - `docs/ai/10_ARCHITECTURE.md`, `docs/ai/20_CRATE_MAP.md`, `docs/ai/40_COMMON_PATTERNS.md`, and `docs/ai/60_PERFORMANCE_NOTES.md` for crate role, dependency, invariant, or performance-sensitive changes.
 - `docs/ai/80_OPEN_QUESTIONS.md` for unresolved data-model or counter semantics.
-- `docs/engine/src/auto-widen-internals.md` and `docs/engine/src/output-internals.md` for auto-widen/map/output behavior changes.
+- `docs/engine/src/auto-widen-internals.md` and `docs/engine/src/sink-internals.md` for auto-widen/map/output behavior changes.
 - `docs/user/src/cxl/builtins-map.md` and related `docs/user/src/cxl/*.md` for public value/map behavior changes.
 - Relevant user/engine envelope and document-context docs before copying older examples.
 

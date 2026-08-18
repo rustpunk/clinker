@@ -8,7 +8,7 @@ This page is the engine-internals reference for how Clinker absorbs input column
 
 The per-source `on_unmapped` policy selects one of three behaviors for input fields absent from the declared schema. The engine-wide default is `auto_widen`.
 
-- **`auto_widen`** *(default)* — per-record undeclared fields are absorbed into a `Value::Map` payload carried by an engine-stamped `$widened` sidecar column appended to the source's schema. The payload propagates downstream and the sink expands it back to top-level columns when `include_unmapped: true` on the Output node (the default). Pattern precedent: Databricks Auto Loader's `_rescued_data` sidecar and ClickHouse's `JSON` column type.
+- **`auto_widen`** *(default)* — per-record undeclared fields are absorbed into a `Value::Map` payload carried by an engine-stamped `$widened` sidecar column appended to the source's schema. The payload propagates downstream and the sink expands it back to top-level columns when `include_unmapped: true` on the Sink node (the default). Pattern precedent: Databricks Auto Loader's `_rescued_data` sidecar and ClickHouse's `JSON` column type.
 - **`drop`** — undeclared input fields are silently stripped at read time. No sidecar; the source's plan-time schema equals the declared `schema:`.
 - **`reject`** — any input record carrying a key not in the declared schema fails the source with a `FormatError::UndeclaredField` diagnostic naming the offending field.
 

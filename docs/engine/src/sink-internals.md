@@ -326,9 +326,11 @@ body from different bytes.
 
 Telemetry is attached to the runtime owner that establishes each real Sink work
 unit: the synchronous dispatcher, streaming writer thread, or deferred
-correlation commit. The closed metric set is `sink_started`, `sink_completed`,
-`sink_records`, and `sink_errors`; each finished or failed work unit emits one
-complete `sink` span after the outcome is known. Admission loss is
+correlation commit. The closed metric set is `clinker.sink.started`, exactly one
+of `clinker.sink.completed`, `clinker.sink.failed`, or
+`clinker.sink.interrupted`, plus `clinker.sink.records`,
+`clinker.sink.errors`, and `clinker.sink.bytes`; each terminal work unit emits
+one complete `clinker.sink` span after the outcome is known. Admission loss is
 behavior-neutral: a full telemetry arena may drop the optional span but cannot
 change writer bytes or run status.
 

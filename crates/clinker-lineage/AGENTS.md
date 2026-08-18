@@ -6,13 +6,13 @@ Root `AGENTS.md` still applies. This file adds local guidance for `clinker-linea
 
 `clinker-lineage` serializes Clinker pipeline lineage as OpenLineage events —
 the vendor-neutral open standard for dataset and column-level lineage. It maps
-Source/Output nodes to dataset identities, walks a `CompiledPlan` DAG to
+Source/Sink nodes to dataset identities, walks a `CompiledPlan` DAG to
 compute column-level lineage, and assembles run events for NDJSON output. It
 is a plan-time, read-only consumer of `clinker-plan`: it never runs pipelines.
 
 ## Responsibilities
 
-- Map each Source/Output node to its OpenLineage dataset identity (`dataset`).
+- Map each Source/Sink node to its OpenLineage dataset identity (`dataset`).
 - Compute DIRECT (value-derivation) per-column lineage and whole-dataset
   INDIRECT influence (filter / join / group-by / sort / conditional) from the
   compiled DAG, tracing through composition bodies to true source columns

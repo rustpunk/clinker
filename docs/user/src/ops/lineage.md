@@ -26,7 +26,7 @@ arena.
 
 Both flags require an explicit `[observability.lineage]` identity policy in the
 workspace `clinker.toml`. The default `identity_mode = "external"` requires one
-exact binding for every emitted source and output node. A binding uses either a
+exact binding for every emitted Source and Sink node. A binding uses either a
 canonical datasource or a complete catalog namespace/name pair:
 
 ```toml

@@ -1,9 +1,10 @@
 //! Sink-specific observability and lineage contract tests.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Cursor, Write};
+use std::path::Path;
 #[cfg(feature = "lineage")]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
@@ -495,27 +496,32 @@ nodes:
     );
 }
 
-fn retired_terminal_line(contents: &str) -> Option<usize> {
-    contents.lines().enumerate().find_map(|(index, line)| {
-        let authored = line.split_once('#').map_or(line, |(prefix, _)| prefix);
-        authored
-            .match_indices(RETIRED_TERMINAL_DISCRIMINATOR)
-            .any(|(column, _)| {
-                let before = authored[..column].chars().next_back();
-                let after = authored[column + RETIRED_TERMINAL_DISCRIMINATOR.len()..]
-                    .chars()
-                    .next();
-                before.is_none_or(|character| {
-                    character.is_ascii_whitespace() || matches!(character, '-' | '{' | ',')
-                }) && after.is_none_or(|character| {
-                    character.is_ascii_whitespace() || matches!(character, '}' | ',')
-                })
-            })
-            .then_some(index + 1)
-    })
+fn retired_terminal_count(contents: &str) -> usize {
+    contents.matches(RETIRED_TERMINAL_DISCRIMINATOR).count()
 }
 
-fn scan_authored_yaml(root: &Path, violations: &mut Vec<String>) -> io::Result<()> {
+fn relative_path(workspace: &Path, path: &Path) -> io::Result<String> {
+    let relative = path
+        .strip_prefix(workspace)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    relative
+        .components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| io::Error::other("workspace path is not UTF-8"))
+        })
+        .collect::<io::Result<Vec<_>>>()
+        .map(|components| components.join("/"))
+}
+
+fn scan_authored_surfaces(
+    workspace: &Path,
+    root: &Path,
+    occurrences: &mut BTreeMap<String, usize>,
+) -> io::Result<()> {
     if !root.is_dir() {
         return Ok(());
     }
@@ -524,16 +530,17 @@ fn scan_authored_yaml(root: &Path, violations: &mut Vec<String>) -> io::Result<(
         let file_type = entry.file_type()?;
         let path = entry.path();
         if file_type.is_dir() {
-            scan_authored_yaml(&path, violations)?;
+            scan_authored_surfaces(workspace, &path, occurrences)?;
         } else if file_type.is_file()
             && path
                 .extension()
                 .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| matches!(extension, "yaml" | "yml"))
+                .is_some_and(|extension| matches!(extension, "yaml" | "yml" | "rs" | "md"))
         {
             let contents = std::fs::read_to_string(&path)?;
-            if let Some(line) = retired_terminal_line(&contents) {
-                violations.push(format!("{}:{line}", path.display()));
+            let count = retired_terminal_count(&contents);
+            if count > 0 {
+                occurrences.insert(relative_path(workspace, &path)?, count);
             }
         }
     }
@@ -541,29 +548,56 @@ fn scan_authored_yaml(root: &Path, violations: &mut Vec<String>) -> io::Result<(
 }
 
 #[test]
-fn authored_standalone_yaml_uses_only_the_sink_terminal_discriminator() {
+fn authored_surfaces_contain_only_explicit_retired_terminal_examples() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace = manifest
         .parent()
         .and_then(Path::parent)
         .expect("clinker crate lives under the workspace crates directory");
-    let mut violations = Vec::new();
-    for root in [workspace.join("benches"), workspace.join("examples")] {
-        scan_authored_yaml(&root, &mut violations).expect("scan authored YAML root");
+    let mut occurrences = BTreeMap::new();
+    for root in [
+        workspace.join("benches"),
+        workspace.join("crates"),
+        workspace.join("docs"),
+        workspace.join("examples"),
+    ] {
+        scan_authored_surfaces(workspace, &root, &mut occurrences)
+            .expect("scan authored YAML, Rust, and Markdown surfaces");
     }
-    for entry in std::fs::read_dir(workspace.join("crates")).expect("workspace crates directory") {
-        let entry = entry.expect("crate entry");
-        if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
-            scan_authored_yaml(&entry.path().join("tests"), &mut violations)
-                .expect("scan crate test and fixture YAML");
+    for file in [workspace.join("CHANGELOG.md"), workspace.join("README.md")] {
+        let contents = std::fs::read_to_string(&file).expect("read root author surface");
+        let count = retired_terminal_count(&contents);
+        if count > 0 {
+            occurrences.insert(
+                relative_path(workspace, &file).expect("root-relative author surface"),
+                count,
+            );
         }
     }
 
-    violations.sort();
-    assert!(
-        violations.is_empty(),
-        "authored standalone YAML still uses `{RETIRED_TERMINAL_DISCRIMINATOR}`:\n{}",
-        violations.join("\n")
+    let expected = BTreeMap::from([
+        ("CHANGELOG.md".to_owned(), 1),
+        ("crates/clinker-core-types/src/diagnostic.rs".to_owned(), 1),
+        (
+            "crates/clinker-core-types/tests/registry_no_orphan_codes.rs".to_owned(),
+            1,
+        ),
+        (
+            "crates/clinker-exec/tests/node_taxonomy_lift_test.rs".to_owned(),
+            2,
+        ),
+        ("crates/clinker/tests/sink_surface.rs".to_owned(), 2),
+        ("docs/ai/10_ARCHITECTURE.md".to_owned(), 1),
+        ("docs/ai/15_PRODUCTION_CONTRACTS.md".to_owned(), 1),
+        ("docs/ai/20_CRATE_MAP.md".to_owned(), 1),
+        ("docs/ai/70_GLOSSARY.md".to_owned(), 1),
+        ("docs/engine/src/architecture.md".to_owned(), 1),
+        ("docs/user/src/nodes/sink.md".to_owned(), 1),
+        ("docs/user/src/ops/explain.md".to_owned(), 1),
+    ]);
+    assert_eq!(
+        occurrences, expected,
+        "every retired terminal spelling must be an explicit migration or negative-test example"
     );
 }
 

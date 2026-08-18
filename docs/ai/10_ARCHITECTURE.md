@@ -216,7 +216,7 @@ the D-18/D-19 classification in
 [the crate map](20_CRATE_MAP.md#rust-reachability-and-compatibility) before
 making a compatibility claim or changing a re-export:
 
-- `clinker_plan::config::PipelineConfig::{compile, compile_with_diagnostics, compile_topology_only, source_configs, output_configs}`.
+- `clinker_plan::config::PipelineConfig::{compile, compile_with_diagnostics, compile_topology_only, source_configs, sink_configs}`.
 - `clinker_plan::config::{load_config, load_config_with_vars}` and `clinker_plan::yaml::{from_str, to_string, Spanned, CxlSource}`.
 - `clinker_plan::plan::CompiledPlan::{dag, config, composition_bodies, statistics, body_of, provenance, provenance_mut, channel_identity, pipeline_hash, bound_schemas, schema_provenance, cxl_modules}` and planning-owned module resources under `clinker_plan::resources`.
 - `clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, PlanEdge, NodeExecutionReqs}`.

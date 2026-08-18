@@ -70,14 +70,14 @@ rides along.
 
 **Column order.** Emitted columns that exist in the source schema come first in
 schema order; derived columns follow in emit order, which is why
-`gross_amount` and `line_total` are last. The Output node's `mapping:` key can
+`gross_amount` and `line_total` are last. The Sink node's `mapping:` key can
 state the order explicitly instead — it declares the output columns, their
 names, and their order in one sequence. This scenario renames in the transform
 so the emitted names and the written header are read from one place.
 
 **Row order is stable because the read is.** A single-file source delivers
 records in file order, deterministically, so this output is byte-comparable
-against a committed golden without any sorting step. The Output node does have a
+against a committed golden without any sorting step. The Sink node does have a
 `sort_order:` key — do not reach for it yet: it is parsed and documented but
 currently has no effect at all ([#950](https://github.com/rustpunk/clinker/issues/950)).
 

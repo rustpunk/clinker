@@ -6,7 +6,7 @@
   "selection": "existing-crates-features",
   "approver_role_ref": "maintainer:architecture",
   "evidence_refs": [
-    "docs/engine/src/output-internals.md",
+    "docs/engine/src/sink-internals.md",
     "crates/clinker-exec/src/output/containment.rs",
     "Cargo.lock",
     "crates/clinker-plan/Cargo.toml",

@@ -667,7 +667,7 @@ see the Resolved Archive. This entry keeps the one remaining follow-on.)
   harder to review and would weaken the current default.
 - Files/modules involved:
   `crates/clinker-exec/src/output/containment.rs`, output configuration in
-  `clinker-plan`, and `docs/user/src/nodes/output.md`.
+  `clinker-plan`, and `docs/user/src/nodes/sink.md`.
 - Suggested way to resolve it: Research group-owned drop-zone practices on
   Unix, NFS, and SMB; decide whether the surface should be an explicit mode,
   an ACL-oriented policy, or remain external. Preserve `0600` as the default

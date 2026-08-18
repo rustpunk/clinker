@@ -38,7 +38,7 @@ east,725,3,1
 
 The trailing `$ck.aggregate.regional_totals` column is the
 engine-managed synthetic CK column the relaxed aggregate stamps on
-its output schema. It surfaces here only because the Output node
+its output schema. It surfaces here only because the Sink node
 sets `include_correlation_keys: true`; default writer output strips
 it. See [Correlation Keys](../../../docs/src/pipeline/correlation-keys.md)
 for the full lifecycle and Combine `propagate_ck` semantics.

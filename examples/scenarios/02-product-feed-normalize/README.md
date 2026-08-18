@@ -96,7 +96,7 @@ but untransformable. The write side puts the container back with `wrap_in`.
 
 ## Direct multi-output broadcast
 
-Both Output nodes read the same `normalize` result. Direct multi-output edges
+Both Sink nodes read the same `normalize` result. Direct multi-output edges
 are broadcast, not partitioned: `catalog.csv` and `catalog.xml` each receive all
 14 records and encode the repeated category field in their own format. The
 scenario gate compares both files with committed goldens and requires
