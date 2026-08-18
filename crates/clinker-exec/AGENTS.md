@@ -118,7 +118,7 @@ executor APIs:
 - `docs/engine/src/execution-model.md`
 - `docs/engine/src/memory-arbitration.md`
 - `docs/engine/src/storage-internals.md`
-- Relevant engine internals docs such as `combine-internals.md`, `output-internals.md`, `correlation-lifecycle.md`, and `retraction-protocol.md`
+- Relevant engine internals docs such as `combine-internals.md`, `sink-internals.md`, `correlation-lifecycle.md`, and `retraction-protocol.md`
 - `docs/ai/*.md` when architecture, commands, crate boundaries, or invariants change
 - Relevant examples and fixtures under `examples/pipelines/` and `crates/clinker-exec/tests/fixtures/`
 

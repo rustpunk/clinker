@@ -155,7 +155,7 @@ produces no body records and drains cleanly.
 
 ## Writing SWIFT MT
 
-A SWIFT Output node inverts the reader exactly. It re-emits each block-4
+A SWIFT Sink node inverts the reader exactly. It re-emits each block-4
 record as a `:tag:value` line and re-frames the single message envelope
 around them: the service blocks 1/2/3 first, then block 4 (`{4:` … `-}`),
 then the optional block-5 trailer. Block-4 free text is opaque, so values are
@@ -174,7 +174,7 @@ as records — they ride the document context.
 
 ```yaml
 nodes:
-  - type: output
+  - type: sink
     name: out
     input: messages
     config:

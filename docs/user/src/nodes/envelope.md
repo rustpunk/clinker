@@ -14,7 +14,7 @@ This page documents the `preserve` and `concat` framing strategies and the ortho
     strategy: preserve
 ```
 
-The node reads its `body:` input and emits the same records, framed per document. A downstream [Output](output.md) with `reconstruct_envelope: true` then writes one framed document per body grain.
+The node reads its `body:` input and emits the same records, framed per document. A downstream [Sink](sink.md) with `reconstruct_envelope: true` then writes one framed document per body grain.
 
 ## Inputs: `body`, the wired `header`, and the not-yet-wired `trailer`
 
@@ -69,7 +69,7 @@ omit it to frame with the body's own envelope
 
 ## `strategy: preserve`
 
-`preserve` emits **one framed document per body grain**. It is a transparent framing stage: body records pass through with their document context and grain unchanged, and the document-boundary signals are forwarded verbatim. Inserting a `preserve` Envelope between a body stage and an Output is byte-identical to today's per-document framing — its value is being the *explicit, composable* stage that later strategies extend, not a change in output.
+`preserve` emits **one framed document per body grain**. It is a transparent framing stage: body records pass through with their document context and grain unchanged, and the document-boundary signals are forwarded verbatim. Inserting a `preserve` Envelope between a body stage and a Sink is byte-identical to today's per-document framing — its value is being the *explicit, composable* stage that later strategies extend, not a change in output.
 
 `preserve` is the default, so `config: { strategy: preserve }` and an empty `config: {}` are equivalent.
 
@@ -95,7 +95,7 @@ nodes:
     name: framed
     body: both
     config: { strategy: concat }
-  - type: output
+  - type: sink
     name: out
     input: framed
     config:
@@ -133,7 +133,7 @@ To resolve a conflict, either keep the documents separate with `preserve`, make 
 
 `header:` and `footer:` are **orthogonal** to the framing strategy. The strategy decides *how many* output documents there are (`preserve` = one per body grain, `concat` = one consolidated); synthesis decides *what header and footer each of those documents carries*. The node computes a fresh header (declarative scalar expressions) and footer (streaming aggregates over the framed body) **per output document**, stamps them as named sections into the document's envelope, and the same `header_from_doc` / `footer_from_doc` writer path renders them.
 
-Both maps are keyed `section -> field -> CXL expression`. The section name is user-chosen — it is the envelope section a downstream [Output](output.md) renders via `header_from_doc` / `footer_from_doc`. The inner field map preserves declaration order, which is the rendered cell order. A synthesized section **overrides** an existing same-named section on the document (a regenerate); other sections ride through untouched.
+Both maps are keyed `section -> field -> CXL expression`. The section name is user-chosen — it is the envelope section a downstream [Sink](sink.md) renders via `header_from_doc` / `footer_from_doc`. The inner field map preserves declaration order, which is the rendered cell order. A synthesized section **overrides** an existing same-named section on the document (a regenerate); other sections ride through untouched.
 
 ```yaml
 - type: envelope
@@ -187,7 +187,7 @@ nodes:
     name: framed
     body: merged
     config: { strategy: preserve }
-  - type: output
+  - type: sink
     name: out
     input: framed
     config:

@@ -40,7 +40,7 @@ nodes:                         # Required — flat list of pipeline nodes
         emit id = id
         emit value = value.trim()
 
-  - type: output
+  - type: sink
     name: result
     input: clean
     config:
@@ -143,7 +143,7 @@ shape is specific to the node kind:
 **Port syntax** -- for consuming a specific branch from a route node, use `node.port`:
 
 ```yaml
-- type: output
+- type: sink
   name: high_value_out
   input: split.high     # Consumes the "high" branch of route node "split"
   config: ...

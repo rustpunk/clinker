@@ -24,7 +24,7 @@ nodes:
         - { name: amount, type: float }
         - { name: description, type: string }
 
-  - type: output
+  - type: sink
     name: split_output
     input: transactions
     config:
@@ -144,7 +144,7 @@ nodes:
       cxl: |
         filter date.starts_with("2026")
 
-  - type: output
+  - type: sink
     name: chunked
     input: current_year
     config:

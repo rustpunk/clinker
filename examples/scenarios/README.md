@@ -119,7 +119,7 @@ runs. Every scenario follows these rules, and new ones should too:
 - Generated data is seeded, never wall-clock derived. Dates are offsets from a
   fixed epoch; money is integer cents, never a float.
 - Row order comes from the reader, which is deterministic per file. The
-  Output node's `sort_order:` key is deliberately unused: it is parsed and
+  Sink node's `sort_order:` key is deliberately unused: it is parsed and
   documented but currently inert ([#950](https://github.com/rustpunk/clinker/issues/950)).
 - `merge` uses `concat`; an unseeded `interleave` is non-deterministic by design.
 - No `now()` or `$pipeline.start_time` in a compared column.

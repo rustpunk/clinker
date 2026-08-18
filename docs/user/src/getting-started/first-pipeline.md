@@ -48,7 +48,7 @@ nodes:
         emit salary = salary
         emit level = if salary >= 90000 then "senior" else "junior"
 
-  - type: output
+  - type: sink
     name: report
     input: classify
     config:
@@ -133,7 +133,7 @@ The pipeline executed as a streaming process:
 1. The source node read `employees.csv` one record at a time.
 2. Each record flowed through the `classify` transform, which evaluated the CXL
    block to produce the output fields.
-3. The output node wrote each transformed record to `salary_report.csv`.
+3. The Sink node wrote each transformed record to `salary_report.csv`.
 
 At no point was the entire dataset loaded into memory. This is how Clinker
 processes files of any size under its memory ceiling.

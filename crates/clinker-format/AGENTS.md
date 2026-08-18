@@ -15,7 +15,7 @@ helpers.
 
 - Decode finite input bytes into `clinker_record::Record` values one record at a time.
 - Encode records to output formats without owning runtime execution.
-- Define the `FormatReader` and `FormatWriter` contracts consumed by executor source/output code.
+- Define the `FormatReader` and `FormatWriter` contracts consumed by executor Source/Sink code.
 - Preserve document context and envelope boundaries through reader and writer hooks.
 - Keep JSON/XML envelope pre-scans bounded by retaining only declared `$doc.*` sections.
 - Provide format-specific structural validation for EDI, HL7, SWIFT, and multi-record files.
@@ -114,7 +114,7 @@ or public format APIs:
 - `docs/user/src/pipelines/envelope-and-doc-context.md`
 - `docs/user/src/pipelines/error-handling.md`
 - `docs/user/src/formats/auto-widen.md`
-- `docs/engine/src/output-internals.md`
+- `docs/engine/src/sink-internals.md`
 - Relevant `examples/pipelines/**` and `benches/pipelines/format/**`
 - `docs/ai/*.md`, especially crate map, design rules, common patterns, testing, and open questions
 

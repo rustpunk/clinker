@@ -11,7 +11,7 @@ reusable sub-pipeline and is covered under Pipelines.
 
 The pages in this part are ordered the way data flows through a DAG — a
 record enters at a Source, fans through the record-level and combining
-nodes, and leaves at an Output:
+nodes, and leaves at a Sink:
 
 | Node | Role | Arity | Streaming vs blocking |
 |------|------|-------|-----------------------|
@@ -24,11 +24,11 @@ nodes, and leaves at an Output:
 | [Reshape](reshape.md) | Pivot / unpivot between wide and long record shapes. | 1 → 1 | Blocking |
 | [Cull](cull.md) | Per-correlation-group removal on a group-level predicate, with a `removed_to` side-output port. | 1 → 2 | Blocking |
 | [Envelope](envelope.md) | Frames a body stream into per-document documents; a composable framing stage. | 1 → 1 | Streaming |
-| [Output](output.md) | Writes records to a sink; the exit point. | 1 → 0 | Streaming |
+| [Sink](sink.md) | Writes records to an output destination; the exit point. | 1 → 0 | Streaming |
 
 ## Streaming vs blocking
 
-Stateless nodes (Transform, Route, Merge, the Combine probe side, Output)
+Stateless nodes (Transform, Route, Merge, the Combine probe side, Sink)
 evaluate records one at a time without accumulating per-record state.
 Blocking nodes (Aggregate, sort, the grace-hash Combine build side)
 accumulate state inside the RSS budget and spill to disk rather than OOM

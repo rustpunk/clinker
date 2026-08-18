@@ -38,7 +38,7 @@ The `inputs:` field is a list of upstream node references. These can be bare nod
 Downstream nodes wire to the merge as a normal single-input reference:
 
 ```yaml
-- type: output
+- type: sink
   name: final_output
   input: rejoin
   config:
@@ -115,7 +115,7 @@ the same input paths and configuration. For unseeded `interleave`, compare the
 decoded record multiset and aggregate values; snapshotting incidental
 cross-input arrival order would assert behavior Clinker does not promise. If
 you need one sorted sequence regardless of Merge mode, declare `sort_order` on
-the downstream [Output](output.md#sort-order). That terminal sort uses only the
+the downstream [Sink](sink.md#sort-order). That terminal sort uses only the
 authored keys and does not invent a hidden identity tie-breaker.
 
 ## Use cases
@@ -161,7 +161,7 @@ The most common pattern is routing records through different processing paths an
     - process_standard
   config: {}
 
-- type: output
+- type: sink
   name: result
   input: all_orders
   config:

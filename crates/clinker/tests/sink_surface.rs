@@ -1,9 +1,11 @@
 //! Sink-specific observability and lineage contract tests.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Cursor, Write};
+use std::path::Path;
 #[cfg(feature = "lineage")]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use clinker_exec::executor::{
@@ -26,6 +28,7 @@ use clinker_plan::config::{ClinkerToml, CompileContext, parse_config};
 use clinker_plan::error::PipelineError;
 
 const INPUT: &str = "id,label\n2,beta\n1,alpha\n";
+const RETIRED_TERMINAL_DISCRIMINATOR: &str = "type: output";
 
 const SYNC_PIPELINE: &str = r#"
 pipeline: { name: sink_sync }
@@ -431,6 +434,170 @@ fn telemetry_full_arena_cannot_change_sink_bytes_or_exit_status() {
     assert!(
         actual.spans.is_empty(),
         "the full ordinary lane drops the optional Sink span"
+    );
+}
+
+#[test]
+fn retired_terminal_spelling_reports_source_located_e376_without_output_effects() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("input.csv"), INPUT).expect("input fixture");
+    let pipeline = workspace.path().join("retired-terminal.yaml");
+    std::fs::write(
+        &pipeline,
+        r#"pipeline: { name: retired_terminal }
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: input.csv
+      schema:
+        - { name: id, type: int }
+        - { name: label, type: string }
+  - type: output
+    name: delivered
+    input: rows
+    config:
+      name: delivered
+      type: csv
+      path: delivered.csv
+"#,
+    )
+    .expect("retired terminal fixture");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_clinker"))
+        .current_dir(workspace.path())
+        .args(["run", "retired-terminal.yaml"])
+        .output()
+        .expect("run clinker");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty(), "a rejected config has no stdout");
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    for required in [
+        "retired-terminal.yaml",
+        "E376",
+        RETIRED_TERMINAL_DISCRIMINATOR,
+        "Correction: type: sink",
+    ] {
+        assert!(
+            diagnostic.contains(required),
+            "diagnostic must contain {required:?}:\n{diagnostic}"
+        );
+    }
+    assert!(
+        !workspace.path().join("delivered.csv").exists(),
+        "the rejected terminal cannot publish output"
+    );
+    assert!(
+        !workspace.path().join(".clinker-attempts").exists(),
+        "the rejected terminal cannot start a publication attempt"
+    );
+}
+
+fn retired_terminal_count(contents: &str) -> usize {
+    contents.matches(RETIRED_TERMINAL_DISCRIMINATOR).count()
+}
+
+fn relative_path(workspace: &Path, path: &Path) -> io::Result<String> {
+    let relative = path
+        .strip_prefix(workspace)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    relative
+        .components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| io::Error::other("workspace path is not UTF-8"))
+        })
+        .collect::<io::Result<Vec<_>>>()
+        .map(|components| components.join("/"))
+}
+
+fn scan_authored_surfaces(
+    workspace: &Path,
+    root: &Path,
+    occurrences: &mut BTreeMap<String, usize>,
+) -> io::Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            scan_authored_surfaces(workspace, &path, occurrences)?;
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| matches!(extension, "yaml" | "yml" | "rs" | "md"))
+        {
+            let contents = std::fs::read_to_string(&path)?;
+            let count = retired_terminal_count(&contents);
+            if count > 0 {
+                occurrences.insert(relative_path(workspace, &path)?, count);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn authored_surfaces_contain_only_explicit_retired_terminal_examples() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest
+        .parent()
+        .and_then(Path::parent)
+        .expect("clinker crate lives under the workspace crates directory");
+    let mut occurrences = BTreeMap::new();
+    for root in [
+        workspace.join("benches"),
+        workspace.join("crates"),
+        workspace.join("docs"),
+        workspace.join("examples"),
+    ] {
+        scan_authored_surfaces(workspace, &root, &mut occurrences)
+            .expect("scan authored YAML, Rust, and Markdown surfaces");
+    }
+    for file in [workspace.join("CHANGELOG.md"), workspace.join("README.md")] {
+        let contents = std::fs::read_to_string(&file).expect("read root author surface");
+        let count = retired_terminal_count(&contents);
+        if count > 0 {
+            occurrences.insert(
+                relative_path(workspace, &file).expect("root-relative author surface"),
+                count,
+            );
+        }
+    }
+
+    let expected = BTreeMap::from([
+        ("CHANGELOG.md".to_owned(), 1),
+        ("crates/clinker-core-types/src/diagnostic.rs".to_owned(), 1),
+        (
+            "crates/clinker-core-types/tests/registry_no_orphan_codes.rs".to_owned(),
+            1,
+        ),
+        (
+            "crates/clinker-exec/tests/node_taxonomy_lift_test.rs".to_owned(),
+            2,
+        ),
+        ("crates/clinker/tests/sink_surface.rs".to_owned(), 2),
+        ("docs/ai/10_ARCHITECTURE.md".to_owned(), 1),
+        ("docs/ai/15_PRODUCTION_CONTRACTS.md".to_owned(), 1),
+        ("docs/ai/20_CRATE_MAP.md".to_owned(), 1),
+        ("docs/ai/70_GLOSSARY.md".to_owned(), 1),
+        ("docs/engine/src/architecture.md".to_owned(), 1),
+        ("docs/user/src/nodes/sink.md".to_owned(), 1),
+        ("docs/user/src/ops/explain.md".to_owned(), 1),
+    ]);
+    assert_eq!(
+        occurrences, expected,
+        "every retired terminal spelling must be an explicit migration or negative-test example"
     );
 }
 

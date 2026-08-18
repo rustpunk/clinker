@@ -171,7 +171,7 @@ envelopes](../pipelines/error-handling.md#malformed-envelopes-structural-validat
 
 ## Writing EDIFACT
 
-An EDIFACT Output node reconstructs the envelope around emitted records.
+An EDIFACT Sink node reconstructs the envelope around emitted records.
 Records map by the same positional columns (`seg_id`, `msg_ref`,
 `msg_type`, `eNN`); trailing `null`/empty elements are trimmed so no
 fabricated delimiters appear, and a column the writer does not recognize
@@ -180,7 +180,7 @@ Engine-internal `$`-namespaced columns are excluded automatically.
 
 ```yaml
 nodes:
-  - type: output
+  - type: sink
     name: out
     input: messages
     config:

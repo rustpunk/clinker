@@ -138,12 +138,12 @@ Downstream nodes draw from the two ports by reference:
 - The **side output** (removed groups) is referenced as `<cull>.<removed_to>`: `input: flag_large_histories.review`.
 
 ```yaml
-  - type: output
+  - type: sink
     name: kept
     input: flag_large_histories            # main port — kept groups
     config: { name: kept, type: csv, path: kept.csv }
 
-  - type: output
+  - type: sink
     name: review
     input: flag_large_histories.review     # side-output port — removed groups
     config: { name: review, type: csv, path: review.csv }

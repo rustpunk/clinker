@@ -76,7 +76,7 @@ nodes:
               plan_end: "plan_end"          # the rest of the window
               status: "'synthesized'"
 
-  - type: output
+  - type: sink
     name: out
     input: backfill
     config:

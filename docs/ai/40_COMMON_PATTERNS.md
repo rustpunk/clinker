@@ -347,7 +347,7 @@ permanent stability.
 - **Classification:** Local to external OpenLineage identity.
 - **Where:** `LineageIdentityContext`, dataset emission, and CLI lineage
   preflight.
-- **Use:** Bind each source/output node to canonical datasource or exact catalog
+- **Use:** Bind each Source/Sink node to canonical datasource or exact catalog
   namespace/name identity. Keep that collection identity stable while placing
   authorized concrete input/output locations in standard subset facets and
   authorized aliases in the standard symlinks facet.

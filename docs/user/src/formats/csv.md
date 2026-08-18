@@ -112,7 +112,7 @@ regardless of how an upstream node ordered the record's fields. An
 output-schema column the record does not carry emits an empty cell,
 the same as an explicit null; with `include_unmapped: false` a record
 field the output schema does not name is not written. See
-[Output Nodes](../nodes/output.md) for header control, field mapping,
+[Sink Nodes](../nodes/sink.md) for header control, field mapping,
 and null handling.
 
 ### Writing multi-value cells (`join_values`)
@@ -123,7 +123,7 @@ no configuration: values join with `;`, and a value that itself contains the
 delimiter is a hard error rather than a cell that would split back wrongly.
 
 ```yaml
-- type: output
+- type: sink
   name: report
   input: orders
   config:
@@ -181,7 +181,7 @@ split_values:
 
 ### Header widening under auto-widen
 
-When [`auto_widen`](auto-widen.md) is in effect and the Output leaves
+When [`auto_widen`](auto-widen.md) is in effect and the Sink leaves
 `include_unmapped` at its default of `true`, different records can carry
 different carried-along columns. The header must still be shared by every
 row, so Clinker widens it to the **union of every record's columns** in

@@ -254,7 +254,7 @@ opt-in. An empty `BTS-1`/`FTS-1` still disables the check entirely. See
 
 ## Writing HL7
 
-An HL7 Output node re-emits the `MSH` and body segments from the record
+An HL7 Sink node re-emits the `MSH` and body segments from the record
 stream, escaping any field data that carries a delimiter byte. Records map
 by the same positional columns (`seg_id`, `fNN`); trailing `null`/empty
 fields are trimmed so no fabricated delimiters appear, and a column the
@@ -275,7 +275,7 @@ dropped upstream) is written with the conventional `|^~\&` set.
 
 ```yaml
 nodes:
-  - type: output
+  - type: sink
     name: out
     input: messages
     config:

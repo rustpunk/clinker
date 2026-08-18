@@ -6,8 +6,8 @@
   "selection": "evidenced-matrix",
   "approver_role_ref": "maintainer:architecture",
   "evidence_refs": [
-    "docs/engine/src/output-internals.md",
-    "docs/user/src/nodes/output.md",
+    "docs/engine/src/sink-internals.md",
+    "docs/user/src/nodes/sink.md",
     ".github/workflows/ci.yml",
     "crates/clinker/tests/output_containment.rs"
   ],

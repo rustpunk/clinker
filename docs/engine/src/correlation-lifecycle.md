@@ -8,10 +8,10 @@ This page is the engineer's reference for how a correlation key is born, carried
 
 The engine adds a shadow column named `$ck.<field>` (one per correlation-key field) to every declaring source's schema and copies the field's value into it at ingest. From that point on, the shadow column is the authoritative group identity — if a downstream transform rewrites the user-declared correlation field, the shadow column is untouched and the group identity is preserved.
 
-Shadow columns are an internal engine namespace. You never write `$ck.<field>` in YAML or CXL — the engine manages them. They are stripped from default writer output. To surface them for debugging, set `include_correlation_keys: true` on an output node:
+Shadow columns are an internal engine namespace. You never write `$ck.<field>` in YAML or CXL — the engine manages them. They are stripped from default writer output. To surface them for debugging, set `include_correlation_keys: true` on a Sink node:
 
 ```yaml
-- type: output
+- type: sink
   name: debug_out
   input: validate
   config:

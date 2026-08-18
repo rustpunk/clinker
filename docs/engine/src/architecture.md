@@ -2,7 +2,7 @@
 
 Clinker is a **bounded-memory batch DAG executor**. A pipeline run is a finite job over finite input: Source nodes read until EOF, the DAG drains, the process exits with a status code. It pairs a custom expression language (CXL) with YAML pipeline orchestration.
 
-Within a run, stateless operators (Transform, Route, most Combine probe-side work, Output) evaluate records **one at a time** without per-record state accumulation. The DAG executor materializes intermediate buffers between non-fused stages, so memory scales with the largest live intermediate stage's output, not total input size; fused Source → Transform → Output paths skip materialization entirely. Blocking operators (Aggregate, sort, grace-hash Combine) accumulate state inside the configured RSS budget (default 512 MB) and spill to disk when soft/hard thresholds trip rather than OOM the process.
+Within a run, stateless operators (Transform, Route, most Combine probe-side work, Sink) evaluate records **one at a time** without per-record state accumulation. The DAG executor materializes intermediate buffers between non-fused stages, so memory scales with the largest live intermediate stage's output, not total input size; fused Source → Transform → Sink paths skip materialization entirely. Blocking operators (Aggregate, sort, grace-hash Combine) accumulate state inside the configured RSS budget (default 512 MB) and spill to disk when soft/hard thresholds trip rather than OOM the process.
 
 ## The three pillars
 
@@ -12,7 +12,7 @@ Every design decision cascades from three commitments. They are permanent — an
 
 2. **Finite jobs.** No daemon mode, no service surface, no infinite event loop. `clinker run` invokes, drains, exits.
 
-3. **Single process forever.** One invocation = one OS process. Parallelism happens inside the process via `std::thread` and Rayon — no worker-process pools, no multi-machine sharding, no network shuffle, no cluster manager. Scale by adding cores / RAM / disk to one host (the DuckDB / Polars / Kettle model). If a host genuinely can't fit the work, partition the input by file or key and run multiple `clinker` invocations from a shell script.
+3. **Single process forever.** One invocation = one OS process. Parallelism happens inside the process via `std::thread` and Rayon — no worker-process pools, no multi-machine sharding, no network shuffle, no cluster manager. Scale by adding cores / RAM / disk to one host. If a host genuinely can't fit the work, partition the input by file or key and run multiple `clinker` invocations from a shell script.
 
 These pillars are why the memory arbitrator is a single in-process component rather than a distributed scheduler, why there is no network shuffle in Combine, and why spill-to-local-disk is the universal pressure-relief valve.
 
@@ -51,7 +51,7 @@ Pipelines use a single flat `nodes:` list; each entry's `type:` discriminator se
 - **Reshape** — per-group mutate-and-synthesize.
 - **Cull** — per-group rule evaluation with retained and removed output ports.
 - **Envelope** — document-level consolidation or expansion at explicit DAG boundaries.
-- **Output** — sink writer.
+- **Sink** — terminal writer.
 - **Composition** — call-site node referencing a `.comp.yaml` reusable sub-pipeline, lowered at compile time.
 
 The plan itself is a petgraph DAG (`ExecutionPlanDag`) of topologically-sorted nodes, each carrying a parallelism strategy and `NodeProperties` (ordering / partitioning provenance). CXL is typechecked at compile time into a `TypedProgram`, and schema is propagated across the DAG at plan time.
@@ -77,12 +77,15 @@ and [Streaming vs. Blocking Stages](execution-model.md#plan-admission-and-runtim
 
 ## Terminal destination vocabulary
 
-`PipelineNode::Output` and YAML `type: output` are the current terminal-writer
-surface. D-56 assigns an atomic migration of that terminal destination concept
-to `Sink` / `type: sink` under AUTH-09, before endpoint expansion. The
-migration has not landed. Output ports, produced artifacts and
-paths, serialization formats, stdout and machine output, writer results, and
-OpenLineage output datasets remain distinct and valid output vocabulary. See
+`PipelineNode::Sink`, `SinkConfig`, and YAML `type: sink` are the current
+terminal-writer surface; planning lowers them to `PlanNode::Sink` and runtime
+execution delegates to `executor/sink_dispatch.rs`. The retired
+`type: output` spelling is rejected with the paste-ready correction
+`type: sink`. Output ports, produced artifacts and paths, serialization
+formats, stdout and machine output, writer results, and OpenLineage output
+datasets remain distinct and valid output vocabulary. See [Sink
+Nodes](https://github.com/rustpunk/clinker/blob/main/docs/user/src/nodes/sink.md),
+[Sink Internals](sink-internals.md), and
 [Terminal destination vocabulary](https://github.com/rustpunk/clinker/blob/main/docs/ai/15_PRODUCTION_CONTRACTS.md#terminal-destination-vocabulary).
 
 ## Key engine decisions
