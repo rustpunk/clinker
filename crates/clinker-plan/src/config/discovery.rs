@@ -682,6 +682,7 @@ mod tests {
             dlq_granularity: crate::config::DlqGranularity::Record,
             declared_doc_paths: Vec::new(),
             split_to_rows: None,
+            max_output_rows_per_input: 0,
             split_values: None,
             array_paths: None,
             sort_order: None,

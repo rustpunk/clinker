@@ -373,6 +373,14 @@ source opens. The disjointness rule is this reader's: it assigns each element to
 one occurrence group by document position, which is sound exactly when the
 declared groups do not nest. A JSON source has no such constraint.
 
+Set source-level `max_output_rows_per_input: N` to bound that cumulative
+product without constructing it in memory. The reader emits the first `N` rows
+in document/declaration order, then a first attempted row above the ceiling
+routes the original ordered XML field occurrences to the DLQ as
+`expansion_limit_exceeded`; `0` or omission is unlimited. See
+[Source Nodes -> `split_to_rows`](../nodes/source.md#one-record-per-value-split_to_rows)
+for the complete error and `fail_fast` behavior.
+
 ### All occurrences in one field: `multiple: true`
 
 Declaring a schema column `multiple: true` collects every occurrence of that

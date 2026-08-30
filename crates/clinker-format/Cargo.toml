@@ -19,8 +19,12 @@ indexmap = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-clinker-bench-support = { workspace = true }
+clinker-bench-support = { workspace = true, features = ["bench-alloc"] }
 
 [[bench]]
 name = "io_throughput"
+harness = false
+
+[[bench]]
+name = "fan_out"
 harness = false

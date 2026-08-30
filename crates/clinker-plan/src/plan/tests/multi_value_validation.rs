@@ -127,6 +127,32 @@ fn duplicate_split_to_rows_field_is_rejected_with_a_span() {
 }
 
 #[test]
+fn nonzero_fan_out_limit_without_split_to_rows_is_rejected() {
+    let yaml = json_pipeline(
+        r#"      max_output_rows_per_input: 10
+      schema:
+        - { name: id, type: int }"#,
+        "json",
+    );
+    let found = coded(&compile_err(&yaml), "E358");
+    assert_eq!(found.len(), 1, "expected one E358: {found:?}");
+    assert!(found[0].0.contains("max_output_rows_per_input"));
+    assert!(found[0].0.contains("split_to_rows"));
+    assert!(found[0].1, "E358 must carry a source span");
+}
+
+#[test]
+fn zero_fan_out_limit_without_split_to_rows_is_an_explicit_disabled_value() {
+    let yaml = json_pipeline(
+        r#"      max_output_rows_per_input: 0
+      schema:
+        - { name: id, type: int }"#,
+        "json",
+    );
+    compile_ok(&yaml);
+}
+
+#[test]
 fn nested_split_to_rows_fields_are_rejected() {
     // This ran at XML reader construction as an unspanned string error; it
     // now fails at compile, before any input is opened.

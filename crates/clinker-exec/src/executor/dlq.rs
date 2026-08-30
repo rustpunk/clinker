@@ -14,6 +14,7 @@ use crate::executor::diagnostic_preview::build_diagnostic_preview;
 pub(crate) enum SourceRejectionKind {
     DeclaredType,
     UnknownRecordType,
+    FanOutLimit,
 }
 
 impl SourceRejectionKind {
@@ -23,6 +24,7 @@ impl SourceRejectionKind {
             Self::UnknownRecordType => {
                 clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
             }
+            Self::FanOutLimit => clinker_core_types::dlq::DlqErrorCategory::ExpansionLimitExceeded,
         }
     }
 
@@ -109,6 +111,33 @@ impl SourceRejectionEvent {
             original_record,
             triggering_field: "record_type".into(),
             triggering_value: clinker_record::Value::String(discriminator.into()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fan_out_limit(
+        source_row: crate::executor::stream_event::SourceRowId,
+        source_name: Arc<str>,
+        source_file: Arc<str>,
+        field: String,
+        limit: u64,
+        actual: u128,
+        original_record: Record,
+    ) -> Self {
+        Self {
+            source_row,
+            source_name,
+            source_file,
+            row: source_row.ordinal(),
+            kind: SourceRejectionKind::FanOutLimit,
+            message: format!(
+                "source fan-out field {field:?} attempted row {actual}, exceeding \
+                 `max_output_rows_per_input: {limit}`; the original input was rejected and no \
+                 further fan-out rows were emitted"
+            ),
+            original_record,
+            triggering_field: field.into_boxed_str(),
+            triggering_value: clinker_record::Value::String(actual.to_string().into()),
         }
     }
 

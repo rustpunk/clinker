@@ -49,8 +49,8 @@ fn test_accounting_alloc_region_baseline_excluded() {
 fn test_accounting_alloc_realloc_growth() {
     let region = Region::new(&ALLOC);
     let mut v: Vec<u8> = Vec::with_capacity(16);
-    for _ in 0..1024 {
-        v.push(0);
+    for value in 0..1024 {
+        v.push(value as u8);
     }
     let change = region.change();
     assert!(change.reallocs >= 1);

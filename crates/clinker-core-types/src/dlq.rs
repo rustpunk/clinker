@@ -45,10 +45,11 @@ pub enum DlqErrorCategory {
     /// is set. Mirrors Flink sideOutputLateData / Beam late-drop /
     /// Spark window late-drop.
     LateRecord,
-    /// Per-record `emit each` fan-out produced more output records
-    /// than the transform's `max_expansion` ceiling allows. The
-    /// originating record is routed to DLQ before the fan-out can
-    /// emit any of its truncated body records.
+    /// Per-input fan-out exceeded its authored ceiling. A Transform
+    /// `emit each` breach routes the origin before any body rows emit;
+    /// a Source `split_to_rows` breach emits exactly its configured ceiling
+    /// and then routes the original input on the first attempted row above it.
+    /// Neither path silently reports a truncated expansion as successful.
     ExpansionLimitExceeded,
     /// A Combine output-stage CXL evaluation or coercion failed for one
     /// driver row — probe-key extraction, residual-filter eval, or the

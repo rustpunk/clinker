@@ -35,10 +35,11 @@ use serde::{Deserialize, Serialize};
 /// Per-source config patch carried by a channel.
 ///
 /// Keyed forms only. `schema` ops are keyed by column name, `split_to_rows` /
-/// `split_values` ops by field name, and `options` sets a scalar per-format
-/// input option by its key. `Serialize` is derived for config-identity hashing only (folding the
-/// applied patches into the pipeline `source_hash`); the wire deserialize form
-/// is the channel YAML.
+/// `split_values` ops by field name, `max_output_rows_per_input` replaces the
+/// scalar fan-out ceiling, and `options` sets a scalar per-format input option
+/// by its key. `Serialize` is derived for config-identity hashing only (folding
+/// the applied patches into the pipeline `source_hash`); the wire deserialize
+/// form is the channel YAML.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SourceConfigPatch {
@@ -46,6 +47,10 @@ pub struct SourceConfigPatch {
     pub schema: IndexMap<String, SchemaColumnOp>,
     /// Field-keyed fan-out ops: set-by-field (add-or-modify) or `remove`.
     pub split_to_rows: IndexMap<String, SplitToRowsOp>,
+    /// Replacement for the source's per-input fan-out ceiling. Zero disables
+    /// the ceiling, matching the hand-written source surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_rows_per_input: Option<u64>,
     /// Field-keyed in-cell-parse ops: set-by-field (add-or-modify) or `remove`.
     pub split_values: IndexMap<String, SplitValuesOp>,
     /// Scalar per-format input options, keyed by option name. Merged onto the
@@ -83,6 +88,7 @@ impl SourceConfigPatch {
     pub fn is_empty(&self) -> bool {
         self.schema.is_empty()
             && self.split_to_rows.is_empty()
+            && self.max_output_rows_per_input.is_none()
             && self.split_values.is_empty()
             && self.options.is_empty()
             && self.group_section.is_none()
@@ -910,6 +916,9 @@ pub(crate) fn apply_patch_to_source_body(
 ) -> Result<(), ConfigError> {
     apply_schema_ops(&mut body.schema, &patch.schema, src, None)?;
     apply_split_to_rows_ops(&mut body.source, &patch.split_to_rows, src)?;
+    if let Some(limit) = patch.max_output_rows_per_input {
+        body.source.max_output_rows_per_input = limit;
+    }
     apply_split_values_ops(&mut body.source, &patch.split_values, src)?;
     apply_option_ops(&mut body.source, &patch.options, src)?;
     apply_nested_section_op(
@@ -2365,6 +2374,40 @@ nodes:
             .split_to_rows
             .clone()
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn max_output_rows_per_input_patch_replaces_and_can_disable_the_ceiling() {
+        let mut config = json_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("max_output_rows_per_input: 9\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .source_configs()
+                .next()
+                .unwrap()
+                .max_output_rows_per_input,
+            9
+        );
+
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("max_output_rows_per_input: 0\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .source_configs()
+                .next()
+                .unwrap()
+                .max_output_rows_per_input,
+            0
+        );
     }
 
     fn split_values(config: &PipelineConfig) -> Vec<SplitValues> {
