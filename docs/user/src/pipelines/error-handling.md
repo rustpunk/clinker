@@ -84,6 +84,7 @@ Every DLQ record includes these metadata columns:
 | `_cxl_dlq_stage` | Name of the transform or aggregate node where the error occurred |
 | `_cxl_dlq_route` | Route branch name (if the error occurred after routing) |
 | `_cxl_dlq_trigger` | Validation rule name that triggered the rejection |
+| `_cxl_dlq_source_record` | Present in the optional source-row columns for a record-grained E345 rejection. Contains the fixed-width line text or a JSON array of decoded CSV cells, preserving the physical row without assigning it a declared record shape. |
 
 When `include_reason: true` is set, two additional columns appear:
 
@@ -117,7 +118,7 @@ The `_cxl_dlq_error_category` column contains one of these values:
 | `late_record` | A record arrived at a time-windowed aggregate after its event-time window had already closed |
 | `expansion_limit_exceeded` | A transform's `emit each` fan-out produced more output records than its `max_expansion` ceiling allows |
 | `combine_output_row` | A Combine output-stage eval failed for one driver row (probe-key, residual, or matched / `on_miss: null_fields` body); the entry carries the contributing-build lineage and rewinds both the driver and matched build source's rollback cursor. Routed to the DLQ under `continue` across every Combine join mode; `fail_fast` propagates the eval error |
-| `structural_validation` | An envelope trailer's declared count did not match the body the reader streamed (X12 `SE`/`GE`/`IEA`, EDIFACT `UNT`/`UNZ`, HL7 `BTS`/`FTS`, a multi-record flat-file trailer), or a multi-record flat file broke a non-count structural rule (an unknown record-type discriminator, a body record after the trailer). The root-cause `trigger: true` entry for a malformed document rejected under a source's `dlq_granularity: document` policy; every already-streamed record of the same file is a `document_rejected` collateral |
+| `structural_validation` | A structural source rule failed: an envelope trailer's declared count did not match its streamed body, a multi-record body appeared after its closing trailer, or a record type discriminator was unknown. Under `dlq_granularity: document`, the root cause has `trigger: true` and every already-streamed record of that file is `document_rejected` collateral. Under record-grained `continue`, E345 instead emits only the unknown row with `_cxl_dlq_source_record`. |
 
 ## Advanced options
 
@@ -239,7 +240,7 @@ nodes:
       dlq_granularity: document   # reuse the document opt-in — no separate config
 ```
 
-The opt-in is the same `dlq_granularity: document` knob that governs per-record document rejection above; there is no separate `validation:` block. A malformed envelope is simply one more reason a source under the `document` policy condemns a whole document.
+The opt-in is the same `dlq_granularity: document` knob that governs per-record document rejection above; there is no separate `validation:` block. A malformed envelope is simply one more reason a source under the `document` policy condemns a whole document. E345 is the one structural class that also has a record-grained recovery: under `strategy: continue` and the default `dlq_granularity: record`, only the unknown-tag row is dead-lettered and the reader continues at the next physical row. The DLQ row exposes the unknown tag as `record_type` and the unguessed decoded input as `_cxl_dlq_source_record` (fixed-width line text, or a JSON array of decoded CSV cells).
 
 **Honest timing — rejected at the sink boundary, not before the first record.** The trailer that carries the count arrives at the *end* of the file, after every body record it counts has already streamed through the DAG. Clinker is a bounded-memory streaming engine — it does not buffer the whole file up front to pre-validate it (that would defeat the streaming model). So the count mismatch is detected mid-stream, the file is marked failed, and the document-level DLQ buffer rejects every already-streamed record of the file at its close. The user-visible outcome is the same — **no record of a malformed envelope is ever written to the output** — but the rejection lands at the sink boundary, not literally before the file's first record streams.
 
@@ -247,7 +248,7 @@ The opt-in is the same `dlq_granularity: document` knob that governs per-record 
 
 **Multiple files keep flowing.** When a `glob` / `paths` source matches several files and one is malformed, only that file dead-letters — ingestion continues to the remaining files, so the clean files after a bad one still reach the sink. (This is unlike the default `record` granularity, where a count mismatch aborts the whole run and no file's records are written.) Dead-lettering one malformed file never silently drops the good files around it.
 
-**Default behavior unchanged.** Under the default `dlq_granularity: record`, a structural failure still **aborts the run** exactly as before — the document-DLQ disposition is strictly opt-in. Genuine corruption (a truncated stream, a bad delimiter, a control-number echo mismatch, a segment after an X12/EDIFACT/HL7 envelope trailer) **always aborts**, even under the `document` opt-in: only the trailer-count claims and the multi-record structural failures above are reclassified to the DLQ; structural corruption that makes the stream un-parseable is never silently dead-lettered.
+**Record-grained E345 is narrow.** Under the default `dlq_granularity: record`, `strategy: continue` can recover only from an unknown multi-record discriminator because the reader has consumed exactly one bounded physical row and can resume unambiguously. Trailer-count mismatches and a body record after a document-closing trailer still abort at record granularity: neither belongs to one independently recoverable row. Genuine corruption (a truncated stream, a bad delimiter, a control-number echo mismatch, a segment after an X12/EDIFACT/HL7 envelope trailer) **always aborts**, even under the `document` opt-in. Under `fail_fast`, E345 also aborts at the offending line.
 
 > **Cryptographic integrity (checksums / signatures) is not yet validated.** Envelope formats can also carry a SHA-256 body hash, a JWS-signed JSON payload, or an XML Signature. Clinker extracts these envelope sections but does not yet verify them. Tracked for a future release.
 

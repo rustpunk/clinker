@@ -173,6 +173,9 @@ file is never buffered.
   identically on both paths.
 - An **unknown discriminator value** (a tag no `records:` entry declares)
   is a structural-integrity failure, classified separately from a trailer
-  count mismatch: it [aborts the run](https://github.com/rustpunk/clinker/blob/main/docs/explain/E345.md) by default,
-  or under `dlq_granularity: document` condemns the whole file to the
-  dead-letter sink and the run continues.
+  count mismatch. It [aborts the run](https://github.com/rustpunk/clinker/blob/main/docs/explain/E345.md)
+  under `fail_fast`; under `continue` with the default record granularity it
+  dead-letters only that physical line and continues with the next line; under
+  `dlq_granularity: document` it condemns the whole file. A record-grained DLQ
+  row carries the line text in `_cxl_dlq_source_record` without guessing which
+  declared field layout the unknown tag meant.
