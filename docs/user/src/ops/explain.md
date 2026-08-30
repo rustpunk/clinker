@@ -26,20 +26,42 @@ Node 2: route_1 (Route, parallel: record)
   -> [high] output_high
   -> [default] output_standard
 
-Node 3: output_high (Output, parallel: serial)
+Node 3: output_high (Sink, parallel: serial)
 
-Node 4: output_standard (Output, parallel: serial)
+Node 4: output_standard (Sink, parallel: serial)
 ```
 
 Key information shown:
 
 - **Node index and name** -- the topological position in the DAG
-- **Node type** -- Source, Transform, Aggregate, Route, Merge, Output, Composition
+- **Node type** -- Source, Transform, Aggregate, Route, Merge, Sink, Composition
 - **Parallelism strategy** -- how the optimizer plans to execute the node
 - **Connections** -- downstream nodes, with port labels for route branches
 - **Buffer class** (Physical Properties section) -- `buffer: streaming` for a node that hands its output straight to a single downstream consumer, or `buffer: materialized` for one that holds a whole stage's output in an inter-stage buffer. See [Streaming vs. Blocking Stages](streaming-vs-blocking.md) for the distinction.
 
 The buffer class is a pre-runtime signal for memory pressure: a `materialized` node holds its rows against `pipeline.memory.limit` and may spill to disk once the budget is tight, while a `streaming` node holds only a small in-flight slice. Use the annotation alongside `--memory-limit` / `pipeline.memory.limit` to predict which stages will dominate memory before running the pipeline.
+
+When a Sink declares `sort_order`, text output also includes a terminal writer
+decision:
+
+```text
+=== Sink Writer Ordering ===
+
+sink.export:
+  terminal_order: customer_id asc, created_at desc
+  disposition: deferred_sort
+  boundary_mode: records_only
+  partition_scope: global_split_sequence
+```
+
+`disposition: proven_terminal_sort` means the final upstream Sort already
+establishes the exact authored order; its name appears as `proven_by`. A
+`deferred_sort` is enforced over the complete writer population and can use the
+bounded spill path. `boundary_mode` names the physical write path.
+`partition_scope` says how wide the promise is: for example,
+`global_split_sequence` is one order across all numbered split files, while
+`per_source_file` is an independent order for each fan-out destination. The
+section is absent when no terminal order was authored.
 
 ## JSON format
 
@@ -57,6 +79,11 @@ Produces a machine-readable JSON object for programmatic consumption. Useful for
 - CI pipelines that need to assert plan properties
 - Custom dashboards that visualize execution plans
 - Diffing plans between config versions
+
+An authored Sink order adds a `writer_boundaries` array. Each entry carries the
+Sink name, structured `terminal_order` fields and directions, the
+`terminal_order_label`, `disposition`, optional `proven_by`, `boundary_mode`,
+and `partition_scope`. The key is omitted when no Sink declares an order.
 
 ```bash
 # Compare plans before and after a config change
@@ -91,6 +118,8 @@ The resulting diagram shows:
 - Nodes as labeled boxes with type and parallelism annotations
 - Edges as arrows with port labels where applicable
 - Branch/merge fan-out and fan-in structure
+- Terminal order, writer disposition, boundary mode, and partition scope on a
+  Sink that declares `sort_order`
 
 ## When to use explain
 
