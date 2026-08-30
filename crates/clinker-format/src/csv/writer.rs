@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
@@ -47,6 +48,11 @@ pub struct CsvWriterConfig {
     /// column, mirroring the source-side `split_values`. Empty by default;
     /// populated from the output's `join_values`.
     pub join_values: Vec<JoinValues>,
+    /// Exact output-facing column names whose schema declares
+    /// `multiple: true`. Arrays are encoded only in these columns; an array
+    /// reaching any other column is a routing/type-contract violation and is
+    /// rejected before the row is written.
+    pub declared_multiple: BTreeSet<String>,
 }
 
 impl Default for CsvWriterConfig {
@@ -58,6 +64,7 @@ impl Default for CsvWriterConfig {
             envelope: None,
             error_on_undeclared_columns: false,
             join_values: Vec::new(),
+            declared_multiple: BTreeSet::new(),
         }
     }
 }
@@ -95,6 +102,10 @@ pub struct CsvWriter<W: Write> {
     /// a positional lookup rather than a name scan over `config.join_values` per
     /// column per record (mirrors the CSV reader's `split_specs`).
     join_overrides: Vec<Option<JoinValues>>,
+    /// Per-emitted-column declaration bit, aligned to `column_indices` and
+    /// resolved once at construction so the record hot path performs no name
+    /// lookup or allocation.
+    declared_multiple: Vec<bool>,
     /// Per-document envelope framer, present only when `config.envelope` is.
     framer: Option<EnvelopeFramer>,
 }
@@ -124,6 +135,14 @@ impl<W: Write> CsvWriter<W> {
                 config.join_values.iter().find(|j| j.field == name).cloned()
             })
             .collect();
+        let declared_multiple = column_indices
+            .iter()
+            .map(|&idx| {
+                config
+                    .declared_multiple
+                    .contains(schema.columns()[idx].as_ref())
+            })
+            .collect();
         Self {
             inner,
             schema,
@@ -132,6 +151,7 @@ impl<W: Write> CsvWriter<W> {
             column_indices,
             row_buf,
             join_overrides,
+            declared_multiple,
             framer,
         }
     }
@@ -228,19 +248,21 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
             column_indices,
             row_buf,
             join_overrides,
+            declared_multiple,
             framer,
             ..
         } = self;
         let columns = schema.columns();
-        for ((slot, &idx), join) in row_buf
+        for (((slot, &idx), join), is_multiple) in row_buf
             .iter_mut()
             .zip(column_indices.iter())
             .zip(join_overrides.iter())
+            .zip(declared_multiple.iter())
         {
             let col = columns[idx].as_ref();
             slot.clear();
             if let Some(v) = record.get(col) {
-                write_csv_cell(slot, col, v, join.as_ref())?;
+                write_csv_cell(slot, col, v, join.as_ref(), *is_multiple)?;
             }
         }
 
@@ -414,9 +436,14 @@ fn write_csv_cell(
     col: &str,
     value: &Value,
     join: Option<&JoinValues>,
+    is_multiple: bool,
 ) -> Result<(), FormatError> {
     match value {
-        Value::Array(items) => write_joined_cell(buf, col, value, items, join),
+        Value::Array(items) if is_multiple => write_joined_cell(buf, col, value, items, join),
+        Value::Array(_) => Err(FormatError::UnserializableArrayValue {
+            format: "CSV",
+            column: col.to_string(),
+        }),
         Value::Map(_) => Err(FormatError::UnserializableMapValue {
             format: "CSV",
             column: col.to_string(),
@@ -931,9 +958,18 @@ mod tests {
 
     use crate::multi_value::{JoinValues, OnConflict};
 
+    fn declared_config(fields: &[&str]) -> CsvWriterConfig {
+        CsvWriterConfig {
+            declared_multiple: fields.iter().map(|field| (*field).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
     fn join_config(entries: Vec<JoinValues>) -> CsvWriterConfig {
+        let declared_multiple = entries.iter().map(|entry| entry.field.clone()).collect();
         CsvWriterConfig {
             join_values: entries,
+            declared_multiple,
             ..Default::default()
         }
     }
@@ -955,7 +991,7 @@ mod tests {
                 ]),
             ],
         );
-        let output = write_to_string(&schema, CsvWriterConfig::default(), &[record]);
+        let output = write_to_string(&schema, declared_config(&["tags"]), &[record]);
         assert_eq!(output, "id,tags\n7,a;b;c\n");
     }
 
@@ -973,7 +1009,7 @@ mod tests {
                 Value::Array(vec![Value::String("solo".into())]),
             ],
         );
-        let output = write_to_string(&schema, CsvWriterConfig::default(), &[empty, single]);
+        let output = write_to_string(&schema, declared_config(&["tags"]), &[empty, single]);
         assert_eq!(output, "id,tags\n1,\n2,solo\n");
     }
 
@@ -1015,7 +1051,7 @@ mod tests {
             ])],
         );
         let mut buf = Vec::new();
-        let mut writer = CsvWriter::new(&mut buf, Arc::clone(&schema), CsvWriterConfig::default());
+        let mut writer = CsvWriter::new(&mut buf, Arc::clone(&schema), declared_config(&["tags"]));
         let err = writer.write_record(&record).unwrap_err();
         assert!(err.is_join_collision());
         match err {
@@ -1121,7 +1157,7 @@ mod tests {
 
         // error: the ';' inside "a,b;c" collides.
         let mut buf = Vec::new();
-        let mut w = CsvWriter::new(&mut buf, Arc::clone(&schema), CsvWriterConfig::default());
+        let mut w = CsvWriter::new(&mut buf, Arc::clone(&schema), declared_config(&["tags"]));
         assert!(w.write_record(&record).unwrap_err().is_join_collision());
 
         // escape: round-trips through the reader despite the CSV comma-quoting.
@@ -1166,7 +1202,7 @@ mod tests {
         // Delimited (default error): empty cell, reads back as [] (0 values).
         let delimited = write_to_string(
             &schema,
-            CsvWriterConfig::default(),
+            declared_config(&["tags"]),
             std::slice::from_ref(&record),
         );
         assert_eq!(delimited, "id,tags\n1,\n");

@@ -22,6 +22,7 @@
 //! rendered record values or record-sized scalar capacity.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -67,6 +68,11 @@ pub struct XmlWriterConfig {
     /// output's `join_values`. Mirrors the CSV writer's `join_values` field —
     /// the two writers read disjoint sub-vocabularies of the same declaration.
     pub join_values: Vec<JoinValues>,
+    /// Exact output-facing column names whose schema declares
+    /// `multiple: true`. A top-level array is repeated only for one of these
+    /// columns; arrays nested inside a neutral map remain ordinary structured
+    /// XML values.
+    pub declared_multiple: BTreeSet<String>,
 }
 
 impl Default for XmlWriterConfig {
@@ -79,6 +85,7 @@ impl Default for XmlWriterConfig {
             include_engine_stamped: false,
             envelope: None,
             join_values: Vec::new(),
+            declared_multiple: BTreeSet::new(),
         }
     }
 }
@@ -634,6 +641,10 @@ enum PlanNode {
     Leaf {
         name: String,
         field: usize,
+        /// Whether this top-level schema field declares `multiple: true`.
+        /// Used only to admit a top-level array; nested arrays inside maps use
+        /// the neutral recursive writer contract instead.
+        declared_multiple: bool,
         /// Per-item naming when this leaf's value is a `Value::Array`. `None`
         /// emits bare repeats named after the leaf; `Some` carries the
         /// `repeat_as` / `wrap_in` overrides from the field's `join_values`
@@ -701,6 +712,7 @@ fn build_tree_plan<'a>(
             &path,
             &config.attribute_prefix,
             &config.join_values,
+            &config.declared_multiple,
         )?;
     }
     Ok(TreePlan { root })
@@ -717,6 +729,7 @@ fn plan_insert_field(
     path: &[Cow<'_, str>],
     attribute_prefix: &str,
     join_values: &[JoinValues],
+    declared_multiple: &BTreeSet<String>,
 ) -> Result<(), FormatError> {
     let (segment, rest) = path
         .split_first()
@@ -743,6 +756,7 @@ fn plan_insert_field(
                 rest,
                 attribute_prefix,
                 join_values,
+                declared_multiple,
             )
         } else {
             let mut branch_body = PlanBody::default();
@@ -753,6 +767,7 @@ fn plan_insert_field(
                 rest,
                 attribute_prefix,
                 join_values,
+                declared_multiple,
             )?;
             body.children.push(PlanNode::Branch {
                 name: segment.to_string(),
@@ -785,6 +800,7 @@ fn plan_insert_field(
         body.children.push(PlanNode::Leaf {
             name: segment.to_string(),
             field: field_index,
+            declared_multiple: declared_multiple.contains(field),
             repeat,
         });
         Ok(())
@@ -849,6 +865,7 @@ fn validate_body<S: FieldSource>(
         validate_field_value(
             value,
             true,
+            false,
             config.preserve_nulls,
             &config.attribute_prefix,
             name,
@@ -856,11 +873,16 @@ fn validate_body<S: FieldSource>(
     }
     for child in &body.children {
         match child {
-            PlanNode::Leaf { field, .. } => {
+            PlanNode::Leaf {
+                field,
+                declared_multiple,
+                ..
+            } => {
                 let (name, value) = values.field(*field);
                 validate_field_value(
                     value,
                     false,
+                    *declared_multiple,
                     config.preserve_nulls,
                     &config.attribute_prefix,
                     name,
@@ -875,12 +897,19 @@ fn validate_body<S: FieldSource>(
 fn validate_field_value(
     val: &Value,
     is_attr: bool,
+    declared_multiple: bool,
     _preserve_nulls: bool,
     attribute_prefix: &str,
     name: &str,
 ) -> Result<(), FormatError> {
     match val {
-        Value::Array(_) if !is_attr => validate_xml_nested_value(val, name, attribute_prefix),
+        Value::Array(_) if !is_attr && declared_multiple => {
+            validate_xml_nested_value(val, name, attribute_prefix)
+        }
+        Value::Array(_) if !is_attr => Err(FormatError::UnserializableArrayValue {
+            format: "XML",
+            column: name.to_string(),
+        }),
         Value::Array(_) => Err(FormatError::Xml(format!(
             "field '{name}': an XML attribute cannot hold multiple values — a \
                  `multiple:` field maps to repeated elements, not an attribute"
@@ -1017,6 +1046,7 @@ fn emit_body<W: Write, S: FieldSource>(
                 name,
                 field,
                 repeat,
+                ..
             } => {
                 let (field_name, value) = values.field(*field);
                 if !field_emits(value, false, preserve_nulls) {
@@ -1711,6 +1741,14 @@ mod tests {
         )
     }
 
+    /// An XML writer config that admits arrays only for the named fields.
+    fn xml_multiple_config(fields: &[&str]) -> XmlWriterConfig {
+        XmlWriterConfig {
+            declared_multiple: fields.iter().map(|field| (*field).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
     /// A `join_values` config naming one field with the given XML overrides.
     fn xml_join_config(
         field: &str,
@@ -1718,6 +1756,7 @@ mod tests {
         wrap_in: Option<&str>,
     ) -> XmlWriterConfig {
         XmlWriterConfig {
+            declared_multiple: [field.to_string()].into_iter().collect(),
             join_values: vec![JoinValues {
                 field: field.into(),
                 repeat_as: repeat_as.map(str::to_string),
@@ -1738,7 +1777,7 @@ mod tests {
             7,
             vec![Value::String("a".into()), Value::String("b".into())],
         );
-        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        let output = write_records(xml_multiple_config(&["tags"]), &[record], &schema);
         assert_eq!(
             output,
             "<Root><Record><id>7</id><tags>a</tags><tags>b</tags></Record></Root>"
@@ -1751,7 +1790,7 @@ mod tests {
     fn test_xml_write_multi_value_single_element_matches_scalar() {
         let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
         let array = record_with_tags(&schema, 7, vec![Value::String("a".into())]);
-        let array_out = write_records(XmlWriterConfig::default(), &[array], &schema);
+        let array_out = write_records(xml_multiple_config(&["tags"]), &[array], &schema);
         let scalar = Record::new(
             Arc::clone(&schema),
             vec![Value::Integer(7), Value::String("a".into())],
@@ -1771,7 +1810,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
         let bare = record_with_tags(&schema, 7, vec![]);
         assert_eq!(
-            write_records(XmlWriterConfig::default(), &[bare], &schema),
+            write_records(xml_multiple_config(&["tags"]), &[bare], &schema),
             "<Root><Record><id>7</id></Record></Root>"
         );
         let wrapped = record_with_tags(&schema, 7, vec![]);
@@ -1796,7 +1835,7 @@ mod tests {
             7,
             vec![Value::String("a".into()), Value::String("".into())],
         );
-        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        let output = write_records(xml_multiple_config(&["tags"]), &[record], &schema);
         assert_eq!(
             output,
             "<Root><Record><id>7</id><tags>a</tags><tags/></Record></Root>"
@@ -1968,7 +2007,11 @@ mod tests {
             vec![Value::Array(vec![Value::String("a".into())])],
         );
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let mut writer = XmlWriter::new(
+            &mut buf,
+            Arc::clone(&schema),
+            xml_multiple_config(&["tags"]),
+        );
         let err = writer.write_record(&record).unwrap_err();
         assert!(
             matches!(&err, FormatError::UnserializableArrayValue { column, .. } if column == "tags"),
@@ -2006,6 +2049,7 @@ mod tests {
         let output = write_records(
             XmlWriterConfig {
                 record_element: "Order".into(),
+                declared_multiple: ["tags".to_string()].into_iter().collect(),
                 ..Default::default()
             },
             &[record],
