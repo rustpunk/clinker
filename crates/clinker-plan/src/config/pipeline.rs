@@ -2410,33 +2410,6 @@ impl PipelineConfig {
                     .unwrap_or_default();
             }
         }
-        let declared_multiple_by_sink: std::collections::HashMap<
-            String,
-            std::collections::BTreeSet<String>,
-        > = runtime_config
-            .nodes
-            .iter()
-            .filter_map(|spanned| match &spanned.value {
-                PipelineNode::Sink { header, config } => {
-                    Some((header.name.clone(), config.sink.declared_multiple.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        for node in dag.graph.node_weights_mut() {
-            let crate::plan::execution::PlanNode::Sink {
-                name,
-                resolved: Some(payload),
-                ..
-            } = node
-            else {
-                continue;
-            };
-            payload.sink.declared_multiple = declared_multiple_by_sink
-                .get(name)
-                .cloned()
-                .unwrap_or_default();
-        }
         // Resolved unified `SourceSchema` per source, retained on the plan.
         let mut bound_schemas: indexmap::IndexMap<String, clinker_format::SourceSchema> =
             indexmap::IndexMap::new();
