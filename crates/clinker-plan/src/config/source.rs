@@ -101,6 +101,12 @@ pub struct SourceConfig {
     /// Entries apply in declaration order, so two fan-outs multiply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split_to_rows: Option<Vec<SplitToRows>>,
+    /// Maximum output rows one input record may produce through
+    /// `split_to_rows`. Zero or omission leaves fan-out unlimited. A finite
+    /// ceiling emits at most this many rows, then rejects the original input
+    /// through the source DLQ on the first attempted row above the ceiling.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub max_output_rows_per_input: u64,
     /// In-cell parse declarations: each names a field whose delimited text is
     /// split into the several values a `multiple: true` column holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -912,6 +918,47 @@ mod tests {
     use super::*;
     use crate::config::ByteSize;
     use clinker_format::SplitToRowsMode;
+
+    fn parse_source_with_limit(limit_line: &str) -> Result<SourceConfig, String> {
+        let yaml = format!(
+            "pipeline:\n  name: fan_out_limit\nnodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: json\n      path: input.json\n{limit_line}      split_to_rows: [items]\n      schema:\n        - {{ name: items, type: string }}\n  - type: sink\n    name: out\n    input: src\n    config:\n      name: out\n      type: json\n      path: output.json\n"
+        );
+        let config: PipelineConfig =
+            crate::yaml::from_str(&yaml).map_err(|error| error.to_string())?;
+        Ok(config.source_configs().next().expect("source").clone())
+    }
+
+    #[test]
+    fn max_output_rows_per_input_is_optional_and_zero_disables_it() {
+        assert_eq!(
+            parse_source_with_limit("")
+                .unwrap()
+                .max_output_rows_per_input,
+            0
+        );
+        assert_eq!(
+            parse_source_with_limit("      max_output_rows_per_input: 0\n")
+                .unwrap()
+                .max_output_rows_per_input,
+            0
+        );
+        assert_eq!(
+            parse_source_with_limit("      max_output_rows_per_input: 12\n")
+                .unwrap()
+                .max_output_rows_per_input,
+            12
+        );
+    }
+
+    #[test]
+    fn max_output_rows_per_input_rejects_negative_and_fractional_values() {
+        for value in ["-1", "1.5"] {
+            let error =
+                parse_source_with_limit(&format!("      max_output_rows_per_input: {value}\n"))
+                    .unwrap_err();
+            assert!(error.contains("max_output_rows_per_input"), "{error}");
+        }
+    }
 
     /// The `split_to_rows` shorthand: a bare field name and a full mapping mix
     /// freely in one sequence, and the shorthand materializes the same

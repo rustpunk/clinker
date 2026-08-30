@@ -41,7 +41,7 @@ use cxl::analyzer::doc_paths::DocPath;
 use crate::bom::UTF8_BOM;
 use crate::doc_index::DocArenaIndex;
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, coerce_section_fields};
-use crate::error::FormatError;
+use crate::error::{FanOutLimitFailure, FormatError};
 use crate::multi_value::{SplitToRows, SplitToRowsMode, SplitValues, split_text_value};
 use crate::numeric_observation::{
     NumericObservation, NumericObserver, NumericParserOutcome, observe_xml_scalar,
@@ -63,6 +63,9 @@ pub struct XmlReaderConfig {
     /// Fan-out declarations, applied in declaration order — so two entries
     /// multiply, exactly as two nested loops would.
     pub split_to_rows: Vec<SplitToRows>,
+    /// Maximum rows one input element may emit through `split_to_rows`.
+    /// Zero disables the ceiling.
+    pub max_output_rows_per_input: u64,
     /// In-cell parse declarations: a field's text is split on its delimiter
     /// into the several values a `multiple: true` column holds.
     pub split_values: Vec<SplitValues>,
@@ -87,6 +90,7 @@ impl Default for XmlReaderConfig {
             namespace_handling: NamespaceMode::Strip,
             multi_value_fields: Vec::new(),
             split_to_rows: Vec::new(),
+            max_output_rows_per_input: 0,
             split_values: Vec::new(),
             declared_doc_paths: Vec::new(),
             max_index_bytes: None,
@@ -103,6 +107,7 @@ pub enum NamespaceMode {
 /// One record element's raw extraction: flattened `(key, value)` pairs in
 /// document order with repeated keys intact, plus the field ranges covered
 /// by each declared fan-out field's element occurrences.
+#[derive(Clone)]
 struct RawRecord {
     fields: Vec<(String, String)>,
     /// Index-aligned with `XmlReaderConfig::split_to_rows`: for each declared
@@ -130,6 +135,23 @@ impl RawRecord {
             presence: Vec::new(),
         }
     }
+}
+
+/// Preserve one raw XML record for a structured source rejection without
+/// collapsing repeated field names. Each array item records one flattened
+/// field occurrence in document order.
+fn raw_xml_record_value(raw: &RawRecord) -> Value {
+    Value::Array(
+        raw.fields
+            .iter()
+            .map(|(field, value)| {
+                let mut occurrence = IndexMap::with_capacity(2);
+                occurrence.insert("field".into(), Value::String(field.clone().into()));
+                occurrence.insert("value".into(), Value::String(value.clone().into()));
+                Value::Map(Box::new(occurrence))
+            })
+            .collect(),
+    )
 }
 
 /// A flattened field tagged with its index in the original extraction, so
@@ -262,10 +284,18 @@ struct XmlExpansionCursor {
     instances: Vec<Vec<Range<usize>>>,
     frames: Vec<XmlExpansionFrame>,
     current: Option<Vec<IndexedField>>,
+    max_output_rows: u64,
+    emitted: u64,
+    failure: Option<FanOutLimitFailure>,
 }
 
 impl XmlExpansionCursor {
-    fn new(raw: RawRecord, entries: &[SplitToRows]) -> Self {
+    fn new(
+        raw: RawRecord,
+        entries: &[SplitToRows],
+        max_output_rows: u64,
+        original_record: Option<Value>,
+    ) -> Self {
         let RawRecord {
             fields,
             split_instances,
@@ -281,6 +311,16 @@ impl XmlExpansionCursor {
             instances: split_instances,
             frames: Vec::with_capacity(entries.len()),
             current: None,
+            max_output_rows,
+            emitted: 0,
+            failure: original_record.map(|original_record| FanOutLimitFailure {
+                field: entries
+                    .last()
+                    .map_or_else(String::new, |entry| entry.field.clone()),
+                limit: max_output_rows,
+                actual: u128::from(max_output_rows) + 1,
+                original_record,
+            }),
         };
         cursor.descend(record, 0);
         cursor
@@ -321,17 +361,24 @@ impl XmlExpansionCursor {
 }
 
 impl Iterator for XmlExpansionCursor {
-    type Item = Vec<(String, String)>;
+    type Item = Result<Vec<(String, String)>, FormatError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let output = self.current.take()?;
+        if self.max_output_rows != 0 && self.emitted >= self.max_output_rows {
+            self.frames.clear();
+            return Some(Err(FormatError::FanOutLimit(Box::new(
+                self.failure
+                    .take()
+                    .expect("a finite fan-out limit carries its original record"),
+            ))));
+        }
+        self.emitted += 1;
         self.advance();
-        Some(
-            output
-                .into_iter()
-                .map(|(_, key, value)| (key, value))
-                .collect(),
-        )
+        Some(Ok(output
+            .into_iter()
+            .map(|(_, key, value)| (key, value))
+            .collect()))
     }
 }
 
@@ -393,7 +440,7 @@ pub struct XmlReader {
     pending: Option<XmlExpansionCursor>,
     /// First raw output used for schema inference. Assembly remains deferred
     /// to `next_record` so record-local structural errors reach the DLQ path.
-    deferred_first: Option<Vec<(String, String)>>,
+    deferred_first: Option<RawRecord>,
     /// Whether we've finished all records.
     done: bool,
     /// Optional authoring-only sink receiving one bounded scalar observation
@@ -846,8 +893,15 @@ impl XmlReader {
     /// under the default `keep_empty: true`, and is dropped when the author
     /// opts out. Memory is bounded by the parent element, declaration-depth
     /// cursor tables, and one output row rather than the occurrence product.
-    fn apply_split_to_rows(&self, raw: RawRecord) -> XmlExpansionCursor {
-        XmlExpansionCursor::new(raw, &self.config.split_to_rows)
+    fn apply_split_to_rows(
+        &self,
+        raw: RawRecord,
+        original_record: Option<Value>,
+    ) -> XmlExpansionCursor {
+        let limit = original_record
+            .as_ref()
+            .map_or(0, |_| self.config.max_output_rows_per_input);
+        XmlExpansionCursor::new(raw, &self.config.split_to_rows, limit, original_record)
     }
 
     /// Skip an entire subtree (from current Start to its matching End).
@@ -1032,7 +1086,7 @@ impl FormatReader for XmlReader {
         // `keep_empty: false` entry drops an element with no occurrence, and
         // inferring from that dropped expansion would cache a column-less
         // schema for the whole source while records kept flowing.
-        let (first, presence) = loop {
+        let (raw, first, presence) = loop {
             let Some(raw) = self.read_next_record_raw()? else {
                 let s = SchemaBuilder::new().build();
                 self.schema = Some(Arc::clone(&s));
@@ -1042,10 +1096,9 @@ impl FormatReader for XmlReader {
             // Value-less self-closing columns push no field, so they never reach
             // the expansion; carry their names alongside so inference keeps them.
             let presence = raw.presence.clone();
-            let mut expanded = self.apply_split_to_rows(raw);
-            if let Some(first) = expanded.next() {
-                self.pending = Some(expanded);
-                break (first, presence);
+            let mut expanded = self.apply_split_to_rows(raw.clone(), None);
+            if let Some(first) = expanded.next().transpose()? {
+                break (raw, first, presence);
             }
         };
 
@@ -1067,10 +1120,11 @@ impl FormatReader for XmlReader {
             .collect::<SchemaBuilder>()
             .build();
 
-        // Keep the first output raw so fallible assembly still runs from
-        // `next_record`, inside the executor's record loop. The cursor retained
-        // above generates only the remaining outputs.
-        self.deferred_first = Some(first);
+        // Keep the first input raw so fallible assembly and the per-input
+        // output ceiling both run from `next_record`, inside the executor's
+        // record loop. Schema inference must not consume an uncounted output
+        // or retain a cursor with the runtime ceiling disabled.
+        self.deferred_first = Some(raw);
         self.schema = Some(Arc::clone(&schema));
 
         Ok(schema)
@@ -1082,11 +1136,17 @@ impl FormatReader for XmlReader {
         }
 
         loop {
-            if let Some(fields) = self.deferred_first.take() {
-                return Ok(Some(self.fields_to_record(fields)?));
+            if let Some(raw) = self.deferred_first.take() {
+                let original_record = (self.config.max_output_rows_per_input != 0)
+                    .then(|| raw_xml_record_value(&raw));
+                let mut expanded = self.apply_split_to_rows(raw, original_record);
+                if let Some(fields) = expanded.next().transpose()? {
+                    self.pending = Some(expanded);
+                    return Ok(Some(self.fields_to_record(fields)?));
+                }
             }
             if let Some(mut pending) = self.pending.take()
-                && let Some(fields) = pending.next()
+                && let Some(fields) = pending.next().transpose()?
             {
                 self.pending = Some(pending);
                 return Ok(Some(self.fields_to_record(fields)?));
@@ -1095,8 +1155,10 @@ impl FormatReader for XmlReader {
                 Some(r) => r,
                 None => return Ok(None),
             };
-            let mut expanded = self.apply_split_to_rows(raw);
-            if let Some(fields) = expanded.next() {
+            let original_record =
+                (self.config.max_output_rows_per_input != 0).then(|| raw_xml_record_value(&raw));
+            let mut expanded = self.apply_split_to_rows(raw, original_record);
+            if let Some(fields) = expanded.next().transpose()? {
                 self.pending = Some(expanded);
                 return Ok(Some(self.fields_to_record(fields)?));
             }
@@ -2761,6 +2823,70 @@ mod tests {
             rows += 1;
         }
         assert_eq!(rows, occurrence_count * occurrence_count);
+    }
+
+    #[test]
+    fn fan_out_limit_emits_exact_ceiling_then_rejects_original_input() {
+        let xml = concat!(
+            "<Root><Order><id>7</id>",
+            "<A><a>0</a></A><A><a>1</a></A>",
+            "<B><b>0</b></B><B><b>1</b></B><B><b>2</b></B>",
+            "</Order></Root>",
+        );
+        let mut config = split_config("Root/Order", vec![split("A"), split("B")]);
+        config.max_output_rows_per_input = 4;
+        let mut reader = reader_from_str(xml, config);
+        reader
+            .schema()
+            .expect("schema inference is not a fan-out attempt");
+
+        let mut pairs = Vec::new();
+        for _ in 0..4 {
+            let record = reader.next_record().unwrap().unwrap();
+            pairs.push((record.get("A.a").cloned(), record.get("B.b").cloned()));
+        }
+        assert_eq!(
+            pairs,
+            vec![
+                (Some(Value::Integer(0)), Some(Value::Integer(0))),
+                (Some(Value::Integer(0)), Some(Value::Integer(1))),
+                (Some(Value::Integer(0)), Some(Value::Integer(2))),
+                (Some(Value::Integer(1)), Some(Value::Integer(0))),
+            ]
+        );
+
+        let error = reader.next_record().unwrap_err();
+        let FormatError::FanOutLimit(failure) = error else {
+            panic!("expected structured fan-out limit failure, got {error}");
+        };
+        assert_eq!(failure.field, "B");
+        assert_eq!(failure.limit, 4);
+        assert_eq!(failure.actual, 5);
+        let Value::Array(original) = failure.original_record else {
+            panic!("XML rejection must retain ordered raw field occurrences");
+        };
+        assert!(original.len() >= 6);
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn zero_fan_out_limit_keeps_the_full_product() {
+        let xml = "<Root><Order><A>0</A><A>1</A><B>0</B><B>1</B><B>2</B></Order></Root>";
+        let mut config = split_config("Root/Order", vec![split("A"), split("B")]);
+        config.max_output_rows_per_input = 0;
+        let mut reader = reader_from_str(xml, config);
+        reader.schema().unwrap();
+        let mut rows = 0;
+        while reader.next_record().unwrap().is_some() {
+            if let Some(cursor) = &reader.pending {
+                assert!(
+                    cursor.failure.is_none(),
+                    "an unlimited source must not retain a DLQ copy of its input"
+                );
+            }
+            rows += 1;
+        }
+        assert_eq!(rows, 6);
     }
 
     #[test]

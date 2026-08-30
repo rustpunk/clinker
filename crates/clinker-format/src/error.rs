@@ -35,6 +35,19 @@ pub struct UnknownRecordTypeFailure {
     pub message: String,
 }
 
+/// One source record whose declared fan-out would emit beyond its authored
+/// per-input ceiling. The original decoded value remains available so the
+/// executor can route the exact input to the DLQ rather than fabricating an
+/// expanded or truncated representative.
+#[derive(Debug)]
+pub struct FanOutLimitFailure {
+    pub field: String,
+    pub limit: u64,
+    /// First output count that exceeds `limit` (`limit + 1`).
+    pub actual: u128,
+    pub original_record: Value,
+}
+
 /// Errors produced by format readers and writers.
 ///
 /// Streaming: errors are returned per-record, not buffered. The executor
@@ -108,6 +121,9 @@ pub enum FormatError {
     /// Carries the decoded row so record-grained recovery never fabricates a
     /// declared record shape or loses the rejected input.
     UnknownRecordType(Box<UnknownRecordTypeFailure>),
+    /// A JSON/XML `split_to_rows` cursor reached the first output beyond the
+    /// source's `max_output_rows_per_input` ceiling.
+    FanOutLimit(Box<FanOutLimitFailure>),
     /// A multi-record flat file broke a non-count structural rule that cannot
     /// be recovered as one independent row: a body record appeared after the
     /// trailer that closes the document. Kept apart from
@@ -312,6 +328,13 @@ impl fmt::Display for FormatError {
                     failure.message
                 )
             }
+            Self::FanOutLimit(failure) => write!(
+                f,
+                "source fan-out field {:?} would emit output row {} beyond the declared \
+                 `max_output_rows_per_input: {}` ceiling; the original input record is \
+                 rejected instead of silently reporting a truncated expansion as successful",
+                failure.field, failure.actual, failure.limit
+            ),
             Self::StructuralValidation { format, message } => {
                 write!(f, "{format} structural validation error: {message}")
             }

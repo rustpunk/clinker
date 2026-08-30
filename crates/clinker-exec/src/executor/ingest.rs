@@ -620,9 +620,10 @@ fn drive_record_source(
         // rejection kind. It mirrors the reader columns, carries a reserved
         // decoded-physical-row slot, then uses the same three source stamps as
         // successful rows. A declared-type failure leaves the raw slot Null;
-        // an undeclared discriminator fills it without fabricating a declared
-        // record layout. The source-order barrier can therefore spill and
-        // merge both kinds in one ordinal-ordered stream.
+        // an undeclared discriminator or fan-out ceiling breach fills it
+        // without fabricating a declared record layout. The source-order
+        // barrier can therefore spill and merge every kind in one
+        // ordinal-ordered stream.
         let rejection_schema = build_source_rejection_schema(&reader_schema);
 
         // Fallback `$source.file` for records whose reader exposes no
@@ -975,6 +976,97 @@ fn drive_record_source(
                         )) => return Err(*error),
                     }
                 }
+                Err(clinker_format::FormatError::FanOutLimit(failure)) => {
+                    let clinker_format::error::FanOutLimitFailure {
+                        field,
+                        limit,
+                        actual,
+                        original_record: raw_record,
+                    } = *failure;
+                    total_count =
+                        total_count
+                            .checked_add(1)
+                            .ok_or_else(|| PipelineError::Internal {
+                                op: "source-ingest-count",
+                                node: src_cfg.name.clone(),
+                                detail: String::from(
+                                    "source record count cannot advance beyond u64::MAX",
+                                ),
+                            })?;
+                    let file_arc = src_reader
+                        .current_source_file()
+                        .cloned()
+                        .unwrap_or_else(|| Arc::clone(&static_source_file));
+                    if stack_belongs_to_other_file(&doc_stack, &file_arc) {
+                        open_file_level_doc(
+                            &src_cfg,
+                            &mut stream,
+                            &mut doc_stack,
+                            &mut src_reader,
+                            &file_arc,
+                        )?;
+                    }
+                    apply_source_lifecycle_events(
+                        &src_cfg,
+                        &mut stream,
+                        &mut doc_stack,
+                        &mut src_reader,
+                        &file_arc,
+                        preserve_empty_physical_files,
+                    )?;
+                    let doc_ctx = doc_stack.last().cloned().unwrap_or_else(|| {
+                        Arc::new(clinker_record::DocumentContext::new(
+                            clinker_record::DocumentId::next(),
+                            Arc::clone(&file_arc),
+                            clinker_record::EnvelopeRecord::empty(),
+                        ))
+                    });
+                    let original_record = stamp_source_rejection_record(
+                        &rejection_schema,
+                        reader_schema.column_count(),
+                        vec![clinker_record::Value::Null; reader_schema.column_count()],
+                        raw_record,
+                        &doc_ctx,
+                        &file_arc,
+                        &source_name_arc,
+                    )?;
+                    let row_id = stream.reserve_rejected_row_id().map_err(|err| {
+                        PipelineError::Internal {
+                            op: "source-ingest-identity",
+                            node: src_cfg.name.clone(),
+                            detail: err.to_string(),
+                        }
+                    })?;
+                    let event = crate::executor::dlq::SourceRejectionEvent::fan_out_limit(
+                        row_id,
+                        Arc::clone(&source_name_arc),
+                        file_arc,
+                        field,
+                        limit,
+                        actual,
+                        original_record,
+                    );
+                    match stream.push_rejection(event) {
+                        Ok(()) => {}
+                        Err(crate::executor::source_stream::SourceStreamError::Closed) => break,
+                        Err(
+                            crate::executor::source_stream::SourceStreamError::OrdinalExhausted {
+                                source,
+                            },
+                        ) => {
+                            return Err(PipelineError::Internal {
+                                op: "source-ingest-identity",
+                                node: src_cfg.name.clone(),
+                                detail: format!(
+                                    "source row identity exhausted for {source}: ordinal cannot advance beyond u64::MAX"
+                                ),
+                            });
+                        }
+                        Err(crate::executor::source_stream::SourceStreamError::OrderViolation(
+                            error,
+                        )) => return Err(*error),
+                    }
+                }
                 Err(clinker_format::FormatError::UnknownRecordType(failure))
                     if src_cfg.dlq_granularity == clinker_plan::config::DlqGranularity::Record =>
                 {
@@ -1301,10 +1393,10 @@ fn close_open_levels(
 
 const SOURCE_RAW_RECORD_COLUMN: &str = "_cxl_dlq_source_record";
 
-/// Build the one source-rejection schema shared by declared-type and reader-
-/// classification failures. Its fixed shape lets the ordered-source barrier
-/// spill a mixed rejection stream without assuming every rejected attempt had
-/// a declared record type.
+/// Build the one source-rejection schema shared by declared-type, reader-
+/// classification, and fan-out-ceiling failures. Its fixed shape lets the
+/// ordered-source barrier spill a mixed rejection stream without assuming
+/// every rejected attempt had a declared record type.
 fn build_source_rejection_schema(
     reader_schema: &Arc<clinker_record::Schema>,
 ) -> Arc<clinker_record::Schema> {
@@ -1796,6 +1888,7 @@ fn build_json_reader_config(
     }
     config.multi_value_fields = multi_value_fields(schema);
     config.split_to_rows = input.split_to_rows.clone().unwrap_or_default();
+    config.max_output_rows_per_input = input.max_output_rows_per_input;
     config.split_values = input.split_values.clone().unwrap_or_default();
     config
 }
@@ -1856,6 +1949,7 @@ fn build_xml_reader_config(
     }
     config.multi_value_fields = multi_value_fields(schema);
     config.split_to_rows = input.split_to_rows.clone().unwrap_or_default();
+    config.max_output_rows_per_input = input.max_output_rows_per_input;
     config.split_values = input.split_values.clone().unwrap_or_default();
     config
 }

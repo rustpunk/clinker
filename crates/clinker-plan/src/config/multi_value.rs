@@ -221,6 +221,19 @@ fn validate_source_declarations(
     let fan_out = source.split_to_rows.as_deref().unwrap_or(&[]);
     let in_cell = source.split_values.as_deref().unwrap_or(&[]);
 
+    if source.max_output_rows_per_input != 0 && fan_out.is_empty() {
+        faults.push(DeclarationFault {
+            message: format!(
+                "source '{}': `max_output_rows_per_input` is {}, but the source declares no \
+                 `split_to_rows` fan-out for that ceiling to bound",
+                source.name, source.max_output_rows_per_input
+            ),
+            help: "add the intended `split_to_rows` entries, or remove \
+                   `max_output_rows_per_input` (zero also disables the ceiling)"
+                .to_string(),
+        });
+    }
+
     // A declaration the format's reader is never handed does nothing at all,
     // and nothing downstream reports it. Reject the block itself rather than
     // only its contents, so the no-op fails at compile the way the retired

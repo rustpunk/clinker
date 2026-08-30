@@ -39,7 +39,7 @@ use cxl::analyzer::doc_paths::DocPath;
 use crate::bom::UTF8_BOM;
 use crate::doc_index::DocArenaIndex;
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, EnvelopeFieldType};
-use crate::error::FormatError;
+use crate::error::{FanOutLimitFailure, FormatError};
 use crate::json::body_stream::{JsonArrayStream, is_json_ws};
 use crate::json::streaming::{SectionTarget, extract_sections};
 use crate::multi_value::{SplitToRows, SplitToRowsMode, SplitValues};
@@ -61,6 +61,9 @@ pub struct JsonReaderConfig {
     /// Fan-out declarations, applied in declaration order — so two entries
     /// multiply, exactly as two nested loops would.
     pub split_to_rows: Vec<SplitToRows>,
+    /// Maximum rows one input record may emit through `split_to_rows`.
+    /// Zero disables the ceiling.
+    pub max_output_rows_per_input: u64,
     /// In-cell parse declarations: a field's text is split on its delimiter
     /// into the several values a `multiple: true` column holds.
     pub split_values: Vec<SplitValues>,
@@ -209,14 +212,32 @@ struct JsonExpansionCursor {
     entries: Vec<SplitToRows>,
     frames: Vec<JsonExpansionFrame>,
     current: Option<serde_json::Map<String, serde_json::Value>>,
+    max_output_rows: u64,
+    emitted: u64,
+    failure: Option<FanOutLimitFailure>,
 }
 
 impl JsonExpansionCursor {
-    fn new(record: serde_json::Map<String, serde_json::Value>, entries: &[SplitToRows]) -> Self {
+    fn new(
+        record: serde_json::Map<String, serde_json::Value>,
+        entries: &[SplitToRows],
+        max_output_rows: u64,
+        original_record: Option<Value>,
+    ) -> Self {
         let mut cursor = Self {
             entries: entries.to_vec(),
             frames: Vec::with_capacity(entries.len()),
             current: None,
+            max_output_rows,
+            emitted: 0,
+            failure: original_record.map(|original_record| FanOutLimitFailure {
+                field: entries
+                    .last()
+                    .map_or_else(String::new, |entry| entry.field.clone()),
+                limit: max_output_rows,
+                actual: u128::from(max_output_rows) + 1,
+                original_record,
+            }),
         };
         cursor.descend(record, 0);
         cursor
@@ -259,12 +280,21 @@ impl JsonExpansionCursor {
 }
 
 impl Iterator for JsonExpansionCursor {
-    type Item = serde_json::Map<String, serde_json::Value>;
+    type Item = Result<serde_json::Map<String, serde_json::Value>, FormatError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let output = self.current.take()?;
+        if self.max_output_rows != 0 && self.emitted >= self.max_output_rows {
+            self.frames.clear();
+            return Some(Err(FormatError::FanOutLimit(Box::new(
+                self.failure
+                    .take()
+                    .expect("a finite fan-out limit carries its original record"),
+            ))));
+        }
+        self.emitted += 1;
         self.advance();
-        Some(output)
+        Some(Ok(output))
     }
 }
 
@@ -596,8 +626,12 @@ impl JsonReader {
     fn apply_split_to_rows(
         &self,
         flat: serde_json::Map<String, serde_json::Value>,
+        original_record: Option<Value>,
     ) -> JsonExpansionCursor {
-        JsonExpansionCursor::new(flat, &self.config.split_to_rows)
+        let limit = original_record
+            .as_ref()
+            .map_or(0, |_| self.config.max_output_rows_per_input);
+        JsonExpansionCursor::new(flat, &self.config.split_to_rows, limit, original_record)
     }
 
     /// Apply the schema-level `multiple:` declarations and the `split_values`
@@ -796,8 +830,8 @@ impl FormatReader for JsonReader {
             };
             let mut flat = serde_json::Map::new();
             Self::flatten_value("", &raw, &mut flat, 0, None, &[]);
-            let mut expanded = self.apply_split_to_rows(flat);
-            if let Some(first) = expanded.next() {
+            let mut expanded = self.apply_split_to_rows(flat, None);
+            if let Some(first) = expanded.next().transpose()? {
                 break (raw, first);
             }
         };
@@ -821,8 +855,10 @@ impl FormatReader for JsonReader {
         // flattened-name collision here rather than in the eager `schema` call.
         if let Some(raw) = self.deferred_first.take() {
             let flat = self.flatten_record_body(&raw)?;
-            let mut expanded = self.apply_split_to_rows(flat);
-            if let Some(first) = expanded.next() {
+            let original_record =
+                (self.config.max_output_rows_per_input != 0).then(|| json_to_value(&raw));
+            let mut expanded = self.apply_split_to_rows(flat, original_record);
+            if let Some(first) = expanded.next().transpose()? {
                 let record = self.map_to_record(first)?;
                 self.pending = Some(expanded);
                 return Ok(Some(record));
@@ -833,7 +869,7 @@ impl FormatReader for JsonReader {
         }
 
         if let Some(mut pending) = self.pending.take()
-            && let Some(flat) = pending.next()
+            && let Some(flat) = pending.next().transpose()?
         {
             self.pending = Some(pending);
             return Ok(Some(self.map_to_record(flat)?));
@@ -845,8 +881,10 @@ impl FormatReader for JsonReader {
                 None => return Ok(None),
             };
             let flat = self.flatten_record_body(&raw)?;
-            let mut expanded = self.apply_split_to_rows(flat);
-            let Some(first) = expanded.next() else {
+            let original_record =
+                (self.config.max_output_rows_per_input != 0).then(|| json_to_value(&raw));
+            let mut expanded = self.apply_split_to_rows(flat, original_record);
+            let Some(first) = expanded.next().transpose()? else {
                 continue;
             };
             let record = self.map_to_record(first)?;
@@ -2221,6 +2259,72 @@ mod tests {
             rows += 1;
         }
         assert_eq!(rows, occurrence_count * occurrence_count);
+    }
+
+    #[test]
+    fn fan_out_limit_emits_exact_ceiling_then_rejects_original_input() {
+        let input = r#"[{"id":7,"left":[{"l":0},{"l":1}],"right":[{"r":0},{"r":1},{"r":2}]}]"#;
+        let config = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows::bare("left"), SplitToRows::bare("right")],
+            max_output_rows_per_input: 4,
+            ..default_config()
+        };
+        let mut reader = reader_from_str(input, config);
+        reader
+            .schema()
+            .expect("schema inference is not a fan-out attempt");
+
+        let mut pairs = Vec::new();
+        for _ in 0..4 {
+            let record = reader.next_record().unwrap().unwrap();
+            pairs.push((record.get("l").cloned(), record.get("r").cloned()));
+        }
+        assert_eq!(
+            pairs,
+            vec![
+                (Some(Value::Integer(0)), Some(Value::Integer(0))),
+                (Some(Value::Integer(0)), Some(Value::Integer(1))),
+                (Some(Value::Integer(0)), Some(Value::Integer(2))),
+                (Some(Value::Integer(1)), Some(Value::Integer(0))),
+            ]
+        );
+
+        let error = reader.next_record().unwrap_err();
+        let FormatError::FanOutLimit(failure) = error else {
+            panic!("expected structured fan-out limit failure, got {error}");
+        };
+        assert_eq!(failure.field, "right");
+        assert_eq!(failure.limit, 4);
+        assert_eq!(failure.actual, 5);
+        let Value::Map(original) = failure.original_record else {
+            panic!("JSON rejection must retain the original object");
+        };
+        assert_eq!(original.get("id"), Some(&Value::Integer(7)));
+        assert!(matches!(original.get("left"), Some(Value::Array(items)) if items.len() == 2));
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn zero_fan_out_limit_keeps_the_full_product() {
+        let input = r#"[{"left":[0,1],"right":[0,1,2]}]"#;
+        let config = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows::bare("left"), SplitToRows::bare("right")],
+            max_output_rows_per_input: 0,
+            ..default_config()
+        };
+        let mut reader = reader_from_str(input, config);
+        reader.schema().unwrap();
+        let mut rows = 0;
+        while reader.next_record().unwrap().is_some() {
+            if let Some(cursor) = &reader.pending {
+                assert!(
+                    cursor.failure.is_none(),
+                    "an unlimited source must not retain a DLQ copy of its input"
+                );
+            }
+            rows += 1;
+        }
+        assert_eq!(rows, 6);
     }
 
     #[test]
