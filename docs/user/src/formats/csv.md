@@ -265,6 +265,10 @@ own `type` / `trim` / `pad`, the same as a single-record CSV field.
   are skipped rather than parsed.
 - An **unknown discriminator value** (a tag no `records:` entry declares)
   is a structural-integrity failure, classified separately from a trailer
-  count mismatch: it [aborts the run](https://github.com/rustpunk/clinker/blob/main/docs/explain/E345.md) by default,
-  or under `dlq_granularity: document` condemns the whole file to the
-  dead-letter sink and the run continues.
+  count mismatch. It [aborts the run](https://github.com/rustpunk/clinker/blob/main/docs/explain/E345.md)
+  under `fail_fast`; under `continue` with the default record granularity it
+  dead-letters only that physical row and continues with the next row; under
+  `dlq_granularity: document` it condemns the whole file. A record-grained DLQ
+  row carries a JSON array of the decoded CSV cells in `_cxl_dlq_source_record`,
+  preserving empty cells without guessing which declared layout the unknown
+  tag meant.

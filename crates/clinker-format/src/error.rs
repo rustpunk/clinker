@@ -18,6 +18,23 @@ pub struct DeclaredTypeFailure {
     pub message: String,
 }
 
+/// Complete evidence for one physical multi-record row whose discriminator
+/// matched no declared record type. The reader has consumed exactly this row
+/// and can continue with the next one; the executor owns whether the failure
+/// aborts, rejects the row, or condemns its containing document.
+#[derive(Debug)]
+pub struct UnknownRecordTypeFailure {
+    /// One-based physical line number, including skipped headers and blanks.
+    pub row: u64,
+    /// Trimmed discriminator value that failed the declared tag lookup.
+    pub discriminator: String,
+    /// Exact decoded physical-row shape. Fixed-width rows carry the line text;
+    /// CSV rows carry a JSON array of decoded cells, preserving empty cells.
+    pub raw_record: Value,
+    /// Complete E345 diagnostic with the paste-ready declaration remedy.
+    pub message: String,
+}
+
 /// Errors produced by format readers and writers.
 ///
 /// Streaming: errors are returned per-record, not buffered. The executor
@@ -87,13 +104,18 @@ pub enum FormatError {
         format: &'static str,
         message: String,
     },
-    /// A multi-record flat file broke a structural rule that is NOT a
-    /// trailer count claim: a line's record-type discriminator matched no
-    /// declared `records:` entry (E345), or a body record appeared after
-    /// the trailer that closes the document. Kept apart from
+    /// One physical multi-record row had an undeclared discriminator value.
+    /// Carries the decoded row so record-grained recovery never fabricates a
+    /// declared record shape or loses the rejected input.
+    UnknownRecordType(Box<UnknownRecordTypeFailure>),
+    /// A multi-record flat file broke a non-count structural rule that cannot
+    /// be recovered as one independent row: a body record appeared after the
+    /// trailer that closes the document. Kept apart from
     /// [`FormatError::StructuralCount`] so callers can tell a malformed tag
-    /// from a count mismatch, while both classes share the document-level
-    /// DLQ disposition under `dlq_granularity: document` (see
+    /// from a count mismatch, and apart from [`FormatError::UnknownRecordType`]
+    /// because only the latter carries one recoverable physical row. All three
+    /// classes share the document-level DLQ disposition under
+    /// `dlq_granularity: document` (see
     /// [`FormatError::is_document_structural`]). `format` names the spec
     /// for the DLQ stage label; `message` is the precise description the
     /// reader built at the offending line.
@@ -283,6 +305,13 @@ impl fmt::Display for FormatError {
             Self::StructuralCount { format, message } => {
                 write!(f, "{format} structural count error: {message}")
             }
+            Self::UnknownRecordType(failure) => {
+                write!(
+                    f,
+                    "multi-record structural validation error: {}",
+                    failure.message
+                )
+            }
             Self::StructuralValidation { format, message } => {
                 write!(f, "{format} structural validation error: {message}")
             }
@@ -438,9 +467,9 @@ impl FormatError {
     }
 
     /// Build a [`FormatError::StructuralValidation`] for a multi-record
-    /// flat-file structural failure that is not a trailer count claim (an
-    /// unknown record-type discriminator, a body record after the trailer
-    /// that closes the document).
+    /// flat-file structural failure that is not a trailer count claim and is
+    /// not one independently recoverable unknown-tag row (currently a body
+    /// record after the trailer that closes the document).
     pub fn multi_record_structural_validation(message: impl Into<String>) -> Self {
         Self::StructuralValidation {
             format: "multi-record",
@@ -460,15 +489,17 @@ impl FormatError {
     /// `true` for the error classes the executor reclassifies from
     /// run-aborting to document-DLQ under `dlq_granularity: document`: a
     /// trailer count mismatch ([`FormatError::StructuralCount`]), a
+    /// typed unknown multi-record row ([`FormatError::UnknownRecordType`]), a
     /// non-count structural failure of a multi-record document
-    /// ([`FormatError::StructuralValidation`]), or an undeclared repeated
-    /// field a self-describing reader detected
+    /// ([`FormatError::StructuralValidation`]), or an undeclared repeated field
+    /// a self-describing reader detected
     /// ([`FormatError::UndeclaredRepeatedField`]). Every other variant keeps
     /// aborting the run.
     pub fn is_document_structural(&self) -> bool {
         matches!(
             self,
             Self::StructuralCount { .. }
+                | Self::UnknownRecordType(_)
                 | Self::StructuralValidation { .. }
                 | Self::UndeclaredRepeatedField { .. }
         )

@@ -25,14 +25,14 @@ use crate::executor::stream_event::{Punctuation, SourceRowId};
 #[derive(Debug, Clone)]
 pub(crate) enum SourceAttemptEvent {
     Record(Record, SourceRowId),
-    TypeError(Box<crate::executor::TypeErrorEvent>),
+    Rejection(Box<crate::executor::SourceRejectionEvent>),
 }
 
 impl SourceAttemptEvent {
     pub(crate) fn source_row(&self) -> SourceRowId {
         match self {
             Self::Record(_, source_row) => *source_row,
-            Self::TypeError(event) => event.source_row,
+            Self::Rejection(event) => event.source_row,
         }
     }
 }
@@ -56,8 +56,8 @@ pub(crate) struct AttemptPopulationDelta {
 
 /// Source-channel payload. Attempts are either direct (accounted when
 /// consumed) or name the already-applied ordered-file population that covers
-/// them. Type failures are consumed before downstream [`StreamEvent`] buffers
-/// are built.
+/// them. Rejections are consumed before downstream [`StreamEvent`] buffers are
+/// built.
 #[derive(Debug, Clone)]
 pub(crate) enum SourceStreamEvent {
     Population(AttemptPopulationDelta),
@@ -290,18 +290,18 @@ impl SourceIngestChannel {
         Ok(row_id)
     }
 
-    /// Push a declared-type rejection at its exact source-stream position.
+    /// Push a source rejection at its exact source-stream position.
     /// The full original record is bounded by the same channel capacity and
     /// accounted with the same per-record queue estimate as successful rows.
-    pub(crate) fn push_type_error(
+    pub(crate) fn push_rejection(
         &mut self,
-        event: crate::executor::dlq::TypeErrorEvent,
+        event: crate::executor::dlq::SourceRejectionEvent,
     ) -> Result<(), SourceStreamError> {
         self.consumer_handle.wait_while_paused();
-        let sample = (std::mem::size_of::<crate::executor::dlq::TypeErrorEvent>()
-            + event.original_record.estimated_heap_size()) as u64;
+        let sample = (std::mem::size_of::<crate::executor::dlq::SourceRejectionEvent>()
+            + event.estimated_heap_size()) as u64;
         self.record_bytes_ewma = ewma_step(self.record_bytes_ewma, sample);
-        let event = SourceAttemptEvent::TypeError(Box::new(event));
+        let event = SourceAttemptEvent::Rejection(Box::new(event));
         if let Some(barrier) = self.order_barrier.as_mut() {
             barrier.observe_attempt(event)?;
         } else {

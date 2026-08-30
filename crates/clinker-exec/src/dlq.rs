@@ -19,7 +19,8 @@ use clinker_plan::config::DlqConfig;
 /// Column layout:
 /// - Always: _cxl_dlq_id, _cxl_dlq_timestamp, _cxl_dlq_source_file, _cxl_dlq_source_row
 /// - If include_reason: _cxl_dlq_error_category, _cxl_dlq_error_detail
-/// - If include_source_row: all *user-declared* source fields plus
+/// - If include_source_row: all *user-declared* source fields plus the
+///   conditional `_cxl_dlq_source_record` physical-row capture and
 ///   correlation-lattice columns (`$ck.<field>`,
 ///   `$ck.aggregate.<name>`) in schema order. Engine-stamped
 ///   sidecar columns (`$widened`) are filtered out — they carry
@@ -219,7 +220,8 @@ pub fn partition_dlq_entries<'a>(
 }
 
 /// Iterator over schema columns that should appear in DLQ output:
-/// user-declared columns plus correlation-lattice columns
+/// user-declared columns, the conditional `_cxl_dlq_source_record` physical-
+/// row capture, plus correlation-lattice columns
 /// (`$ck.<field>`, `$ck.aggregate.<name>`). The `$widened`
 /// `auto_widen` sidecar absorber is filtered out — its
 /// `Value::Map` payload has no canonical scalar serialization and

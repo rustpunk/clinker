@@ -229,10 +229,10 @@ pub(crate) fn record_error_to_document_buffer_if_doc_dlq(
 /// Mark the document containing a source declared-type failure. The rejected
 /// row has its document context, but it has not passed the ordinary source
 /// stamping path, so source and file identity must come from the
-/// [`crate::executor::dlq::TypeErrorEvent`] itself.
-pub(crate) fn record_type_error_to_document_buffer_if_doc_dlq(
+/// [`crate::executor::dlq::SourceRejectionEvent`] itself.
+pub(crate) fn record_source_rejection_to_document_buffer_if_doc_dlq(
     ctx: &mut ExecutorContext<'_>,
-    event: &crate::executor::dlq::TypeErrorEvent,
+    event: &crate::executor::dlq::SourceRejectionEvent,
     diagnostic: String,
 ) -> bool {
     let Some(state) = ctx.document_dlq.as_ref() else {
@@ -249,14 +249,14 @@ pub(crate) fn record_type_error_to_document_buffer_if_doc_dlq(
         Arc::clone(&event.source_file),
         DocTrigger {
             source_row: event.source_row,
-            category: clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
+            category: event.category(),
             error_message: diagnostic,
             original_record: event.original_record.clone(),
             stage: Some(DlqEntry::stage_source()),
             route: None,
             source_name: Arc::clone(&event.source_name),
-            triggering_field: Some(Arc::from(event.field.as_ref())),
-            triggering_value: Some(event.original_value.clone()),
+            triggering_field: Some(Arc::from(event.triggering_field.as_ref())),
+            triggering_value: Some(event.triggering_value.clone()),
         },
     );
     true

@@ -616,6 +616,15 @@ fn drive_record_source(
             )
             .build();
 
+        // Rejected source attempts use one common spill schema regardless of
+        // rejection kind. It mirrors the reader columns, carries a reserved
+        // decoded-physical-row slot, then uses the same three source stamps as
+        // successful rows. A declared-type failure leaves the raw slot Null;
+        // an undeclared discriminator fills it without fabricating a declared
+        // record layout. The source-order barrier can therefore spill and
+        // merge both kinds in one ordinal-ordered stream.
+        let rejection_schema = build_source_rejection_schema(&reader_schema);
+
         // Fallback `$source.file` for records whose reader exposes no
         // per-record file identity (`current_source_file() == None`):
         // single-file readers and every non-file transport. Derived from
@@ -902,9 +911,31 @@ fn drive_record_source(
                         &file_arc,
                         preserve_empty_physical_files,
                     )?;
-                    if let Some(ctx) = doc_stack.last() {
-                        original_record.set_doc_ctx(Arc::clone(ctx));
-                    }
+                    let doc_ctx = doc_stack.last().cloned().unwrap_or_else(|| {
+                        Arc::new(clinker_record::DocumentContext::new(
+                            clinker_record::DocumentId::next(),
+                            Arc::clone(&file_arc),
+                            clinker_record::EnvelopeRecord::empty(),
+                        ))
+                    });
+                    original_record = stamp_source_rejection_record(
+                        &rejection_schema,
+                        reader_schema.column_count(),
+                        reader_schema
+                            .columns()
+                            .iter()
+                            .map(|column| {
+                                original_record
+                                    .get(column.as_ref())
+                                    .cloned()
+                                    .unwrap_or(clinker_record::Value::Null)
+                            })
+                            .collect(),
+                        clinker_record::Value::Null,
+                        &doc_ctx,
+                        &file_arc,
+                        &source_name_arc,
+                    )?;
                     let row_id = stream.reserve_rejected_row_id().map_err(|err| {
                         PipelineError::Internal {
                             op: "source-ingest-identity",
@@ -912,7 +943,7 @@ fn drive_record_source(
                             detail: err.to_string(),
                         }
                     })?;
-                    let event = crate::executor::dlq::TypeErrorEvent::new(
+                    let event = crate::executor::dlq::SourceRejectionEvent::declared_type(
                         row_id,
                         Arc::clone(&source_name_arc),
                         file_arc,
@@ -923,7 +954,113 @@ fn drive_record_source(
                         original_value,
                         message,
                     );
-                    match stream.push_type_error(event) {
+                    match stream.push_rejection(event) {
+                        Ok(()) => {}
+                        Err(crate::executor::source_stream::SourceStreamError::Closed) => break,
+                        Err(
+                            crate::executor::source_stream::SourceStreamError::OrdinalExhausted {
+                                source,
+                            },
+                        ) => {
+                            return Err(PipelineError::Internal {
+                                op: "source-ingest-identity",
+                                node: src_cfg.name.clone(),
+                                detail: format!(
+                                    "source row identity exhausted for {source}: ordinal cannot advance beyond u64::MAX"
+                                ),
+                            });
+                        }
+                        Err(crate::executor::source_stream::SourceStreamError::OrderViolation(
+                            error,
+                        )) => return Err(*error),
+                    }
+                }
+                Err(clinker_format::FormatError::UnknownRecordType(failure))
+                    if src_cfg.dlq_granularity == clinker_plan::config::DlqGranularity::Record =>
+                {
+                    let clinker_format::error::UnknownRecordTypeFailure {
+                        row,
+                        discriminator,
+                        raw_record,
+                        message,
+                    } = *failure;
+                    total_count =
+                        total_count
+                            .checked_add(1)
+                            .ok_or_else(|| PipelineError::Internal {
+                                op: "source-ingest-count",
+                                node: src_cfg.name.clone(),
+                                detail: String::from(
+                                    "source record count cannot advance beyond u64::MAX",
+                                ),
+                            })?;
+                    let file_arc = src_reader
+                        .current_source_file()
+                        .cloned()
+                        .unwrap_or_else(|| Arc::clone(&static_source_file));
+                    if stack_belongs_to_other_file(&doc_stack, &file_arc) {
+                        open_file_level_doc(
+                            &src_cfg,
+                            &mut stream,
+                            &mut doc_stack,
+                            &mut src_reader,
+                            &file_arc,
+                        )?;
+                    }
+                    apply_source_lifecycle_events(
+                        &src_cfg,
+                        &mut stream,
+                        &mut doc_stack,
+                        &mut src_reader,
+                        &file_arc,
+                        preserve_empty_physical_files,
+                    )?;
+                    let doc_ctx = doc_stack.last().cloned().unwrap_or_else(|| {
+                        Arc::new(clinker_record::DocumentContext::new(
+                            clinker_record::DocumentId::next(),
+                            Arc::clone(&file_arc),
+                            clinker_record::EnvelopeRecord::empty(),
+                        ))
+                    });
+                    let mut body_values =
+                        vec![clinker_record::Value::Null; reader_schema.column_count()];
+                    let record_type_index = reader_schema.index("record_type").ok_or_else(|| {
+                        PipelineError::Internal {
+                            op: "source-ingest-rejection",
+                            node: src_cfg.name.clone(),
+                            detail: String::from(
+                                "an unknown multi-record discriminator reached ingest without the reserved record_type column",
+                            ),
+                        }
+                    })?;
+                    body_values[record_type_index] =
+                        clinker_record::Value::from(discriminator.as_str());
+                    let original_record = stamp_source_rejection_record(
+                        &rejection_schema,
+                        reader_schema.column_count(),
+                        body_values,
+                        raw_record,
+                        &doc_ctx,
+                        &file_arc,
+                        &source_name_arc,
+                    )?;
+                    let row_id = stream.reserve_rejected_row_id().map_err(|err| {
+                        PipelineError::Internal {
+                            op: "source-ingest-identity",
+                            node: src_cfg.name.clone(),
+                            detail: err.to_string(),
+                        }
+                    })?;
+                    let event = crate::executor::dlq::SourceRejectionEvent::unknown_record_type(
+                        row_id,
+                        Arc::clone(&source_name_arc),
+                        file_arc,
+                        row,
+                        original_record,
+                        discriminator,
+                        message,
+                    );
+                    match stream.push_rejection(event) {
                         Ok(()) => {}
                         Err(crate::executor::source_stream::SourceStreamError::Closed) => break,
                         Err(
@@ -950,9 +1087,11 @@ fn drive_record_source(
                     // an envelope trailer's declared count disagreeing with
                     // the body the reader streamed (X12 SE/GE/IEA, EDIFACT
                     // UNT/UNZ, HL7 BTS/FTS, a multi-record trailer), and a
-                    // multi-record structural-validation failure (an unknown
-                    // record-type discriminator, a body record after the
-                    // trailer). A trailer count is only known at the trailer,
+                    // multi-record structural failure (an unknown record-type
+                    // discriminator, a body record after the trailer). The
+                    // unknown-tag case reaches this branch only under document
+                    // granularity; record-grained continue was handled above.
+                    // A trailer count is only known at the trailer,
                     // AFTER every body record it counts has already streamed,
                     // so the document cannot be rejected before its first
                     // record. Instead, tag the file's close with a
@@ -971,9 +1110,10 @@ fn drive_record_source(
                             .current_source_file()
                             .cloned()
                             .unwrap_or_else(|| Arc::clone(&static_source_file));
-                        // A malformed file whose FIRST body record fails — an
-                        // unknown record-type tag on an early line of file N>=2
-                        // of a multi-file source — condemns a file the driver
+                        // A malformed file whose FIRST body record fails — for
+                        // example an unknown tag under document granularity on
+                        // an early line of file N>=2 of a multi-file source —
+                        // condemns a file the driver
                         // has NOT yet opened a document for: the reader already
                         // advanced `current_source_file()` to the condemned
                         // file, but the open level stack still belongs to the
@@ -1157,6 +1297,73 @@ fn close_open_levels(
         )?;
     }
     Ok(())
+}
+
+const SOURCE_RAW_RECORD_COLUMN: &str = "_cxl_dlq_source_record";
+
+/// Build the one source-rejection schema shared by declared-type and reader-
+/// classification failures. Its fixed shape lets the ordered-source barrier
+/// spill a mixed rejection stream without assuming every rejected attempt had
+/// a declared record type.
+fn build_source_rejection_schema(
+    reader_schema: &Arc<clinker_record::Schema>,
+) -> Arc<clinker_record::Schema> {
+    let mut builder =
+        clinker_record::SchemaBuilder::with_capacity(reader_schema.column_count() + 4);
+    for (idx, column) in reader_schema.columns().iter().enumerate() {
+        builder = match reader_schema.field_metadata(idx) {
+            Some(metadata) => builder.with_field_meta(column.as_ref(), metadata.clone()),
+            None => builder.with_field(column.as_ref()),
+        };
+    }
+    builder
+        .with_field(SOURCE_RAW_RECORD_COLUMN)
+        .with_field_meta(
+            clinker_plan::config::pipeline_node::SOURCE_FILE_COLUMN,
+            clinker_record::FieldMetadata::source_file(),
+        )
+        .with_field_meta(
+            clinker_plan::config::pipeline_node::SOURCE_NAME_COLUMN,
+            clinker_record::FieldMetadata::source_name(),
+        )
+        .with_field_meta(
+            clinker_plan::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN,
+            clinker_record::FieldMetadata::source_event_time(),
+        )
+        .build()
+}
+
+/// Stamp one rejected attempt onto the shared rejection schema. `body_values`
+/// must match the reader schema exactly; the raw decoded row is separate so an
+/// undeclared discriminator never causes positional fields to be guessed.
+#[allow(clippy::too_many_arguments)]
+fn stamp_source_rejection_record(
+    rejection_schema: &Arc<clinker_record::Schema>,
+    reader_column_count: usize,
+    mut body_values: Vec<clinker_record::Value>,
+    raw_record: clinker_record::Value,
+    doc_ctx: &Arc<clinker_record::DocumentContext>,
+    file_arc: &Arc<str>,
+    source_name_arc: &Arc<str>,
+) -> Result<clinker_record::Record, PipelineError> {
+    if body_values.len() != reader_column_count {
+        return Err(PipelineError::Internal {
+            op: "source-ingest-rejection",
+            node: source_name_arc.to_string(),
+            detail: format!(
+                "rejected record carried {} reader values for a {}-column source schema",
+                body_values.len(),
+                reader_column_count,
+            ),
+        });
+    }
+    body_values.push(raw_record);
+    body_values.push(clinker_record::Value::from(file_arc.as_ref()));
+    body_values.push(clinker_record::Value::from(source_name_arc.as_ref()));
+    body_values.push(clinker_record::Value::Null);
+    let mut record = clinker_record::Record::new(Arc::clone(rejection_schema), body_values);
+    record.set_doc_ctx(Arc::clone(doc_ctx));
+    Ok(record)
 }
 
 /// Build a representative record for a document the ingest thread condemned
@@ -2002,9 +2209,9 @@ nodes:
                     ..
                 } => StreamEvent::record(record, row_id),
                 crate::executor::source_stream::SourceStreamEvent::Attempt {
-                    event: crate::executor::source_stream::SourceAttemptEvent::TypeError(event),
+                    event: crate::executor::source_stream::SourceAttemptEvent::Rejection(event),
                     ..
-                } => panic!("unexpected declared-type failure in envelope fixture: {event:?}"),
+                } => panic!("unexpected source rejection in envelope fixture: {event:?}"),
                 crate::executor::source_stream::SourceStreamEvent::Punctuation(punctuation) => {
                     StreamEvent::punctuation(punctuation)
                 }

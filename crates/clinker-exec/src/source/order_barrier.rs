@@ -127,108 +127,88 @@ pub(crate) struct FirstInversion {
 /// the shared spill envelope; this sidecar retains the remaining attribution
 /// without consulting authored sort fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StagedTypeError {
+struct StagedSourceRejection {
     source_row: SourceRowId,
+    row: u64,
     source_name: String,
     source_file: String,
-    column: usize,
-    field: Box<str>,
-    declared_type: Box<str>,
-    original_byte_length: usize,
-    preview_rendered: String,
-    preview_redacted: bool,
+    kind: crate::executor::SourceRejectionKind,
     message: String,
-    original_value: Value,
+    triggering_field: Box<str>,
+    triggering_value: Value,
 }
 
-impl StagedTypeError {
-    fn from_event(event: crate::executor::TypeErrorEvent) -> (Record, Self) {
-        let crate::executor::TypeErrorEvent {
+impl StagedSourceRejection {
+    fn from_event(event: crate::executor::SourceRejectionEvent) -> (Record, Self) {
+        let crate::executor::SourceRejectionEvent {
             source_row,
             source_name,
             source_file,
-            row: _,
-            column,
-            field,
-            declared_type,
-            original_byte_length,
-            preview,
-            diagnostic_code: _,
+            row,
+            kind,
             message,
             original_record,
-            original_value,
+            triggering_field,
+            triggering_value,
         } = event;
         (
             original_record,
             Self {
                 source_row,
+                row,
                 source_name: source_name.to_string(),
                 source_file: source_file.to_string(),
-                column,
-                field,
-                declared_type,
-                original_byte_length,
-                preview_rendered: preview.rendered,
-                preview_redacted: preview.redacted,
+                kind,
                 message,
-                original_value,
+                triggering_field,
+                triggering_value,
             },
         )
     }
 
-    fn into_event(self, original_record: Record) -> crate::executor::TypeErrorEvent {
-        crate::executor::TypeErrorEvent {
+    fn into_event(self, original_record: Record) -> crate::executor::SourceRejectionEvent {
+        crate::executor::SourceRejectionEvent {
             source_row: self.source_row,
             source_name: Arc::from(self.source_name),
             source_file: Arc::from(self.source_file),
-            row: self.source_row.ordinal(),
-            column: self.column,
-            field: self.field,
-            declared_type: self.declared_type,
-            original_byte_length: self.original_byte_length,
-            preview: crate::executor::diagnostic_preview::DiagnosticPreview {
-                rendered: self.preview_rendered,
-                original_byte_length: self.original_byte_length,
-                redacted: self.preview_redacted,
-            },
-            diagnostic_code: "E126",
+            row: self.row,
+            kind: self.kind,
             message: self.message,
             original_record,
-            original_value: self.original_value,
+            triggering_field: self.triggering_field,
+            triggering_value: self.triggering_value,
         }
     }
 }
 
-impl PartialEq for StagedTypeError {
+impl PartialEq for StagedSourceRejection {
     fn eq(&self, other: &Self) -> bool {
         self.source_row == other.source_row
     }
 }
 
-impl Eq for StagedTypeError {}
+impl Eq for StagedSourceRejection {}
 
-impl PartialOrd for StagedTypeError {
+impl PartialOrd for StagedSourceRejection {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for StagedTypeError {
+impl Ord for StagedSourceRejection {
     fn cmp(&self, other: &Self) -> Ordering {
         self.source_row.cmp(&other.source_row)
     }
 }
 
-impl HeapBytes for StagedTypeError {
+impl HeapBytes for StagedSourceRejection {
     fn heap_bytes(&self) -> usize {
         self.source_name
             .len()
             .saturating_add(self.source_file.len())
-            .saturating_add(self.field.len())
-            .saturating_add(self.declared_type.len())
-            .saturating_add(self.preview_rendered.len())
             .saturating_add(self.message.len())
-            .saturating_add(self.original_value.heap_size())
+            .saturating_add(self.triggering_field.len())
+            .saturating_add(self.triggering_value.heap_size())
     }
 }
 
@@ -255,7 +235,7 @@ pub(crate) struct SourceFileEventSpool {
     leading: Vec<Punctuation>,
     trailing: Vec<Punctuation>,
     records: Option<SortBuffer<SourceRowId>>,
-    errors: Option<SortBuffer<StagedTypeError>>,
+    errors: Option<SortBuffer<StagedSourceRejection>>,
     previous: Option<Record>,
     previous_row: Option<u64>,
     original_doc_ctx: Option<Arc<DocumentContext>>,
@@ -378,7 +358,7 @@ impl SourceFileOrderBarrier {
     ) -> Result<(), SourceStreamError> {
         match event {
             SourceAttemptEvent::Record(record, row_id) => self.observe_typed_event(record, row_id),
-            SourceAttemptEvent::TypeError(event) => self.observe_type_error(*event),
+            SourceAttemptEvent::Rejection(event) => self.observe_rejection(*event),
         }
     }
 
@@ -485,9 +465,9 @@ impl SourceFileOrderBarrier {
         Ok(())
     }
 
-    fn observe_type_error(
+    fn observe_rejection(
         &mut self,
-        event: crate::executor::TypeErrorEvent,
+        event: crate::executor::SourceRejectionEvent,
     ) -> Result<(), SourceStreamError> {
         if event.source_row.source() != self.config.source_id {
             return Err(SourceStreamError::OrderViolation(Box::new(
@@ -502,8 +482,8 @@ impl SourceFileOrderBarrier {
                 },
             )));
         }
-        let (record, payload) = StagedTypeError::from_event(event);
-        let record_bytes = type_error_pair_bytes(&record, &payload);
+        let (record, payload) = StagedSourceRejection::from_event(event);
+        let record_bytes = rejection_pair_bytes(&record, &payload);
         self.record_bytes_ewma = ewma_step(self.record_bytes_ewma, record_bytes);
         let Some(state) = self.state.as_mut() else {
             return Err(self.shape_error_for_file(
@@ -542,7 +522,9 @@ impl SourceFileOrderBarrier {
             ));
         }
         state.attempted_count = state.attempted_count.saturating_add(1);
-        state.rejected_count = state.rejected_count.saturating_add(1);
+        if payload.kind.counts_as_type_error() {
+            state.rejected_count = state.rejected_count.saturating_add(1);
+        }
         state
             .errors
             .as_mut()
@@ -712,8 +694,8 @@ impl SourceFileOrderBarrier {
 
     fn prepare_errors(
         &mut self,
-        buffer: Option<SortBuffer<StagedTypeError>>,
-    ) -> Result<PreparedOutput<StagedTypeError>, SourceStreamError> {
+        buffer: Option<SortBuffer<StagedSourceRejection>>,
+    ) -> Result<PreparedOutput<StagedSourceRejection>, SourceStreamError> {
         let Some(buffer) = buffer else {
             return Ok(PreparedOutput::Empty);
         };
@@ -933,7 +915,7 @@ impl SourceFileOrderBarrier {
 
     fn emit_errors(
         &mut self,
-        output: PreparedOutput<StagedTypeError>,
+        output: PreparedOutput<StagedSourceRejection>,
         population: AttemptPopulationId,
         original_doc_ctx: Option<&Arc<DocumentContext>>,
     ) -> Result<(), SourceStreamError> {
@@ -942,7 +924,7 @@ impl SourceFileOrderBarrier {
             PreparedOutput::InMemory(errors) => {
                 for (mut record, payload) in errors {
                     reattach_original_doc_ctx(&mut record, original_doc_ctx)?;
-                    self.emit_type_error(payload.into_event(record), population)?;
+                    self.emit_rejection(payload.into_event(record), population)?;
                 }
                 Ok(())
             }
@@ -957,7 +939,7 @@ impl SourceFileOrderBarrier {
                         SourceStreamError::OrderViolation(Box::new(PipelineError::from(error)))
                     })?;
                     reattach_original_doc_ctx(&mut record, original_doc_ctx)?;
-                    self.emit_type_error(payload.into_event(record), population)?;
+                    self.emit_rejection(payload.into_event(record), population)?;
                 }
                 self.fixed_memory_bytes = 0;
                 self.update_runtime_charge();
@@ -987,16 +969,16 @@ impl SourceFileOrderBarrier {
         Ok(())
     }
 
-    fn emit_type_error(
+    fn emit_rejection(
         &mut self,
-        event: crate::executor::TypeErrorEvent,
+        event: crate::executor::SourceRejectionEvent,
         population: AttemptPopulationId,
     ) -> Result<(), SourceStreamError> {
-        let sample = type_error_event_bytes(&event);
+        let sample = rejection_event_bytes(&event);
         self.record_bytes_ewma = ewma_step(self.record_bytes_ewma, sample);
         self.tx
             .send(SourceStreamEvent::Attempt {
-                event: SourceAttemptEvent::TypeError(Box::new(event)),
+                event: SourceAttemptEvent::Rejection(Box::new(event)),
                 population: Some(population),
             })
             .map_err(|_| SourceStreamError::Closed)?;
@@ -1255,23 +1237,16 @@ fn record_pair_bytes(record: &Record) -> u64 {
         + std::mem::size_of::<SourceRowId>()) as u64
 }
 
-fn type_error_pair_bytes(record: &Record, payload: &StagedTypeError) -> u64 {
+fn rejection_pair_bytes(record: &Record, payload: &StagedSourceRejection) -> u64 {
     (std::mem::size_of::<Record>()
         + record.estimated_heap_size()
-        + std::mem::size_of::<StagedTypeError>()
+        + std::mem::size_of::<StagedSourceRejection>()
         + payload.heap_bytes()) as u64
 }
 
-fn type_error_event_bytes(event: &crate::executor::TypeErrorEvent) -> u64 {
-    (std::mem::size_of::<crate::executor::TypeErrorEvent>()
-        + event.original_record.estimated_heap_size()
-        + event.source_name.len()
-        + event.source_file.len()
-        + event.field.len()
-        + event.declared_type.len()
-        + event.preview.rendered.len()
-        + event.message.len()
-        + event.original_value.heap_size()) as u64
+fn rejection_event_bytes(event: &crate::executor::SourceRejectionEvent) -> u64 {
+    (std::mem::size_of::<crate::executor::SourceRejectionEvent>() + event.estimated_heap_size())
+        as u64
 }
 
 fn resident_record_bytes(output: &PreparedOutput<SourceRowId>) -> u64 {
@@ -1284,11 +1259,11 @@ fn resident_record_bytes(output: &PreparedOutput<SourceRowId>) -> u64 {
     }
 }
 
-fn resident_error_bytes(output: &PreparedOutput<StagedTypeError>) -> u64 {
+fn resident_error_bytes(output: &PreparedOutput<StagedSourceRejection>) -> u64 {
     match output {
         PreparedOutput::InMemory(errors) => errors
             .iter()
-            .map(|(record, payload)| type_error_pair_bytes(record, payload))
+            .map(|(record, payload)| rejection_pair_bytes(record, payload))
             .fold(0, u64::saturating_add),
         PreparedOutput::Empty | PreparedOutput::Spilled { .. } => 0,
     }
@@ -1493,6 +1468,31 @@ nodes:
         );
         record.set_doc_ctx(Arc::clone(doc));
         record
+    }
+
+    #[test]
+    fn staged_rejection_preserves_physical_line_distinct_from_attempt_ordinal() {
+        let source_row = SourceRowId::new(PlanNodeId::new(7), 2);
+        let record = Record::new(
+            Arc::new(Schema::new(vec!["record_type".into()])),
+            vec![Value::from("X")],
+        );
+        let event = crate::executor::SourceRejectionEvent::unknown_record_type(
+            source_row,
+            Arc::from("rows"),
+            Arc::from("rows.csv"),
+            3,
+            record,
+            "X".to_string(),
+            "E345 line 3".to_string(),
+        );
+
+        let (record, staged) = StagedSourceRejection::from_event(event);
+        let restored = staged.into_event(record);
+
+        assert_eq!(restored.source_row, source_row);
+        assert_eq!(restored.row, 3);
+        assert_eq!(restored.diagnostic_message(), "E345 line 3");
     }
 
     #[test]

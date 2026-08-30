@@ -360,11 +360,12 @@ impl FormatReader for MultiFileFormatReader {
     fn advance_to_next_file(&mut self) -> Result<bool, FormatError> {
         // Drop the active (dead-lettered) inner reader and open the next
         // slot. A structural-count failure fires at the file's closing
-        // trailer (fully consumed); a mid-file structural-validation failure
-        // (an unknown record-type tag) abandons the unread remainder — the
-        // whole file is condemned either way, so nothing that should stream
-        // is lost. Verify the new file's schema before its records flow,
-        // exactly as the EOF-driven advance in `next_record` does.
+        // trailer (fully consumed); a mid-file structural failure such as an
+        // unknown record-type tag under document granularity abandons the
+        // unread remainder — the whole file is condemned either way, so
+        // nothing that should stream is lost. Verify the new file's schema
+        // before its records flow, exactly as the EOF-driven advance in
+        // `next_record` does.
         if let Some(active) = self.active.as_mut() {
             let queued = active.take_source_lifecycle_events();
             self.lifecycle_events.extend(queued);

@@ -284,7 +284,7 @@ pub(crate) fn push_dlq(
 
 /// One population shared by source-type strategy routing and its circuit
 /// breaker. `attempted` counts decoded source rows observed so far;
-/// `rejected` is the subset represented by [`TypeErrorEvent`]s.
+/// `rejected` is the declared-type subset of source rejections.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TypeErrorPopulation {
     pub(crate) attempted: u64,
@@ -347,13 +347,16 @@ pub(crate) fn record_source_success(ctx: &mut ExecutorContext<'_>, source: &Arc<
     advance_source_population(ctx, source, 1);
 }
 
-/// Add exactly one rejected row to the shared type-error population.
-pub(crate) fn record_type_error(
+/// Add exactly one rejected row to the shared source-attempt population.
+/// Only declared-type failures advance the type-error numerator.
+pub(crate) fn record_source_rejection_population(
     ctx: &mut ExecutorContext<'_>,
-    event: &crate::executor::dlq::TypeErrorEvent,
+    event: &crate::executor::dlq::SourceRejectionEvent,
 ) {
     advance_source_population(ctx, &event.source_name, 1);
-    ctx.type_error_population.rejected = ctx.type_error_population.rejected.saturating_add(1);
+    if event.counts_as_type_error() {
+        ctx.type_error_population.rejected = ctx.type_error_population.rejected.saturating_add(1);
+    }
 }
 
 /// Apply one complete ordered-file population exactly once, then decide its
@@ -449,7 +452,7 @@ pub(crate) fn consume_source_event(
                     }
                     Ok(ConsumedSourceEvent::Record(record, row_id))
                 }
-                crate::executor::source_stream::SourceAttemptEvent::TypeError(event) => {
+                crate::executor::source_stream::SourceAttemptEvent::Rejection(event) => {
                     let event = *event;
                     if event.source_name.as_ref() != expected_source.as_ref() {
                         return Err(PipelineError::Internal {
@@ -462,9 +465,9 @@ pub(crate) fn consume_source_event(
                         });
                     }
                     if population.is_none() {
-                        record_type_error(ctx, &event);
+                        record_source_rejection_population(ctx, &event);
                     }
-                    route_type_error(ctx, event)?;
+                    route_source_rejection(ctx, event)?;
                     Ok(ConsumedSourceEvent::Rejected)
                 }
             }
@@ -497,15 +500,15 @@ pub(crate) fn evaluate_type_error_threshold(
     Ok(())
 }
 
-/// Exhaustive source-type disposition. The failing row never leaves this
+/// Exhaustive source-rejection disposition. The failing row never leaves this
 /// function as a downstream record: fail-fast returns immediately; continuing
 /// strategies require an explicit DLQ and preserve the complete original row.
-fn route_type_error(
+fn route_source_rejection(
     ctx: &mut ExecutorContext<'_>,
-    event: crate::executor::dlq::TypeErrorEvent,
+    event: crate::executor::dlq::SourceRejectionEvent,
 ) -> Result<(), PipelineError> {
-    let diagnostic = event.diagnostic_message();
-    tracing::error!(target: "clinker::source_type", "{diagnostic}");
+    let diagnostic = event.diagnostic_message().to_string();
+    tracing::error!(target: "clinker::source_rejection", "{diagnostic}");
     match ctx.strategy {
         ErrorStrategy::FailFast => Err(PipelineError::Format(
             clinker_format::FormatError::InvalidRecord {
@@ -517,13 +520,13 @@ fn route_type_error(
             if ctx.config.error_handling.dlq.is_none() {
                 return Err(PipelineError::Config(
                     clinker_plan::config::ConfigError::Validation(format!(
-                        "[E126] source type error requires `error_handling.dlq` under strategy {:?}",
-                        ctx.strategy
+                        "source rejection requires `error_handling.dlq` under strategy {:?}: {diagnostic}",
+                        ctx.strategy,
                     )),
                 ));
             }
             let document_marked =
-                crate::executor::document_dlq::record_type_error_to_document_buffer_if_doc_dlq(
+                crate::executor::document_dlq::record_source_rejection_to_document_buffer_if_doc_dlq(
                     ctx,
                     &event,
                     diagnostic.clone(),
@@ -531,15 +534,15 @@ fn route_type_error(
             if !document_marked {
                 let entry = DlqEntry {
                     source_row: event.source_row,
-                    category: clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
+                    category: event.category(),
                     error_message: diagnostic,
                     original_record: event.original_record,
                     stage: Some(DlqEntry::stage_source()),
                     route: None,
                     trigger: true,
                     source_name: event.source_name,
-                    triggering_field: Some(Arc::from(event.field)),
-                    triggering_value: Some(event.original_value),
+                    triggering_field: Some(Arc::from(event.triggering_field)),
+                    triggering_value: Some(event.triggering_value),
                 };
                 push_dlq(ctx, entry)?;
             }
