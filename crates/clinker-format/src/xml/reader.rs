@@ -365,15 +365,17 @@ impl Iterator for XmlExpansionCursor {
 
     fn next(&mut self) -> Option<Self::Item> {
         let output = self.current.take()?;
-        if self.max_output_rows != 0 && self.emitted >= self.max_output_rows {
-            self.frames.clear();
-            return Some(Err(FormatError::FanOutLimit(Box::new(
-                self.failure
-                    .take()
-                    .expect("a finite fan-out limit carries its original record"),
-            ))));
+        if self.max_output_rows != 0 {
+            if self.emitted >= self.max_output_rows {
+                self.frames.clear();
+                return Some(Err(FormatError::FanOutLimit(Box::new(
+                    self.failure
+                        .take()
+                        .expect("a finite fan-out limit carries its original record"),
+                ))));
+            }
+            self.emitted += 1;
         }
-        self.emitted += 1;
         self.advance();
         Some(Ok(output
             .into_iter()
@@ -2883,6 +2885,7 @@ mod tests {
                     cursor.failure.is_none(),
                     "an unlimited source must not retain a DLQ copy of its input"
                 );
+                assert_eq!(cursor.emitted, 0, "an unlimited source needs no counter");
             }
             rows += 1;
         }
