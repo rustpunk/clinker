@@ -259,6 +259,15 @@ impl MultiFileFormatReader {
         }
         Ok(())
     }
+
+    /// Move every structural event currently queued by the active reader into
+    /// the wrapper's ordered lifecycle queue.
+    fn collect_active_lifecycle_events(&mut self) {
+        if let Some(active) = self.active.as_mut() {
+            self.lifecycle_events
+                .extend(active.take_source_lifecycle_events());
+        }
+    }
 }
 
 impl FormatReader for MultiFileFormatReader {
@@ -302,18 +311,25 @@ impl FormatReader for MultiFileFormatReader {
     }
 
     fn take_envelope_events(&mut self) -> Vec<clinker_format::EnvelopeEvent> {
-        // Forward the active per-file reader's nested-envelope boundaries.
-        // Each file is a self-contained document, so its inner levels open
-        // and close entirely within that file's stream; the wrapper never
-        // bridges a level across a file boundary. Before any file is
-        // materialized there are no events to drain.
-        match self.active.as_mut() {
-            Some(active) => active.take_envelope_events(),
-            None => Vec::new(),
+        // `next_record` can reach one inner reader's EOF and advance into the
+        // next file before returning a record. The old reader is gone by the
+        // time the caller drains this method, so envelope events must come
+        // from the wrapper-owned ordered queue rather than the new active
+        // reader. A caller chooses this legacy envelope-only drain or the
+        // richer lifecycle drain for a pull; discarded physical entries must
+        // not accumulate across an unbounded file list.
+        self.collect_active_lifecycle_events();
+        let mut envelopes = Vec::new();
+        for event in std::mem::take(&mut self.lifecycle_events) {
+            if let clinker_format::SourceLifecycleEvent::Envelope(event) = event {
+                envelopes.push(event);
+            }
         }
+        envelopes
     }
 
     fn take_source_lifecycle_events(&mut self) -> Vec<clinker_format::SourceLifecycleEvent> {
+        self.collect_active_lifecycle_events();
         std::mem::take(&mut self.lifecycle_events)
     }
 
@@ -447,6 +463,41 @@ mod tests {
             &events[3],
             clinker_format::SourceLifecycleEvent::PhysicalFileClose(file)
                 if file.ends_with("empty.swift")
+        ));
+    }
+
+    #[test]
+    fn trailing_envelope_close_survives_the_next_file_advance() {
+        let first = "{1:F01BANKBEBBAXXX0000000000}{2:I103BANKDEFFXXXXN}\
+            {4:\r\n:20:FIRST\r\n-}";
+        let second = "{1:F01BANKBEBBAXXX0000000000}{2:I103BANKDEFFXXXXN}\
+            {4:\r\n:20:SECOND\r\n-}";
+        let mut reader = MultiFileFormatReader::new(
+            vec![slot("first.swift", first), slot("second.swift", second)],
+            swift_factory(),
+        );
+        reader.schema().expect("schema");
+
+        assert!(reader.next_record().expect("first record").is_some());
+        assert!(matches!(
+            reader.take_envelope_events().as_slice(),
+            [clinker_format::EnvelopeEvent::OpenLevel { .. }]
+        ));
+
+        assert!(reader.next_record().expect("second record").is_some());
+        assert!(reader.current_file().ends_with("second.swift"));
+        assert!(matches!(
+            reader.take_envelope_events().as_slice(),
+            [
+                clinker_format::EnvelopeEvent::CloseLevel,
+                clinker_format::EnvelopeEvent::OpenLevel { .. }
+            ]
+        ));
+
+        assert!(reader.next_record().expect("end of input").is_none());
+        assert!(matches!(
+            reader.take_envelope_events().as_slice(),
+            [clinker_format::EnvelopeEvent::CloseLevel]
         ));
     }
 
