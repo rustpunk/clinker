@@ -25,7 +25,6 @@
 //! whole-file byte buffer is retained for a file-backed input. See
 //! [`crate::xml::streaming`] for the event-driven pruned-extraction pass.
 
-use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::ops::Range;
 use std::sync::Arc;
@@ -146,6 +145,196 @@ type IndexedField = (usize, String, String);
 /// treats it as a trailing field and carries it through untouched.
 const SYNTHETIC_FIELD_INDEX: usize = usize::MAX;
 
+/// One declaration level in a lazy XML fan-out.
+///
+/// Fields are partitioned once into the record head/tail and occurrence
+/// buckets. Selecting another occurrence clones one output row, not the other
+/// rows in the cartesian product.
+struct XmlExpansionFrame {
+    head: Vec<IndexedField>,
+    tail: Vec<IndexedField>,
+    occurrences: Vec<Vec<IndexedField>>,
+    selected: usize,
+    entry: SplitToRows,
+}
+
+impl XmlExpansionFrame {
+    fn new(
+        record: Vec<IndexedField>,
+        entry: SplitToRows,
+        instances: &[Range<usize>],
+    ) -> Option<Self> {
+        if instances.is_empty() {
+            return entry.keep_empty.then_some(Self {
+                head: record,
+                tail: Vec::new(),
+                occurrences: Vec::new(),
+                selected: 0,
+                entry,
+            });
+        }
+
+        let anchor = instances[0].start;
+        let span = instances.last().map_or(0, |range| range.end);
+        let mut owner = vec![None; span];
+        for (position, range) in instances.iter().enumerate() {
+            for slot in &mut owner[range.clone()] {
+                *slot = Some(position);
+            }
+        }
+
+        let mut occurrences = vec![Vec::new(); instances.len()];
+        let mut head = Vec::new();
+        let mut tail = Vec::new();
+        for field in record {
+            match owner.get(field.0).copied().flatten() {
+                Some(position) => occurrences[position].push((
+                    field.0,
+                    projected_key(&field.1, &entry.field, entry.mode),
+                    field.2,
+                )),
+                None if field.0 < anchor => head.push(field),
+                None => tail.push(field),
+            }
+        }
+        Some(Self {
+            head,
+            tail,
+            occurrences,
+            selected: 0,
+            entry,
+        })
+    }
+
+    fn render(&self) -> Vec<IndexedField> {
+        let Some(selected) = self.occurrences.get(self.selected) else {
+            let mut record = self.head.clone();
+            record.extend(self.tail.iter().cloned());
+            return record;
+        };
+        let mut occurrence = selected.clone();
+        if let Some(column) = &self.entry.position_column {
+            occurrence.retain(|field| field.1 != *column);
+            occurrence.push((
+                SYNTHETIC_FIELD_INDEX,
+                column.clone(),
+                (self.selected + 1).to_string(),
+            ));
+        }
+
+        let mut shadowed: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(occurrence.len());
+        if self.entry.mode == SplitToRowsMode::Extract {
+            shadowed.extend(occurrence.iter().map(|field| field.1.clone()));
+        }
+        if let Some(column) = &self.entry.position_column {
+            shadowed.insert(column.clone());
+        }
+        let mut record = self
+            .head
+            .iter()
+            .filter(|field| !shadowed.contains(field.1.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        record.extend(occurrence);
+        record.extend(
+            self.tail
+                .iter()
+                .filter(|field| !shadowed.contains(field.1.as_str()))
+                .cloned(),
+        );
+        record
+    }
+
+    fn advance(&mut self) -> bool {
+        let selections = self.occurrences.len().max(1);
+        if self.selected + 1 >= selections {
+            return false;
+        }
+        self.selected += 1;
+        true
+    }
+}
+
+/// Suspended mixed-radix expansion of one XML record element.
+struct XmlExpansionCursor {
+    entries: Vec<SplitToRows>,
+    instances: Vec<Vec<Range<usize>>>,
+    frames: Vec<XmlExpansionFrame>,
+    current: Option<Vec<IndexedField>>,
+}
+
+impl XmlExpansionCursor {
+    fn new(raw: RawRecord, entries: &[SplitToRows]) -> Self {
+        let RawRecord {
+            fields,
+            split_instances,
+            ..
+        } = raw;
+        let record = fields
+            .into_iter()
+            .enumerate()
+            .map(|(index, (key, value))| (index, key, value))
+            .collect();
+        let mut cursor = Self {
+            entries: entries.to_vec(),
+            instances: split_instances,
+            frames: Vec::with_capacity(entries.len()),
+            current: None,
+        };
+        cursor.descend(record, 0);
+        cursor
+    }
+
+    fn descend(&mut self, mut record: Vec<IndexedField>, mut depth: usize) -> bool {
+        while depth < self.entries.len() {
+            let Some(frame) =
+                XmlExpansionFrame::new(record, self.entries[depth].clone(), &self.instances[depth])
+            else {
+                return false;
+            };
+            record = frame.render();
+            self.frames.push(frame);
+            depth += 1;
+        }
+        self.current = Some(record);
+        true
+    }
+
+    fn advance(&mut self) {
+        let mut depth = self.frames.len();
+        while depth > 0 {
+            depth -= 1;
+            if self.frames[depth].advance() {
+                self.frames.truncate(depth + 1);
+                let record = self.frames[depth].render();
+                if self.descend(record, depth + 1) {
+                    return;
+                }
+                depth = self.frames.len();
+            } else {
+                self.frames.truncate(depth);
+            }
+        }
+        self.current = None;
+    }
+}
+
+impl Iterator for XmlExpansionCursor {
+    type Item = Vec<(String, String)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let output = self.current.take()?;
+        self.advance();
+        Some(
+            output
+                .into_iter()
+                .map(|(_, key, value)| (key, value))
+                .collect(),
+        )
+    }
+}
+
 /// A fan-out element currently being extracted. Declared fields never nest
 /// (rejected at plan time, E358), so at most one occurrence is open at a time.
 struct OpenInstance {
@@ -198,15 +387,13 @@ pub struct XmlReader {
     matched_depth: usize,
     /// Current XML depth (incremented on Start, decremented on End).
     xml_depth: usize,
-    /// Expanded field lists awaiting assembly into records: schema inference
-    /// reads the first record element eagerly, and a `split_to_rows` fan-out
-    /// expands one element into several. Held as RAW `(key, value)` lists —
-    /// not assembled `Record`s — so the fallible assembly step (which rejects
-    /// an undeclared repeated field) runs in `next_record`, inside the
-    /// executor's record loop, rather than in the eager `schema` call the
-    /// ingest setup makes before that loop. Bounded by one element's
-    /// expansion, never the whole input.
-    pending: VecDeque<Vec<(String, String)>>,
+    /// Suspended expansion of the current input element. Schema inference
+    /// reads one output eagerly, while later outputs are generated one at a
+    /// time so the cartesian product is never retained.
+    pending: Option<XmlExpansionCursor>,
+    /// First raw output used for schema inference. Assembly remains deferred
+    /// to `next_record` so record-local structural errors reach the DLQ path.
+    deferred_first: Option<Vec<(String, String)>>,
     /// Whether we've finished all records.
     done: bool,
     /// Optional authoring-only sink receiving one bounded scalar observation
@@ -276,7 +463,8 @@ impl XmlReader {
             path_segments,
             matched_depth: 0,
             xml_depth: 0,
-            pending: VecDeque::new(),
+            pending: None,
+            deferred_first: None,
             done: false,
             numeric_observer,
         })
@@ -651,44 +839,15 @@ impl XmlReader {
             .position(|e| e.field == dotted)
     }
 
-    /// Expand one raw record through the declared `split_to_rows` fields,
-    /// applied in declaration order: each emits one output per element
-    /// occurrence, duplicating every field outside the group onto each.
+    /// Start a lazy expansion over the declared `split_to_rows` fields.
     ///
     /// A record with no occurrence of a field — an empty repetition or an
     /// absent element, which XML cannot distinguish — passes through unchanged
     /// under the default `keep_empty: true`, and is dropped when the author
-    /// opts out. Memory is bounded by one record's fan-out (the product of the
-    /// occurrence counts).
-    fn apply_split_to_rows(&self, raw: RawRecord) -> Vec<Vec<(String, String)>> {
-        if self.config.split_to_rows.is_empty() {
-            return vec![raw.fields];
-        }
-
-        let mut result: Vec<Vec<IndexedField>> = vec![
-            raw.fields
-                .into_iter()
-                .enumerate()
-                .map(|(i, (k, v))| (i, k, v))
-                .collect(),
-        ];
-        for (entry, instances) in self.config.split_to_rows.iter().zip(&raw.split_instances) {
-            let mut next = Vec::new();
-            for rec in result {
-                if instances.is_empty() {
-                    if entry.keep_empty {
-                        next.push(rec);
-                    }
-                } else {
-                    split_field_to_rows(&rec, entry, instances, &mut next);
-                }
-            }
-            result = next;
-        }
-        result
-            .into_iter()
-            .map(|rec| rec.into_iter().map(|(_, k, v)| (k, v)).collect())
-            .collect()
+    /// opts out. Memory is bounded by the parent element, declaration-depth
+    /// cursor tables, and one output row rather than the occurrence product.
+    fn apply_split_to_rows(&self, raw: RawRecord) -> XmlExpansionCursor {
+        XmlExpansionCursor::new(raw, &self.config.split_to_rows)
     }
 
     /// Skip an entire subtree (from current Start to its matching End).
@@ -873,7 +1032,7 @@ impl FormatReader for XmlReader {
         // `keep_empty: false` entry drops an element with no occurrence, and
         // inferring from that dropped expansion would cache a column-less
         // schema for the whole source while records kept flowing.
-        let (expanded, presence) = loop {
+        let (first, presence) = loop {
             let Some(raw) = self.read_next_record_raw()? else {
                 let s = SchemaBuilder::new().build();
                 self.schema = Some(Arc::clone(&s));
@@ -883,9 +1042,10 @@ impl FormatReader for XmlReader {
             // Value-less self-closing columns push no field, so they never reach
             // the expansion; carry their names alongside so inference keeps them.
             let presence = raw.presence.clone();
-            let expanded = self.apply_split_to_rows(raw);
-            if !expanded.is_empty() {
-                break (expanded, presence);
+            let mut expanded = self.apply_split_to_rows(raw);
+            if let Some(first) = expanded.next() {
+                self.pending = Some(expanded);
+                break (first, presence);
             }
         };
 
@@ -893,9 +1053,7 @@ impl FormatReader for XmlReader {
         // Real field names first (in document order), then any value-less
         // self-closing columns that contributed no field — so a column present
         // only as `<x/>` in the first record is not silently absent.
-        let schema = expanded
-            .first()
-            .expect("non-empty checked above")
+        let schema = first
             .iter()
             .map(|(k, _)| k.clone())
             .chain(presence)
@@ -909,13 +1067,10 @@ impl FormatReader for XmlReader {
             .collect::<SchemaBuilder>()
             .build();
 
-        // Buffer the first element's expansions as RAW field lists; the
-        // fallible `fields_to_record` assembly runs in `next_record`. Set the
-        // cached schema only after buffering so a caller never sees a schema
-        // paired with an unbuffered first record.
-        for fields in expanded {
-            self.pending.push_back(fields);
-        }
+        // Keep the first output raw so fallible assembly still runs from
+        // `next_record`, inside the executor's record loop. The cursor retained
+        // above generates only the remaining outputs.
+        self.deferred_first = Some(first);
         self.schema = Some(Arc::clone(&schema));
 
         Ok(schema)
@@ -927,15 +1082,23 @@ impl FormatReader for XmlReader {
         }
 
         loop {
-            if let Some(fields) = self.pending.pop_front() {
+            if let Some(fields) = self.deferred_first.take() {
+                return Ok(Some(self.fields_to_record(fields)?));
+            }
+            if let Some(mut pending) = self.pending.take()
+                && let Some(fields) = pending.next()
+            {
+                self.pending = Some(pending);
                 return Ok(Some(self.fields_to_record(fields)?));
             }
             let raw = match self.read_next_record_raw()? {
                 Some(r) => r,
                 None => return Ok(None),
             };
-            for fields in self.apply_split_to_rows(raw) {
-                self.pending.push_back(fields);
+            let mut expanded = self.apply_split_to_rows(raw);
+            if let Some(fields) = expanded.next() {
+                self.pending = Some(expanded);
+                return Ok(Some(self.fields_to_record(fields)?));
             }
         }
     }
@@ -1154,93 +1317,6 @@ fn strip_field_prefix<'a>(key: &'a str, path: &'a str) -> &'a str {
     match key.strip_prefix(path) {
         Some(rest) if !rest.is_empty() => rest.trim_start_matches('.'),
         _ => path.rsplit('.').next().unwrap_or(path),
-    }
-}
-
-/// Fan one record out to one output per element occurrence of a declared
-/// field: each output keeps that occurrence's fields (projected per
-/// [`projected_key`]) plus every field outside the field's occurrences.
-/// Occurrence fields are spliced where the first occurrence sat, so all
-/// fanned-out siblings share one column order. A declared `position_column`
-/// receives each occurrence's 1-based position.
-///
-/// Lifting a prefix off under [`SplitToRowsMode::Extract`], or synthesizing a
-/// `position_column`, can land a field on a name another field already occupies
-/// — one outside the group (`<Order><name>` alongside `<Item><name>`) or, for a
-/// position column, one inside the occurrence itself (`<Item><line_no>` under
-/// `position_column: line_no`). The occurrence wins the first: it IS the record
-/// under `extract`. The synthesized position wins the second: it is what the
-/// author asked for by name, and the JSON reader resolves the same collision
-/// the same way. The displaced field is dropped here rather than carried
-/// alongside: two fields sharing one name would otherwise reach record assembly
-/// as a repeat and trip its loud `UndeclaredRepeatedField` error, turning this
-/// intended fan-out shadow into a spurious rejection.
-///
-/// One pass over the record buckets every field, so the work is linear in the
-/// record's fields plus the fan-out it emits — a rescan per occurrence would
-/// make reading a single record quadratic in its occurrence count.
-fn split_field_to_rows(
-    rec: &[IndexedField],
-    entry: &SplitToRows,
-    instances: &[Range<usize>],
-    out: &mut Vec<Vec<IndexedField>>,
-) {
-    let anchor = instances[0].start;
-    // Field index → the occurrence that owns it. Ranges are recorded in
-    // document order and never overlap, so the last range's end spans them all
-    // and a field outside that span belongs to no occurrence.
-    let span = instances.last().map_or(0, |r| r.end);
-    let mut owner: Vec<Option<u32>> = vec![None; span];
-    for (position, range) in instances.iter().enumerate() {
-        for slot in &mut owner[range.clone()] {
-            *slot = Some(position as u32);
-        }
-    }
-    let mut inside: Vec<Vec<IndexedField>> = vec![Vec::new(); instances.len()];
-    let mut head: Vec<IndexedField> = Vec::new();
-    let mut tail: Vec<IndexedField> = Vec::new();
-    for field in rec {
-        let idx = field.0;
-        match owner.get(idx).copied().flatten() {
-            Some(position) => inside[position as usize].push((
-                idx,
-                projected_key(&field.1, &entry.field, entry.mode),
-                field.2.clone(),
-            )),
-            None if idx < anchor => head.push(field.clone()),
-            None => tail.push(field.clone()),
-        }
-    }
-    for (position, mut fields) in inside.into_iter().enumerate() {
-        if let Some(column) = &entry.position_column {
-            fields.retain(|field| field.1 != *column);
-            fields.push((
-                SYNTHETIC_FIELD_INDEX,
-                column.clone(),
-                (position + 1).to_string(),
-            ));
-        }
-        // Names this occurrence puts on the output record that a field outside
-        // the group could also occupy.
-        let (kept_head, kept_tail) = {
-            let mut shadowed: std::collections::HashSet<&str> =
-                std::collections::HashSet::with_capacity(fields.len());
-            if entry.mode == SplitToRowsMode::Extract {
-                shadowed.extend(fields.iter().map(|field| field.1.as_str()));
-            }
-            if let Some(column) = &entry.position_column {
-                shadowed.insert(column.as_str());
-            }
-            let keep = |field: &&IndexedField| !shadowed.contains(field.1.as_str());
-            (
-                head.iter().filter(keep).cloned().collect::<Vec<_>>(),
-                tail.iter().filter(keep).cloned().collect::<Vec<_>>(),
-            )
-        };
-        let mut record = kept_head;
-        record.extend(fields);
-        record.extend(kept_tail);
-        out.push(record);
     }
 }
 
@@ -2648,6 +2724,43 @@ mod tests {
                 .map(|(a, b)| (Some(Value::Integer(a)), Some(Value::String(b.into()))))
                 .collect();
         assert_eq!(pairs, expected);
+    }
+
+    #[test]
+    fn cartesian_fan_out_retains_occurrences_not_output_product() {
+        let occurrence_count = 64;
+        let mut xml = String::from("<Root><Order><id>1</id>");
+        for i in 0..occurrence_count {
+            xml.push_str(&format!("<A><a>{i}</a></A>"));
+        }
+        for i in 0..occurrence_count {
+            xml.push_str(&format!("<B><b>{i}</b></B>"));
+        }
+        xml.push_str("</Order></Root>");
+        let config = split_config("Root/Order", vec![split("A"), split("B")]);
+        let mut reader = reader_from_str(&xml, config);
+        reader.schema().unwrap();
+
+        let first = reader.next_record().unwrap().unwrap();
+        assert_eq!(first.get("A.a"), Some(&Value::Integer(0)));
+        assert_eq!(first.get("B.b"), Some(&Value::Integer(0)));
+        let cursor = reader.pending.as_ref().expect("remaining expansion");
+        assert_eq!(cursor.frames.len(), 2);
+        assert_eq!(
+            cursor
+                .frames
+                .iter()
+                .map(|frame| frame.occurrences.len())
+                .sum::<usize>(),
+            occurrence_count * 2,
+            "cursor retains the radix inputs, not their product"
+        );
+
+        let mut rows = 1;
+        while reader.next_record().unwrap().is_some() {
+            rows += 1;
+        }
+        assert_eq!(rows, occurrence_count * occurrence_count);
     }
 
     #[test]

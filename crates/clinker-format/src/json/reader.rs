@@ -90,7 +90,10 @@ pub struct JsonReader {
     inner: InnerReader,
     schema: Option<Arc<Schema>>,
     config: JsonReaderConfig,
-    pending: Vec<serde_json::Map<String, serde_json::Value>>,
+    /// Suspended expansion of the current input record. It retains one map per
+    /// declared fan-out depth and one current output map, never the cartesian
+    /// product of all occurrence counts.
+    pending: Option<JsonExpansionCursor>,
     /// The first raw record, read eagerly by schema inference and held UN-parsed
     /// so its fallible flatten (which rejects an undeclared flattened-name
     /// collision) runs in `next_record`, inside the executor's record loop,
@@ -136,6 +139,133 @@ enum InnerReader {
 struct CollisionSink<'a> {
     undeclared: &'a mut Vec<String>,
     accumulated: &'a mut HashSet<String>,
+}
+
+/// One declaration level in a lazy JSON fan-out.
+///
+/// The repeated value is removed from `base` once. Rendering a sibling clones
+/// only the record without that repeated array, avoiding the old quadratic
+/// clone of the entire array for every occurrence.
+struct JsonExpansionFrame {
+    base: serde_json::Map<String, serde_json::Value>,
+    occurrences: Vec<serde_json::Value>,
+    selected: usize,
+    entry: SplitToRows,
+}
+
+impl JsonExpansionFrame {
+    fn new(
+        mut record: serde_json::Map<String, serde_json::Value>,
+        entry: SplitToRows,
+    ) -> Option<Self> {
+        let value = record.shift_remove(&entry.field);
+        let occurrences = match value {
+            Some(serde_json::Value::Array(values)) => values,
+            Some(serde_json::Value::Null) => Vec::new(),
+            Some(value) => vec![value],
+            None => take_dissolved_object(&mut record, &entry.field)
+                .into_iter()
+                .collect(),
+        };
+        if occurrences.is_empty() && !entry.keep_empty {
+            return None;
+        }
+        Some(Self {
+            base: record,
+            occurrences,
+            selected: 0,
+            entry,
+        })
+    }
+
+    fn render(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut record = self.base.clone();
+        if let Some(value) = self.occurrences.get(self.selected) {
+            project_element(&mut record, &self.entry, value);
+            if let Some(column) = &self.entry.position_column {
+                record.insert(column.clone(), (self.selected + 1).into());
+            }
+        }
+        record
+    }
+
+    fn advance(&mut self) -> bool {
+        let selections = self.occurrences.len().max(1);
+        if self.selected + 1 >= selections {
+            return false;
+        }
+        self.selected += 1;
+        true
+    }
+}
+
+/// Depth-first mixed-radix cursor over one flattened JSON record.
+///
+/// Nested declarations can have a different inner radix for each outer
+/// occurrence, so the cursor rebuilds only the affected suffix when a digit
+/// carries. The retained state is bounded by declaration depth times one input
+/// record; it never grows with the output-row product.
+struct JsonExpansionCursor {
+    entries: Vec<SplitToRows>,
+    frames: Vec<JsonExpansionFrame>,
+    current: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl JsonExpansionCursor {
+    fn new(record: serde_json::Map<String, serde_json::Value>, entries: &[SplitToRows]) -> Self {
+        let mut cursor = Self {
+            entries: entries.to_vec(),
+            frames: Vec::with_capacity(entries.len()),
+            current: None,
+        };
+        cursor.descend(record, 0);
+        cursor
+    }
+
+    fn descend(
+        &mut self,
+        mut record: serde_json::Map<String, serde_json::Value>,
+        mut depth: usize,
+    ) -> bool {
+        while depth < self.entries.len() {
+            let Some(frame) = JsonExpansionFrame::new(record, self.entries[depth].clone()) else {
+                return false;
+            };
+            record = frame.render();
+            self.frames.push(frame);
+            depth += 1;
+        }
+        self.current = Some(record);
+        true
+    }
+
+    fn advance(&mut self) {
+        let mut depth = self.frames.len();
+        while depth > 0 {
+            depth -= 1;
+            if self.frames[depth].advance() {
+                self.frames.truncate(depth + 1);
+                let record = self.frames[depth].render();
+                if self.descend(record, depth + 1) {
+                    return;
+                }
+                depth = self.frames.len();
+            } else {
+                self.frames.truncate(depth);
+            }
+        }
+        self.current = None;
+    }
+}
+
+impl Iterator for JsonExpansionCursor {
+    type Item = serde_json::Map<String, serde_json::Value>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let output = self.current.take()?;
+        self.advance();
+        Some(output)
+    }
 }
 
 impl JsonReader {
@@ -190,7 +320,7 @@ impl JsonReader {
             inner,
             schema: None,
             config,
-            pending: Vec::new(),
+            pending: None,
             deferred_first: None,
             source,
             body_identity,
@@ -466,67 +596,8 @@ impl JsonReader {
     fn apply_split_to_rows(
         &self,
         flat: serde_json::Map<String, serde_json::Value>,
-    ) -> Vec<serde_json::Map<String, serde_json::Value>> {
-        if self.config.split_to_rows.is_empty() {
-            return vec![flat];
-        }
-
-        let mut result = vec![flat];
-        for entry in &self.config.split_to_rows {
-            let mut next = Vec::new();
-            for mut rec in result {
-                // The lone occurrence a non-array value contributes, lifted out
-                // of the record so the projection below can put it back under
-                // the mode's rules. An object occurrence has no value to read:
-                // `flatten_value` dissolved it into dotted child keys before
-                // this ran, and reading that as an absent field would treat a
-                // populated group as an empty one. An explicit `null` is no
-                // occurrence at all — JSON producers routinely write one where
-                // a group is absent — so it falls through to the empty arm and
-                // is governed by `keep_empty`, exactly as an absent field is.
-                let single = match rec.get(&entry.field) {
-                    Some(serde_json::Value::Array(_) | serde_json::Value::Null) => None,
-                    Some(_) => rec.shift_remove(&entry.field),
-                    None => take_dissolved_object(&mut rec, &entry.field),
-                };
-                if let Some(elem) = single {
-                    project_element(&mut rec, entry, &elem);
-                    if let Some(column) = &entry.position_column {
-                        rec.insert(column.clone(), 1.into());
-                    }
-                    next.push(rec);
-                    continue;
-                }
-                match rec.get(&entry.field) {
-                    Some(serde_json::Value::Array(arr)) if !arr.is_empty() => {
-                        for (position, elem) in arr.iter().enumerate() {
-                            let mut r = rec.clone();
-                            // `shift_remove`, not `remove`: with
-                            // `preserve_order` the latter is a swap-remove that
-                            // would drag the last column into the vacated slot,
-                            // scrambling column order across fanned-out
-                            // siblings that must share one shape.
-                            r.shift_remove(&entry.field);
-                            project_element(&mut r, entry, elem);
-                            if let Some(column) = &entry.position_column {
-                                r.insert(column.clone(), (position + 1).into());
-                            }
-                            next.push(r);
-                        }
-                    }
-                    // An empty array or an absent field: nothing to fan out.
-                    _ => {
-                        if entry.keep_empty {
-                            let mut r = rec;
-                            r.shift_remove(&entry.field);
-                            next.push(r);
-                        }
-                    }
-                }
-            }
-            result = next;
-        }
-        result
+    ) -> JsonExpansionCursor {
+        JsonExpansionCursor::new(flat, &self.config.split_to_rows)
     }
 
     /// Apply the schema-level `multiple:` declarations and the `split_values`
@@ -716,7 +787,7 @@ impl FormatReader for JsonReader {
         // loop (where it can be dead-lettered) rather than through this eager
         // `schema` call, which the ingest setup makes before the loop begins and
         // whose error would abort the whole run.
-        let (raw, expanded) = loop {
+        let (raw, first) = loop {
             let Some(raw) = self.next_raw()? else {
                 let s = SchemaBuilder::new().build();
                 self.schema = Some(Arc::clone(&s));
@@ -725,15 +796,13 @@ impl FormatReader for JsonReader {
             };
             let mut flat = serde_json::Map::new();
             Self::flatten_value("", &raw, &mut flat, 0, None, &[]);
-            let expanded = self.apply_split_to_rows(flat);
-            if !expanded.is_empty() {
-                break (raw, expanded);
+            let mut expanded = self.apply_split_to_rows(flat);
+            if let Some(first) = expanded.next() {
+                break (raw, first);
             }
         };
 
-        let schema = expanded
-            .first()
-            .expect("non-empty checked above")
+        let schema = first
             .keys()
             .map(|k| k.clone().into_boxed_str())
             .collect::<SchemaBuilder>()
@@ -752,10 +821,10 @@ impl FormatReader for JsonReader {
         // flattened-name collision here rather than in the eager `schema` call.
         if let Some(raw) = self.deferred_first.take() {
             let flat = self.flatten_record_body(&raw)?;
-            let mut expanded = self.apply_split_to_rows(flat).into_iter();
+            let mut expanded = self.apply_split_to_rows(flat);
             if let Some(first) = expanded.next() {
                 let record = self.map_to_record(first)?;
-                self.pending = expanded.collect();
+                self.pending = Some(expanded);
                 return Ok(Some(record));
             }
             // The deferred record expanded to nothing after all (only reachable
@@ -763,8 +832,10 @@ impl FormatReader for JsonReader {
             // through to the pending/main-loop path.
         }
 
-        if !self.pending.is_empty() {
-            let flat = self.pending.remove(0);
+        if let Some(mut pending) = self.pending.take()
+            && let Some(flat) = pending.next()
+        {
+            self.pending = Some(pending);
             return Ok(Some(self.map_to_record(flat)?));
         }
 
@@ -774,14 +845,12 @@ impl FormatReader for JsonReader {
                 None => return Ok(None),
             };
             let flat = self.flatten_record_body(&raw)?;
-            let expanded = self.apply_split_to_rows(flat);
-            if expanded.is_empty() {
+            let mut expanded = self.apply_split_to_rows(flat);
+            let Some(first) = expanded.next() else {
                 continue;
-            }
-            let mut expanded = expanded.into_iter();
-            let first = expanded.next().expect("non-empty checked above");
+            };
             let record = self.map_to_record(first)?;
-            self.pending = expanded.collect();
+            self.pending = Some(expanded);
             return Ok(Some(record));
         }
     }
@@ -2109,6 +2178,49 @@ mod tests {
         let only = r.next_record().unwrap().unwrap();
         assert!(matches!(only.get("items"), Some(Value::Array(_))));
         assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn cartesian_fan_out_retains_occurrences_not_output_product() {
+        let occurrence_count = 64;
+        let values = |name: &str| {
+            (0..occurrence_count)
+                .map(|i| format!(r#"{{"{name}":{i}}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let input = format!(
+            r#"[{{"id":1,"left":[{}],"right":[{}]}}]"#,
+            values("l"),
+            values("r")
+        );
+        let config = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows::bare("left"), SplitToRows::bare("right")],
+            ..default_config()
+        };
+        let mut reader = reader_from_str(&input, config);
+        reader.schema().unwrap();
+
+        let first = reader.next_record().unwrap().unwrap();
+        assert_eq!(first.get("l"), Some(&Value::Integer(0)));
+        assert_eq!(first.get("r"), Some(&Value::Integer(0)));
+        let cursor = reader.pending.as_ref().expect("remaining expansion");
+        assert_eq!(cursor.frames.len(), 2);
+        assert_eq!(
+            cursor
+                .frames
+                .iter()
+                .map(|frame| frame.occurrences.len())
+                .sum::<usize>(),
+            occurrence_count * 2,
+            "cursor retains the radix inputs, not their product"
+        );
+
+        let mut rows = 1;
+        while reader.next_record().unwrap().is_some() {
+            rows += 1;
+        }
+        assert_eq!(rows, occurrence_count * occurrence_count);
     }
 
     #[test]
