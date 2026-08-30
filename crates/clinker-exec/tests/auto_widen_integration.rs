@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Cursor, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
@@ -45,9 +46,23 @@ fn test_params() -> PipelineRunParams {
     }
 }
 
+fn fixture_workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+}
+
 fn run_single(yaml: &str, csv_input: &str) -> (ExecutionReport, String) {
+    run_single_in_context(yaml, csv_input, &CompileContext::default())
+}
+
+fn run_single_in_context(
+    yaml: &str,
+    csv_input: &str,
+    ctx: &CompileContext,
+) -> (ExecutionReport, String) {
     let config = parse_config(yaml).expect("parse pipeline yaml");
-    let plan = PipelineConfig::compile(&config, &CompileContext::default()).expect("compile");
+    let plan = PipelineConfig::compile(&config, ctx).expect("compile");
     let readers = HashMap::from([(
         config.source_configs().next().unwrap().name.clone(),
         clinker_exec::executor::single_file_reader(
@@ -73,8 +88,26 @@ fn run_two_source_merge(
     src_b_name: &str,
     csv_b: &str,
 ) -> (ExecutionReport, String) {
+    run_two_source_in_context(
+        yaml,
+        src_a_name,
+        csv_a,
+        src_b_name,
+        csv_b,
+        &CompileContext::default(),
+    )
+}
+
+fn run_two_source_in_context(
+    yaml: &str,
+    src_a_name: &str,
+    csv_a: &str,
+    src_b_name: &str,
+    csv_b: &str,
+    ctx: &CompileContext,
+) -> (ExecutionReport, String) {
     let config = parse_config(yaml).expect("parse pipeline yaml");
-    let plan = PipelineConfig::compile(&config, &CompileContext::default()).expect("compile");
+    let plan = PipelineConfig::compile(&config, ctx).expect("compile");
     let readers = HashMap::from([
         (
             src_a_name.to_string(),
@@ -175,6 +208,48 @@ nodes:
     );
 }
 
+#[test]
+fn composition_body_aggregate_terminal_strips_widened_payload() {
+    let yaml = r#"
+pipeline:
+  name: composition_aggregate_widened
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: csv
+    path: in.csv
+    schema:
+      - { name: dept, type: string }
+      - { name: salary, type: int }
+- type: composition
+  name: summarized
+  input: src
+  use: ../compositions/auto_widen_aggregate_terminal.comp.yaml
+  inputs:
+    rows: src
+- type: sink
+  name: out
+  input: summarized
+  config:
+    name: out
+    type: csv
+    path: out.csv
+    include_unmapped: true
+"#;
+    let csv = "dept,salary,notes,extra\nA,100,n1,e1\nA,200,n2,e2\nB,300,n3,e3\n";
+    let root = fixture_workspace_root();
+    let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
+    let (_report, output) = run_single_in_context(yaml, csv, &ctx);
+    let header = output.lines().next().expect("header");
+    assert_eq!(
+        header, "dept,total",
+        "the aggregate terminal sets `$widened` to Null, so the parent sink must not expand \
+         body-input sidecar keys. got: {header}"
+    );
+}
+
 // ── H2: Combine — driver carries $widened, build drops ─────────
 
 /// CSV combine: orders (driver) ⨝ products (build) on product_id.
@@ -246,6 +321,68 @@ nodes:
         !cols.contains(&"category"),
         "build-side $widened key `category` must NOT reach the joined output (build-side \
          sidecar is dropped by design, matching propagate_ck: Driver). got header: {header}"
+    );
+}
+
+#[test]
+fn composition_body_combine_first_terminal_carries_driver_widened() {
+    let yaml = r#"
+pipeline:
+  name: composition_combine_widened
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: orders.csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: product_id, type: string }
+      - { name: quantity, type: int }
+- type: source
+  name: products
+  config:
+    name: products
+    type: csv
+    path: products.csv
+    schema:
+      - { name: product_id, type: string }
+      - { name: name, type: string }
+      - { name: price, type: float }
+- type: composition
+  name: enriched
+  input: orders
+  use: ../compositions/combine_enrich.comp.yaml
+  inputs:
+    orders: orders
+    products: products
+- type: sink
+  name: out
+  input: enriched
+  config:
+    name: out
+    type: csv
+    path: out.csv
+    include_unmapped: true
+"#;
+    let orders = "order_id,product_id,quantity,region\nO1,P1,2,US\n";
+    let products = "product_id,name,price,category\nP1,Widget,10.0,hardware\n";
+    let root = fixture_workspace_root();
+    let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
+    let (_report, output) =
+        run_two_source_in_context(yaml, "orders", orders, "products", products, &ctx);
+    let header = output.lines().next().expect("header");
+    let cols: Vec<&str> = header.split(',').collect();
+    assert!(
+        cols.contains(&"region"),
+        "the first-mode combine terminal must carry the driver's `$widened` payload through \
+         the composition boundary. got: {header}"
+    );
+    assert!(
+        !cols.contains(&"category"),
+        "the combine terminal must not carry the build-side `$widened` payload through the \
+         composition boundary. got: {header}"
     );
 }
 
