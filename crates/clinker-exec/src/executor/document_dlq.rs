@@ -333,6 +333,40 @@ struct DocBucket {
     depth: i64,
 }
 
+/// Rejection payload detached from the executor context so punctuation and
+/// end-of-input decisions share one deduplicated assembly path.
+struct TakenDocumentRejection {
+    trigger: Option<DocTrigger>,
+    collaterals: Vec<(Record, SourceRowId, Arc<str>)>,
+}
+
+/// Claim the one decision slot for `key` in this Output invocation.
+fn claim_document_decision(decided: &mut HashSet<DocKey>, key: &DocKey) -> bool {
+    decided.insert(Arc::clone(key))
+}
+
+/// Apply one close punctuation to its live bucket and return the document key
+/// when this is its outermost close. A close without a live bucket is still a
+/// terminal decision candidate; the invocation and run ledgers deduplicate it.
+fn closing_document_key(buckets: &mut HashMap<DocKey, DocBucket>, file: &DocKey) -> Option<DocKey> {
+    let outermost = match buckets.get_mut(file) {
+        Some(bucket) => {
+            bucket.depth -= 1;
+            bucket.depth <= 0
+        }
+        None => true,
+    };
+    outermost.then(|| Arc::clone(file))
+}
+
+/// Stable end-of-input decision order for documents whose outermost close
+/// never arrived.
+fn remaining_document_keys(buckets: &HashMap<DocKey, DocBucket>) -> Vec<DocKey> {
+    let mut remaining: Vec<DocKey> = buckets.keys().cloned().collect();
+    remaining.sort_unstable();
+    remaining
+}
+
 /// Per-Output-invocation driver for the `document` granularity: buffers
 /// each record into its file's spillable bucket and, when the file's
 /// outermost close arrives (envelope depth back to zero) or at end-of-input,
@@ -472,7 +506,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         ctx: &mut ExecutorContext<'_>,
         key: &DocKey,
     ) -> Result<(), PipelineError> {
-        if !self.decided.insert(Arc::clone(key)) {
+        if !claim_document_decision(&mut self.decided, key) {
             return Ok(());
         }
         let bucket = self.buckets.remove(key);
@@ -733,18 +767,8 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                             Self::bucket_for(&mut self.buckets, &self.arbitrator, &file).depth += 1;
                         }
                         PunctuationKind::DocumentClose => {
-                            let outermost = match self.buckets.get_mut(&file) {
-                                Some(b) => {
-                                    b.depth -= 1;
-                                    b.depth <= 0
-                                }
-                                // No live bucket: either already decided, or
-                                // a close with no tracked open (malformed) —
-                                // treat as the file's terminal close.
-                                None => true,
-                            };
-                            if outermost {
-                                self.decide_document(ctx, &file)?;
+                            if let Some(key) = closing_document_key(&mut self.buckets, &file) {
+                                self.decide_document(ctx, &key)?;
                             }
                         }
                     }
@@ -756,9 +780,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         // clean-vs-failed axis as one closed in stream — a failed one
         // rejects with its collaterals, a clean one flushes. Deterministic
         // order keeps emit / write ordering stable across runs.
-        let mut remaining: Vec<DocKey> = self.buckets.keys().cloned().collect();
-        remaining.sort_unstable();
-        for key in remaining {
+        for key in remaining_document_keys(&self.buckets) {
             self.decide_document(ctx, &key)?;
         }
 
@@ -991,43 +1013,25 @@ fn push_document_collateral(
     )
 }
 
-/// Emit the reject DLQ entries for failed document `key`, once per document
-/// run-scoped: the captured root-cause trigger (`trigger: true`, its
-/// original category) followed by a `DocumentRejected` collateral
-/// (`trigger: false`) for every other buffered record of the document.
-/// Every emitted entry counts toward the DLQ rate. Drops the document's
-/// trigger and its bucket.
-fn reject_document_now(
-    ctx: &mut ExecutorContext<'_>,
+/// Take one failed document's root cause and unique collateral records.
+/// Returns `None` after the run-scoped rejection slot has already been taken.
+fn take_document_rejection(
+    state: &mut DocumentDlqState,
+    arbitrator: &crate::pipeline::memory::MemoryArbitrator,
     key: &DocKey,
     bucket: Option<DocBucket>,
-) -> Result<(), PipelineError> {
-    let already_rejected = {
-        let state = ctx
-            .document_dlq
-            .as_mut()
-            .expect("document_dlq is Some — checked by caller");
-        !state.rejected.insert(Arc::clone(key))
-    };
-    if already_rejected {
+) -> Result<Option<TakenDocumentRejection>, PipelineError> {
+    if !state.rejected.insert(Arc::clone(key)) {
         // Already rejected (duplicate close): release any bucket this caller
         // handed in so its consumer does not leak, and emit nothing more.
         if let Some(bucket) = bucket {
             bucket.handle.set_bytes(0);
-            ctx.memory_budget.unregister_consumer(bucket.consumer_id);
+            arbitrator.unregister_consumer(bucket.consumer_id);
         }
-        return Ok(());
+        return Ok(None);
     }
-    let (trigger, extra_collaterals) = {
-        let state = ctx
-            .document_dlq
-            .as_mut()
-            .expect("document_dlq is Some — checked above");
-        (
-            state.failed.remove(key),
-            state.extra_collaterals.remove(key).unwrap_or_default(),
-        )
-    };
+    let trigger = state.failed.remove(key);
+    let extra_collaterals = state.extra_collaterals.remove(key).unwrap_or_default();
 
     // Collect this document's collateral rows out of the bucket before any
     // `push_dlq` borrows `ctx` mutably. SourceRowId already contains the
@@ -1058,16 +1062,60 @@ fn reject_document_now(
             ..
         } = bucket;
         handle.set_bytes(0);
+        let mut drain_error = None;
         for event in buffer.drain() {
-            if let StreamEvent::Record(record, source_row) = event? {
-                let source_name = source_name_arc_of(&record);
-                if seen.insert(source_row) {
-                    collaterals.push((record, source_row, source_name));
+            match event {
+                Ok(StreamEvent::Record(record, source_row)) => {
+                    let source_name = source_name_arc_of(&record);
+                    if seen.insert(source_row) {
+                        collaterals.push((record, source_row, source_name));
+                    }
+                }
+                Ok(StreamEvent::Punctuation(_)) => {}
+                Err(error) => {
+                    drain_error = Some(error);
+                    break;
                 }
             }
         }
-        ctx.memory_budget.unregister_consumer(consumer_id);
+        arbitrator.unregister_consumer(consumer_id);
+        if let Some(error) = drain_error {
+            return Err(error);
+        }
     }
+
+    Ok(Some(TakenDocumentRejection {
+        trigger,
+        collaterals,
+    }))
+}
+
+/// Emit the reject DLQ entries for failed document `key`, once per document
+/// run-scoped: the captured root-cause trigger (`trigger: true`, its
+/// original category) followed by a `DocumentRejected` collateral
+/// (`trigger: false`) for every other buffered record of the document.
+/// Every emitted entry counts toward the DLQ rate. Drops the document's
+/// trigger and its bucket.
+fn reject_document_now(
+    ctx: &mut ExecutorContext<'_>,
+    key: &DocKey,
+    bucket: Option<DocBucket>,
+) -> Result<(), PipelineError> {
+    let arbitrator = Arc::clone(&ctx.memory_budget);
+    let rejection = {
+        let state = ctx
+            .document_dlq
+            .as_mut()
+            .expect("document_dlq is Some — checked by caller");
+        take_document_rejection(state, &arbitrator, key, bucket)?
+    };
+    let Some(TakenDocumentRejection {
+        trigger,
+        collaterals,
+    }) = rejection
+    else {
+        return Ok(());
+    };
 
     if let Some(t) = trigger {
         push_dlq(
@@ -1109,7 +1157,9 @@ fn reject_document_now(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clinker_record::{Schema, Value};
+    use clinker_record::{
+        DocumentContext, DocumentId, EnvelopeRecord, FieldMetadata, Schema, SchemaBuilder, Value,
+    };
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec!["id".into(), "value".into()]))
@@ -1120,6 +1170,145 @@ mod tests {
             Arc::clone(s),
             vec![Value::Integer(id), Value::Integer(value)],
         )
+    }
+
+    fn rejected_document_fixture() -> (
+        Arc<crate::pipeline::memory::MemoryArbitrator>,
+        DocumentDlqState,
+        HashMap<DocKey, DocBucket>,
+        Arc<DocumentContext>,
+    ) {
+        let key: DocKey = Arc::from("broken.x12");
+        let source_name: Arc<str> = Arc::from("orders");
+        let doc = Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::clone(&key),
+            EnvelopeRecord::empty(),
+        ));
+        let schema = SchemaBuilder::with_capacity(4)
+            .with_field("id")
+            .with_field("value")
+            .with_field_meta("$source.file", FieldMetadata::SourceFile)
+            .with_field_meta("$source.name", FieldMetadata::SourceName)
+            .build();
+        let record = |id: i64| {
+            let mut record = Record::new(
+                Arc::clone(&schema),
+                vec![
+                    Value::Integer(id),
+                    Value::Integer(id * 10),
+                    Value::from(key.as_ref()),
+                    Value::from(source_name.as_ref()),
+                ],
+            );
+            record.set_doc_ctx(Arc::clone(&doc));
+            record
+        };
+        let trigger_record = record(1);
+        let collateral_record = record(2);
+        let trigger_row = SourceRowId::from(1);
+        let collateral_row = SourceRowId::from(2);
+
+        let mut state = DocumentDlqState::new(HashSet::from([Arc::clone(&source_name)]));
+        state.failed.insert(
+            Arc::clone(&key),
+            DocTrigger {
+                source_row: trigger_row,
+                category: clinker_core_types::dlq::DlqErrorCategory::ValidationFailure,
+                error_message: "document validation failed".to_string(),
+                original_record: trigger_record.clone(),
+                stage: Some("validate".to_string()),
+                route: None,
+                source_name,
+                triggering_field: None,
+                triggering_value: None,
+            },
+        );
+
+        let arbitrator = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+            1024 * 1024,
+            0.8,
+            0.6,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        ));
+        let handle = crate::pipeline::memory::ConsumerHandle::new();
+        let consumer_id = arbitrator.register_consumer(Arc::new(
+            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
+        ));
+        let mut buffer = NodeBuffer::Memory(Vec::new());
+        buffer.push(trigger_record, trigger_row);
+        buffer.push(collateral_record, collateral_row);
+        let bucket = DocBucket {
+            buffer,
+            consumer_id,
+            handle,
+            depth: 1,
+        };
+        (arbitrator, state, HashMap::from([(key, bucket)]), doc)
+    }
+
+    #[test]
+    fn duplicate_document_close_claims_one_rejection() {
+        let (arbitrator, mut state, mut buckets, doc) = rejected_document_fixture();
+        let key = Arc::clone(doc.source_file());
+        let closes = [
+            crate::executor::stream_event::Punctuation::document_close(Arc::clone(&doc)),
+            crate::executor::stream_event::Punctuation::document_close(Arc::clone(&doc)),
+        ];
+        let mut decided = HashSet::new();
+        let mut rejections = Vec::new();
+
+        for close in closes {
+            if let Some(decision_key) = closing_document_key(&mut buckets, close.source_file())
+                && claim_document_decision(&mut decided, &decision_key)
+                && let Some(rejection) = take_document_rejection(
+                    &mut state,
+                    &arbitrator,
+                    &decision_key,
+                    buckets.remove(&decision_key),
+                )
+                .expect("rejection assembly")
+            {
+                rejections.push(rejection);
+            }
+        }
+
+        assert_eq!(decided, HashSet::from([key]));
+        assert_eq!(rejections.len(), 1, "a duplicate close cannot reject twice");
+        assert!(rejections[0].trigger.is_some(), "one root-cause entry");
+        assert_eq!(
+            rejections[0].collaterals.len(),
+            1,
+            "the sibling record is emitted once"
+        );
+        assert_eq!(arbitrator.consumer_count(), 0, "the bucket unregisters");
+    }
+
+    #[test]
+    fn unterminated_dirty_document_is_rejected_at_drain() {
+        let (arbitrator, mut state, mut buckets, _doc) = rejected_document_fixture();
+        let mut decided = HashSet::new();
+        let mut rejections = Vec::new();
+
+        for key in remaining_document_keys(&buckets) {
+            if claim_document_decision(&mut decided, &key)
+                && let Some(rejection) =
+                    take_document_rejection(&mut state, &arbitrator, &key, buckets.remove(&key))
+                        .expect("end-of-input rejection assembly")
+            {
+                rejections.push(rejection);
+            }
+        }
+
+        assert_eq!(rejections.len(), 1, "drain decides the open document");
+        assert!(rejections[0].trigger.is_some(), "one root-cause entry");
+        assert_eq!(
+            rejections[0].collaterals.len(),
+            1,
+            "the buffered sibling becomes one collateral"
+        );
+        assert!(buckets.is_empty(), "the drained bucket is released");
+        assert_eq!(arbitrator.consumer_count(), 0, "the bucket unregisters");
     }
 
     /// A per-document bucket that spills to disk round-trips every record
