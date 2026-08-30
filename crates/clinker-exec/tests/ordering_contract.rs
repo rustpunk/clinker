@@ -299,6 +299,107 @@ fn writer_boundary_null_drop_planning_matrix() {
     );
 }
 
+fn split_order_yaml(output_path: &std::path::Path, memory_limit: &str) -> String {
+    let output_path = serde_json::to_string(&output_path.to_string_lossy()).expect("quote path");
+    format!(
+        r#"
+pipeline:
+  name: split_writer_order
+  memory: {{ limit: "{memory_limit}", backpressure: spill }}
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: rows.csv
+      schema:
+        - {{ name: key, type: {{ nullable: int }} }}
+        - {{ name: payload, type: string }}
+  - type: sink
+    name: out
+    input: rows
+    config:
+      name: out
+      type: csv
+      path: {output_path}
+      sort_order:
+        - {{ field: key, order: asc, null_order: drop }}
+      split:
+        max_records: 2
+"#
+    )
+}
+
+fn run_split_order(memory_limit: &str) -> Vec<String> {
+    let root = tempfile::tempdir().expect("temporary split destination");
+    let output_path = root.path().join("ordered.csv");
+    let config: PipelineConfig =
+        clinker_plan::yaml::from_str(&split_order_yaml(&output_path, memory_limit))
+            .expect("split fixture must parse");
+    let mut compile_ctx = CompileContext::new(root.path());
+    compile_ctx.allow_absolute_paths = true;
+    let plan = PipelineConfig::compile(&config, &compile_ctx).expect("split fixture must compile");
+    let readers: SourceReaders = HashMap::from([(
+        "rows".to_string(),
+        single_file_reader(
+            "rows.csv",
+            Box::new(Cursor::new(
+                b"key,payload\n3,three\n,drop-a\n1,one-a\n2,two\n1,one-b\n,drop-b\n4,four\n"
+                    .to_vec(),
+            )),
+        ),
+    )]);
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(std::io::sink()) as Box<dyn Write + Send>,
+    )]);
+
+    let report = PipelineExecutor::run_plan_with_readers_writers_in_context(
+        &plan,
+        readers,
+        writers,
+        &PipelineRunParams::default(),
+        compile_ctx,
+    )
+    .expect("split ordering fixture must run");
+    assert_eq!(
+        report.counters.null_dropped_count, 2,
+        "null-key rows must be removed before split sizing"
+    );
+
+    let mut files: Vec<_> = std::fs::read_dir(root.path())
+        .expect("read split destination")
+        .map(|entry| entry.expect("split entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "csv"))
+        .collect();
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| std::fs::read_to_string(path).expect("read split bytes"))
+        .collect()
+}
+
+#[test]
+fn split_sink_is_one_ordered_sequence_before_rotation() {
+    let resident = run_split_order("64M");
+    let spilled = run_split_order("2400");
+    let expected = vec![
+        "key,payload\n1,one-a\n1,one-b\n".to_string(),
+        "key,payload\n2,two\n3,three\n".to_string(),
+        "key,payload\n4,four\n".to_string(),
+    ];
+
+    assert_eq!(
+        resident, expected,
+        "numbered files must be contiguous slices"
+    );
+    assert_eq!(
+        spilled, expected,
+        "spill sorting must emit identical split bytes"
+    );
+}
+
 #[test]
 fn writer_boundary_post_rewrite_proof() {
     let plan = compile(&merge_output_pipeline("64M", true));
