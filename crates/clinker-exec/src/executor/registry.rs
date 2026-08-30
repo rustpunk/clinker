@@ -286,6 +286,7 @@ fn build_writer_factory(
             // gate has already rejected `join_values` on a non-CSV output, so
             // only the CSV arm consumes it.
             csv_config.join_values = join_values;
+            csv_config.declared_multiple = output.declared_multiple.clone();
             // Lossless mode: when the Output carries every column through
             // (`include_unmapped: true`), a record column the pinned header
             // lacks must fail loudly rather than be silently dropped. The
@@ -356,6 +357,7 @@ fn build_writer_factory(
             // field. The plan-time E362 gate has already validated the block, so
             // the XML and CSV arms each consume the sub-vocabulary they read.
             xml_config.join_values = join_values;
+            xml_config.declared_multiple = output.declared_multiple.clone();
             xml_config.envelope = resolve_envelope_spec(
                 reconstruct_envelope,
                 opts.as_ref().and_then(|o| o.envelope.as_ref()),
@@ -548,6 +550,98 @@ fn build_split_policy(split: &clinker_plan::config::SplitConfig) -> SplitPolicy 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_plan::config::{CompileContext, parse_config};
+    use clinker_record::{Record, Value};
+
+    fn compiled_split_sink(format: &str, declared_multiple: bool) -> SinkConfig {
+        let multiple = if declared_multiple {
+            ", multiple: true"
+        } else {
+            ""
+        };
+        let yaml = format!(
+            r#"
+pipeline:
+  name: split_multi_value_contract
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: in.json
+      schema:
+        - {{ name: tags, type: any{multiple} }}
+  - type: sink
+    name: out
+    input: src
+    config:
+      name: out
+      type: {format}
+      path: out.{format}
+      split:
+        max_records: 1
+"#
+        );
+        let config = parse_config(&yaml).expect("split pipeline parses");
+        let plan = config
+            .compile(&CompileContext::default())
+            .expect("split pipeline compiles");
+        plan.config()
+            .sink_configs()
+            .next()
+            .expect("compiled plan has a Sink")
+            .clone()
+    }
+
+    #[test]
+    fn split_csv_and_xml_writers_enforce_compiled_multiple_columns() {
+        for format in ["csv", "xml"] {
+            for declared in [true, false] {
+                let temp = tempfile::tempdir().expect("temp output directory");
+                let mut sink = compiled_split_sink(format, declared);
+                sink.path = temp
+                    .path()
+                    .join(format!("out.{format}"))
+                    .display()
+                    .to_string();
+                let schema = Arc::new(Schema::new(vec!["tags".into()]));
+                let record = Record::new(
+                    Arc::clone(&schema),
+                    vec![Value::Array(vec![
+                        Value::String("a".into()),
+                        Value::String("b".into()),
+                    ])],
+                );
+                let raw = Box::new(std::io::Cursor::new(Vec::<u8>::new())) as Box<dyn Write + Send>;
+                let mut writer = build_format_writer(
+                    &sink,
+                    raw,
+                    schema,
+                    crate::output::staging::OutputStagingRegistry::default(),
+                    None,
+                )
+                .expect("split writer builds");
+                let result = writer.write_record(&record);
+                if declared {
+                    result.unwrap_or_else(|error| {
+                        panic!("declared {format} array must write: {error}")
+                    });
+                    writer
+                        .flush()
+                        .unwrap_or_else(|error| panic!("{format} writer flushes: {error}"));
+                } else {
+                    let error = result.expect_err("undeclared split array must fail");
+                    let message = error.to_string();
+                    assert!(
+                        message.contains(format.to_ascii_uppercase().as_str())
+                            && message.contains("tags"),
+                        "{message}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn xml_writer_config_plumbs_attribute_prefix() {

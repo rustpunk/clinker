@@ -36,6 +36,11 @@ fn transformed_pipeline(cxl: &str, preserve_nulls: Option<bool>, rename_repeats:
     } else {
         ""
     };
+    let output_schema = if rename_repeats {
+        "      schema:\n        - { name: tags, type: string, multiple: true }\n"
+    } else {
+        ""
+    };
     let preserve_nulls = preserve_nulls
         .map(|value| format!("      preserve_nulls: {value}\n"))
         .unwrap_or_default();
@@ -68,6 +73,7 @@ nodes:
       type: xml
       path: ./out.xml
       include_unmapped: false
+__OUTPUT_SCHEMA__
 __PRESERVE_NULLS__
 __JOIN_VALUES__      options:
         root_element: Feed
@@ -75,6 +81,7 @@ __JOIN_VALUES__      options:
         attribute_prefix: "@"
 "#
     .replace("        __CXL__", &cxl)
+    .replace("__OUTPUT_SCHEMA__", output_schema)
     .replace("__PRESERVE_NULLS__", &preserve_nulls)
     .replace("__JOIN_VALUES__", join_values)
 }
