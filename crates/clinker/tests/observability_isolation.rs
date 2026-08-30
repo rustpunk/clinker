@@ -1284,6 +1284,7 @@ fn invoke_fault_matrix(
     command
         .current_dir(root.path())
         .env("CLINKER_TEST_OTLP_OUTCOME", "success")
+        .env("CLINKER_TEST_OTLP_ENSURE_SIGNAL_PROBES", "1")
         .env("CLINKER_TEST_OTLP_CAPTURE", &capture)
         .args([
             "run",
@@ -1302,6 +1303,10 @@ fn invoke_fault_matrix(
             "traces" => "CLINKER_TEST_OTLP_TRACES_OUTCOME",
             _ => panic!("unknown OTLP signal"),
         };
+        // The debug exporter gives each signal a one-item exporter-boundary
+        // probe only when the fixed arena admitted no real payload for it. This
+        // keeps both the selected fault and sibling success observable without
+        // changing the admission-loss behavior this matrix runs beside.
         command.env(variable, otlp_outcome);
     }
     if let Some(mode) = lineage_sink {

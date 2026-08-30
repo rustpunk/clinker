@@ -561,6 +561,8 @@ impl OtlpWorker {
                             state.enter_final_flush();
                             state.drain_final();
                             state.deliver_lifecycle(snapshot.as_ref());
+                            #[cfg(debug_assertions)]
+                            state.deliver_pending_injected_outcome_probes();
                             let _ = done_sender.try_send(state.report);
                             return;
                         }
@@ -816,6 +818,24 @@ impl WorkerState<'_> {
         self.deliver_encoded(OtlpSignal::Traces, encoded, 1);
     }
 
+    /// Complete fault-matrix test signals that had no admitted payload to carry them.
+    ///
+    /// The fault matrix deliberately keeps the real arena small enough to prove
+    /// admission loss. Under scheduler contention that can discard every record
+    /// of a signal before the injected exporter sees one. An opt-in injected
+    /// one-item exporter-boundary probe keeps selected-fault and sibling-success
+    /// assertions deterministic without changing arena capacity, admission, or
+    /// production behavior. Real drained records and the lifecycle span always
+    /// take priority.
+    #[cfg(debug_assertions)]
+    fn deliver_pending_injected_outcome_probes(&mut self) {
+        for signal in [OtlpSignal::Logs, OtlpSignal::Metrics, OtlpSignal::Traces] {
+            if let Some(result) = self.backend.pending_injected_outcome_probe(signal) {
+                self.report.record(signal, result, 1);
+            }
+        }
+    }
+
     /// Split one drained batch across as many requests as its bounded buffer
     /// needs. Halving on overflow keeps the memory fixed while guaranteeing
     /// forward progress; only an item that cannot be represented alone is
@@ -947,6 +967,16 @@ impl DeliveryBackend {
             Self::Recording(recording) => recording.deliver(signal, item_count, shutdown),
         }
     }
+
+    #[cfg(debug_assertions)]
+    fn pending_injected_outcome_probe(&mut self, signal: OtlpSignal) -> Option<DeliveryResult> {
+        match self {
+            Self::Injected(injected) => injected.pending_outcome_probe(signal),
+            Self::Network => None,
+            #[cfg(test)]
+            Self::Recording(_) => None,
+        }
+    }
 }
 
 /// Records what the worker handed the transport, and whether the worker would
@@ -1004,6 +1034,7 @@ impl RecordingDelivery {
 struct InjectedDelivery {
     capture: Option<File>,
     reported: [bool; 3],
+    ensure_signal_probes: bool,
 }
 
 #[cfg(debug_assertions)]
@@ -1016,6 +1047,9 @@ impl InjectedDelivery {
         Ok(Self {
             capture,
             reported: [false; 3],
+            ensure_signal_probes: std::env::var_os("CLINKER_TEST_OTLP_ENSURE_SIGNAL_PROBES")
+                .as_deref()
+                == Some(std::ffi::OsStr::new("1")),
         })
     }
 
@@ -1043,7 +1077,6 @@ impl InjectedDelivery {
                 return DeliveryResult::EncodingFailure;
             }
         }
-        let mode = injected_signal_outcome(signal);
         let signal_index = match signal {
             OtlpSignal::Logs => 0,
             OtlpSignal::Metrics => 1,
@@ -1059,6 +1092,27 @@ impl InjectedDelivery {
             };
         }
         self.reported[signal_index] = true;
+        Self::outcome_result(injected_signal_outcome(signal).as_deref(), item_count)
+    }
+
+    fn pending_outcome_probe(&mut self, signal: OtlpSignal) -> Option<DeliveryResult> {
+        let signal_index = match signal {
+            OtlpSignal::Logs => 0,
+            OtlpSignal::Metrics => 1,
+            OtlpSignal::Traces => 2,
+        };
+        if self.reported[signal_index] {
+            return None;
+        }
+        let mode = injected_signal_outcome(signal);
+        if mode.is_none() && !self.ensure_signal_probes {
+            return None;
+        }
+        self.reported[signal_index] = true;
+        Some(Self::outcome_result(mode.as_deref(), 1))
+    }
+
+    fn outcome_result(mode: Option<&str>, item_count: u64) -> DeliveryResult {
         let (accepted, rejected, attempts, failed, outcome) = match mode.as_deref() {
             None | Some("success") => (1, 0, 1, false, None),
             Some("partial") => (0, 1, 1, false, Some("partial")),
