@@ -941,6 +941,47 @@ nodes:
     assert_eq!(row.tail, cxl::typecheck::RowTail::Closed);
 }
 
+/// A generated X12 row includes the functional-group control number beside
+/// the transaction-set control columns, so a direct X12-to-X12 pipeline can
+/// preserve `GS..GE` group boundaries without an author-written Transform.
+#[test]
+fn test_bind_schema_generated_x12_includes_group_ref() {
+    let yaml = r#"
+pipeline:
+  name: gen-x12
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: x12
+      path: dummy.x12
+      schema: { generated: {} }
+  - type: sink
+    name: out
+    input: interchange
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let (artifacts, config) = bind_yaml(yaml);
+    let row = typed_output_row(&config, &artifacts, "interchange")
+        .expect("generated X12 source must have a bound row");
+    for col in ["seg_id", "group_ref", "set_ref", "set_type", "e01", "e32"] {
+        assert!(row.has_field(col), "generated X12 row missing {col:?}");
+    }
+    assert!(
+        matches!(
+            row.lookup("group_ref"),
+            cxl::typecheck::ColumnLookup::Declared(cxl::typecheck::Type::String)
+        ),
+        "group_ref must bind as a concrete String, got {:?}",
+        row.lookup("group_ref"),
+    );
+    assert_eq!(row.tail, cxl::typecheck::RowTail::Closed);
+}
+
 /// A `SourceSchema::Generated` HL7 source honors `max_fields` and applies the
 /// declared composite-field splits when synthesizing its compile-time columns,
 /// so the split-leaf columns (`f08_c1`/`f08_c2`) — not the verbatim `f08` —
