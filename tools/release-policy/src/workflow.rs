@@ -484,7 +484,7 @@ fn validate_ci_policy_jobs(jobs: &BTreeMap<String, Job>) -> Result<(), GateError
     )?;
     require_unnamed_action_step(
         &steps[1],
-        "dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9",
+        "dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772",
         &["toolchain", "1.91", "components", "clippy, rustfmt"],
     )?;
     require_plain_command_step(
@@ -525,7 +525,7 @@ fn validate_ci_policy_jobs(jobs: &BTreeMap<String, Job>) -> Result<(), GateError
     )?;
     require_unnamed_action_step(
         &steps[1],
-        "dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9",
+        "dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772",
         &["toolchain", "1.91", "components", "clippy, rustfmt"],
     )?;
     require_plain_command_step(
@@ -732,7 +732,7 @@ fn require_exact_release_dependency(job: &Job) -> Result<(), GateError> {
     )?;
     require_unnamed_action_step(
         &steps[1],
-        "dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9",
+        "dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772",
         &["toolchain", "1.91"],
     )?;
     require_command_step(
@@ -934,7 +934,7 @@ fn require_exact_release_assembly(assemble: &Job) -> Result<(), GateError> {
     require_action_step(
         &steps[6],
         "Attest the verified release archives",
-        "actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373",
+        "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
         &["subject-path", "artifacts/*.tar.gz\nartifacts/*.zip\n"],
     )?;
     require_command_step(
