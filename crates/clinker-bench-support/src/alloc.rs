@@ -74,6 +74,12 @@ impl AccountingAlloc {
     }
 }
 
+impl Default for AccountingAlloc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // SAFETY: All operations forward to `System` after updating atomic counters.
 // `alloc_zeroed` is overridden to prevent double-counting (the default impl
 // calls `self.alloc()`). Realloc failure (null return) still counts the
