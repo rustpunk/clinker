@@ -609,6 +609,13 @@ files or Merge inputs. The guarantee is exactly the authored field sequence,
 direction, and null placement. `drop` is also part of the authored contract:
 records with a null in a sort key do not reach the writer.
 
+For a split Sink, that order is global across the complete numbered split set,
+not restarted independently inside each file. Clinker sorts and applies
+`null_order: drop` before it rotates the writer. Each numbered file is therefore
+a contiguous slice of the one ordered sequence, and concatenating the files in
+sequence-number order recovers that sequence. Dropped rows do not count toward
+`max_records`, `max_bytes`, or the resulting number of split files.
+
 The sort is stable. Equal authored keys retain their upstream arrival order
 within a given execution path, and the same path produces the same bytes in
 resident and forced-spill operation. Clinker does not add a source-row,
@@ -680,6 +687,12 @@ tokens are rejected during configuration validation. For example,
 `{stem}_{seq:03}.{ext}` renders sequence 7 as `007`.
 
 For formats whose output wraps the whole file in framing -- a JSON array or an XML root element -- each split file is a complete, independently valid document: the framing is closed at rotation and reopened for the next file.
+
+When the Sink also declares `sort_order`, splitting happens after the complete
+Sink population has been ordered and null-key drops have been applied. Segment
+1 receives the first surviving records, segment 2 the next records, and so on.
+The files are individually ordered and together form one ordered sequence when
+read by sequence number; split rotation never starts a new independent sort.
 
 ### Oversize group policies
 

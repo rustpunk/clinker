@@ -69,18 +69,119 @@ fn transform_cxl_sources(config: &PipelineConfig) -> Vec<(String, String)> {
 /// the same consumers a per-partition scope disqualifies. Printing the fields
 /// alone left an author looking at a global, sorted input that did not get the
 /// scan, with nothing on the page to say why.
-fn order_fields_label(order: &[crate::config::SortField]) -> String {
+trait ExplainOrderField {
+    fn field(&self) -> &str;
+    fn order(&self) -> crate::config::SortOrder;
+}
+
+impl ExplainOrderField for crate::config::SortField {
+    fn field(&self) -> &str {
+        &self.field
+    }
+
+    fn order(&self) -> crate::config::SortOrder {
+        self.order
+    }
+}
+
+impl ExplainOrderField for ResolvedSortField {
+    fn field(&self) -> &str {
+        &self.field
+    }
+
+    fn order(&self) -> crate::config::SortOrder {
+        self.order
+    }
+}
+
+fn sort_direction_label(order: crate::config::SortOrder) -> &'static str {
+    match order {
+        crate::config::SortOrder::Asc => "asc",
+        crate::config::SortOrder::Desc => "desc",
+    }
+}
+
+fn order_fields_label<T: ExplainOrderField>(order: &[T]) -> String {
     order
         .iter()
-        .map(|field| {
-            let direction = match field.order {
-                crate::config::SortOrder::Asc => "asc",
-                crate::config::SortOrder::Desc => "desc",
-            };
-            format!("{} {direction}", field.field)
-        })
+        .map(|field| format!("{} {}", field.field(), sort_direction_label(field.order())))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WriterOrderFieldExplain {
+    field: String,
+    direction: &'static str,
+}
+
+/// Author-facing projection of one compiled terminal writer-order decision.
+///
+/// This reports the frozen decision from `enforce_terminal_writer_order`; it
+/// deliberately does not repeat the planner's eligibility rules.
+#[derive(Debug, Clone, Serialize)]
+struct WriterBoundaryExplain {
+    sink: String,
+    terminal_order: Vec<WriterOrderFieldExplain>,
+    terminal_order_label: String,
+    disposition: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proven_by: Option<String>,
+    boundary_mode: &'static str,
+    partition_scope: &'static str,
+}
+
+impl WriterBoundaryExplain {
+    fn from_boundary(boundary: &PhysicalWriterBoundary) -> Option<Self> {
+        let OrderGuarantee::Sorted(fields) = &boundary.guarantee else {
+            return None;
+        };
+        if fields.is_empty() {
+            return None;
+        }
+
+        let terminal_order = fields
+            .iter()
+            .map(|field| WriterOrderFieldExplain {
+                field: field.field.clone(),
+                direction: sort_direction_label(field.order),
+            })
+            .collect::<Vec<_>>();
+        let terminal_order_label = order_fields_label(fields);
+        let (disposition, proven_by) = match &boundary.disposition {
+            WriterOrderDisposition::Unordered => ("unordered", None),
+            WriterOrderDisposition::Preserve => ("preserve", None),
+            WriterOrderDisposition::ProvenTerminalSort { sort, .. } => {
+                ("proven_terminal_sort", Some(sort.node_name.clone()))
+            }
+            WriterOrderDisposition::DeferredSort { .. } => ("deferred_sort", None),
+        };
+        let partition_scope = match boundary.partition.key {
+            WriterPartitionKey::Single => "single_file",
+            WriterPartitionKey::SourceFile => "per_source_file",
+            WriterPartitionKey::SplitSequence => "global_split_sequence",
+            WriterPartitionKey::Document => "per_document",
+            WriterPartitionKey::CorrelationGroup => "per_correlation_group",
+        };
+
+        Some(Self {
+            sink: boundary.output_name.clone(),
+            terminal_order,
+            terminal_order_label,
+            disposition,
+            proven_by,
+            boundary_mode: boundary.mode.as_str(),
+            partition_scope,
+        })
+    }
+}
+
+fn writer_boundary_explain_views(dag: &ExecutionPlanDag) -> Vec<WriterBoundaryExplain> {
+    dag.order_contract()
+        .writer_boundaries
+        .iter()
+        .filter_map(WriterBoundaryExplain::from_boundary)
+        .collect()
 }
 
 /// The scope of a node's declared order, or `None` where it declares none.
@@ -540,6 +641,27 @@ impl ExecutionPlanDag {
                     ));
                 }
                 out.push('\n');
+            }
+        }
+
+        let writer_boundaries = writer_boundary_explain_views(self);
+        if !writer_boundaries.is_empty() {
+            out.push_str("=== Sink Writer Ordering ===\n\n");
+            for boundary in writer_boundaries {
+                out.push_str(&format!("sink.{}:\n", boundary.sink));
+                out.push_str(&format!(
+                    "  terminal_order: {}\n",
+                    boundary.terminal_order_label
+                ));
+                out.push_str(&format!("  disposition: {}\n", boundary.disposition));
+                if let Some(proven_by) = boundary.proven_by {
+                    out.push_str(&format!("  proven_by: {proven_by}\n"));
+                }
+                out.push_str(&format!("  boundary_mode: {}\n", boundary.boundary_mode));
+                out.push_str(&format!(
+                    "  partition_scope: {}\n\n",
+                    boundary.partition_scope
+                ));
             }
         }
 
@@ -1702,7 +1824,28 @@ impl ExecutionPlanDag {
                         None => format!(r#"label="{}""#, dep),
                     }
                 },
-                &|_, (_, node)| { format!(r#"label="{}""#, dot_escape(&node.display_name())) },
+                &|_, (_, node)| {
+                    let mut label = node.display_name();
+                    if let Some(boundary) = self
+                        .order_contract()
+                        .writer_boundaries
+                        .iter()
+                        .find(|boundary| boundary.output_id == node.id())
+                        .and_then(WriterBoundaryExplain::from_boundary)
+                    {
+                        label.push_str(&format!(
+                            "\nterminal order: {}\ndisposition: {}\nboundary: {}\nscope: {}",
+                            boundary.terminal_order_label,
+                            boundary.disposition,
+                            boundary.boundary_mode,
+                            boundary.partition_scope
+                        ));
+                        if let Some(proven_by) = boundary.proven_by {
+                            label.push_str(&format!("\nproven by: {proven_by}"));
+                        }
+                    }
+                    format!(r#"label="{}""#, dot_escape(&label))
+                },
             )
         )
     }
@@ -1735,7 +1878,9 @@ fn dot_escape(s: &str) -> String {
 /// across recompiles where `NodeIndex` values change.
 impl Serialize for ExecutionPlanDag {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(4))?;
+        let writer_boundaries = writer_boundary_explain_views(self);
+        let mut map =
+            serializer.serialize_map(Some(4 + usize::from(!writer_boundaries.is_empty())))?;
         map.serialize_entry("schema_version", "1")?;
 
         // Build node list in topo order
@@ -1783,6 +1928,9 @@ impl Serialize for ExecutionPlanDag {
         }
         map.serialize_entry("node_properties", &PropsMap(self))?;
         map.serialize_entry("source_activation", &self.source_activation.summary())?;
+        if !writer_boundaries.is_empty() {
+            map.serialize_entry("writer_boundaries", &writer_boundaries)?;
+        }
         map.end()
     }
 }
@@ -1991,7 +2139,10 @@ impl<'a> Serialize for ExplainJson<'a> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         // schema_version + nodes + node_properties, plus storage_summary
         // when the CLI threaded the storage context through.
-        let entry_count = 3 + usize::from(self.storage_summary.is_some());
+        let writer_boundaries = writer_boundary_explain_views(self.dag);
+        let entry_count = 3
+            + usize::from(self.storage_summary.is_some())
+            + usize::from(!writer_boundaries.is_empty());
         let mut map = serializer.serialize_map(Some(entry_count))?;
         map.serialize_entry("schema_version", "1")?;
 
@@ -2079,6 +2230,10 @@ impl<'a> Serialize for ExplainJson<'a> {
             }
         }
         map.serialize_entry("node_properties", &PropsMap(self.dag))?;
+
+        if !writer_boundaries.is_empty() {
+            map.serialize_entry("writer_boundaries", &writer_boundaries)?;
+        }
 
         // Storage observability at parity with the text `--explain`
         // output. Omitted (not `null`) when the JSON view was built
@@ -2354,6 +2509,79 @@ mod order_scope_tests {
             scope.contains("per partition") && scope.contains("$source.file"),
             "a partitioned stream names the key its order is scoped to: {scope}"
         );
+    }
+}
+
+#[cfg(test)]
+mod writer_boundary_explain_tests {
+    use super::*;
+
+    fn sorted_sink() -> (PipelineConfig, ExecutionPlanDag) {
+        let config: PipelineConfig = crate::yaml::from_str(
+            r#"
+pipeline:
+  name: explain-writer-order
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: rows.csv
+      schema: [{ name: key, type: int }]
+  - type: sink
+    name: out
+    input: rows
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      sort_order: [{ field: key, order: asc, null_order: last }]
+"#,
+        )
+        .expect("fixture parses");
+        let dag = config
+            .compile(&crate::config::CompileContext::default())
+            .expect("fixture compiles")
+            .dag()
+            .clone();
+        (config, dag)
+    }
+
+    #[test]
+    fn frozen_proven_sort_decision_is_distinct_from_deferred_sort() {
+        let (config, mut dag) = sorted_sink();
+        let boundary = dag
+            .order_contract
+            .writer_boundaries
+            .first_mut()
+            .expect("compiled writer boundary");
+        let OrderGuarantee::Sorted(fields) = boundary.guarantee.clone() else {
+            panic!("fixture must retain the authored sort");
+        };
+        boundary.disposition = WriterOrderDisposition::ProvenTerminalSort {
+            sort: WriterOrderStage {
+                node_id: boundary.producer.producer,
+                node_name: "__sort__out".to_string(),
+            },
+            fields,
+        };
+
+        let text = dag.explain_text(&config);
+        assert!(text.contains("disposition: proven_terminal_sort"));
+        assert!(text.contains("proven_by: __sort__out"));
+
+        let statistics = crate::plan::statistics::StatisticsCatalog::new();
+        let json = serde_json::to_value(ExplainJson::new(&dag, &statistics)).unwrap();
+        assert_eq!(
+            json["writer_boundaries"][0]["disposition"],
+            "proven_terminal_sort"
+        );
+        assert_eq!(json["writer_boundaries"][0]["proven_by"], "__sort__out");
+
+        let dot = dag.explain_dot();
+        assert!(dot.contains("disposition: proven_terminal_sort"));
+        assert!(dot.contains("proven by: __sort__out"));
     }
 }
 
