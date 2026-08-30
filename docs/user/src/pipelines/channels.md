@@ -630,6 +630,7 @@ sources:
       items:      { mode: split, position_column: line_no }  # add-or-modify
       tags:       { position_column: ~ }    # clear one attribute
       line_items: remove                    # drop an entry (unknown field -> E234)
+    max_output_rows_per_input: 10000        # replace the source ceiling; 0 disables it
     split_values:                           # keyed by field name
       codes:      { delimiter: "|" }        # add-or-modify an entry
       tags:       { delimiter: ~ }          # reset to the default delimiter

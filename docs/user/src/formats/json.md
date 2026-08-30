@@ -119,6 +119,13 @@ level, which removes the `orders.items` path the inner entry addresses — so th
 pairing is rejected at compile (`E358`) rather than silently fanning out only
 one level. A duplicated field is rejected too.
 
+Set source-level `max_output_rows_per_input: N` to bound the cumulative product
+without materializing it. The reader emits the first `N` rows in stable order,
+then a first attempted row above the ceiling routes the original JSON object to
+the DLQ as `expansion_limit_exceeded`; `0` or omission is unlimited. See
+[Source Nodes -> `split_to_rows`](../nodes/source.md#one-record-per-value-split_to_rows)
+for the complete error and `fail_fast` behavior.
+
 ## Flattened-name collisions
 
 The reader dissolves nested objects into dotted keys, so `{"a": {"b": 1}}`

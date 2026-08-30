@@ -489,6 +489,7 @@ forms mix freely in one list:
         keep_empty: true
         mode: extract
         position_column: line_no
+    max_output_rows_per_input: 10000
 ```
 
 | Key | Default | Meaning |
@@ -528,6 +529,25 @@ both. On an **XML** source, two entries may not name nested element groups
 either (`Item` and `Item.part`): that reader assigns each element to one
 occurrence group by document position, and a nested pair leaves the inner
 group's membership ambiguous.
+
+`max_output_rows_per_input` is valid only alongside a non-empty
+`split_to_rows` block and bounds that cumulative product for one original
+JSON object or XML record element. Omit it, or set it to `0`, for no ceiling.
+With a positive value `N`, the reader emits exactly the first `N` records in
+the same declaration order shown above. If an `N+1` row is attempted, the
+reader stops that input and reports an `expansion_limit_exceeded` source
+failure. Under `error_handling.strategy: continue`, the complete decoded
+original input representation is routed to the DLQ; the first `N` records
+remain valid output. This is not
+silent truncation: the run records one explicit rejection naming the field,
+the configured ceiling, and the exact first violating count (`N+1`). Under
+`fail_fast`, the run fails at that boundary.
+
+The check is lazy: the reader never materializes or pre-counts the Cartesian
+product. Its cursor holds the original input, the declared occurrence lists,
+and one output record. This source setting is separate from a Transform's
+[`max_expansion`](transform.md#expansion-cap-max_expansion); when both surfaces
+fan out, each enforces its own per-input boundary.
 
 A **JSON** source accepts a nested pair to produce a two-level expansion, but
 only when the outer entry declares `mode: split`. `mode: extract` lifts the

@@ -116,7 +116,7 @@ The `_cxl_dlq_error_category` column contains one of these values:
 | `group_size_exceeded` | A correlation-key group exceeded the configured `max_group_buffer` limit |
 | `document_rejected` | A non-failing record was DLQ'd as collateral because another record in its document failed under a source's `dlq_granularity: document` policy |
 | `late_record` | A record arrived at a time-windowed aggregate after its event-time window had already closed |
-| `expansion_limit_exceeded` | A transform's `emit each` fan-out produced more output records than its `max_expansion` ceiling allows |
+| `expansion_limit_exceeded` | Per-input fan-out exceeded its authored ceiling. Transform `max_expansion` rejects before body rows emit; Source `max_output_rows_per_input` emits exactly its ceiling, then DLQs the original input on the first attempted row above it. Neither is silent truncation. |
 | `combine_output_row` | A Combine output-stage eval failed for one driver row (probe-key, residual, or matched / `on_miss: null_fields` body); the entry carries the contributing-build lineage and rewinds both the driver and matched build source's rollback cursor. Routed to the DLQ under `continue` across every Combine join mode; `fail_fast` propagates the eval error |
 | `structural_validation` | A structural source rule failed: an envelope trailer's declared count did not match its streamed body, a multi-record body appeared after its closing trailer, or a record type discriminator was unknown. Under `dlq_granularity: document`, the root cause has `trigger: true` and every already-streamed record of that file is `document_rejected` collateral. Under record-grained `continue`, E345 instead emits only the unknown row with `_cxl_dlq_source_record`. |
 
