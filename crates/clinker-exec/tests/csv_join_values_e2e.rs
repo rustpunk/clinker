@@ -15,7 +15,8 @@ use std::collections::HashMap;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_core_types::dlq::DlqErrorCategory;
-use clinker_exec::executor::{PipelineRunParams, SourceReaders};
+use clinker_exec::executor::{ExecutionReport, PipelineRunParams, SourceReaders};
+use clinker_plan::error::PipelineError;
 use clinker_record::Value;
 
 fn params() -> PipelineRunParams {
@@ -43,6 +44,135 @@ fn json_reader() -> SourceReaders {
             Box::new(std::io::Cursor::new(JSON_INPUT.as_bytes().to_vec())),
         ),
     )])
+}
+
+fn run_input(
+    pipeline: &str,
+    source: &str,
+    filename: &str,
+    input: &[u8],
+) -> (Result<ExecutionReport, PipelineError>, SharedBuffer) {
+    let config = clinker_plan::config::parse_config(pipeline).expect("pipeline parses");
+    let readers = HashMap::from([(
+        source.to_string(),
+        clinker_exec::executor::single_file_reader(
+            filename,
+            Box::new(std::io::Cursor::new(input.to_vec())),
+        ),
+    )]);
+    let output = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(output.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    (
+        common::run_config(&config, readers, writers, &params()),
+        output,
+    )
+}
+
+#[test]
+fn csv_declared_multiple_read_write_round_trip() {
+    const PIPELINE: &str = r#"
+pipeline:
+  name: csv_multi_value_round_trip
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: ./in.csv
+      split_values:
+        - tags
+      schema:
+        - { name: order_id, type: string }
+        - { name: tags, type: string, multiple: true }
+  - type: sink
+    name: out
+    input: orders
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+"#;
+    const INPUT: &[u8] = b"order_id,tags\n1,a;b\n2,x;y;z\n";
+    let (result, output) = run_input(PIPELINE, "orders", "in.csv", INPUT);
+    result.expect("declared multi-value CSV round-trip succeeds");
+    assert_eq!(output.contents(), INPUT);
+}
+
+#[test]
+fn csv_undeclared_array_fails_on_buffered_output() {
+    const PIPELINE: &str = r#"
+pipeline:
+  name: csv_array_backstop_buffered
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: json
+      path: ./in.json
+      schema:
+        - { name: payload, type: any }
+  - type: sink
+    name: out
+    input: orders
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+"#;
+    let (result, output) = run_input(PIPELINE, "orders", "in.json", br#"[{"payload":["a","b"]}]"#);
+    let error = result.expect_err("an undeclared array must fail the CSV write");
+    let message = error.to_string();
+    assert!(
+        message.contains("CSV") && message.contains("payload"),
+        "{message}"
+    );
+    assert_eq!(
+        output.as_string(),
+        "payload\n",
+        "the schema header may be staged, but the failed record must not be serialized"
+    );
+}
+
+#[test]
+fn csv_undeclared_array_fails_on_streaming_output() {
+    const PIPELINE: &str = r#"
+pipeline:
+  name: csv_array_backstop_streaming
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: json
+      path: ./in.json
+      schema:
+        - { name: order_id, type: string }
+  - type: transform
+    name: collect
+    input: orders
+    config:
+      cxl: |
+        emit payload = [order_id]
+  - type: sink
+    name: out
+    input: collect
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+"#;
+    let (result, _output) = run_input(PIPELINE, "orders", "in.json", br#"[{"order_id":"1"}]"#);
+    let error = result.expect_err("an undeclared array must fail the fused CSV write");
+    let message = error.to_string();
+    assert!(
+        message.contains("CSV") && message.contains("payload"),
+        "{message}"
+    );
 }
 
 /// The buffered Output arm (a bare `source → output` chain is not streaming

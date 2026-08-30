@@ -16,7 +16,7 @@
 //! errors surface as E201 (missing source schema) and E102–E108 / W101
 //! (composition binding).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -76,6 +76,14 @@ pub struct CompileArtifacts {
     /// reads each node's program off its id to stamp the node) and as the
     /// compile-time `$doc` path-walk source.
     pub typed: HashMap<PlanNodeId, Arc<TypedProgram>>,
+    /// Output-facing fields whose array shape is authorized by an authored
+    /// `multiple: true` schema declaration, keyed by stable node identity.
+    ///
+    /// This is a bind-to-lowering contract, not author configuration. The
+    /// schema walk preserves it only through operations that retain the same
+    /// value (including direct CXL aliases), so an unrelated runtime array can
+    /// never become writable merely because it reaches a CSV/XML Sink.
+    pub declared_multiple: HashMap<PlanNodeId, BTreeSet<String>>,
     /// Per-Combine `where:` predicate typed programs, keyed by the
     /// combine node's [`PlanNodeId`]. The node-keyed `typed` map stores
     /// only a Combine's `cxl:` body; the `where:` predicate is decomposed
@@ -235,6 +243,11 @@ impl CompileArtifacts {
         self.typed.contains_key(&id)
     }
 
+    /// Look up the compiled multi-value declaration contract for a node.
+    pub fn declared_multiple_get(&self, id: PlanNodeId) -> Option<&BTreeSet<String>> {
+        self.declared_multiple.get(&id)
+    }
+
     /// Record a node's typed CXL program under its [`PlanNodeId`].
     pub fn typed_insert(&mut self, id: PlanNodeId, prog: Arc<TypedProgram>) {
         self.typed.insert(id, prog);
@@ -375,6 +388,7 @@ pub fn bind_schema(
     // side-table entry by the node's own id.
     let top_level_ids = top_level_name_ids(nodes, &artifacts);
     let mut schema_by_name: HashMap<String, Row> = HashMap::new();
+    let mut declared_multiple_by_name: HashMap<String, BTreeSet<String>> = HashMap::new();
     let mut scoped_vars = scoped_vars;
     scoped_vars.module_exports = ctx.cxl_modules.module_exports();
     scoped_vars.runtime_modules = ctx.cxl_modules.runtime_modules();
@@ -415,6 +429,7 @@ pub fn bind_schema(
         &mut bind_ctx,
         &mut artifacts,
         &mut schema_by_name,
+        &mut declared_multiple_by_name,
     );
 
     // Cross-Transform duplicate `declares:` (the only path that
@@ -2488,6 +2503,7 @@ fn bind_schema_inner(
     bind_ctx: &mut BindContext<'_>,
     artifacts: &mut CompileArtifacts,
     schema_by_name: &mut HashMap<String, Row>,
+    declared_multiple_by_name: &mut HashMap<String, BTreeSet<String>>,
 ) {
     let span_for = |spanned: &Spanned<PipelineNode>| -> Span {
         let line = spanned.referenced.line() as u32;
@@ -2598,6 +2614,15 @@ fn bind_schema_inner(
                     span,
                     diags,
                 );
+                let declared_multiple: BTreeSet<String> = resolved_columns
+                    .iter()
+                    .filter(|column| column.multiple.unwrap_or(false))
+                    .map(|column| column.name.clone())
+                    .collect();
+                declared_multiple_by_name.insert(name.clone(), declared_multiple.clone());
+                artifacts
+                    .declared_multiple
+                    .insert(node_id, declared_multiple);
                 let (columns, missing) = columns_from_decl(
                     &resolved_columns,
                     config.correlation_key.as_ref(),
@@ -2713,6 +2738,16 @@ fn bind_schema_inner(
                 ) {
                     Ok(mut typed) => {
                         let out = propagate_row(&upstream, &typed);
+                        let incoming = declared_multiple_by_name
+                            .get(input_target(&header.input.value))
+                            .cloned()
+                            .unwrap_or_default();
+                        let declared_multiple =
+                            propagate_transform_declared_multiple(&incoming, &typed);
+                        declared_multiple_by_name.insert(name.clone(), declared_multiple.clone());
+                        artifacts
+                            .declared_multiple
+                            .insert(node_id, declared_multiple);
                         schema_by_name.insert(name.clone(), out.clone());
                         typed.output_row = out;
                         artifacts.typed_insert(node_id, Arc::new(typed));
@@ -2874,6 +2909,20 @@ fn bind_schema_inner(
                 ) {
                     Ok(mut typed) => {
                         let out = propagate_aggregate(&name, &config.group_by, &upstream, &typed);
+                        let incoming = declared_multiple_by_name
+                            .get(input_target(&header.input.value))
+                            .cloned()
+                            .unwrap_or_default();
+                        let declared_multiple: BTreeSet<String> = config
+                            .group_by
+                            .iter()
+                            .filter(|field| incoming.contains(field.as_str()))
+                            .cloned()
+                            .collect();
+                        declared_multiple_by_name.insert(name.clone(), declared_multiple.clone());
+                        artifacts
+                            .declared_multiple
+                            .insert(node_id, declared_multiple);
                         schema_by_name.insert(name.clone(), out.clone());
                         typed.output_row = out;
                         artifacts.typed_insert(node_id, Arc::new(typed));
@@ -2937,6 +2986,14 @@ fn bind_schema_inner(
                             .route_branch_typed
                             .insert(node_id, branch_programs);
                     }
+                    let declared_multiple = declared_multiple_by_name
+                        .get(input_target(&header.input.value))
+                        .cloned()
+                        .unwrap_or_default();
+                    declared_multiple_by_name.insert(name.clone(), declared_multiple.clone());
+                    artifacts
+                        .declared_multiple
+                        .insert(node_id, declared_multiple);
                     schema_by_name.insert(name, cloned);
                 }
             }
@@ -3000,6 +3057,21 @@ fn bind_schema_inner(
                 if let Some(first) = header.inputs.first()
                     && let Some(upstream) = schema_by_name.get(input_target(&first.value))
                 {
+                    let mut inputs = header.inputs.iter().map(|input| {
+                        declared_multiple_by_name
+                            .get(input_target(&input.value))
+                            .cloned()
+                            .unwrap_or_default()
+                    });
+                    let declared_multiple = inputs.next().map_or_else(BTreeSet::new, |first| {
+                        inputs.fold(first, |intersection, next| {
+                            intersection.intersection(&next).cloned().collect()
+                        })
+                    });
+                    declared_multiple_by_name.insert(name.clone(), declared_multiple.clone());
+                    artifacts
+                        .declared_multiple
+                        .insert(node_id, declared_multiple);
                     let row = upstream.clone();
                     schema_by_name.insert(name.clone(), row.clone());
                     artifacts.typed_insert(node_id, Arc::new(synthetic_typed_program(row)));
@@ -3007,6 +3079,19 @@ fn bind_schema_inner(
             }
             PipelineNode::Sink { header, config } => {
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
+                    let incoming = declared_multiple_by_name
+                        .get(input_target(&header.input.value))
+                        .cloned()
+                        .unwrap_or_default();
+                    let declared_multiple =
+                        crate::config::multi_value::sink_output_multiple_columns(
+                            &config.sink,
+                            incoming,
+                        );
+                    declared_multiple_by_name.insert(name.clone(), declared_multiple.clone());
+                    artifacts
+                        .declared_multiple
+                        .insert(node_id, declared_multiple);
                     let row = upstream.clone();
                     validate_output_mapping_columns(&name, &config.sink, &row, span, diags);
                     schema_by_name.insert(name.clone(), row.clone());
@@ -3015,6 +3100,14 @@ fn bind_schema_inner(
             }
             PipelineNode::Reshape { header, config } => {
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
+                    let declared_multiple = declared_multiple_by_name
+                        .get(input_target(&header.input.value))
+                        .cloned()
+                        .unwrap_or_default();
+                    declared_multiple_by_name.insert(name.clone(), declared_multiple.clone());
+                    artifacts
+                        .declared_multiple
+                        .insert(node_id, declared_multiple);
                     let upstream = upstream.clone();
                     bind_reshape(
                         &ReshapeNodeBinding {
@@ -3033,6 +3126,14 @@ fn bind_schema_inner(
             }
             PipelineNode::Cull { header, config } => {
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
+                    let declared_multiple = declared_multiple_by_name
+                        .get(input_target(&header.input.value))
+                        .cloned()
+                        .unwrap_or_default();
+                    declared_multiple_by_name.insert(name.clone(), declared_multiple.clone());
+                    artifacts
+                        .declared_multiple
+                        .insert(node_id, declared_multiple);
                     let upstream = upstream.clone();
                     bind_cull(
                         &CullNodeBinding {
@@ -3057,6 +3158,14 @@ fn bind_schema_inner(
             // reads only the body input for the output row here.
             PipelineNode::Envelope { header, config } => {
                 if let Some(upstream) = upstream_schema(&header.body.value, schema_by_name) {
+                    let declared_multiple = declared_multiple_by_name
+                        .get(input_target(&header.body.value))
+                        .cloned()
+                        .unwrap_or_default();
+                    declared_multiple_by_name.insert(name.clone(), declared_multiple.clone());
+                    artifacts
+                        .declared_multiple
+                        .insert(node_id, declared_multiple);
                     let row = upstream.clone();
                     schema_by_name.insert(name.clone(), row.clone());
                     // Compile declarative header/footer synthesis against the
@@ -3105,6 +3214,20 @@ fn bind_schema_inner(
                     artifacts,
                     schema_by_name,
                 );
+                let declared_multiple = artifacts
+                    .typed_get(node_id)
+                    .map(|typed| {
+                        propagate_combine_declared_multiple(
+                            header,
+                            declared_multiple_by_name,
+                            typed,
+                        )
+                    })
+                    .unwrap_or_default();
+                declared_multiple_by_name.insert(name.clone(), declared_multiple.clone());
+                artifacts
+                    .declared_multiple
+                    .insert(node_id, declared_multiple);
             }
             PipelineNode::Composition {
                 r#use,
@@ -3127,6 +3250,7 @@ fn bind_schema_inner(
                     bind_ctx,
                     artifacts,
                     schema_by_name,
+                    declared_multiple_by_name,
                 );
             }
         }
@@ -3166,6 +3290,7 @@ fn bind_composition(
     bind_ctx: &mut BindContext<'_>,
     artifacts: &mut CompileArtifacts,
     parent_schema_by_name: &mut HashMap<String, Row>,
+    parent_declared_multiple_by_name: &mut HashMap<String, BTreeSet<String>>,
 ) {
     let &CompositionBindParams {
         node_name,
@@ -3661,8 +3786,15 @@ fn bind_composition(
 
     // Seed body_schema_by_name with input port rows.
     let mut body_schema_by_name: HashMap<String, Row> = HashMap::new();
+    let mut body_declared_multiple_by_name: HashMap<String, BTreeSet<String>> = HashMap::new();
     for (port_name, row) in &input_port_rows {
         body_schema_by_name.insert(port_name.clone(), row.clone());
+        let declared_multiple = call_inputs
+            .get(port_name)
+            .and_then(|upstream| parent_declared_multiple_by_name.get(upstream))
+            .cloned()
+            .unwrap_or_default();
+        body_declared_multiple_by_name.insert(port_name.clone(), declared_multiple);
     }
 
     // Reject duplicate body node names (E001) before minting. The
@@ -3762,6 +3894,7 @@ fn bind_composition(
         bind_ctx,
         artifacts,
         &mut body_schema_by_name,
+        &mut body_declared_multiple_by_name,
     );
 
     // Restore parent state.
@@ -4178,7 +4311,25 @@ fn bind_composition(
 
     // 16. Write composition's output row to parent scope.
     // Use the first output port's row as the composition node's output.
-    if let Some((_, row)) = output_port_rows.into_iter().next() {
+    if let Some((port_name, row)) = output_port_rows.into_iter().next() {
+        let declared_multiple = signature
+            .outputs
+            .get(&port_name)
+            .and_then(|output| {
+                let internal_name = output
+                    .internal_ref
+                    .value
+                    .split('.')
+                    .next()
+                    .unwrap_or(output.internal_ref.value.as_str());
+                body_declared_multiple_by_name.get(internal_name)
+            })
+            .cloned()
+            .unwrap_or_default();
+        parent_declared_multiple_by_name.insert(node_name.to_string(), declared_multiple.clone());
+        artifacts
+            .declared_multiple
+            .insert(node_id, declared_multiple);
         parent_schema_by_name.insert(node_name.to_string(), row);
     }
 }
@@ -6028,6 +6179,148 @@ fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
         out.insert(QualifiedField::bare(name), emit_type);
     });
     Row::from_parts(out, upstream.declared_span, upstream.tail.clone())
+}
+
+/// Propagate the authored multi-value declaration through one Transform.
+///
+/// Transform evaluation starts from the incoming record and overwrites fields
+/// named by `emit`. Only a direct field reference (or a chain of top-level
+/// `let` aliases ending at one) preserves the declaration. Every expression
+/// that constructs or computes a value revokes it, even when its inferred CXL
+/// type is `array`: runtime type alone cannot distinguish an intentional
+/// schema-declared repeated field from `match: collect`, an array literal, or
+/// a value routed into the wrong column.
+fn propagate_transform_declared_multiple(
+    incoming: &BTreeSet<String>,
+    typed: &TypedProgram,
+) -> BTreeSet<String> {
+    fn is_direct_alias(
+        expr: &Expr,
+        incoming: &BTreeSet<String>,
+        let_aliases: &[bool],
+        typed: &TypedProgram,
+    ) -> bool {
+        let Expr::FieldRef { node_id, name, .. } = expr else {
+            return false;
+        };
+        match typed
+            .bindings
+            .get(node_id.0 as usize)
+            .and_then(Option::as_ref)
+        {
+            Some(cxl::resolve::ResolvedBinding::Field(_)) => incoming.contains(name.as_ref()),
+            Some(cxl::resolve::ResolvedBinding::LetVar(index)) => {
+                let_aliases.get(*index).copied().unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
+    fn revoke_nested_emits(statements: &[Statement], output: &mut BTreeSet<String>) {
+        cxl::ast::for_each_field_emit(statements, &mut |name, _| {
+            output.remove(name);
+        });
+    }
+
+    let mut output = incoming.clone();
+    let mut let_aliases = Vec::new();
+    for statement in &typed.program.statements {
+        match statement {
+            Statement::Let { expr, .. } => {
+                let_aliases.push(is_direct_alias(expr, incoming, &let_aliases, typed));
+            }
+            Statement::Emit {
+                name,
+                expr,
+                target: cxl::ast::EmitTarget::Field,
+                ..
+            } => {
+                if is_direct_alias(expr, incoming, &let_aliases, typed) {
+                    output.insert(name.to_string());
+                } else {
+                    output.remove(name.as_ref());
+                }
+            }
+            Statement::EmitEach { body, .. } | Statement::ExplodeOuter { body, .. } => {
+                // Fan-out bindings change value identity and may overwrite an
+                // otherwise pass-through field. Revoke every nested emit
+                // rather than authorizing one from its inferred array type.
+                revoke_nested_emits(body, &mut output);
+            }
+            _ => {}
+        }
+    }
+    output
+}
+
+/// Propagate declarations through a Combine body without treating the
+/// `match: collect` result or any computed array as schema authorization.
+/// Combine outputs are projection-only, so unlike Transform this starts empty
+/// and admits only direct qualified aliases from an input whose contract names
+/// the referenced field.
+fn propagate_combine_declared_multiple(
+    header: &CombineHeader,
+    declared_multiple_by_name: &HashMap<String, BTreeSet<String>>,
+    typed: &TypedProgram,
+) -> BTreeSet<String> {
+    fn is_direct_alias(
+        expr: &Expr,
+        header: &CombineHeader,
+        declared_multiple_by_name: &HashMap<String, BTreeSet<String>>,
+        let_aliases: &[bool],
+        typed: &TypedProgram,
+    ) -> bool {
+        match expr {
+            Expr::QualifiedFieldRef { parts, .. } if parts.len() == 2 => {
+                let Some(input) = header.input.get(parts[0].as_ref()) else {
+                    return false;
+                };
+                declared_multiple_by_name
+                    .get(input_target(&input.value))
+                    .is_some_and(|fields| fields.contains(parts[1].as_ref()))
+            }
+            Expr::FieldRef { node_id, .. } => match typed
+                .bindings
+                .get(node_id.0 as usize)
+                .and_then(Option::as_ref)
+            {
+                Some(cxl::resolve::ResolvedBinding::LetVar(index)) => {
+                    let_aliases.get(*index).copied().unwrap_or(false)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    let mut output = BTreeSet::new();
+    let mut let_aliases = Vec::new();
+    for statement in &typed.program.statements {
+        match statement {
+            Statement::Let { expr, .. } => let_aliases.push(is_direct_alias(
+                expr,
+                header,
+                declared_multiple_by_name,
+                &let_aliases,
+                typed,
+            )),
+            Statement::Emit {
+                name,
+                expr,
+                target: cxl::ast::EmitTarget::Field,
+                ..
+            } => {
+                if is_direct_alias(expr, header, declared_multiple_by_name, &let_aliases, typed) {
+                    output.insert(name.to_string());
+                }
+            }
+            // Fan-out emits are not direct Combine aliases; they construct a
+            // different record stream and therefore cannot authorize arrays.
+            Statement::EmitEach { .. } | Statement::ExplodeOuter { .. } => {}
+            _ => {}
+        }
+    }
+    output
 }
 
 /// Propagate an upstream row through an Aggregate node: start with the

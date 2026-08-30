@@ -121,6 +121,9 @@ A `multiple:` field is joined into one delimited cell on write — the write-sid
 inverse of [`split_values`](#multi-value-cells-split_values). The default needs
 no configuration: values join with `;`, and a value that itself contains the
 delimiter is a hard error rather than a cell that would split back wrongly.
+The planner carries the exact output-facing `multiple: true` column set through
+mapping and exclusion into the writer. An array reaching any other CSV column
+is rejected as a routing/type-contract error rather than joined implicitly.
 
 ```yaml
 - type: sink

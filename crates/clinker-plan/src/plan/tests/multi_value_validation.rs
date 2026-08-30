@@ -12,6 +12,7 @@
 //! still-non-encoding sink (`fixed_width`).
 
 use clinker_core_types::Diagnostic;
+use std::collections::BTreeSet;
 
 use crate::config::{CompileContext, parse_config};
 
@@ -81,6 +82,18 @@ fn compile_ok(yaml: &str) {
     config
         .compile(&CompileContext::default())
         .unwrap_or_else(|d| panic!("compile must succeed, got: {d:?}"));
+}
+
+fn compiled_sink(yaml: &str) -> crate::config::SinkConfig {
+    let config = parse_config(yaml).expect("pipeline parses");
+    let plan = config
+        .compile(&CompileContext::default())
+        .unwrap_or_else(|d| panic!("compile must succeed, got: {d:?}"));
+    plan.config()
+        .sink_configs()
+        .next()
+        .expect("compiled plan has one Sink")
+        .clone()
 }
 
 /// Every diagnostic carrying `code`, as `(message, has_span)`.
@@ -245,6 +258,116 @@ fn multi_value_column_into_a_json_csv_or_xml_output_compiles() {
         );
         compile_ok(&yaml);
     }
+}
+
+#[test]
+fn compiled_sink_retains_output_facing_multiple_columns() {
+    let yaml = r#"
+pipeline:
+  name: derived_multi_value_contract
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: ./in.json
+      schema:
+        - { name: tags, type: string, multiple: true }
+        - { name: labels, type: string, multiple: true }
+        - { name: dropped, type: string, multiple: true }
+  - type: sink
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      exclude: [dropped]
+      mapping:
+        - renamed_tags: tags
+"#;
+    let sink = compiled_sink(yaml);
+    assert_eq!(
+        sink.declared_multiple,
+        BTreeSet::from(["labels".to_string(), "renamed_tags".to_string()])
+    );
+}
+
+#[test]
+fn compiled_sink_unions_its_output_schema_multiple_columns() {
+    let yaml = r#"
+pipeline:
+  name: output_schema_multi_value_contract
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: ./in.json
+      schema:
+        - { name: id, type: string }
+  - type: sink
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      schema:
+        - { name: id, type: string }
+        - { name: codes, type: string, multiple: true }
+"#;
+    let sink = compiled_sink(yaml);
+    assert_eq!(
+        sink.declared_multiple,
+        BTreeSet::from(["codes".to_string()])
+    );
+}
+
+#[test]
+fn compiled_sink_preserves_only_direct_multi_value_aliases() {
+    let yaml = r#"
+pipeline:
+  name: transformed_multi_value_contract
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: ./in.json
+      schema:
+        - { name: category, type: string, multiple: true }
+  - type: transform
+    name: normalize
+    input: src
+    config:
+      cxl: |
+        emit categories = category
+        let copied = category
+        emit categories_via_let = copied
+        emit constructed = [category]
+        let rebuilt = [category]
+        emit constructed_via_let = rebuilt
+  - type: sink
+    name: out
+    input: normalize
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let sink = compiled_sink(yaml);
+    assert_eq!(
+        sink.declared_multiple,
+        BTreeSet::from([
+            "categories".to_string(),
+            "categories_via_let".to_string(),
+            "category".to_string(),
+        ])
+    );
 }
 
 #[test]
@@ -584,6 +707,59 @@ nodes:
         "expected one E359 for the combine's reference input"
     );
     assert!(found[0].0.contains("events"), "{}", found[0].0);
+}
+
+#[test]
+fn compiled_combine_sink_preserves_only_direct_multi_value_aliases() {
+    let yaml = r#"
+pipeline:
+  name: combine_multi_value_contract
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: json
+      path: ./orders.json
+      schema:
+        - { name: id, type: string }
+  - type: source
+    name: events
+    config:
+      name: events
+      type: json
+      path: ./events.json
+      schema:
+        - { name: id, type: string }
+        - { name: tags, type: string, multiple: true }
+  - type: combine
+    name: enriched
+    input:
+      orders: orders
+      events: events
+    config:
+      where: "orders.id == events.id"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit id = orders.id
+        let copied = events.tags
+        emit categories = copied
+        emit constructed = [events.tags]
+      propagate_ck: driver
+  - type: sink
+    name: report
+    input: enriched
+    config:
+      name: report
+      type: csv
+      path: out.csv
+"#;
+    let sink = compiled_sink(yaml);
+    assert_eq!(
+        sink.declared_multiple,
+        BTreeSet::from(["categories".to_string()])
+    );
 }
 
 /// `multiple: true` inside a multi-record schema's record types is the same

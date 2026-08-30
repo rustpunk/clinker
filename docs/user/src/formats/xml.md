@@ -240,12 +240,15 @@ The default needs no configuration:
 <Order><id>1</id><tags>a</tags><tags>b</tags></Order>
 ```
 
-The value itself carries whether it repeats, so no per-field declaration is
-needed to decide *whether* to repeat — only to rename the elements. A field with
-one value emits exactly one element, byte-identical to a scalar field's output; a
-field with an empty array emits **nothing** (no element, and no container even
-when one is configured); an empty-string value emits a self-closing item element
-(`<tags/>`).
+The planner carries the exact output-facing `multiple: true` column set through
+mapping and exclusion into the writer. A top-level array repeats only for one of
+those columns; an array reaching any other XML column is rejected as a
+routing/type-contract error rather than treated as an implicit declaration.
+Arrays nested inside a map remain part of XML's native recursive structure. A
+field with one value emits exactly one element, byte-identical to a scalar
+field's output; a field with an empty array emits **nothing** (no element, and no
+container even when one is configured); an empty-string value emits a
+self-closing item element (`<tags/>`).
 
 A `multiple:` column that maps to an **attribute** field (a column whose name
 maps to an XML attribute, e.g. `@tags`, declared `multiple: true`) is rejected at

@@ -152,19 +152,18 @@ pub enum FormatError {
         format: &'static str,
         column: String,
     },
-    /// A non-JSON writer (CSV / XML / fixed-width) was handed a record
-    /// carrying a `Value::Array` payload at a regular column slot.
-    /// JSON / NDJSON writers serialize arrays natively; the other formats
-    /// have no canonical scalar serialization for an array and would
-    /// otherwise silently degrade it — JSON-encoding the array into a
-    /// single cell (CSV), comma-joining its elements inside one element
-    /// (XML), or emitting an empty field (fixed-width). A stray array
-    /// reaching a non-JSON writer is far more often a routing bug (e.g. a
-    /// `match: collect` combine output sent to CSV) than a deliberate
+    /// A writer was handed a `Value::Array` payload at a column whose compiled
+    /// schema contract does not authorize repetition. JSON / NDJSON writers
+    /// serialize arrays natively; CSV and XML encode arrays only for fields
+    /// derived from a `multiple: true` declaration; fixed-width has no array
+    /// encoding. A stray array is far more often a routing bug (for example, a
+    /// `match: collect` result sent to an ordinary CSV column) than a deliberate
     /// choice, so raise it explicitly rather than hide the misroute.
     ///
     /// Routes to fix this at the user level:
     ///
+    /// - If this is an intentional repeated CSV/XML field, declare the source
+    ///   or Sink schema column with `multiple: true`.
     /// - Coerce the array to a scalar in CXL (`to_string`, or an
     ///   equivalent join / aggregate) before the emit.
     /// - Or route to a self-describing format (JSON / NDJSON) that
@@ -326,8 +325,9 @@ impl fmt::Display for FormatError {
             Self::UnserializableArrayValue { format, column } => write!(
                 f,
                 "{format} writer cannot serialize a `Value::Array` payload at column {column:?}. \
-                 A stray array reaching a non-JSON writer is usually a routing bug (e.g. a \
-                 `match: collect` combine output sent to CSV). Coerce the array to a scalar in \
+                 The compiled schema does not declare that output field as `multiple: true`. \
+                 If this is an intentional repeated CSV/XML field, add `multiple: true` to its \
+                 source or Sink schema declaration. Otherwise coerce the array to a scalar in \
                  CXL (`to_string`, or an equivalent join) before the emit, or route to a \
                  self-describing format (JSON / NDJSON) that serializes arrays natively."
             ),

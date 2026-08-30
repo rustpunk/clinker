@@ -2398,6 +2398,18 @@ impl PipelineConfig {
         // through keeps an empty set, which the reader treats as "skip the
         // pre-scan entirely".
         let mut runtime_config = self.clone();
+        for (spanned, node_id) in runtime_config
+            .nodes
+            .iter_mut()
+            .zip(artifacts.top_level_node_ids.iter().copied())
+        {
+            if let PipelineNode::Sink { config, .. } = &mut spanned.value {
+                config.sink.declared_multiple = artifacts
+                    .declared_multiple_get(node_id)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
         // Resolved unified `SourceSchema` per source, retained on the plan.
         let mut bound_schemas: indexmap::IndexMap<String, clinker_format::SourceSchema> =
             indexmap::IndexMap::new();
@@ -4010,16 +4022,23 @@ pub(crate) fn lower_node_to_plan_node(
                 output_schema: schema_from_bound(),
             })
         }
-        PipelineNode::Sink { config, .. } => Some(PlanNode::Sink {
-            name: name.to_string(),
-            id,
-            span,
-            resolved: Some(Box::new(PlanSinkPayload {
-                sink: config.sink.clone(),
-                validated_path: None,
-                fan_out_per_source_file: false,
-            })),
-        }),
+        PipelineNode::Sink { config, .. } => {
+            let mut sink = config.sink.clone();
+            sink.declared_multiple = artifacts
+                .declared_multiple_get(id)
+                .cloned()
+                .unwrap_or_default();
+            Some(PlanNode::Sink {
+                name: name.to_string(),
+                id,
+                span,
+                resolved: Some(Box::new(PlanSinkPayload {
+                    sink,
+                    validated_path: None,
+                    fan_out_per_source_file: false,
+                })),
+            })
+        }
         PipelineNode::Route { config, .. } => {
             // One typed program per branch, in `conditions` declaration order —
             // the same order `branches` is collected in below — so route
