@@ -758,9 +758,7 @@ nodes:
 "#
 }
 
-fn run_record_dlq(
-    fixture: &str,
-) -> (clinker_exec::executor::ExecutionReport, String, String) {
+fn run_record_dlq(fixture: &str) -> (clinker_exec::executor::ExecutionReport, String, String) {
     let config = parse_config(record_dlq_yaml()).expect("parse record-DLQ pipeline");
     let plan = config
         .compile(&CompileContext::default())
@@ -812,26 +810,96 @@ fn unknown_tag_under_record_dlq_rejects_only_that_line_and_continues() {
         Some(&clinker_record::Value::from("X"))
     );
     assert_eq!(
-        rejected.original_record.get("$source.raw_record"),
-        Some(&clinker_record::Value::Array(vec![
-            clinker_record::Value::from("X99999 999")
-        ]))
+        rejected.original_record.get("_cxl_dlq_source_record"),
+        Some(&clinker_record::Value::from("X99999 999"))
     );
 
-    assert!(sink.contains("detail,1,100"), "first valid row missing: {sink}");
-    assert!(sink.contains("detail,2,200"), "later valid row missing: {sink}");
-    assert!(!sink.contains("999"), "rejected row reached success Sink: {sink}");
     assert!(
-        dlq.contains("$source.raw_record") && dlq.contains("X99999 999"),
+        sink.contains("detail,1,100"),
+        "first valid row missing: {sink}"
+    );
+    assert!(
+        sink.contains("detail,2,200"),
+        "later valid row missing: {sink}"
+    );
+    assert!(
+        !sink.contains("999"),
+        "rejected row reached success Sink: {sink}"
+    );
+    assert!(
+        dlq.contains("_cxl_dlq_source_record") && dlq.contains("X99999 999"),
         "DLQ must carry the rejected physical line: {dlq}"
     );
 }
 
 #[test]
+fn unknown_csv_tag_preserves_decoded_cells_and_continues() {
+    let yaml = r#"
+pipeline:
+  name: multi_record_csv_row_dlq
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: input.csv
+      options:
+        has_header: false
+      schema:
+        discriminator: { field: kind }
+        records:
+          - id: detail
+            tag: D
+            columns:
+              - { name: kind, type: string }
+              - { name: id, type: int }
+              - { name: amount, type: int }
+  - type: sink
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let (report, output) =
+        run_typed_multi_record(yaml, "input.csv", "D,1,100\nX,\"quoted, cell\",\nD,2,200\n")
+            .expect("record-grained CSV E345 must reject one row and continue");
+
+    assert_eq!(report.counters.total_count, 3);
+    assert_eq!(report.counters.dlq_count, 1);
+    let rejected = &report.dlq_entries[0];
+    assert_eq!(
+        rejected.original_record.get("record_type"),
+        Some(&clinker_record::Value::from("X"))
+    );
+    assert_eq!(
+        rejected.original_record.get("_cxl_dlq_source_record"),
+        Some(&clinker_record::Value::from(r#"["X","quoted, cell",""]"#))
+    );
+    assert!(
+        output.contains("detail,D,1,100"),
+        "first row missing: {output}"
+    );
+    assert!(
+        output.contains("detail,D,2,200"),
+        "later row missing: {output}"
+    );
+    assert!(
+        !output.contains("quoted"),
+        "rejected row reached Sink: {output}"
+    );
+}
+
+#[test]
 fn unknown_tag_aborts_the_run_by_default() {
-    // Under the default `dlq_granularity: record` an unknown discriminator
-    // aborts the run at the offending line — the document-DLQ disposition is
-    // strictly opt-in.
+    // The default `fail_fast` strategy aborts at the offending line even
+    // though record granularity can recover when `strategy: continue` is set.
     let bad_tag = "HBATCH0001\nD00001 100\nX99999 999\nT00001    \n";
     let err = run(pipeline_yaml(), bad_tag).expect_err("an unknown tag must abort the run");
     assert!(

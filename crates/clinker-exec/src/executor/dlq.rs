@@ -3,30 +3,53 @@
 use std::sync::Arc;
 
 use clinker_record::Record;
+use serde::{Deserialize, Serialize};
 
-use crate::executor::diagnostic_preview::{DiagnosticPreview, build_diagnostic_preview};
+use crate::executor::diagnostic_preview::build_diagnostic_preview;
 
-/// One decoded source row rejected by its authored type declaration.
+/// Runtime disposition class for one rejected source attempt. Kept beside the
+/// source event rather than inferred from diagnostic text, and serialized by
+/// the source-order spill path when ordered input is staged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum SourceRejectionKind {
+    DeclaredType,
+    UnknownRecordType,
+}
+
+impl SourceRejectionKind {
+    pub(crate) const fn category(self) -> clinker_core_types::dlq::DlqErrorCategory {
+        match self {
+            Self::DeclaredType => clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
+            Self::UnknownRecordType => {
+                clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+            }
+        }
+    }
+
+    pub(crate) const fn counts_as_type_error(self) -> bool {
+        matches!(self, Self::DeclaredType)
+    }
+}
+
+/// One decoded source attempt rejected before it could enter the DAG. The
+/// complete original representation travels through the same bounded source
+/// channel and spillable ordering barrier as successful records.
 #[derive(Debug, Clone)]
-pub(crate) struct TypeErrorEvent {
+pub(crate) struct SourceRejectionEvent {
     pub(crate) source_row: crate::executor::stream_event::SourceRowId,
     pub(crate) source_name: Arc<str>,
     pub(crate) source_file: Arc<str>,
     pub(crate) row: u64,
-    pub(crate) column: usize,
-    pub(crate) field: Box<str>,
-    pub(crate) declared_type: Box<str>,
-    pub(crate) original_byte_length: usize,
-    pub(crate) preview: DiagnosticPreview,
-    pub(crate) diagnostic_code: &'static str,
+    pub(crate) kind: SourceRejectionKind,
     pub(crate) message: String,
     pub(crate) original_record: Record,
-    pub(crate) original_value: clinker_record::Value,
+    pub(crate) triggering_field: Box<str>,
+    pub(crate) triggering_value: clinker_record::Value,
 }
 
-impl TypeErrorEvent {
+impl SourceRejectionEvent {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub(crate) fn declared_type(
         source_row: crate::executor::stream_event::SourceRowId,
         source_name: Arc<str>,
         source_file: Arc<str>,
@@ -46,39 +69,70 @@ impl TypeErrorEvent {
         // as the value preview. Current coercion reasons exclude input data;
         // this is defense-in-depth against a future error source echoing it.
         let message = build_diagnostic_preview(message.as_bytes(), false).rendered;
+        let diagnostic = format!(
+            "[E126] source={source_name:?} file={source_file:?} row={} column={column} \
+             field={field:?} declared_type={declared_type} preview=\"{}\" \
+             original_bytes={}: {message}",
+            source_row.ordinal(),
+            preview.rendered,
+            preview.original_byte_length,
+        );
         Self {
             source_row,
             source_name,
             source_file,
             row: source_row.ordinal(),
-            column,
-            field: field.into_boxed_str(),
-            declared_type: declared_type.into_boxed_str(),
-            original_byte_length: preview.original_byte_length,
-            preview,
-            diagnostic_code: "E126",
-            message,
+            kind: SourceRejectionKind::DeclaredType,
+            message: diagnostic,
             original_record,
-            original_value,
+            triggering_field: field.into_boxed_str(),
+            triggering_value: original_value,
         }
     }
 
+    pub(crate) fn unknown_record_type(
+        source_row: crate::executor::stream_event::SourceRowId,
+        source_name: Arc<str>,
+        source_file: Arc<str>,
+        row: u64,
+        original_record: Record,
+        discriminator: String,
+        message: String,
+    ) -> Self {
+        Self {
+            source_row,
+            source_name,
+            source_file,
+            row,
+            kind: SourceRejectionKind::UnknownRecordType,
+            message,
+            original_record,
+            triggering_field: "record_type".into(),
+            triggering_value: clinker_record::Value::String(discriminator.into()),
+        }
+    }
+
+    pub(crate) const fn category(&self) -> clinker_core_types::dlq::DlqErrorCategory {
+        self.kind.category()
+    }
+
+    pub(crate) const fn counts_as_type_error(&self) -> bool {
+        self.kind.counts_as_type_error()
+    }
+
+    pub(crate) fn estimated_heap_size(&self) -> usize {
+        self.source_name
+            .len()
+            .saturating_add(self.source_file.len())
+            .saturating_add(self.message.len())
+            .saturating_add(self.triggering_field.len())
+            .saturating_add(self.triggering_value.heap_size())
+            .saturating_add(self.original_record.estimated_heap_size())
+    }
+
     /// Single-line bounded diagnostic suitable for stderr and DLQ reason text.
-    pub(crate) fn diagnostic_message(&self) -> String {
-        format!(
-            "[{}] source={:?} file={:?} row={} column={} field={:?} declared_type={} \
-             preview=\"{}\" original_bytes={}: {}",
-            self.diagnostic_code,
-            self.source_name,
-            self.source_file,
-            self.row,
-            self.column,
-            self.field,
-            self.declared_type,
-            self.preview.rendered,
-            self.original_byte_length,
-            self.message,
-        )
+    pub(crate) fn diagnostic_message(&self) -> &str {
+        &self.message
     }
 }
 

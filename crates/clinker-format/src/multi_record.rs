@@ -518,7 +518,7 @@ impl<R: Read> MultiRecordReader<R> {
             };
             let tag = self.extract_tag(&line)?;
             let Some(rt) = self.by_tag.get(&tag) else {
-                return Err(self.unknown_tag_error(&tag));
+                return Err(self.unknown_tag_error(tag, line));
             };
             let id = Arc::clone(&rt.id);
             if self.header_ids.iter().any(|h| Arc::ptr_eq(h, &id)) {
@@ -561,19 +561,41 @@ impl<R: Read> MultiRecordReader<R> {
 
     /// Build the E345 error for an unknown discriminator value.
     ///
-    /// Classed as a structural-validation error — distinguishable from a
-    /// trailer count mismatch — so the source ingest driver routes it through
-    /// the document-level dead-letter seam under `dlq_granularity: document`
-    /// (condemning the file) instead of always aborting the run. Per-record
-    /// dead-lettering of a single unknown-tag row is tracked separately.
-    fn unknown_tag_error(&self, tag: &str) -> FormatError {
-        FormatError::multi_record_structural_validation(format!(
+    /// Carries the decoded physical row across the reader boundary. Fixed-
+    /// width input is one exact decoded line; CSV input is the exact decoded
+    /// cell sequence. Keeping it untyped is deliberate: an unknown tag gives
+    /// the reader no declared layout from which it could truthfully name or
+    /// coerce fields.
+    fn unknown_tag_error(&self, tag: String, line: ScannedLine) -> FormatError {
+        let raw_record = match line {
+            ScannedLine::FixedWidth(bytes) => match String::from_utf8(bytes) {
+                Ok(line) => Value::String(line.into()),
+                Err(error) => Value::String(
+                    serde_json::to_string(&error.into_bytes())
+                        .expect("a byte array always serializes as JSON")
+                        .into(),
+                ),
+            },
+            ScannedLine::Csv(record) => Value::String(
+                serde_json::to_string(&record.iter().collect::<Vec<_>>())
+                    .expect("decoded CSV cells always serialize as JSON")
+                    .into(),
+            ),
+        };
+        let message = format!(
             "E345 line {}: unknown record-type discriminator {tag:?} — no `records:` entry \
-             declares this tag. Declare a record type with `tag: {tag}`, or set \
-             `dlq_granularity: document` to dead-letter the file. \
+             declares this tag. Declare a record type with `tag: {tag}`, use \
+             `error_handling.strategy: continue` with record-grained DLQ to reject only this \
+             row, or set `dlq_granularity: document` to dead-letter the file. \
              See: clinker explain --code E345",
             self.physical_row
-        ))
+        );
+        FormatError::UnknownRecordType(Box::new(crate::error::UnknownRecordTypeFailure {
+            row: self.physical_row,
+            discriminator: tag,
+            raw_record,
+            message,
+        }))
     }
 
     /// Validate every trailer structural constraint against the streamed body
@@ -1210,21 +1232,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tag_is_a_structural_validation_error_with_e345() {
+    fn unknown_fixed_width_tag_carries_the_exact_rejected_line() {
         let data = b"D00001 100\nX99999 999\n";
         let mut reader = fw_reader(&data[..], fw_types(), Vec::new(), Vec::new()).unwrap();
         assert!(reader.next_record().unwrap().is_some());
         let err = reader.next_record().unwrap_err();
-        assert!(
-            matches!(
-                err,
-                FormatError::StructuralValidation {
-                    format: "multi-record",
-                    ..
-                }
-            ),
-            "an unknown tag is a validation failure, not a count mismatch: {err:?}"
-        );
         assert!(
             err.is_document_structural(),
             "must route through the document DLQ seam"
@@ -1233,6 +1245,12 @@ mod tests {
             !err.is_structural_count(),
             "must stay distinguishable from a trailer count mismatch"
         );
+        let FormatError::UnknownRecordType(failure) = &err else {
+            panic!("expected typed unknown-record failure, got {err:?}");
+        };
+        assert_eq!(failure.row, 2);
+        assert_eq!(failure.discriminator, "X");
+        assert_eq!(failure.raw_record, Value::from("X99999 999"));
         let msg = err.to_string();
         assert!(msg.contains("E345"), "expected E345 in: {msg}");
         assert!(msg.contains("\"X\""), "should name the unknown tag: {msg}");
@@ -1240,6 +1258,46 @@ mod tests {
             msg.contains("line 2"),
             "should name the physical line: {msg}"
         );
+    }
+
+    #[test]
+    fn unknown_csv_tag_carries_every_decoded_cell() {
+        let data = "D,1,100\nX,\"quoted, cell\",\nD,2,200\n";
+        let types = vec![rtype(
+            "detail",
+            "D",
+            vec![
+                csv_field("rec_type", Type::String),
+                csv_field("id", Type::Int),
+                csv_field("amount", Type::Int),
+            ],
+        )];
+        let mut reader = MultiRecordReader::new_csv(
+            Cursor::new(data.as_bytes().to_vec()),
+            MultiRecordSpec {
+                discriminator: csv_disc("rec_type"),
+                record_types: types,
+                structure: Vec::new(),
+                header_tags: Vec::new(),
+            },
+            CsvDialect {
+                delimiter: b',',
+                quote_char: b'"',
+                has_header: false,
+            },
+        )
+        .unwrap();
+        assert!(reader.next_record().unwrap().is_some());
+        let FormatError::UnknownRecordType(failure) = reader.next_record().unwrap_err() else {
+            panic!("expected typed unknown-record failure");
+        };
+        assert_eq!(failure.row, 2);
+        assert_eq!(failure.discriminator, "X");
+        assert_eq!(
+            failure.raw_record,
+            Value::from(r#"["X","quoted, cell",""]"#)
+        );
+        assert!(reader.next_record().unwrap().is_some());
     }
 
     #[test]

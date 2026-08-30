@@ -75,7 +75,7 @@ Existing dev/bench dependencies are expected: `criterion` and
 - `ReopenableSource` reopens paths for multi-pass readers; one-shot buffering is the bounded pathless fallback.
 - JSON/XML envelope pre-scans retain only declared `$doc.*` paths and enforce `max_index_bytes`.
 - Reader/writer wrappers must delegate hooks such as `current_source_file`, `prepare_document`, `take_envelope_events`, `advance_to_next_file`, `begin_document`, `end_document`, and `bytes_written`.
-- `FormatError::StructuralCount` is the only format error class marked for document-DLQ reclassification; other corruption remains fatal.
+- `FormatError::is_document_structural()` is the document-DLQ classifier. It admits trailer-count failures, typed unknown multi-record discriminators, other multi-record structural validation, and undeclared repeated fields; genuine corruption remains fatal.
 - JSON and XML write `Value::Map` payloads recursively with their documented
   native key rules; scalar-only writers reject maps instead of inventing an
   encoding.
