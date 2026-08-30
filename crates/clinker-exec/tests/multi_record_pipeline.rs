@@ -724,6 +724,109 @@ fn run_document_dlq_multi(
     (report, out.as_string())
 }
 
+/// A record-DLQ variant without a trailer constraint. An undeclared tag is one
+/// rejected physical row; the valid rows before and after it must still reach
+/// the success Sink under `continue`.
+fn record_dlq_yaml() -> &'static str {
+    r#"
+pipeline:
+  name: multi_record_row_dlq
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: fixed_width
+      glob: ./*.txt
+      files:
+        on_no_match: skip
+      schema:
+        discriminator: { start: 0, width: 1 }
+        records:
+          - { id: detail, tag: D, columns: [ { name: id, type: int, start: 1, width: 5 }, { name: amount, type: int, start: 6, width: 4 } ] }
+  - type: sink
+    name: out
+    input: payments
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+}
+
+fn run_record_dlq(
+    fixture: &str,
+) -> (clinker_exec::executor::ExecutionReport, String, String) {
+    let config = parse_config(record_dlq_yaml()).expect("parse record-DLQ pipeline");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile record-DLQ pipeline");
+    let slots = vec![FileSlot::new(
+        PathBuf::from("payments.txt"),
+        Box::new(Cursor::new(fixture.as_bytes().to_vec())),
+    )];
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+        "payments".to_string(),
+        clinker_exec::executor::SourceInput::Files(slots),
+    )]);
+    let out = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(out.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "e".to_string(),
+        batch_id: "b".to_string(),
+        pipeline_vars: indexmap::IndexMap::new(),
+        shutdown_token: None,
+        ..Default::default()
+    };
+    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect("record-grained E345 must reject one row and continue");
+
+    let mut dlq = Vec::new();
+    clinker_exec::dlq::write_dlq(&mut dlq, &report.dlq_entries, true, true)
+        .expect("serialize record-grained DLQ");
+    (report, out.as_string(), String::from_utf8(dlq).unwrap())
+}
+
+#[test]
+fn unknown_tag_under_record_dlq_rejects_only_that_line_and_continues() {
+    let (report, sink, dlq) = run_record_dlq("D00001 100\nX99999 999\nD00002 200\n");
+
+    assert_eq!(report.counters.total_count, 3);
+    assert_eq!(report.counters.dlq_count, 1);
+    assert_eq!(report.dlq_entries.len(), 1);
+    let rejected = &report.dlq_entries[0];
+    assert_eq!(
+        rejected.category,
+        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+    );
+    assert!(rejected.error_message.contains("E345"));
+    assert_eq!(
+        rejected.original_record.get("record_type"),
+        Some(&clinker_record::Value::from("X"))
+    );
+    assert_eq!(
+        rejected.original_record.get("$source.raw_record"),
+        Some(&clinker_record::Value::Array(vec![
+            clinker_record::Value::from("X99999 999")
+        ]))
+    );
+
+    assert!(sink.contains("detail,1,100"), "first valid row missing: {sink}");
+    assert!(sink.contains("detail,2,200"), "later valid row missing: {sink}");
+    assert!(!sink.contains("999"), "rejected row reached success Sink: {sink}");
+    assert!(
+        dlq.contains("$source.raw_record") && dlq.contains("X99999 999"),
+        "DLQ must carry the rejected physical line: {dlq}"
+    );
+}
+
 #[test]
 fn unknown_tag_aborts_the_run_by_default() {
     // Under the default `dlq_granularity: record` an unknown discriminator
