@@ -463,11 +463,10 @@ nodes:
 
 #[test]
 fn x12_output_emits_multiple_functional_groups() {
-    // A two-group source interchange is projected so the functional-group
-    // control number becomes a `group_ref` discriminator, then written back
-    // as X12. The writer must reopen a GS..GE group per discriminator,
-    // recompute each GE transaction-set count, and re-parse cleanly — proving
-    // multi-group output, not a single GS wrapping every set.
+    // A two-group source interchange is written directly back as X12. The
+    // reader-stamped `group_ref` must make the writer reopen a GS..GE group
+    // per source group, recompute each GE transaction-set count, and re-parse
+    // cleanly — with no Transform required to recover GS06 from `$doc`.
     let multi = format!(
         "{ISA}\
         GS*PO*S*R*20240101*1200*1*X*004010~\
@@ -491,28 +490,16 @@ nodes:
       glob: ./*.x12
       schema:
         - { name: seg_id, type: string }
+        - { name: group_ref, type: string }
         - { name: set_ref, type: string }
         - { name: set_type, type: string }
         - { name: e01, type: { nullable: string } }
         - { name: e02, type: { nullable: string } }
         - { name: e03, type: { nullable: string } }
         - { name: e04, type: { nullable: string } }
-  - type: transform
-    name: regroup
-    input: interchange
-    config:
-      cxl: |
-        emit seg_id = seg_id
-        emit group_ref = $doc.functional_group.e06
-        emit set_ref = set_ref
-        emit set_type = set_type
-        emit e01 = e01
-        emit e02 = e02
-        emit e03 = e03
-        emit e04 = e04
   - type: sink
     name: out
-    input: regroup
+    input: interchange
     config:
       name: out
       type: x12

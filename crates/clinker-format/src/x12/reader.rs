@@ -2,7 +2,7 @@
 //!
 //! Streaming, row-at-a-time: each non-service segment of an interchange
 //! becomes one [`Record`] with a static positional schema
-//! `[seg_id, set_ref, set_type, e01..e<max>]`. Service segments
+//! `[seg_id, group_ref, set_ref, set_type, e01..e<max>]`. Service segments
 //! (`ISA`/`IEA`/`GS`/`GE`/`SE`) are consumed by the reader to drive the
 //! three-tier envelope and inline structural validation; the `ST` segment
 //! that opens a transaction set **is** emitted as a body record. Service
@@ -435,8 +435,9 @@ impl<R: Read> X12Reader<R> {
     }
 
     /// Map a parsed segment to a positional [`Record`] under the static
-    /// schema. `seg_id`, `set_ref`, and `set_type` are stamped from the
-    /// open transaction set; the data elements fill `e01..`. Absent
+    /// schema. `seg_id` comes from the segment, `group_ref` from the open
+    /// functional group, and `set_ref` / `set_type` from the open transaction
+    /// set; the data elements fill `e01..`. Absent
     /// trailing elements stay `Value::Null`; an element count past
     /// `max_elements` errors with guidance.
     fn body_record(&self, segment: &ParsedSegment) -> Result<Record, FormatError> {
@@ -449,13 +450,19 @@ impl<R: Read> X12Reader<R> {
                 self.max_elements
             )));
         }
+        let group_ref = self
+            .open_group
+            .as_ref()
+            .map(|group| group.control_number.clone())
+            .unwrap_or_default();
         let (set_ref, set_type) = match self.open_set.as_ref() {
             Some(set) => (set.control_number.clone(), set.set_type.clone()),
             None => (String::new(), String::new()),
         };
 
-        let mut values: Vec<Value> = Vec::with_capacity(3 + self.max_elements);
+        let mut values: Vec<Value> = Vec::with_capacity(4 + self.max_elements);
         values.push(Value::String(segment.tag.as_str().into()));
+        values.push(string_or_null(&group_ref));
         values.push(string_or_null(&set_ref));
         values.push(string_or_null(&set_type));
         for i in 0..self.max_elements {
@@ -612,15 +619,16 @@ fn parse_count(raw: Option<&String>, segment: &str, field: &str) -> Result<u64, 
 }
 
 /// The engine-synthesized positional columns for an X12 `Generated` source:
-/// `[seg_id, set_ref, set_type, e01..e<max_elements>]`, every column
+/// `[seg_id, group_ref, set_ref, set_type, e01..e<max_elements>]`, every column
 /// `string`-typed. Single source of truth for the X12 positional schema — the
 /// runtime reader's [`build_schema`] derives its column names from this list,
 /// and the planner seeds the compile-time bind of a
 /// [`SourceSchema::Generated`](crate::SourceSchema) X12 source from the same
 /// list, so the runtime schema and the typechecked row never disagree.
 pub fn generated_columns(max_elements: usize) -> Vec<Column> {
-    let mut columns = Vec::with_capacity(3 + max_elements);
+    let mut columns = Vec::with_capacity(4 + max_elements);
     columns.push(Column::bare("seg_id", Type::String));
+    columns.push(Column::bare("group_ref", Type::String));
     columns.push(Column::bare("set_ref", Type::String));
     columns.push(Column::bare("set_type", Type::String));
     for i in 0..max_elements {
@@ -629,7 +637,7 @@ pub fn generated_columns(max_elements: usize) -> Vec<Column> {
     columns
 }
 
-/// Build the static positional schema `[seg_id, set_ref, set_type,
+/// Build the static positional schema `[seg_id, group_ref, set_ref, set_type,
 /// e01..e<max>]`. Column names come from [`generated_columns`]; element text
 /// is stored verbatim (lossless round-trip) and the reader schema stays in
 /// lockstep with the planner's Generated-source bind.
@@ -724,9 +732,10 @@ mod tests {
     }
 
     #[test]
-    fn set_ref_and_type_stamped_on_every_record() {
+    fn group_ref_set_ref_and_type_stamped_on_every_record() {
         let recs = collect(&interchange());
         for rec in &recs {
+            assert_eq!(rec.get("group_ref"), Some(&Value::String("1".into())));
             assert_eq!(rec.get("set_ref"), Some(&Value::String("0001".into())));
             assert_eq!(rec.get("set_type"), Some(&Value::String("850".into())));
         }
@@ -972,6 +981,9 @@ mod tests {
         let recs = collect(&data);
         // 3 sets × (ST + BEG) = 6 body records.
         assert_eq!(recs.len(), 6);
+        assert_eq!(recs[0].get("group_ref"), Some(&Value::String("1".into())));
+        assert_eq!(recs[2].get("group_ref"), Some(&Value::String("1".into())));
+        assert_eq!(recs[4].get("group_ref"), Some(&Value::String("2".into())));
         assert_eq!(recs[0].get("set_ref"), Some(&Value::String("0001".into())));
         assert_eq!(recs[2].get("set_ref"), Some(&Value::String("0002".into())));
         assert_eq!(recs[4].get("set_ref"), Some(&Value::String("0003".into())));
