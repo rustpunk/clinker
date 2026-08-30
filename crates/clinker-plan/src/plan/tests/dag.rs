@@ -938,6 +938,86 @@ fn test_explain_json_tiers() {
     }
 }
 
+fn split_sink_order_fixture_yaml() -> &'static str {
+    r#"
+pipeline:
+  name: split-sink-order
+nodes:
+  - type: source
+    name: primary
+    config:
+      name: primary
+      type: csv
+      path: data.csv
+      schema:
+        - { name: amount, type: { nullable: int } }
+  - type: sink
+    name: output
+    input: primary
+    config:
+      name: output
+      type: csv
+      path: out.csv
+      sort_order:
+        - { field: amount, order: desc, null_order: drop }
+      split:
+        max_records: 2
+"#
+}
+
+#[test]
+fn terminal_writer_order_is_visible_in_every_explain_format() {
+    let config = parse_fixture(split_sink_order_fixture_yaml());
+    let plan = compile_fixture(&config, &["amount"]);
+
+    let text = plan.explain_text(&config);
+    for expected in [
+        "=== Sink Writer Ordering ===",
+        "sink.output:",
+        "terminal_order: amount desc",
+        "disposition: deferred_sort",
+        "boundary_mode: records_only",
+        "partition_scope: global_split_sequence",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+    }
+
+    let statistics = crate::plan::statistics::StatisticsCatalog::new();
+    let json = serde_json::to_value(ExplainJson::new(&plan, &statistics)).unwrap();
+    let boundaries = json["writer_boundaries"].as_array().unwrap();
+    assert_eq!(boundaries.len(), 1);
+    let boundary = &boundaries[0];
+    assert_eq!(boundary["sink"], "output");
+    assert_eq!(boundary["terminal_order_label"], "amount desc");
+    assert_eq!(boundary["terminal_order"][0]["field"], "amount");
+    assert_eq!(boundary["terminal_order"][0]["direction"], "desc");
+    assert_eq!(boundary["disposition"], "deferred_sort");
+    assert_eq!(boundary["boundary_mode"], "records_only");
+    assert_eq!(boundary["partition_scope"], "global_split_sequence");
+
+    let dot = plan.explain_dot();
+    for expected in [
+        "terminal order: amount desc",
+        "disposition: deferred_sort",
+        "boundary: records_only",
+        "scope: global_split_sequence",
+    ] {
+        assert!(dot.contains(expected), "missing {expected:?} in:\n{dot}");
+    }
+}
+
+#[test]
+fn terminal_writer_order_is_omitted_when_not_authored() {
+    let config = parse_fixture(linear_fixture_yaml());
+    let plan = compile_fixture(&config, &["amount"]);
+
+    assert!(!plan.explain_text(&config).contains("Sink Writer Ordering"));
+    let statistics = crate::plan::statistics::StatisticsCatalog::new();
+    let json = serde_json::to_value(ExplainJson::new(&plan, &statistics)).unwrap();
+    assert!(json.get("writer_boundaries").is_none());
+    assert!(!plan.explain_dot().contains("terminal order:"));
+}
+
 /// DOT output starts with `digraph` and contains node names.
 #[test]
 fn test_explain_dot_valid_syntax() {
