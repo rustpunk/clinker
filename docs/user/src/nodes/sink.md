@@ -220,11 +220,14 @@ When a source declares a `correlation_key:`, the engine tracks correlation-group
 
 ### Nested columns and writer capabilities
 
-JSON and XML write map and array values recursively. JSON uses native objects
-and arrays; XML maps ordinary keys to child elements, reserves unescaped
-`@...`/`#text` keys for attributes/text, and repeats a child name for arrays.
-CSV, fixed-width, EDIFACT, X12, and HL7 remain scalar formats and reject a map
-that reaches a column slot. See [JSON](../formats/json.md#native-map-and-array-values),
+JSON writes map and array values recursively. XML maps ordinary keys to child
+elements, reserves unescaped `@...`/`#text` keys for attributes/text, and writes
+an array at a top-level column only when that output-facing column comes from a
+`multiple: true` declaration; arrays nested inside a map remain native XML
+structure. CSV likewise joins an array only for a compiled `multiple: true`
+column. An undeclared array at either writer is a routing error, not an implicit
+declaration. CSV, fixed-width, EDIFACT, X12, and HL7 reject a map that reaches a
+column slot. See [JSON](../formats/json.md#native-map-and-array-values),
 [XML](../formats/xml.md#native-map-and-array-values), and
 [Auto-Widen & Schema Drift](../formats/auto-widen.md#writer-errors-on-unexpanded-columns).
 

@@ -341,7 +341,7 @@ terminal ordering contribute indirect influence. Composition-scoped Sinks keep
 distinct external identities. The Rust/YAML node name changed to Sink; the
 lineage role and its output-dataset vocabulary did not.
 
-## Writer handling of `Value::Map` payloads
+## Writer handling of structured payloads
 
 CSV, fixed-width, EDIFACT, X12, and HL7 writers **refuse** records carrying a `Value::Map` payload at any column slot, raising:
 
@@ -355,6 +355,18 @@ unescaped `@...` keys to attributes, `#text` to text, and arrays to repeated
 children. Both recursive writers validate the shared key grammar, decoded-key
 collisions, and the 64-container depth cap before any record bytes reach the
 sink.
+
+Top-level arrays have a separate compile/runtime contract. Planning resolves
+every reachable `multiple: true` source column, applies Sink `exclude:`,
+`mapping:`, and `include_unmapped:` rules, unions the Sink's own schema, and
+retains the resulting output-facing names on the compiled Sink config. CSV
+joins arrays and XML repeats elements only for those names. Either writer raises
+`FormatError::UnserializableArrayValue` when an array reaches any other column.
+The derived set is schema-bounded; CSV resolves it to one boolean per emitted
+column and XML stores one boolean per schema leaf, so the record path performs
+no name-set allocation or input-cardinality growth. Buffered, fused streaming,
+split, correlation, and document paths all construct writers through the same
+factory boundary.
 
 The engine-stamped `$widened` sidecar is handled at projection: it is expanded
 or stripped rather than exposed as author XML. The contract is the same on the
