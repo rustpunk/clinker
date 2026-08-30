@@ -307,6 +307,51 @@ fn body_output_valid_csv_delimiter_compiles() {
         .expect("a body output with a single-byte delimiter must compile");
 }
 
+#[test]
+fn body_sink_retains_its_compiled_multiple_column_contract() {
+    let (workspace, config) = workspace_with_body(
+        r#"  - type: transform
+    name: shape
+    input: inp
+    config:
+      cxl: |
+        emit id = id
+        emit val = val
+  - type: sink
+    name: body_sink
+    input: shape
+    config:
+      name: body_sink
+      type: csv
+      path: body_sink.csv
+      schema:
+        - { name: tags, type: string, multiple: true }
+"#,
+        "shape",
+    );
+
+    let ctx = CompileContext::with_pipeline_dir(workspace.path(), PathBuf::from("pipelines"));
+    let compiled = config.compile(&ctx).expect("body Sink pipeline compiles");
+    let body_id = body_id_for(&compiled, "body");
+    let body = compiled.body_of(body_id).expect("compiled body retained");
+    let declared = body
+        .graph
+        .node_weights()
+        .find_map(|node| match node {
+            PlanNode::Sink {
+                name,
+                resolved: Some(payload),
+                ..
+            } if name == "body_sink" => Some(&payload.sink.declared_multiple),
+            _ => None,
+        })
+        .expect("body Sink retained");
+    assert_eq!(
+        declared,
+        &std::collections::BTreeSet::from(["tags".to_string()])
+    );
+}
+
 /// The body CSV check covers the source side too: a body Source `quote_char`
 /// that is not a single ASCII byte is rejected at compile, mirroring the
 /// top-level source `quote_char` validation.

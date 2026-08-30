@@ -4,6 +4,7 @@ use super::*;
 use clinker_format::JoinValues;
 use clinker_record::schema_def::LineSeparator;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// Sink destination configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +100,15 @@ pub struct SinkConfig {
     /// writers only — declaring it on another output format is rejected (E362).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join_values: Option<Vec<JoinValues>>,
+    /// Output-facing columns that the compiled plan proves originate from a
+    /// `multiple: true` schema declaration. The planner applies Sink mapping,
+    /// exclusion, and passthrough rules before stamping this set. Writers use
+    /// it as a fail-closed runtime contract: an array in any other column is a
+    /// misrouted value, not an implicit multi-value declaration.
+    ///
+    /// Derived at compile time and never accepted from or written to YAML.
+    #[serde(skip, default)]
+    pub declared_multiple: BTreeSet<String>,
     #[serde(flatten)]
     pub format: OutputFormat,
     /// External tooling metadata: stage notes + field annotations. Ignored by the engine.

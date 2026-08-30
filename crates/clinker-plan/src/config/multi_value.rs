@@ -839,6 +839,46 @@ fn resolved_source_schemas(nodes: &[Spanned<PipelineNode>]) -> HashMap<&str, Sou
         .collect()
 }
 
+pub(crate) fn sink_output_multiple_columns(
+    sink: &SinkConfig,
+    incoming: BTreeSet<String>,
+) -> BTreeSet<String> {
+    let excluded = |name: &str| {
+        sink.exclude
+            .as_ref()
+            .is_some_and(|columns| columns.iter().any(|column| column == name))
+    };
+    let available: BTreeSet<String> = incoming
+        .into_iter()
+        .filter(|column| !excluded(column))
+        .collect();
+
+    let mut output = BTreeSet::new();
+    match sink.mapping.as_ref() {
+        Some(mapping) => {
+            for entry in mapping.entries() {
+                if available.contains(&entry.source) {
+                    output.insert(entry.output.clone());
+                }
+            }
+            if sink.include_unmapped {
+                output.extend(
+                    available
+                        .into_iter()
+                        .filter(|column| !mapping.claims_source(column))
+                        .filter(|column| !mapping.claims_output(column)),
+                );
+            }
+        }
+        None => output.extend(available),
+    }
+
+    if let Some(schema) = sink.schema.as_ref() {
+        output.extend(multi_value_columns(schema));
+    }
+    output
+}
+
 /// The per-source multi-value gates — E360, E361, E358 — over one node list.
 pub fn source_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
     let schemas = resolved_source_schemas(nodes);
