@@ -157,14 +157,14 @@ impl MultiplicityCandidate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CsvInterpretation {
+struct CsvMultiplicityInterpretation {
     delimiter: char,
     escape: Option<char>,
 }
 
 #[derive(Debug, Clone)]
 struct CsvInterpretationState {
-    interpretation: CsvInterpretation,
+    interpretation: CsvMultiplicityInterpretation,
     viable: bool,
     delimiter_seen: bool,
     escape_activated: bool,
@@ -172,7 +172,7 @@ struct CsvInterpretationState {
 }
 
 #[derive(Debug, Clone)]
-struct MultiplicityAccumulator {
+struct MultiplicityEvidence {
     format: MultiplicityFormat,
     observations: u64,
     empty_records: u64,
@@ -183,7 +183,7 @@ struct MultiplicityAccumulator {
     csv: Vec<CsvInterpretationState>,
 }
 
-impl MultiplicityAccumulator {
+impl MultiplicityEvidence {
     fn new(format: MultiplicityFormat) -> Self {
         let csv = if matches!(format, MultiplicityFormat::Csv(_)) {
             csv_interpretations()
@@ -206,10 +206,10 @@ impl MultiplicityAccumulator {
         self.observations = self.observations.saturating_add(1);
         match self.format {
             MultiplicityFormat::Xml | MultiplicityFormat::Json => {
-                let count = match value {
-                    None | Some(Value::Null) => 0,
-                    Some(Value::Array(values)) => values.len(),
-                    Some(_) => 1,
+                let count = match self.format {
+                    MultiplicityFormat::Xml => observe_xml_multiplicity(value),
+                    MultiplicityFormat::Json => observe_json_array_multiplicity(value),
+                    MultiplicityFormat::Csv(_) => unreachable!("format matched above"),
                 };
                 self.observe_count(count);
                 Ok(())
@@ -219,7 +219,20 @@ impl MultiplicityAccumulator {
                     self.empty_records = self.empty_records.saturating_add(1);
                     Ok(())
                 }
-                Some(Value::String(text)) => self.observe_csv(text.as_str(), charset),
+                Some(Value::Array(values)) if values.len() == 1 => match &values[0] {
+                    Value::String(text) => evaluate_csv_multiplicity(self, text.as_str(), charset),
+                    Value::Null => {
+                        self.empty_records = self.empty_records.saturating_add(1);
+                        Ok(())
+                    }
+                    _ => {
+                        self.singleton_records = self.singleton_records.saturating_add(1);
+                        Ok(())
+                    }
+                },
+                Some(Value::String(text)) => {
+                    evaluate_csv_multiplicity(self, text.as_str(), charset)
+                }
                 Some(_) => {
                     self.singleton_records = self.singleton_records.saturating_add(1);
                     Ok(())
@@ -304,12 +317,18 @@ impl MultiplicityAccumulator {
         }
     }
 
-    fn csv_candidates(&self) -> Vec<CsvInterpretation> {
+    fn csv_candidates(&self) -> Vec<CsvMultiplicityInterpretation> {
         let activated_escapes = self
             .csv
             .iter()
             .filter(|state| state.viable && state.escape_activated)
             .map(|state| state.interpretation.delimiter)
+            .collect::<HashSet<_>>();
+        let activated_escape_characters = self
+            .csv
+            .iter()
+            .filter(|state| state.viable && state.escape_activated)
+            .filter_map(|state| state.interpretation.escape)
             .collect::<HashSet<_>>();
         self.csv
             .iter()
@@ -320,6 +339,7 @@ impl MultiplicityAccumulator {
                     && self
                         .delimiter_candidates
                         .contains(&state.interpretation.delimiter)
+                    && !activated_escape_characters.contains(&state.interpretation.delimiter)
                     && match state.interpretation.escape {
                         Some(_) => state.escape_activated,
                         None => !activated_escapes.contains(&state.interpretation.delimiter),
@@ -334,6 +354,34 @@ enum MultiplicityResolution {
     Conclusive(MultiplicityConfigEdit),
     Unconfirmed(&'static str),
     ReviewOnly(&'static str),
+}
+
+fn observe_xml_multiplicity(value: Option<&Value>) -> usize {
+    same_record_value_count(value)
+}
+
+fn observe_json_array_multiplicity(value: Option<&Value>) -> usize {
+    same_record_value_count(value)
+}
+
+fn same_record_value_count(value: Option<&Value>) -> usize {
+    match value {
+        None | Some(Value::Null) => 0,
+        Some(Value::Array(values)) => values.len(),
+        Some(_) => 1,
+    }
+}
+
+fn evaluate_csv_multiplicity(
+    evidence: &mut MultiplicityEvidence,
+    text: &str,
+    charset: Charset,
+) -> Result<(), GuessError> {
+    evidence.observe_csv(text, charset)
+}
+
+fn validate_multiplicity_exhaustively(evidence: &MultiplicityEvidence) -> MultiplicityResolution {
+    evidence.resolution()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -454,6 +502,7 @@ struct GuessReport {
     limits: LimitsReport,
     coverage: Vec<SourceCoverage>,
     fields: Vec<FieldReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     multiplicity: Vec<MultiplicityReport>,
     patch: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -504,7 +553,8 @@ struct LimitsReport {
     max_reported_files_per_source: usize,
     max_numeric_lexeme_evidence_bytes: usize,
     max_evidence_per_owner: usize,
-    max_csv_delimiter_candidates: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_csv_delimiter_candidates: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -834,7 +884,7 @@ fn run_inner(
         selected
             .multiplicity
             .iter()
-            .map(|candidate| MultiplicityAccumulator::new(candidate.format))
+            .map(|candidate| MultiplicityEvidence::new(candidate.format))
             .collect::<Vec<_>>(),
     ));
     let config_dir = args
@@ -966,7 +1016,7 @@ fn run_inner(
         .iter()
         .map(|candidate| {
             let accumulated = &multiplicity_accumulators[candidate.accumulator_index];
-            let (outcome, reason) = match accumulated.resolution() {
+            let (outcome, reason) = match validate_multiplicity_exhaustively(accumulated) {
                 MultiplicityResolution::Conclusive(mut edit) => {
                     if let Some(split) = edit.split_values().cloned() {
                         edit = MultiplicityConfigEdit::delimited(SplitValues {
@@ -1088,7 +1138,8 @@ fn run_inner(
             max_numeric_lexeme_evidence_bytes:
                 clinker_format::numeric_observation::MAX_NUMERIC_LEXEME_EVIDENCE_BYTES,
             max_evidence_per_owner: MAX_EVIDENCE_PER_OWNER,
-            max_csv_delimiter_candidates: MAX_CSV_DELIMITER_CANDIDATES,
+            max_csv_delimiter_candidates: (!selected.multiplicity.is_empty())
+                .then_some(MAX_CSV_DELIMITER_CANDIDATES),
         },
         coverage,
         fields,
@@ -1768,39 +1819,10 @@ fn select_candidates(
                         column,
                         true,
                     )?;
-                    if !column.is_multiple()
-                        && !header.name.starts_with('$')
-                        && !column.name.starts_with('$')
+                    if let Some(candidate) =
+                        select_multiplicity_candidates(&header.name, body, column)?
                     {
-                        let format = match &body.source.format {
-                            InputFormat::Xml(_) => Some(MultiplicityFormat::Xml),
-                            InputFormat::Json(_) => Some(MultiplicityFormat::Json),
-                            InputFormat::Csv(options) => {
-                                let charset = options
-                                    .as_ref()
-                                    .and_then(|options| options.encoding.as_deref())
-                                    .map(Charset::from_name)
-                                    .transpose()
-                                    .map_err(|error| GuessError::configuration(error.to_string()))?
-                                    .unwrap_or_default();
-                                Some(MultiplicityFormat::Csv(charset))
-                            }
-                            _ => None,
-                        };
-                        if let Some(format) = format {
-                            let selector = format!("{}.{}", header.name, column.name);
-                            multiplicity.insert(
-                                selector,
-                                MultiplicityCandidate {
-                                    source: header.name.clone(),
-                                    column: column.name.clone(),
-                                    physical_field: column.physical_name().to_owned(),
-                                    address: ScopedColumnAddress::new(&header.name, &column.name),
-                                    format,
-                                    accumulator_index: usize::MAX,
-                                },
-                            );
-                        }
+                        multiplicity.insert(candidate.selector(), candidate);
                     }
                 }
             }
@@ -1884,6 +1906,39 @@ fn select_candidates(
         numeric: selected_numeric,
         multiplicity: selected_multiplicity,
     })
+}
+
+fn select_multiplicity_candidates(
+    source: &str,
+    body: &SourceBody,
+    column: &Column,
+) -> Result<Option<MultiplicityCandidate>, GuessError> {
+    if column.is_multiple() || source.starts_with('$') || column.name.starts_with('$') {
+        return Ok(None);
+    }
+    let format = match &body.source.format {
+        InputFormat::Xml(_) => MultiplicityFormat::Xml,
+        InputFormat::Json(_) => MultiplicityFormat::Json,
+        InputFormat::Csv(options) => {
+            let charset = options
+                .as_ref()
+                .and_then(|options| options.encoding.as_deref())
+                .map(Charset::from_name)
+                .transpose()
+                .map_err(|error| GuessError::configuration(error.to_string()))?
+                .unwrap_or_default();
+            MultiplicityFormat::Csv(charset)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(MultiplicityCandidate {
+        source: source.to_owned(),
+        column: column.name.clone(),
+        physical_field: column.physical_name().to_owned(),
+        address: ScopedColumnAddress::new(source, &column.name),
+        format,
+        accumulator_index: usize::MAX,
+    }))
 }
 
 fn register_candidate_column(
@@ -2357,20 +2412,8 @@ fn open_reader(
     let byte_source = ReopenableSource::path(open_path)
         .with_exact_len(file.size)
         .with_tally(tally.clone());
-    let mut probe_schema = source.body.schema.clone();
-    if let SourceSchema::Columns(columns) = &mut probe_schema {
-        for candidate in candidates.multiplicity.iter().filter(|candidate| {
-            candidate.source == source.source
-                && !matches!(candidate.format, MultiplicityFormat::Csv(_))
-        }) {
-            if let Some(column) = columns
-                .iter_mut()
-                .find(|column| column.name == candidate.column)
-            {
-                column.multiple = Some(true);
-            }
-        }
-    }
+    let probe_schema =
+        build_multiplicity_probe_schema(&source.body.schema, candidates, &source.source);
     let reader = clinker_exec::executor::build_source_format_reader(
         &source.body.source,
         &probe_schema,
@@ -2396,7 +2439,7 @@ fn open_reader(
 fn next_observed_record(
     active: &mut ActiveReader,
     accumulators: &Arc<Mutex<Vec<FieldAccumulator>>>,
-    multiplicity_accumulators: &Arc<Mutex<Vec<MultiplicityAccumulator>>>,
+    multiplicity_accumulators: &Arc<Mutex<Vec<MultiplicityEvidence>>>,
 ) -> Result<ReaderStep, GuessError> {
     active
         .observation_state
@@ -2499,6 +2542,29 @@ fn next_observed_record(
     }
 }
 
+fn build_multiplicity_probe_schema(
+    schema: &SourceSchema,
+    candidates: &SelectedCandidates,
+    source: &str,
+) -> SourceSchema {
+    let mut probe = schema.clone();
+    if let SourceSchema::Columns(columns) = &mut probe {
+        for candidate in candidates
+            .multiplicity
+            .iter()
+            .filter(|candidate| candidate.source == source)
+        {
+            if let Some(column) = columns
+                .iter_mut()
+                .find(|column| column.name == candidate.column)
+            {
+                column.multiple = Some(true);
+            }
+        }
+    }
+    probe
+}
+
 fn complete_absence_observations(
     field_map: &ObserverFieldMap,
     record: &Record,
@@ -2560,7 +2626,7 @@ fn sample_sources_fairly(
     manifest: &[FrozenSource<'_>],
     candidates: &SelectedCandidates,
     accumulators: Arc<Mutex<Vec<FieldAccumulator>>>,
-    multiplicity_accumulators: Arc<Mutex<Vec<MultiplicityAccumulator>>>,
+    multiplicity_accumulators: Arc<Mutex<Vec<MultiplicityEvidence>>>,
     config_dir: &Path,
     shutdown: &clinker_exec::pipeline::shutdown::ShutdownToken,
 ) -> Result<Vec<SourceCoverage>, GuessError> {
@@ -2627,7 +2693,7 @@ fn check_sources_exhaustively(
     manifest: &[FrozenSource<'_>],
     candidates: &SelectedCandidates,
     accumulators: Arc<Mutex<Vec<FieldAccumulator>>>,
-    multiplicity_accumulators: Arc<Mutex<Vec<MultiplicityAccumulator>>>,
+    multiplicity_accumulators: Arc<Mutex<Vec<MultiplicityEvidence>>>,
     config_dir: &Path,
     shutdown: &clinker_exec::pipeline::shutdown::ShutdownToken,
 ) -> Result<Vec<SourceCoverage>, GuessError> {
@@ -2898,7 +2964,7 @@ fn csv_interpretations() -> Vec<CsvInterpretationState> {
         Vec::with_capacity(punctuation.len().saturating_mul(punctuation.len()));
     for delimiter in &punctuation {
         interpretations.push(CsvInterpretationState {
-            interpretation: CsvInterpretation {
+            interpretation: CsvMultiplicityInterpretation {
                 delimiter: *delimiter,
                 escape: None,
             },
@@ -2909,7 +2975,7 @@ fn csv_interpretations() -> Vec<CsvInterpretationState> {
         });
         for escape in punctuation.iter().filter(|escape| *escape != delimiter) {
             interpretations.push(CsvInterpretationState {
-                interpretation: CsvInterpretation {
+                interpretation: CsvMultiplicityInterpretation {
                     delimiter: *delimiter,
                     escape: Some(*escape),
                 },
@@ -2923,7 +2989,7 @@ fn csv_interpretations() -> Vec<CsvInterpretationState> {
     interpretations
 }
 
-fn split_csv_cell(text: &str, interpretation: CsvInterpretation) -> Vec<String> {
+fn split_csv_cell(text: &str, interpretation: CsvMultiplicityInterpretation) -> Vec<String> {
     let mut fields = vec![String::new()];
     let mut characters = text.chars().peekable();
     while let Some(character) = characters.next() {
@@ -2950,7 +3016,7 @@ fn split_csv_cell(text: &str, interpretation: CsvInterpretation) -> Vec<String> 
     fields
 }
 
-fn join_csv_cell(fields: &[String], interpretation: CsvInterpretation) -> String {
+fn join_csv_cell(fields: &[String], interpretation: CsvMultiplicityInterpretation) -> String {
     let mut rendered = String::new();
     for (index, field) in fields.iter().enumerate() {
         if index > 0 {

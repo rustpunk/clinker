@@ -135,7 +135,13 @@ fn tracer_xml_json_csv_multiplicity_evidence() {
         singleton_json.path(),
         &["--write", "--field", "values.tags"],
     );
-    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let report = parse_report(&output);
     assert_eq!(report["write"]["reason"], "unresolved_evidence");
     assert_eq!(report["multiplicity"][0]["outcome"], "unconfirmed");
@@ -205,17 +211,23 @@ fn exhaustive_conflict_and_adjacent_paths_do_not_authorize_a_write() {
     let json = tempfile::tempdir().expect("temporary adjacent JSON workspace");
     std::fs::write(
         json.path().join("pipeline.yaml"),
-        "pipeline:\n  name: adjacent\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: json\n      path: input.json\n      options: { format: array }\n      schema:\n        - { name: tags, type: string }\n        - { name: labels, type: string }\n",
+        "pipeline:\n  name: adjacent\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: json\n      path: input.json\n      options: { format: array }\n      schema:\n        - { name: tags, type: string }\n        - { name: labels, type: string, multiple: true }\n",
     )
     .unwrap();
     std::fs::write(
         json.path().join("input.json"),
-        r#"[{"tags":["one"],"labels":["x","y"]},{"tags":["two"]}]"#,
+        r#"[{"tags":["one"],"labels":["x","y"]},{"tags":["two"],"labels":["z"]}]"#,
     )
     .unwrap();
     let before = std::fs::read(json.path().join("pipeline.yaml")).unwrap();
     let output = guess(json.path(), &["--write", "--field", "values.tags"]);
-    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let report = parse_report(&output);
     assert_eq!(report["multiplicity"][0]["multi_records"], 0);
     assert_eq!(report["multiplicity"][0]["singleton_records"], 2);

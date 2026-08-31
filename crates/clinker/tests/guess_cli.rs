@@ -472,7 +472,7 @@ fn preview_selector_conflict_absence_and_ambiguity_exit_one() {
 }
 
 #[test]
-fn preview_selector_fields_deduplicate_and_reject_unknown_or_concrete_fields() {
+fn preview_selector_fields_deduplicate_and_route_concrete_multiplicity_fields() {
     let workspace = workspace();
     let deduplicated = guess(
         workspace.path(),
@@ -486,13 +486,36 @@ fn preview_selector_fields_deduplicate_and_reject_unknown_or_concrete_fields() {
     let report = parse_success(&deduplicated);
     assert_eq!(report["fields"].as_array().expect("fields").len(), 1);
 
-    for field in ["csv_orders.missing", "json_orders.ratio", "amount"] {
+    for field in ["csv_orders.missing", "amount"] {
         let rejected = guess(workspace.path(), &["--field", field]);
         assert_eq!(rejected.status.code(), Some(1), "field {field}");
         let stderr = String::from_utf8_lossy(&rejected.stderr);
         assert!(stderr.contains(field), "stderr for {field}: {stderr}");
         assert!(stderr.contains("--field"), "stderr for {field}: {stderr}");
     }
+
+    let multiplicity = tempfile::tempdir().expect("temporary concrete selector workspace");
+    std::fs::write(
+        multiplicity.path().join("pipeline.yaml"),
+        "pipeline:\n  name: concrete_selector\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: json\n      path: input.json\n      options: { format: array }\n      schema:\n        - { name: tag, type: string }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        multiplicity.path().join("input.json"),
+        r#"[{"tag":"one"},{"tag":"two"}]"#,
+    )
+    .unwrap();
+    let concrete = guess(multiplicity.path(), &["--field", "values.tag"]);
+    assert_eq!(
+        concrete.status.code(),
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&concrete.stdout),
+        String::from_utf8_lossy(&concrete.stderr)
+    );
+    let concrete = parse_report(&concrete);
+    assert_eq!(concrete["fields"], serde_json::json!([]));
+    assert_eq!(concrete["multiplicity"][0]["field"], "values.tag");
 
     let pipeline_path = workspace.path().join("pipeline.yaml");
     let pipeline = std::fs::read_to_string(&pipeline_path).expect("read pipeline fixture");
