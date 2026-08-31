@@ -322,7 +322,7 @@ fn read_group(
         }
         None if matches!(group.occurs.fill, crate::FixedWidthFill::Shift) => {
             let remaining = line.len().saturating_sub(start);
-            if remaining % group.occurrence_width() != 0 {
+            if !remaining.is_multiple_of(group.occurrence_width()) {
                 return Err(FormatError::InvalidRecord {
                     row,
                     message: format!(
