@@ -96,6 +96,60 @@ fn compiled_sink(yaml: &str) -> crate::config::SinkConfig {
         .clone()
 }
 
+fn fixed_width_group_pipeline(group: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: fixed_width_group
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: fixed_width
+      path: ./in.txt
+      schema:
+{group}
+  - type: sink
+    name: out
+    input: src
+    config:
+      name: out
+      type: fixed_width
+      path: ./out.txt
+      schema:
+{group}
+"#
+    )
+}
+
+#[test]
+fn fixed_width_positional_group_compiles_through_normal_admission() {
+    let yaml = fixed_width_group_pipeline(
+        r#"        - name: transactions
+          type: map
+          multiple: true
+          start: 0
+          count_field: { name: transaction_count, width: 1 }
+          occurs: { max: 2 }
+          fields:
+            - { name: kind, type: string, start: 0, width: 1 }
+            - { name: code, type: string, start: 1, width: 2 }"#,
+    );
+    compile_ok(&yaml);
+
+    let sink = compiled_sink(&yaml);
+    let group = sink
+        .schema
+        .as_ref()
+        .and_then(clinker_format::SourceSchema::as_columns)
+        .and_then(|columns| columns.first())
+        .expect("compiled sink retains the positional group");
+    assert_eq!(group.bound_type(), cxl::typecheck::Type::Array);
+    assert_eq!(group.occurs.as_ref().expect("occurs").max, 2);
+    assert_eq!(group.fields.as_deref().expect("children").len(), 2);
+}
+
 /// Every diagnostic carrying `code`, as `(message, has_span)`.
 fn coded(diags: &[Diagnostic], code: &str) -> Vec<(String, bool)> {
     diags
