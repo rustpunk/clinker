@@ -1566,6 +1566,37 @@ mod tests {
         prove_multiplicity_only_change(raw, &edited, &address, &requested).unwrap();
     }
 
+    #[test]
+    fn multiplicity_edit_rejects_noop_conflict_and_sibling_changes() {
+        let address = ScopedColumnAddress::new("values", "tags");
+        let native = MultiplicityConfigEdit::native();
+        let already_multiple = "pipeline:\n  name: multiplicity_edit\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: json\n      path: input.json\n      schema:\n        - { name: tags, type: string, multiple: true }\n";
+        assert_eq!(
+            plan_multiplicity_edit(already_multiple, &address, &native).unwrap(),
+            MultiplicityEditDecision::Ineligible(MultiplicityEditIneligibility::AlreadyMultiple)
+        );
+
+        let conflict = "pipeline:\n  name: multiplicity_edit\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: csv\n      path: input.csv\n      split_values: [{ field: tags, delimiter: ';' }]\n      schema:\n        - { name: tags, type: string }\n";
+        assert_eq!(
+            plan_multiplicity_edit(conflict, &address, &native).unwrap(),
+            MultiplicityEditDecision::Ineligible(
+                MultiplicityEditIneligibility::ConflictingSplitValues
+            )
+        );
+
+        let raw = "pipeline:\n  name: multiplicity_edit\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: json\n      path: input.json\n      schema:\n        - { name: tags, type: string, multiple: false }\n";
+        let MultiplicityEditDecision::Editable(edit) =
+            plan_multiplicity_edit(raw, &address, &native).unwrap()
+        else {
+            panic!("literal false owner must be editable");
+        };
+        let edited = edit
+            .apply(raw)
+            .unwrap()
+            .replace("path: input.json", "path: sibling.json");
+        assert!(prove_multiplicity_only_change(raw, &edited, &address, &native).is_err());
+    }
+
     fn fixed_width_group_pipeline(max: usize, child_width: usize, count_width: usize) -> String {
         format!(
             "pipeline:\n  name: group_identity\nnodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: fixed_width\n      path: in.txt\n      schema:\n        - name: transactions\n          type: map\n          multiple: true\n          start: 0\n          fields:\n            - {{ name: code, type: string, width: {child_width} }}\n          occurs: {{ max: {max} }}\n          count_field: {{ name: transaction_count, width: {count_width} }}\n"
