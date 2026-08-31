@@ -1189,6 +1189,42 @@ mod tests {
         );
     }
 
+    fn fixed_width_group_pipeline(max: usize, child_width: usize, count_width: usize) -> String {
+        format!(
+            "pipeline:\n  name: group_identity\nnodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: fixed_width\n      path: in.txt\n      schema:\n        - name: transactions\n          type: map\n          multiple: true\n          start: 0\n          fields:\n            - {{ name: code, type: string, width: {child_width} }}\n          occurs: {{ max: {max} }}\n          count_field: {{ name: transaction_count, width: {count_width} }}\n"
+        )
+    }
+
+    #[test]
+    fn fixed_width_group_fields_participate_in_semantic_identity() {
+        let base_raw = fixed_width_group_pipeline(2, 3, 1);
+        let base = super::super::parse_config(&base_raw).expect("base parses");
+        let base_digest = semantic_config_digest(&base).expect("base digest");
+
+        for changed_raw in [
+            fixed_width_group_pipeline(3, 3, 1),
+            fixed_width_group_pipeline(2, 4, 1),
+            fixed_width_group_pipeline(2, 3, 2),
+        ] {
+            let changed = super::super::parse_config(&changed_raw).expect("changed parses");
+            assert_ne!(
+                base_digest,
+                semantic_config_digest(&changed).expect("changed digest")
+            );
+        }
+
+        let canonical = expand_multi_value_shorthand(&base_raw).expect("canonical pass");
+        assert_eq!(
+            canonical, base_raw,
+            "group YAML has no shorthand to rewrite"
+        );
+        let reparsed = super::super::parse_config(&canonical).expect("canonical parses");
+        assert_eq!(
+            base_digest,
+            semantic_config_digest(&reparsed).expect("canonical digest")
+        );
+    }
+
     /// Every normalized shorthand sequence a document declares, grouped by
     /// surface — the semantic content that must survive canonicalization.
     #[derive(Debug, PartialEq)]

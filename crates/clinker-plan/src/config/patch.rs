@@ -23,8 +23,8 @@ use crate::config::composition::SchemaProvRecorder;
 use crate::config::pipeline_node::{PipelineNode, SourceBody};
 use crate::yaml::Spanned;
 use clinker_format::{
-    Column, Discriminator, EnvelopeFieldType, NestedEnvelopeSection, RecordType, SourceSchema,
-    SplitToRows, SplitToRowsMode, SplitValues,
+    Column, Discriminator, EnvelopeFieldType, FixedWidthCountField, FixedWidthOccurs,
+    NestedEnvelopeSection, RecordType, SourceSchema, SplitToRows, SplitToRowsMode, SplitValues,
 };
 use clinker_record::schema_def::{Justify, TruncationPolicy};
 use cxl::typecheck::Type;
@@ -166,6 +166,15 @@ pub struct ColumnPatch {
     /// the declaration on a column that had it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multiple: Option<bool>,
+    /// Per-occurrence child layout for a fixed-width repeating group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<Column>>,
+    /// Cardinality and fill policy for a fixed-width repeating group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurs: Option<FixedWidthOccurs>,
+    /// Optional derived physical occurrence count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count_field: Option<FixedWidthCountField>,
 }
 
 impl ColumnPatch {
@@ -241,6 +250,9 @@ impl<'de> Deserialize<'de> for SchemaColumnOp {
             allowed_values: Option<Vec<String>>,
             long_unique: Option<bool>,
             multiple: Option<bool>,
+            fields: Option<Vec<Column>>,
+            occurs: Option<FixedWidthOccurs>,
+            count_field: Option<FixedWidthCountField>,
         }
 
         impl OpMap {
@@ -265,6 +277,9 @@ impl<'de> Deserialize<'de> for SchemaColumnOp {
                     allowed_values: self.allowed_values,
                     long_unique: self.long_unique,
                     multiple: self.multiple,
+                    fields: self.fields,
+                    occurs: self.occurs,
+                    count_field: self.count_field,
                 }
             }
         }
@@ -1228,6 +1243,9 @@ fn apply_column_patch(
     set!(allowed_values, "enum");
     set!(long_unique, "long_unique");
     set!(multiple, "multiple");
+    set!(fields, "fields");
+    set!(occurs, "occurs");
+    set!(count_field, "count_field");
 }
 
 fn apply_split_to_rows_ops(
@@ -1846,6 +1864,28 @@ nodes:
         assert_eq!(col.ty, Type::Float);
         assert_eq!(col.scale, Some(2));
         assert_eq!(col.format.as_deref(), Some("%.2f"));
+    }
+
+    #[test]
+    fn schema_modify_sets_fixed_width_group_attributes_together() {
+        let mut config = csv_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml(
+                "schema:\n  amount:\n    type: map\n    multiple: true\n    fields:\n      - { name: code, type: string, width: 2 }\n    occurs: { max: 3, fill: pad }\n    count_field: { name: amount_count, width: 1 }\n",
+            ),
+        )
+        .unwrap();
+        let column = column_named(&config, "amount");
+        assert_eq!(column.ty, Type::Map);
+        assert!(column.is_multiple());
+        assert_eq!(column.fields.as_deref().expect("children").len(), 1);
+        assert_eq!(column.occurs.as_ref().expect("occurs").max, 3);
+        assert_eq!(
+            column.count_field.as_ref().expect("count").name,
+            "amount_count"
+        );
     }
 
     #[test]

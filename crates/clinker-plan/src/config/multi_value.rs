@@ -67,6 +67,70 @@ fn output_encodes_multi_value(format: &OutputFormat) -> bool {
     }
 }
 
+fn has_fixed_width_group(column: &Column) -> bool {
+    column.fields.is_some() || column.occurs.is_some() || column.count_field.is_some()
+}
+
+fn fixed_width_group_names(schema: &SourceSchema) -> BTreeSet<String> {
+    schema
+        .as_columns()
+        .unwrap_or_default()
+        .iter()
+        .filter(|column| has_fixed_width_group(column))
+        .map(|column| column.name.clone())
+        .collect()
+}
+
+fn validate_positional_group_schema(
+    schema: &SourceSchema,
+    fixed_width: bool,
+    input: bool,
+) -> Option<DeclarationFault> {
+    let has_group = match schema {
+        SourceSchema::Columns(columns) => columns.iter().any(has_fixed_width_group),
+        SourceSchema::MultiRecord { record_types, .. } => record_types
+            .iter()
+            .flat_map(|record| &record.columns)
+            .any(has_fixed_width_group),
+        SourceSchema::Generated(_) | SourceSchema::File(_) => false,
+    };
+    if !has_group {
+        return None;
+    }
+    if !fixed_width {
+        return Some(DeclarationFault {
+            message: "`fields` / `occurs` / `count_field` declare a positional fixed-width repeating group on a non-fixed-width schema".to_string(),
+            help: "remove the positional group keys, or use `type: fixed_width`; JSON/XML repetition uses native arrays/elements and delimited scalar cells use `split_values`".to_string(),
+        });
+    }
+    let SourceSchema::Columns(columns) = schema else {
+        return Some(DeclarationFault {
+            message: "fixed-width repeating groups require a single column-list schema; the multi-record reader has no nested occurrence layout".to_string(),
+            help: "move the group to a single-schema fixed-width source/sink, or flatten each occurrence into the multi-record type's scalar columns".to_string(),
+        });
+    };
+
+    let result = if input {
+        clinker_format::fixed_width::FixedWidthReader::new(
+            std::io::empty(),
+            columns.clone(),
+            clinker_format::fixed_width::FixedWidthReaderConfig::default(),
+        )
+        .map(|_| ())
+    } else {
+        clinker_format::fixed_width::FixedWidthWriter::new(
+            Vec::<u8>::new(),
+            columns.clone(),
+            clinker_format::fixed_width::FixedWidthWriterConfig::default(),
+        )
+        .map(|_| ())
+    };
+    result.err().map(|error| DeclarationFault {
+        message: format!("invalid fixed-width repeating-group layout: {error}"),
+        help: "declare `type: map`, `multiple: true`, scalar child `fields`, and `occurs: { max: <positive count> }`; keep every maximum byte range disjoint".to_string(),
+    })
+}
+
 /// The `attribute_prefix` an XML output resolves to: the declared value, or the
 /// writer default `@` when unset — matching `build_xml_writer_config`, so the
 /// plan-time attribute classification and the runtime writer agree.
@@ -517,6 +581,21 @@ fn validate_source_declarations(
         // `multiple: true` column can hold. Without the declaration the column
         // would be typed as a single value while carrying an array.
         for entry in in_cell {
+            if columns.iter().any(|column| {
+                column.physical_name() == entry.field && has_fixed_width_group(column)
+            }) {
+                faults.push(DeclarationFault {
+                    message: format!(
+                        "source '{}': `split_values` names the positional repeating group '{}' — delimiter-packed cells and repeated field groups are distinct encodings",
+                        source.name, entry.field
+                    ),
+                    help: format!(
+                        "remove the `split_values` entry for '{}'; its `fields` and `occurs` layout already produces the array",
+                        entry.field
+                    ),
+                });
+                continue;
+            }
             match resolve_declared_field(&columns, &entry.field) {
                 DeclaredField::Multiple => {}
                 DeclaredField::Single => faults.push(DeclarationFault {
@@ -630,6 +709,8 @@ fn validate_multi_value_input(
         .iter()
         .filter(|c| {
             c.is_multiple()
+                && !(matches!(source.format, InputFormat::FixedWidth(_))
+                    && has_fixed_width_group(c))
                 && !(reads_in_cell && declared.iter().any(|e| e.field == c.physical_name()))
         })
         .collect();
@@ -932,6 +1013,18 @@ pub fn source_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
         let Some(schema) = schemas.get(header.name.as_str()) else {
             continue;
         };
+        if let Some(fault) = validate_positional_group_schema(
+            schema,
+            matches!(body.source.format, InputFormat::FixedWidth(_)),
+            true,
+        ) {
+            faults.push(NodeFault {
+                node_index,
+                code: "E358",
+                message: format!("source '{}': {}", header.name, fault.message),
+                help: fault.help,
+            });
+        }
         // E361 — a `multiple: true` column on a source whose format has no way
         // to produce one. The read-side arrow of E359: `bound_type` binds the
         // column as an array for every format, so without this the typechecker
@@ -1172,6 +1265,11 @@ pub fn sink_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
         .map(|(name, schema)| (*name, multi_value_columns(schema)))
         .filter(|(_, columns)| !columns.is_empty())
         .collect();
+    let positional_by_source: HashMap<&str, BTreeSet<String>> = schemas
+        .iter()
+        .map(|(name, schema)| (*name, fixed_width_group_names(schema)))
+        .filter(|(_, columns)| !columns.is_empty())
+        .collect();
     let mut faults = Vec::new();
     let reachability = source_data_reachability(nodes);
     for (node_index, spanned) in nodes.iter().enumerate() {
@@ -1183,6 +1281,22 @@ pub fn sink_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
             continue;
         };
         let output = &body.sink;
+        let fixed_width_output = matches!(output.format, OutputFormat::FixedWidth(_));
+        if let Some(schema) = output.schema.as_ref()
+            && let Some(fault) = validate_positional_group_schema(schema, fixed_width_output, false)
+        {
+            faults.push(NodeFault {
+                node_index,
+                code: "E359",
+                message: format!("output '{}': {}", header.name, fault.message),
+                help: fault.help,
+            });
+        }
+        let sink_groups = output
+            .schema
+            .as_ref()
+            .map(fixed_width_group_names)
+            .unwrap_or_default();
         // E362 — a malformed `join_values` declaration, checked before the
         // encoding gate below: `csv` (the format that consumes it) short-circuits
         // that gate, so its own per-entry checks must run here or never.
@@ -1270,32 +1384,46 @@ pub fn sink_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
             continue;
         }
         let format = output.format.format_name();
-        if let Some(declared) = output.schema.as_ref().map(multi_value_columns)
-            && !declared.is_empty()
-        {
-            faults.push(NodeFault {
-                node_index,
-                code: "E359",
-                message: format!(
-                    "output '{out}': its own `schema:` declares the multi-value column(s) \
-                     {columns} (`multiple: true`), and a `{format}` output has no encoding for a \
-                     field holding more than one value",
-                    out = header.name,
-                    columns = quoted_list(&declared),
-                ),
-                help: "drop `multiple: true` from the output column — no writer encodes \
-                       repetition today, so the declaration would be accepted and ignored — or \
-                       write this stream to a `json` output, which does"
-                    .to_string(),
-            });
+        if let Some(mut declared) = output.schema.as_ref().map(multi_value_columns) {
+            if fixed_width_output {
+                declared.retain(|column| !sink_groups.contains(column));
+            }
+            if !declared.is_empty() {
+                faults.push(NodeFault {
+                    node_index,
+                    code: "E359",
+                    message: format!(
+                        "output '{out}': its own `schema:` declares the multi-value column(s) \
+                         {columns} (`multiple: true`), and a `{format}` output has no encoding for a \
+                         field holding more than one value",
+                        out = header.name,
+                        columns = quoted_list(&declared),
+                    ),
+                    help: "drop `multiple: true` from the output column, or use a format with a \
+                           native/delimited encoding; a fixed-width array requires an explicit \
+                           bounded `fields` plus `occurs` group"
+                        .to_string(),
+                });
+            }
         }
         let Some(feeding) = reachability.get(header.name.as_str()) else {
             continue;
         };
         for source_name in feeding {
-            let Some(columns) = multi_value_by_source.get(source_name.as_str()) else {
+            let Some(source_columns) = multi_value_by_source.get(source_name.as_str()) else {
                 continue;
             };
+            let mut columns = source_columns.clone();
+            if fixed_width_output {
+                let source_groups = positional_by_source.get(source_name.as_str());
+                columns.retain(|column| {
+                    !(sink_groups.contains(column)
+                        && source_groups.is_some_and(|groups| groups.contains(column)))
+                });
+            }
+            if columns.is_empty() {
+                continue;
+            }
             faults.push(NodeFault {
                 node_index,
                 code: "E359",
@@ -1304,7 +1432,7 @@ pub fn sink_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
                      {columns} (`multiple: true`), and a `{format}` output has no encoding for a \
                      field holding more than one value",
                     out = header.name,
-                    columns = quoted_list(columns),
+                    columns = quoted_list(&columns),
                 ),
                 help: "write this stream to a `json` output, collapse the column to a single \
                        value in a transform before the sink, or drop `multiple: true` from the \

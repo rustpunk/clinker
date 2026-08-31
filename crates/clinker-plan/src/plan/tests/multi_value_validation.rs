@@ -150,6 +150,118 @@ fn fixed_width_positional_group_compiles_through_normal_admission() {
     assert_eq!(group.fields.as_deref().expect("children").len(), 2);
 }
 
+#[test]
+fn fixed_width_group_requires_a_positive_maximum() {
+    let missing = fixed_width_group_pipeline(
+        r#"        - name: transactions
+          type: map
+          multiple: true
+          start: 0
+          occurs: {}
+          fields:
+            - { name: code, type: string, width: 2 }"#,
+    );
+    let parse_error = parse_config(&missing).expect_err("max is a required strict leaf");
+    assert!(parse_error.to_string().contains("max"), "{parse_error}");
+
+    let zero = source_format_pipeline(
+        "fixed_width",
+        r#"      schema:
+        - name: transactions
+          type: map
+          multiple: true
+          start: 0
+          occurs: { max: 0 }
+          fields:
+            - { name: code, type: string, width: 2 }"#,
+    );
+    let found = coded(&compile_err(&zero), "E358");
+    assert_eq!(found.len(), 1, "expected one group-layout error: {found:?}");
+    assert!(
+        found[0].0.contains("transactions") && found[0].0.contains("positive"),
+        "{}",
+        found[0].0
+    );
+    assert!(found[0].1, "group diagnostics keep the source node span");
+}
+
+#[test]
+fn fixed_width_group_rejects_hybrid_nested_and_overlapping_shapes() {
+    for (group, expected) in [
+        (
+            r#"        - name: transactions
+          type: map
+          multiple: true
+          start: 0
+          width: 10
+          occurs: { max: 2 }
+          fields:
+            - { name: code, type: string, width: 2 }"#,
+            "remove `width`",
+        ),
+        (
+            r#"        - name: transactions
+          type: map
+          multiple: true
+          start: 0
+          occurs: { max: 2 }
+          fields:
+            - name: nested
+              type: map
+              multiple: true
+              occurs: { max: 2 }
+              fields:
+                - { name: code, type: string, width: 2 }"#,
+            "flatten",
+        ),
+        (
+            r#"        - name: transactions
+          type: map
+          multiple: true
+          start: 0
+          occurs: { max: 2 }
+          fields:
+            - { name: kind, type: string, start: 0, width: 2 }
+            - { name: code, type: string, start: 1, width: 2 }"#,
+            "overlaps",
+        ),
+    ] {
+        let yaml = fixed_width_group_pipeline(group);
+        let found = coded(&compile_err(&yaml), "E358");
+        assert_eq!(
+            found.len(),
+            1,
+            "expected one source layout error: {found:?}"
+        );
+        assert!(found[0].0.contains(expected), "{}", found[0].0);
+        assert!(found[0].1, "layout diagnostic keeps a source span");
+    }
+}
+
+#[test]
+fn fixed_width_group_cannot_use_split_values_as_a_second_encoding() {
+    let yaml = source_format_pipeline(
+        "fixed_width",
+        r#"      split_values:
+        - { field: transactions, delimiter: ";" }
+      schema:
+        - name: transactions
+          type: map
+          multiple: true
+          start: 0
+          occurs: { max: 2 }
+          fields:
+            - { name: code, type: string, width: 2 }"#,
+    );
+    let found = coded(&compile_err(&yaml), "E358");
+    assert_eq!(found.len(), 1, "expected one encoding error: {found:?}");
+    assert!(
+        found[0].0.contains("distinct encodings") && found[0].0.contains("transactions"),
+        "{}",
+        found[0].0
+    );
+}
+
 /// Every diagnostic carrying `code`, as `(message, has_span)`.
 fn coded(diags: &[Diagnostic], code: &str) -> Vec<(String, bool)> {
     diags
