@@ -46,6 +46,21 @@ reader/writer construction arms are wired. It must also state which schema,
 multi-record, envelope, splitting, and document-cardinality features it can
 represent. This is deliberate compile-time wiring, not dynamic discovery.
 
+Fixed-width repeating groups demonstrate the coordinated form of this seam.
+The strict `Column` shape carries `fields`, `occurs`, and an optional physical
+`count_field` through patching, overlay provenance, canonical identity, and
+normal planner admission before either format constructor runs. Layout
+resolution then proves a finite maximum width with checked arithmetic. The
+reader retains one declared-length row, while the writer validates and encodes
+one declared-length record before committing bytes. The group remains one
+logical array-of-records column; a derived count cell is layout machinery and
+never enters the logical schema or CXL namespace. Delimiter-packed scalar
+cells remain a distinct `split_values` representation and cannot bypass the
+positional-group checks. The executable byte and rejection matrix is in
+`crates/clinker-format/tests/fixed_width_repeating_groups.rs`, with planner
+admission coverage in
+`crates/clinker-plan/src/plan/tests/multi_value_validation.rs`.
+
 ## Non-file transports
 
 `RecordSource` is the transport-neutral ingest contract. File readers reach it

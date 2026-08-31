@@ -174,6 +174,27 @@ type.
 | D-54 | Composition authors and runtime maintainers | partially-implemented | Analytic windows work in supported top-level shapes, while nested composition state has warning, lookup, and scope-collision gaps. | Support scope-local windows at every otherwise valid nesting depth; traverse typed body or call relationships; use body scope plus local slot; reject unsupported roots at compile time and treat missing state as an invariant error. | CONT-08, CORR-03 | Phase 2 / CORR-03 | Expands supported nesting while replacing warning or `Null` fallbacks with compile or invariant errors. | planner window analysis and executor window arenas | 2026-07-29 |
 | D-55 | Pipeline authors and schema maintainers | implemented | Runtime E158 still rejects `numeric`. `clinker guess` resolves one effective base/channel/group configuration, reports every exact single- or multi-record owner, reuses runtime reader construction and parser-owned arbitrary-precision observations, and supplies deterministic bounded preview plus exhaustive check/write modes. Preview pins every selected reader to its admitted discovered length, rejecting pre-open mismatch, truncation, or growth without handing excess bytes to a format reader. Write admits only one inline literal owner in the base config, streams fixed-bounded input digests, revalidates exact config bytes, typed effective semantics, the complete manifest, input contents, and owner provenance, resolves the staged sibling and proves its semantic diff, then publishes through a stable sibling advisory lock, atomic rename, and directory fsync. All other ownership or drift shapes are patch-only. The persistent lock path coordinates cooperating writers across replacement; it is not a kernel content-conditional rename against writers that ignore advisory locking. Guess now records one fixed started metric, one mutually exclusive completed/unresolved/failed/interrupted metric, and one post-completion closed span through the existing lossy arena. Signal names and attributes contain no authored name, selector, path, format, record, evidence, count, or rendered error, and signal admission or delivery cannot change command truth. This authoring command changes no row value or route, so it emits no lineage. Its metrics use a fixed atomic array and its sole bounded span uses the preallocated arena, retaining nothing that grows with input and requiring no `MemoryConsumer`. | Keep authoring-only bounded preview and exhaustive modes; write only after conclusive exact evidence and unchanged snapshots; reuse canonical source and format paths; keep runtime schemas concrete and fail closed. | CONT-08, AUTH-03 | AUTH-03 | Additive command; never silently rewrites ambiguous, lossy, remote, generated, or non-replayable input. | `crates/clinker/src/guess.rs`; `crates/clinker-plan/src/config/canonical.rs`; `crates/clinker-channel/src/staging_copy.rs`; `crates/clinker-exec/src/telemetry.rs`; `crates/clinker/src/observability/export.rs`; `crates/clinker/tests/guess_cli.rs`; `crates/clinker-exec/tests/numeric_guess_parity.rs`; `docs/user/src/ops/validation.md` | 2026-08-17 |
 
+### AUTH-08 fixed-width repeating-group slice
+
+Fixed-width sources and sinks now admit one explicit bounded positional group:
+`Column.fields` describes an occurrence, `occurs.max` fixes the physical upper
+bound, and an optional leading `count_field` controls cardinality without
+entering the logical schema. The strict shape participates in patches,
+configuration provenance, and semantic identity before the normal planner
+admits it. Both format directions share checked layout resolution; the reader
+retains one declared-length row and the writer validates a complete
+declared-length record before its first destination write. Exact-byte tests
+cover zero through maximum cardinality, padding and shifting, adjacent groups,
+count disagreement, explicit first/last truncation, stable equal-value order,
+malformed layouts, and destination atomicity. See
+`crates/clinker-format/src/fixed_width/field.rs`,
+`crates/clinker-plan/src/config/multi_value.rs`, and
+`crates/clinker-format/tests/fixed_width_repeating_groups.rs`.
+
+This closes only the positional fixed-width part of AUTH-08. Repeated-value
+discovery and authoring remain separate work; this evidence must not be read as
+completion of that delivery group.
+
 ## Terminal destination vocabulary
 
 | Contract | Audience | Status | Observed now | Locked target | Requirement | Owner | Compatibility / reversibility | Evidence | Last verified |

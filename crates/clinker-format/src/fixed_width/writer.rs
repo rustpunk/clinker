@@ -414,6 +414,23 @@ fn encode_group(
             }
             None => None,
         };
+        let renders_as_unused_padding = match values {
+            Some(values) => group_occurrence_is_blank(group, values)?,
+            None => false,
+        };
+        if group.resolved.count_field.is_none()
+            && matches!(group.resolved.occurs.fill, FixedWidthFill::Pad)
+            && renders_as_unused_padding
+        {
+            return Err(FormatError::InvalidRecord {
+                row: 0,
+                message: format!(
+                    "group '{}': occurrence {} renders exactly like an unused padded slot; add a `count_field` or provide at least one non-padding child value",
+                    group.resolved.name,
+                    index + 1
+                ),
+            });
+        }
         let occurrence_start = encoded.len();
         for child in &group.fields {
             encoded.resize(occurrence_start + child.start, b' ');
@@ -425,6 +442,24 @@ fn encode_group(
         encoded.resize(occurrence_start + group.resolved.occurrence_width(), b' ');
     }
     Ok(group.resolved.encoded_width(selected.len()))
+}
+
+fn group_occurrence_is_blank(
+    group: &WriteGroup,
+    values: &indexmap::IndexMap<Box<str>, Value>,
+) -> Result<bool, FormatError> {
+    for (field, resolved) in group.fields.iter().zip(&group.resolved.fields) {
+        let value = values.get(field.name.as_str()).unwrap_or(&Value::Null);
+        if matches!(value, Value::Array(_) | Value::Map(_)) {
+            return Ok(false);
+        }
+        let formatted = format_scalar_value(field, value)?;
+        let padded = pad_and_justify(field, &formatted);
+        if !field::strip_padding(&padded, resolved).is_empty() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn encode_scalar_cell(

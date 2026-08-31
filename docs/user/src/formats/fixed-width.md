@@ -109,6 +109,74 @@ field is an empty array; a field with no delimiter is a one-element array. A
 compile ([E361](https://github.com/rustpunk/clinker/blob/main/docs/explain/E361.md)). The entry is read only on a
 single-schema source, not the multi-record reader below.
 
+## Repeating groups
+
+A positional repeating group occupies a bounded sequence of fixed-width
+occurrence records. Declare the logical column as `type: map` with
+`multiple: true`, put the per-occurrence byte layout in `fields`, and give the
+group a finite positive `occurs.max`:
+
+```yaml
+    schema:
+      - { name: account_id, type: string, start: 0, width: 8 }
+      - name: transactions
+        type: map
+        multiple: true
+        start: 8
+        fields:
+          - { name: kind, type: string, start: 0, width: 1 }
+          - { name: code, type: string, start: 1, width: 2 }
+        occurs:
+          min: 0
+          max: 3
+          fill: pad
+          on_overflow: error
+        count_field:
+          name: transaction_count
+          width: 1
+```
+
+Child `start` offsets are relative to one occurrence. As with top-level
+columns, a child may omit `start` to continue after the previous child. The
+count field, when present, is a leading physical cell inside the group's byte
+range; the occurrence payload follows it. It controls how many occurrence
+maps the reader returns, but it is not a logical record column and cannot be
+named from CXL. In the example, `2A01B02   ` means two three-byte occurrences
+followed by one unused padded slot.
+
+`occurs.min` defaults to zero and cannot exceed `max`. Both values count
+logical occurrences. `max` has no default and cannot be inferred: it is what
+bounds the resolved record width, the reader's one-line buffer, and the
+writer's one-record buffer. Missing, zero, overflowing, overlapping, hybrid,
+or recursively repeated layouts fail during normal pipeline compilation,
+before an input or destination is opened.
+
+`fill` chooses the physical treatment of unused occurrences:
+
+- `pad` (the default) always reserves `max` occurrence slots and fills unused
+  child cells with their declared padding. Without a count field, the reader
+  infers only a trailing run of completely padded slots. A populated slot
+  after an empty one is invalid, and the writer rejects an authored occurrence
+  that itself renders entirely as padding because it could not be read back
+  unambiguously. Add `count_field` when an all-empty occurrence is meaningful.
+- `shift` omits unused slots. A count field makes the following byte position
+  explicit. Without one, a shifted group must be the last physical field; the
+  reader otherwise cannot distinguish group bytes from the next field.
+
+Overflow is an error by default. The diagnostic names the group, its declared
+maximum, and the supplied count without printing record values. To choose
+lossy output deliberately, set `on_overflow: truncate` and also select the
+retained end with `keep: first` or `keep: last`; `keep` is invalid with the
+default error policy. The writer validates and encodes the complete bounded
+record before the first destination write, so an invalid later occurrence or
+overflow cannot leave a partial record behind.
+
+Repeating groups and delimiter-packed scalar cells are separate encodings. A
+bare `multiple: true` fixed-width column is not a positional group, and a
+`split_values` entry cannot stand in for `fields` plus `occurs`. A fixed-width
+sink that receives an array of records must declare the same named positional
+group in its output schema.
+
 ## Schema drift
 
 Fixed-width is **inert** with respect to
