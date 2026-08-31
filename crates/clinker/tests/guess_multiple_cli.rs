@@ -109,8 +109,8 @@ fn tracer_xml_json_csv_multiplicity_evidence() {
     );
 
     let csv = tempfile::tempdir().expect("temporary CSV workspace");
-    write_pipeline(csv.path(), "csv", "", "tags\na|b\nc|d\n", "csv");
-    assert_written_multiplicity(csv.path(), Some("'|'"));
+    write_pipeline(csv.path(), "csv", "", "tags\na|b\nc\n", "csv");
+    assert_written_multiplicity(csv.path(), Some("\"|\""));
 
     let ambiguous_csv = tempfile::tempdir().expect("temporary ambiguous CSV workspace");
     write_pipeline(
@@ -120,17 +120,17 @@ fn tracer_xml_json_csv_multiplicity_evidence() {
         "tags\na|b;c\nd|e;f\n",
         "csv",
     );
-    let before = std::fs::read(ambiguous_csv.path().join("pipeline.yaml"))
-        .expect("read ambiguous pipeline");
-    let output = guess(
-        ambiguous_csv.path(),
-        &["--write", "--field", "values.tags"],
-    );
+    let before =
+        std::fs::read(ambiguous_csv.path().join("pipeline.yaml")).expect("read ambiguous pipeline");
+    let output = guess(ambiguous_csv.path(), &["--write", "--field", "values.tags"]);
     assert_eq!(output.status.code(), Some(3));
     let report = parse_report(&output);
     assert_eq!(report["write"]["reason"], "unresolved_evidence");
     assert_eq!(report["multiplicity"][0]["outcome"], "review_only");
-    assert_eq!(report["multiplicity"][0]["reason"], "ambiguous_interpretation");
+    assert_eq!(
+        report["multiplicity"][0]["reason"],
+        "ambiguous_interpretation"
+    );
     assert_eq!(
         std::fs::read(ambiguous_csv.path().join("pipeline.yaml"))
             .expect("read unchanged ambiguous pipeline"),

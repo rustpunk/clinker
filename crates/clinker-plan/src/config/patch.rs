@@ -32,6 +32,101 @@ use indexmap::IndexMap;
 use serde::de;
 use serde::{Deserialize, Serialize};
 
+/// Exact directly-authored owner of one single-record source column.
+///
+/// The address deliberately carries no resolved layout or engine identity:
+/// authoring tools use the same source and exposed column names present in
+/// YAML, while canonical mutation separately proves that exactly one direct
+/// owner exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedColumnAddress {
+    source: String,
+    column: String,
+}
+
+impl ScopedColumnAddress {
+    /// Build an address from one authored source and exposed column name.
+    pub fn new(source: impl Into<String>, column: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            column: column.into(),
+        }
+    }
+
+    /// Authored source-node name.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Authored exposed column name.
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+
+    /// Stable source-schema address used in diagnostics and reports.
+    pub fn render(&self) -> String {
+        super::composition::ScopedSchemaLeafAddress::column(&self.source, &self.column, "multiple")
+            .render()
+    }
+}
+
+/// Complete typed mutation authorized by conclusive multiplicity evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultiplicityConfigEdit {
+    split_values: Option<SplitValues>,
+}
+
+impl MultiplicityConfigEdit {
+    /// Mark a column as natively multiple without cell splitting.
+    pub fn native() -> Self {
+        Self { split_values: None }
+    }
+
+    /// Mark a column as multiple using one complete cell-splitting declaration.
+    pub fn delimited(split_values: SplitValues) -> Self {
+        Self {
+            split_values: Some(split_values),
+        }
+    }
+
+    /// Optional complete cell-splitting declaration carried by this edit.
+    pub fn split_values(&self) -> Option<&SplitValues> {
+        self.split_values.as_ref()
+    }
+}
+
+/// Apply one typed multiplicity edit through the ordinary source-patch owner.
+///
+/// Canonical authoring uses this to construct the expected semantic result;
+/// raw YAML editing remains a separate exact-byte operation.
+pub fn apply_multiplicity_config_edit(
+    config: &mut PipelineConfig,
+    address: &ScopedColumnAddress,
+    edit: &MultiplicityConfigEdit,
+) -> Result<(), ConfigError> {
+    let mut source = SourceConfigPatch::default();
+    source.schema.insert(
+        address.column.clone(),
+        SchemaColumnOp::Modify(ColumnPatch {
+            multiple: Some(true),
+            ..ColumnPatch::default()
+        }),
+    );
+    if let Some(split) = edit.split_values() {
+        source.split_values.insert(
+            address.column.clone(),
+            SplitValuesOp::Set {
+                delimiter: Some(Some(split.delimiter.clone())),
+                escape: Some(Some(split.escape.clone())),
+                json: Some(Some(split.json)),
+            },
+        );
+    }
+    let mut patches = IndexMap::new();
+    patches.insert(address.source.clone(), source);
+    apply_source_patches(config, &patches)
+}
+
 /// Per-source config patch carried by a channel.
 ///
 /// Keyed forms only. `schema` ops are keyed by column name, `split_to_rows` /
@@ -441,6 +536,12 @@ pub enum SplitValuesOp {
         /// it. The attribute has no unset state — it always holds a separator —
         /// so the clear form restores the default rather than removing it.
         delimiter: Option<Option<String>>,
+        /// Three-state escape update: omitted keeps the current value, null
+        /// clears it to the no-escape default, and a string replaces it.
+        escape: Option<Option<String>>,
+        /// Three-state embedded-JSON update: omitted keeps the current value,
+        /// null restores `false`, and a boolean replaces it.
+        json: Option<Option<bool>>,
     },
 }
 
@@ -455,6 +556,10 @@ impl<'de> Deserialize<'de> for SplitValuesOp {
         struct SetMap {
             #[serde(default, deserialize_with = "explicit_option")]
             delimiter: Option<Option<String>>,
+            #[serde(default, deserialize_with = "explicit_option")]
+            escape: Option<Option<String>>,
+            #[serde(default, deserialize_with = "explicit_option")]
+            json: Option<Option<bool>>,
         }
 
         struct V;
@@ -463,8 +568,8 @@ impl<'de> Deserialize<'de> for SplitValuesOp {
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.write_str(
-                    "a `split_values` op: either `remove` or a map `{ delimiter: <str> }` \
-                     (`delimiter: ~` resets it to the default)",
+                    "a `split_values` op: either `remove` or a map with `delimiter`, \
+                     `escape`, and `json` leaves (YAML null resets a leaf)",
                 )
             }
 
@@ -474,8 +579,8 @@ impl<'de> Deserialize<'de> for SplitValuesOp {
                 }
                 Err(de::Error::custom(format!(
                     "unknown split_values op {v:?}; the bare scalar form only accepts `remove` \
-                     — use `{{ delimiter: <str> }}` to add or modify an entry, with \
-                     `delimiter: ~` to reset it to the default"
+                     — use a map with `delimiter`, `escape`, and `json` leaves to add or \
+                     modify an entry"
                 )))
             }
 
@@ -483,6 +588,8 @@ impl<'de> Deserialize<'de> for SplitValuesOp {
                 let m = SetMap::deserialize(de::value::MapAccessDeserializer::new(map))?;
                 Ok(SplitValuesOp::Set {
                     delimiter: m.delimiter,
+                    escape: m.escape,
+                    json: m.json,
                 })
             }
         }
@@ -1312,7 +1419,11 @@ fn apply_split_values_ops(
                 };
                 entries.remove(idx);
             }
-            SplitValuesOp::Set { delimiter } => {
+            SplitValuesOp::Set {
+                delimiter,
+                escape,
+                json,
+            } => {
                 let entries = source.split_values.get_or_insert_with(Vec::new);
                 let entry = match entries.iter_mut().find(|e| e.field == *field) {
                     Some(existing) => existing,
@@ -1327,6 +1438,12 @@ fn apply_split_values_ops(
                     entry.delimiter = d
                         .clone()
                         .unwrap_or_else(|| clinker_format::DEFAULT_VALUE_DELIMITER.to_string());
+                }
+                if let Some(e) = escape {
+                    entry.escape = e.clone().unwrap_or_default();
+                }
+                if let Some(j) = json {
+                    entry.json = j.unwrap_or(false);
                 }
             }
         }
@@ -2590,10 +2707,22 @@ nodes:
         apply(
             &mut config,
             "src",
-            patch_from_yaml("split_values:\n  tags: { delimiter: \"|\" }\n"),
+            patch_from_yaml(
+                "split_values:\n  tags: { delimiter: \"|\", escape: \"\\\\\", json: true }\n",
+            ),
         )
         .unwrap();
         assert_eq!(split_values(&config)[0].delimiter, "|");
+        assert_eq!(split_values(&config)[0].escape, "\\");
+        assert!(split_values(&config)[0].json);
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("split_values:\n  tags: { escape: ~, json: ~ }\n"),
+        )
+        .unwrap();
+        assert_eq!(split_values(&config)[0].escape, "");
+        assert!(!split_values(&config)[0].json);
         apply(
             &mut config,
             "src",
