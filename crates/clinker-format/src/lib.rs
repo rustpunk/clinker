@@ -43,8 +43,9 @@ pub use numeric_observation::{
 };
 pub use record_path::{RecordPath, RecordPathError, RecordPathSyntax};
 pub use schema::{
-    Column, DEFAULT_VALUE_DELIMITER, Discriminator, GeneratedSchema, RECORD_TYPE_COLUMN,
-    RecordType, SourceSchema, StructureConstraint, multi_record_superset,
+    Column, DEFAULT_VALUE_DELIMITER, Discriminator, FixedWidthCountField, FixedWidthFill,
+    FixedWidthOccurs, FixedWidthOverflow, FixedWidthTruncateKeep, GeneratedSchema,
+    RECORD_TYPE_COLUMN, RecordType, SourceSchema, StructureConstraint, multi_record_superset,
 };
 pub use source::{ByteTally, ReopenableSource, RetainedFileGuard};
 pub use traits::{FormatReader, FormatWriter, SourceLifecycleEvent};

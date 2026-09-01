@@ -39,6 +39,34 @@ Representative code and manifest evidence cited by those docs includes:
 
 ## Entries
 
+### 2026-08-31: Guess Writes Multiplicity Only From Exhaustive Same-Record Proof
+
+Type: Source-backed fact.
+
+Summary: `clinker guess --field <source>.<column>` now reviews directly
+authored single-record CSV, JSON, and XML columns for multiplicity. XML needs
+two siblings in one logical record; JSON needs one array longer than one. Empty
+and singleton arrays abstain and are never summed across records. CSV needs one
+bounded delimiter/activated-escape interpretation that parses and re-encodes
+every non-null cell to identical bytes in the declared character set, with at
+least one multi-token cell. Ambiguity, candidate overflow, late conflict, and
+singleton-only evidence remain review-only or unconfirmed.
+
+Conclusive evidence reuses `multiple` and `split_values`; there is no new
+author syntax. The typed edit resolves one direct owner, proves the staged
+configuration differs only by that mutation, then uses the existing input
+snapshot, stable lock, final byte comparisons, atomic replacement, and parent
+sync. No-op, conflicting, indirect, stale, interrupted, and concurrent paths
+leave configuration bytes unchanged. Numeric-only reports remain byte-stable.
+The report retains counts and proof states, never sampled values; interpretation
+state is fixed-size. This is plan-time authoring, so it adds no lineage edge or
+runtime telemetry vocabulary.
+
+Evidence: `crates/clinker/src/guess.rs`,
+`crates/clinker-plan/src/config/{patch,canonical}.rs`,
+`crates/clinker/tests/guess_multiple_cli.rs`, and the focused `config::patch`,
+`config::canonical`, `guess_multiple_cli`, and `guess_cli` test targets.
+
 ### 2026-08-14: The No-C Gate Proves Itself, and the `pure` Trade Is Measured
 
 Type: Source-backed fact (issues #952 and #954), with one human decision noted.

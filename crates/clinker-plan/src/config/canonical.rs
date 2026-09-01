@@ -41,6 +41,7 @@ use clinker_format::{JoinValues, SplitToRows, SplitValues};
 use cxl::typecheck::Type;
 
 use super::composition::ScopedSchemaLeafAddress;
+use super::patch::{MultiplicityConfigEdit, ScopedColumnAddress, apply_multiplicity_config_edit};
 use super::{PipelineConfig, PipelineNode, SourceSchema};
 use crate::yaml::{self, Spanned};
 
@@ -160,6 +161,68 @@ pub enum NumericTypeEditDecision {
     Ineligible(NumericEditIneligibility),
 }
 
+/// Why a multiplicity edit cannot be proven as one exact authored mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiplicityEditIneligibility {
+    MissingOwner,
+    AmbiguousOwner,
+    IndirectProvenance,
+    NonLiteralOwner,
+    AlreadyMultiple,
+    ConflictingSplitValues,
+}
+
+impl MultiplicityEditIneligibility {
+    /// Stable report spelling for this ineligibility.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingOwner => "owner_not_inline",
+            Self::AmbiguousOwner => "owner_ambiguous",
+            Self::IndirectProvenance => "owner_indirect_provenance",
+            Self::NonLiteralOwner => "owner_not_literal",
+            Self::AlreadyMultiple => "owner_already_multiple",
+            Self::ConflictingSplitValues => "split_values_conflict",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MultiplicityByteEdit {
+    start: usize,
+    end: usize,
+    expected: String,
+    replacement: String,
+}
+
+/// Exact byte edits for one directly-authored multiplicity owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiplicityEdit {
+    edits: Vec<MultiplicityByteEdit>,
+}
+
+impl MultiplicityEdit {
+    /// Apply every planned byte edit using compare-and-swap expectations.
+    pub fn apply(&self, raw: &str) -> Result<String, CanonicalError> {
+        let mut edited = raw.to_owned();
+        for edit in &self.edits {
+            if edited.get(edit.start..edit.end) != Some(edit.expected.as_str()) {
+                return Err(CanonicalError::Internal(
+                    "multiplicity edit owner changed after it was located".to_owned(),
+                ));
+            }
+            edited.replace_range(edit.start..edit.end, &edit.replacement);
+        }
+        Ok(edited)
+    }
+}
+
+/// Result of locating one exact source-column multiplicity owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultiplicityEditDecision {
+    Editable(MultiplicityEdit),
+    Ineligible(MultiplicityEditIneligibility),
+}
+
 #[derive(Deserialize)]
 struct NumericDocProbe {
     #[serde(default)]
@@ -180,6 +243,8 @@ struct NumericNodeProbe {
 struct NumericConfigProbe {
     #[serde(default)]
     schema: Option<Spanned<NumericSchemaProbe>>,
+    #[serde(default)]
+    split_values: Option<Spanned<Vec<SplitValues>>>,
 }
 
 enum NumericSchemaProbe {
@@ -248,6 +313,8 @@ struct NumericColumnProbe {
     name: Spanned<String>,
     #[serde(default, rename = "type")]
     ty: Option<Spanned<AuthoredTypeProbe>>,
+    #[serde(default)]
+    multiple: Option<Spanned<bool>>,
 }
 
 enum AuthoredTypeProbe {
@@ -406,6 +473,256 @@ pub fn plan_numeric_type_edit(
     }))
 }
 
+/// Plan a surgical edit that marks one directly-authored single-record column
+/// as multiple and optionally adds its complete `split_values` declaration.
+pub fn plan_multiplicity_edit(
+    raw: &str,
+    address: &ScopedColumnAddress,
+    requested: &MultiplicityConfigEdit,
+) -> Result<MultiplicityEditDecision, CanonicalError> {
+    let doc: NumericDocProbe =
+        yaml::from_str(raw).map_err(|error| CanonicalError::Parse(error.to_string()))?;
+    let mut located = Vec::new();
+    for node in &doc.nodes {
+        let (Some(kind), Some(source), Some(config)) = (&node.kind, &node.name, &node.config)
+        else {
+            continue;
+        };
+        if kind.value != "source" || source.value != address.source() {
+            continue;
+        }
+        let Some(schema) = &config.schema else {
+            continue;
+        };
+        let NumericSchemaProbe::Columns(columns) = &schema.value else {
+            continue;
+        };
+        for column in columns
+            .iter()
+            .filter(|column| column.name.value == address.column())
+        {
+            located.push((kind, source, schema, config, column));
+        }
+    }
+    let (kind, source, schema, config, column) = match located.as_slice() {
+        [] => {
+            return Ok(MultiplicityEditDecision::Ineligible(
+                MultiplicityEditIneligibility::MissingOwner,
+            ));
+        }
+        [owner] => *owner,
+        _ => {
+            return Ok(MultiplicityEditDecision::Ineligible(
+                MultiplicityEditIneligibility::AmbiguousOwner,
+            ));
+        }
+    };
+    if !is_direct(kind)
+        || !is_direct(source)
+        || !is_direct(schema)
+        || !is_direct(&column.name)
+        || column
+            .multiple
+            .as_ref()
+            .is_some_and(|multiple| !is_direct(multiple))
+        || config
+            .split_values
+            .as_ref()
+            .is_some_and(|split| !is_direct(split))
+    {
+        return Ok(MultiplicityEditDecision::Ineligible(
+            MultiplicityEditIneligibility::IndirectProvenance,
+        ));
+    }
+    if column.multiple.as_ref().is_some_and(|value| value.value) {
+        return Ok(MultiplicityEditDecision::Ineligible(
+            MultiplicityEditIneligibility::AlreadyMultiple,
+        ));
+    }
+    if config.split_values.as_ref().is_some_and(|entries| {
+        entries
+            .value
+            .iter()
+            .any(|entry| entry.field == address.column())
+    }) {
+        return Ok(MultiplicityEditDecision::Ineligible(
+            MultiplicityEditIneligibility::ConflictingSplitValues,
+        ));
+    }
+
+    let newline = if raw.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut edits = vec![plan_multiple_leaf_edit(raw, column, newline)?];
+    if let Some(split) = requested.split_values() {
+        edits.push(plan_split_values_insert(
+            raw, schema, config, split, newline,
+        )?);
+    }
+    edits.sort_by(|left, right| right.start.cmp(&left.start));
+    for pair in edits.windows(2) {
+        if pair[1].end > pair[0].start {
+            return Err(CanonicalError::Internal(
+                "multiplicity byte edits overlap".to_owned(),
+            ));
+        }
+    }
+    Ok(MultiplicityEditDecision::Editable(MultiplicityEdit {
+        edits,
+    }))
+}
+
+fn plan_multiple_leaf_edit(
+    raw: &str,
+    column: &NumericColumnProbe,
+    newline: &str,
+) -> Result<MultiplicityByteEdit, CanonicalError> {
+    if let Some(multiple) = &column.multiple {
+        let start = exact_scalar_start(raw, multiple, "false").ok_or_else(|| {
+            CanonicalError::Internal(
+                "direct multiplicity owner is not a literal false scalar".to_owned(),
+            )
+        })?;
+        return Ok(MultiplicityByteEdit {
+            start,
+            end: start + "false".len(),
+            expected: "false".to_owned(),
+            replacement: "true".to_owned(),
+        });
+    }
+
+    let name_offset =
+        column.name.referenced.span().byte_offset().ok_or_else(|| {
+            CanonicalError::Internal("column owner has no source offset".to_owned())
+        })? as usize;
+    let line_start = raw[..name_offset].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = raw[name_offset..]
+        .find('\n')
+        .map_or(raw.len(), |index| name_offset + index);
+    let line = &raw[line_start..line_end];
+    let offset_in_line = name_offset.saturating_sub(line_start);
+    if let Some(close) = line[offset_in_line..].find('}') {
+        let close = line_start + offset_in_line + close;
+        return Ok(MultiplicityByteEdit {
+            start: close,
+            end: close,
+            expected: String::new(),
+            replacement: ", multiple: true".to_owned(),
+        });
+    }
+
+    let item_indent = line.len() - line.trim_start_matches(' ').len();
+    let attribute_indent = if line.trim_start().starts_with("- ") {
+        item_indent.saturating_add(2)
+    } else {
+        item_indent
+    };
+    Ok(MultiplicityByteEdit {
+        start: line_end,
+        end: line_end,
+        expected: String::new(),
+        replacement: format!("{newline}{}multiple: true", " ".repeat(attribute_indent)),
+    })
+}
+
+fn exact_scalar_start<T>(raw: &str, value: &Spanned<T>, token: &str) -> Option<usize> {
+    let reported = value.referenced.span().byte_offset()? as usize;
+    if raw.get(reported..reported + token.len()) == Some(token) {
+        return Some(reported);
+    }
+    None
+}
+
+fn plan_split_values_insert(
+    raw: &str,
+    schema: &Spanned<NumericSchemaProbe>,
+    config: &NumericConfigProbe,
+    split: &SplitValues,
+    newline: &str,
+) -> Result<MultiplicityByteEdit, CanonicalError> {
+    if let Some(existing) = &config.split_values {
+        let reported = existing.referenced.span().byte_offset().ok_or_else(|| {
+            CanonicalError::Internal("split_values owner has no source offset".to_owned())
+        })? as usize;
+        let start = match resolve_sequence_start(raw, reported) {
+            SequenceStart::Splice(start) => start,
+            SequenceStart::PassThrough => {
+                return Err(CanonicalError::Internal(
+                    "split_values owner is indirect".to_owned(),
+                ));
+            }
+            SequenceStart::Unexpected(reason) => {
+                return Err(CanonicalError::Internal(reason));
+            }
+        };
+        if raw.as_bytes().get(start) == Some(&b'[') {
+            let end = flow_sequence_end(raw, start)?;
+            let rendered = serde_json::to_string(split)
+                .map_err(|error| CanonicalError::Internal(error.to_string()))?;
+            return Ok(MultiplicityByteEdit {
+                start: end - 1,
+                end: end - 1,
+                expected: String::new(),
+                replacement: format!(
+                    "{}{}",
+                    if existing.value.is_empty() { "" } else { ", " },
+                    rendered
+                ),
+            });
+        }
+        let end = block_sequence_end(raw, start);
+        let indent = leading_indent(raw, start);
+        let rendered = render_block(std::slice::from_ref(split), indent, newline)?;
+        return Ok(MultiplicityByteEdit {
+            start: end,
+            end,
+            expected: String::new(),
+            replacement: format!("{newline}{}{rendered}", " ".repeat(indent)),
+        });
+    }
+
+    let reported =
+        schema.referenced.span().byte_offset().ok_or_else(|| {
+            CanonicalError::Internal("schema owner has no source offset".to_owned())
+        })? as usize;
+    let schema_line = find_key_line_start(raw, reported, "schema:").ok_or_else(|| {
+        CanonicalError::Internal("cannot locate directly-authored schema key".to_owned())
+    })?;
+    let line_end = raw[schema_line..]
+        .find('\n')
+        .map_or(raw.len(), |index| schema_line + index);
+    let indent = raw[schema_line..line_end]
+        .len()
+        .saturating_sub(raw[schema_line..line_end].trim_start_matches(' ').len());
+    let rendered = render_block(std::slice::from_ref(split), indent + 2, newline)?;
+    Ok(MultiplicityByteEdit {
+        start: schema_line,
+        end: schema_line,
+        expected: String::new(),
+        replacement: format!(
+            "{}split_values:{newline}{}{rendered}{newline}",
+            " ".repeat(indent),
+            " ".repeat(indent + 2),
+        ),
+    })
+}
+
+fn find_key_line_start(raw: &str, reported: usize, key: &str) -> Option<usize> {
+    let mut line_start = raw[..reported].rfind('\n').map_or(0, |index| index + 1);
+    loop {
+        let line_end = raw[line_start..]
+            .find('\n')
+            .map_or(raw.len(), |index| line_start + index);
+        if raw[line_start..line_end].trim_start().starts_with(key) {
+            return Some(line_start);
+        }
+        if line_start == 0 {
+            return None;
+        }
+        line_start = raw[..line_start - 1]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+    }
+}
+
 fn locate_column<'a>(
     kind: &'a Spanned<String>,
     source: &'a Spanned<String>,
@@ -502,6 +819,21 @@ pub fn prove_numeric_type_only_change(
     prove_resolved_numeric_type_only_change(&expected, &actual, address, replacement)
 }
 
+/// Reparse a proposed edit and prove its only semantic changes are the selected
+/// column becoming multiple and, when present, its complete split declaration.
+pub fn prove_multiplicity_only_change(
+    original: &str,
+    edited: &str,
+    address: &ScopedColumnAddress,
+    requested: &MultiplicityConfigEdit,
+) -> Result<(), CanonicalError> {
+    let expected =
+        super::parse_config(original).map_err(|error| CanonicalError::Parse(error.to_string()))?;
+    let actual =
+        super::parse_config(edited).map_err(|error| CanonicalError::Parse(error.to_string()))?;
+    prove_resolved_multiplicity_only_change(&expected, &actual, address, requested)
+}
+
 /// Prove that two already-resolved effective configurations differ only at the
 /// selected numeric type leaf.
 ///
@@ -526,6 +858,29 @@ pub fn prove_resolved_numeric_type_only_change(
     if semantic_config_digest(&expected)? != semantic_config_digest(edited)? {
         return Err(CanonicalError::Internal(
             "edited config changes semantics outside the intended numeric type leaf".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Prove that two resolved configurations differ only by one typed
+/// multiplicity edit at the selected directly-authored source column.
+pub fn prove_resolved_multiplicity_only_change(
+    original: &PipelineConfig,
+    edited: &PipelineConfig,
+    address: &ScopedColumnAddress,
+    requested: &MultiplicityConfigEdit,
+) -> Result<(), CanonicalError> {
+    let mut expected = original.clone();
+    apply_multiplicity_config_edit(&mut expected, address, requested).map_err(|error| {
+        CanonicalError::Internal(format!(
+            "cannot apply expected multiplicity edit for {}: {error}",
+            address.render()
+        ))
+    })?;
+    if semantic_config_digest(&expected)? != semantic_config_digest(edited)? {
+        return Err(CanonicalError::Internal(
+            "edited config changes semantics outside the intended multiplicity owner".to_owned(),
         ));
     }
     Ok(())
@@ -1186,6 +1541,95 @@ mod tests {
         assert!(
             prove_numeric_type_only_change(&raw, &edited, &address, ConcreteNumericType::Int)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn multiplicity_edit_adds_complete_typed_owner_and_proves_semantics() {
+        let raw = "pipeline:\n  name: multiplicity_edit\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: csv\n      path: input.csv\n      # keep schema note\n      schema:\n        - name: tags\n          type: string\n";
+        let address = ScopedColumnAddress::new("values", "tags");
+        let requested = MultiplicityConfigEdit::delimited(SplitValues {
+            field: "tags".to_owned(),
+            delimiter: "|".to_owned(),
+            escape: "\\".to_owned(),
+            json: false,
+        });
+        let MultiplicityEditDecision::Editable(edit) =
+            plan_multiplicity_edit(raw, &address, &requested).unwrap()
+        else {
+            panic!("direct source column must be editable");
+        };
+        let edited = edit.apply(raw).unwrap();
+        assert!(edited.contains("# keep schema note"));
+        assert!(edited.contains("multiple: true"));
+        assert!(edited.contains("split_values:"));
+        prove_multiplicity_only_change(raw, &edited, &address, &requested).unwrap();
+    }
+
+    #[test]
+    fn multiplicity_edit_rejects_noop_conflict_and_sibling_changes() {
+        let address = ScopedColumnAddress::new("values", "tags");
+        let native = MultiplicityConfigEdit::native();
+        let already_multiple = "pipeline:\n  name: multiplicity_edit\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: json\n      path: input.json\n      schema:\n        - { name: tags, type: string, multiple: true }\n";
+        assert_eq!(
+            plan_multiplicity_edit(already_multiple, &address, &native).unwrap(),
+            MultiplicityEditDecision::Ineligible(MultiplicityEditIneligibility::AlreadyMultiple)
+        );
+
+        let conflict = "pipeline:\n  name: multiplicity_edit\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: csv\n      path: input.csv\n      split_values: [{ field: tags, delimiter: ';' }]\n      schema:\n        - { name: tags, type: string }\n";
+        assert_eq!(
+            plan_multiplicity_edit(conflict, &address, &native).unwrap(),
+            MultiplicityEditDecision::Ineligible(
+                MultiplicityEditIneligibility::ConflictingSplitValues
+            )
+        );
+
+        let raw = "pipeline:\n  name: multiplicity_edit\nnodes:\n  - type: source\n    name: values\n    config:\n      name: values\n      type: json\n      path: input.json\n      schema:\n        - { name: tags, type: string, multiple: false }\n";
+        let MultiplicityEditDecision::Editable(edit) =
+            plan_multiplicity_edit(raw, &address, &native).unwrap()
+        else {
+            panic!("literal false owner must be editable");
+        };
+        let edited = edit
+            .apply(raw)
+            .unwrap()
+            .replace("path: input.json", "path: sibling.json");
+        assert!(prove_multiplicity_only_change(raw, &edited, &address, &native).is_err());
+    }
+
+    fn fixed_width_group_pipeline(max: usize, child_width: usize, count_width: usize) -> String {
+        format!(
+            "pipeline:\n  name: group_identity\nnodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: fixed_width\n      path: in.txt\n      schema:\n        - name: transactions\n          type: map\n          multiple: true\n          start: 0\n          fields:\n            - {{ name: code, type: string, width: {child_width} }}\n          occurs: {{ max: {max} }}\n          count_field: {{ name: transaction_count, width: {count_width} }}\n"
+        )
+    }
+
+    #[test]
+    fn fixed_width_group_fields_participate_in_semantic_identity() {
+        let base_raw = fixed_width_group_pipeline(2, 3, 1);
+        let base = super::super::parse_config(&base_raw).expect("base parses");
+        let base_digest = semantic_config_digest(&base).expect("base digest");
+
+        for changed_raw in [
+            fixed_width_group_pipeline(3, 3, 1),
+            fixed_width_group_pipeline(2, 4, 1),
+            fixed_width_group_pipeline(2, 3, 2),
+        ] {
+            let changed = super::super::parse_config(&changed_raw).expect("changed parses");
+            assert_ne!(
+                base_digest,
+                semantic_config_digest(&changed).expect("changed digest")
+            );
+        }
+
+        let canonical = expand_multi_value_shorthand(&base_raw).expect("canonical pass");
+        assert_eq!(
+            canonical, base_raw,
+            "group YAML has no shorthand to rewrite"
+        );
+        let reparsed = super::super::parse_config(&canonical).expect("canonical parses");
+        assert_eq!(
+            base_digest,
+            semantic_config_digest(&reparsed).expect("canonical digest")
         );
     }
 
