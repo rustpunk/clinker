@@ -114,6 +114,21 @@ fn discover_composition_fragments(repo: &Path) -> Result<Vec<String>, String> {
     Ok(fragments)
 }
 
+fn normalized_repo_relative_path(repo: &Path, path: &Path) -> Result<String, String> {
+    path.strip_prefix(repo)
+        .map_err(|_| "composition inventory contains a path escape".to_owned())?
+        .components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "composition inventory contains a non-UTF-8 path escape".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|components| components.join("/"))
+}
+
 fn discover_under(
     repo: &Path,
     directory: &Path,
@@ -129,11 +144,7 @@ fn discover_under(
             .file_type()
             .map_err(|error| format!("cannot inspect composition inventory entry: {error}"))?;
         let path = entry.path();
-        let relative = path
-            .strip_prefix(repo)
-            .ok()
-            .and_then(Path::to_str)
-            .ok_or_else(|| "composition inventory contains a non-UTF-8 path escape".to_owned())?;
+        let relative = normalized_repo_relative_path(repo, &path)?;
         if file_type.is_symlink() {
             return Err(format!(
                 "path-escaping composition inventory entry {relative:?}: symlinks are not admitted"
@@ -142,7 +153,7 @@ fn discover_under(
         if file_type.is_dir() {
             discover_under(repo, &path, fragments)?;
         } else if file_type.is_file() && relative.ends_with(".comp.yaml") {
-            fragments.push(normalize_fragment_key(relative)?);
+            fragments.push(normalize_fragment_key(&relative)?);
         }
     }
     Ok(())
