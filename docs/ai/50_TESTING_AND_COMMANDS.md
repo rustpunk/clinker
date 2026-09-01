@@ -649,7 +649,10 @@ cargo test --benches -p clinker-benchmarks --locked --offline
 
 Status: **Verified.**
 
-The `cargo test --benches -p clinker-benchmarks` command is not just a compile check; it runs a full e2e benchmark smoke matrix across many YAML configs and size tiers. It took several minutes in this session.
+The `cargo test --benches -p clinker-benchmarks` command is not just a compile
+check. It executes every discovered benchmark pipeline once at Small scale and
+fails on planning or runtime errors. Real `cargo bench` invocations retain the
+Small, Medium, and Large Criterion timing matrix.
 
 Benchmark targets from `cargo metadata`:
 
@@ -762,7 +765,9 @@ Status: **Inferred from CI for the exact online forms.** Locked/offline variants
 
 - **Environment-dependent:** `cargo test --workspace` needs local socket permission for `clinker-net` REST e2e tests. The restricted sandbox produced `Operation not permitted`; the unsandboxed run passed.
 - **Environment-dependent:** spill-heavy tests need a soft `ulimit -n` of at least 65536; demand scales with the libtest thread count, which defaults to the core count. At 1024 a `clinker-exec` spill test fails with `Too many open files (os error 24)`; at 4096 on a 32-core host two do, because the measured peak there is 4165-4222 descriptors. Raise the limit with the raise-only snippet in section 4 — a bare `ulimit -n <n>` lowers an already-higher limit into the failing range. CI is unaffected: `.github/workflows/ci.yml` sets no `ulimit`, so every job inherits the runner default.
-- **Expensive:** `cargo test --benches -p clinker-benchmarks` runs the e2e benchmark smoke matrix and took several minutes.
+- **Broader than a compile check:** `cargo test --benches -p clinker-benchmarks`
+  executes one Small-scale e2e preflight for every discovered benchmark
+  pipeline. Real Criterion measurements remain substantially more expensive.
 - **Expensive:** `cargo bench ...` runs real Criterion measurements and should be reserved for performance-sensitive changes.
 - **Expensive:** `cargo test -- --ignored` includes at least one XML generator test that reports generating about 600 MB.
 - **Environment-dependent:** cross-target checks in CI require Rust targets `x86_64-pc-windows-msvc` and `aarch64-apple-darwin`; native Windows/macOS CI runs `cargo test --workspace`.
@@ -774,6 +779,9 @@ Status: **Inferred from CI for the exact online forms.** Locked/offline variants
 - `Operation not permitted` in `crates/clinker-net/tests/rest_executor_e2e.rs`: the test likely cannot bind a local socket in the sandbox. Rerun outside the sandbox or in normal CI.
 - `cargo deny check` cannot acquire `~/.cargo/advisory-dbs/db.lock`: the filesystem sandbox is read-only for that cargo advisory DB path. Rerun with permission to write/read the cargo advisory database.
 - `cargo test --workspace` can run for a long time: the workspace has a large test suite with many integration tests. Use `cargo test -p <package>` or an exact test filter while iterating.
-- `cargo test --benches -p clinker-benchmarks` runs many `Testing e2e/...` cases: this is expected. It is CI's benchmark smoke gate, not a quick compile check.
+- `cargo test --benches -p clinker-benchmarks` prints one preflight line per
+  discovered pipeline: this is expected. It is CI's executable benchmark
+  smoke gate, not a compile-only check; it does not run the Medium or Large
+  timing tiers.
 - Rustdoc warnings from `cargo doc --workspace --no-deps`: current docs build exits 0 with warnings for broken/private intra-doc links, invalid HTML tags, and bare URLs. Do not treat these warnings as a new failure unless your change introduced them or the command becomes warning-denied.
 - A root `README.md` exists (project overview and pillars). For command evidence, still prefer `CLAUDE.md`, `Cargo.toml`, CI, crate manifests, `docs/user`, `docs/engine`, examples, tests, and benches over README prose.
