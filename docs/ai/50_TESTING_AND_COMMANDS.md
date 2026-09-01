@@ -126,6 +126,34 @@ cargo test --workspace
 
 Status: **Inferred from CI.**
 
+### Test artifact storage
+
+Cargo compiles every file-level integration-test target as a separate linked
+executable. That multiplies full debug information and incremental object
+caches across Clinker's large integration matrix. The workspace therefore
+uses this repository-wide test profile:
+
+```toml
+[profile.test]
+debug = "line-tables-only"
+incremental = false
+```
+
+`line-tables-only` preserves filenames and line numbers in backtraces while
+omitting variable and parameter debug data. The setting changes only test
+builds; ordinary development and release profiles keep their existing
+behavior. When a targeted test needs an interactive debugger, opt back into
+full debug information and incremental compilation for that invocation:
+
+```bash
+CARGO_PROFILE_TEST_DEBUG=full \
+CARGO_PROFILE_TEST_INCREMENTAL=true \
+cargo test -p <package> --test <test-target>
+```
+
+Keep the override targeted. Applying it to the full workspace recreates the
+large artifact footprint the default profile avoids.
+
 There is at least one intentionally ignored slow test:
 
 ```bash

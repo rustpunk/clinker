@@ -163,6 +163,15 @@ unicode-normalization = "0.1"
 [workspace.metadata.release]
 shared-version = true
 
+# Cargo links every integration-test target as a separate executable. Keep
+# file-and-line backtraces for ordinary test failures without replicating full
+# variable/type debug information and incremental object caches across the
+# workspace's large test matrix. Contributors can opt back into both for an
+# interactive debugger session; see docs/ai/50_TESTING_AND_COMMANDS.md.
+[profile.test]
+debug = "line-tables-only"
+incremental = false
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
