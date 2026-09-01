@@ -1,21 +1,23 @@
 _compose:
   name: "Clean Names"
-  description: "Normalize and deduplicate name fields"
-  version: "1.0"
-  contract:
-    requires:
-      - name: first_name
-        type: string
-      - name: last_name
-        type: string
-    produces:
-      - name: full_name
-        type: string
-      - name: name_key
-        type: string
+  inputs:
+    input:
+      description: Names to normalize
+      required: true
+      schema:
+        - { name: first_name, type: string }
+        - { name: last_name, type: string }
+  outputs:
+    output:
+      ref: normalize_names
+      description: Original fields plus normalized display and key fields
+  config_schema: {}
 
-transformations:
-  - name: normalize_names
-    cxl: |
-      emit full_name = first_name.trim() + " " + last_name.trim()
-      emit name_key = (first_name.trim() + "_" + last_name.trim()).lower()
+nodes:
+  - type: transform
+    name: normalize_names
+    input: input
+    config:
+      cxl: |
+        emit full_name = first_name.trim() + " " + last_name.trim()
+        emit name_key = (first_name.trim() + "_" + last_name.trim()).lower()

@@ -103,27 +103,8 @@ fn discover_composition_fragments(repo: &Path) -> Result<Vec<String>, String> {
             "composition inventory root {COMPOSITION_ROOT} is missing"
         ));
     }
-    let table = scan_workspace_signatures(&root).map_err(|diagnostics| {
-        let mut codes = diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.code.as_str())
-            .collect::<Vec<_>>();
-        codes.sort_unstable();
-        codes.dedup();
-        format!(
-            "production loader rejected {COMPOSITION_ROOT} with diagnostic codes: {}",
-            codes.join(", ")
-        )
-    })?;
-    let mut fragments = table
-        .keys()
-        .map(|relative| {
-            let relative = relative.to_str().ok_or_else(|| {
-                "composition inventory contains a non-UTF-8 repository path".to_owned()
-            })?;
-            normalize_fragment_key(&format!("{COMPOSITION_ROOT}/{relative}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut fragments = Vec::new();
+    discover_under(repo, &root, &mut fragments)?;
     fragments.sort();
     if fragments.is_empty() {
         return Err(format!(
@@ -131,6 +112,40 @@ fn discover_composition_fragments(repo: &Path) -> Result<Vec<String>, String> {
         ));
     }
     Ok(fragments)
+}
+
+fn discover_under(
+    repo: &Path,
+    directory: &Path,
+    fragments: &mut Vec<String>,
+) -> Result<(), String> {
+    let mut entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("cannot read composition inventory: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot read composition inventory entry: {error}"))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect composition inventory entry: {error}"))?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(repo)
+            .ok()
+            .and_then(Path::to_str)
+            .ok_or_else(|| "composition inventory contains a non-UTF-8 path escape".to_owned())?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "path-escaping composition inventory entry {relative:?}: symlinks are not admitted"
+            ));
+        }
+        if file_type.is_dir() {
+            discover_under(repo, &path, fragments)?;
+        } else if file_type.is_file() && relative.ends_with(".comp.yaml") {
+            fragments.push(normalize_fragment_key(relative)?);
+        }
+    }
+    Ok(())
 }
 
 fn load_corpus_cases(path: &Path) -> Result<CorpusCases, String> {
@@ -177,23 +192,20 @@ fn loader_codes(diagnostics: &[clinker_core_types::Diagnostic]) -> String {
 
 fn materialize_composition_case(
     repo: &Path,
-    fragments: &[String],
     fragment_key: &str,
     case: &CorpusCase,
 ) -> Result<tempfile::TempDir, String> {
     let workspace = tempfile::tempdir()
         .map_err(|error| format!("{fragment_key}: cannot create case workspace: {error}"))?;
-    for fragment in fragments {
-        let destination = workspace.path().join(fragment);
-        std::fs::create_dir_all(
-            destination
-                .parent()
-                .ok_or_else(|| format!("{fragment}: destination has no parent"))?,
-        )
-        .map_err(|error| format!("{fragment}: cannot create destination: {error}"))?;
-        std::fs::copy(repo.join(fragment), destination)
-            .map_err(|error| format!("{fragment}: cannot copy fragment: {error}"))?;
-    }
+    let destination = workspace.path().join(fragment_key);
+    std::fs::create_dir_all(
+        destination
+            .parent()
+            .ok_or_else(|| format!("{fragment_key}: destination has no parent"))?,
+    )
+    .map_err(|error| format!("{fragment_key}: cannot create destination: {error}"))?;
+    std::fs::copy(repo.join(fragment_key), destination)
+        .map_err(|error| format!("{fragment_key}: cannot copy fragment: {error}"))?;
 
     let root = workspace.path().join(COMPOSITION_ROOT);
     let signatures = scan_workspace_signatures(&root).map_err(|diagnostics| {
@@ -288,13 +300,8 @@ fn first_difference(expected: &[u8], actual: &[u8]) -> String {
     )
 }
 
-fn run_composition_case(
-    repo: &Path,
-    fragments: &[String],
-    fragment_key: &str,
-    case: &CorpusCase,
-) -> Result<(), String> {
-    let workspace = materialize_composition_case(repo, fragments, fragment_key, case)?;
+fn run_composition_case(repo: &Path, fragment_key: &str, case: &CorpusCase) -> Result<(), String> {
+    let workspace = materialize_composition_case(repo, fragment_key, case)?;
     let output = Command::new(env!("CARGO_BIN_EXE_clinker"))
         .current_dir(workspace.path())
         .args([
@@ -345,13 +352,13 @@ fn load_inventory_and_cases() -> Result<(PathBuf, Vec<String>, CorpusCases), Str
 #[test]
 fn clean_names_executes_exact_bytes() {
     let key = "examples/pipelines/compositions/clean_names.comp.yaml";
-    let (repo, fragments, cases) =
+    let (repo, _fragments, cases) =
         load_inventory_and_cases().unwrap_or_else(|error| panic!("{error}"));
     let case = cases
         .0
         .get(key)
         .expect("clean_names case present after exact-set validation");
-    run_composition_case(&repo, &fragments, key, case).unwrap_or_else(|error| panic!("{error}"));
+    run_composition_case(&repo, key, case).unwrap_or_else(|error| panic!("{error}"));
 }
 
 #[test]
