@@ -3,8 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  # Stacked pull requests target feature branches, so validate every PR base.
+  pull_request: {}
   # Auto-update PR branches rebases open PRs with the default GITHUB_TOKEN, and
   # pushes made with that token never start a workflow run. Manual dispatch is
   # therefore the only way to re-validate a rebased branch without pushing to it.
