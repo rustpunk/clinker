@@ -1,4 +1,4 @@
-//! End-to-end EDIFACT ingestion and round-trip.
+//! End-to-end EDIFACT ingestion and round-trip in the shared format harness.
 //!
 //! Covers: (1) an EDIFACT source declaring a `UNB` envelope section feeds
 //! `$doc.<section>.<field>` into a Transform and writes CSV; (2) an

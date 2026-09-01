@@ -1,10 +1,10 @@
-//! Format dispatch integration tests for Phase 0.
+//! Format dispatch integration tests.
 //!
 //! Tests in this module verify that the executor dispatches to the correct
 //! format reader/writer based on `InputFormat`/`OutputFormat` config enums.
 //! Uses small in-memory payloads (5-10 records) for correctness, not benchmarks.
 
-mod common;
+use crate::common;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{DlqEntry, PipelineRunParams};

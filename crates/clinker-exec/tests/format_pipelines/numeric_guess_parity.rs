@@ -1,3 +1,5 @@
+//! Runtime/authoring numeric-observation parity in the shared format harness.
+
 use clinker_exec::executor::build_source_format_reader;
 use clinker_exec::pipeline::schema_coerce::{CoercingReader, coerce_numeric_with_observation};
 use clinker_format::ReopenableSource;

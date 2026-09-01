@@ -154,6 +154,47 @@ cargo test -p <package> --test <test-target>
 Keep the override targeted. Applying it to the full workspace recreates the
 large artifact footprint the default profile avoids.
 
+Related format-pipeline cases in `clinker-exec` share the `format_pipelines`
+integration target instead of relinking the executor graph once per source
+file. This reduced that package's Cargo integration targets from 136 to 124
+while preserving all 103 format behavior cases as separately named Rust
+modules. A topology test fails if a case file is not declared. Run
+the complete suite or one case module with:
+
+```bash
+cargo test -p clinker-exec --test format_pipelines --locked --offline
+cargo test -p clinker-exec --test format_pipelines --locked --offline \
+  csv_charset::
+```
+
+Files directly under `crates/clinker-exec/tests/` remain automatically
+discovered standalone targets. Cases intentionally grouped into the shared
+harness live under `crates/clinker-exec/tests/format_pipelines/`; adding a new
+file there also requires declaring its module in `format_pipelines.rs`.
+
+In isolated cold targets on one Linux host, compiling only these thirteen
+cases with `--no-run` used 2,319,033,679 bytes as separate targets and
+944,084,479 bytes as the shared target, a 59.3% reduction for this slice. The
+measurement includes the common dependency graph in both targets; it is disk
+evidence, not a cross-host timing guarantee.
+
+Package-only and workspace-wide commands can resolve different feature graphs,
+so running both into one target directory may retain two hash families for the
+same tests. In the same measurement session, a package-only `clinker-exec`
+gate followed by the workspace gate left 125 superseded executables totaling
+13,118,563,912 bytes. On a space-constrained machine, keep narrow iteration in
+a disposable target and clean that target before starting the workspace gate:
+
+```bash
+CARGO_TARGET_DIR=target/package-iteration \
+  cargo test -p clinker-exec --test format_pipelines --locked --offline
+CARGO_TARGET_DIR=target/package-iteration cargo clean
+cargo test --workspace --locked --offline
+```
+
+Use a task-specific target path and clean only that generated directory; do
+not clean a shared target that another worktree or process is using.
+
 There is at least one intentionally ignored slow test:
 
 ```bash

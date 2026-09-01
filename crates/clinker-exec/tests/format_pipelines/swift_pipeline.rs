@@ -1,4 +1,4 @@
-//! End-to-end SWIFT MT ingestion and emission.
+//! End-to-end SWIFT MT ingestion and emission in the shared format harness.
 //!
 //! Covers: (1) a SWIFT source surfaces its service blocks (1/2/3/5) as
 //! file-level `$doc` envelope sections on every block-4 body record, proving

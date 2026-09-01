@@ -2,7 +2,7 @@
 //! parsed and compiled, a real transform evaluates maps/arrays/comprehensions,
 //! and both recursive writers receive the resulting neutral value.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 

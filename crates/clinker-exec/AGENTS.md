@@ -92,6 +92,7 @@ Existing normal dependencies are intentional evidence:
 - **Inferred:** `cargo check -p clinker-exec --locked --offline`
 - **Inferred:** `cargo check -p clinker-exec --features bench-alloc --locked --offline`
 - **Inferred:** `cargo check --benches -p clinker-exec --locked --offline`
+- **Verified:** `cargo test -p clinker-exec --test format_pipelines --locked --offline`
 - **Inferred:** `cargo test -p clinker-exec --locked --offline <test_name>`
 - **Inferred:** `cargo test -p clinker-exec --locked --offline` (needs a soft `ulimit -n` of at least the 65536 floor — see `docs/ai/50_TESTING_AND_COMMANDS.md` section 4 for the measurement behind it and the raise-only snippet)
 
