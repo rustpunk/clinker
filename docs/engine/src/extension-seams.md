@@ -109,6 +109,33 @@ and execution: it knows records and expression semantics, not pipeline YAML or
 operator scheduling. It is a per-record ETL expression language, not SQL, and
 it does not decide whether a pipeline is executable.
 
+## Composition example corpus
+
+Committed composition fragments are an executable authoring contract, not
+parser fixtures. The corpus test follows this boundary:
+
+```text
+recursive inventory -> exact case set -> production loader -> generated pipeline -> clinker -> exact bytes
+```
+
+The inventory discovers every `.comp.yaml` recursively without a manual
+allowlist and compares normalized, repository-relative paths with the case
+manifest as exact sets. Duplicate manifest keys, path escapes, missing or empty
+directories, missing cases, and extra cases are separate failures. Both
+inventory paths and failure ordering are deterministic.
+
+For each case, the harness materializes only the selected fragment in an
+isolated workspace, calls the production composition scanner and compiler, and
+then invokes the built `clinker` executable. A case succeeds only when the
+process status, run counters, and output bytes match its committed expectation.
+`clinker run --explain` remains a compilation check and cannot replace the
+runtime byte comparison.
+
+This seam adds no production retention or execution work of its own. Its fixed,
+finite fixtures exercise the existing compiled-plan, runtime, telemetry, and
+lineage paths; their existing memory and observability contracts remain the
+authoritative ones.
+
 ## Diagnostics and runtime resources
 
 Diagnostic codes are registered centrally, then emitted with source spans and,

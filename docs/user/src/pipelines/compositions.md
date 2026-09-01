@@ -145,6 +145,34 @@ are inlined before the body binds. A body Sink therefore rounds
 `decimal` columns to their declared [`scale`](../nodes/sink.md#rounding-decimals-to-a-declared-scale)
 at the write boundary exactly as a top-level Sink does.
 
+### Executable example corpus
+
+The five fragments under `examples/pipelines/compositions/` are executable
+examples of the current authoring surface:
+
+- Clean Names
+- Fiscal Date Fields
+- Order Classification
+- Shipping Cost
+- Validate Email
+
+Each fragment uses `_compose.inputs`, `_compose.outputs`, `config_schema`, and
+the unified `nodes` list. The two date-dependent examples require an explicit
+`as_of_date` configuration value so their results do not depend on the day the
+test runs.
+
+The composition example test recursively inventories every `.comp.yaml` file
+in that directory. Its case manifest must name exactly that discovered set:
+empty or missing inventories, duplicate keys, missing or extra cases, and paths
+that escape the corpus directory fail with distinct diagnostics before any
+example runs. Each case is then loaded through the production composition
+loader, placed in a generated pipeline, and executed by the real `clinker`
+binary. The test checks the exit status, record counters, and output bytes.
+
+`clinker run --explain` proves that a generated pipeline compiles. It does not
+prove that the example produces the documented result; the executable corpus's
+byte comparison is the behavior check.
+
 ## Advanced wiring
 
 For compositions with multiple input ports, bind every declared port by name:
