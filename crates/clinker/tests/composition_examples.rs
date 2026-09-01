@@ -362,6 +362,27 @@ fn clean_names_executes_exact_bytes() {
 }
 
 #[test]
+fn every_composition_fragment_executes_exact_bytes() {
+    let (repo, fragments, cases) =
+        load_inventory_and_cases().unwrap_or_else(|error| panic!("{error}"));
+    let failures = fragments
+        .iter()
+        .filter_map(|key| {
+            let case = cases
+                .0
+                .get(key)
+                .expect("case present after exact-set validation");
+            run_composition_case(&repo, key, case).err()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        failures.is_empty(),
+        "composition corpus failures:\n\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
 fn duplicate_corpus_keys_are_rejected() {
     let key = "examples/pipelines/compositions/clean_names.comp.yaml";
     let value = r#"{"input":"","expected":"","counters":{"total":0,"ok":0,"written":0,"dlq":0}}"#;
@@ -444,4 +465,45 @@ fn missing_and_extra_case_keys_fail_distinctly() {
     let error = require_exact_case_set(&fragments, &extra).expect_err("extra case must fail");
     assert!(error.starts_with("extra corpus cases for:"), "{error}");
     assert!(!error.contains("missing corpus cases for:"), "{error}");
+}
+
+#[test]
+fn exact_set_validation_is_order_independent() {
+    let mut fragments = vec![
+        "examples/pipelines/compositions/b.comp.yaml".to_owned(),
+        "examples/pipelines/compositions/a.comp.yaml".to_owned(),
+    ];
+    let cases = CorpusCases(BTreeMap::from([
+        (
+            "examples/pipelines/compositions/a.comp.yaml".to_owned(),
+            CorpusCase {
+                input: String::new(),
+                expected: String::new(),
+                counters: Counters {
+                    total: 0,
+                    ok: 0,
+                    written: 0,
+                    dlq: 0,
+                },
+                config: BTreeMap::new(),
+            },
+        ),
+        (
+            "examples/pipelines/compositions/b.comp.yaml".to_owned(),
+            CorpusCase {
+                input: String::new(),
+                expected: String::new(),
+                counters: Counters {
+                    total: 0,
+                    ok: 0,
+                    written: 0,
+                    dlq: 0,
+                },
+                config: BTreeMap::new(),
+            },
+        ),
+    ]));
+    require_exact_case_set(&fragments, &cases).expect("forward order must match");
+    fragments.reverse();
+    require_exact_case_set(&fragments, &cases).expect("reverse order must match");
 }
