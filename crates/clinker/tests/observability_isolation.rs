@@ -1392,6 +1392,67 @@ fn invoke_fault_matrix(
     }
 }
 
+/// A fault-matrix run whose arena refused nothing, so its per-signal export
+/// counters carry the whole run and can be compared for exact equality.
+///
+/// The arena never blocks the producer that offers it a signal: one offered
+/// while the drain thread holds the lock is refused as `contended`, which is
+/// the scheduler's decision rather than the run's. An exporter can only count
+/// what reached it, so a single refused log leaves the logs summary at
+/// `attempts: 0` — indistinguishable, to an equality assertion, from a fault
+/// on one signal having silenced a sibling. Under CI-scale CPU contention
+/// that made a true property fail on whichever case lost the race, which is
+/// how a scheduling artifact reads as an isolation defect.
+///
+/// Retrying is bounded and forgives only `contended`, exactly as `emit_one_log`
+/// does for the in-process arena: every other drop reason is a real admission
+/// regression and fails on the first run, a partial count is refused rather
+/// than read as complete, and exhausting the budget fails too — so a genuinely
+/// starved arena cannot be retried green.
+fn invoke_fault_matrix_on_an_uncontended_arena(
+    otlp_signal: Option<&str>,
+    otlp_outcome: &str,
+    lineage_sink: Option<&str>,
+    lineage_repeat: bool,
+    lineage_max_event: &str,
+) -> MatrixRun {
+    const ATTEMPTS: u32 = 8;
+    let label = format!("{}/{otlp_outcome}", otlp_signal.unwrap_or("baseline"));
+    let mut last = None;
+    for _ in 0..ATTEMPTS {
+        let run = invoke_fault_matrix(
+            otlp_signal,
+            otlp_outcome,
+            lineage_sink,
+            lineage_repeat,
+            lineage_max_event,
+        );
+        let admission = run.observability["admission"].clone();
+        let dropped = admission["dropped"]
+            .as_object()
+            .expect("admission drop reasons")
+            .clone();
+        for (reason, count) in &dropped {
+            if reason != "contended" {
+                assert_eq!(
+                    count.as_u64(),
+                    Some(0),
+                    "{label} arena dropped signals for {reason}"
+                );
+            }
+        }
+        let contended = dropped["contended"].as_u64().expect("contended drops");
+        if contended == 0 && admission["counts_complete"] == Value::Bool(true) {
+            return run;
+        }
+        last = Some(admission);
+    }
+    panic!(
+        "{label} never produced an uncontended arena across {ATTEMPTS} runs, last admission {:#?}",
+        last.expect("a refused run records its admission")
+    )
+}
+
 /// The observability summary with its scheduling-dependent numbers removed,
 /// so the rest can be compared across runs for exact equality.
 ///
@@ -1619,7 +1680,7 @@ fn worker_startup_failures_are_preeffect_and_machine_terminal() {
 
 #[test]
 fn fault_matrix_otlp_outcomes_change_only_the_selected_signal() {
-    let baseline = invoke_fault_matrix(None, "success", None, false, "4KB");
+    let baseline = invoke_fault_matrix_on_an_uncontended_arena(None, "success", None, false, "4KB");
     assert_eq!(baseline.oracle.status, Some(2));
     assert_eq!(baseline.oracle.terminal["event"], "completed");
     assert_eq!(baseline.oracle.terminal["result"], "completed_with_dlq");
@@ -1639,7 +1700,13 @@ fn fault_matrix_otlp_outcomes_change_only_the_selected_signal() {
             "shutdown",
             "flush-expiry",
         ] {
-            let run = invoke_fault_matrix(Some(signal), outcome, None, false, "4KB");
+            let run = invoke_fault_matrix_on_an_uncontended_arena(
+                Some(signal),
+                outcome,
+                None,
+                false,
+                "4KB",
+            );
             assert!(
                 run.elapsed < Duration::from_secs(3),
                 "{signal}/{outcome} blocked completion"
