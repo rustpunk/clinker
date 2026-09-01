@@ -5,7 +5,7 @@
 //! executor wiring (`build_csv_reader_config` copying `split_values` onto the
 //! single-schema CSV reader) that the unit tests cannot see.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 

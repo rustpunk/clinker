@@ -6,7 +6,7 @@
 //! source's inferred dotted columns through the writer factory into the JSON
 //! writer.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 
