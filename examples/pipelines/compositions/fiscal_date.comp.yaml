@@ -1,37 +1,50 @@
+# Derive fiscal calendar fields for an April-through-March fiscal year.
 _compose:
   name: "Fiscal Date Fields"
-  description: "Derive fiscal year, quarter, and period from a date field"
-  version: "2.0"
-  contract:
-    requires:
-      - name: invoice_date
-        type: date
-    produces:
-      - name: fiscal_year
-        type: int
-      - name: fiscal_quarter
-        type: string
-      - name: fiscal_period
-        type: string
-      - name: fiscal_month
-        type: int
-      - name: is_current_fy
-        type: bool
+  inputs:
+    input:
+      required: true
+      schema:
+        - { name: invoice_date, type: date }
+  outputs:
+    output:
+      ref: flag_current_fy
+      description: Original fields plus fiscal year, quarter, period, month, and current-year flag
+  config_schema:
+    as_of_date:
+      type: string
+      required: true
+      description: ISO date used to determine the current fiscal year
 
-transformations:
-  - name: compute_fiscal_year
+nodes:
+  - type: transform
+    name: compute_fiscal_year
     description: "Fiscal year starts April 1 — dates in Jan-Mar belong to prior FY"
-    cxl: |
-      let month = invoice_date.month()
-      emit fiscal_year = if month < 4 then invoice_date.year() else invoice_date.year() + 1
-  - name: compute_fiscal_quarter
-    cxl: |
-      let month = invoice_date.month()
-      emit fiscal_quarter = if month >= 4 and month <= 6 then "Q1" else if month >= 7 and month <= 9 then "Q2" else if month >= 10 and month <= 12 then "Q3" else "Q4"
-      emit fiscal_month = if month >= 4 then month - 3 else month + 9
-  - name: compute_fiscal_period
-    cxl: |
-      emit fiscal_period = "FY" + fiscal_year.to_string() + "-" + fiscal_quarter
-  - name: flag_current_fy
-    cxl: |
-      emit is_current_fy = fiscal_year == current_fiscal_year()
+    input: input
+    config:
+      cxl: |
+        let month = invoice_date.month()
+        emit fiscal_year = if month < 4 then invoice_date.year() else invoice_date.year() + 1
+  - type: transform
+    name: compute_fiscal_quarter
+    input: compute_fiscal_year
+    config:
+      cxl: |
+        let month = invoice_date.month()
+        emit fiscal_quarter = if month >= 4 and month <= 6 then "Q1" else if month >= 7 and month <= 9 then "Q2" else if month >= 10 and month <= 12 then "Q3" else "Q4"
+        emit fiscal_month = if month >= 4 then month - 3 else month + 9
+  - type: transform
+    name: compute_fiscal_period
+    input: compute_fiscal_quarter
+    config:
+      cxl: |
+        emit fiscal_period = "FY".concat(fiscal_year.to_string(), "-", fiscal_quarter)
+  - type: transform
+    name: flag_current_fy
+    input: compute_fiscal_period
+    config:
+      cxl: |
+        let as_of = $config.as_of_date.to_date("%Y-%m-%d")
+        let as_of_month = as_of.month()
+        let current_fiscal_year = if as_of_month < 4 then as_of.year() else as_of.year() + 1
+        emit is_current_fy = fiscal_year == current_fiscal_year
