@@ -204,6 +204,17 @@ fn validate_triggers(name: &str, triggers: &BTreeMap<String, Value>) -> Result<(
         return Ok(());
     }
 
+    if name == "ci.yml"
+        && !triggers
+            .get("pull_request")
+            .and_then(Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+    {
+        return Err(policy(
+            "CI pull_request trigger must match every base branch",
+        ));
+    }
+
     if triggers
         .get("push")
         .and_then(Value::as_object)
