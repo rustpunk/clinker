@@ -561,12 +561,18 @@ impl OtlpWorker {
                             state.enter_final_flush();
                             state.drain_final();
                             state.deliver_lifecycle(snapshot.as_ref());
+                            #[cfg(debug_assertions)]
+                            state.deliver_pending_injected_outcome_probes();
                             let _ = done_sender.try_send(state.report);
                             return;
                         }
                         Ok(WorkerCommand::Drain) => {
                             state.enter_final_flush();
                             state.drain_final();
+                            // Deliberately no test probes here: Drop uses Drain
+                            // for runs that never reached a terminal, and only
+                            // the explicit fault-matrix Finish path has a
+                            // determinism obligation.
                             let _ = done_sender.try_send(state.report);
                             return;
                         }
@@ -816,6 +822,81 @@ impl WorkerState<'_> {
         self.deliver_encoded(OtlpSignal::Traces, encoded, 1);
     }
 
+    /// Complete fault-matrix test signals that had no admitted payload to carry them.
+    ///
+    /// The fault matrix deliberately keeps the real arena small enough to prove
+    /// admission loss. Under scheduler contention that can discard every record
+    /// of a signal before the injected exporter sees one. An opt-in injected
+    /// one-item exporter-boundary probe keeps selected-fault and sibling-success
+    /// assertions deterministic without changing arena capacity, admission, or
+    /// production behavior. The probe is encoded and delivered through the same
+    /// injected capture boundary as a drained item, so the capture remains an
+    /// independent oracle for every reported signal. Real drained records and the
+    /// lifecycle span always take priority. The explicit ensure flag gates every
+    /// probe, including signals that also have an injected outcome configured.
+    #[cfg(debug_assertions)]
+    fn deliver_pending_injected_outcome_probes(&mut self) {
+        for signal in [OtlpSignal::Logs, OtlpSignal::Metrics, OtlpSignal::Traces] {
+            if self.backend.needs_injected_outcome_probe(signal) {
+                let encoded = self.encode_injected_outcome_probe(signal);
+                self.deliver_encoded(signal, encoded, 1);
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn encode_injected_outcome_probe(&mut self, signal: OtlpSignal) -> io::Result<()> {
+        match signal {
+            OtlpSignal::Logs => {
+                let record = LogRecord {
+                    event: "clinker.test.otlp_signal_probe".to_owned(),
+                    severity: Severity::Info,
+                    message: "OTLP signal probe".to_owned(),
+                    correlation: self.correlation.clone(),
+                    fields: Default::default(),
+                };
+                self.payload.encode(&logs_envelope(
+                    std::slice::from_ref(&record),
+                    &unix_nanos_now().to_string(),
+                    &self.correlation,
+                ))
+            }
+            OtlpSignal::Metrics => {
+                let point = MetricPoint {
+                    key: MetricKey::TransformRecords,
+                    value: 0,
+                };
+                let observed_at = unix_nanos_now();
+                self.payload.encode(&metrics_envelope(
+                    std::slice::from_ref(&point),
+                    MetricsWindow {
+                        start: observed_at,
+                        end: observed_at,
+                    },
+                    &self.correlation,
+                ))
+            }
+            OtlpSignal::Traces => {
+                let observed_at = unix_nanos_now();
+                let span = TraceSpan {
+                    name: SpanName::Transform,
+                    status: SpanStatus::Ok,
+                    logical_node: "__otlp_signal_probe".to_owned(),
+                    started_at_unix_nanos: observed_at,
+                    ended_at_unix_nanos: observed_at,
+                };
+                let trace_id = self.trace_id.clone();
+                let span_id = self.reserve_span_ids(1);
+                self.payload.encode(&traces_envelope(
+                    std::slice::from_ref(&span),
+                    &trace_id,
+                    span_id,
+                    &self.correlation,
+                ))
+            }
+        }
+    }
+
     /// Split one drained batch across as many requests as its bounded buffer
     /// needs. Halving on overflow keeps the memory fixed while guaranteeing
     /// forward progress; only an item that cannot be represented alone is
@@ -847,7 +928,11 @@ impl WorkerState<'_> {
                         || self.stop.load(Ordering::Acquire)
                 },
             ),
-            Err(_) => DeliveryResult::EncodingFailure,
+            Err(_) => {
+                #[cfg(debug_assertions)]
+                self.backend.mark_injected_outcome_reported(signal);
+                DeliveryResult::EncodingFailure
+            }
         };
         self.report.record(signal, result, item_count);
         self.publish_progress();
@@ -947,6 +1032,23 @@ impl DeliveryBackend {
             Self::Recording(recording) => recording.deliver(signal, item_count, shutdown),
         }
     }
+
+    #[cfg(debug_assertions)]
+    fn needs_injected_outcome_probe(&self, signal: OtlpSignal) -> bool {
+        match self {
+            Self::Injected(injected) => injected.needs_outcome_probe(signal),
+            Self::Network => false,
+            #[cfg(test)]
+            Self::Recording(_) => false,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn mark_injected_outcome_reported(&mut self, signal: OtlpSignal) {
+        if let Self::Injected(injected) = self {
+            injected.mark_reported(signal);
+        }
+    }
 }
 
 /// Records what the worker handed the transport, and whether the worker would
@@ -1004,6 +1106,7 @@ impl RecordingDelivery {
 struct InjectedDelivery {
     capture: Option<File>,
     reported: [bool; 3],
+    ensure_signal_probes: bool,
 }
 
 #[cfg(debug_assertions)]
@@ -1016,10 +1119,16 @@ impl InjectedDelivery {
         Ok(Self {
             capture,
             reported: [false; 3],
+            ensure_signal_probes: std::env::var_os("CLINKER_TEST_OTLP_ENSURE_SIGNAL_PROBES")
+                .as_deref()
+                == Some(std::ffi::OsStr::new("1")),
         })
     }
 
     fn deliver(&mut self, signal: OtlpSignal, payload: &[u8], item_count: u64) -> DeliveryResult {
+        let signal_index = signal_index(signal);
+        let first_outcome = !self.reported[signal_index];
+        self.reported[signal_index] = true;
         if let Some(capture) = self.capture.as_mut() {
             #[derive(Serialize)]
             struct Captured<'a> {
@@ -1043,13 +1152,7 @@ impl InjectedDelivery {
                 return DeliveryResult::EncodingFailure;
             }
         }
-        let mode = injected_signal_outcome(signal);
-        let signal_index = match signal {
-            OtlpSignal::Logs => 0,
-            OtlpSignal::Metrics => 1,
-            OtlpSignal::Traces => 2,
-        };
-        if self.reported[signal_index] {
+        if !first_outcome {
             return DeliveryResult::Injected {
                 accepted: 0,
                 rejected: 0,
@@ -1058,7 +1161,18 @@ impl InjectedDelivery {
                 outcome: None,
             };
         }
-        self.reported[signal_index] = true;
+        Self::outcome_result(injected_signal_outcome(signal).as_deref(), item_count)
+    }
+
+    fn needs_outcome_probe(&self, signal: OtlpSignal) -> bool {
+        self.ensure_signal_probes && !self.reported[signal_index(signal)]
+    }
+
+    fn mark_reported(&mut self, signal: OtlpSignal) {
+        self.reported[signal_index(signal)] = true;
+    }
+
+    fn outcome_result(mode: Option<&str>, item_count: u64) -> DeliveryResult {
         let (accepted, rejected, attempts, failed, outcome) = match mode.as_deref() {
             None | Some("success") => (1, 0, 1, false, None),
             Some("partial") => (0, 1, 1, false, Some("partial")),
@@ -1089,6 +1203,15 @@ impl InjectedDelivery {
             failed,
             outcome,
         }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn signal_index(signal: OtlpSignal) -> usize {
+    match signal {
+        OtlpSignal::Logs => 0,
+        OtlpSignal::Metrics => 1,
+        OtlpSignal::Traces => 2,
     }
 }
 

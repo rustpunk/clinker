@@ -1284,6 +1284,7 @@ fn invoke_fault_matrix(
     command
         .current_dir(root.path())
         .env("CLINKER_TEST_OTLP_OUTCOME", "success")
+        .env("CLINKER_TEST_OTLP_ENSURE_SIGNAL_PROBES", "1")
         .env("CLINKER_TEST_OTLP_CAPTURE", &capture)
         .args([
             "run",
@@ -1302,6 +1303,10 @@ fn invoke_fault_matrix(
             "traces" => "CLINKER_TEST_OTLP_TRACES_OUTCOME",
             _ => panic!("unknown OTLP signal"),
         };
+        // The debug exporter gives each signal a one-item exporter-boundary
+        // probe only when the fixed arena admitted no real payload for it. This
+        // keeps both the selected fault and sibling success observable without
+        // changing the admission-loss behavior this matrix runs beside.
         command.env(variable, otlp_outcome);
     }
     if let Some(mode) = lineage_sink {
@@ -1495,6 +1500,31 @@ fn assert_private_surfaces_are_clean(run: &MatrixRun) {
     );
 }
 
+fn assert_collector_captured_all_signals(run: &MatrixRun, label: &str) {
+    let captured = run
+        .collector_bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .enumerate()
+        .map(|(index, line)| {
+            let event: Value = serde_json::from_slice(line)
+                .unwrap_or_else(|error| panic!("{label}: collector record {index}: {error}"));
+            event["signal"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{label}: collector record {index} has no signal"))
+                .to_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        captured,
+        ["logs", "metrics", "traces"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        "{label}: the collector did not capture every OTLP signal"
+    );
+}
+
 #[test]
 fn fault_matrix_endpoint_partitions_fail_before_every_effect() {
     for endpoint in [
@@ -1624,6 +1654,7 @@ fn fault_matrix_otlp_outcomes_change_only_the_selected_signal() {
     assert_eq!(baseline.oracle.terminal["event"], "completed");
     assert_eq!(baseline.oracle.terminal["result"], "completed_with_dlq");
     assert_private_surfaces_are_clean(&baseline);
+    assert_collector_captured_all_signals(&baseline, "baseline");
 
     for signal in ["logs", "metrics", "traces"] {
         for outcome in [
@@ -1649,6 +1680,7 @@ fn fault_matrix_otlp_outcomes_change_only_the_selected_signal() {
                 "authoritative drift for {signal}/{outcome}"
             );
             assert_private_surfaces_are_clean(&run);
+            assert_collector_captured_all_signals(&run, &format!("{signal}/{outcome}"));
             for sibling in ["logs", "metrics", "traces"] {
                 if sibling != signal {
                     assert_eq!(
@@ -1674,6 +1706,7 @@ fn fault_matrix_otlp_outcomes_change_only_the_selected_signal() {
 #[test]
 fn fault_matrix_lineage_outcomes_leave_otlp_and_authoritative_truth_unchanged() {
     let baseline = invoke_fault_matrix(None, "success", None, false, "4KB");
+    assert_collector_captured_all_signals(&baseline, "baseline");
     for (mode, repeat, max_event, expected) in [
         (
             "permission-denied",
@@ -1709,6 +1742,7 @@ fn fault_matrix_lineage_outcomes_leave_otlp_and_authoritative_truth_unchanged() 
         assert_peak_retained_is_bounded(&run.observability, mode);
         assert_peak_retained_is_bounded(&baseline.observability, "baseline");
         assert_private_surfaces_are_clean(&run);
+        assert_collector_captured_all_signals(&run, &format!("lineage {mode}"));
         let diagnostic = String::from_utf8_lossy(&run.output.stderr);
         assert!(
             diagnostic.contains("lineage delivery outcome"),
