@@ -1,4 +1,4 @@
-//! End-to-end X12 ingestion and round-trip.
+//! End-to-end X12 ingestion and round-trip in the shared format harness.
 //!
 //! Covers: (1) an X12 source surfaces all three envelope tiers
 //! (`ISA` interchange, `GS` functional group, `ST` transaction set) as

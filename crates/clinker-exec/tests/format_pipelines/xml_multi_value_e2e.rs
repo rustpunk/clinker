@@ -7,7 +7,7 @@
 //! the executor wiring the unit tests cannot see: the writer factory threading
 //! the output's `join_values` into the XML writer config.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 

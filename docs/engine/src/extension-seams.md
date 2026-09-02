@@ -46,6 +46,21 @@ reader/writer construction arms are wired. It must also state which schema,
 multi-record, envelope, splitting, and document-cardinality features it can
 represent. This is deliberate compile-time wiring, not dynamic discovery.
 
+Fixed-width repeating groups demonstrate the coordinated form of this seam.
+The strict `Column` shape carries `fields`, `occurs`, and an optional physical
+`count_field` through patching, overlay provenance, canonical identity, and
+normal planner admission before either format constructor runs. Layout
+resolution then proves a finite maximum width with checked arithmetic. The
+reader retains one declared-length row, while the writer validates and encodes
+one declared-length record before committing bytes. The group remains one
+logical array-of-records column; a derived count cell is layout machinery and
+never enters the logical schema or CXL namespace. Delimiter-packed scalar
+cells remain a distinct `split_values` representation and cannot bypass the
+positional-group checks. The executable byte and rejection matrix is in
+`crates/clinker-format/tests/fixed_width_repeating_groups.rs`, with planner
+admission coverage in
+`crates/clinker-plan/src/plan/tests/multi_value_validation.rs`.
+
 ## Non-file transports
 
 `RecordSource` is the transport-neutral ingest contract. File readers reach it
@@ -93,6 +108,33 @@ handled by every later phase that can receive it. CXL remains below planning
 and execution: it knows records and expression semantics, not pipeline YAML or
 operator scheduling. It is a per-record ETL expression language, not SQL, and
 it does not decide whether a pipeline is executable.
+
+## Composition example corpus
+
+Committed composition fragments are an executable authoring contract, not
+parser fixtures. The corpus test follows this boundary:
+
+```text
+recursive inventory -> exact case set -> production loader -> generated pipeline -> clinker -> exact bytes
+```
+
+The inventory discovers every `.comp.yaml` recursively without a manual
+allowlist and compares normalized, repository-relative paths with the case
+manifest as exact sets. Duplicate manifest keys, path escapes, missing or empty
+directories, missing cases, and extra cases are separate failures. Both
+inventory paths and failure ordering are deterministic.
+
+For each case, the harness materializes only the selected fragment in an
+isolated workspace, calls the production composition scanner and compiler, and
+then invokes the built `clinker` executable. A case succeeds only when the
+process status, run counters, and output bytes match its committed expectation.
+`clinker run --explain` remains a compilation check and cannot replace the
+runtime byte comparison.
+
+This seam adds no production retention or execution work of its own. Its fixed,
+finite fixtures exercise the existing compiled-plan, runtime, telemetry, and
+lineage paths; their existing memory and observability contracts remain the
+authoritative ones.
 
 ## Diagnostics and runtime resources
 

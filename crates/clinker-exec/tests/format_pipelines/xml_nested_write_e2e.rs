@@ -5,7 +5,7 @@
 //! use exact bytes so wrapper, repetition, null, and record-atomicity behavior
 //! cannot drift independently between those layers.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 

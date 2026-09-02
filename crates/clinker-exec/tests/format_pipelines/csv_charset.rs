@@ -1,4 +1,4 @@
-//! End-to-end CSV `encoding` handling.
+//! End-to-end CSV `encoding` handling in the shared format-pipeline harness.
 //!
 //! Covers the observable behaviors of a declared CSV source `encoding`:
 //! (1) a single-schema source declaring `iso-8859-1` decodes high bytes

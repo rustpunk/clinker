@@ -1,4 +1,4 @@
-//! End-to-end HL7 v2 ingestion and round-trip.
+//! End-to-end HL7 v2 ingestion and round-trip in the shared format harness.
 //!
 //! Covers: (1) an HL7 source surfaces the message-level envelope as a
 //! `$doc` section on every body record, proving the nested-envelope nesting

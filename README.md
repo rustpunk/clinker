@@ -148,6 +148,17 @@ cargo install --path crates/cxl-cli
 cargo test --workspace
 ```
 
+The repository's test profile keeps filename-and-line backtraces while
+omitting the much larger variable/type debug data and incremental caches that
+would otherwise be repeated across every integration-test executable. For an
+interactive debugger session, opt back into both for the targeted test only:
+
+```bash
+CARGO_PROFILE_TEST_DEBUG=full \
+CARGO_PROFILE_TEST_INCREMENTAL=true \
+cargo test -p <package> --test <test-target>
+```
+
 There are no C build dependencies: no crate in the graph runs a C compiler, and
 CI proves it by building the workspace and all its test and benchmark targets
 with `CC` and friends pointed at a program that fails. The same job builds one

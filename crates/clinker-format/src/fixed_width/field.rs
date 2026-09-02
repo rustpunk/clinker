@@ -18,7 +18,9 @@ use cxl::typecheck::Type;
 
 use crate::error::FormatError;
 use crate::numeric_observation::{NumericObservation, observe_positional_numeric_with_result};
-use crate::schema::Column;
+use crate::schema::{
+    Column, FixedWidthCountField, FixedWidthFill, FixedWidthOccurs, FixedWidthOverflow,
+};
 
 /// Result of one scalar coercion together with parser-owned numeric evidence
 /// when the declared target is `numeric`.
@@ -82,6 +84,22 @@ impl ResolvedField {
             .start
             .ok_or_else(|| invalid_field(&f.name, "must have 'start'"))?;
 
+        Self::from_column_at(f, start)
+    }
+
+    /// Resolve a field at an already established byte offset.
+    ///
+    /// This is used for width-only fields inside a sequential writer layout
+    /// and inside one occurrence of a repeating group. The returned `start`
+    /// remains relative to the containing layout.
+    pub fn from_column_at(f: &Column, start: usize) -> Result<Self, FormatError> {
+        if f.fields.is_some() || f.occurs.is_some() || f.count_field.is_some() {
+            return Err(invalid_field(
+                &f.name,
+                "mixes scalar attributes with a repeating-group declaration; use either a scalar column or `fields` plus `occurs`",
+            ));
+        }
+
         let width = resolve_width(f, start)?;
 
         // `end()` is computed once per record on the hot read path, so the range
@@ -113,6 +131,226 @@ impl ResolvedField {
     /// The first byte position past this field's range.
     pub fn end(&self) -> usize {
         self.start + self.width
+    }
+}
+
+/// A fixed-width repeating group resolved to a finite physical layout.
+///
+/// Child starts are relative to one occurrence. The optional derived count
+/// occupies the first bytes of the group, followed by at most `occurs.max`
+/// copies of the child layout. `max_width` is computed with checked arithmetic
+/// at construction and therefore bounds both the reader's row buffer and the
+/// writer's per-record encoding buffer.
+#[derive(Debug, Clone)]
+pub struct ResolvedRepeatingGroup {
+    pub name: String,
+    pub start: usize,
+    pub fields: Vec<ResolvedField>,
+    pub occurs: FixedWidthOccurs,
+    pub count_field: Option<FixedWidthCountField>,
+    occurrence_width: usize,
+    max_width: usize,
+}
+
+impl ResolvedRepeatingGroup {
+    /// Resolve one strict group declaration at its containing-layout offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError::InvalidRecord`] for a non-map/non-multiple
+    /// group, missing or empty children, scalar/group hybrids, recursive
+    /// repetition, invalid cardinality/overflow policy, overlapping child
+    /// ranges, an invalid count field, or checked layout overflow.
+    pub fn from_column_at(column: &Column, start: usize) -> Result<Self, FormatError> {
+        let children = column.fields.as_ref().ok_or_else(|| {
+            invalid_group(
+                &column.name,
+                "requires `fields`; add the per-occurrence child layout",
+            )
+        })?;
+        let occurs = column.occurs.clone().ok_or_else(|| {
+            invalid_group(
+                &column.name,
+                "requires `occurs` with a positive `max` (for example `occurs: { max: 2 }`)",
+            )
+        })?;
+
+        if !column.is_multiple() || !matches!(column.ty.unwrap_nullable(), Type::Map) {
+            return Err(invalid_group(
+                &column.name,
+                "must declare `type: map` and `multiple: true` so its logical value is an array of records",
+            ));
+        }
+        if column.width.is_some()
+            || column.end.is_some()
+            || column.justify.is_some()
+            || column.pad.is_some()
+            || column.trim.is_some()
+            || column.truncation.is_some()
+        {
+            return Err(invalid_group(
+                &column.name,
+                "mixes scalar layout keys with `fields`/`occurs`; remove `width`, `end`, `justify`, `pad`, `trim`, and `truncation` from the group",
+            ));
+        }
+        if children.is_empty() {
+            return Err(invalid_group(
+                &column.name,
+                "has no child fields; add at least one fixed-width child field",
+            ));
+        }
+        if occurs.max == 0 {
+            return Err(invalid_group(
+                &column.name,
+                "has `occurs.max: 0`; set `max` to a positive finite count",
+            ));
+        }
+        if occurs.min > occurs.max {
+            return Err(invalid_group(
+                &column.name,
+                &format!(
+                    "has `occurs.min: {}` greater than `occurs.max: {}`; set `min` no greater than `max`",
+                    occurs.min, occurs.max
+                ),
+            ));
+        }
+        match (occurs.on_overflow, occurs.keep) {
+            (FixedWidthOverflow::Truncate, None) => {
+                return Err(invalid_group(
+                    &column.name,
+                    "uses `on_overflow: truncate` without `keep`; add `keep: first` or `keep: last`",
+                ));
+            }
+            (FixedWidthOverflow::Error, Some(_)) => {
+                return Err(invalid_group(
+                    &column.name,
+                    "sets `keep` while `on_overflow` is `error`; remove `keep` or select `on_overflow: truncate`",
+                ));
+            }
+            _ => {}
+        }
+
+        let count_width = match &column.count_field {
+            Some(count) if count.name.trim().is_empty() => {
+                return Err(invalid_group(
+                    &column.name,
+                    "has a count field with an empty `name`; provide a diagnostic name",
+                ));
+            }
+            Some(count) if count.width == 0 => {
+                return Err(invalid_group(
+                    &column.name,
+                    "has `count_field.width: 0`; set the width to a positive byte count",
+                ));
+            }
+            Some(count) => {
+                let digits = occurs.max.to_string().len();
+                if digits > count.width {
+                    return Err(invalid_group(
+                        &column.name,
+                        &format!(
+                            "count field '{}' is {} byte(s) wide but `occurs.max: {}` needs {digits}; increase `count_field.width` to at least {digits}",
+                            count.name, count.width, occurs.max
+                        ),
+                    ));
+                }
+                count.width
+            }
+            None => 0,
+        };
+
+        let mut fields = Vec::with_capacity(children.len());
+        let mut next_start = 0usize;
+        for child in children {
+            if child.fields.is_some()
+                || child.occurs.is_some()
+                || child.count_field.is_some()
+                || child.is_multiple()
+            {
+                return Err(invalid_group(
+                    &column.name,
+                    &format!(
+                        "child '{}' repeats or contains nested fields; flatten the child into one scalar occurrence layout",
+                        child.name
+                    ),
+                ));
+            }
+            let child_start = child.start.unwrap_or(next_start);
+            let resolved = ResolvedField::from_column_at(child, child_start)?;
+            next_start = resolved.end();
+            fields.push(resolved);
+        }
+        fields.sort_by_key(|field| field.start);
+        for pair in fields.windows(2) {
+            let (previous, next) = (&pair[0], &pair[1]);
+            if next.start < previous.end() {
+                return Err(invalid_group(
+                    &column.name,
+                    &format!(
+                        "child '{}' range {}..{} overlaps child '{}' range {}..{}; give each child a disjoint range",
+                        next.name,
+                        next.start,
+                        next.end(),
+                        previous.name,
+                        previous.start,
+                        previous.end()
+                    ),
+                ));
+            }
+        }
+
+        let occurrence_width = fields.iter().map(ResolvedField::end).max().unwrap_or(0);
+        let repeated_width = occurrence_width.checked_mul(occurs.max).ok_or_else(|| {
+            invalid_group(
+                &column.name,
+                "layout width overflows `occurs.max * occurrence_width`; reduce the declared bound or child widths",
+            )
+        })?;
+        let max_width = count_width.checked_add(repeated_width).ok_or_else(|| {
+            invalid_group(
+                &column.name,
+                "layout width overflows after adding `count_field.width`; reduce the declared widths",
+            )
+        })?;
+        start.checked_add(max_width).ok_or_else(|| {
+            invalid_group(
+                &column.name,
+                "`start` plus the bounded group width overflows; reduce the start or declared widths",
+            )
+        })?;
+
+        Ok(Self {
+            name: column.name.clone(),
+            start,
+            fields,
+            occurs,
+            count_field: column.count_field.clone(),
+            occurrence_width,
+            max_width,
+        })
+    }
+
+    pub fn count_width(&self) -> usize {
+        self.count_field.as_ref().map_or(0, |count| count.width)
+    }
+
+    pub fn occurrence_width(&self) -> usize {
+        self.occurrence_width
+    }
+
+    pub fn max_width(&self) -> usize {
+        self.max_width
+    }
+
+    pub fn end(&self) -> usize {
+        self.start + self.max_width
+    }
+
+    pub fn encoded_width(&self, count: usize) -> usize {
+        match self.occurs.fill {
+            FixedWidthFill::Pad => self.max_width,
+            FixedWidthFill::Shift => self.count_width() + self.occurrence_width * count,
+        }
     }
 }
 
@@ -610,6 +848,13 @@ pub(crate) fn invalid_field(name: &str, problem: &str) -> FormatError {
     FormatError::InvalidRecord {
         row: 0,
         message: format!("field '{name}': fixed-width field {problem}"),
+    }
+}
+
+pub(crate) fn invalid_group(name: &str, problem: &str) -> FormatError {
+    FormatError::InvalidRecord {
+        row: 0,
+        message: format!("group '{name}': fixed-width repeating group {problem}"),
     }
 }
 

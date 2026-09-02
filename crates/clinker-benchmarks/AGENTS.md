@@ -33,7 +33,7 @@ for Clinker pipeline YAML configs. It intentionally lives outside
 - `src/runner.rs`: loads benchmark YAML, prepares generated source readers, compiles plans, runs executor, and rewrites split-output temp paths.
 - `src/format_mapping.rs`: converts source `InputFormat` to generated-data `DataFormat` and rejects unsupported benchmark-generation formats.
 - `src/report.rs`: summary table formatting, CI JSON structs, and conversion from `ExecutionReport`.
-- `benches/e2e_matrix.rs`: Criterion matrix over discovered configs at Small, Medium, and Large scales, with a Small pre-flight run.
+- `benches/e2e_matrix.rs`: one Small correctness preflight per discovered config in test mode, and the Criterion matrix over Small, Medium, and Large scales in benchmark mode.
 - `benches/e2e_xlarge.rs`: feature-gated XLarge Criterion benchmark target.
 
 ## Dependency rules
@@ -58,7 +58,9 @@ Existing dependencies are intentional evidence:
 - Benchmark runner code stays outside `clinker-exec`.
 - XLarge setup stays behind `bench-xlarge` and the separate `e2e_xlarge` target.
 - `benches/pipelines/future/` configs are not active benchmark coverage; discovery excludes them through `clinker-bench-support`.
-- `e2e_matrix` pre-flights each config at `Scale::Small` before timed loops.
+- `e2e_matrix` pre-flights each config at `Scale::Small`. Test mode stops after
+  that complete correctness pass; benchmark mode continues into the timed
+  Small, Medium, and Large matrix.
 - Benchmark source data is derived from each source node schema and cached through `BenchDataCache`.
 - Unsupported generated-data mappings are explicit errors for JSON object, EDIFACT, X12, HL7, and SWIFT.
 - Split-output benchmarks need real temp filesystem paths; the runner rewrites placeholder paths under `target/bench-split-tmp`.
@@ -66,7 +68,8 @@ Existing dependencies are intentional evidence:
 
 ## Common mistakes for AI agents to avoid
 
-- Treating `cargo test --benches -p clinker-benchmarks` as a quick compile-only check.
+- Treating `cargo test --benches -p clinker-benchmarks` as a compile-only check;
+  it executes every discovered pipeline once at Small scale.
 - Running real `cargo bench` casually; Criterion runs are expensive and performance-sensitive.
 - Adding benchmark configs under `future/` and assuming they run.
 - Adding a new source format without updating `format_mapping.rs` and generated data support.

@@ -50,7 +50,7 @@ Prefer `--explain text` when reviewing a schema change because the resulting
 plan is visible evidence of what the planner admitted. See [Explain
 Plans](explain.md) for text, JSON, and DOT plan output.
 
-## Concretizing `numeric` source fields
+## Guessing numeric types and repeated source fields
 
 `numeric` is an authoring-only placeholder. Runtime planning still rejects it
 with E158; use `clinker guess` to collect the real readers' parser evidence and
@@ -65,10 +65,12 @@ clinker guess pipeline.yaml --field orders.amount --write
 
 With no selector, the base pipeline is inspected. Exactly one `--channel ID`
 or `--group NAME` selects an effective configuration; the two options conflict.
-Repeatable `--field node.column` selectors only narrow the literal `numeric`
-leaves and preserve their first requested order. A selector can represent more
-than one authored multi-record leaf, and the report gives every exact owner
-address separately.
+Repeatable `--field node.column` selectors narrow literal `numeric` leaves or
+select one concrete column from a single-record CSV, JSON, or XML source for
+multiplicity review. Numeric selectors retain their existing meaning and can
+represent more than one authored multi-record leaf; the report gives every
+exact owner address separately. Concrete multiplicity candidates are limited
+to directly authored columns that do not already declare `multiple: true`.
 
 The default preview is deterministic, bounded, and read-only. It freezes the
 configured stable file order (name ascending by default) and reports the
@@ -85,7 +87,10 @@ limits candidates to 100,000 source-schema leaves. Per owner, at most eight
 representative observations are retained, each with at most 128 bytes of
 numeric lexeme evidence. Coverage retains at most four file details per source
 and reports aggregate sampled, truncated, uncovered, and unreported counts for
-the rest. These fixed bounds are also printed in the JSON report.
+the rest. Multiplicity inference retains counters and a fixed interpretation
+set, never field values or a raw sample corpus. More than 16 distinct CSV
+delimiter candidates is review-only. These fixed bounds are also printed in
+the JSON report when they apply.
 
 The manifest identity covers normalized path, configured order, and discovered
 size; it is not a content hash or a compare-and-swap proof. Preview and check
@@ -95,13 +100,18 @@ after collection and immediately before publication.
 
 `--check` uses the same frozen, capped manifest but reads every selected file
 and record. It is exhaustive over that manifest rather than subject to the
-preview's open/record/byte sampling budgets. `--write` is equally exhaustive,
-but edits only when exactly one resolved owner is an inline, literal `numeric`
-leaf in the base pipeline. An overlay, external/generated owner, alias,
-interpolation, symlink, non-local input, multiple owners, unresolved evidence,
-or changed snapshot leaves the pipeline untouched and reports the patch with
-exit 3. A successful edit changes only the `numeric` token; nullability,
-requiredness, defaults, precision, scale, and every sibling byte are preserved.
+preview's open/record/byte sampling budgets. `--write` is equally exhaustive
+and edits only when exactly one resolved owner is directly authored in the
+base pipeline. Numeric evidence may replace one literal `numeric` leaf.
+Multiplicity evidence may set one column's `multiple: true` and, for CSV, add
+one complete `split_values` entry using the proven delimiter and activated
+escape. Both are one owner mutation. An overlay, external/generated owner,
+alias, interpolation, existing conflicting split declaration, no-op
+already-multiple column, symlink, non-local input, multiple owners, unresolved
+evidence, or changed snapshot leaves the pipeline untouched and reports the
+patch with exit 3. The edit is reparsed and compared with a typed expected
+configuration, so comments, ordering, spans, and every unrelated scalar remain
+unchanged.
 
 Publication holds an advisory `fs4` lock on the stable sibling
 `<CONFIG>.clinker-guess.lock` file through a sibling-temp flush/fsync, final
@@ -120,6 +130,82 @@ when every integer is exactly representable there. Numeric defaults vote
 through the schema parser. Accepted missing/null/empty states abstain but remain
 reported, forbidden absence is a conflict, and all-no-value evidence remains
 unresolved. No confidence threshold or statistical guess is used.
+
+### Repeated-value evidence
+
+Multiplicity is proved per logical record; counts from separate records are
+never added together. The production reader runs against a temporary schema
+clone so it can retain ordered repeated values for observation without changing
+the effective pipeline:
+
+- XML becomes conclusive when one record contains two or more sibling elements
+  at the selected path. A sibling in each of two records is still unconfirmed.
+- JSON becomes conclusive when one record contains an array longer than one.
+  Null, empty, and one-element arrays remain unconfirmed.
+- CSV becomes conclusive only when exactly one delimiter/activated-escape
+  interpretation parses and re-encodes every non-null cell to the original
+  bytes in the source's declared character set, and at least one cell produces
+  multiple values. Two surviving interpretations are review-only.
+
+For example, each selected `tags` field below uses the same existing schema
+surface:
+
+```yaml
+schema:
+  - name: tags
+    type: string
+```
+
+Conclusive XML has two siblings in one `row`:
+
+```xml
+<root><row><tags>a</tags><tags>b</tags></row></root>
+```
+
+Conclusive JSON has an array longer than one:
+
+```json
+[{"tags": []}, {"tags": ["a"]}, {"tags": ["a", "b"]}]
+```
+
+Conclusive CSV has one lossless interpretation:
+
+```csv
+tags
+a|b
+plain
+```
+
+The corresponding safe CSV edit reuses the normal multi-value syntax:
+
+```yaml
+split_values:
+  - field: tags
+    delimiter: "|"
+schema:
+  - name: tags
+    type: string
+    multiple: true
+```
+
+These inputs remain review-only or unconfirmed and cannot write:
+
+```json
+[{"tags": []}, {"tags": ["a"]}, {"tags": ["b"]}]
+```
+
+```csv
+tags
+a|b;c
+d|e;f
+```
+
+Run the exhaustive gate before requesting a write:
+
+```bash
+clinker guess pipeline.yaml --field values.tags --check
+clinker guess pipeline.yaml --field values.tags --write
+```
 
 | Exit | Meaning |
 |------|---------|

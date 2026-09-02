@@ -142,6 +142,9 @@ pub fn column_attrs(col: &Column) -> Vec<(&'static str, serde_json::Value)> {
         allowed_values,
         long_unique,
         multiple,
+        fields,
+        occurs,
+        count_field,
     } = col;
 
     let mut attrs: Vec<(&'static str, serde_json::Value)> = Vec::new();
@@ -178,6 +181,9 @@ pub fn column_attrs(col: &Column) -> Vec<(&'static str, serde_json::Value)> {
     opt!(allowed_values, "enum");
     opt!(long_unique, "long_unique");
     opt!(multiple, "multiple");
+    opt!(fields, "fields");
+    opt!(occurs, "occurs");
+    opt!(count_field, "count_field");
     attrs
 }
 
@@ -433,7 +439,9 @@ impl<'a> SchemaProvRecorder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clinker_format::Column;
+    use clinker_format::{
+        Column, FixedWidthCountField, FixedWidthFill, FixedWidthOccurs, FixedWidthOverflow,
+    };
     use cxl::typecheck::Type;
 
     fn columns(cols: Vec<Column>) -> SourceSchema {
@@ -463,6 +471,43 @@ mod tests {
             winner(&db, "src", "amount", "type"),
             (SchemaLayer::Channel, SchemaAttr::json(&Type::Float))
         );
+    }
+
+    #[test]
+    fn base_seeds_every_fixed_width_group_attribute() {
+        let group = Column {
+            multiple: Some(true),
+            fields: Some(vec![Column {
+                width: Some(2),
+                ..Column::bare("code", Type::String)
+            }]),
+            occurs: Some(FixedWidthOccurs {
+                min: 0,
+                max: 3,
+                fill: FixedWidthFill::Pad,
+                on_overflow: FixedWidthOverflow::Error,
+                keep: None,
+            }),
+            count_field: Some(FixedWidthCountField {
+                name: "transaction_count".to_string(),
+                width: 1,
+            }),
+            ..Column::bare("transactions", Type::Map)
+        };
+        let mut db = SchemaProvenanceDb::default();
+        db.seed_base("src", &columns(vec![group]));
+        let attrs = db.attrs_for("src", "transactions");
+        for attribute in ["fields", "occurs", "count_field"] {
+            assert!(attrs.contains(&attribute), "missing {attribute}: {attrs:?}");
+            assert_eq!(
+                db.get("src", "transactions", attribute)
+                    .expect("group leaf")
+                    .winning_layer()
+                    .expect("winner")
+                    .kind,
+                SchemaLayer::Base
+            );
+        }
     }
 
     /// A later application within one layer replaces the earlier (last-wins).
