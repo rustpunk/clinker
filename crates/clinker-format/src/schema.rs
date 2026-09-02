@@ -40,6 +40,69 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// delimiter. One constant, so read and write never drift apart.
 pub const DEFAULT_VALUE_DELIMITER: &str = ";";
 
+/// Whether unused cells in a bounded fixed-width repeating group keep their
+/// declared space or let following cells move left.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FixedWidthFill {
+    /// Reserve every occurrence slot, padding unused trailing slots.
+    #[default]
+    Pad,
+    /// Emit only populated occurrence slots and shift following fields left.
+    Shift,
+}
+
+/// Behavior when a record supplies more occurrences than the declared bound.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FixedWidthOverflow {
+    /// Reject the complete record before writing any destination bytes.
+    #[default]
+    Error,
+    /// Retain an explicitly selected end of the occurrence list.
+    Truncate,
+}
+
+/// Which end of an overflowing occurrence list survives truncation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FixedWidthTruncateKeep {
+    First,
+    Last,
+}
+
+/// Finite cardinality and physical fill policy for a repeating group.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FixedWidthOccurs {
+    /// Minimum accepted occurrence count. Defaults to zero.
+    #[serde(default)]
+    pub min: usize,
+    /// Maximum occurrence count. Required and validated as positive.
+    pub max: usize,
+    /// Whether unused slots remain padded or subsequent fields shift left.
+    #[serde(default)]
+    pub fill: FixedWidthFill,
+    /// Overflow behavior. Defaults to rejecting the record.
+    #[serde(default)]
+    pub on_overflow: FixedWidthOverflow,
+    /// Required only when `on_overflow: truncate` is selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<FixedWidthTruncateKeep>,
+}
+
+/// A physical occurrence count emitted alongside a repeating group.
+///
+/// This descriptor is layout metadata only. Its `name` is used in diagnostics
+/// and provenance; it is not added to the logical record schema.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FixedWidthCountField {
+    pub name: String,
+    /// Count-cell width in bytes. Required and validated as positive.
+    pub width: usize,
+}
+
 /// One declared source column — the superset of the historical format-layer
 /// `FieldDef` and CXL-layer `ColumnDecl`. Carries a single `type`
 /// ([`cxl::typecheck::Type`]) that drives both byte-level parsing and
@@ -131,6 +194,15 @@ pub struct Column {
     /// column at plan time (E359) rather than degrading it at run time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multiple: Option<bool>,
+    /// Per-occurrence child layout for a bounded fixed-width repeating group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<Column>>,
+    /// Cardinality and fill policy for a bounded fixed-width repeating group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurs: Option<FixedWidthOccurs>,
+    /// Optional derived physical occurrence count. Never a logical column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_field: Option<FixedWidthCountField>,
 }
 
 impl Column {
@@ -158,6 +230,9 @@ impl Column {
             allowed_values: None,
             long_unique: None,
             multiple: None,
+            fields: None,
+            occurs: None,
+            count_field: None,
         }
     }
 

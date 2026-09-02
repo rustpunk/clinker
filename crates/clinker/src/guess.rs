@@ -13,11 +13,12 @@ use clinker_format::numeric_observation::{
     NumericVote, observe_schema_numeric,
 };
 use clinker_format::{
-    ByteTally, Column, FormatReader, NumericObserver, RECORD_TYPE_COLUMN, ReopenableSource,
-    SourceSchema,
+    ByteTally, Charset, Column, FormatReader, NumericObserver, RECORD_TYPE_COLUMN,
+    ReopenableSource, SourceSchema, SplitValues,
 };
 use clinker_plan::config::composition::ScopedSchemaLeafAddress;
-use clinker_plan::config::{PipelineNode, SourceBody, SourceTransport};
+use clinker_plan::config::patch::{MultiplicityConfigEdit, ScopedColumnAddress};
+use clinker_plan::config::{InputFormat, PipelineNode, SourceBody, SourceTransport};
 use clinker_plan::error::PipelineError;
 use clinker_record::{Record, Value};
 use cxl::typecheck::Type;
@@ -34,6 +35,7 @@ const MAX_INPUT_BYTES_TOTAL: u64 = 8 * 1_024 * 1_024;
 const MAX_REPORTED_FILES_PER_SOURCE: usize = 4;
 const MAX_EVIDENCE_PER_OWNER: usize = 8;
 const MAX_SCHEMA_LEAVES: usize = clinker_plan::yaml::MAX_NODES;
+const MAX_CSV_DELIMITER_CANDIDATES: usize = 16;
 
 /// A classified `guess` failure. Selection/configuration errors are command
 /// misuse (exit 1), source I/O and reader failures are infrastructure (exit
@@ -119,6 +121,267 @@ impl Candidate {
     fn selector(&self) -> String {
         format!("{}.{}", self.source, self.column)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultiplicityFormat {
+    Xml,
+    Json,
+    Csv(Charset),
+}
+
+impl MultiplicityFormat {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Xml => "xml",
+            Self::Json => "json",
+            Self::Csv(_) => "csv",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MultiplicityCandidate {
+    source: String,
+    column: String,
+    physical_field: String,
+    address: ScopedColumnAddress,
+    format: MultiplicityFormat,
+    accumulator_index: usize,
+}
+
+impl MultiplicityCandidate {
+    fn selector(&self) -> String {
+        format!("{}.{}", self.source, self.column)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CsvMultiplicityInterpretation {
+    delimiter: char,
+    escape: Option<char>,
+}
+
+#[derive(Debug, Clone)]
+struct CsvInterpretationState {
+    interpretation: CsvMultiplicityInterpretation,
+    viable: bool,
+    delimiter_seen: bool,
+    escape_activated: bool,
+    multi_records: u64,
+}
+
+#[derive(Debug, Clone)]
+struct MultiplicityEvidence {
+    format: MultiplicityFormat,
+    observations: u64,
+    empty_records: u64,
+    singleton_records: u64,
+    multi_records: u64,
+    delimiter_candidates: BTreeSet<char>,
+    candidate_overflow: bool,
+    csv: Vec<CsvInterpretationState>,
+}
+
+impl MultiplicityEvidence {
+    fn new(format: MultiplicityFormat) -> Self {
+        let csv = if matches!(format, MultiplicityFormat::Csv(_)) {
+            csv_interpretations()
+        } else {
+            Vec::new()
+        };
+        Self {
+            format,
+            observations: 0,
+            empty_records: 0,
+            singleton_records: 0,
+            multi_records: 0,
+            delimiter_candidates: BTreeSet::new(),
+            candidate_overflow: false,
+            csv,
+        }
+    }
+
+    fn observe(&mut self, value: Option<&Value>) -> Result<(), GuessError> {
+        self.observations = self.observations.saturating_add(1);
+        match self.format {
+            MultiplicityFormat::Xml | MultiplicityFormat::Json => {
+                let count = match self.format {
+                    MultiplicityFormat::Xml => observe_xml_multiplicity(value),
+                    MultiplicityFormat::Json => observe_json_array_multiplicity(value),
+                    MultiplicityFormat::Csv(_) => unreachable!("format matched above"),
+                };
+                self.observe_count(count);
+                Ok(())
+            }
+            MultiplicityFormat::Csv(charset) => match value {
+                None | Some(Value::Null) => {
+                    self.empty_records = self.empty_records.saturating_add(1);
+                    Ok(())
+                }
+                Some(Value::Array(values)) if values.len() == 1 => match &values[0] {
+                    Value::String(text) => evaluate_csv_multiplicity(self, text.as_str(), charset),
+                    Value::Null => {
+                        self.empty_records = self.empty_records.saturating_add(1);
+                        Ok(())
+                    }
+                    _ => {
+                        self.singleton_records = self.singleton_records.saturating_add(1);
+                        Ok(())
+                    }
+                },
+                Some(Value::String(text)) => {
+                    evaluate_csv_multiplicity(self, text.as_str(), charset)
+                }
+                Some(_) => {
+                    self.singleton_records = self.singleton_records.saturating_add(1);
+                    Ok(())
+                }
+            },
+        }
+    }
+
+    fn observe_count(&mut self, count: usize) {
+        match count {
+            0 => self.empty_records = self.empty_records.saturating_add(1),
+            1 => self.singleton_records = self.singleton_records.saturating_add(1),
+            _ => self.multi_records = self.multi_records.saturating_add(1),
+        }
+    }
+
+    fn observe_csv(&mut self, text: &str, charset: Charset) -> Result<(), GuessError> {
+        for character in text
+            .chars()
+            .filter(|character| is_csv_candidate(*character))
+        {
+            self.delimiter_candidates.insert(character);
+        }
+        if self.delimiter_candidates.len() > MAX_CSV_DELIMITER_CANDIDATES {
+            self.candidate_overflow = true;
+        }
+        let original = charset
+            .encode(text)
+            .map_err(|error| GuessError::infrastructure(error.to_string()))?;
+        for state in &mut self.csv {
+            if !state.viable {
+                continue;
+            }
+            let interpretation = state.interpretation;
+            let activated = interpretation.escape.is_some_and(|escape| {
+                text.contains(&format!("{escape}{}", interpretation.delimiter))
+                    || text.contains(&format!("{escape}{escape}"))
+            });
+            state.escape_activated |= activated;
+            state.delimiter_seen |= text.contains(interpretation.delimiter);
+            let fields = split_csv_cell(text, interpretation);
+            let rendered = join_csv_cell(&fields, interpretation);
+            let encoded = charset
+                .encode(&rendered)
+                .map_err(|error| GuessError::infrastructure(error.to_string()))?;
+            state.viable = encoded == original;
+            if state.viable && fields.len() > 1 {
+                state.multi_records = state.multi_records.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn resolution(&self) -> MultiplicityResolution {
+        match self.format {
+            MultiplicityFormat::Xml | MultiplicityFormat::Json if self.multi_records > 0 => {
+                MultiplicityResolution::Conclusive(MultiplicityConfigEdit::native())
+            }
+            MultiplicityFormat::Xml | MultiplicityFormat::Json => {
+                MultiplicityResolution::Unconfirmed("same_record_multiplicity_unconfirmed")
+            }
+            MultiplicityFormat::Csv(_) if self.candidate_overflow => {
+                MultiplicityResolution::ReviewOnly("candidate_bound_exceeded")
+            }
+            MultiplicityFormat::Csv(_) => {
+                let candidates = self.csv_candidates();
+                match candidates.as_slice() {
+                    [interpretation] => MultiplicityResolution::Conclusive(
+                        MultiplicityConfigEdit::delimited(SplitValues {
+                            field: String::new(),
+                            delimiter: interpretation.delimiter.to_string(),
+                            escape: interpretation
+                                .escape
+                                .map_or_else(String::new, |c| c.to_string()),
+                            json: false,
+                        }),
+                    ),
+                    [] => MultiplicityResolution::Unconfirmed("no_lossless_interpretation"),
+                    _ => MultiplicityResolution::ReviewOnly("ambiguous_interpretation"),
+                }
+            }
+        }
+    }
+
+    fn csv_candidates(&self) -> Vec<CsvMultiplicityInterpretation> {
+        let activated_escapes = self
+            .csv
+            .iter()
+            .filter(|state| state.viable && state.escape_activated)
+            .map(|state| state.interpretation.delimiter)
+            .collect::<HashSet<_>>();
+        let activated_escape_characters = self
+            .csv
+            .iter()
+            .filter(|state| state.viable && state.escape_activated)
+            .filter_map(|state| state.interpretation.escape)
+            .collect::<HashSet<_>>();
+        self.csv
+            .iter()
+            .filter(|state| {
+                state.viable
+                    && state.delimiter_seen
+                    && state.multi_records > 0
+                    && self
+                        .delimiter_candidates
+                        .contains(&state.interpretation.delimiter)
+                    && !activated_escape_characters.contains(&state.interpretation.delimiter)
+                    && match state.interpretation.escape {
+                        Some(_) => state.escape_activated,
+                        None => !activated_escapes.contains(&state.interpretation.delimiter),
+                    }
+            })
+            .map(|state| state.interpretation)
+            .collect()
+    }
+}
+
+enum MultiplicityResolution {
+    Conclusive(MultiplicityConfigEdit),
+    Unconfirmed(&'static str),
+    ReviewOnly(&'static str),
+}
+
+fn observe_xml_multiplicity(value: Option<&Value>) -> usize {
+    same_record_value_count(value)
+}
+
+fn observe_json_array_multiplicity(value: Option<&Value>) -> usize {
+    same_record_value_count(value)
+}
+
+fn same_record_value_count(value: Option<&Value>) -> usize {
+    match value {
+        None | Some(Value::Null) => 0,
+        Some(Value::Array(values)) => values.len(),
+        Some(_) => 1,
+    }
+}
+
+fn evaluate_csv_multiplicity(
+    evidence: &mut MultiplicityEvidence,
+    text: &str,
+    charset: Charset,
+) -> Result<(), GuessError> {
+    evidence.observe_csv(text, charset)
+}
+
+fn validate_multiplicity_exhaustively(evidence: &MultiplicityEvidence) -> MultiplicityResolution {
+    evidence.resolution()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -239,6 +502,8 @@ struct GuessReport {
     limits: LimitsReport,
     coverage: Vec<SourceCoverage>,
     fields: Vec<FieldReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    multiplicity: Vec<MultiplicityReport>,
     patch: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     write: Option<WriteReport>,
@@ -288,6 +553,21 @@ struct LimitsReport {
     max_reported_files_per_source: usize,
     max_numeric_lexeme_evidence_bytes: usize,
     max_evidence_per_owner: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_csv_delimiter_candidates: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct MultiplicityReport {
+    field: String,
+    address: String,
+    format: &'static str,
+    observations: u64,
+    empty_records: u64,
+    singleton_records: u64,
+    multi_records: u64,
+    outcome: &'static str,
+    reason: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -597,9 +877,16 @@ fn run_inner(
     } else {
         true
     };
-    let mut candidates = select_candidates(&effective.config, &args.fields)?;
-    index_numeric_owners(&mut candidates);
-    let accumulators = Arc::new(Mutex::new(build_accumulators(&candidates)));
+    let mut selected = select_candidates(&effective.config, &args.fields)?;
+    index_numeric_owners(&mut selected.numeric);
+    let accumulators = Arc::new(Mutex::new(build_accumulators(&selected.numeric)));
+    let multiplicity_accumulators = Arc::new(Mutex::new(
+        selected
+            .multiplicity
+            .iter()
+            .map(|candidate| MultiplicityEvidence::new(candidate.format))
+            .collect::<Vec<_>>(),
+    ));
     let config_dir = args
         .config
         .parent()
@@ -612,7 +899,7 @@ fn run_inner(
                 args.config.display()
             ))
         })?;
-    let manifest = freeze_manifest(&effective.config, &candidates, &config_dir)?;
+    let manifest = freeze_manifest(&effective.config, &selected, &config_dir)?;
     let input_snapshot = if matches!(mode, GuessMode::Write) {
         Some(InputSnapshot::capture(&manifest)?)
     } else {
@@ -638,22 +925,25 @@ fn run_inner(
     let coverage = match mode {
         GuessMode::Preview => sample_sources_fairly(
             &manifest,
-            &candidates,
+            &selected,
             Arc::clone(&accumulators),
+            Arc::clone(&multiplicity_accumulators),
             &config_dir,
             shutdown,
         )?,
         GuessMode::Check => check_sources_exhaustively(
             &manifest,
-            &candidates,
+            &selected,
             Arc::clone(&accumulators),
+            Arc::clone(&multiplicity_accumulators),
             &config_dir,
             shutdown,
         )?,
         GuessMode::Write => check_sources_exhaustively(
             &manifest,
-            &candidates,
+            &selected,
             Arc::clone(&accumulators),
+            Arc::clone(&multiplicity_accumulators),
             &config_dir,
             shutdown,
         )?,
@@ -666,7 +956,8 @@ fn run_inner(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut edits = Vec::new();
     let mut resolved = true;
-    let fields = candidates
+    let fields = selected
+        .numeric
         .iter()
         .map(|candidate| {
             let owners = candidate
@@ -681,7 +972,7 @@ fn run_inner(
                             "float" => clinker_plan::config::canonical::ConcreteNumericType::Float,
                             _ => unreachable!("numeric resolution returns int or float"),
                         };
-                        edits.push(PatchEdit {
+                        edits.push(PatchEdit::Numeric {
                             owner: owner.address.clone(),
                             replacement,
                             address: owner.address.render(),
@@ -717,8 +1008,66 @@ fn run_inner(
             }
         })
         .collect();
+    let multiplicity_accumulators = multiplicity_accumulators
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let multiplicity = selected
+        .multiplicity
+        .iter()
+        .map(|candidate| {
+            let accumulated = &multiplicity_accumulators[candidate.accumulator_index];
+            let (outcome, reason) = match validate_multiplicity_exhaustively(accumulated) {
+                MultiplicityResolution::Conclusive(mut edit) => {
+                    if let Some(split) = edit.split_values().cloned() {
+                        edit = MultiplicityConfigEdit::delimited(SplitValues {
+                            field: candidate.column.clone(),
+                            ..split
+                        });
+                    }
+                    edits.push(PatchEdit::Multiplicity {
+                        owner: candidate.address.clone(),
+                        edit,
+                    });
+                    ("conclusive", None)
+                }
+                MultiplicityResolution::Unconfirmed(reason) => {
+                    resolved = false;
+                    ("unconfirmed", Some(reason))
+                }
+                MultiplicityResolution::ReviewOnly(reason) => {
+                    resolved = false;
+                    ("review_only", Some(reason))
+                }
+            };
+            MultiplicityReport {
+                field: candidate.selector(),
+                address: candidate.address.render(),
+                format: candidate.format.label(),
+                observations: accumulated.observations,
+                empty_records: accumulated.empty_records,
+                singleton_records: accumulated.singleton_records,
+                multi_records: accumulated.multi_records.max(
+                    accumulated
+                        .csv_candidates()
+                        .iter()
+                        .filter_map(|interpretation| {
+                            accumulated
+                                .csv
+                                .iter()
+                                .find(|state| state.interpretation == *interpretation)
+                                .map(|state| state.multi_records)
+                        })
+                        .max()
+                        .unwrap_or(0),
+                ),
+                outcome,
+                reason,
+            }
+        })
+        .collect();
     let patch = render_patch(&edits);
     drop(accumulators);
+    drop(multiplicity_accumulators);
     let mut write_succeeded = false;
     let write = if matches!(mode, GuessMode::Write) {
         let Some(initial_config) = config_snapshot.as_ref() else {
@@ -789,9 +1138,12 @@ fn run_inner(
             max_numeric_lexeme_evidence_bytes:
                 clinker_format::numeric_observation::MAX_NUMERIC_LEXEME_EVIDENCE_BYTES,
             max_evidence_per_owner: MAX_EVIDENCE_PER_OWNER,
+            max_csv_delimiter_candidates: (!selected.multiplicity.is_empty())
+                .then_some(MAX_CSV_DELIMITER_CANDIDATES),
         },
         coverage,
         fields,
+        multiplicity,
         patch,
         write,
     };
@@ -913,6 +1265,85 @@ impl Drop for ConfigFileLock {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlannedEdit {
+    Numeric(clinker_plan::config::canonical::NumericTypeEdit),
+    Multiplicity(clinker_plan::config::canonical::MultiplicityEdit),
+}
+
+fn plan_proposed_edit(
+    raw: &str,
+    proposed: &PatchEdit,
+) -> Result<Result<PlannedEdit, &'static str>, GuessError> {
+    use clinker_plan::config::canonical::{
+        MultiplicityEditDecision, NumericTypeEditDecision, plan_multiplicity_edit,
+        plan_numeric_type_edit,
+    };
+    let decision = match proposed {
+        PatchEdit::Numeric {
+            owner, replacement, ..
+        } => match plan_numeric_type_edit(raw, owner, *replacement)
+            .map_err(|error| GuessError::infrastructure(error.to_string()))?
+        {
+            NumericTypeEditDecision::Editable(edit) => Ok(PlannedEdit::Numeric(edit)),
+            NumericTypeEditDecision::Ineligible(reason) => Err(reason.as_str()),
+        },
+        PatchEdit::Multiplicity { owner, edit } => match plan_multiplicity_edit(raw, owner, edit)
+            .map_err(|error| GuessError::infrastructure(error.to_string()))?
+        {
+            MultiplicityEditDecision::Editable(edit) => Ok(PlannedEdit::Multiplicity(edit)),
+            MultiplicityEditDecision::Ineligible(reason) => Err(reason.as_str()),
+        },
+    };
+    Ok(decision)
+}
+
+fn apply_planned_edit(raw: &str, edit: &PlannedEdit) -> Result<String, GuessError> {
+    match edit {
+        PlannedEdit::Numeric(edit) => edit.apply(raw),
+        PlannedEdit::Multiplicity(edit) => edit.apply(raw),
+    }
+    .map_err(|error| GuessError::infrastructure(error.to_string()))
+}
+
+fn prove_proposed_raw(
+    original: &str,
+    edited: &str,
+    proposed: &PatchEdit,
+) -> Result<(), GuessError> {
+    use clinker_plan::config::canonical::{
+        prove_multiplicity_only_change, prove_numeric_type_only_change,
+    };
+    match proposed {
+        PatchEdit::Numeric {
+            owner, replacement, ..
+        } => prove_numeric_type_only_change(original, edited, owner, *replacement),
+        PatchEdit::Multiplicity { owner, edit } => {
+            prove_multiplicity_only_change(original, edited, owner, edit)
+        }
+    }
+    .map_err(|error| GuessError::infrastructure(error.to_string()))
+}
+
+fn prove_proposed_resolved(
+    original: &clinker_plan::config::PipelineConfig,
+    edited: &clinker_plan::config::PipelineConfig,
+    proposed: &PatchEdit,
+) -> Result<(), GuessError> {
+    use clinker_plan::config::canonical::{
+        prove_resolved_multiplicity_only_change, prove_resolved_numeric_type_only_change,
+    };
+    match proposed {
+        PatchEdit::Numeric {
+            owner, replacement, ..
+        } => prove_resolved_numeric_type_only_change(original, edited, owner, *replacement),
+        PatchEdit::Multiplicity { owner, edit } => {
+            prove_resolved_multiplicity_only_change(original, edited, owner, edit)
+        }
+    }
+    .map_err(|error| GuessError::infrastructure(error.to_string()))
+}
+
 fn perform_write(
     args: &GuessArgs,
     initial_config: &ConfigSnapshot,
@@ -922,31 +1353,13 @@ fn perform_write(
     config_dir: &Path,
     shutdown: &clinker_exec::pipeline::shutdown::ShutdownToken,
 ) -> Result<WriteReport, GuessError> {
-    use clinker_plan::config::canonical::{
-        NumericTypeEditDecision, plan_numeric_type_edit, prove_numeric_type_only_change,
-        prove_resolved_numeric_type_only_change,
+    let owner = proposed.address();
+    let edit = match plan_proposed_edit(&initial_config.raw, proposed)? {
+        Ok(edit) => edit,
+        Err(reason) => return Ok(WriteReport::not_written(reason, Some(owner))),
     };
-
-    let owner = proposed.address.clone();
-    let edit =
-        match plan_numeric_type_edit(&initial_config.raw, &proposed.owner, proposed.replacement)
-            .map_err(|error| GuessError::infrastructure(error.to_string()))?
-        {
-            NumericTypeEditDecision::Editable(edit) => edit,
-            NumericTypeEditDecision::Ineligible(reason) => {
-                return Ok(WriteReport::not_written(reason.as_str(), Some(owner)));
-            }
-        };
-    let edited = edit
-        .apply(&initial_config.raw)
-        .map_err(|error| GuessError::infrastructure(error.to_string()))?;
-    prove_numeric_type_only_change(
-        &initial_config.raw,
-        &edited,
-        &proposed.owner,
-        proposed.replacement,
-    )
-    .map_err(|error| GuessError::infrastructure(error.to_string()))?;
+    let edited = apply_planned_edit(&initial_config.raw, &edit)?;
+    prove_proposed_raw(&initial_config.raw, &edited, proposed)?;
 
     let _config_lock = match ConfigFileLock::try_acquire(&args.config)? {
         ConfigLockAttempt::Acquired(lock) => lock,
@@ -1123,35 +1536,17 @@ fn perform_write(
                     "cannot resolve staged pipeline config before publication: {error}"
                 ))
             })?;
-    prove_resolved_numeric_type_only_change(
-        &final_effective.config,
-        &staged_effective,
-        &proposed.owner,
-        proposed.replacement,
-    )
-    .map_err(|error| GuessError::infrastructure(error.to_string()))?;
-    match plan_numeric_type_edit(
-        &final_path_snapshot.raw,
-        &proposed.owner,
-        proposed.replacement,
-    )
-    .map_err(|error| GuessError::infrastructure(error.to_string()))?
-    {
-        NumericTypeEditDecision::Editable(current) if current == edit => {}
-        NumericTypeEditDecision::Editable(_) | NumericTypeEditDecision::Ineligible(_) => {
+    prove_proposed_resolved(&final_effective.config, &staged_effective, proposed)?;
+    match plan_proposed_edit(&final_path_snapshot.raw, proposed)? {
+        Ok(current) if current == edit => {}
+        Ok(_) | Err(_) => {
             return Ok(WriteReport::not_written(
                 "owner_changed_before_publication",
                 Some(owner),
             ));
         }
     }
-    prove_numeric_type_only_change(
-        &final_path_snapshot.raw,
-        &edited,
-        &proposed.owner,
-        proposed.replacement,
-    )
-    .map_err(|error| GuessError::infrastructure(error.to_string()))?;
+    prove_proposed_raw(&final_path_snapshot.raw, &edited, proposed)?;
 
     // Re-hash the complete bounded input snapshot after staged semantic
     // resolution so input equality is the last potentially long operation
@@ -1391,11 +1786,17 @@ fn resolve_effective_config(args: &GuessArgs) -> Result<EffectiveConfig, GuessEr
     Ok(EffectiveConfig { config, selection })
 }
 
+struct SelectedCandidates {
+    numeric: Vec<Candidate>,
+    multiplicity: Vec<MultiplicityCandidate>,
+}
+
 fn select_candidates(
     config: &clinker_plan::config::PipelineConfig,
     requested: &[String],
-) -> Result<Vec<Candidate>, GuessError> {
+) -> Result<SelectedCandidates, GuessError> {
     let mut candidates = IndexMap::new();
+    let mut multiplicity = IndexMap::new();
     let mut all_fields: HashMap<String, Vec<Type>> = HashMap::new();
     let mut schema_leaves = 0usize;
     for node in &config.nodes {
@@ -1418,6 +1819,11 @@ fn select_candidates(
                         column,
                         true,
                     )?;
+                    if let Some(candidate) =
+                        select_multiplicity_candidates(&header.name, body, column)?
+                    {
+                        multiplicity.insert(candidate.selector(), candidate);
+                    }
                 }
             }
             SourceSchema::MultiRecord { record_types, .. } => {
@@ -1438,13 +1844,16 @@ fn select_candidates(
             SourceSchema::Generated(_) | SourceSchema::File(_) => {}
         }
     }
-    if candidates.is_empty() {
-        return Err(GuessError::configuration(
-            "the selected effective configuration has no literal `numeric` source-schema leaves; correction: declare `type: numeric` on an inference-only source column",
-        ));
-    }
     if requested.is_empty() {
-        return Ok(candidates.into_values().collect());
+        if candidates.is_empty() {
+            return Err(GuessError::configuration(
+                "the selected effective configuration has no literal `numeric` source-schema leaves; correction: declare `type: numeric` on an inference-only source column or select one concrete field for multiplicity review",
+            ));
+        }
+        return Ok(SelectedCandidates {
+            numeric: candidates.into_values().collect(),
+            multiplicity: Vec::new(),
+        });
     }
 
     let mut requested_once = IndexSet::new();
@@ -1456,36 +1865,80 @@ fn select_candidates(
         }
         requested_once.insert(field.clone());
     }
-    let by_selector = candidates;
-    requested_once
-        .into_iter()
-        .map(|field| {
-            if let Some(candidate) = by_selector.get(&field) {
-                return Ok(candidate.clone());
-            }
-            if let Some(concrete) = all_fields.get(&field) {
-                let concrete = concrete
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                Err(GuessError::configuration(format!(
-                    "--field {field:?} has only concrete declaration(s) ({concrete}), not `numeric`; correction: remove that selector or point it at a literal `numeric` source column"
-                )))
-            } else {
-                Err(GuessError::configuration(format!(
-                    "unknown --field {field:?}; correction: use one of {}",
-                    {
-                        let mut selectors = by_selector.keys().cloned().collect::<Vec<_>>();
-                        selectors.sort();
-                        selectors.join(", ")
-                    }
-                )))
-            }
-        })
-        .collect()
+    let mut selected_numeric = Vec::new();
+    let mut selected_multiplicity = Vec::new();
+    for field in requested_once {
+        if let Some(candidate) = candidates.get(&field) {
+            selected_numeric.push(candidate.clone());
+            continue;
+        }
+        if let Some(candidate) = multiplicity.get(&field) {
+            let mut candidate = candidate.clone();
+            candidate.accumulator_index = selected_multiplicity.len();
+            selected_multiplicity.push(candidate);
+            continue;
+        }
+        if let Some(concrete) = all_fields.get(&field) {
+            let concrete = concrete
+                .iter()
+                .map(ToString::to_string)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(GuessError::configuration(format!(
+                "--field {field:?} has concrete declaration(s) ({concrete}) but its source format cannot supply multiplicity evidence; correction: select a single-record CSV, JSON, or XML source column"
+            )));
+        }
+        let mut selectors = candidates
+            .keys()
+            .chain(multiplicity.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        selectors.sort();
+        selectors.dedup();
+        return Err(GuessError::configuration(format!(
+            "unknown --field {field:?}; correction: use one of {}",
+            selectors.join(", ")
+        )));
+    }
+    Ok(SelectedCandidates {
+        numeric: selected_numeric,
+        multiplicity: selected_multiplicity,
+    })
+}
+
+fn select_multiplicity_candidates(
+    source: &str,
+    body: &SourceBody,
+    column: &Column,
+) -> Result<Option<MultiplicityCandidate>, GuessError> {
+    if column.is_multiple() || source.starts_with('$') || column.name.starts_with('$') {
+        return Ok(None);
+    }
+    let format = match &body.source.format {
+        InputFormat::Xml(_) => MultiplicityFormat::Xml,
+        InputFormat::Json(_) => MultiplicityFormat::Json,
+        InputFormat::Csv(options) => {
+            let charset = options
+                .as_ref()
+                .and_then(|options| options.encoding.as_deref())
+                .map(Charset::from_name)
+                .transpose()
+                .map_err(|error| GuessError::configuration(error.to_string()))?
+                .unwrap_or_default();
+            MultiplicityFormat::Csv(charset)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(MultiplicityCandidate {
+        source: source.to_owned(),
+        column: column.name.clone(),
+        physical_field: column.physical_name().to_owned(),
+        address: ScopedColumnAddress::new(source, &column.name),
+        format,
+        accumulator_index: usize::MAX,
+    }))
 }
 
 fn register_candidate_column(
@@ -1750,12 +2203,19 @@ fn read_capped_config(reader: impl Read) -> std::io::Result<String> {
 
 fn freeze_manifest<'a>(
     config: &'a clinker_plan::config::PipelineConfig,
-    candidates: &[Candidate],
+    candidates: &SelectedCandidates,
     config_dir: &Path,
 ) -> Result<Vec<FrozenSource<'a>>, GuessError> {
     let selected_sources = candidates
+        .numeric
         .iter()
         .map(|candidate| candidate.source.as_str())
+        .chain(
+            candidates
+                .multiplicity
+                .iter()
+                .map(|candidate| candidate.source.as_str()),
+        )
         .collect::<IndexSet<_>>();
     let mut manifest = Vec::with_capacity(selected_sources.len());
     let mut retained_files = 0usize;
@@ -1850,6 +2310,7 @@ struct ActiveReader {
     tally: ByteTally,
     observation_state: Arc<Mutex<ReaderObservationState>>,
     field_map: Arc<ObserverFieldMap>,
+    multiplicity_fields: Vec<(String, usize)>,
     records: u64,
     numeric_errors: u64,
 }
@@ -1879,11 +2340,22 @@ fn open_reader(
     source_index: usize,
     source: &FrozenSource<'_>,
     file: &clinker_plan::config::discovery::DiscoveredFile,
-    candidates: &[Candidate],
+    candidates: &SelectedCandidates,
     accumulators: Arc<Mutex<Vec<FieldAccumulator>>>,
     config_dir: &Path,
 ) -> Result<ActiveReader, GuessError> {
-    let field_map = Arc::new(observer_field_map(candidates, &source.source));
+    let field_map = Arc::new(observer_field_map(&candidates.numeric, &source.source));
+    let multiplicity_fields = candidates
+        .multiplicity
+        .iter()
+        .filter(|candidate| candidate.source == source.source)
+        .map(|candidate| {
+            (
+                candidate.physical_field.clone(),
+                candidate.accumulator_index,
+            )
+        })
+        .collect::<Vec<_>>();
     let observation_state = Arc::new(Mutex::new(ReaderObservationState::default()));
     let observer_map = Arc::clone(&field_map);
     let observer_state = Arc::clone(&observation_state);
@@ -1940,9 +2412,11 @@ fn open_reader(
     let byte_source = ReopenableSource::path(open_path)
         .with_exact_len(file.size)
         .with_tally(tally.clone());
+    let probe_schema =
+        build_multiplicity_probe_schema(&source.body.schema, candidates, &source.source);
     let reader = clinker_exec::executor::build_source_format_reader(
         &source.body.source,
-        &source.body.schema,
+        &probe_schema,
         source.body.on_unmapped.clone(),
         byte_source,
         Some(observer),
@@ -1956,6 +2430,7 @@ fn open_reader(
         tally,
         observation_state,
         field_map,
+        multiplicity_fields,
         records: 0,
         numeric_errors: 0,
     })
@@ -1964,6 +2439,7 @@ fn open_reader(
 fn next_observed_record(
     active: &mut ActiveReader,
     accumulators: &Arc<Mutex<Vec<FieldAccumulator>>>,
+    multiplicity_accumulators: &Arc<Mutex<Vec<MultiplicityEvidence>>>,
 ) -> Result<ReaderStep, GuessError> {
     active
         .observation_state
@@ -1980,6 +2456,12 @@ fn next_observed_record(
                 state.seen.clone()
             };
             complete_absence_observations(&active.field_map, &record, &seen, accumulators);
+            let mut accumulated = multiplicity_accumulators
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (field, index) in &active.multiplicity_fields {
+                accumulated[*index].observe(record.get(field))?;
+            }
             active.records = active.records.saturating_add(1);
             Ok(ReaderStep::Record)
         }
@@ -2060,6 +2542,29 @@ fn next_observed_record(
     }
 }
 
+fn build_multiplicity_probe_schema(
+    schema: &SourceSchema,
+    candidates: &SelectedCandidates,
+    source: &str,
+) -> SourceSchema {
+    let mut probe = schema.clone();
+    if let SourceSchema::Columns(columns) = &mut probe {
+        for candidate in candidates
+            .multiplicity
+            .iter()
+            .filter(|candidate| candidate.source == source)
+        {
+            if let Some(column) = columns
+                .iter_mut()
+                .find(|column| column.name == candidate.column)
+            {
+                column.multiple = Some(true);
+            }
+        }
+    }
+    probe
+}
+
 fn complete_absence_observations(
     field_map: &ObserverFieldMap,
     record: &Record,
@@ -2119,8 +2624,9 @@ fn finish_reader(active: ActiveReader, coverage: &mut [SourceCoverage], truncate
 
 fn sample_sources_fairly(
     manifest: &[FrozenSource<'_>],
-    candidates: &[Candidate],
+    candidates: &SelectedCandidates,
     accumulators: Arc<Mutex<Vec<FieldAccumulator>>>,
+    multiplicity_accumulators: Arc<Mutex<Vec<MultiplicityEvidence>>>,
     config_dir: &Path,
     shutdown: &clinker_exec::pipeline::shutdown::ShutdownToken,
 ) -> Result<Vec<SourceCoverage>, GuessError> {
@@ -2165,7 +2671,7 @@ fn sample_sources_fairly(
         let Some(mut reader) = active.pop_front() else {
             break;
         };
-        match next_observed_record(&mut reader, &accumulators)? {
+        match next_observed_record(&mut reader, &accumulators, &multiplicity_accumulators)? {
             ReaderStep::Record | ReaderStep::NumericError => {
                 records = records.saturating_add(1);
                 maybe_inject_interruption(shutdown, interrupt_after, records);
@@ -2185,8 +2691,9 @@ fn sample_sources_fairly(
 
 fn check_sources_exhaustively(
     manifest: &[FrozenSource<'_>],
-    candidates: &[Candidate],
+    candidates: &SelectedCandidates,
     accumulators: Arc<Mutex<Vec<FieldAccumulator>>>,
+    multiplicity_accumulators: Arc<Mutex<Vec<MultiplicityEvidence>>>,
     config_dir: &Path,
     shutdown: &clinker_exec::pipeline::shutdown::ShutdownToken,
 ) -> Result<Vec<SourceCoverage>, GuessError> {
@@ -2210,7 +2717,8 @@ fn check_sources_exhaustively(
                 if shutdown.is_requested() {
                     return Err(GuessError::interrupted());
                 }
-                match next_observed_record(&mut reader, &accumulators)? {
+                match next_observed_record(&mut reader, &accumulators, &multiplicity_accumulators)?
+                {
                     ReaderStep::Record | ReaderStep::NumericError => {
                         total_records = total_records.saturating_add(1);
                         maybe_inject_interruption(shutdown, interrupt_after, total_records);
@@ -2362,21 +2870,54 @@ fn stable_input_path(path: &Path, config_dir: &Path) -> String {
         .replace('\\', "/")
 }
 
-struct PatchEdit {
-    owner: ScopedSchemaLeafAddress,
-    replacement: clinker_plan::config::canonical::ConcreteNumericType,
-    address: String,
-    from_type: String,
-    to_type: String,
+enum PatchEdit {
+    Numeric {
+        owner: ScopedSchemaLeafAddress,
+        replacement: clinker_plan::config::canonical::ConcreteNumericType,
+        address: String,
+        from_type: String,
+        to_type: String,
+    },
+    Multiplicity {
+        owner: ScopedColumnAddress,
+        edit: MultiplicityConfigEdit,
+    },
+}
+
+impl PatchEdit {
+    fn address(&self) -> String {
+        match self {
+            Self::Numeric { address, .. } => address.clone(),
+            Self::Multiplicity { owner, .. } => owner.render(),
+        }
+    }
 }
 
 fn render_patch(edits: &[PatchEdit]) -> String {
     let mut patch = String::from("edits:\n");
     for edit in edits {
-        patch.push_str(&format!(
-            "  - address: {}\n    from: {}\n    to: {}\n",
-            edit.address, edit.from_type, edit.to_type
-        ));
+        match edit {
+            PatchEdit::Numeric {
+                address,
+                from_type,
+                to_type,
+                ..
+            } => patch.push_str(&format!(
+                "  - address: {address}\n    from: {from_type}\n    to: {to_type}\n"
+            )),
+            PatchEdit::Multiplicity { owner, edit } => {
+                patch.push_str(&format!(
+                    "  - address: {}\n    from: false\n    to: true\n",
+                    owner.render()
+                ));
+                if let Some(split) = edit.split_values() {
+                    patch.push_str(&format!(
+                        "    split_values:\n      delimiter: {:?}\n      escape: {:?}\n",
+                        split.delimiter, split.escape
+                    ));
+                }
+            }
+        }
     }
     patch
 }
@@ -2407,6 +2948,91 @@ fn contains_numeric_leaf(ty: &Type) -> bool {
         | Type::Map
         | Type::Any => false,
     }
+}
+
+fn is_csv_candidate(character: char) -> bool {
+    character.is_ascii_graphic()
+        && !character.is_ascii_alphanumeric()
+        && !matches!(character, '\'' | '"')
+}
+
+fn csv_interpretations() -> Vec<CsvInterpretationState> {
+    let punctuation = ('!'..='~')
+        .filter(|character| is_csv_candidate(*character))
+        .collect::<Vec<_>>();
+    let mut interpretations =
+        Vec::with_capacity(punctuation.len().saturating_mul(punctuation.len()));
+    for delimiter in &punctuation {
+        interpretations.push(CsvInterpretationState {
+            interpretation: CsvMultiplicityInterpretation {
+                delimiter: *delimiter,
+                escape: None,
+            },
+            viable: true,
+            delimiter_seen: false,
+            escape_activated: false,
+            multi_records: 0,
+        });
+        for escape in punctuation.iter().filter(|escape| *escape != delimiter) {
+            interpretations.push(CsvInterpretationState {
+                interpretation: CsvMultiplicityInterpretation {
+                    delimiter: *delimiter,
+                    escape: Some(*escape),
+                },
+                viable: true,
+                delimiter_seen: false,
+                escape_activated: false,
+                multi_records: 0,
+            });
+        }
+    }
+    interpretations
+}
+
+fn split_csv_cell(text: &str, interpretation: CsvMultiplicityInterpretation) -> Vec<String> {
+    let mut fields = vec![String::new()];
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if interpretation.escape == Some(character)
+            && characters.peek().is_some_and(|next| {
+                *next == interpretation.delimiter || Some(*next) == interpretation.escape
+            })
+        {
+            if let Some(escaped) = characters.next() {
+                fields
+                    .last_mut()
+                    .expect("one CSV field exists")
+                    .push(escaped);
+            }
+        } else if character == interpretation.delimiter {
+            fields.push(String::new());
+        } else {
+            fields
+                .last_mut()
+                .expect("one CSV field exists")
+                .push(character);
+        }
+    }
+    fields
+}
+
+fn join_csv_cell(fields: &[String], interpretation: CsvMultiplicityInterpretation) -> String {
+    let mut rendered = String::new();
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            rendered.push(interpretation.delimiter);
+        }
+        for character in field.chars() {
+            if interpretation.escape.is_some()
+                && (character == interpretation.delimiter
+                    || Some(character) == interpretation.escape)
+            {
+                rendered.push(interpretation.escape.expect("escape is present"));
+            }
+            rendered.push(character);
+        }
+    }
+    rendered
 }
 
 fn boundary_label(boundary: NumericBoundary) -> &'static str {

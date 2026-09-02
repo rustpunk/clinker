@@ -95,6 +95,27 @@ fn exact_workflow_verify_argv_accepts_the_governed_repository() {
 }
 
 #[test]
+fn ci_workflow_rejects_a_pull_request_base_filter() {
+    let root = fixture();
+    let source = ci_workflow();
+    let restricted = source.replacen(
+        "  pull_request: {}",
+        "  pull_request:\n    branches: [main]",
+        1,
+    );
+    assert_ne!(restricted, source, "scenario fixture must change");
+    write_workflow(root.path(), "ci.yml", &restricted);
+
+    let output = gate(root.path());
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("CI pull_request trigger must match every base branch")
+    );
+}
+
+#[test]
 fn release_workflow_requires_every_build_and_assembly_stage_in_order() {
     let root = fixture();
     let source = release_workflow();

@@ -1,0 +1,58 @@
+{
+  "examples/pipelines/compositions/clean_names.comp.yaml": {
+    "input": "first_name,last_name\n Ada , Lovelace \nGrace,Hopper\n",
+    "expected": "first_name,last_name,full_name,name_key\n Ada , Lovelace ,Ada Lovelace,ada_lovelace\nGrace,Hopper,Grace Hopper,grace_hopper\n",
+    "counters": {
+      "total": 2,
+      "ok": 2,
+      "written": 2,
+      "dlq": 0
+    }
+  },
+  "examples/pipelines/compositions/fiscal_date.comp.yaml": {
+    "input": "invoice_date\n2026-02-15\n2026-04-10\n",
+    "expected": "invoice_date,fiscal_year,fiscal_quarter,fiscal_month,fiscal_period,is_current_fy\n2026-02-15,2026,Q4,11,FY2026-Q4,false\n2026-04-10,2027,Q1,1,FY2027-Q1,true\n",
+    "counters": {
+      "total": 2,
+      "ok": 2,
+      "written": 2,
+      "dlq": 0
+    },
+    "config": {
+      "as_of_date": "2026-07-01"
+    }
+  },
+  "examples/pipelines/compositions/order_classification.comp.yaml": {
+    "input": "line_total,shipping_method,status,order_date_parsed\n1200.0,overnight,pending,2026-06-20\n300.0,standard,pending,2026-06-29\n",
+    "expected": "line_total,shipping_method,status,order_date_parsed,value_tier,priority_level,days_since_order,fulfillment_risk,order_score\n1200,overnight,pending,2026-06-20,premium,urgent,11,overdue,12.3\n300,standard,pending,2026-06-29,standard,normal,2,ok,2.1333333333333333\n",
+    "counters": {
+      "total": 2,
+      "ok": 2,
+      "written": 2,
+      "dlq": 0
+    },
+    "config": {
+      "as_of_date": "2026-07-01"
+    }
+  },
+  "examples/pipelines/compositions/shipping_cost.comp.yaml": {
+    "input": "weight_kg,shipping_method,quantity\n2.5,express,3\n1.2,standard,2\n",
+    "expected": "weight_kg,shipping_method,quantity,shipping_weight,base_shipping,shipping_cost\n2.5,express,3,7.5,2.5,18.75\n1.2,standard,2,2.4,1.2,2.88\n",
+    "counters": {
+      "total": 2,
+      "ok": 2,
+      "written": 2,
+      "dlq": 0
+    }
+  },
+  "examples/pipelines/compositions/validate_email.comp.yaml": {
+    "input": "email\n  ADA@Example.COM  \ninvalid-address\n",
+    "expected": "email,email_lower,email_valid,email_domain\n  ADA@Example.COM  ,ada@example.com,true,example.com\ninvalid-address,invalid-address,false,\n",
+    "counters": {
+      "total": 2,
+      "ok": 2,
+      "written": 2,
+      "dlq": 0
+    }
+  }
+}

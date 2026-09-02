@@ -77,3 +77,42 @@ The remediation is to set every merge upstream source to the same `on_unmapped` 
 Fixed-width sources are positional: the schema is constructed from `width` / `start..end` byte ranges, and bytes outside the declared ranges are invisible to the reader. There is no notion of an "undeclared field" to absorb — a byte either falls inside a declared range (and becomes a declared column) or is never read. `auto_widen` therefore can never populate the sidecar for a fixed-width source; the `$widened` slot stays `Value::Null` for every record.
 
 Because the policy is silently inert rather than wrong, the executor emits a `tracing::info` diagnostic at source-reader construction time when `auto_widen` is the policy on a fixed-width source, naming the source. The diagnostic fires once per reader instance — a source used as a combine build-side input across multiple combines may produce one log line per combine. To avoid the noise, switch to `on_unmapped: drop` (or `reject`) for explicit scalar semantics, or accept the empty sidecar.
+
+## Guess multiplicity authoring proof
+
+`clinker guess --field <source>.<column>` can review a directly authored,
+single-record CSV, JSON, or XML column that is not already multiple. This is an
+authoring path, not runtime schema drift: it never writes `$widened`, resolved
+layout names, or any other system field into author vocabulary.
+
+The read pass clones the selected source schema and marks candidate columns
+multiple only in that finite probe. The ordinary format reader then returns the
+same ordered `Value::Array` shape runtime ingestion would use after an author
+declares `multiple: true`. XML sibling and JSON array counts are inspected per
+record, so two singleton records cannot combine into proof. Null, empty, and
+singleton evidence is counted but abstains.
+
+CSV retains one fixed-size state table rather than cells. Delimiter candidates
+come from observed non-alphanumeric, non-whitespace characters and are capped
+at 16 distinct values. Escape handling is active only after an observed
+escape-before-delimiter or escape-before-escape sequence. Each live
+interpretation splits and re-encodes through the source `Charset`; byte
+inequality removes it. Exhaustive check/write requires one survivor across
+every non-null cell and at least one multi-token cell. No survivor is
+unconfirmed, while several survivors or a candidate-bound overflow is
+review-only.
+
+A conclusive edit goes through the same guarded publication path as numeric
+concretization: frozen input hashes, stable lock, staged sibling file, direct
+owner re-resolution, exact-byte comparisons, typed semantic proof, atomic
+replacement, and parent-directory sync. The typed mutation sets `multiple`
+and, only for CSV, one complete `split_values` value. An already-multiple
+column, conflicting split declaration, indirect owner, sibling semantic
+change, interruption, or competing writer produces no publication. Reports
+contain paths, counters, proof states, and proposed syntax, but never sampled
+field values.
+
+This authoring-only work changes neither row selection nor field values in an
+executed plan, so it adds no lineage edge. It reuses the fixed-cardinality Guess
+lifecycle signals and retains only bounded counters/interpretation state; no
+new execution span, metric label, or memory consumer is introduced.

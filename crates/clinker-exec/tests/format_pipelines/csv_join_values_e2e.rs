@@ -1,4 +1,5 @@
-//! End-to-end proof that a CSV sink joins a `multiple:` field into one
+//! End-to-end proof, in the shared format-pipeline harness, that a CSV sink
+//! joins a `multiple:` field into one
 //! delimited cell, and that a `join_values` `on_conflict: error` collision
 //! dead-letters the offending record (naming the field and value) instead of
 //! aborting the run — the central acceptance criterion of #917.
@@ -9,7 +10,7 @@
 //! error to the DLQ under `Continue`. Both the buffered arm (source → output)
 //! and the streaming fused arm (source → transform → output) are exercised.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 

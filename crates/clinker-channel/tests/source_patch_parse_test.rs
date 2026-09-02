@@ -72,7 +72,8 @@ sources:
     assert!(matches!(
         patch.split_values.get("tags"),
         Some(SplitValuesOp::Set {
-            delimiter: Some(Some(d))
+            delimiter: Some(Some(d)),
+            ..
         }) if d == ";"
     ));
     assert!(matches!(
@@ -176,7 +177,8 @@ sources:
     assert!(matches!(
         o.sources["src"].split_values.get("codes"),
         Some(SplitValuesOp::Set {
-            delimiter: Some(None)
+            delimiter: Some(None),
+            ..
         })
     ));
 }
