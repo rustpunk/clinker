@@ -198,13 +198,20 @@ nodes:
     path: out.csv
     include_unmapped: true
 "#;
-    let csv = "dept,salary,notes,extra\nA,100,n1,e1\nA,200,n2,e2\nB,300,n3,e3\n";
+    let csv = "dept,salary,notes,extra\nA,100,n1,e1\nA,200,n2,e2\nB,400,n3,e3\n";
     let (_report, output) = run_single(yaml, csv);
-    let header = output.lines().next().expect("header");
+    let mut rows: Vec<&str> = output.lines().collect();
+    let header = rows.remove(0);
+    rows.sort_unstable();
     assert_eq!(
         header, "dept,total",
         "aggregate output header must be exactly [dept,total] — sidecar is Null at \
          aggregate boundary so include_unmapped: true expands to nothing. got: {header}"
+    );
+    assert_eq!(
+        rows,
+        ["A,300", "B,400"],
+        "the aggregate must preserve grouping and sums while dropping the sidecar. got: {rows:?}"
     );
 }
 
@@ -238,15 +245,23 @@ nodes:
     path: out.csv
     include_unmapped: true
 "#;
-    let csv = "dept,salary,notes,extra\nA,100,n1,e1\nA,200,n2,e2\nB,300,n3,e3\n";
+    let csv = "dept,salary,notes,extra\nA,100,n1,e1\nA,200,n2,e2\nB,400,n3,e3\n";
     let root = fixture_workspace_root();
     let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
     let (_report, output) = run_single_in_context(yaml, csv, &ctx);
-    let header = output.lines().next().expect("header");
+    let mut rows: Vec<&str> = output.lines().collect();
+    let header = rows.remove(0);
+    rows.sort_unstable();
     assert_eq!(
         header, "dept,total",
         "the aggregate terminal sets `$widened` to Null, so the parent sink must not expand \
          body-input sidecar keys. got: {header}"
+    );
+    assert_eq!(
+        rows,
+        ["A,300", "B,400"],
+        "the composition boundary must preserve the body aggregate's grouping and sums. \
+         got: {rows:?}"
     );
 }
 
@@ -372,17 +387,11 @@ nodes:
     let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
     let (_report, output) =
         run_two_source_in_context(yaml, "orders", orders, "products", products, &ctx);
-    let header = output.lines().next().expect("header");
-    let cols: Vec<&str> = header.split(',').collect();
-    assert!(
-        cols.contains(&"region"),
-        "the first-mode combine terminal must carry the driver's `$widened` payload through \
-         the composition boundary. got: {header}"
-    );
-    assert!(
-        !cols.contains(&"category"),
-        "the combine terminal must not carry the build-side `$widened` payload through the \
-         composition boundary. got: {header}"
+    assert_eq!(
+        output, "order_id,product_name,total,region\nO1,Widget,20,US\n",
+        "the first-mode combine terminal must carry the driver's `$widened` payload (region) \
+         through the composition boundary and must not carry the build side's (category), and \
+         the join must still produce the enriched row. got: {output}"
     );
 }
 
