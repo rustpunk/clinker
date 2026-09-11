@@ -1,0 +1,20 @@
+_compose:
+  name: auto_widen_aggregate_terminal
+  inputs:
+    rows:
+      schema:
+        - { name: dept, type: string }
+        - { name: salary, type: int }
+  outputs:
+    summarized: dept_totals
+  config_schema: {}
+
+nodes:
+  - type: aggregate
+    name: dept_totals
+    input: rows
+    config:
+      group_by: [dept]
+      cxl: |
+        emit dept = dept
+        emit total = sum(salary)
