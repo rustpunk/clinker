@@ -159,6 +159,10 @@ fn memory_failed_stage_cannot_seal_and_grants_move_split_merge() {
     assert_eq!(provider.used(), 0);
     let mut stage = scope.stage().unwrap();
     assert!(stage.write_all(&[1; 256 * 1024]).is_err());
+    assert_eq!(
+        stage.failure().unwrap().kind,
+        clinker_format::preparation::ResourceErrorKind::Budget
+    );
     assert!(stage.finish().is_err());
     assert_eq!(provider.used(), 0);
 }

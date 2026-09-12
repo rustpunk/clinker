@@ -1,4 +1,5 @@
 pub mod capabilities;
+pub mod preparation;
 pub mod stage_metrics;
 
 pub(crate) mod aggregate_dispatch;
@@ -639,7 +640,14 @@ impl PipelineExecutor {
         // workspace `clinker.toml` (a runtime parameter), not the per-pipeline
         // `memory:` block the arbitrator builder reads.
         if let Some(cap) = params.spill_disk_cap_bytes {
-            arbitrator.set_max_spill_bytes(cap);
+            arbitrator.set_max_spill_bytes(cap).map_err(|error| {
+                PipelineError::spill_cap_exceeded(
+                    "writer resources",
+                    cap,
+                    error.requested as u64,
+                    arbitrator.writer_resource_usage().disk,
+                )
+            })?;
         }
         let memory_budget = std::sync::Arc::new(arbitrator);
         Self::run_with_readers_writers_with_arbitrator_and_activation(

@@ -1412,7 +1412,7 @@ mod tests {
         ));
         // A one-byte disk quota: the mem-tail flush overflows it on the first
         // write, regardless of how the soft memory limit is set.
-        arbitrator.set_max_spill_bytes(1);
+        arbitrator.set_max_spill_bytes(1).unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
 
         let handle = crate::pipeline::memory::ConsumerHandle::new();

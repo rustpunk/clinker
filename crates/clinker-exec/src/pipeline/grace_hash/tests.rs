@@ -966,7 +966,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         0.000_000_5,
         Box::new(NoOpPolicy),
     );
-    budget.set_max_spill_bytes(64);
+    budget.set_max_spill_bytes(64).unwrap();
 
     let combined_schema = clinker_record::SchemaBuilder::new()
         .with_field("dk")
@@ -1054,7 +1054,7 @@ fn build_eviction_spill_commit_trips_disk_cap_mid_stream() {
     // the first eviction commit overshoots; hard limit huge so
     // `should_abort` never fires.
     let budget = tiny_budget();
-    budget.set_max_spill_bytes(1);
+    budget.set_max_spill_bytes(1).unwrap();
 
     let total = 4096usize;
     let mut fed = 0usize;
@@ -1139,7 +1139,7 @@ fn build_eviction_spill_commit_trips_disk_cap_mid_stream() {
 
 /// Per-commit enforcement on the build-side OnDisk immediate-write path:
 /// once a partition is already spilled, each subsequent record streams to
-/// its own file and must charge the cap on that commit. A 1-byte cap trips
+/// its own file and must charge the cap on that commit. An exhausted cap trips
 /// on the FIRST such record rather than accumulating a fresh file per row
 /// until the phase ends.
 #[test]
@@ -1185,10 +1185,10 @@ fn build_ondisk_immediate_write_commit_trips_disk_cap() {
     let after_pre_spill = budget.cumulative_spill_bytes();
     assert!(after_pre_spill > 0, "pre-spill must have committed a file");
 
-    // Clamp the cap to 1 byte. The next record routed to the OnDisk
+    // Clamp the cap to the already committed bytes. The next OnDisk record
     // partition streams straight to a fresh file and charges on commit,
     // which must trip immediately.
-    budget.set_max_spill_bytes(1);
+    budget.set_max_spill_bytes(after_pre_spill).unwrap();
 
     let total = 8usize;
     let mut fed = 0usize;
@@ -1207,7 +1207,7 @@ fn build_ondisk_immediate_write_commit_trips_disk_cap() {
         }
     }
 
-    let err = hit.expect("1-byte cap must abort the OnDisk immediate write");
+    let err = hit.expect("exhausted cap must abort the OnDisk immediate write");
     match &err {
         GraceSpillError::CapExceeded {
             attempted,
@@ -1218,7 +1218,7 @@ fn build_ondisk_immediate_write_commit_trips_disk_cap() {
                 *attempted > 0,
                 "the immediate-write commit must report its size"
             );
-            assert_eq!(*cap, 1);
+            assert_eq!(*cap, after_pre_spill);
             assert!(
                 *cumulative > *cap,
                 "cumulative ({cumulative}) must exceed cap ({cap})"
@@ -1243,7 +1243,7 @@ fn build_ondisk_immediate_write_commit_trips_disk_cap() {
             current,
         } => {
             assert_eq!(node, "join_ondisk");
-            assert_eq!(cap, 1);
+            assert_eq!(cap, after_pre_spill);
             assert!(attempted > 0);
             assert!(current > cap);
         }
@@ -1252,7 +1252,7 @@ fn build_ondisk_immediate_write_commit_trips_disk_cap() {
 }
 
 /// Per-commit enforcement on the probe-finalize path: each partition's
-/// buffered probe writer is committed and charged in turn, so a 1-byte cap
+/// buffered probe writer is committed and charged in turn, so an exhausted cap
 /// trips on the FIRST partition finalized and leaves later partitions'
 /// writers unflushed — rather than finalizing every open writer and only
 /// then checking the total.
@@ -1322,10 +1322,15 @@ fn probe_finalize_spill_commit_trips_disk_cap_per_partition() {
 
     // Clamp the cap; finalize must commit each probe file and trip on the
     // first partition, leaving the later partition's writer open.
-    budget.set_max_spill_bytes(1);
+    let existing_spill = budget.cumulative_spill_bytes();
+    assert!(
+        existing_spill > 0,
+        "build partitions already own spill bytes"
+    );
+    budget.set_max_spill_bytes(existing_spill).unwrap();
     let err = exec
         .finalize_probe_spills(&budget)
-        .expect_err("1-byte cap must abort probe finalize");
+        .expect_err("exhausted cap must abort probe finalize");
     match &err {
         GraceSpillError::CapExceeded {
             attempted,
@@ -1336,7 +1341,7 @@ fn probe_finalize_spill_commit_trips_disk_cap_per_partition() {
                 *attempted > 0,
                 "the finalized probe file must report its size"
             );
-            assert_eq!(*cap, 1);
+            assert_eq!(*cap, existing_spill);
             assert!(
                 *cumulative > *cap,
                 "cumulative ({cumulative}) must exceed cap ({cap})"
@@ -1389,7 +1394,7 @@ fn probe_finalize_spill_commit_trips_disk_cap_per_partition() {
             current,
         } => {
             assert_eq!(node, "join_probe");
-            assert_eq!(cap, 1);
+            assert_eq!(cap, existing_spill);
             assert!(attempted > 0);
             assert!(current > cap);
         }

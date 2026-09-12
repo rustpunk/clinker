@@ -497,7 +497,7 @@ mod tests {
             0.70,
             Box::new(NoOpPolicy),
         ));
-        budget.set_max_spill_bytes(1);
+        budget.set_max_spill_bytes(1).unwrap();
         let charge =
             crate::pipeline::spill_merge::SpillChargeGuard::new(Arc::clone(&budget), "enforce");
         let spill_root = tempfile::tempdir().unwrap();
@@ -612,7 +612,7 @@ mod tests {
 
         // Exactly one sort population fits. A stale first charge would make
         // the second spill exceed this cap.
-        budget.set_max_spill_bytes(first_bytes);
+        budget.set_max_spill_bytes(first_bytes).unwrap();
         run_sort(&budget, &schema).expect("the second sort must not see stale first-sort bytes");
         assert_eq!(budget.cumulative_spill_bytes(), 0);
         assert_eq!(

@@ -1400,7 +1400,7 @@ mod tests {
     #[test]
     fn cascade_charges_intermediate_runs_and_surfaces_e320() {
         let arb = unlimited_arbitrator();
-        arb.set_max_spill_bytes(1); // any intermediate write trips the cap
+        arb.set_max_spill_bytes(1).unwrap(); // any intermediate write trips the cap
         let budget = MergeBudget {
             budget: &arb,
             node: "quota-node",
@@ -1443,7 +1443,7 @@ mod tests {
         // Concurrent on-disk usage peaks at ~data + one fan-in group, under 2x;
         // the sum of transient re-writes across the seven passes is several times
         // the data, so a monotonic counter would trip this cap.
-        arb.set_max_spill_bytes(2 * data_bytes);
+        arb.set_max_spill_bytes(2 * data_bytes).unwrap();
         arb.record_spill_bytes("sort", data_bytes);
 
         let budget = MergeBudget {

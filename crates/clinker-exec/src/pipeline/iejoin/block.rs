@@ -2294,7 +2294,7 @@ mod tests {
     fn run_block(driver: &Side, build: &Side, cfg: &RunCfg) -> Result<Vec<Record>, PipelineError> {
         let budget = arbitrator(cfg.hard_limit);
         if let Some(cap) = cfg.max_spill_bytes {
-            budget.set_max_spill_bytes(cap);
+            budget.set_max_spill_bytes(cap).unwrap();
         }
         run_block_on(driver, build, cfg, &budget)
     }
@@ -5130,7 +5130,7 @@ mod tests {
     ) -> Result<Vec<Record>, PipelineError> {
         let budget = arbitrator(cfg.hard_limit);
         if let Some(cap) = cfg.max_spill_bytes {
-            budget.set_max_spill_bytes(cap);
+            budget.set_max_spill_bytes(cap).unwrap();
         }
         run_block_equi_on(driver, build, cfg, hash_of, eq_of, &budget)
     }

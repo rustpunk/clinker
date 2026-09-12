@@ -3729,7 +3729,7 @@ mod tests {
     fn phase_a_driver_spill_past_disk_cap_fails_with_spill_cap_exceeded() {
         let pairs = phase_a_driver_pairs(64);
         let budget = MemoryArbitrator::with_policy(1024, 0.80, 0.70, Box::new(NoOpPolicy));
-        budget.set_max_spill_bytes(1);
+        budget.set_max_spill_bytes(1).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let handle = crate::pipeline::memory::ConsumerHandle::new();
         let err = sort_side_stream(SideStreamBuild {
@@ -3778,7 +3778,7 @@ mod tests {
             })
             .collect();
         let budget = MemoryArbitrator::with_policy(1024, 0.80, 0.70, Box::new(NoOpPolicy));
-        budget.set_max_spill_bytes(1);
+        budget.set_max_spill_bytes(1).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let handle = crate::pipeline::memory::ConsumerHandle::new();
         let err = sort_side_stream(SideStreamBuild {

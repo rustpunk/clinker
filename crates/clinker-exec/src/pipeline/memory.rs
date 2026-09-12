@@ -28,6 +28,8 @@
 //! react-only behavior pass `Box::new(NoOpPolicy)` explicitly.
 
 use arc_swap::ArcSwap;
+pub mod reservation;
+use clinker_format::preparation::{ResourceError, ResourceErrorKind};
 use clinker_plan::plan::scheduling_hint::SchedulingHint;
 use petgraph::graph::NodeIndex;
 use std::borrow::Cow;
@@ -531,6 +533,10 @@ impl ConsumerHandle {
 /// without compromising the existing pipeline-context concurrency
 /// posture.
 pub trait MemoryConsumer: Send + Sync {
+    /// True only when the synchronized grant ledger already includes this usage.
+    fn is_admission_managed(&self) -> bool {
+        false
+    }
     /// Live bytes the consumer currently holds against the arbitrator's
     /// `limit` envelope. Read every arbitration round; must be cheap.
     fn current_usage(&self) -> u64;
@@ -809,6 +815,8 @@ pub fn build_policy(knob: clinker_plan::config::BackpressureKnob) -> Box<dyn Arb
 /// surfaces E310 with a partition + spill-bytes diagnostic instead
 /// of continuing to fill the disk.
 pub struct MemoryArbitrator {
+    admission: Mutex<reservation::ReservationLedger>,
+    writer_cleanup: Mutex<Option<Arc<dyn reservation::WriterCleanup>>>,
     /// Total memory limit in bytes (the hard limit). Default: 512MB.
     /// `AtomicU64` for `&self` access; production sets this once at
     /// construction. Tests reconfigure via `set_limit`.
@@ -901,6 +909,8 @@ impl MemoryArbitrator {
         );
         Self {
             limit: AtomicU64::new(limit),
+            admission: Mutex::new(reservation::ReservationLedger::default()),
+            writer_cleanup: Mutex::new(None),
             spill_threshold_pct,
             resume_threshold_pct,
             peak_rss: AtomicU64::new(0),
@@ -1025,8 +1035,17 @@ impl MemoryArbitrator {
     /// construction; integration tests use this to drive deterministic
     /// overflow scenarios without spawning processes of the requested
     /// RSS size.
-    pub fn set_limit(&self, n: u64) {
+    pub fn set_limit(&self, n: u64) -> Result<(), ResourceError> {
+        let ledger = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        if n < ledger.usage.memory {
+            return Err(ResourceError::new(
+                ResourceErrorKind::Budget,
+                ledger.usage.memory as usize,
+                n as usize,
+            ));
+        }
         self.limit.store(n, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Soft-limit fraction (constructor-set; default 0.80).
@@ -1126,8 +1145,21 @@ impl MemoryArbitrator {
     /// Reconfigure the disk-spill quota. Production sets this at
     /// construction; integration tests use it to drive E310
     /// overshoot scenarios.
-    pub fn set_max_spill_bytes(&self, n: u64) {
+    pub fn set_max_spill_bytes(&self, n: u64) -> Result<(), ResourceError> {
+        let ledger = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        let occupied = ledger
+            .usage
+            .disk
+            .saturating_add(self.cumulative_spill_bytes());
+        if n < occupied {
+            return Err(ResourceError::new(
+                ResourceErrorKind::DiskQuota,
+                occupied.min(usize::MAX as u64) as usize,
+                n as usize,
+            ));
+        }
         self.max_spill_bytes.store(n, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Bytes currently on disk across every spill operator polling this
@@ -1171,6 +1203,7 @@ impl MemoryArbitrator {
     /// sorts release their surviving runs when the eager merger or lazy stream
     /// drops.
     pub fn record_spill_bytes(&self, node: &str, n: u64) -> bool {
+        let ledger = self.admission.lock().unwrap_or_else(|e| e.into_inner());
         let _ =
             self.cumulative_spill_bytes
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -1184,7 +1217,9 @@ impl MemoryArbitrator {
             let entry = per_stage.entry(node.to_string()).or_insert(0);
             *entry = entry.saturating_add(n);
         }
-        self.cumulative_spill_bytes.load(Ordering::Relaxed)
+        self.cumulative_spill_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(ledger.usage.disk)
             > self.max_spill_bytes.load(Ordering::Relaxed)
     }
 
@@ -1202,6 +1237,7 @@ impl MemoryArbitrator {
     /// never charged to this node) cannot wrap the counter below other stages'
     /// live charges.
     pub fn release_spill_bytes(&self, node: &str, n: u64) {
+        let _ledger = self.admission.lock().unwrap_or_else(|e| e.into_inner());
         if n == 0 {
             return;
         }
@@ -2323,7 +2359,7 @@ mod tests {
     fn test_record_spill_bytes_under_quota() {
         let arbitrator =
             MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
-        arbitrator.set_max_spill_bytes(1024);
+        arbitrator.set_max_spill_bytes(1024).unwrap();
         assert!(!arbitrator.record_spill_bytes("sort", 256));
         assert_eq!(arbitrator.cumulative_spill_bytes(), 256);
         assert!(!arbitrator.record_spill_bytes("sort", 512));
@@ -2334,7 +2370,7 @@ mod tests {
     fn test_record_spill_bytes_overflows_quota() {
         let arbitrator =
             MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
-        arbitrator.set_max_spill_bytes(1024);
+        arbitrator.set_max_spill_bytes(1024).unwrap();
         assert!(!arbitrator.record_spill_bytes("sort", 1024));
         assert!(arbitrator.record_spill_bytes("sort", 1));
         assert_eq!(arbitrator.cumulative_spill_bytes(), 1025);
@@ -2347,7 +2383,7 @@ mod tests {
         // silently disable the gate.
         let arbitrator =
             MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
-        arbitrator.set_max_spill_bytes(1024);
+        arbitrator.set_max_spill_bytes(1024).unwrap();
         arbitrator
             .cumulative_spill_bytes
             .store(u64::MAX - 10, Ordering::Relaxed);
@@ -2558,7 +2594,7 @@ mod tests {
         // poll_arbitration is private — exercise it through the
         // public `should_spill` path with a deliberately tiny
         // limit so the soft-threshold gate trips.
-        arbitrator.set_limit(1);
+        arbitrator.set_limit(1).unwrap();
         arbitrator.set_peak_rss_for_test(100);
         // NoOpPolicy yields no victim, so should_spill still returns
         // true (RSS-based) and no consumer state changes.

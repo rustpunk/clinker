@@ -1350,7 +1350,7 @@ mod tests {
         let schema: Arc<Schema> = Arc::new(Schema::new(vec!["account".into()]));
         let spill_root = tempfile::tempdir().unwrap();
         let arb = arbitrator(512);
-        arb.set_max_spill_bytes(1);
+        arb.set_max_spill_bytes(1).unwrap();
         let handle = ConsumerHandle::new();
         let mut buffer = CullGroupBuffer::new(Arc::clone(&schema), true);
         // One group, ~5 KiB resident against a 512 B soft limit, so the

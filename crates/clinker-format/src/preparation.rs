@@ -278,6 +278,8 @@ impl ResourceAuthority for MemoryAuthority {
 
 /// Private encoding destination. An error permanently prevents sealing.
 pub trait OperationStage: Write + Send {
+    /// Bounded failure evidence, retained without copying provider diagnostics.
+    fn failure(&self) -> Option<ResourceError>;
     fn finish(self: Box<Self>) -> Result<PreparedBytes, FormatError>;
 }
 
@@ -285,6 +287,8 @@ pub trait OperationStage: Write + Send {
 /// `seal` must rewind and establish immutable, complete bytes, without codecs.
 pub trait StageStorage: Read + Write + Send {
     fn seal(&mut self) -> Result<u64, ResourceError>;
+    /// Release readback storage fallibly before the encoder commits state.
+    fn complete(&mut self) -> Result<(), ResourceError>;
 }
 
 /// Adapts provider storage with a retained progress buffer and charged metadata.
@@ -313,36 +317,42 @@ impl<S: StageStorage + 'static> StorageStage<S> {
 }
 impl<S: StageStorage> Write for StorageStage<S> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if let Some(error) = self.failed {
-            return Err(io::Error::other(error));
+        if self.failed.is_some() {
+            return Err(io::ErrorKind::Other.into());
         }
         if let Err(error) = self.scope.check_cancelled() {
             self.failed = Some(error);
-            return Err(io::Error::other(error));
+            return Err(io::ErrorKind::Other.into());
         }
         match self.storage.write(bytes) {
             Ok(0) if !bytes.is_empty() => {
                 let error = ResourceError::new(ResourceErrorKind::Storage, bytes.len(), 0);
                 self.failed = Some(error);
-                Err(io::Error::other(error))
+                Err(io::ErrorKind::Other.into())
             }
             Ok(n) => Ok(n),
             Err(error) => {
                 self.failed = Some(io_resource(&error, ResourceErrorKind::Storage));
-                Err(error)
+                // Provider errors can own path strings. Drop them while the
+                // metadata grant is live; only bounded evidence crosses out.
+                Err(io::ErrorKind::Other.into())
             }
         }
     }
     fn flush(&mut self) -> io::Result<()> {
-        if let Some(error) = self.failed {
-            return Err(io::Error::other(error));
+        if self.failed.is_some() {
+            return Err(io::ErrorKind::Other.into());
         }
-        self.storage.flush().inspect_err(|error| {
-            self.failed = Some(io_resource(error, ResourceErrorKind::Storage));
+        self.storage.flush().map_err(|error| {
+            self.failed = Some(io_resource(&error, ResourceErrorKind::Storage));
+            io::Error::from(io::ErrorKind::Other)
         })
     }
 }
 impl<S: StageStorage + 'static> OperationStage for StorageStage<S> {
+    fn failure(&self) -> Option<ResourceError> {
+        self.failed
+    }
     fn finish(mut self: Box<Self>) -> Result<PreparedBytes, FormatError> {
         if let Some(error) = self.failed {
             return Err(error.into());
@@ -379,6 +389,7 @@ impl<S: StageStorage> Readback for StorageStage<S> {
             destination.write_all(&bytes[..n])?;
             remaining -= n as u64;
         }
+        self.storage.complete()?;
         Ok(())
     }
 }
@@ -468,6 +479,9 @@ impl Read for MemoryStorage {
     }
 }
 impl StageStorage for MemoryStorage {
+    fn complete(&mut self) -> Result<(), ResourceError> {
+        Ok(())
+    }
     fn seal(&mut self) -> Result<u64, ResourceError> {
         self.read = 0;
         Ok(self.len as u64)
@@ -536,7 +550,10 @@ impl<W: Write, E: FormatEncoder> PreparedWriter<W, E> {
         }
         let finalize = matches!(operation, OutputOperation::Finalize);
         let mut stage = self.scope.stage()?;
-        let pending = self.encoder.prepare(operation, &mut stage, &self.scope)?;
+        let pending = match self.encoder.prepare(operation, &mut stage, &self.scope) {
+            Ok(pending) => pending,
+            Err(error) => return Err(stage.failure().map(FormatError::Resource).unwrap_or(error)),
+        };
         let prepared = stage.finish()?;
         if let Err(error) = prepared.deliver(&mut self.destination) {
             self.state = DeliveryState::Poisoned(ResourceError::new(

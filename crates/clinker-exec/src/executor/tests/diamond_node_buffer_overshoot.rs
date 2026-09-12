@@ -46,7 +46,7 @@ fn spill_tripped_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> 
     );
     // 90 GiB: above the 80 GiB soft limit, below the 100 GiB hard limit.
     arb.set_peak_rss_for_test(90 * 1024 * 1024 * 1024);
-    arb.set_max_spill_bytes(1);
+    arb.set_max_spill_bytes(1).unwrap();
     Arc::new(arb)
 }
 
@@ -60,7 +60,7 @@ fn forced_spill_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
         Box::new(crate::pipeline::memory::Priority),
     );
     arb.set_peak_rss_for_test(90 * 1024 * 1024 * 1024);
-    arb.set_max_spill_bytes(u64::MAX);
+    arb.set_max_spill_bytes(u64::MAX).unwrap();
     Arc::new(arb)
 }
 
