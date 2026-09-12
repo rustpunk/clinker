@@ -78,6 +78,11 @@ pub struct OwnerId(pub u64);
 /// Provider boundary. Reserve/release must be synchronized and account the
 /// entire requested layout before allocation. No callback sees a destination.
 pub trait ResourceAuthority: Send + Sync {
+    /// Identity of the aggregate ledger. Adapters sharing a ledger return the
+    /// same identity; owner identifiers travel with tokens, not a second tally.
+    fn identity(&self) -> usize {
+        std::ptr::from_ref(self).cast::<()>() as usize
+    }
     fn try_reserve(
         self: Arc<Self>,
         owner: OwnerId,
@@ -116,7 +121,7 @@ impl AllocationGrant {
     /// Move the charge to another scope of this same authority, without a
     /// release/reacquire window or a second allocation.
     pub fn transfer(&mut self, scope: &WriterScope) -> Result<(), ResourceError> {
-        if !Arc::ptr_eq(&self.authority, &scope.resources.authority) {
+        if self.authority.identity() != scope.resources.authority.identity() {
             return Err(ResourceError::new(
                 ResourceErrorKind::Authority,
                 self.bytes,
@@ -140,7 +145,7 @@ impl AllocationGrant {
     }
     /// Combine ownership only when authority and owner are identical.
     pub fn merge(&mut self, mut other: Self) -> Result<(), ResourceError> {
-        if !Arc::ptr_eq(&self.authority, &other.authority) || self.owner != other.owner {
+        if self.authority.identity() != other.authority.identity() || self.owner != other.owner {
             return Err(ResourceError::new(
                 ResourceErrorKind::Authority,
                 other.bytes,
@@ -396,18 +401,19 @@ impl PreparedBytes {
     }
 }
 
-/// Memory stage has four inline chunk slots, never a growing chunk inventory.
+/// Memory stage retains independently admitted chunks and an admitted inventory.
+/// Its caller may choose a spill threshold; standalone use has only its budget.
 pub struct MemoryStorage {
     scope: WriterScope,
-    chunks: [Option<ReservedBuffer>; 4],
+    chunks: crate::reserved::ReservedVec<ReservedBuffer>,
     len: usize,
     read: usize,
 }
 impl MemoryStorage {
     pub fn new(scope: WriterScope) -> Self {
         Self {
+            chunks: crate::reserved::ReservedVec::new(scope.clone()),
             scope,
-            chunks: std::array::from_fn(|_| None),
             len: 0,
             read: 0,
         }
@@ -420,7 +426,7 @@ impl MemoryStorage {
     }
     /// Borrow already admitted chunks for spill, without acquiring workspace.
     pub fn chunks(&self) -> impl Iterator<Item = &[u8]> {
-        self.chunks.iter().flatten().map(ReservedBuffer::as_slice)
+        self.chunks.as_slice().iter().map(ReservedBuffer::as_slice)
     }
 }
 impl Write for MemoryStorage {
@@ -430,22 +436,13 @@ impl Write for MemoryStorage {
         }
         let index = self.len / STAGE_CHUNK_BYTES;
         if index == self.chunks.len() {
-            return Err(io::Error::other(ResourceError::new(
-                ResourceErrorKind::Budget,
-                bytes.len(),
-                0,
-            )));
-        }
-        if self.chunks[index].is_none() {
             let mut chunk = ReservedBuffer::new(self.scope.clone());
             chunk
                 .reserve_exact(STAGE_CHUNK_BYTES)
                 .map_err(io::Error::other)?;
-            self.chunks[index] = Some(chunk);
+            self.chunks.push(chunk).map_err(io::Error::other)?;
         }
-        let chunk = self.chunks[index].as_mut().ok_or_else(|| {
-            io::Error::other(ResourceError::new(ResourceErrorKind::Authority, 0, 0))
-        })?;
+        let chunk = &mut self.chunks.as_mut_slice()[index];
         let n = bytes.len().min(STAGE_CHUNK_BYTES - chunk.len());
         chunk
             .extend_from_slice(&bytes[..n])
@@ -462,11 +459,7 @@ impl Read for MemoryStorage {
         if self.read == self.len || out.is_empty() {
             return Ok(0);
         }
-        let chunk = self.chunks[self.read / STAGE_CHUNK_BYTES]
-            .as_ref()
-            .ok_or_else(|| {
-                io::Error::other(ResourceError::new(ResourceErrorKind::Readback, 0, 0))
-            })?;
+        let chunk = &self.chunks.as_slice()[self.read / STAGE_CHUNK_BYTES];
         let offset = self.read % STAGE_CHUNK_BYTES;
         let n = out.len().min(chunk.len() - offset);
         out[..n].copy_from_slice(&chunk.as_slice()[offset..offset + n]);

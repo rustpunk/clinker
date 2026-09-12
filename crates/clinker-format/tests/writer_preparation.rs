@@ -158,7 +158,7 @@ fn memory_failed_stage_cannot_seal_and_grants_move_split_merge() {
     drop(grant);
     assert_eq!(provider.used(), 0);
     let mut stage = scope.stage().unwrap();
-    assert!(stage.write_all(&[1; 80 * 1024]).is_err());
+    assert!(stage.write_all(&[1; 256 * 1024]).is_err());
     assert!(stage.finish().is_err());
     assert_eq!(provider.used(), 0);
 }
@@ -207,4 +207,41 @@ fn memory_finalize_commits_once_and_zero_acceptance_also_poisons() {
     assert!(writer.flush().is_err());
     assert!(writer.flush().is_err());
     assert_eq!(writer.encoder().committed, 0);
+}
+
+#[test]
+fn memory_standalone_stage_has_no_hidden_operation_byte_cap() {
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+    let mut stage = provider.resources().scope().unwrap().stage().unwrap();
+    let bytes = vec![42; 192 * 1024];
+    stage.write_all(&bytes).unwrap();
+    let mut output = Vec::new();
+    stage.finish().unwrap().deliver(&mut output).unwrap();
+    assert_eq!(output, bytes);
+    assert_eq!(provider.used(), 0);
+}
+
+#[test]
+fn memory_many_appends_have_geometric_growth_and_exact_fallback() {
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+    let mut bytes = ReservedBuffer::new(provider.resources().scope().unwrap());
+    let mut replacements = 0;
+    let mut capacity = 0;
+    for _ in 0..10000 {
+        bytes.extend_from_slice(b"x").unwrap();
+        if bytes.capacity() != capacity {
+            replacements += 1;
+            capacity = bytes.capacity();
+        }
+    }
+    assert!(
+        replacements <= 15,
+        "linear append workload must not cause linear reallocations"
+    );
+    let small = MemoryOnlyResources::new(NonZeroUsize::new(9).unwrap());
+    let mut bytes = ReservedBuffer::new(small.resources().scope().unwrap());
+    bytes.extend_from_slice(b"1234").unwrap();
+    bytes.extend_from_slice(b"5").unwrap();
+    assert_eq!(bytes.capacity(), 5);
+    assert_eq!(bytes.as_slice(), b"12345");
 }

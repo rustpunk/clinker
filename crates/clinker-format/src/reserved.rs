@@ -136,13 +136,26 @@ impl<T> ReservedVec<T> {
             .len
             .checked_add(1)
             .ok_or_else(|| ResourceError::new(ResourceErrorKind::Layout, usize::MAX, 0))?;
-        self.reserve_exact(next)?;
+        self.reserve_amortized(next)?;
         // SAFETY: next is admitted, the slot is uninitialized and uniquely owned.
         unsafe {
             self.ptr.as_ptr().add(self.len).write(value);
         }
         self.len = next;
         Ok(())
+    }
+
+    fn reserve_amortized(&mut self, needed: usize) -> Result<(), ResourceError> {
+        if needed <= self.capacity {
+            return Ok(());
+        }
+        let preferred = self.capacity.checked_mul(2).unwrap_or(needed).max(needed);
+        match self.reserve_exact(preferred) {
+            Err(error) if preferred != needed && error.kind == ResourceErrorKind::Budget => {
+                self.reserve_exact(needed)
+            }
+            result => result,
+        }
     }
 }
 
@@ -194,7 +207,7 @@ impl ReservedBuffer {
             .len
             .checked_add(bytes.len())
             .ok_or_else(|| ResourceError::new(ResourceErrorKind::Layout, bytes.len(), 0))?;
-        self.reserve_exact(end)?;
+        self.reserve_amortized(end)?;
         // SAFETY: end fits the allocation and the input cannot alias exclusive self.
         unsafe {
             std::ptr::copy_nonoverlapping(
