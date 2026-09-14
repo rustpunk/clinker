@@ -7,6 +7,107 @@ use clinker_format::preparation::{FormatEncoder, OutputOperation, PreparedWriter
 use clinker_format::reserved::ReservedBuffer;
 use clinker_format::reserved::ReservedVec;
 
+struct FaultAllocator;
+thread_local! {
+    static ALLOCATIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static FAIL_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+// SAFETY: successful allocations and all deallocations use System with the
+// original layouts. Failure returns null, as GlobalAlloc permits. Thread-local
+// scalar tracking neither allocates nor affects other test threads.
+unsafe impl std::alloc::GlobalAlloc for FaultAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let _ = ALLOCATIONS.try_with(|count| {
+            if let Some(n) = count.get() {
+                count.set(Some(n + 1));
+            }
+        });
+        if FAIL_NEXT
+            .try_with(|fail| fail.replace(false))
+            .unwrap_or(false)
+        {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: the caller supplies a valid allocation layout.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: every non-null allocation above came from System.
+        unsafe { std::alloc::System.dealloc(pointer, layout) }
+    }
+}
+#[global_allocator]
+static ALLOCATOR: FaultAllocator = FaultAllocator;
+
+fn allocation_probe<T>(fail_next: bool, operation: impl FnOnce() -> T) -> (T, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FAIL_NEXT.with(|fail| fail.set(false));
+            ALLOCATIONS.with(|count| count.set(None));
+        }
+    }
+    let reset = Reset;
+    ALLOCATIONS.with(|count| count.set(Some(0)));
+    FAIL_NEXT.with(|fail| fail.set(fail_next));
+    let result = operation();
+    let allocations = ALLOCATIONS.with(|count| count.get().unwrap());
+    drop(reset);
+    (result, allocations)
+}
+
+#[test]
+fn memory_resource_refusal_does_not_allocate_an_error() {
+    for allocation_failure in [false, true] {
+        let limit = if allocation_failure { 128 * 1024 } else { 1 };
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(limit).unwrap());
+        let mut storage =
+            clinker_format::preparation::MemoryStorage::new(provider.resources().scope().unwrap());
+        let (result, allocations) = allocation_probe(allocation_failure, || storage.write(b"x"));
+        assert!(result.is_err());
+        assert_eq!(allocations, usize::from(allocation_failure));
+        assert!(result.unwrap_err().get_ref().is_none());
+        assert_eq!(storage.len(), 0);
+        assert_eq!(provider.used(), 0);
+    }
+}
+
+#[test]
+fn memory_allocator_failure_reaches_prepared_writer_without_error_allocation() {
+    struct FailDuringEncode;
+    impl FormatEncoder for FailDuringEncode {
+        type Pending = ();
+        fn prepare(
+            &self,
+            _: OutputOperation<'_>,
+            stage: &mut dyn Write,
+            _: &WriterScope,
+        ) -> Result<(), FormatError> {
+            let (result, allocations) = allocation_probe(true, || stage.write_all(b"x"));
+            assert_eq!(
+                allocations, 1,
+                "only the refused chunk allocation is attempted"
+            );
+            result?;
+            Ok(())
+        }
+        fn commit(&mut self, _: ()) {
+            panic!("failed preparation cannot commit");
+        }
+    }
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+    let mut writer =
+        PreparedWriter::new(Vec::new(), FailDuringEncode, provider.resources()).unwrap();
+    let error = writer
+        .write_operation(OutputOperation::Finalize)
+        .unwrap_err();
+    assert!(
+        matches!(error, FormatError::Resource(error) if error.kind == clinker_format::preparation::ResourceErrorKind::Allocation)
+    );
+    assert!(writer.destination().is_empty());
+    assert_eq!(provider.used(), 0);
+}
+
 struct Encoder {
     committed: usize,
     reject: bool,
