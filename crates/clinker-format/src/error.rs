@@ -55,6 +55,8 @@ pub struct FanOutLimitFailure {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum FormatError {
+    /// Bounded, allocation-free admission or prepared-delivery failure.
+    Resource(crate::preparation::ResourceError),
     /// A failure already assigned an exact registered machine code by the
     /// subsystem that detected it. The code remains structured across this
     /// transport boundary; callers must not recover it from `Display` text.
@@ -306,6 +308,7 @@ pub enum FormatError {
 impl fmt::Display for FormatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Resource(error) => error.fmt(f),
             Self::Classified { code, message } => write!(f, "[{code}] {message}"),
             Self::Interrupted => f.write_str("source read interrupted"),
             Self::Io(e) => write!(f, "I/O error: {e}"),

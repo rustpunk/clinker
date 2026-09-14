@@ -749,7 +749,7 @@ fn bounds_memory_overshoot_is_rejected_before_provider_allocation() {
     provider
         .declared_lease_bytes
         .store(128 * 1024 * 1024, Ordering::SeqCst);
-    arbitrator.set_limit(64 * 1024 * 1024);
+    arbitrator.set_limit(64 * 1024 * 1024).unwrap();
 
     let error = registry
         .acquire(&selected, &requirement)

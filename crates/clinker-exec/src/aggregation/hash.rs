@@ -2524,7 +2524,7 @@ mod spill_trigger_tests {
             Some(spill_dir.path().to_path_buf()),
         );
         // One-byte disk cap: the first spill's on-disk bytes already cross it.
-        agg.arbitrator_for_test().set_max_spill_bytes(1);
+        agg.arbitrator_for_test().set_max_spill_bytes(1).unwrap();
 
         let input = make_schema(&["k", "v"]);
         let stable = StableEvalContext::test_default();

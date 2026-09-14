@@ -6,6 +6,23 @@ soft or hard memory threshold trips, rather than running the process out of
 memory. By default those spill files land in the operating system's temporary
 directory. The `[storage]` block in `clinker.toml` lets you redirect them.
 
+## Output preparation in library integrations
+
+Library integrations can prepare a complete output operation before sending
+its bytes to a destination. This API requires a finite memory budget and uses
+temporary disk storage only when a spill location is explicitly supplied.
+Temporary files remain charged until their removal is confirmed, including
+when cleanup must be retried. A failed cleanup is not free disk capacity.
+
+Failure before delivery writes nothing. Once destination delivery starts,
+ordinary I/O can accept a prefix before failing, so the writer refuses further
+operations after a delivery error. Preparation does not promise atomic
+publication to an arbitrary destination.
+
+This additive library API has not yet been connected to the CLI's existing
+format writers. It adds no storage setting and changes neither the configured
+spill defaults below nor the separate publication controls.
+
 ## The `[storage]` block
 
 Storage settings are a property of the **workspace**, not of an individual

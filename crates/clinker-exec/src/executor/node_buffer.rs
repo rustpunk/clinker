@@ -2219,7 +2219,7 @@ mod tests {
         arb.record_spill_bytes("other", 777);
         let (mut buffer, original_paths) = shared_merge_spilled_fixture(&arb);
         let input_bytes = arb.cumulative_spill_bytes() - 777;
-        arb.set_max_spill_bytes(input_bytes + 777);
+        arb.set_max_spill_bytes(input_bytes + 777).unwrap();
 
         match buffer.reread() {
             Err(PipelineError::SpillCapExceeded { node, .. }) => assert_eq!(node, "banded"),

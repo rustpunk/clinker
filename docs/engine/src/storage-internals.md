@@ -4,6 +4,58 @@
 
 This page is the engine-internals reference for the durability and concurrency mechanics behind Clinker's storage subsystem: how a matched source file is copied to a local staging volume without ever leaving a corrupt or half-trusted artifact behind, how concurrent `clinker` invocations sharing one staging or spill volume coordinate through advisory locks, and how a startup crash purge reclaims the artifacts a `SIGKILL`-ed run could not clean up. The depth here is the staging copy protocol (single-pass copy + hash, atomic publish via rename, parent-directory `fsync`, verify, manifest commit), the per-source reader-writer lock semantics, the orphan-detection liveness gates, the file-permission model, and the filesystem-journal reasoning behind the directory `fsync`. The user-facing page documents the `[storage]` config block, the spill dir, disk cap, compression, and observability surfaces; those are out of scope here.
 
+## Prepared output storage
+
+The preparation library can seal complete operation bytes in finite memory or
+executor-backed raw temporary storage. This is an additive API; current codec
+and CLI constructors have not been migrated to it. It is distinct from source
+file staging and output publication described below.
+
+An executor provider with no resolved spill root is memory-only. It never
+silently uses the operating system temporary directory. With a resolved root,
+each operation reserves its future descriptor slot and file/path metadata
+before accepting bytes, plus a 16 KiB progress buffer retained through
+readback. Memory is held in independently admitted 16 KiB chunks. A spill
+request, memory-budget refusal or the 64 KiB residency threshold moves those
+bytes to a raw file. The threshold is not an operation-size ceiling: disk
+staging can continue within the supplied quota. Standalone memory-only staging
+is limited by its explicit budget, not by that spill threshold.
+
+Every temporary write admits at most 8 KiB of prospective disk growth first.
+Short writes retain only the bytes actually written and release unused quota;
+memory remains charged until its copy has finished spilling. Sealing rewinds
+storage and establishes its exact byte length. The existing stage box becomes
+readback storage, and the retained progress buffer streams bytes to the
+destination without a second operation-sized allocation. A truncated readback
+fails instead of delivering an apparently complete operation.
+
+Admission, allocation, quota and cancellation failures retain a typed inline
+`ResourceError`. `StageStorage::failure` and `resource_error` recover that
+evidence from the nonallocating standard-I/O sentinel at write, flush and
+readback boundaries. Direct storage callers must inspect this channel instead
+of interpreting the sentinel as an unclassified data error. Failed memory
+storage cannot accept more writes or seal its prefix. Metadata/progress/box
+failure notifications run while the original owners and grants are live.
+No error needs a heap-allocated diagnostic after resource denial.
+
+Before delivery, errors leave the destination and committed encoder state
+untouched. Generic destination I/O may accept a prefix before failing; after
+delivery begins, `PreparedWriter` poisons continuation on any error and never
+retries or commits pending state. Even zero-byte destination acceptance is a
+delivery failure. Storage is closed and removed before encoder state commits;
+cleanup failure after byte delivery also prevents commit and poisons the writer.
+Drop performs cleanup but does not finalize or retry destination writes.
+
+Unlink failure transfers the exact disk charge, path grant and descriptor slot
+to an already-admitted cleanup-debt slot. Retry runs outside admission locks;
+failure never reports reclaimed bytes. An uncertain native close retains
+conservative debt and is never retried by raw handle, since the handle could
+have been reused. Debt can outlive the provider in the run arbitrator, keeping
+its memory consumer live. Confirmed removal releases charges exactly once;
+unresolved debt remains visible at run teardown. Cleanup still runs when the
+run is cancelled. The [memory contract](memory-arbitration.md#prepared-output-telemetry)
+documents the fixed lifecycle counters and their limits.
+
 ## How a file is staged
 
 When `storage.staging` is enabled and a source path matches a configured pattern, the source is copied to a local volume before the pipeline reads it. Each matched source maps to a **stable, content-addressed** set of files directly under the staging `dir`, deterministic across runs of the same source:

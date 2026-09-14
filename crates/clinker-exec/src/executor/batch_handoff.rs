@@ -615,7 +615,7 @@ mod tests {
         // Force the soft threshold to trip unconditionally. The streaming
         // charge path polls `should_spill_self` (no pausing round), so the
         // precondition asserts that variant.
-        arbitrator.set_limit(1);
+        arbitrator.set_limit(1).unwrap();
         arbitrator.set_peak_rss_for_test(u64::MAX);
         assert!(arbitrator.should_spill_self());
 
@@ -719,7 +719,7 @@ mod tests {
             0.70,
             Box::new(NoOpPolicy),
         ));
-        arbitrator.set_limit(1);
+        arbitrator.set_limit(1).unwrap();
         arbitrator.set_peak_rss_for_test(u64::MAX);
         assert!(arbitrator.should_spill_self());
 
@@ -811,11 +811,11 @@ mod tests {
         ));
         // Force the streaming charge path onto the spill branch (the charge
         // path polls `should_spill_self`, no pausing round)...
-        arbitrator.set_limit(1);
+        arbitrator.set_limit(1).unwrap();
         arbitrator.set_peak_rss_for_test(u64::MAX);
         assert!(arbitrator.should_spill_self());
         // ...then choke the disk quota so the first spilled run overflows.
-        arbitrator.set_max_spill_bytes(1);
+        arbitrator.set_max_spill_bytes(1).unwrap();
 
         let spill_dir = tempfile::tempdir().expect("temp dir");
         let spill_root: Arc<std::path::Path> = Arc::from(spill_dir.path());

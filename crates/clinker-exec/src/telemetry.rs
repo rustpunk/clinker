@@ -152,11 +152,29 @@ pub enum MetricKey {
     SinkRecords,
     SinkErrors,
     SinkBytes,
+    WriterAdmissionStarted,
+    WriterAdmissionCompleted,
+    WriterAdmissionFailed,
+    WriterAdmissionInterrupted,
+    WriterStageStarted,
+    WriterStageCompleted,
+    WriterStageFailed,
+    WriterStageInterrupted,
+    WriterStageDropped,
+    WriterSpillStarted,
+    WriterSpillCompleted,
+    WriterSpillFailed,
+    WriterSpillInterrupted,
+    WriterSpillBytes,
+    WriterCleanupStarted,
+    WriterCleanupCompleted,
+    WriterCleanupFailed,
+    WriterCleanupInterrupted,
 }
 
 impl MetricKey {
     /// Every fixed metric key in stable counter-index order.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 54] = [
         Self::TransformStarted,
         Self::TransformCompleted,
         Self::TransformRecords,
@@ -193,6 +211,24 @@ impl MetricKey {
         Self::SinkRecords,
         Self::SinkErrors,
         Self::SinkBytes,
+        Self::WriterAdmissionStarted,
+        Self::WriterAdmissionCompleted,
+        Self::WriterAdmissionFailed,
+        Self::WriterAdmissionInterrupted,
+        Self::WriterStageStarted,
+        Self::WriterStageCompleted,
+        Self::WriterStageFailed,
+        Self::WriterStageInterrupted,
+        Self::WriterStageDropped,
+        Self::WriterSpillStarted,
+        Self::WriterSpillCompleted,
+        Self::WriterSpillFailed,
+        Self::WriterSpillInterrupted,
+        Self::WriterSpillBytes,
+        Self::WriterCleanupStarted,
+        Self::WriterCleanupCompleted,
+        Self::WriterCleanupFailed,
+        Self::WriterCleanupInterrupted,
     ];
     /// Number of entries in [`Self::ALL`].
     pub const COUNT: usize = Self::ALL.len();
@@ -237,6 +273,24 @@ impl MetricKey {
             Self::SinkRecords => 33,
             Self::SinkErrors => 34,
             Self::SinkBytes => 35,
+            Self::WriterAdmissionStarted => 36,
+            Self::WriterAdmissionCompleted => 37,
+            Self::WriterAdmissionFailed => 38,
+            Self::WriterAdmissionInterrupted => 39,
+            Self::WriterStageStarted => 40,
+            Self::WriterStageCompleted => 41,
+            Self::WriterStageFailed => 42,
+            Self::WriterStageInterrupted => 43,
+            Self::WriterStageDropped => 44,
+            Self::WriterSpillStarted => 45,
+            Self::WriterSpillCompleted => 46,
+            Self::WriterSpillFailed => 47,
+            Self::WriterSpillInterrupted => 48,
+            Self::WriterSpillBytes => 49,
+            Self::WriterCleanupStarted => 50,
+            Self::WriterCleanupCompleted => 51,
+            Self::WriterCleanupFailed => 52,
+            Self::WriterCleanupInterrupted => 53,
         }
     }
 }
@@ -253,11 +307,15 @@ pub enum SpanName {
     Source,
     Guess,
     Sink,
+    WriterAdmission,
+    WriterStage,
+    WriterSpill,
+    WriterCleanup,
 }
 
 impl SpanName {
     /// Every span name in stable index order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 12] = [
         Self::Transform,
         Self::CredentialResolve,
         Self::ResourceOpen,
@@ -266,6 +324,10 @@ impl SpanName {
         Self::Source,
         Self::Guess,
         Self::Sink,
+        Self::WriterAdmission,
+        Self::WriterStage,
+        Self::WriterSpill,
+        Self::WriterCleanup,
     ];
 
     /// Return this name's stable slot in the closed span vocabulary.
@@ -280,6 +342,10 @@ impl SpanName {
             Self::Source => 5,
             Self::Guess => 6,
             Self::Sink => 7,
+            Self::WriterAdmission => 8,
+            Self::WriterStage => 9,
+            Self::WriterSpill => 10,
+            Self::WriterCleanup => 11,
         }
     }
 }
@@ -596,6 +662,10 @@ impl TelemetryArena {
             queue,
             rate: RateLimiter::new(policy.rate_limit_per_second(), policy.rate_limit_burst()),
         }));
+        // Initialize native mutex storage within the fixed startup allowance.
+        // On platforms with lazy mutex allocation, the first producer call
+        // must not allocate while reporting another allocation's failure.
+        drop(shared.lock().unwrap_or_else(|e| e.into_inner()));
 
         let producer = TelemetryProducer {
             policy: Arc::new(policy.clone()),
@@ -1974,6 +2044,24 @@ mod tests {
             MetricKey::SinkRecords,
             MetricKey::SinkErrors,
             MetricKey::SinkBytes,
+            MetricKey::WriterAdmissionStarted,
+            MetricKey::WriterAdmissionCompleted,
+            MetricKey::WriterAdmissionFailed,
+            MetricKey::WriterAdmissionInterrupted,
+            MetricKey::WriterStageStarted,
+            MetricKey::WriterStageCompleted,
+            MetricKey::WriterStageFailed,
+            MetricKey::WriterStageInterrupted,
+            MetricKey::WriterStageDropped,
+            MetricKey::WriterSpillStarted,
+            MetricKey::WriterSpillCompleted,
+            MetricKey::WriterSpillFailed,
+            MetricKey::WriterSpillInterrupted,
+            MetricKey::WriterSpillBytes,
+            MetricKey::WriterCleanupStarted,
+            MetricKey::WriterCleanupCompleted,
+            MetricKey::WriterCleanupFailed,
+            MetricKey::WriterCleanupInterrupted,
         ];
 
         assert_eq!(MetricKey::COUNT, expected.len());
