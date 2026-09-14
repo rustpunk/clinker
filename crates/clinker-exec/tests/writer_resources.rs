@@ -31,6 +31,29 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 #[test]
+fn writer_primitive_telemetry_vocabulary_is_closed_and_serializable() {
+    use clinker_exec::telemetry::{MetricKey, SpanName};
+    for name in [
+        "writer_admission",
+        "writer_stage",
+        "writer_spill",
+        "writer_cleanup",
+    ] {
+        let span: SpanName = serde_json::from_str(&format!("\"{name}\"")).unwrap();
+        assert_eq!(serde_json::to_string(&span).unwrap(), format!("\"{name}\""));
+        for outcome in ["started", "completed", "failed", "interrupted"] {
+            let key = format!("\"{name}_{outcome}\"");
+            let metric: MetricKey = serde_json::from_str(&key).unwrap();
+            assert_eq!(serde_json::to_string(&metric).unwrap(), key);
+        }
+    }
+    for name in ["writer_stage_dropped", "writer_spill_bytes"] {
+        let metric: MetricKey = serde_json::from_str(&format!("\"{name}\"")).unwrap();
+        assert!(MetricKey::ALL.contains(&metric));
+    }
+}
+
+#[test]
 fn stage_disk_refusal_preserves_quota_evidence_without_error_allocation() {
     use clinker_format::preparation::{ResourceError, ResourceErrorKind};
     let root = tempfile::tempdir().unwrap();
