@@ -323,6 +323,7 @@ impl ResourceAuthority for ExecutorAuthority {
                     slot: Some(slot),
                     metadata: Some(metadata),
                     bytes: 0,
+                    failed: None,
                     admission: self.admission.clone(),
                 };
                 StorageStage::create(scope, state)
@@ -632,26 +633,37 @@ struct SpillStorage {
     slot: Option<usize>,
     metadata: Option<AllocationGrant>,
     bytes: u64,
+    failed: Option<ResourceError>,
     admission: Arc<AdmissionAuthority>,
 }
 impl SpillStorage {
-    fn spill(&mut self) -> io::Result<()> {
+    fn spill(&mut self) -> Result<(), ResourceError> {
         let temp = tempfile::Builder::new()
             .prefix(TEMP_PREFIX)
             .rand_bytes(TEMP_RANDOM_BYTES)
-            .tempfile_in(&self.storage.root)?;
+            .tempfile_in(&self.storage.root)
+            .map_err(|error| io_resource(&error, ResourceErrorKind::Storage))?;
         self.file = Some(temp.into_parts());
         if let Some(memory) = self.memory.take() {
             for chunk in memory.chunks() {
-                self.write_all(chunk)?;
+                let mut remaining = chunk;
+                while !remaining.is_empty() {
+                    let n = self.write_bytes(remaining)?;
+                    if n == 0 {
+                        return Err(ResourceError::new(
+                            ResourceErrorKind::Storage,
+                            remaining.len(),
+                            0,
+                        ));
+                    }
+                    remaining = &remaining[n..];
+                }
             }
         }
         Ok(())
     }
-}
-impl Write for SpillStorage {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.admission.check_cancelled().map_err(io::Error::other)?;
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<usize, ResourceError> {
+        self.admission.check_cancelled()?;
         if bytes.is_empty() {
             return Ok(0);
         }
@@ -664,23 +676,24 @@ impl Write for SpillStorage {
                 match memory.write(bytes) {
                     Ok(n) => return Ok(n),
                     Err(error)
-                        if io_resource(&error, ResourceErrorKind::Storage).kind
+                        if memory
+                            .resource_error(&error, ResourceErrorKind::Storage)
+                            .kind
                             == ResourceErrorKind::Budget => {}
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        return Err(memory.resource_error(&error, ResourceErrorKind::Storage));
+                    }
                 }
             }
             self.spill()?;
         }
         let amount = bytes.len().min(8 * 1024);
-        self.admission
-            .arbitrator
-            .admit_writer_disk(amount as u64)
-            .map_err(io::Error::other)?;
+        self.admission.arbitrator.admit_writer_disk(amount as u64)?;
         let result = write_temporary(
             &mut self
                 .file
                 .as_mut()
-                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?
+                .ok_or_else(|| ResourceError::new(ResourceErrorKind::Storage, 0, 0))?
                 .0,
             &bytes[..amount],
         );
@@ -689,9 +702,23 @@ impl Write for SpillStorage {
             .arbitrator
             .release_writer_disk((amount - written) as u64);
         self.bytes += written as u64;
-        result
+        result.map_err(|error| io_resource(&error, ResourceErrorKind::Storage))
+    }
+}
+impl Write for SpillStorage {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.failed.is_some() {
+            return Err(io::ErrorKind::Other.into());
+        }
+        self.write_bytes(bytes).map_err(|error| {
+            self.failed = Some(error);
+            io::ErrorKind::Other.into()
+        })
     }
     fn flush(&mut self) -> io::Result<()> {
+        if self.failed.is_some() {
+            return Err(io::ErrorKind::Other.into());
+        }
         if let Some((file, _)) = &mut self.file {
             file.flush()?;
         }
@@ -700,7 +727,13 @@ impl Write for SpillStorage {
 }
 impl Read for SpillStorage {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.admission.check_cancelled().map_err(io::Error::other)?;
+        if self.failed.is_some() {
+            return Err(io::ErrorKind::Other.into());
+        }
+        if let Err(error) = self.admission.check_cancelled() {
+            self.failed = Some(error);
+            return Err(io::ErrorKind::Other.into());
+        }
         if let Some(memory) = &mut self.memory {
             memory.read(bytes)
         } else {
@@ -713,10 +746,17 @@ impl Read for SpillStorage {
     }
 }
 impl StageStorage for SpillStorage {
+    fn failure(&self) -> Option<ResourceError> {
+        self.failed
+            .or_else(|| self.memory.as_ref().and_then(StageStorage::failure))
+    }
     fn complete(&mut self) -> Result<(), ResourceError> {
         self.close_and_remove()
     }
     fn seal(&mut self) -> Result<u64, ResourceError> {
+        if let Some(error) = self.failure() {
+            return Err(error);
+        }
         self.admission.check_cancelled()?;
         if let Some(memory) = &mut self.memory {
             memory.seal()

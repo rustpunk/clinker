@@ -286,6 +286,16 @@ pub trait OperationStage: Write + Send {
 /// Storage implementations own their memory/files and support bounded readback.
 /// `seal` must rewind and establish immutable, complete bytes, without codecs.
 pub trait StageStorage: Read + Write + Send {
+    /// First terminal resource failure, retained inline for this storage's
+    /// lifetime. Resource-denied I/O returns a nonallocating ErrorKind sentinel;
+    /// callers must recover this evidence before interpreting that sentinel.
+    /// A failed storage cannot accept more bytes or seal a partial operation.
+    fn failure(&self) -> Option<ResourceError>;
+    /// Recover resource evidence at each I/O boundary, including readback.
+    fn resource_error(&self, error: &io::Error, fallback: ResourceErrorKind) -> ResourceError {
+        self.failure()
+            .unwrap_or_else(|| io_resource(error, fallback))
+    }
     fn seal(&mut self) -> Result<u64, ResourceError>;
     /// Release readback storage fallibly before the encoder commits state.
     fn complete(&mut self) -> Result<(), ResourceError>;
@@ -332,7 +342,10 @@ impl<S: StageStorage> Write for StorageStage<S> {
             }
             Ok(n) => Ok(n),
             Err(error) => {
-                self.failed = Some(io_resource(&error, ResourceErrorKind::Storage));
+                self.failed = Some(
+                    self.storage
+                        .resource_error(&error, ResourceErrorKind::Storage),
+                );
                 // Provider errors can own path strings. Drop them while the
                 // metadata grant is live; only bounded evidence crosses out.
                 Err(io::ErrorKind::Other.into())
@@ -344,7 +357,10 @@ impl<S: StageStorage> Write for StorageStage<S> {
             return Err(io::ErrorKind::Other.into());
         }
         self.storage.flush().map_err(|error| {
-            self.failed = Some(io_resource(&error, ResourceErrorKind::Storage));
+            self.failed = Some(
+                self.storage
+                    .resource_error(&error, ResourceErrorKind::Storage),
+            );
             io::Error::from(io::ErrorKind::Other)
         })
     }
@@ -379,10 +395,9 @@ impl<S: StageStorage> Readback for StorageStage<S> {
             self.scope.check_cancelled()?;
             let amount = remaining.min((PROGRESS_BYTES / 2) as u64) as usize;
             let bytes = &mut self.progress.as_mut_slice()[..amount];
-            let n = self
-                .storage
-                .read(bytes)
-                .map_err(|e| FormatError::Resource(io_resource(&e, ResourceErrorKind::Readback)))?;
+            let n = self.storage.read(bytes).map_err(|e| {
+                FormatError::Resource(self.storage.resource_error(&e, ResourceErrorKind::Readback))
+            })?;
             if n == 0 {
                 return Err(ResourceError::new(ResourceErrorKind::Readback, amount, 0).into());
             }
@@ -419,6 +434,7 @@ pub struct MemoryStorage {
     chunks: crate::reserved::ReservedVec<ReservedBuffer>,
     len: usize,
     read: usize,
+    failed: Option<ResourceError>,
 }
 impl MemoryStorage {
     pub fn new(scope: WriterScope) -> Self {
@@ -427,6 +443,7 @@ impl MemoryStorage {
             scope,
             len: 0,
             read: 0,
+            failed: None,
         }
     }
     pub fn len(&self) -> usize {
@@ -439,34 +456,50 @@ impl MemoryStorage {
     pub fn chunks(&self) -> impl Iterator<Item = &[u8]> {
         self.chunks.as_slice().iter().map(ReservedBuffer::as_slice)
     }
-}
-impl Write for MemoryStorage {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<usize, ResourceError> {
+        self.scope.check_cancelled()?;
         if bytes.is_empty() {
             return Ok(0);
         }
         let index = self.len / STAGE_CHUNK_BYTES;
         if index == self.chunks.len() {
             let mut chunk = ReservedBuffer::new(self.scope.clone());
-            chunk
-                .reserve_exact(STAGE_CHUNK_BYTES)
-                .map_err(io::Error::other)?;
-            self.chunks.push(chunk).map_err(io::Error::other)?;
+            chunk.reserve_exact(STAGE_CHUNK_BYTES)?;
+            self.chunks.push(chunk)?;
         }
         let chunk = &mut self.chunks.as_mut_slice()[index];
         let n = bytes.len().min(STAGE_CHUNK_BYTES - chunk.len());
-        chunk
-            .extend_from_slice(&bytes[..n])
-            .map_err(io::Error::other)?;
+        chunk.extend_from_slice(&bytes[..n])?;
         self.len += n;
         Ok(n)
     }
+}
+impl Write for MemoryStorage {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.failed.is_some() {
+            return Err(io::ErrorKind::Other.into());
+        }
+        self.write_bytes(bytes).map_err(|error| {
+            self.failed = Some(error);
+            io::ErrorKind::Other.into()
+        })
+    }
     fn flush(&mut self) -> io::Result<()> {
+        if self.failed.is_some() {
+            return Err(io::ErrorKind::Other.into());
+        }
         Ok(())
     }
 }
 impl Read for MemoryStorage {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.failed.is_some() {
+            return Err(io::ErrorKind::Other.into());
+        }
+        if let Err(error) = self.scope.check_cancelled() {
+            self.failed = Some(error);
+            return Err(io::ErrorKind::Other.into());
+        }
         if self.read == self.len || out.is_empty() {
             return Ok(0);
         }
@@ -479,10 +512,17 @@ impl Read for MemoryStorage {
     }
 }
 impl StageStorage for MemoryStorage {
+    fn failure(&self) -> Option<ResourceError> {
+        self.failed
+    }
     fn complete(&mut self) -> Result<(), ResourceError> {
         Ok(())
     }
     fn seal(&mut self) -> Result<u64, ResourceError> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        self.scope.check_cancelled()?;
         self.read = 0;
         Ok(self.len as u64)
     }
@@ -593,7 +633,8 @@ impl<W: Write, E: FormatEncoder> PreparedWriter<W, E> {
     }
 }
 
-/// Preserve typed bounded resource evidence across the standard I/O adapter.
+/// Extract legacy boxed evidence or classify native I/O. Storage adapters must
+/// use [`StageStorage::resource_error`] to recover their inline failure first.
 pub fn io_resource(error: &io::Error, fallback: ResourceErrorKind) -> ResourceError {
     error
         .get_ref()

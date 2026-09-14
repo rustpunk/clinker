@@ -4,6 +4,7 @@ use std::num::NonZeroUsize;
 use clinker_format::FormatError;
 use clinker_format::preparation::MemoryOnlyResources;
 use clinker_format::preparation::{FormatEncoder, OutputOperation, PreparedWriter, WriterScope};
+use clinker_format::preparation::{ResourceError, ResourceErrorKind, StageStorage, StorageStage};
 use clinker_format::reserved::ReservedBuffer;
 use clinker_format::reserved::ReservedVec;
 
@@ -68,6 +69,110 @@ fn memory_resource_refusal_does_not_allocate_an_error() {
         assert_eq!(allocations, usize::from(allocation_failure));
         assert!(result.unwrap_err().get_ref().is_none());
         assert_eq!(storage.len(), 0);
+        assert_eq!(provider.used(), 0);
+        let expected = ResourceError::new(
+            if allocation_failure {
+                ResourceErrorKind::Allocation
+            } else {
+                ResourceErrorKind::Budget
+            },
+            clinker_format::preparation::STAGE_CHUNK_BYTES,
+            usize::from(!allocation_failure),
+        );
+        assert_eq!(storage.failure(), Some(expected));
+        let (retry, allocations) = allocation_probe(false, || storage.write(b"retry"));
+        assert!(retry.is_err());
+        assert_eq!(allocations, 0);
+        assert_eq!(storage.seal(), Err(expected));
+    }
+}
+
+#[test]
+fn storage_recovers_exact_inline_evidence_on_write_flush_and_readback() {
+    #[derive(Clone, Copy)]
+    enum Boundary {
+        Write,
+        Flush,
+        Read,
+    }
+    struct FailingStorage {
+        boundary: Boundary,
+        failed: bool,
+        evidence: ResourceError,
+    }
+    impl Write for FailingStorage {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if matches!(self.boundary, Boundary::Write) {
+                self.failed = true;
+                Err(std::io::ErrorKind::Other.into())
+            } else {
+                Ok(bytes.len())
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.failed = true;
+            Err(std::io::ErrorKind::Other.into())
+        }
+    }
+    impl std::io::Read for FailingStorage {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            self.failed = true;
+            Err(std::io::ErrorKind::Other.into())
+        }
+    }
+    impl StageStorage for FailingStorage {
+        fn failure(&self) -> Option<ResourceError> {
+            self.failed.then_some(self.evidence)
+        }
+        fn seal(&mut self) -> Result<u64, ResourceError> {
+            Ok(1)
+        }
+        fn complete(&mut self) -> Result<(), ResourceError> {
+            Ok(())
+        }
+    }
+    let evidence = ResourceError {
+        kind: ResourceErrorKind::Cancelled,
+        requested: 91,
+        available: 17,
+        field: Some(3),
+        offset: Some(41),
+    };
+    for boundary in [Boundary::Write, Boundary::Flush, Boundary::Read] {
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+        let mut stage = StorageStage::create(
+            provider.resources().scope().unwrap(),
+            FailingStorage {
+                boundary,
+                failed: false,
+                evidence,
+            },
+        )
+        .unwrap();
+        match boundary {
+            Boundary::Write => {
+                assert!(stage.write(b"x").is_err());
+                assert_eq!(stage.failure(), Some(evidence));
+                assert!(
+                    matches!(stage.finish(), Err(FormatError::Resource(error)) if error == evidence)
+                );
+            }
+            Boundary::Flush => {
+                assert!(stage.flush().is_err());
+                assert_eq!(stage.failure(), Some(evidence));
+                assert!(
+                    matches!(stage.finish(), Err(FormatError::Resource(error)) if error == evidence)
+                );
+            }
+            Boundary::Read => {
+                let mut output = Vec::new();
+                let (result, allocations) =
+                    allocation_probe(false, || stage.finish().unwrap().deliver(&mut output));
+                assert_eq!(allocations, 0);
+                assert!(matches!(result, Err(FormatError::Resource(error)) if error == evidence));
+                assert!(output.is_empty());
+            }
+        }
         assert_eq!(provider.used(), 0);
     }
 }

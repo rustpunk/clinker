@@ -6,6 +6,65 @@ use clinker_exec::{
     },
 };
 
+struct CountingAllocator;
+thread_local! {
+    static ALLOCATIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+// SAFETY: allocation and deallocation delegate to System with unchanged
+// layouts. Thread-local scalar counting neither allocates nor crosses threads.
+unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let _ = ALLOCATIONS.try_with(|count| {
+            if let Some(n) = count.get() {
+                count.set(Some(n + 1));
+            }
+        });
+        // SAFETY: the caller supplies a valid allocation layout.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: every allocation above came from System.
+        unsafe { std::alloc::System.dealloc(pointer, layout) }
+    }
+}
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+#[test]
+fn stage_disk_refusal_preserves_quota_evidence_without_error_allocation() {
+    use clinker_format::preparation::{ResourceError, ResourceErrorKind};
+    let root = tempfile::tempdir().unwrap();
+    let arb = Arc::new(MemoryArbitrator::with_policy(
+        128 * 1024,
+        0.8,
+        0.7,
+        Box::new(NoOpPolicy),
+    ));
+    arb.set_max_spill_bytes(72 * 1024).unwrap();
+    let provider = ExecutorResources::new(
+        arb.clone(),
+        ShutdownToken::detached(),
+        Some(&configured(root.path())),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let mut stage = provider.resources().scope().unwrap().stage().unwrap();
+    stage.write_all(&[7; 72 * 1024]).unwrap();
+    assert_eq!(arb.writer_resource_usage().disk, 72 * 1024);
+    ALLOCATIONS.with(|count| count.set(Some(0)));
+    let result = stage.write(&[9; 1024]);
+    let allocations = ALLOCATIONS.with(|count| count.replace(None).unwrap());
+    assert!(result.is_err());
+    assert_eq!(allocations, 0);
+    let expected = ResourceError::new(ResourceErrorKind::DiskQuota, 1024, 0);
+    assert_eq!(stage.failure(), Some(expected));
+    assert!(
+        matches!(stage.finish(), Err(clinker_format::FormatError::Resource(error)) if error == expected)
+    );
+    assert_eq!(arb.writer_resource_usage().disk, 0);
+    assert_eq!(arb.writer_resource_usage().descriptors, 0);
+}
+
 fn configured(root: &std::path::Path) -> clinker_exec::executor::ResolvedStorage {
     clinker_exec::executor::ResolvedStorage {
         spill_root_dir: Some(root.to_owned()),
