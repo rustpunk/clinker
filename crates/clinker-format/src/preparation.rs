@@ -286,6 +286,10 @@ pub trait OperationStage: Write + Send {
 /// Storage implementations own their memory/files and support bounded readback.
 /// `seal` must rewind and establish immutable, complete bytes, without codecs.
 pub trait StageStorage: Read + Write + Send {
+    /// Observe a terminal resource failure established by the stage adapter,
+    /// including admission before the first storage call. Must not allocate or
+    /// change the returned error; delivery behavior never depends on observation.
+    fn resource_failed(&mut self, _error: ResourceError) {}
     /// First terminal resource failure, retained inline for this storage's
     /// lifetime. Resource-denied I/O returns a nonallocating ErrorKind sentinel;
     /// callers must recover this evidence before interpreting that sentinel.
@@ -312,17 +316,36 @@ pub struct StorageStage<S: StageStorage> {
 }
 impl<S: StageStorage + 'static> StorageStage<S> {
     /// Reserve metadata and progress before any storage writes or destination effects.
-    pub fn create(scope: WriterScope, storage: S) -> Result<Box<dyn OperationStage>, FormatError> {
-        let metadata = scope.reserve(Layout::new::<Self>())?;
+    pub fn create(
+        scope: WriterScope,
+        mut storage: S,
+    ) -> Result<Box<dyn OperationStage>, FormatError> {
+        let metadata = scope.reserve(Layout::new::<Self>()).inspect_err(|&error| {
+            storage.resource_failed(error);
+        })?;
         let mut progress = ReservedBuffer::new(scope.clone());
-        progress.extend_from_slice(&[0; PROGRESS_BYTES])?;
+        progress
+            .extend_from_slice(&[0; PROGRESS_BYTES])
+            .inspect_err(|&error| {
+                storage.resource_failed(error);
+            })?;
         Ok(crate::reserved::try_box(Self {
             storage,
             progress,
             scope,
             failed: None,
             _metadata: metadata,
+        })
+        .map_err(|(error, mut stage)| {
+            stage.record_failure(error);
+            error
         })?)
+    }
+}
+impl<S: StageStorage> StorageStage<S> {
+    fn record_failure(&mut self, error: ResourceError) {
+        self.failed.get_or_insert(error);
+        self.storage.resource_failed(error);
     }
 }
 impl<S: StageStorage> Write for StorageStage<S> {
@@ -331,18 +354,18 @@ impl<S: StageStorage> Write for StorageStage<S> {
             return Err(io::ErrorKind::Other.into());
         }
         if let Err(error) = self.scope.check_cancelled() {
-            self.failed = Some(error);
+            self.record_failure(error);
             return Err(io::ErrorKind::Other.into());
         }
         match self.storage.write(bytes) {
             Ok(0) if !bytes.is_empty() => {
                 let error = ResourceError::new(ResourceErrorKind::Storage, bytes.len(), 0);
-                self.failed = Some(error);
+                self.record_failure(error);
                 Err(io::ErrorKind::Other.into())
             }
             Ok(n) => Ok(n),
             Err(error) => {
-                self.failed = Some(
+                self.record_failure(
                     self.storage
                         .resource_error(&error, ResourceErrorKind::Storage),
                 );
@@ -357,7 +380,7 @@ impl<S: StageStorage> Write for StorageStage<S> {
             return Err(io::ErrorKind::Other.into());
         }
         self.storage.flush().map_err(|error| {
-            self.failed = Some(
+            self.record_failure(
                 self.storage
                     .resource_error(&error, ResourceErrorKind::Storage),
             );
@@ -373,8 +396,12 @@ impl<S: StageStorage + 'static> OperationStage for StorageStage<S> {
         if let Some(error) = self.failed {
             return Err(error.into());
         }
-        self.scope.check_cancelled()?;
-        let len = self.storage.seal()?;
+        self.scope.check_cancelled().inspect_err(|&error| {
+            self.record_failure(error);
+        })?;
+        let len = self.storage.seal().inspect_err(|&error| {
+            self.record_failure(error);
+        })?;
         // Reuse the existing admitted box as readback; no second allocation.
         Ok(PreparedBytes {
             len,
@@ -392,19 +419,32 @@ impl<S: StageStorage> Readback for StorageStage<S> {
         mut remaining: u64,
     ) -> Result<(), FormatError> {
         while remaining != 0 {
-            self.scope.check_cancelled()?;
+            self.scope.check_cancelled().inspect_err(|&error| {
+                self.record_failure(error);
+            })?;
             let amount = remaining.min((PROGRESS_BYTES / 2) as u64) as usize;
             let bytes = &mut self.progress.as_mut_slice()[..amount];
-            let n = self.storage.read(bytes).map_err(|e| {
-                FormatError::Resource(self.storage.resource_error(&e, ResourceErrorKind::Readback))
-            })?;
+            let n = match self.storage.read(bytes) {
+                Ok(n) => n,
+                Err(error) => {
+                    let error = self
+                        .storage
+                        .resource_error(&error, ResourceErrorKind::Readback);
+                    self.record_failure(error);
+                    return Err(error.into());
+                }
+            };
             if n == 0 {
-                return Err(ResourceError::new(ResourceErrorKind::Readback, amount, 0).into());
+                let error = ResourceError::new(ResourceErrorKind::Readback, amount, 0);
+                self.record_failure(error);
+                return Err(error.into());
             }
             destination.write_all(&bytes[..n])?;
             remaining -= n as u64;
         }
-        self.storage.complete()?;
+        self.storage.complete().inspect_err(|&error| {
+            self.record_failure(error);
+        })?;
         Ok(())
     }
 }

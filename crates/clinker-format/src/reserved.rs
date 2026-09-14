@@ -21,14 +21,19 @@ fn allocate(layout: Layout) -> *mut u8 {
     unsafe { alloc(layout) }
 }
 
-/// Allocate an already-admitted box with recoverable allocator failure.
-pub(crate) fn try_box<T>(value: T) -> Result<Box<T>, ResourceError> {
+/// Allocate an already-admitted box. Failure returns the intact owner so its
+/// caller can observe the error while all grants are still live, before drop.
+pub(crate) fn try_box<T>(value: T) -> Result<Box<T>, (ResourceError, T)> {
     let layout = Layout::new::<T>();
     if layout.size() == 0 {
         return Ok(Box::new(value));
     }
-    let ptr = NonNull::new(allocate(layout).cast::<T>())
-        .ok_or_else(|| ResourceError::new(ResourceErrorKind::Allocation, layout.size(), 0))?;
+    let Some(ptr) = NonNull::new(allocate(layout).cast::<T>()) else {
+        return Err((
+            ResourceError::new(ResourceErrorKind::Allocation, layout.size(), 0),
+            value,
+        ));
+    };
     // SAFETY: ptr owns exactly Layout::new::<T>(); initialize before constructing
     // the Box, whose destructor uses the identical global allocator/layout.
     unsafe {

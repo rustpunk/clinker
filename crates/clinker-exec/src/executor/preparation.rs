@@ -5,6 +5,166 @@
 //! merely because a temporary-file destructor ran.
 
 use super::storage_validate::ResolvedStorage;
+use crate::telemetry::{
+    MetricKey, SpanFact, SpanName, SpanStatus, TelemetryProducer, unix_nanos_now,
+};
+
+#[derive(Clone, Copy)]
+enum ResourceWork {
+    Admission,
+    Stage,
+    Spill,
+    Cleanup,
+}
+impl ResourceWork {
+    fn vocabulary(self) -> (SpanName, &'static str, [MetricKey; 4]) {
+        use MetricKey::*;
+        match self {
+            Self::Admission => (
+                SpanName::WriterAdmission,
+                "writer.admission",
+                [
+                    WriterAdmissionStarted,
+                    WriterAdmissionCompleted,
+                    WriterAdmissionFailed,
+                    WriterAdmissionInterrupted,
+                ],
+            ),
+            Self::Stage => (
+                SpanName::WriterStage,
+                "writer.stage",
+                [
+                    WriterStageStarted,
+                    WriterStageCompleted,
+                    WriterStageFailed,
+                    WriterStageInterrupted,
+                ],
+            ),
+            Self::Spill => (
+                SpanName::WriterSpill,
+                "writer.spill",
+                [
+                    WriterSpillStarted,
+                    WriterSpillCompleted,
+                    WriterSpillFailed,
+                    WriterSpillInterrupted,
+                ],
+            ),
+            Self::Cleanup => (
+                SpanName::WriterCleanup,
+                "writer.cleanup",
+                [
+                    WriterCleanupStarted,
+                    WriterCleanupCompleted,
+                    WriterCleanupFailed,
+                    WriterCleanupInterrupted,
+                ],
+            ),
+        }
+    }
+}
+
+// Inline observation. Producer clones share the already reserved telemetry
+// arena/counters and allocate nothing; stage metadata admits this value too.
+struct ResourceSignal {
+    producer: Option<TelemetryProducer>,
+    work: ResourceWork,
+    started: u64,
+    closed: bool,
+}
+impl ResourceSignal {
+    fn new(producer: Option<TelemetryProducer>, work: ResourceWork) -> Self {
+        if let Some(producer) = &producer {
+            producer.record_metric(work.vocabulary().2[0], 1);
+        }
+        Self {
+            started: if producer.is_some() {
+                unix_nanos_now()
+            } else {
+                0
+            },
+            producer,
+            work,
+            closed: false,
+        }
+    }
+    fn finish(&mut self, result: Result<(), ResourceError>) {
+        let (_, _, keys) = self.work.vocabulary();
+        let (key, status) = match result {
+            Ok(()) => (keys[1], SpanStatus::Ok),
+            Err(error) if error.kind == ResourceErrorKind::Cancelled => {
+                (keys[3], SpanStatus::Unset)
+            }
+            Err(_) => (keys[2], SpanStatus::Error),
+        };
+        self.close(key, status);
+    }
+    fn close(&mut self, key: MetricKey, status: SpanStatus) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        if let Some(producer) = &self.producer {
+            producer.record_metric(key, 1);
+            let (name, logical_node, _) = self.work.vocabulary();
+            let _ = producer.emit_span(SpanFact {
+                name,
+                status,
+                logical_node,
+                started_at_unix_nanos: self.started,
+                ended_at_unix_nanos: unix_nanos_now().max(self.started),
+            });
+        }
+    }
+}
+
+struct ObservedStorage<S: StageStorage> {
+    storage: S,
+    signal: ResourceSignal,
+}
+impl<S: StageStorage> Write for ObservedStorage<S> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.storage.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.storage.flush()
+    }
+}
+impl<S: StageStorage> Read for ObservedStorage<S> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.storage.read(bytes)
+    }
+}
+impl<S: StageStorage> StageStorage for ObservedStorage<S> {
+    fn failure(&self) -> Option<ResourceError> {
+        self.storage.failure()
+    }
+    fn resource_failed(&mut self, error: ResourceError) {
+        self.storage.resource_failed(error);
+        self.signal.finish(Err(error));
+    }
+    fn seal(&mut self) -> Result<u64, ResourceError> {
+        let result = self.storage.seal();
+        if let Err(error) = result {
+            self.signal.finish(Err(error));
+        }
+        result
+    }
+    fn complete(&mut self) -> Result<(), ResourceError> {
+        let result = self.storage.complete();
+        self.signal.finish(result);
+        result
+    }
+}
+impl<S: StageStorage> Drop for ObservedStorage<S> {
+    fn drop(&mut self) {
+        // No terminal storage result was established. A concurrently requested
+        // shutdown does not establish why a caller abandoned these bytes.
+        // Destination failures belong to Sink telemetry, not this owner.
+        self.signal
+            .close(MetricKey::WriterStageDropped, SpanStatus::Unset);
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -109,6 +269,7 @@ struct AdmissionAuthority {
     handle: Arc<ConsumerHandle>,
     id: ConsumerId,
     shutdown: ShutdownToken,
+    telemetry: Option<TelemetryProducer>,
 }
 
 // Debt owners may be retained by the arbitrator itself. Their grant release
@@ -197,11 +358,14 @@ impl Drop for AdmissionAuthority {
 impl ExecutorResources {
     /// Establish one run consumer. The control blocks are fixed run-startup
     /// allowances; storage inventory/path allocations are admitted separately.
+    /// The optional producer shares its existing arena and cannot change grant
+    /// admission, storage results or cancellation. No CLI wiring is implied.
     pub fn new(
         arbitrator: Arc<MemoryArbitrator>,
         shutdown: ShutdownToken,
         storage: Option<&ResolvedStorage>,
         descriptors: NonZeroUsize,
+        telemetry: Option<TelemetryProducer>,
     ) -> Result<Self, ResourceError> {
         let handle = ConsumerHandle::new();
         arbitrator.attach_writer_handle(handle.clone())?;
@@ -213,6 +377,7 @@ impl ExecutorResources {
             handle,
             id,
             shutdown,
+            telemetry,
         });
         let storage = match storage.and_then(|storage| storage.spill_root_dir.as_ref()) {
             Some(root) => Some(StorageCapability::new(
@@ -261,8 +426,12 @@ impl ResourceAuthority for AdmissionAuthority {
         owner: OwnerId,
         layout: Layout,
     ) -> Result<AllocationGrant, ResourceError> {
-        self.check_cancelled()?;
-        self.arbitrator.admit_writer_memory(layout.size())?;
+        let mut signal = ResourceSignal::new(self.telemetry.clone(), ResourceWork::Admission);
+        let result = self
+            .check_cancelled()
+            .and_then(|()| self.arbitrator.admit_writer_memory(layout.size()));
+        signal.finish(result);
+        result?;
         Ok(AllocationGrant::admitted(self, owner, layout.size()))
     }
     fn release(&self, _: OwnerId, bytes: usize) {
@@ -279,7 +448,14 @@ impl ResourceAuthority for AdmissionAuthority {
         self: Arc<Self>,
         scope: WriterScope,
     ) -> Result<Box<dyn OperationStage>, FormatError> {
-        StorageStage::create(scope.clone(), MemoryStorage::new(scope))
+        let signal = ResourceSignal::new(self.telemetry.clone(), ResourceWork::Stage);
+        StorageStage::create(
+            scope.clone(),
+            ObservedStorage {
+                storage: MemoryStorage::new(scope),
+                signal,
+            },
+        )
     }
 }
 impl ResourceAuthority for ExecutorAuthority {
@@ -303,16 +479,26 @@ impl ResourceAuthority for ExecutorAuthority {
         self: Arc<Self>,
         scope: WriterScope,
     ) -> Result<Box<dyn OperationStage>, FormatError> {
+        let mut signal = ResourceSignal::new(self.admission.telemetry.clone(), ResourceWork::Stage);
         match &self.storage {
-            None => StorageStage::create(scope.clone(), MemoryStorage::new(scope)),
+            None => StorageStage::create(
+                scope.clone(),
+                ObservedStorage {
+                    storage: MemoryStorage::new(scope),
+                    signal,
+                },
+            ),
             Some(storage) => {
                 // Reserve the future spill descriptor/metadata at operation
                 // start so pressure cannot strand a full memory stage.
-                let slot = storage.claim()?;
+                let slot = storage.claim().inspect_err(|&error| {
+                    signal.finish(Err(error));
+                })?;
                 let metadata = match scope.reserve(storage.file_layout) {
                     Ok(g) => g,
                     Err(e) => {
                         storage.release_slot(slot);
+                        signal.finish(Err(e));
                         return Err(e.into());
                     }
                 };
@@ -326,7 +512,13 @@ impl ResourceAuthority for ExecutorAuthority {
                     failed: None,
                     admission: self.admission.clone(),
                 };
-                StorageStage::create(scope, state)
+                StorageStage::create(
+                    scope,
+                    ObservedStorage {
+                        storage: state,
+                        signal,
+                    },
+                )
             }
         }
     }
@@ -558,6 +750,8 @@ impl StorageCapability {
                     _ => unreachable!(),
                 }
             };
+            let mut signal =
+                ResourceSignal::new(self.admission.telemetry.clone(), ResourceWork::Cleanup);
             if debt.close_uncertain {
                 // Unlink cannot prove disk release while the handle may still
                 // be open. Never retry a raw handle whose identity is lost.
@@ -565,6 +759,7 @@ impl StorageCapability {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .as_mut_slice()[index] = Slot::Debt(debt);
+                signal.finish(Err(ResourceError::new(ResourceErrorKind::Storage, 0, 0)));
                 continue;
             }
             match std::fs::remove_file(&debt.path) {
@@ -572,8 +767,10 @@ impl StorageCapability {
                     debt.path.disable_cleanup(true);
                     self.admission.arbitrator.release_writer_disk(debt.bytes);
                     self.release_slot(index);
+                    signal.finish(Ok(()));
                 }
                 Err(_) => {
+                    signal.finish(Err(ResourceError::new(ResourceErrorKind::Storage, 0, 0)));
                     self.slots
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -638,6 +835,12 @@ struct SpillStorage {
 }
 impl SpillStorage {
     fn spill(&mut self) -> Result<(), ResourceError> {
+        let mut signal = ResourceSignal::new(self.admission.telemetry.clone(), ResourceWork::Spill);
+        let result = self.spill_bytes();
+        signal.finish(result);
+        result
+    }
+    fn spill_bytes(&mut self) -> Result<(), ResourceError> {
         let temp = tempfile::Builder::new()
             .prefix(TEMP_PREFIX)
             .rand_bytes(TEMP_RANDOM_BYTES)
@@ -702,6 +905,9 @@ impl SpillStorage {
             .arbitrator
             .release_writer_disk((amount - written) as u64);
         self.bytes += written as u64;
+        if let Some(producer) = &self.admission.telemetry {
+            producer.record_metric(MetricKey::WriterSpillBytes, written as u64);
+        }
         result.map_err(|error| io_resource(&error, ResourceErrorKind::Storage))
     }
 }
@@ -775,6 +981,16 @@ impl StageStorage for SpillStorage {
 }
 impl SpillStorage {
     fn close_and_remove(&mut self) -> Result<(), ResourceError> {
+        if self.slot.is_none() {
+            return Ok(());
+        }
+        let mut signal =
+            ResourceSignal::new(self.admission.telemetry.clone(), ResourceWork::Cleanup);
+        let result = self.release_storage();
+        signal.finish(result);
+        result
+    }
+    fn release_storage(&mut self) -> Result<(), ResourceError> {
         let Some(slot) = self.slot.take() else {
             return Ok(());
         };
@@ -838,6 +1054,7 @@ mod tests {
             token.clone(),
             Some(&resolved),
             NonZeroUsize::new(1).unwrap(),
+            None,
         )
         .unwrap();
         let baseline = arb.writer_resource_usage().memory;
@@ -894,6 +1111,7 @@ mod tests {
                 ShutdownToken::detached(),
                 Some(&resolved),
                 NonZeroUsize::new(1).unwrap(),
+                None,
             )
             .unwrap();
             let mut writer =
@@ -947,6 +1165,7 @@ mod tests {
             ShutdownToken::detached(),
             Some(&resolved),
             NonZeroUsize::new(1).unwrap(),
+            None,
         )
         .unwrap();
         let mut stage = provider.resources().scope().unwrap().stage().unwrap();
@@ -982,6 +1201,7 @@ mod tests {
                 ShutdownToken::detached(),
                 Some(&resolved),
                 NonZeroUsize::new(1).unwrap(),
+                None,
             )
             .unwrap();
             let baseline = arb.writer_resource_usage().memory;

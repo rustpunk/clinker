@@ -9,16 +9,30 @@ use clinker_exec::{
 struct CountingAllocator;
 thread_local! {
     static ALLOCATIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static FAIL_ALLOCATION: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 // SAFETY: allocation and deallocation delegate to System with unchanged
 // layouts. Thread-local scalar counting neither allocates nor crosses threads.
 unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let _ = ALLOCATIONS.try_with(|count| {
-            if let Some(n) = count.get() {
-                count.set(Some(n + 1));
-            }
-        });
+        let attempt = ALLOCATIONS
+            .try_with(|count| {
+                if let Some(n) = count.get() {
+                    count.set(Some(n + 1));
+                    Some(n + 1)
+                } else {
+                    None
+                }
+            })
+            .ok()
+            .flatten();
+        if attempt.is_some()
+            && FAIL_ALLOCATION
+                .try_with(|fail| fail.get() == attempt)
+                .unwrap_or(false)
+        {
+            return std::ptr::null_mut();
+        }
         // SAFETY: the caller supplies a valid allocation layout.
         unsafe { std::alloc::System.alloc(layout) }
     }
@@ -29,6 +43,246 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
 }
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+fn telemetry() -> (
+    clinker_exec::telemetry::TelemetryProducer,
+    clinker_exec::telemetry::TelemetryReceiver,
+) {
+    let config = clinker_plan::config::ClinkerToml::parse(
+        r#"
+[observability]
+arena_bytes = "768KB"
+ordinary_lane_bytes = "512KB"
+high_severity_lane_bytes = "256KB"
+max_batch_bytes = "8KB"
+rate_limit_per_second = 100000
+rate_limit_burst = 100000
+[observability.otlp]
+endpoint = "https://collector.invalid"
+[observability.otlp.auth]
+mode = "none"
+"#,
+    )
+    .unwrap();
+    clinker_exec::telemetry::TelemetryArena::reserve(&config.resolve_observability(None).unwrap())
+        .unwrap()
+}
+
+#[test]
+fn stage_telemetry_observes_construction_denial_and_allocator_failure() {
+    use clinker_exec::telemetry::{MetricKey, SpanName, SpanStatus};
+    use clinker_format::preparation::ResourceErrorKind;
+    // Deny metadata, deny progress, fail progress allocation, fail stage box.
+    for (limit, fail_at) in [
+        (1, None),
+        (4096, None),
+        (128 * 1024, Some(1)),
+        (128 * 1024, Some(2)),
+    ] {
+        let (producer, receiver) = telemetry();
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            limit,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            ShutdownToken::detached(),
+            None,
+            NonZeroUsize::new(1).unwrap(),
+            Some(producer),
+        )
+        .unwrap();
+        let scope = provider.resources().scope().unwrap();
+        ALLOCATIONS.with(|count| count.set(Some(0)));
+        FAIL_ALLOCATION.with(|fail| fail.set(fail_at));
+        let result = scope.stage();
+        FAIL_ALLOCATION.with(|fail| fail.set(None));
+        let allocations = ALLOCATIONS.with(|count| count.replace(None).unwrap());
+        if let Some(fail_at) = fail_at {
+            assert_eq!(allocations, fail_at);
+        }
+        assert!(
+            matches!(result, Err(clinker_format::FormatError::Resource(error)) if error.kind == if fail_at.is_some() { ResourceErrorKind::Allocation } else { ResourceErrorKind::Budget })
+        );
+        assert_eq!(arb.writer_resource_usage().memory, 0);
+        let batch = receiver.try_recv_batch().unwrap();
+        assert_eq!(batch.metric(MetricKey::WriterStageStarted), 1);
+        assert_eq!(batch.metric(MetricKey::WriterStageFailed), 1);
+        assert_eq!(batch.metric(MetricKey::WriterStageDropped), 0);
+        assert_eq!(batch.metric(MetricKey::WriterStageCompleted), 0);
+        assert_eq!(
+            batch.metric(MetricKey::WriterAdmissionFailed),
+            u64::from(fail_at.is_none())
+        );
+        let spans: Vec<_> = batch
+            .traces()
+            .iter()
+            .filter(|span| span.name == SpanName::WriterStage)
+            .collect();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].status, SpanStatus::Error);
+    }
+}
+
+#[test]
+fn stage_telemetry_distinguishes_completion_cancellation_and_abandonment() {
+    use clinker_exec::telemetry::{MetricKey, SpanName, SpanStatus};
+    for outcome in [
+        MetricKey::WriterStageCompleted,
+        MetricKey::WriterStageInterrupted,
+        MetricKey::WriterStageDropped,
+        MetricKey::WriterStageFailed,
+    ] {
+        let (producer, receiver) = telemetry();
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            128 * 1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let token = ShutdownToken::detached();
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            token.clone(),
+            None,
+            NonZeroUsize::new(1).unwrap(),
+            Some(producer),
+        )
+        .unwrap();
+        let scope = provider.resources().scope().unwrap();
+        let mut stage = scope.stage().unwrap();
+        let mut output = Vec::new();
+        match outcome {
+            MetricKey::WriterStageCompleted => {
+                stage.write_all(b"complete").unwrap();
+                stage.finish().unwrap().deliver(&mut output).unwrap();
+                assert_eq!(output, b"complete");
+            }
+            MetricKey::WriterStageInterrupted => {
+                token.request();
+                assert!(stage.write_all(b"cancelled before storage").is_err());
+                assert!(stage.finish().is_err());
+            }
+            MetricKey::WriterStageFailed => {
+                assert!(stage.write_all(&[1; 256 * 1024]).is_err());
+                assert!(stage.finish().is_err());
+            }
+            _ => {
+                // A shutdown request alone is not an observed cancellation
+                // result; abandoning without another operation remains dropped.
+                token.request();
+                drop(stage);
+            }
+        }
+        assert_eq!(arb.writer_resource_usage().memory, 0);
+        let batch = receiver.try_recv_batch().unwrap();
+        assert_eq!(batch.metric(MetricKey::WriterStageStarted), 1);
+        assert_eq!(batch.metric(outcome), 1);
+        assert_eq!(
+            [
+                MetricKey::WriterStageCompleted,
+                MetricKey::WriterStageFailed,
+                MetricKey::WriterStageInterrupted,
+                MetricKey::WriterStageDropped
+            ]
+            .into_iter()
+            .map(|key| batch.metric(key))
+            .sum::<u64>(),
+            1
+        );
+        let spans: Vec<_> = batch
+            .traces()
+            .iter()
+            .filter(|span| span.name == SpanName::WriterStage)
+            .collect();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0].status,
+            match outcome {
+                MetricKey::WriterStageCompleted => SpanStatus::Ok,
+                MetricKey::WriterStageFailed => SpanStatus::Error,
+                _ => SpanStatus::Unset,
+            }
+        );
+        assert!(spans[0].started_at_unix_nanos <= spans[0].ended_at_unix_nanos);
+        assert_eq!(spans[0].logical_node, "writer.stage");
+    }
+}
+
+#[test]
+fn stage_spill_and_cleanup_telemetry_cannot_block_a_full_arena() {
+    use clinker_exec::telemetry::{
+        AdmissionOutcome, DropReason, MetricKey, SpanFact, SpanName, SpanStatus,
+    };
+    for full in [false, true] {
+        let (producer, receiver) = telemetry();
+        if full {
+            for status in [SpanStatus::Ok, SpanStatus::Error] {
+                loop {
+                    let result = producer.emit_span(SpanFact {
+                        name: SpanName::Transform,
+                        status,
+                        logical_node: "fill",
+                        started_at_unix_nanos: 1,
+                        ended_at_unix_nanos: 2,
+                    });
+                    if result == AdmissionOutcome::Dropped(DropReason::Full) {
+                        break;
+                    }
+                    assert!(matches!(result, AdmissionOutcome::Accepted { .. }));
+                }
+            }
+        }
+        let baseline = producer.snapshot();
+        let token = ShutdownToken::detached();
+        let root = tempfile::tempdir().unwrap();
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            128 * 1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            token.clone(),
+            Some(&configured(root.path())),
+            NonZeroUsize::new(1).unwrap(),
+            Some(producer.clone()),
+        )
+        .unwrap();
+        let mut stage = provider.resources().scope().unwrap().stage().unwrap();
+        stage.write_all(&[7; 100 * 1024]).unwrap();
+        let mut output = Vec::new();
+        stage.finish().unwrap().deliver(&mut output).unwrap();
+        assert_eq!(output, [7; 100 * 1024]);
+        arb.set_max_spill_bytes(0).unwrap();
+        let scope = provider.resources().scope().unwrap();
+        let mut refused = scope.stage().unwrap();
+        assert!(refused.write_all(&[9; 100 * 1024]).is_err());
+        assert!(refused.finish().is_err());
+        let mut cancelled = scope.stage().unwrap();
+        token.request();
+        assert!(cancelled.write_all(b"cancelled").is_err());
+        assert!(cancelled.finish().is_err());
+        assert_eq!(arb.writer_resource_usage().disk, 0);
+        assert_eq!(arb.writer_resource_usage().descriptors, 0);
+        assert_eq!(producer.snapshot().owned_bytes, baseline.owned_bytes);
+        if full {
+            assert_eq!(producer.snapshot().accepted, baseline.accepted);
+        }
+        let batch = receiver.try_recv_batch().unwrap();
+        assert_eq!(batch.metric(MetricKey::WriterStageCompleted), 1);
+        assert_eq!(batch.metric(MetricKey::WriterStageFailed), 1);
+        assert_eq!(batch.metric(MetricKey::WriterStageInterrupted), 1);
+        assert_eq!(batch.metric(MetricKey::WriterSpillStarted), 2);
+        assert_eq!(batch.metric(MetricKey::WriterSpillCompleted), 1);
+        assert_eq!(batch.metric(MetricKey::WriterSpillFailed), 1);
+        assert_eq!(batch.metric(MetricKey::WriterSpillBytes), 100 * 1024);
+        assert_eq!(batch.metric(MetricKey::WriterCleanupCompleted), 3);
+    }
+}
 
 #[test]
 fn writer_primitive_telemetry_vocabulary_is_closed_and_serializable() {
@@ -56,6 +310,7 @@ fn writer_primitive_telemetry_vocabulary_is_closed_and_serializable() {
 #[test]
 fn stage_disk_refusal_preserves_quota_evidence_without_error_allocation() {
     use clinker_format::preparation::{ResourceError, ResourceErrorKind};
+    let (producer, receiver) = telemetry();
     let root = tempfile::tempdir().unwrap();
     let arb = Arc::new(MemoryArbitrator::with_policy(
         128 * 1024,
@@ -69,6 +324,7 @@ fn stage_disk_refusal_preserves_quota_evidence_without_error_allocation() {
         ShutdownToken::detached(),
         Some(&configured(root.path())),
         NonZeroUsize::new(1).unwrap(),
+        Some(producer),
     )
     .unwrap();
     let mut stage = provider.resources().scope().unwrap().stage().unwrap();
@@ -86,6 +342,13 @@ fn stage_disk_refusal_preserves_quota_evidence_without_error_allocation() {
     );
     assert_eq!(arb.writer_resource_usage().disk, 0);
     assert_eq!(arb.writer_resource_usage().descriptors, 0);
+    assert_eq!(
+        receiver
+            .try_recv_batch()
+            .unwrap()
+            .metric(clinker_exec::telemetry::MetricKey::WriterStageFailed),
+        1
+    );
 }
 
 fn configured(root: &std::path::Path) -> clinker_exec::executor::ResolvedStorage {
@@ -111,6 +374,7 @@ fn stage_spills_with_all_other_memory_reserved_and_releases_file() {
         ShutdownToken::detached(),
         Some(&configured(root.path())),
         NonZeroUsize::new(2).unwrap(),
+        None,
     )
     .unwrap();
     let baseline = arb.writer_resource_usage().memory;
@@ -155,6 +419,7 @@ fn stage_quota_and_cancellation_never_seal_or_touch_destination() {
         token.clone(),
         Some(&configured(root.path())),
         NonZeroUsize::new(1).unwrap(),
+        None,
     )
     .unwrap();
     let baseline = arb.writer_resource_usage().memory;
@@ -186,6 +451,7 @@ fn stage_descriptor_denial_and_limit_changes_are_atomic() {
         ShutdownToken::detached(),
         Some(&configured(root.path())),
         NonZeroUsize::new(1).unwrap(),
+        None,
     )
     .unwrap();
     let scope = provider.resources().scope().unwrap();
@@ -203,6 +469,7 @@ fn stage_descriptor_denial_and_limit_changes_are_atomic() {
 
 #[test]
 fn stage_failed_unlink_retains_bounded_debt_until_successful_cleanup() {
+    let (producer, receiver) = telemetry();
     let root = tempfile::tempdir().unwrap();
     let arb = Arc::new(MemoryArbitrator::with_policy(
         128 * 1024,
@@ -215,6 +482,7 @@ fn stage_failed_unlink_retains_bounded_debt_until_successful_cleanup() {
         ShutdownToken::detached(),
         Some(&configured(root.path())),
         NonZeroUsize::new(1).unwrap(),
+        Some(producer),
     )
     .unwrap();
     let scope = provider.resources().scope().unwrap();
@@ -246,11 +514,21 @@ fn stage_failed_unlink_retains_bounded_debt_until_successful_cleanup() {
     provider.cleanup();
     assert_eq!(provider.cleanup_debt_count(), 0);
     assert_eq!(arb.writer_resource_usage().disk, 0);
+    let batch = receiver.try_recv_batch().unwrap();
+    assert_eq!(
+        batch.metric(clinker_exec::telemetry::MetricKey::WriterCleanupFailed),
+        2
+    );
+    assert_eq!(
+        batch.metric(clinker_exec::telemetry::MetricKey::WriterCleanupCompleted),
+        1
+    );
     assert!(scope.stage().is_ok());
 }
 
 #[test]
 fn stage_short_readback_refuses_incomplete_prepared_bytes() {
+    let (producer, receiver) = telemetry();
     let root = tempfile::tempdir().unwrap();
     let arb = Arc::new(MemoryArbitrator::with_policy(
         128 * 1024,
@@ -263,6 +541,7 @@ fn stage_short_readback_refuses_incomplete_prepared_bytes() {
         ShutdownToken::detached(),
         Some(&configured(root.path())),
         NonZeroUsize::new(1).unwrap(),
+        Some(producer),
     )
     .unwrap();
     let mut stage = provider.resources().scope().unwrap().stage().unwrap();
@@ -284,6 +563,15 @@ fn stage_short_readback_refuses_incomplete_prepared_bytes() {
     assert!(prepared.deliver(&mut output).is_err());
     assert!(output.is_empty());
     assert_eq!(arb.writer_resource_usage().disk, 0);
+    let batch = receiver.try_recv_batch().unwrap();
+    assert_eq!(
+        batch.metric(clinker_exec::telemetry::MetricKey::WriterStageFailed),
+        1
+    );
+    assert_eq!(
+        batch.metric(clinker_exec::telemetry::MetricKey::WriterStageDropped),
+        0
+    );
 }
 
 #[test]
@@ -315,6 +603,7 @@ fn stage_relative_and_long_configured_roots_preserve_exact_storage_directory() {
             ShutdownToken::detached(),
             Some(&configured(configured_path)),
             NonZeroUsize::new(1).unwrap(),
+            None,
         )
         .unwrap();
         let mut stage = provider.resources().scope().unwrap().stage().unwrap();
@@ -344,6 +633,7 @@ fn stage_cleanup_debt_outlives_provider_and_remains_retryable() {
         ShutdownToken::detached(),
         Some(&configured(root.path())),
         NonZeroUsize::new(1).unwrap(),
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -390,6 +680,7 @@ fn stage_competing_grants_never_oversubscribe() {
         ShutdownToken::detached(),
         None,
         NonZeroUsize::new(4).unwrap(),
+        None,
     )
     .unwrap();
     let barrier = Arc::new(std::sync::Barrier::new(8));
@@ -426,6 +717,7 @@ fn stage_memory_sealed_bytes_match_standalone() {
         ShutdownToken::detached(),
         None,
         NonZeroUsize::new(4).unwrap(),
+        None,
     )
     .unwrap();
     let mut stage = provider.resources().scope().unwrap().stage().unwrap();

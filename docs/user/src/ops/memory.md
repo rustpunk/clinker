@@ -2,6 +2,21 @@
 
 Clinker is designed to be a good neighbor on shared servers. Rather than consuming all available memory, it works within a configurable budget and reaches for back-pressure or disk spill before it runs out.
 
+## What the budget measures
+
+Memory attribution and process RSS measure different things. Clinker samples
+RSS to detect pressure, while individual operators report the data they retain.
+Allocator overhead, thread stacks, native I/O workspace and startup allocations
+also contribute to RSS. Setting a budget therefore does not promise that the
+process's resident size will always equal its accounted data size.
+
+Library integrations can additionally use finite, explicitly budgeted output
+preparation. That API reserves memory before allocation and includes both old
+and replacement buffers during growth. It can refuse an operation before
+writing any output when its memory budget cannot cover it. These library
+primitives are not yet connected to the CLI's existing format writers; they
+introduce no YAML key or CLI flag and do not change the tuning controls below.
+
 ## The `memory:` block
 
 All pipeline-level memory tuning lives under a single optional block:

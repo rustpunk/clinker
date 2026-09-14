@@ -6,6 +6,87 @@ This page is the engine-internals reference for how Clinker tracks, attributes, 
 
 ## How it works
 
+### Exact allocation admission for prepared output
+
+`clinker_format::preparation` provides an additive library foundation for
+preparing one complete output operation before delivery. Existing codecs and
+CLI writer construction do not yet use it. `MemoryOnlyResources` requires an
+explicit nonzero memory budget. `ExecutorResources` shares the run's
+`MemoryArbitrator` and takes an explicit optional telemetry producer; disabling
+telemetry changes no resource limit. Neither provider offers an unlimited
+memory path.
+
+`AllocationGrant` reserves the complete requested `Layout` before allocation.
+`ReservedBuffer` and `ReservedVec` retain that grant until the allocation is
+freed. Growth reserves the replacement while the old block remains charged;
+allocation failure leaves the old contents and charge intact. Moving a grant
+or transferring it within one authority moves ownership without a release and
+reacquire gap. Splitting or merging grants preserves the total; cross-authority
+transfers are refused. Requested layouts include stage metadata, chunk
+inventories, and retained progress space, rather than just encoded lengths.
+
+The executor admission ledger serializes reservations and limit changes. It
+subtracts sampled legacy consumer usage and outstanding writer grants before
+admitting another layout. Legacy samples remain estimates, not atomic grants.
+`writer_resource_usage()` derives current memory, peak memory, disk and
+descriptor usage from this ledger. `set_limit` refuses a limit below outstanding
+writer grants and leaves the previous limit unchanged; the disk setter likewise
+refuses a quota below the sum of outstanding writer disk and legacy spill bytes.
+
+`WriterResourceConsumer` reports the ledger's exact live grant total through its
+`ConsumerHandle`. It is admission-managed and never backpressureable: parking
+the synchronous writer would prevent its own release progress. Spill requests
+are consumed at chunk boundaries, and cancellation is checked before consulting
+pause state. Grants and cleanup debt keep the admission owner registered after
+the provider handle drops; the final owner unregisters it on success, error or
+cancellation. [Prepared storage](storage-internals.md#prepared-output-storage)
+describes the separate disk and descriptor ownership.
+
+These are requested-allocation bounds, not whole-process RSS bounds. Allocator
+metadata/rounding, thread stacks and native I/O internals remain outside them.
+Named fixed startup allowances are the standalone Arc/mutex control block and
+the executor authority, admission, consumer and storage control blocks. The
+environment-derived current-directory lookup is a temporary startup allowance;
+retained authored paths, path-construction envelopes and descriptor inventories
+are admitted separately. Existing parser buffers, input records and legacy
+operators remain with their existing owners; this API does not retroactively
+admit them.
+
+### Prepared-output telemetry
+
+An executor provider supplied with the existing `TelemetryProducer` emits
+closed `WriterAdmission`, `WriterStage`, `WriterSpill` and `WriterCleanup` spans.
+Scopes are fixed literals: no filename, field value, owner ID or authored node
+becomes a metric dimension. Each scope has started/completed/failed/interrupted
+counters. Admission counts memory-grant attempts; a completed admission grants
+a layout and does not claim the allocator succeeded. Stage observation spans
+creation through successful readback and storage release, including metadata,
+progress-buffer and stage-box refusal. A resource failure is reported with its
+original kind; cancellation is interrupted, not failed. Cleanup continues under
+cancellation so resources can be released.
+
+`WriterStageDropped` counts a stage abandoned without a terminal storage result;
+it does not infer destination success or failure. The existing `SinkRecords`,
+`SinkErrors`, `SinkBytes` and Sink lifecycle metrics own destination-level
+outcomes, so this primitive does not duplicate them. `WriterSpillBytes` counts
+bytes actually written to temporary storage, including partial writes. Cleanup
+attempt counters include retries; they do not claim remaining debt has been
+released. Read current debt and live bytes from the storage and ledger APIs.
+
+Each span is emitted once after its outcome, with both timestamps closed. The
+producer's fixed counters coalesce; span admission may shed load. Full, sampled
+or contended telemetry never changes preparation, cancellation, delivery or
+cleanup, and never grows the arena. Producer clones share the existing
+telemetry arena/counter owner; their inline stage handles and observation state
+are included in the stage metadata grant. The provider's one retained producer
+handle is part of its fixed control block. Format-only providers have no
+executor telemetry dependency.
+
+Lineage is unchanged: these primitives alter no column values, row routing or
+dataset boundary. Raw temporary bytes are internal storage, not a new dataset.
+
+### Existing consumer attribution
+
 Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. Alongside RSS, every memory-touching operator (Source ingest channels, Aggregate hash maps, sort buffers, grace-hash partitions, sort-merge accumulators, IEJoin arrays, inline-Combine hash tables, the Reshape per-group input buffer, `node_buffers` slots and their transient scan materializations, and window-runtime arenas) registers a `MemoryConsumer` wrapper with the pipeline-scoped arbitrator. Each operator owns its live byte counter and updates it on every admit / spill transition; the arbitrator queries `current_usage()` per consumer at every policy poll. This pull-mode attribution lets the policy distinguish *reclaimable* bytes (what an operator can give up right now) from currently-held bytes — a grace-hash with on-disk partitions, for instance, reports only its in-memory portion, and the Reshape buffer reports the live bytes of the groups still resident in memory.
 
 Registrations are scoped to the state they mirror, not to the run: each wrapper is unregistered when the state it attributes drains. A Source's ingest-channel consumer is released the moment its receiver disconnects (whichever arm consumed it — the Source arm, a fused `Merge.interleave`, or a fused Transform); a Combine branch's consumer is released when the branch exits — the IEJoin, grace-hash, and sort-merge branches route their clean return and every internal `?` early-return through a single unregister, and the inline-hash branch unregisters at its clean exit; and a `node_buffers` slot's consumer leaves the registry after its final planned reader. A consumer that collects a sequential scan into a resident vector carries an RAII materialization reservation for its complete synchronous use, so normal completion and every error return unregister it. Composition input seeding transfers that same registration into the body-local node-buffer registry without an unregister/register gap or a second charge. While the body Source canonicalizes its seed, the same byte handle first reserves the prospective output in addition to the still-live seed, then drops back to the output estimate when the seed allocation is gone; admission atomically swaps the wrapper under the existing consumer id. Later stages therefore never see charged bytes from state that has already moved downstream, and the registry the policy polls contains live contributors only.

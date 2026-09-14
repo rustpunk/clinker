@@ -1804,6 +1804,24 @@ fn metric_name(key: MetricKey) -> &'static str {
         MetricKey::SinkRecords => "clinker.sink.records",
         MetricKey::SinkErrors => "clinker.sink.errors",
         MetricKey::SinkBytes => "clinker.sink.bytes",
+        MetricKey::WriterAdmissionStarted => "clinker.writer.admission.started",
+        MetricKey::WriterAdmissionCompleted => "clinker.writer.admission.completed",
+        MetricKey::WriterAdmissionFailed => "clinker.writer.admission.failed",
+        MetricKey::WriterAdmissionInterrupted => "clinker.writer.admission.interrupted",
+        MetricKey::WriterStageStarted => "clinker.writer.stage.started",
+        MetricKey::WriterStageCompleted => "clinker.writer.stage.completed",
+        MetricKey::WriterStageFailed => "clinker.writer.stage.failed",
+        MetricKey::WriterStageInterrupted => "clinker.writer.stage.interrupted",
+        MetricKey::WriterStageDropped => "clinker.writer.stage.dropped",
+        MetricKey::WriterSpillStarted => "clinker.writer.spill.started",
+        MetricKey::WriterSpillCompleted => "clinker.writer.spill.completed",
+        MetricKey::WriterSpillFailed => "clinker.writer.spill.failed",
+        MetricKey::WriterSpillInterrupted => "clinker.writer.spill.interrupted",
+        MetricKey::WriterSpillBytes => "clinker.writer.spill.bytes",
+        MetricKey::WriterCleanupStarted => "clinker.writer.cleanup.started",
+        MetricKey::WriterCleanupCompleted => "clinker.writer.cleanup.completed",
+        MetricKey::WriterCleanupFailed => "clinker.writer.cleanup.failed",
+        MetricKey::WriterCleanupInterrupted => "clinker.writer.cleanup.interrupted",
     }
 }
 
@@ -1817,6 +1835,10 @@ fn span_name(name: SpanName) -> &'static str {
         SpanName::Source => "clinker.source",
         SpanName::Guess => "clinker.guess",
         SpanName::Sink => "clinker.sink",
+        SpanName::WriterAdmission => "clinker.writer.admission",
+        SpanName::WriterStage => "clinker.writer.stage",
+        SpanName::WriterSpill => "clinker.writer.spill",
+        SpanName::WriterCleanup => "clinker.writer.cleanup",
     }
 }
 
@@ -2141,6 +2163,69 @@ mod tests {
             (MetricKey::SinkRecords, "clinker.sink.records"),
             (MetricKey::SinkErrors, "clinker.sink.errors"),
             (MetricKey::SinkBytes, "clinker.sink.bytes"),
+            (
+                MetricKey::WriterAdmissionStarted,
+                "clinker.writer.admission.started",
+            ),
+            (
+                MetricKey::WriterAdmissionCompleted,
+                "clinker.writer.admission.completed",
+            ),
+            (
+                MetricKey::WriterAdmissionFailed,
+                "clinker.writer.admission.failed",
+            ),
+            (
+                MetricKey::WriterAdmissionInterrupted,
+                "clinker.writer.admission.interrupted",
+            ),
+            (
+                MetricKey::WriterStageStarted,
+                "clinker.writer.stage.started",
+            ),
+            (
+                MetricKey::WriterStageCompleted,
+                "clinker.writer.stage.completed",
+            ),
+            (MetricKey::WriterStageFailed, "clinker.writer.stage.failed"),
+            (
+                MetricKey::WriterStageInterrupted,
+                "clinker.writer.stage.interrupted",
+            ),
+            (
+                MetricKey::WriterStageDropped,
+                "clinker.writer.stage.dropped",
+            ),
+            (
+                MetricKey::WriterSpillStarted,
+                "clinker.writer.spill.started",
+            ),
+            (
+                MetricKey::WriterSpillCompleted,
+                "clinker.writer.spill.completed",
+            ),
+            (MetricKey::WriterSpillFailed, "clinker.writer.spill.failed"),
+            (
+                MetricKey::WriterSpillInterrupted,
+                "clinker.writer.spill.interrupted",
+            ),
+            (MetricKey::WriterSpillBytes, "clinker.writer.spill.bytes"),
+            (
+                MetricKey::WriterCleanupStarted,
+                "clinker.writer.cleanup.started",
+            ),
+            (
+                MetricKey::WriterCleanupCompleted,
+                "clinker.writer.cleanup.completed",
+            ),
+            (
+                MetricKey::WriterCleanupFailed,
+                "clinker.writer.cleanup.failed",
+            ),
+            (
+                MetricKey::WriterCleanupInterrupted,
+                "clinker.writer.cleanup.interrupted",
+            ),
         ];
         assert_eq!(metric_names.len(), MetricKey::COUNT);
         for (key, expected) in metric_names {
@@ -2156,6 +2241,10 @@ mod tests {
             (SpanName::Source, "clinker.source"),
             (SpanName::Guess, "clinker.guess"),
             (SpanName::Sink, "clinker.sink"),
+            (SpanName::WriterAdmission, "clinker.writer.admission"),
+            (SpanName::WriterStage, "clinker.writer.stage"),
+            (SpanName::WriterSpill, "clinker.writer.spill"),
+            (SpanName::WriterCleanup, "clinker.writer.cleanup"),
         ];
         for (name, expected) in span_names {
             assert_eq!(span_name(name), expected, "stable name for {name:?}");
@@ -2209,6 +2298,24 @@ mod tests {
                 "clinker.sink.records",
                 "clinker.sink.errors",
                 "clinker.sink.bytes",
+                "clinker.writer.admission.started",
+                "clinker.writer.admission.completed",
+                "clinker.writer.admission.failed",
+                "clinker.writer.admission.interrupted",
+                "clinker.writer.stage.started",
+                "clinker.writer.stage.completed",
+                "clinker.writer.stage.failed",
+                "clinker.writer.stage.interrupted",
+                "clinker.writer.stage.dropped",
+                "clinker.writer.spill.started",
+                "clinker.writer.spill.completed",
+                "clinker.writer.spill.failed",
+                "clinker.writer.spill.interrupted",
+                "clinker.writer.spill.bytes",
+                "clinker.writer.cleanup.started",
+                "clinker.writer.cleanup.completed",
+                "clinker.writer.cleanup.failed",
+                "clinker.writer.cleanup.interrupted",
             ]
         );
         assert_eq!(
@@ -2222,6 +2329,10 @@ mod tests {
                 "clinker.source",
                 "clinker.guess",
                 "clinker.sink",
+                "clinker.writer.admission",
+                "clinker.writer.stage",
+                "clinker.writer.spill",
+                "clinker.writer.cleanup",
             ]
         );
     }
