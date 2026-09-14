@@ -662,6 +662,10 @@ impl TelemetryArena {
             queue,
             rate: RateLimiter::new(policy.rate_limit_per_second(), policy.rate_limit_burst()),
         }));
+        // Initialize native mutex storage within the fixed startup allowance.
+        // On platforms with lazy mutex allocation, the first producer call
+        // must not allocate while reporting another allocation's failure.
+        drop(shared.lock().unwrap_or_else(|e| e.into_inner()));
 
         let producer = TelemetryProducer {
             policy: Arc::new(policy.clone()),

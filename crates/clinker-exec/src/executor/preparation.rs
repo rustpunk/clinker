@@ -709,6 +709,9 @@ impl StorageCapability {
             file_layout,
             _root: root_grant,
         });
+        // Native mutex initialization may allocate once. It belongs to the
+        // fixed storage control-block allowance, never the first stage claim.
+        drop(storage.slots.lock().unwrap_or_else(|e| e.into_inner()));
         drop(startup_root);
         drop(startup_grant);
         Ok(storage)

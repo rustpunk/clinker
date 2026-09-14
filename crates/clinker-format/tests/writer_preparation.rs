@@ -88,6 +88,19 @@ fn memory_resource_refusal_does_not_allocate_an_error() {
 }
 
 #[test]
+fn first_memory_grant_uses_only_startup_allocations() {
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024).unwrap());
+    let scope = provider.resources().scope().unwrap();
+    let (grant, allocations) = allocation_probe(false, || {
+        scope.reserve(std::alloc::Layout::from_size_align(1, 1).unwrap())
+    });
+    assert_eq!(allocations, 0);
+    assert_eq!(provider.used(), 1);
+    drop(grant.unwrap());
+    assert_eq!(provider.used(), 0);
+}
+
+#[test]
 fn storage_recovers_exact_inline_evidence_on_write_flush_and_readback() {
     #[derive(Clone, Copy)]
     enum Boundary {

@@ -225,12 +225,14 @@ struct MemoryAuthority {
 }
 impl MemoryOnlyResources {
     pub fn new(limit: NonZeroUsize) -> Self {
-        Self {
-            authority: Arc::new(MemoryAuthority {
-                limit: limit.get(),
-                used: Mutex::new(0),
-            }),
-        }
+        let authority = Arc::new(MemoryAuthority {
+            limit: limit.get(),
+            used: Mutex::new(0),
+        });
+        // Some platforms allocate the native mutex on first lock. Establish
+        // that fixed control-block storage at startup, before any admission.
+        drop(authority.used.lock().unwrap_or_else(|e| e.into_inner()));
+        Self { authority }
     }
     pub fn resources(&self) -> WriterResources {
         WriterResources::new(self.authority.clone())

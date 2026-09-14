@@ -69,6 +69,56 @@ mode = "none"
 }
 
 #[test]
+fn first_telemetry_emission_uses_only_startup_allocations() {
+    use clinker_exec::telemetry::{AdmissionOutcome, SpanFact, SpanName, SpanStatus};
+    let (producer, receiver) = telemetry();
+    assert_eq!(producer.snapshot().accepted, 0);
+    ALLOCATIONS.with(|count| count.set(Some(0)));
+    let result = producer.emit_span(SpanFact {
+        name: SpanName::WriterStage,
+        status: SpanStatus::Ok,
+        logical_node: "writer.stage",
+        started_at_unix_nanos: 1,
+        ended_at_unix_nanos: 2,
+    });
+    let allocations = ALLOCATIONS.with(|count| count.replace(None).unwrap());
+    assert_eq!(allocations, 0);
+    assert!(matches!(result, AdmissionOutcome::Accepted { .. }));
+    assert_eq!(receiver.try_recv_batch().unwrap().traces().len(), 1);
+}
+
+#[test]
+fn first_spill_stage_allocates_only_admitted_progress_and_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let arb = Arc::new(MemoryArbitrator::with_policy(
+        128 * 1024,
+        0.8,
+        0.7,
+        Box::new(NoOpPolicy),
+    ));
+    let provider = ExecutorResources::new(
+        arb.clone(),
+        ShutdownToken::detached(),
+        Some(&configured(root.path())),
+        NonZeroUsize::new(1).unwrap(),
+        None,
+    )
+    .unwrap();
+    let baseline = arb.writer_resource_usage().memory;
+    let scope = provider.resources().scope().unwrap();
+    ALLOCATIONS.with(|count| count.set(Some(0)));
+    let result = scope.stage();
+    let allocations = ALLOCATIONS.with(|count| count.replace(None).unwrap());
+    assert_eq!(
+        allocations, 2,
+        "only the admitted progress buffer and stage box"
+    );
+    drop(result.unwrap());
+    assert_eq!(arb.writer_resource_usage().memory, baseline);
+    assert_eq!(arb.writer_resource_usage().descriptors, 0);
+}
+
+#[test]
 fn stage_telemetry_observes_construction_denial_and_allocator_failure() {
     use clinker_exec::telemetry::{MetricKey, SpanName, SpanStatus};
     use clinker_format::preparation::ResourceErrorKind;
