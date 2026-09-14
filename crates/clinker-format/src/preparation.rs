@@ -418,6 +418,9 @@ impl<S: StageStorage> Readback for StorageStage<S> {
         destination: &mut dyn Write,
         mut remaining: u64,
     ) -> Result<(), FormatError> {
+        self.scope.check_cancelled().inspect_err(|&error| {
+            self.record_failure(error);
+        })?;
         while remaining != 0 {
             self.scope.check_cancelled().inspect_err(|&error| {
                 self.record_failure(error);
@@ -442,6 +445,9 @@ impl<S: StageStorage> Readback for StorageStage<S> {
             destination.write_all(&bytes[..n])?;
             remaining -= n as u64;
         }
+        self.scope.check_cancelled().inspect_err(|&error| {
+            self.record_failure(error);
+        })?;
         self.storage.complete().inspect_err(|&error| {
             self.record_failure(error);
         })?;

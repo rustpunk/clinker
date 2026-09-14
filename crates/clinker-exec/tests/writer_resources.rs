@@ -359,6 +359,120 @@ fn configured(root: &std::path::Path) -> clinker_exec::executor::ResolvedStorage
     }
 }
 
+fn cancelled_delivery_releases_resources(empty: bool) {
+    use clinker_exec::telemetry::{MetricKey, SpanName, SpanStatus};
+    use clinker_format::{
+        FormatError,
+        preparation::{ResourceError, ResourceErrorKind},
+    };
+
+    struct CancelOnLastWrite {
+        token: ShutdownToken,
+        remaining: usize,
+        output: Vec<u8>,
+    }
+    impl Write for CancelOnLastWrite {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(bytes);
+            self.remaining -= bytes.len();
+            if self.remaining == 0 {
+                self.token.request();
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            panic!("delivery does not flush")
+        }
+    }
+    for spill in [false, true] {
+        let (producer, receiver) = telemetry();
+        let root = tempfile::tempdir().unwrap();
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            128 * 1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let token = ShutdownToken::detached();
+        let storage = configured(root.path());
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            token.clone(),
+            spill.then_some(&storage),
+            NonZeroUsize::new(1).unwrap(),
+            Some(producer),
+        )
+        .unwrap();
+        let baseline = arb.writer_resource_usage().memory;
+        let payload = vec![
+            7;
+            if empty {
+                0
+            } else if spill {
+                100 * 1024
+            } else {
+                1024
+            }
+        ];
+        let mut stage = provider.resources().scope().unwrap().stage().unwrap();
+        stage.write_all(&payload).unwrap();
+        let prepared = stage.finish().unwrap();
+        assert_eq!(prepared.len(), payload.len() as u64);
+        if spill && !empty {
+            assert_eq!(arb.writer_resource_usage().disk, payload.len() as u64);
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+        if empty {
+            token.request();
+        }
+        let mut destination = CancelOnLastWrite {
+            token,
+            remaining: payload.len(),
+            output: Vec::new(),
+        };
+        assert!(
+            matches!(prepared.deliver(&mut destination), Err(FormatError::Resource(error)) if error == ResourceError::new(ResourceErrorKind::Cancelled, 0, 0))
+        );
+        assert_eq!(destination.output, payload);
+        assert_eq!(arb.writer_resource_usage().memory, baseline);
+        assert_eq!(arb.writer_resource_usage().disk, 0);
+        assert_eq!(arb.writer_resource_usage().descriptors, 0);
+        assert_eq!(provider.cleanup_debt_count(), 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        let batch = receiver.try_recv_batch().unwrap();
+        assert_eq!(batch.metric(MetricKey::WriterStageStarted), 1);
+        assert_eq!(batch.metric(MetricKey::WriterStageInterrupted), 1);
+        for key in [
+            MetricKey::WriterStageCompleted,
+            MetricKey::WriterStageFailed,
+            MetricKey::WriterStageDropped,
+        ] {
+            assert_eq!(batch.metric(key), 0);
+        }
+        let spans: Vec<_> = batch
+            .traces()
+            .iter()
+            .filter(|span| span.name == SpanName::WriterStage)
+            .collect();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].status, SpanStatus::Unset);
+        assert!(spans[0].started_at_unix_nanos <= spans[0].ended_at_unix_nanos);
+        drop(provider);
+        assert_eq!(arb.writer_resource_usage().memory, 0);
+        assert_eq!(arb.consumer_count(), 0);
+    }
+}
+
+#[test]
+fn empty_delivery_cancellation_is_interrupted_and_releases_resources() {
+    cancelled_delivery_releases_resources(true);
+}
+
+#[test]
+fn final_write_cancellation_is_interrupted_and_releases_resources() {
+    cancelled_delivery_releases_resources(false);
+}
+
 #[test]
 fn stage_spills_with_all_other_memory_reserved_and_releases_file() {
     let root = tempfile::tempdir().unwrap();

@@ -217,6 +217,174 @@ struct Encoder {
     committed: usize,
     reject: bool,
 }
+
+fn cancelled_delivery_never_commits(cancel_after_seal: bool) {
+    use clinker_format::preparation::{
+        AllocationGrant, MemoryStorage, OperationStage, OwnerId, PreparedBytes, ResourceAuthority,
+        WriterResources,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct Authority {
+        memory: MemoryOnlyResources,
+        cancelled: Arc<AtomicBool>,
+        cancel_after_seal: bool,
+    }
+    struct CancelAfterSeal {
+        stage: Box<dyn OperationStage>,
+        cancelled: Arc<AtomicBool>,
+    }
+    impl Write for CancelAfterSeal {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.stage.write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.stage.flush()
+        }
+    }
+    impl OperationStage for CancelAfterSeal {
+        fn failure(&self) -> Option<ResourceError> {
+            self.stage.failure()
+        }
+        fn finish(self: Box<Self>) -> Result<PreparedBytes, FormatError> {
+            let prepared = self.stage.finish()?;
+            self.cancelled.store(true, Ordering::SeqCst);
+            Ok(prepared)
+        }
+    }
+    impl ResourceAuthority for Authority {
+        fn try_reserve(
+            self: Arc<Self>,
+            _: OwnerId,
+            layout: std::alloc::Layout,
+        ) -> Result<AllocationGrant, ResourceError> {
+            self.memory.resources().scope()?.reserve(layout)
+        }
+        fn release(&self, _: OwnerId, _: usize) {
+            unreachable!("grants belong to the delegated memory authority")
+        }
+        fn check_cancelled(&self) -> Result<(), ResourceError> {
+            if self.cancelled.load(Ordering::SeqCst) {
+                Err(ResourceError::new(ResourceErrorKind::Cancelled, 0, 0))
+            } else {
+                Ok(())
+            }
+        }
+        fn create_stage(
+            self: Arc<Self>,
+            scope: WriterScope,
+        ) -> Result<Box<dyn OperationStage>, FormatError> {
+            let stage = StorageStage::create(scope.clone(), MemoryStorage::new(scope))?;
+            if self.cancel_after_seal {
+                Ok(Box::new(CancelAfterSeal {
+                    stage,
+                    cancelled: self.cancelled.clone(),
+                }))
+            } else {
+                Ok(stage)
+            }
+        }
+    }
+    struct ProbeEncoder {
+        empty: bool,
+        prepared: std::cell::Cell<usize>,
+        committed: usize,
+    }
+    impl FormatEncoder for ProbeEncoder {
+        type Pending = ();
+        fn prepare(
+            &self,
+            _: OutputOperation<'_>,
+            stage: &mut dyn Write,
+            _: &WriterScope,
+        ) -> Result<(), FormatError> {
+            self.prepared.set(self.prepared.get() + 1);
+            if !self.empty {
+                stage.write_all(b"sealed")?;
+            }
+            Ok(())
+        }
+        fn commit(&mut self, _: ()) {
+            self.committed += 1;
+        }
+    }
+    struct CancelOnWrite {
+        cancelled: Arc<AtomicBool>,
+        bytes: Vec<u8>,
+        attempts: usize,
+    }
+    impl Write for CancelOnWrite {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.attempts += 1;
+            self.bytes.extend_from_slice(bytes);
+            self.cancelled.store(true, Ordering::SeqCst);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            panic!("cancelled delivery must not flush")
+        }
+    }
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let authority = Arc::new(Authority {
+        memory: MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap()),
+        cancelled: cancelled.clone(),
+        cancel_after_seal,
+    });
+    let mut writer = PreparedWriter::new(
+        CancelOnWrite {
+            cancelled,
+            bytes: Vec::new(),
+            attempts: 0,
+        },
+        ProbeEncoder {
+            empty: cancel_after_seal,
+            prepared: std::cell::Cell::new(0),
+            committed: 0,
+        },
+        WriterResources::new(authority.clone()),
+    )
+    .unwrap();
+    assert!(
+        matches!(writer.write_operation(OutputOperation::Finalize), Err(FormatError::Resource(error)) if error == ResourceError::new(ResourceErrorKind::Cancelled, 0, 0))
+    );
+    for result in [
+        writer.write_operation(OutputOperation::Finalize),
+        writer.flush(),
+        writer.flush_bytes(),
+    ] {
+        assert!(
+            matches!(result, Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::DeliveryPoisoned)
+        );
+    }
+    assert_eq!(writer.encoder().committed, 0);
+    assert_eq!(writer.encoder().prepared.get(), 1);
+    assert_eq!(
+        writer.destination().attempts,
+        usize::from(!cancel_after_seal)
+    );
+    assert_eq!(
+        writer.destination().bytes.as_slice(),
+        if cancel_after_seal {
+            b"".as_slice()
+        } else {
+            b"sealed".as_slice()
+        }
+    );
+    assert_eq!(authority.memory.used(), 0);
+}
+
+#[test]
+fn empty_delivery_cancellation_prevents_commit_and_continuation() {
+    cancelled_delivery_never_commits(true);
+}
+
+#[test]
+fn final_write_cancellation_prevents_commit_and_continuation() {
+    cancelled_delivery_never_commits(false);
+}
 impl FormatEncoder for Encoder {
     type Pending = usize;
     fn prepare(
