@@ -114,7 +114,7 @@ const LINEAGE_METADATA_DEPENDENCIES: [ExpectedMetadataDependency; 7] = [
 /// what its own failure reports as `found`.
 const LOCK_PACKAGE_COUNT: usize = 310;
 pub const LOCK_PACKAGE_DIGEST: &str =
-    "1c954228bea00199c368598d7d952fe2ad3f122234fc8342f36693641beff2c8";
+    "90003622fc532809ea423ab8b6b22f5a218da5389d23a0c332d9305e00ea6de3";
 
 #[derive(Clone, Copy)]
 struct ExpectedMetadataDependency {
