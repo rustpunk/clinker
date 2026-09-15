@@ -1004,44 +1004,85 @@ mod tests {
         let event = event_of_known_size();
         let exact = serde_json::to_vec(&event).expect("the probe event serializes");
 
-        /// Takes the whole record, but slowly enough that the worker returns
-        /// for its next one past its share of the deadline — an ordinarily
-        /// loaded host, not a stuck destination.
-        struct SlowButComplete;
+        struct GatedComplete {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            published: Arc<Mutex<Vec<u8>>>,
+            flushes: Arc<AtomicU64>,
+        }
 
-        impl Write for SlowButComplete {
+        impl Write for GatedComplete {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                thread::sleep(Duration::from_millis(260));
+                self.entered.send(()).expect("test receives write entry");
+                self.release.recv().expect("test releases the write");
+                self.published.lock().unwrap().extend_from_slice(bytes);
                 Ok(bytes.len())
             }
 
             fn flush(&mut self) -> io::Result<()> {
+                self.flushes.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
         }
 
-        // 400 ms deadline, so the drain share ends at 200 ms and the sole
-        // record is written and done at ~260 ms — late for *starting* work,
-        // early for *finishing* it.
         let config = LineageDeliveryConfig::new(
             (exact.len() + 1) * 4,
             exact.len(),
             Duration::from_millis(400),
         )
         .expect("legal delivery limits");
-        let delivery = LineageDelivery::start(config, SlowButComplete).expect("the worker starts");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let flushes = Arc::new(AtomicU64::new(0));
+        let mut delivery = LineageDelivery::start(
+            config,
+            GatedComplete {
+                entered: entered_tx,
+                release: release_rx,
+                published: Arc::clone(&published),
+                flushes: Arc::clone(&flushes),
+            },
+        )
+        .expect("the worker starts");
         assert_eq!(delivery.try_emit(&event), LineageAdmission::Accepted);
+
+        // Establish that this record began before admission closed. Advance
+        // only the private queue clock to the spent drain share while its
+        // write is held; host scheduling cannot choose which side of the
+        // boundary the next pop observes.
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the admitted record begins writing");
+        delivery.queue.close();
+        let drain_budget = config.flush_deadline / DRAIN_SHARE_OF_DEADLINE;
+        {
+            let mut state = delivery.queue.lock_state();
+            assert!(state.events.is_empty());
+            assert_eq!(state.queued_bytes, 0);
+            state.closed_at = Some(Instant::now().checked_sub(drain_budget).unwrap());
+            assert!(!state.may_begin_record(drain_budget));
+        }
+        release_tx.send(()).expect("the worker awaits completion");
+        // The real worker must report its terminal state before finish reads
+        // it. Deadline waiting itself is covered by the cutoff/stuck-sink
+        // tests; this regression tests the drained-queue classification.
+        delivery.worker.take().unwrap().join().unwrap();
 
         let outcome = delivery.finish();
 
         assert_eq!(
             outcome.terminal(),
             LineageDeliveryTerminal::Shutdown,
-            "every accepted event reached the destination inside the deadline"
+            "the completed export is drained even after the drain share expires"
         );
         assert!(outcome.records_complete(), "and none was left half-written");
         assert_eq!(outcome.accepted(), 1);
         assert_eq!(outcome.dropped(), 0);
+        let mut framed = exact;
+        framed.push(b'\n');
+        assert_eq!(*published.lock().unwrap(), framed);
+        assert_eq!(flushes.load(Ordering::Relaxed), 1);
     }
 
     /// A destination that stops accepting bytes altogether cannot be waited
