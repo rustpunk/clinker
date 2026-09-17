@@ -8,10 +8,10 @@ This page is the engine-internals reference for how Clinker tracks, attributes, 
 
 ### Exact allocation admission for prepared output
 
-`clinker_format::preparation` provides an additive library foundation for
-preparing one complete output operation before delivery. Existing codecs and
-CLI writer construction do not yet use it. `MemoryOnlyResources` requires an
-explicit nonzero memory budget. `ExecutorResources` shares the run's
+`clinker_format::preparation` prepares one complete output operation before
+delivery. CSV writer construction in the CLI and executor uses this path;
+other codecs retain their existing allocation behavior. `MemoryOnlyResources`
+requires an explicit nonzero memory budget. `ExecutorResources` shares the run's
 `MemoryArbitrator` and takes an explicit optional telemetry producer; disabling
 telemetry changes no resource limit. Neither provider offers an unlimited
 memory path.
@@ -35,6 +35,14 @@ inventories, and retained progress space, rather than just encoded lengths.
 The backend and its allocation are destroyed before that lease is released,
 including on error and unwinding. Sealing moves this same owner into
 `PreparedBytes`; it neither reallocates the backend nor detaches its grant.
+
+`FormatWriterHandle` and `WriterFactory` apply the same ordering to the concrete
+writer and closure backings. They admit the actual concrete `Layout` before
+fallible boxing and keep the lease outside the box. Internal buffers and
+captured values retain their own owners; the outer layout cannot account for
+their heap allocations. The handles expose neither a detachable box nor its
+lease. Tests observe the charge at allocator deallocation, including unwinding,
+rather than treating payload destruction or a final zero balance as proof.
 
 The executor admission ledger serializes reservations and limit changes. It
 subtracts sampled legacy consumer usage and outstanding writer grants before
@@ -65,9 +73,38 @@ Named fixed startup allowances are the standalone Arc/mutex control block and
 the executor authority, admission, consumer and storage control blocks. The
 environment-derived current-directory lookup is a temporary startup allowance;
 retained authored paths, path-construction envelopes and descriptor inventories
-are admitted separately. Existing parser buffers, input records and legacy
-operators remain with their existing owners; this API does not retroactively
-admit them.
+are admitted separately. CSV's raw parser buffers and the full intermediate
+JSON tree used for JSON-encoded cells remain explicit parser allowances.
+Unchanged readers and legacy operators retain their existing owners; a later
+deep copy or spill reload is a distinct allocation, not an extension of the
+original grant.
+
+### CSV decoding and document ownership
+
+Runtime CSV constructors select admitted decoding for both single-schema and
+multi-record input. `DecodeWorkspace` borrows valid UTF-8 and uses admitted
+scratch for Latin-1 expansion. Final text, keys, arrays, maps, positional values
+and schemas use allocation-owned storage. Single-schema repeated-cell parsing
+reuses the existing split grammar; final nested JSON values are constructed
+fallibly from the parser's intermediate tree. Compiled multi-record CSV still
+rejects repeated input declarations; charset support does not widen that
+surface.
+
+Multi-record capture retains admitted policy metadata, pending rows, section
+values and trailer state. `FormatReader::prepare_document` and the transport
+adapter return `OwnedMap`, so section ownership survives the reader boundary.
+Ingest moves sections into owned envelope values and a shared
+`DocumentContext`; source coercion preserves the original decoded record on
+failure and admits changed values before replacing it. A surviving record,
+document, string or key alias keeps the corresponding allocation charged.
+Unchanged format readers wrap their existing maps as legacy storage; the
+common carrier alone does not admit those allocations.
+
+These boundaries do not establish constant-memory Source or Combine execution:
+those paths can still materialize whole inputs. Their remaining residency work
+is tracked in [#1183](https://github.com/rustpunk/clinker/issues/1183). CSV's
+admitted allocations and the existing ownership-relative estimates below must
+remain distinct from a claim about all readers or whole-process RSS.
 
 ### Allocation-owned record storage
 

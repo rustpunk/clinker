@@ -7,6 +7,8 @@
 //! whole-group rollback.
 
 mod common;
+#[path = "common/pipeline_resource_fixtures.rs"]
+mod resource_fixtures;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -38,7 +40,7 @@ fn reshape_fixture_records(yaml: &str) -> (clinker_record::Record, clinker_recor
     )
 }
 
-// The hard limit admits the actual input/output carriers.
+// The hard limit admits the actual input/output carriers plus CSV workspace.
 // A large group uses 90% of the limit: above the 80% spill threshold, below the
 // whole-group reload ceiling. No authored-width assumption omits hidden fields.
 fn reshape_fixture_limit(
@@ -65,26 +67,17 @@ fn reshape_fixture_limit(
                 u64,
                 clinker_exec::executor::SourceRowId,
             )>());
-    scan.max((group * 10).div_ceil(9)).to_string()
+    let writer = resource_fixtures::csv_workspace_headroom(&output) as usize;
+    (scan + writer).max((group * 10).div_ceil(9)).to_string()
 }
 
-fn pressure_padding(
-    yaml: &str,
-    input_rows: usize,
-    output_rows: usize,
-    group_rows: usize,
-) -> String {
-    let (input, output) = reshape_fixture_records(yaml);
-    let scan_bytes = |record: &clinker_record::Record, rows: usize| {
-        rows * (std::mem::size_of::<(clinker_record::Record, clinker_exec::executor::SourceRowId)>(
-        ) + record.schema().column_count() * std::mem::size_of::<clinker_record::Value>())
-    };
-    let scan = scan_bytes(&input, input_rows).max(scan_bytes(&output, output_rows));
-    // Retained group text must exceed the largest fixed scan reservation.
-    // One scan's worth of text alone establishes that boundary; the group's
-    // row carriers then add strict headroom. The limit helper admits the whole
-    // group at 90% of the hard ceiling, above the 80% spill threshold.
-    "x".repeat(scan.div_ceil(group_rows))
+fn pressure_padding(yaml: &str, group_rows: usize) -> String {
+    let (_, output) = reshape_fixture_records(yaml);
+    // Four writer workspaces of retained text make the group's spill window
+    // remain meaningful even when the admitted writer needs more than the old
+    // tiny fixture's entire limit. Preserve the group population and oracle.
+    let bytes = resource_fixtures::csv_workspace_headroom(&output) as usize;
+    "x".repeat((4 * bytes).div_ceil(group_rows))
 }
 
 /// Run a single-source → reshape → single-output pipeline over `csv_input`,
@@ -121,13 +114,12 @@ fn run_reshape_report(yaml: &str, csv_input: &str) -> Result<ReshapeReport, Pipe
     };
 
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
-        primary,
-        clinker_exec::executor::single_file_reader(
-            "test.csv",
-            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
-        ),
-    )]);
+    // Preserve the operator budget while keeping fixture decoding outside it.
+    let readers = resource_fixtures::predecoded_csv_readers(
+        &config,
+        &CompileContext::default(),
+        &[(&primary, csv_input)],
+    );
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -681,7 +673,7 @@ fn scd_input(groups: usize, rows_per_group: usize) -> (String, usize) {
 
 #[test]
 fn reshape_spills_under_memory_pressure() {
-    // Size the input and output scans from the compiled schema. The workload and
+    // Size the scan and writer from the compiled schema. The workload and
     // synthesized-row count remain unchanged; real spill and exact resident
     // parity below establish that the pressure fixture still exercises disk.
     let (csv, trigger_groups) = scd_input(200, 8);
@@ -747,9 +739,9 @@ fn reshape_spill_preserves_within_group_arrival_order() {
     // directly in the output (an `order_by` would stably re-sort and mask it).
     // One employee, 50 rows whose `status` carries the arrival index, none
     // triggering, so the output is the input rows in order. Padding the status
-    // keeps the group above the soft threshold while both fixed scans fit.
+    // keeps the group above the soft threshold after admitting CSV workspace.
     // A 512M budget keeps it resident for the baseline.
-    let padding = pressure_padding(&scd_spill_pipeline_no_order("512M"), 50, 50, 50);
+    let padding = pressure_padding(&scd_spill_pipeline_no_order("512M"), 50);
     let mut csv = String::from("employee_id,plan_start,plan_end,status\n");
     for r in 0..50u32 {
         // Small gaps (plan_start == plan_end) so no row triggers; `status`
@@ -919,7 +911,7 @@ fn reshape_spill_preserves_arrival_order_across_merge() {
     // row-for-row.
     let mut csv_a = String::from("account,tag\n");
     let mut csv_b = String::from("account,tag\n");
-    let padding = pressure_padding(&merge_reshape_pipeline("512M"), 120, 120, 120);
+    let padding = pressure_padding(&merge_reshape_pipeline("512M"), 120);
     for r in 0..60u32 {
         csv_a.push_str(&format!("X,{padding}a{r:03}\n"));
         csv_b.push_str(&format!("X,{padding}b{r:03}\n"));
@@ -973,7 +965,7 @@ fn reshape_skew_single_giant_group() {
     // is sized so the giant group still fits the finalize reload (it is not a
     // fail-loud case — see `reshape_giant_group_exceeds_budget_fails_loud`).
     let mut csv = String::from("employee_id,plan_start,plan_end,status\n");
-    let payload = pressure_padding(&scd_spill_pipeline("512M"), 700, 701, 600);
+    let payload = pressure_padding(&scd_spill_pipeline("512M"), 600);
     for r in 0..599 {
         csv.push_str(&format!("employee-00000,{},{},{payload}\n", r * 10, r * 10));
     }

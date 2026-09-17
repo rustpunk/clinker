@@ -111,6 +111,27 @@ retry, heartbeat, or process-tree management to Clinker. A supervising parent
 must heartbeat independently of advisory progress and start a fresh process
 with a new execution ID for every retry.
 
+Typed resource failures carry registry-owned messages and `policy_required`
+retry advice. A supervisor must decide whether a fresh attempt is safe;
+temporary-storage or delivery failure can follow bytes already accepted by a
+destination and does not establish rollback.
+
+| Resource condition | Failure code | Category |
+|---|---|---|
+| Memory budget refused | `runtime.resource.memory_budget_exceeded` | `infrastructure` |
+| Allocation or allocation layout unsatisfied | `runtime.resource.allocation_failed` | `infrastructure` |
+| Spill quota refused | `runtime.resource.spill_cap_exceeded` | `infrastructure` |
+| Descriptor quota refused | `runtime.resource.descriptor_cap_exceeded` | `infrastructure` |
+| Temporary storage or readback failed | `runtime.resource.storage_failed` | `infrastructure` |
+| Continuation refused after delivery failed | `runtime.resource.delivery_poisoned` | `infrastructure` |
+| Resource finalized or ownership authority violated | `runtime.invariant.unknown` | `internal_invariant` |
+
+Explicit resource cancellation is an aborted run, reported as `cancelled` in
+machine mode with exit `130` and no failure classification. It does not depend
+on telemetry delivery or a pending shutdown signal. A genuine resource or data
+failure retains its classification even when a shutdown signal is pending;
+malformed source data remains `source.data.invalid` with `do_not_retry` advice.
+
 ---
 
 ## clinker guess

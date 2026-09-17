@@ -10,12 +10,27 @@ Allocator overhead, thread stacks, native I/O workspace and startup allocations
 also contribute to RSS. Setting a budget therefore does not promise that the
 process's resident size will always equal its accounted data size.
 
-Library integrations can additionally use finite, explicitly budgeted output
-preparation. That API reserves memory before allocation and includes both old
-and replacement buffers during growth. It can refuse an operation before
-writing any output when its memory budget cannot cover it. These library
-primitives are not yet connected to the CLI's existing format writers; they
-introduce no YAML key or CLI flag and do not change the tuning controls below.
+CSV input decoding and output preparation use the run's finite resource budget.
+Growing decoded cells, owned record values and retained document metadata carry
+their accounting with them until the last owner releases the allocation. Output
+policy, schema mappings, captured headers and prepared operation storage are
+also admitted before allocation. Replacing a buffer accounts for both old and
+new storage while they overlap; sharing a value does not release its charge.
+
+An operation that cannot obtain its working memory fails as a resource error.
+CSV does not silently truncate a large cell, impose a separate authored cell-size
+limit, or treat resource refusal as a record eligible for the DLQ. An explicitly
+configured spill location can hold prepared output bytes, but cell rendering and
+metadata still require memory. See [output preparation](storage.md#output-preparation).
+
+This is not a whole-process allocation or constant-memory guarantee. The CSV
+parser's raw buffers and the intermediate JSON tree used to parse JSON-encoded
+cells remain outside this admission boundary. Unchanged format readers and
+later legacy record copies also have separate or incomplete accounting.
+Source and Combine paths can still retain whole inputs; input-sized
+residency remains tracked in [#1183](https://github.com/rustpunk/clinker/issues/1183).
+A successful small fixture does not establish that a larger input fits. The
+existing YAML and CLI tuning controls below remain the controls for this budget.
 
 ## The `memory:` block
 

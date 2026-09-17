@@ -2,6 +2,46 @@ use std::fmt;
 
 use clinker_record::{Record, Value};
 
+/// Closed, allocation-free reasons for rejecting a prepared output field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputEncodingKind {
+    Charset,
+    CharsetName,
+    Array,
+    Map,
+    JoinCollision,
+    SchemaDrift,
+    Json,
+}
+
+/// Inline diagnostic excerpt; the numeric field identity remains authoritative.
+#[derive(Clone, Copy, Debug)]
+pub struct OutputFieldName {
+    bytes: [u8; 48],
+    len: u8,
+}
+impl OutputFieldName {
+    pub fn new(name: &str) -> Self {
+        let mut len = name.len().min(48);
+        while !name.is_char_boundary(len) {
+            len -= 1;
+        }
+        let mut bytes = [0; 48];
+        bytes[..len].copy_from_slice(&name.as_bytes()[..len]);
+        Self {
+            bytes,
+            len: len as u8,
+        }
+    }
+}
+impl fmt::Display for OutputFieldName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            std::str::from_utf8(&self.bytes[..usize::from(self.len)]).map_err(|_| fmt::Error)?,
+        )
+    }
+}
+
 /// Complete evidence for one decoded source value that could not satisfy its
 /// declared type. The executor owns disposition; the format layer only carries
 /// the already-decoded record across the `FormatReader` boundary without
@@ -55,6 +95,15 @@ pub struct FanOutLimitFailure {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum FormatError {
+    /// Field positions and offsets identify invalid input without retaining it.
+    OutputEncoding {
+        format: &'static str,
+        field: usize,
+        offset: usize,
+        kind: OutputEncodingKind,
+        field_name: OutputFieldName,
+        element: Option<std::num::NonZeroUsize>,
+    },
     /// Bounded, allocation-free admission or prepared-delivery failure.
     Resource(crate::preparation::ResourceError),
     /// A failure already assigned an exact registered machine code by the
@@ -308,6 +357,35 @@ pub enum FormatError {
 impl fmt::Display for FormatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::OutputEncoding {
+                format,
+                field,
+                offset,
+                kind,
+                field_name,
+                ..
+            } => write!(
+                f,
+                "{format} output field {field} ({field_name}) at byte {offset}: {}",
+                match kind {
+                    OutputEncodingKind::Charset =>
+                        "character cannot be represented in ISO-8859-1 (Latin-1); use encoding: utf-8",
+                    OutputEncodingKind::CharsetName =>
+                        "unsupported character set; use encoding: utf-8 or encoding: iso-8859-1",
+                    OutputEncodingKind::Array =>
+                        "array requires a declared multiple: true column; declare the source or Sink \
+                         column multiple: true, coerce the array to a scalar in CXL (to_string), \
+                         or route to JSON / NDJSON output",
+                    OutputEncodingKind::Map =>
+                        "map cannot be written as a scalar CSV cell; project scalar fields",
+                    OutputEncodingKind::JoinCollision =>
+                        "value contains the join delimiter; set on_conflict: escape or encode_json",
+                    OutputEncodingKind::SchemaDrift =>
+                        "output schema does not declare this column; declare the column",
+                    OutputEncodingKind::Json =>
+                        "value has no valid JSON representation; check finite numbers, nested keys and depth",
+                }
+            ),
             Self::Resource(error) => error.fmt(f),
             Self::Classified { code, message } => write!(f, "[{code}] {message}"),
             Self::Interrupted => f.write_str("source read interrupted"),
@@ -540,7 +618,14 @@ impl FormatError {
     /// DLQ entry, so this predicate is used by tests and by any caller that only
     /// needs the yes/no.
     pub fn is_join_collision(&self) -> bool {
-        matches!(self, Self::MultiValueDelimiterCollision { .. })
+        matches!(
+            self,
+            Self::MultiValueDelimiterCollision { .. }
+                | Self::OutputEncoding {
+                    kind: OutputEncodingKind::JoinCollision,
+                    ..
+                }
+        )
     }
 }
 
@@ -570,6 +655,45 @@ impl From<csv::Error> for FormatError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_array_display_preserves_remedies_and_bounded_field_context() {
+        let excerpt = "x".repeat(47);
+        let long_name = format!("{excerpt}🦀{}", "private_suffix".repeat(1_000));
+        for (name, displayed_name, field, offset) in [
+            ("items", "items", 3, 17),
+            (long_name.as_str(), excerpt.as_str(), usize::MAX, usize::MAX),
+        ] {
+            let error = FormatError::OutputEncoding {
+                format: "CSV",
+                field,
+                offset,
+                kind: OutputEncodingKind::Array,
+                field_name: OutputFieldName::new(name),
+                element: None,
+            };
+            let message = error.to_string();
+            assert!(
+                message.starts_with(&format!(
+                    "CSV output field {field} ({displayed_name}) at byte {offset}: "
+                )),
+                "preserves bounded field identity and byte offset: {message}"
+            );
+            assert!(message.len() <= 384, "bounded diagnostic: {message}");
+            assert!(
+                message.contains("multiple: true"),
+                "preserves the repeated-column remedy: {message}"
+            );
+            assert!(
+                message.contains("CXL") && message.contains("to_string"),
+                "preserves the scalar-conversion remedy: {message}"
+            );
+            assert!(
+                message.contains("JSON"),
+                "preserves the self-describing output remedy: {message}"
+            );
+        }
+    }
 
     #[test]
     fn schema_drift_display_names_format_column_and_remedies() {

@@ -546,12 +546,9 @@ impl<R: Read + Send> FormatReader for Hl7Reader<R> {
         std::mem::take(&mut self.pending_events)
     }
 
-    fn prepare_document(
-        &mut self,
-        config: &EnvelopeConfig,
-    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
+    fn prepare_document(&mut self, config: &EnvelopeConfig) -> Result<OwnedMap, FormatError> {
         if config.is_empty() {
-            return Ok(IndexMap::new());
+            return Ok(OwnedMap::from_map(IndexMap::new()));
         }
         self.ensure_initialized()?;
         // The FHS header (if present) is the only declared-envelope-section
@@ -610,7 +607,7 @@ impl<R: Read + Send> FormatReader for Hl7Reader<R> {
                 Value::Map(OwnedMap::from_map(typed)),
             );
         }
-        Ok(out)
+        Ok(OwnedMap::from_map(out))
     }
 }
 

@@ -1,7 +1,46 @@
 //! Input/output format selectors.
 
 use super::*;
+use clinker_format::charset::Charset;
 use serde::{Deserialize, Serialize};
+
+fn resolve_encoding(name: Option<&str>) -> Result<Charset, String> {
+    let Some(name) = name else {
+        return Ok(Charset::Utf8);
+    };
+    Charset::from_name(name)
+        .map_err(|error| format!("{error}; use `encoding: utf-8` or `encoding: iso-8859-1`"))
+}
+
+pub(super) fn deserialize_encoding<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let name = Option::<String>::deserialize(deserializer)?;
+    resolve_encoding(name.as_deref()).map_err(serde::de::Error::custom)?;
+    Ok(name)
+}
+
+pub(super) fn serialize_encoding<S: serde::Serializer>(
+    name: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let charset = resolve_encoding(name.as_deref()).map_err(serde::ser::Error::custom)?;
+    Some(match charset {
+        Charset::Utf8 => "utf-8",
+        Charset::Latin1 => "iso-8859-1",
+    })
+    .serialize(serializer)
+}
+
+fn serialize_resolved_options<T: Serialize + Default, S: serde::Serializer>(
+    options: &Option<T>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match options {
+        Some(options) => Some(options).serialize(serializer),
+        None => Some(T::default()).serialize(serializer),
+    }
+}
 
 /// Adjacently tagged format enum for inputs.
 /// `type` selects the format, `options` provides format-specific settings.
@@ -9,17 +48,34 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "options", rename_all = "snake_case")]
 pub enum InputFormat {
-    Csv(Option<CsvInputOptions>),
+    Csv(#[serde(serialize_with = "serialize_resolved_options")] Option<CsvInputOptions>),
     Json(Option<JsonInputOptions>),
     Xml(Option<XmlInputOptions>),
     FixedWidth(Option<FixedWidthInputOptions>),
     Edifact(Option<EdifactInputOptions>),
-    X12(Option<X12InputOptions>),
+    X12(#[serde(serialize_with = "serialize_resolved_options")] Option<X12InputOptions>),
     Hl7(Option<Hl7InputOptions>),
     Swift(Option<SwiftInputOptions>),
 }
 
 impl InputFormat {
+    /// Resolve external byte encoding without allocating on success. `None`
+    /// means the format owns its in-band repertoire; callers must use its codec.
+    /// Invalid programmatic options fail just like authored configuration.
+    pub fn resolved_charset(&self) -> Result<Option<Charset>, String> {
+        match self {
+            Self::Csv(options) => {
+                resolve_encoding(options.as_ref().and_then(|o| o.encoding.as_deref())).map(Some)
+            }
+            Self::X12(options) => {
+                resolve_encoding(options.as_ref().and_then(|o| o.encoding.as_deref())).map(Some)
+            }
+            Self::Json(_) | Self::Xml(_) | Self::FixedWidth(_) | Self::Swift(_) => {
+                Ok(Some(Charset::Utf8))
+            }
+            Self::Edifact(_) | Self::Hl7(_) => Ok(None),
+        }
+    }
     /// Short lowercase format name for display.
     pub fn format_name(&self) -> &'static str {
         match self {
@@ -36,6 +92,22 @@ impl InputFormat {
 }
 
 impl OutputFormat {
+    /// Resolve the closed output repertoire without allocating on success.
+    /// `None` delegates to the format's in-band policy, never to locale guessing.
+    pub fn resolved_charset(&self) -> Result<Option<Charset>, String> {
+        match self {
+            Self::Csv(options) => {
+                resolve_encoding(options.as_ref().and_then(|o| o.encoding.as_deref())).map(Some)
+            }
+            Self::X12(options) => {
+                resolve_encoding(options.as_ref().and_then(|o| o.encoding.as_deref())).map(Some)
+            }
+            Self::Json(_) | Self::Xml(_) | Self::FixedWidth(_) | Self::Swift(_) => {
+                Ok(Some(Charset::Utf8))
+            }
+            Self::Edifact(_) | Self::Hl7(_) => Ok(None),
+        }
+    }
     /// Short lowercase format name for display.
     pub fn format_name(&self) -> &'static str {
         match self {
@@ -77,12 +149,12 @@ impl OutputFormat {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "options", rename_all = "snake_case")]
 pub enum OutputFormat {
-    Csv(Option<CsvOutputOptions>),
+    Csv(#[serde(serialize_with = "serialize_resolved_options")] Option<CsvOutputOptions>),
     Json(Option<JsonOutputOptions>),
     Xml(Option<XmlOutputOptions>),
     FixedWidth(Option<FixedWidthOutputOptions>),
     Edifact(Option<EdifactOutputOptions>),
-    X12(Option<X12OutputOptions>),
+    X12(#[serde(serialize_with = "serialize_resolved_options")] Option<X12OutputOptions>),
     Hl7(Option<Hl7OutputOptions>),
     Swift(Option<SwiftOutputOptions>),
 }

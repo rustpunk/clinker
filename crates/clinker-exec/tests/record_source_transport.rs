@@ -4,7 +4,7 @@
 //! per-source synthetic identifier (`<source:NAME>`) because the row
 //! yielder exposes no per-record file identity.
 
-use clinker_record::owned_storage::{OwnedKey, SharedStorage};
+use clinker_record::owned_storage::{OwnedMap, SharedStorage};
 
 use clinker_format::{EnvelopeConfig, FormatError};
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
@@ -49,11 +49,8 @@ impl RecordSource for StubRecordSource {
             .map(|values| Record::new(self.schema.clone(), values)))
     }
 
-    fn prepare_document(
-        &mut self,
-        _config: &EnvelopeConfig,
-    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
-        Ok(IndexMap::new())
+    fn prepare_document(&mut self, _config: &EnvelopeConfig) -> Result<OwnedMap, FormatError> {
+        Ok(OwnedMap::from_map(IndexMap::new()))
     }
 }
 

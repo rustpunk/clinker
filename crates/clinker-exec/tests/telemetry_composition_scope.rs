@@ -87,8 +87,8 @@ nodes:
     name: eu_orders
     config:
       name: eu_orders
-      type: csv
-      path: eu.csv
+      type: json
+      path: eu.json
       schema:
         - { name: a, type: int }
   - type: transform
@@ -108,15 +108,16 @@ nodes:
     input: enrich_eu
     config:
       name: eu_out
-      type: csv
-      path: eu-out.csv
+      type: json
+      path: eu-out.json
       include_unmapped: false
+      options: { format: ndjson }
   - type: source
     name: us_orders
     config:
       name: us_orders
-      type: csv
-      path: us.csv
+      type: json
+      path: us.json
       schema:
         - { name: a, type: int }
   - type: composition
@@ -130,13 +131,16 @@ nodes:
     input: enrich_us
     config:
       name: us_out
-      type: csv
-      path: us-out.csv
+      type: json
+      path: us-out.json
       include_unmapped: false
+      options: { format: ndjson }
 "#;
 
 /// Run `TWO_CALL_SITES` with telemetry enabled and return every transform span
-/// name the receiver saw, sorted, paired with the two output CSVs.
+/// name the receiver saw, sorted, paired with the two output documents.
+/// JSON keeps this identity test independent of CSV allocation-span pressure;
+/// the fixed arena size and the three exact scope-name assertions are unchanged.
 fn transform_span_names() -> (Vec<String>, HashMap<String, String>) {
     let config = parse_config(TWO_CALL_SITES).expect("pipeline fixture parses");
     let root = fixture_workspace_root();
@@ -149,11 +153,11 @@ fn transform_span_names() -> (Vec<String>, HashMap<String, String>) {
     let readers: clinker_exec::executor::SourceReaders = HashMap::from([
         (
             "eu_orders".to_string(),
-            single_file_reader("eu.csv", Box::new(Cursor::new(b"a\n5\n".to_vec()))),
+            single_file_reader("eu.json", Box::new(Cursor::new(br#"[{"a":5}]"#.to_vec()))),
         ),
         (
             "us_orders".to_string(),
-            single_file_reader("us.csv", Box::new(Cursor::new(b"a\n7\n".to_vec()))),
+            single_file_reader("us.json", Box::new(Cursor::new(br#"[{"a":7}]"#.to_vec()))),
         ),
     ]);
     let buffers: HashMap<String, SharedBuffer> = config
@@ -220,6 +224,6 @@ fn body_transform_spans_name_the_call_site_that_ran_them() {
 
     // The run has to be a real one: identical span names would also be produced
     // by a pipeline that never executed either body.
-    assert_eq!(outputs["eu_out"], "a,computed\n5,10\n");
-    assert_eq!(outputs["us_out"], "a,computed\n7,14\n");
+    assert_eq!(outputs["eu_out"], "{\"a\":5,\"computed\":10}");
+    assert_eq!(outputs["us_out"], "{\"a\":7,\"computed\":14}");
 }

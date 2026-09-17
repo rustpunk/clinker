@@ -23,6 +23,7 @@ use crate::executor::dispatch::{
     single_input_node_buffer_key, sink_collision_dlq_entry, source_file_path_of,
 };
 use crate::executor::node_buffer::TransientNodeBufferReservation;
+use crate::executor::preparation::is_explicit_cancellation;
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::structured_output_guard::{
     StructuredOutputDocumentGuard, structured_output_format,
@@ -356,6 +357,14 @@ where
     let errors_before = ctx.output_errors.len();
     let result = dispatch_sink_work(ctx, current_dag, node_idx, node);
     ctx.sink_byte_counter = None;
+    let errors = ctx.output_errors[errors_before..]
+        .iter()
+        .chain(result.as_ref().err());
+    let failures = errors
+        .clone()
+        .filter(|error| !is_explicit_cancellation(error))
+        .count();
+    let interrupted_error = errors.clone().any(is_explicit_cancellation);
     if let Some(mut signal) = signal.take() {
         signal.record_records(ctx.counters.records_written.saturating_sub(records_before));
         signal.record_bytes(
@@ -363,10 +372,8 @@ where
                 .as_ref()
                 .map_or(0, clinker_format::SharedByteCounter::bytes_written),
         );
-        let new_errors = ctx.output_errors.len().saturating_sub(errors_before);
-        signal.record_errors(u64::try_from(new_errors).unwrap_or(u64::MAX));
-        let interrupted_error = matches!(&result, Err(PipelineError::Interrupted));
-        if (result.is_err() && !interrupted_error) || new_errors > 0 {
+        signal.record_errors(u64::try_from(failures).unwrap_or(u64::MAX));
+        if failures > 0 {
             signal.fail();
         } else if interrupted_error
             || ctx
@@ -715,6 +722,7 @@ fn dispatch_sink_work(
     let output_staging = ctx.output_staging.clone();
     {
         let mut fan_ctx = FanOutContext {
+            writer_resources: ctx.writer_resources.clone(),
             name,
             out_cfg,
             cxl_emit_names_opt,
@@ -1071,6 +1079,7 @@ fn dispatch_sink_envelope(
                             schema,
                             ctx.output_staging.clone(),
                             ctx.sink_byte_counter.clone(),
+                            ctx.writer_resources.clone(),
                         ))
                     });
                 }
@@ -1121,7 +1130,7 @@ fn next_envelope_record(
 /// builds it from `ctx.writers`, the unit test from a probe writer.
 type WriterFactory<'a> = dyn FnMut(
         SharedStorage<clinker_record::Schema>,
-    ) -> Option<Result<Box<dyn clinker_format::FormatWriter>, PipelineError>>
+    ) -> Option<Result<clinker_format::FormatWriterHandle, PipelineError>>
     + 'a;
 
 /// Per-Output state for the envelope-reconstruction arm. Holds the single
@@ -1134,7 +1143,7 @@ type WriterFactory<'a> = dyn FnMut(
 /// the accumulated errors back into the run context.
 #[derive(Default)]
 struct EnvelopeWriterDriver {
-    writer: Option<Box<dyn clinker_format::FormatWriter>>,
+    writer: Option<clinker_format::FormatWriterHandle>,
     /// The currently-open document's context, set on its first record's
     /// `begin_document` and cleared on its `end_document`. `None` before the
     /// first concrete-file record and between documents. Held so the
@@ -1171,6 +1180,9 @@ impl EnvelopeWriterDriver {
         projected: &Record,
         open_writer: &mut WriterFactory<'_>,
     ) {
+        if !self.errors.is_empty() {
+            return;
+        }
         if self.writer.is_none() {
             match open_writer(projected.schema().clone()) {
                 Some(Ok(w)) => self.writer = Some(w),
@@ -1182,6 +1194,9 @@ impl EnvelopeWriterDriver {
             }
         }
         self.maybe_cross_boundary(doc_ctx);
+        if !self.errors.is_empty() {
+            return;
+        }
         let writer = self.writer.as_mut().expect("writer opened above");
         if let Err(e) = writer.write_record(projected) {
             // A `join_values` `on_conflict: error` collision is routed to the DLQ
@@ -1223,12 +1238,18 @@ impl EnvelopeWriterDriver {
             return;
         }
         self.fire_end();
+        if !self.errors.is_empty() {
+            return;
+        }
         self.fire_begin(doc_ctx);
         self.open_doc = Some(doc_ctx.clone());
     }
 
     /// Emit the open document's closing framing, if a document is open.
     fn fire_end(&mut self) {
+        if !self.errors.is_empty() {
+            return;
+        }
         if let (Some(writer), Some(doc_ctx)) = (self.writer.as_mut(), self.open_doc.take())
             && let Err(e) = writer.end_document(&doc_ctx)
         {
@@ -1248,6 +1269,9 @@ impl EnvelopeWriterDriver {
     /// Close the last open document and flush at end of stream.
     fn finish(&mut self) {
         self.fire_end();
+        if !self.errors.is_empty() {
+            return;
+        }
         if let Some(writer) = self.writer.as_mut()
             && let Err(e) = writer.flush()
         {
@@ -1359,6 +1383,7 @@ fn missing_sink_input_error(
 /// one shared shape — a change to how a Sink write is attributed (e.g.
 /// a new metric guard) lands on the struct, not on two signatures.
 struct FanOutContext<'a> {
+    writer_resources: clinker_format::preparation::WriterResources,
     name: &'a str,
     out_cfg: &'a clinker_plan::config::SinkConfig,
     cxl_emit_names_opt: Option<&'a [String]>,
@@ -1408,6 +1433,7 @@ fn emit_single_writer(
         fan_ctx.output_schema.clone(),
         fan_ctx.output_staging.clone(),
         fan_ctx.sink_byte_counter.clone(),
+        fan_ctx.writer_resources.clone(),
     ) {
         Ok(mut csv_writer) => {
             fan_ctx.collector.record(scan_timer.finish(1, 1));
@@ -1441,7 +1467,8 @@ fn emit_single_writer(
                     // the one offending record and keeps writing the rest (unless
                     // FailFast); any other write error is fatal for this writer.
                     if fan_ctx.strategy != ErrorStrategy::FailFast
-                        && let Some(entry) = sink_collision_dlq_entry(record, *rn, fan_ctx.name, &e)
+                        && let Some(entry) =
+                            sink_collision_dlq_entry(record, &projected, *rn, fan_ctx.name, &e)
                     {
                         fan_ctx.dlq_pending.push(entry);
                         continue;
@@ -1492,7 +1519,9 @@ fn emit_fan_out(
     // Build one format writer per pre-opened raw writer. Failed
     // construction for one file does NOT abort the whole output —
     // siblings still get their chance.
-    let mut format_writers: Hm<Arc<str>, Box<dyn clinker_format::FormatWriter>> = Hm::new();
+    // A retained empty slot marks a terminal writer without confusing it with
+    // an unregistered destination or retaining its failed resources.
+    let mut format_writers: Hm<Arc<str>, Option<clinker_format::FormatWriterHandle>> = Hm::new();
     for (file_arc, raw) in per_file {
         let mut resolved_config = fan_ctx.out_cfg.clone();
         if let Some(path) = resolved_paths.remove(&file_arc) {
@@ -1514,11 +1543,15 @@ fn emit_fan_out(
             fan_ctx.output_schema.clone(),
             fan_ctx.output_staging.clone(),
             fan_ctx.sink_byte_counter.clone(),
+            fan_ctx.writer_resources.clone(),
         ) {
             Ok(fw) => {
-                format_writers.insert(file_arc, fw);
+                format_writers.insert(file_arc, Some(fw));
             }
-            Err(e) => fan_ctx.output_errors.push(e),
+            Err(e) => {
+                format_writers.insert(file_arc, None);
+                fan_ctx.output_errors.push(e);
+            }
         }
     }
     fan_ctx.collector.record(scan_timer.finish(1, 1));
@@ -1538,7 +1571,7 @@ fn emit_fan_out(
         // so we need to find by string equality. Build a probing Arc
         // once per record (cheap relative to the write itself).
         let file_arc: Arc<str> = Arc::from(file_path);
-        let Some(fw) = format_writers.get_mut(&file_arc) else {
+        let Some(slot) = format_writers.get_mut(&file_arc) else {
             // Record's file isn't in the fan-out registry — typically
             // means the CLI's writer setup didn't pre-open one for
             // this file. Surface but keep going.
@@ -1550,6 +1583,9 @@ fn emit_fan_out(
                     file_arc
                 ),
             });
+            continue;
+        };
+        let Some(fw) = slot.as_mut() else {
             continue;
         };
         let projected = {
@@ -1577,12 +1613,14 @@ fn emit_fan_out(
                 probe.discard_staged_record();
             }
             if fan_ctx.strategy != ErrorStrategy::FailFast
-                && let Some(entry) = sink_collision_dlq_entry(record, *rn, fan_ctx.name, &e)
+                && let Some(entry) =
+                    sink_collision_dlq_entry(record, &projected, *rn, fan_ctx.name, &e)
             {
                 fan_ctx.dlq_pending.push(entry);
                 continue;
             }
             push_write_error(fan_ctx.output_errors, e);
+            *slot = None;
             continue;
         }
         if let Some(probe) = fan_ctx.mapping_probe.as_deref_mut() {
@@ -1591,9 +1629,9 @@ fn emit_fan_out(
         fan_ctx.written_rows.push(*rn);
     }
 
-    // Flush every writer regardless of per-record errors so partial
-    // outputs land on disk for inspection.
-    for (_arc, mut fw) in format_writers {
+    // Independent siblings still flush; terminal writers must not manufacture
+    // a second error by attempting to continue a poisoned delivery.
+    for mut fw in format_writers.into_values().flatten() {
         let flush_result = {
             let _guard = fan_ctx.write_timer.guard();
             fw.flush()
@@ -1612,6 +1650,148 @@ mod tests {
     use clinker_format::error::FormatError;
     use clinker_record::{DocumentContext, DocumentId, FieldResolver, Schema, Value};
     use std::sync::Mutex;
+
+    #[test]
+    fn explicit_sink_cancellation_preserves_carriers_and_failure_precedence() {
+        use clinker_format::preparation::{ResourceError, ResourceErrorKind};
+        let cancellations = [
+            PipelineError::Interrupted,
+            PipelineError::Format(FormatError::Interrupted),
+            PipelineError::Format(FormatError::Resource(ResourceError::new(
+                ResourceErrorKind::Cancelled,
+                17,
+                23,
+            ))),
+        ];
+        for cancelled in &cancellations {
+            assert!(is_explicit_cancellation(cancelled));
+            let failure = PipelineError::Format(FormatError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "original destination failure",
+            )));
+            for errors in [[cancelled, &failure], [&failure, cancelled]] {
+                assert_eq!(
+                    errors
+                        .iter()
+                        .filter(|error| !is_explicit_cancellation(error))
+                        .count(),
+                    1
+                );
+                assert!(errors.into_iter().any(is_explicit_cancellation));
+            }
+            assert!(
+                matches!(failure, PipelineError::Format(FormatError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::BrokenPipe && error.to_string() == "original destination failure")
+            );
+        }
+        assert!(!is_explicit_cancellation(&PipelineError::Format(
+            FormatError::Resource(ResourceError::new(
+                ResourceErrorKind::DeliveryPoisoned,
+                17,
+                23
+            ),)
+        )));
+        assert!(
+            matches!(&cancellations[2], PipelineError::Format(FormatError::Resource(error))
+            if *error == ResourceError::new(ResourceErrorKind::Cancelled, 17, 23))
+        );
+    }
+
+    #[test]
+    fn isolated_sink_signal_admits_one_closed_span_for_each_outcome() {
+        use crate::telemetry::{MetricKey, SinkSignal, SpanName, SpanStatus, TelemetryArena};
+        let policy = clinker_plan::config::ClinkerToml::parse(
+            "[observability]\narena_bytes = '64KB'\nordinary_lane_bytes = '32KB'\nhigh_severity_lane_bytes = '32KB'\nmax_batch_bytes = '4KB'\n[observability.otlp]\nendpoint = 'https://collector.invalid'\n[observability.otlp.auth]\nmode = 'none'",
+        ).unwrap().resolve_observability(None).unwrap();
+        for (terminal, status) in [
+            (MetricKey::SinkCompleted, SpanStatus::Ok),
+            (MetricKey::SinkFailed, SpanStatus::Error),
+            (MetricKey::SinkInterrupted, SpanStatus::Unset),
+        ] {
+            let (producer, receiver) = TelemetryArena::reserve(&policy).unwrap();
+            let signal = SinkSignal::new(producer, "delivered");
+            match terminal {
+                MetricKey::SinkCompleted => signal.complete(),
+                MetricKey::SinkFailed => signal.fail(),
+                MetricKey::SinkInterrupted => signal.interrupt(),
+                _ => unreachable!(),
+            }
+            let batch = receiver.try_recv_batch().unwrap();
+            assert_eq!(batch.metric(MetricKey::SinkStarted), 1);
+            assert_eq!(batch.metric(terminal), 1);
+            assert_eq!(
+                batch.metric(MetricKey::SinkCompleted)
+                    + batch.metric(MetricKey::SinkFailed)
+                    + batch.metric(MetricKey::SinkInterrupted),
+                1
+            );
+            assert_eq!(batch.traces().len(), 1);
+            let span = &batch.traces()[0];
+            assert_eq!(span.name, SpanName::Sink);
+            assert_eq!(span.status, status);
+            assert_eq!(span.logical_node, "delivered");
+            assert!(span.started_at_unix_nanos > 0);
+            assert!(span.ended_at_unix_nanos >= span.started_at_unix_nanos);
+        }
+    }
+
+    #[test]
+    fn envelope_terminal_errors_stop_all_later_writer_hooks() {
+        struct TerminalWriter {
+            stop: &'static str,
+            log: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl TerminalWriter {
+            fn call(&self, hook: &'static str) -> Result<(), FormatError> {
+                self.log.lock().unwrap().push(hook);
+                if hook == self.stop {
+                    Err(FormatError::Interrupted)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl FormatWriter for TerminalWriter {
+            fn write_record(&mut self, _: &Record) -> Result<(), FormatError> {
+                self.call("write")
+            }
+            fn begin_document(&mut self, _: &DocumentContext) -> Result<(), FormatError> {
+                self.call("begin")
+            }
+            fn end_document(&mut self, _: &DocumentContext) -> Result<(), FormatError> {
+                self.call("end")
+            }
+            fn flush(&mut self) -> Result<(), FormatError> {
+                self.call("flush")
+            }
+        }
+        for stop in ["begin", "write", "end", "flush"] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut driver = EnvelopeWriterDriver::default();
+            let context = doc("one.csv");
+            driver.on_record(&context, &record(1, &context), &mut |_| {
+                Some(Ok(clinker_format::FormatWriterHandle::from_legacy(
+                    Box::new(TerminalWriter {
+                        stop,
+                        log: log.clone(),
+                    }),
+                )))
+            });
+            driver.finish();
+            driver.finish();
+            driver.on_record(&context, &record(2, &context), &mut |_| {
+                panic!("terminal writer reopened")
+            });
+            assert_eq!(driver.errors.len(), 1);
+            assert!(matches!(
+                driver.errors[0],
+                PipelineError::Format(FormatError::Interrupted)
+            ));
+            let expected = ["begin", "write", "end", "flush"];
+            let end = expected.iter().position(|hook| *hook == stop).unwrap();
+            assert_eq!(*log.lock().unwrap(), expected[..=end]);
+        }
+    }
 
     struct FixedUsage(u64);
 
@@ -1772,9 +1952,11 @@ mod tests {
         for rec in records {
             let log = Arc::clone(&log);
             driver.on_record(rec.doc_ctx(), rec, &mut |_schema| {
-                Some(Ok(Box::new(ProbeWriter {
-                    log: Arc::clone(&log),
-                }) as Box<dyn FormatWriter>))
+                Some(Ok(clinker_format::FormatWriterHandle::from_legacy(
+                    Box::new(ProbeWriter {
+                        log: Arc::clone(&log),
+                    }),
+                )))
             });
         }
         driver.finish();

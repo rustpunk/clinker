@@ -6,6 +6,9 @@
 //! producer-side ports, the unchanged (unwidened) schema on both ports,
 //! bounded-memory spill under pressure, and idempotent re-run byte-equality.
 
+#[path = "common/pipeline_resource_fixtures.rs"]
+mod resource_fixtures;
+
 use std::collections::HashMap;
 
 use clinker_bench_support::io::SharedBuffer;
@@ -27,15 +30,17 @@ struct CullOutputs {
 /// `csv_input`, returning both rendered output streams. Panics on run failure;
 /// use [`run_cull_result`] when the run is expected to error.
 fn run_cull(yaml: &str, csv_input: &str) -> CullOutputs {
-    run_cull_result(yaml, csv_input).expect("cull run")
+    run_cull_result(yaml, csv_input, false).expect("cull run")
 }
 
 /// Result-returning variant of [`run_cull`]: surfaces the run error instead of
 /// panicking, so a test can assert on a typed [`clinker_plan::error::PipelineError`]
-/// (for example the drop-decision memory-budget gate).
+/// (for example the drop-decision memory-budget gate). Pressure cases decode
+/// during setup so CSV admission cannot preempt the Cull-specific refusal.
 fn run_cull_result(
     yaml: &str,
     csv_input: &str,
+    predecoded: bool,
 ) -> Result<CullOutputs, clinker_plan::error::PipelineError> {
     let config = parse_config(yaml).expect("fixture pipeline must parse");
     let plan = config
@@ -43,13 +48,20 @@ fn run_cull_result(
         .expect("fixture pipeline must compile");
 
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
-        primary,
+    let source = if predecoded {
+        resource_fixtures::predecoded_csv_source(
+            &config,
+            &CompileContext::default(),
+            &primary,
+            &[("test.csv", csv_input)],
+        )
+    } else {
         clinker_exec::executor::single_file_reader(
             "test.csv",
             Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
-        ),
-    )]);
+        )
+    };
+    let readers = HashMap::from([(primary, source)]);
 
     let main_buf = SharedBuffer::new();
     let removed_buf = SharedBuffer::new();
@@ -669,7 +681,7 @@ fn cull_decision_state_fails_loud_when_group_cardinality_exceeds_budget() {
     // state — not an OOM crash or truncated result. (`count(*) > 100` never
     // fires for one-row groups.)
     let csv = distinct_group_input(20_000);
-    let err = run_cull_result(&decision_state_cull_pipeline("5M"), &csv)
+    let err = run_cull_result(&decision_state_cull_pipeline("5M"), &csv, true)
         .expect_err("an O(groups) decision state above the budget must fail loud");
     match &err {
         clinker_plan::error::PipelineError::MemoryBudgetExceeded {
@@ -724,7 +736,7 @@ fn cull_giant_group_exceeds_budget_fails_loud() {
     // 1 MiB admits the input's exact 816,000-byte fixed-width scan, but the
     // Cull buffer's heap-aware accounting includes the repeated 1 KiB payload
     // and rejects the complete group on reload.
-    let err = run_cull_result(&count_cull_pipeline("1M"), &csv)
+    let err = run_cull_result(&count_cull_pipeline("1M"), &csv, true)
         .expect_err("a single group larger than the budget must fail loud, not OOM");
 
     match &err {

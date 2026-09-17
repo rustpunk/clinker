@@ -17,13 +17,13 @@
 //! sub-baseline budget reaches the spill path instead of being rejected at
 //! startup (E312).
 
+#[path = "common/pipeline_resource_fixtures.rs"]
+mod resource_fixtures;
+
 use std::collections::HashMap;
-use std::io::Cursor;
-use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
-use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
 use clinker_plan::error::PipelineError;
 
@@ -100,18 +100,24 @@ fn run(
     disk_cap: Option<u64>,
 ) -> Result<ExecutionReport, PipelineError> {
     let yaml = spill_cap_yaml(memory_limit, strategy);
-    let config = parse_config(&yaml).expect("parse agg-spill-cap pipeline");
+    let mut config = parse_config(&yaml).expect("parse agg-spill-cap pipeline");
+    if disk_cap.is_none() {
+        resource_fixtures::add_csv_workspace(&mut config, &CompileContext::default());
+    }
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile agg-spill-cap pipeline");
 
-    let slots = vec![FileSlot::new(
-        PathBuf::from("events.csv"),
-        Box::new(Cursor::new(many_key_csv().into_bytes())),
-    )];
-    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+    // Supply already-decoded records so this budget exercises aggregate/spill
+    // accounting rather than the independent CSV decoder admission boundary.
+    let readers = HashMap::from([(
         "events".to_string(),
-        clinker_exec::executor::SourceInput::Files(slots),
+        resource_fixtures::predecoded_csv_source(
+            &config,
+            &CompileContext::default(),
+            "events",
+            &[("events.csv", &many_key_csv())],
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(

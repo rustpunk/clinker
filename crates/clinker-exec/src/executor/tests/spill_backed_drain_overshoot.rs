@@ -25,6 +25,10 @@
 //! planner-inserted correlation sort is the first stage to reserve and
 //! materialize the spilled buffer. The assertions destructure the typed
 //! variant — no substring matching.
+//!
+//! CSV fixtures are eagerly decoded before execution so these local drain
+//! oracles start at the external-record boundary. They do not establish that
+//! source decoding and whole-input retention fit inside the 64 KiB budget.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -72,16 +76,6 @@ fn aggregate_csv() -> String {
         csv.push_str(&format!("id_{i},{dept},{i}\n"));
     }
     csv
-}
-
-fn readers(csv: String) -> crate::executor::SourceReaders {
-    HashMap::from([(
-        "events".to_string(),
-        crate::executor::single_file_reader(
-            "events.csv",
-            Box::new(std::io::Cursor::new(csv.into_bytes())),
-        ),
-    )])
 }
 
 fn writers(out: &SharedBuffer) -> HashMap<String, Box<dyn std::io::Write + Send>> {
@@ -161,6 +155,9 @@ nodes:
 
 fn run(yaml: &str, csv: String) -> PipelineError {
     let config = clinker_plan::config::parse_config(yaml).expect("parse pipeline YAML");
+    let context = clinker_plan::config::CompileContext::default();
+    let readers =
+        crate::test_support::predecoded_csv_readers(&config, &context, &[("events", &csv)]);
     let out = SharedBuffer::new();
     let params = PipelineRunParams {
         execution_id: "spill-backed-drain-overshoot".to_string(),
@@ -169,10 +166,10 @@ fn run(yaml: &str, csv: String) -> PipelineError {
     };
     PipelineExecutor::run_with_readers_writers_with_arbitrator(
         &config,
-        readers(csv),
+        readers,
         writers(&out).into(),
         &params,
-        clinker_plan::config::CompileContext::default(),
+        context,
         abort_seeded_arbitrator(),
     )
     .expect_err("re-materializing the spilled slot past the hard limit must abort")

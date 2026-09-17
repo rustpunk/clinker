@@ -12,7 +12,7 @@
 //! variants surface as a format error so a config-wrong-for-format
 //! mistake fails fast.
 
-use clinker_record::owned_storage::OwnedKey;
+use clinker_record::owned_storage::{OwnedKey, OwnedMap};
 use clinker_record::{
     DEFAULT_DATE_FORMATS, DEFAULT_DATETIME_FORMATS, Value, coerce_to_bool, coerce_to_date,
     coerce_to_datetime, coerce_to_float, coerce_to_int, coerce_to_string,
@@ -241,6 +241,48 @@ pub(crate) fn coerce_section_fields(
             )
         })?;
         out.insert(OwnedKey::from(field.as_str()), coerced);
+    }
+    Ok(out)
+}
+
+/// Convert borrowed header fields into admitted section storage. Only declared
+/// fields are copied; first occurrence and absent/empty-field semantics match
+/// the legacy converter. Scalar parsers retain their existing typed contract.
+pub(crate) fn coerce_section_fields_admitted<'a>(
+    raw: impl Iterator<Item = (&'a str, &'a str)> + Clone,
+    schema: &IndexMap<String, EnvelopeFieldType>,
+    workspace: &crate::preparation::DecodeWorkspace,
+    storage: crate::preparation::TextStorage,
+) -> Result<OwnedMap, crate::FormatError> {
+    let scope = workspace.scope();
+    let mut out = OwnedMap::try_with_capacity(schema.len(), scope)?;
+    for (field, ty) in schema {
+        let Some((_, text)) = raw.clone().find(|(name, _)| *name == field) else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let value = Value::String(match storage {
+            crate::preparation::TextStorage::Shared => {
+                clinker_record::FieldStr::try_new(text, scope)?
+            }
+            crate::preparation::TextStorage::Unique => {
+                clinker_record::FieldStr::try_new_unique(text, scope)?
+            }
+        });
+        let coerced = match ty {
+            EnvelopeFieldType::String => Ok(value),
+            EnvelopeFieldType::Int => coerce_to_int(&value),
+            EnvelopeFieldType::Float => coerce_to_float(&value),
+            EnvelopeFieldType::Bool => coerce_to_bool(&value),
+            EnvelopeFieldType::Date => coerce_to_date(&value, DEFAULT_DATE_FORMATS),
+            EnvelopeFieldType::DateTime => coerce_to_datetime(&value, DEFAULT_DATETIME_FORMATS),
+        }.map_err(|e| crate::FormatError::SchemaInference(format!(
+            "envelope section field {field:?} (declared type {ty:?}): cannot coerce value {text:?}: {e}"
+        )))?;
+        out.try_insert(OwnedKey::try_new(field, scope)?, coerced, scope)
+            .map_err(|(error, _, _)| error)?;
     }
     Ok(out)
 }

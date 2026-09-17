@@ -1103,8 +1103,8 @@ impl RecordingDelivery {
 }
 
 #[cfg(debug_assertions)]
-struct InjectedDelivery {
-    capture: Option<File>,
+struct InjectedDelivery<W: Write = File> {
+    capture: Option<io::BufWriter<W>>,
     reported: [bool; 3],
     ensure_signal_probes: bool,
 }
@@ -1116,13 +1116,26 @@ impl InjectedDelivery {
             .map(File::create)
             .transpose()
             .map_err(|_| ObservabilityRuntimeError::Worker)?;
-        Ok(Self {
+        Ok(Self::with_capture(
             capture,
-            reported: [false; 3],
-            ensure_signal_probes: std::env::var_os("CLINKER_TEST_OTLP_ENSURE_SIGNAL_PROBES")
-                .as_deref()
+            std::env::var_os("CLINKER_TEST_OTLP_ENSURE_SIGNAL_PROBES").as_deref()
                 == Some(std::ffi::OsStr::new("1")),
-        })
+        ))
+    }
+}
+
+#[cfg(debug_assertions)]
+impl<W: Write> InjectedDelivery<W> {
+    fn with_capture(capture: Option<W>, ensure_signal_probes: bool) -> Self {
+        Self {
+            // JSON serialization writes individual tokens. Coalesce those
+            // writes so the debug capture does not spend its finite flush
+            // budget on a file operation per token. Capacity is independent
+            // of payload size; deliver explicitly flushes every NDJSON record.
+            capture: capture.map(|writer| io::BufWriter::with_capacity(8 * 1024, writer)),
+            reported: [false; 3],
+            ensure_signal_probes,
+        }
     }
 
     fn deliver(&mut self, signal: OtlpSignal, payload: &[u8], item_count: u64) -> DeliveryResult {
@@ -1863,6 +1876,122 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[derive(Default)]
+    struct CaptureWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+        max_write_bytes: Option<usize>,
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    #[cfg(debug_assertions)]
+    impl Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.fail_write {
+                return Err(io::Error::other("injected capture write failure"));
+            }
+            let count = bytes.len().min(self.max_write_bytes.unwrap_or(usize::MAX));
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if self.fail_flush {
+                return Err(io::Error::other("injected capture flush failure"));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn injected_capture(writer: CaptureWriter) -> InjectedDelivery<CaptureWriter> {
+        InjectedDelivery::with_capture(Some(writer), false)
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn injected_capture_batches_json_writes_and_flushes_each_record() {
+        let mut delivery = injected_capture(CaptureWriter::default());
+        let payload = serde_json::json!({
+            "resourceMetrics": [{"metrics": [
+                {"name": "clinker.guess.started", "value": "1"},
+                {"name": "clinker.guess.completed", "value": "1"}
+            ]}]
+        });
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        for expected_records in 1..=2 {
+            assert!(!delivery.deliver(OtlpSignal::Metrics, &encoded, 2).failed());
+            let capture = delivery.capture.as_ref().unwrap().get_ref();
+            assert_eq!(
+                capture.writes, expected_records,
+                "batch JSON tokens into one file write"
+            );
+            assert_eq!(
+                capture.flushes, expected_records,
+                "flush every captured record"
+            );
+            let text = std::str::from_utf8(&capture.bytes).unwrap();
+            assert!(text.ends_with('\n'));
+            let records = text.lines().collect::<Vec<_>>();
+            assert_eq!(records.len(), expected_records);
+            for record in records {
+                assert_eq!(
+                    serde_json::from_str::<Value>(record).unwrap(),
+                    serde_json::json!({
+                        "signal": "metrics", "authentication": "none", "payload": payload
+                    })
+                );
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn injected_capture_preserves_large_utf8_records_across_short_writes() {
+        let mut delivery = injected_capture(CaptureWriter {
+            max_write_bytes: Some(7),
+            ..CaptureWriter::default()
+        });
+        let payload = serde_json::json!({"message": "é\\\"\n".repeat(8192)});
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        assert!(!delivery.deliver(OtlpSignal::Logs, &encoded, 1).failed());
+        let capture = delivery.capture.as_ref().unwrap().get_ref();
+        assert_eq!(capture.flushes, 1);
+        assert_eq!(capture.bytes.last(), Some(&b'\n'));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&capture.bytes).unwrap(),
+            serde_json::json!({
+                "signal": "logs", "authentication": "none", "payload": payload
+            })
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn injected_capture_propagates_write_and_flush_failures() {
+        for writer in [
+            CaptureWriter {
+                fail_write: true,
+                ..CaptureWriter::default()
+            },
+            CaptureWriter {
+                fail_flush: true,
+                ..CaptureWriter::default()
+            },
+        ] {
+            let mut delivery = injected_capture(writer);
+            let result = delivery.deliver(OtlpSignal::Metrics, b"{}", 2);
+            assert!(matches!(result, DeliveryResult::EncodingFailure));
+            assert_eq!(result.accepted(2), 0);
+            assert_eq!(result.rejected(2), 2);
+        }
+    }
 
     const SHIPPED_BOUNDS: ArenaBounds = ArenaBounds {
         arena_bytes: 4 * 1024 * 1024,

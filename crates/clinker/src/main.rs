@@ -921,6 +921,9 @@ pub struct ExplainArgs {
 }
 
 fn pipeline_error_exit_code(error: &PipelineError) -> u8 {
+    if is_explicit_cancellation(error) {
+        return 130;
+    }
     match error {
         PipelineError::Config(_)
         | PipelineError::Schema(_)
@@ -1006,6 +1009,30 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
             registered("observability.configuration.invalid")
         }
         PipelineError::Format(format_error) => {
+            if let clinker_format::FormatError::Resource(resource) = format_error {
+                use clinker_record::owned_storage::ResourceErrorKind;
+                return registered(match resource.kind {
+                    ResourceErrorKind::Budget => "runtime.resource.memory_budget_exceeded",
+                    ResourceErrorKind::Allocation | ResourceErrorKind::Layout => {
+                        "runtime.resource.allocation_failed"
+                    }
+                    ResourceErrorKind::DiskQuota => "runtime.resource.spill_cap_exceeded",
+                    ResourceErrorKind::DescriptorQuota => {
+                        "runtime.resource.descriptor_cap_exceeded"
+                    }
+                    ResourceErrorKind::Storage | ResourceErrorKind::Readback => {
+                        "runtime.resource.storage_failed"
+                    }
+                    ResourceErrorKind::DeliveryPoisoned => "runtime.resource.delivery_poisoned",
+                    ResourceErrorKind::Finalized | ResourceErrorKind::Authority => {
+                        "runtime.invariant.unknown"
+                    }
+                    // Terminal callers recognize cancellation before entering
+                    // this failure-only classifier. A misrouted cancellation
+                    // is an invariant violation, never invalid source data.
+                    ResourceErrorKind::Cancelled => "runtime.invariant.unknown",
+                });
+            }
             if let Some(code) = format_error.classification_code() {
                 return registered(code);
             }
@@ -1041,6 +1068,7 @@ fn classify_pipeline_error(error: &PipelineError) -> clinker_core_types::Failure
         PipelineError::SpillCapExceeded { .. } => registered("runtime.resource.spill_cap_exceeded"),
         PipelineError::Multiple(errors) => errors
             .iter()
+            .filter(|error| !is_explicit_cancellation(error))
             .map(classify_pipeline_error)
             .min_by_key(|classification| {
                 let retry_rank = match classification.retry_advice() {
@@ -1134,6 +1162,17 @@ fn is_cancelled_transport_error(error: &PipelineError) -> bool {
     }
 }
 
+/// Recognize explicit cancellation without inferring it from shutdown state.
+/// Source and executor boundaries own normalization inside error wrappers.
+fn is_explicit_cancellation(error: &PipelineError) -> bool {
+    matches!(error, PipelineError::Interrupted)
+        || matches!(
+            error,
+            PipelineError::Format(clinker_format::FormatError::Resource(resource))
+                if resource.kind == clinker_record::owned_storage::ResourceErrorKind::Cancelled
+        )
+}
+
 /// The lifecycle terminal a finished run earned.
 ///
 /// Cancellation is [`RunTerminalOutcome::Abort`] regardless of which source
@@ -1142,9 +1181,10 @@ fn is_cancelled_transport_error(error: &PipelineError) -> bool {
 /// [`PipelineError::Interrupted`] instead, and both are the same operator
 /// action on the lineage and OTLP terminals.
 fn run_terminal_outcome(error: &PipelineError) -> RunTerminalOutcome {
-    match error {
-        PipelineError::Interrupted => RunTerminalOutcome::Abort,
-        other => RunTerminalOutcome::Fail(classify_pipeline_error(other)),
+    if is_explicit_cancellation(error) {
+        RunTerminalOutcome::Abort
+    } else {
+        RunTerminalOutcome::Fail(classify_pipeline_error(error))
     }
 }
 
@@ -1267,7 +1307,7 @@ fn main() -> ExitCode {
                 Err(e) => {
                     let exit_code = pipeline_error_exit_code(&e);
                     if let Some(emitter) = machine.as_ref() {
-                        let terminal_result = if matches!(e, PipelineError::Interrupted) {
+                        let terminal_result = if is_explicit_cancellation(&e) {
                             emitter.emit_completed(exit_code)
                         } else {
                             emitter.emit_failed(exit_code, &classify_pipeline_error(&e))
@@ -7461,6 +7501,179 @@ fn diag_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resource_failure(kind: clinker_record::owned_storage::ResourceErrorKind) -> PipelineError {
+        let mut error =
+            clinker_record::owned_storage::ResourceError::new(kind, 987_654_321, 123_456_789);
+        error.field = Some(314_159);
+        error.offset = Some(271_828);
+        PipelineError::Format(clinker_format::FormatError::Resource(error))
+    }
+
+    #[test]
+    fn resource_failure_classification_preserves_typed_cause_and_registry_text() {
+        use clinker_core_types::{FailureCategory, FailureClassification, RetryAdvice};
+        use clinker_record::owned_storage::ResourceErrorKind::*;
+
+        let cases = [
+            (
+                Budget,
+                "runtime.resource.memory_budget_exceeded",
+                FailureCategory::Infrastructure,
+            ),
+            (
+                Allocation,
+                "runtime.resource.allocation_failed",
+                FailureCategory::Infrastructure,
+            ),
+            (
+                Layout,
+                "runtime.resource.allocation_failed",
+                FailureCategory::Infrastructure,
+            ),
+            (
+                DiskQuota,
+                "runtime.resource.spill_cap_exceeded",
+                FailureCategory::Infrastructure,
+            ),
+            (
+                DescriptorQuota,
+                "runtime.resource.descriptor_cap_exceeded",
+                FailureCategory::Infrastructure,
+            ),
+            (
+                Storage,
+                "runtime.resource.storage_failed",
+                FailureCategory::Infrastructure,
+            ),
+            (
+                Readback,
+                "runtime.resource.storage_failed",
+                FailureCategory::Infrastructure,
+            ),
+            (
+                DeliveryPoisoned,
+                "runtime.resource.delivery_poisoned",
+                FailureCategory::Infrastructure,
+            ),
+            (
+                Finalized,
+                "runtime.invariant.unknown",
+                FailureCategory::InternalInvariant,
+            ),
+            (
+                Authority,
+                "runtime.invariant.unknown",
+                FailureCategory::InternalInvariant,
+            ),
+        ];
+        for (kind, code, category) in cases {
+            let error = resource_failure(kind);
+            let classification = classify_pipeline_error(&error);
+            assert_eq!(classification.code(), code, "{kind:?}");
+            assert_eq!(classification.category(), category, "{kind:?}");
+            assert_eq!(
+                classification.retry_advice(),
+                RetryAdvice::PolicyRequired,
+                "{kind:?}"
+            );
+            let registered =
+                FailureClassification::for_code(code).expect("resource code is registered");
+            assert_eq!(
+                classification, registered,
+                "{kind:?}: only registry text may leave the host"
+            );
+            for context in [
+                "987654321",
+                "123456789",
+                "314159",
+                "271828",
+                "unregistered failure",
+            ] {
+                assert!(!classification.message().contains(context));
+            }
+
+            let shutdown = clinker_exec::pipeline::shutdown::ShutdownToken::new();
+            for requested in [false, true] {
+                if requested {
+                    shutdown.request();
+                }
+                assert_eq!(shutdown.is_requested(), requested);
+                assert!(!is_cancelled_transport_error(&error));
+                assert_eq!(
+                    run_terminal_outcome(&error),
+                    RunTerminalOutcome::Fail(registered.clone())
+                );
+                assert_eq!(pipeline_error_exit_code(&error), 4);
+            }
+
+            let wrapped = PipelineError::CompositionBodyError {
+                composition_name: "private/input/customer-9182.csv".to_owned(),
+                inner: Box::new(error),
+            };
+            assert_eq!(classify_pipeline_error(&wrapped), registered);
+            assert!(!is_cancelled_transport_error(&wrapped));
+            for errors in [
+                vec![resource_failure(Cancelled), resource_failure(kind)],
+                vec![resource_failure(kind), resource_failure(Cancelled)],
+            ] {
+                let mixed = PipelineError::Multiple(errors);
+                assert!(!is_cancelled_transport_error(&mixed));
+                assert_eq!(
+                    run_terminal_outcome(&mixed),
+                    RunTerminalOutcome::Fail(registered.clone())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resource_cancellation_is_abort_with_interrupted_exit_without_a_pending_signal() {
+        for error in [
+            resource_failure(clinker_record::owned_storage::ResourceErrorKind::Cancelled),
+            PipelineError::Interrupted,
+        ] {
+            assert_eq!(run_terminal_outcome(&error), RunTerminalOutcome::Abort);
+            assert_eq!(pipeline_error_exit_code(&error), 130);
+        }
+        assert!(matches!(
+            run_terminal_outcome(&PipelineError::Multiple(vec![])),
+            RunTerminalOutcome::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn resource_classification_preserves_existing_format_failure_contracts() {
+        use clinker_core_types::FailureClassification;
+
+        for (format_error, code) in [
+            (
+                clinker_format::FormatError::Json(
+                    "private/row-9182.json: customer 7314".to_owned(),
+                ),
+                "source.data.invalid",
+            ),
+            (
+                clinker_format::FormatError::Io(std::io::Error::other("private/input.csv")),
+                "infrastructure.runtime.transient",
+            ),
+            (
+                clinker_format::FormatError::Classified {
+                    code: "rest.http.client_error",
+                    message: "private/request: account 9182".to_owned(),
+                },
+                "rest.http.client_error",
+            ),
+        ] {
+            let error = PipelineError::Format(format_error);
+            let registered = FailureClassification::for_code(code).unwrap();
+            assert_eq!(classify_pipeline_error(&error), registered);
+            assert_eq!(
+                run_terminal_outcome(&error),
+                RunTerminalOutcome::Fail(registered)
+            );
+        }
+    }
 
     /// A signal arriving mid-failure must not erase the failure.
     ///

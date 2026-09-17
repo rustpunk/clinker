@@ -680,8 +680,11 @@ fn transform_dispatch_emits_typed_lifecycle_record_error_metrics_and_spans() {
     }
 }
 
+// Concurrent source, transform, and sink producers can lose a log before its
+// field policy is credited. This matrix proves runtime isolation under each
+// policy; controlled producer tests establish the individual positive outcomes.
 #[test]
-fn transform_dispatch_loss_and_truncation_paths_preserve_etl_outcomes() {
+fn transform_dispatch_telemetry_policies_preserve_etl_outcomes() {
     let disabled = run_transform_dispatch(48, None);
     let cases = [
         (
@@ -716,14 +719,82 @@ fn transform_dispatch_loss_and_truncation_paths_preserve_etl_outcomes() {
             snapshot.peak_retained_bytes <= snapshot.owned_bytes,
             "{name}"
         );
-        match name {
-            "truncated" => assert!(snapshot.truncated_fields > 0),
-            "sampled" => assert!(snapshot.sampled_drops > 0),
-            "rate_limited" => assert!(snapshot.rate_limited_drops > 0),
-            "full" => assert!(snapshot.full_drops > 0),
-            _ => unreachable!(),
+        let batch = enabled
+            .batch
+            .expect("fixed Transform metrics are drainable");
+        assert_eq!(batch.metric(MetricKey::TransformStarted), 1, "{name}");
+        assert_eq!(batch.metric(MetricKey::TransformCompleted), 1, "{name}");
+        assert_eq!(batch.metric(MetricKey::TransformRecords), 48, "{name}");
+        assert_eq!(batch.metric(MetricKey::TransformErrors), 1, "{name}");
+
+        // Only customer_id exceeds the 8B cap: the replacement [region] is
+        // exactly eight bytes and hashed email values are not truncated.
+        let field_logs = batch.logs().iter().filter(|record| {
+            matches!(
+                record.event.as_str(),
+                "transform.customer_seen" | "transform.customer_failed"
+            )
+        });
+        let mut expected_truncations = 0;
+        for record in field_logs {
+            let customer = record
+                .fields
+                .get("customer_id")
+                .expect("allowed customer ID");
+            if name == "truncated" {
+                assert_eq!(customer, "custo…");
+                expected_truncations += 1;
+            }
+        }
+        assert_eq!(
+            snapshot.truncated_fields, expected_truncations,
+            "{name}: {snapshot:?}"
+        );
+        if name == "sampled" {
+            // Sampling is decided before lock acquisition; unlike rate and
+            // capacity rejection, contention cannot preempt this outcome.
+            assert!(snapshot.sampled_drops > 0, "{snapshot:?}");
         }
     }
+}
+
+#[test]
+fn transform_field_policy_truncates_an_admitted_typed_customer_id() {
+    let policy = transform_policy("8KB", "4KB", "12KB", "8B", 1, 100_000, 100_000);
+    let (producer, receiver) = TelemetryArena::reserve(&policy).expect("arena reserves");
+    let customer = Value::String("customer-1".into());
+    let email = Value::String("customer-1@example.invalid".into());
+    let region = Value::String("very-long-region-1".into());
+    let secret = Value::String("secret-1".into());
+    let outcome = producer.emit_log(LogEvent {
+        event: "transform.customer_seen",
+        severity: Severity::Info,
+        message: "Customer observed",
+        correlation: correlation(),
+        fields: &[
+            SignalField::from_record("customer_id", &customer),
+            SignalField::from_record("email", &email),
+            SignalField::from_record("region", &region),
+            SignalField::from_record("secret", &secret),
+        ],
+    });
+    assert!(outcome.is_accepted(), "{outcome:?}");
+    let snapshot = producer.snapshot();
+    assert_eq!(snapshot.accepted, 1);
+    assert_eq!(snapshot.truncated_fields, 1);
+    assert_eq!(snapshot.denied_fields, 1);
+    let batch = receiver
+        .try_recv_batch()
+        .expect("admitted record is drainable");
+    assert_eq!(batch.logs().len(), 1);
+    let fields = &batch.logs()[0].fields;
+    assert_eq!(
+        fields.get("customer_id").map(String::as_str),
+        Some("custo…")
+    );
+    assert_eq!(fields.get("region").map(String::as_str), Some("[region]"));
+    assert!(fields.get("email").unwrap().starts_with("blake3:"));
+    assert!(!fields.contains_key("secret"));
 }
 
 /// Admit twenty Error events under `sample_every = 10`, interleaving

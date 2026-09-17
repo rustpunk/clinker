@@ -384,6 +384,7 @@ pub(super) fn drain_streaming_channel<C: StreamingConsumer>(
 /// `out` rather than aborting so the dispatcher can surface them alongside
 /// any sibling `output_errors`.
 struct SinkStreamConsumer {
+    writer_resources: clinker_format::preparation::WriterResources,
     spec: StreamingSinkSpec,
     out: StreamingOutputTaskOutput,
     /// Set only when channel disconnect reached the writer-finalization hook.
@@ -394,7 +395,7 @@ struct SinkStreamConsumer {
     /// on close for the empty-stream case).
     scan_timer_slot: Option<stage_metrics::StageTimer>,
     /// Lazily built on the first record's projected schema.
-    writer: Option<Box<dyn FormatWriter>>,
+    writer: Option<clinker_format::FormatWriterHandle>,
     /// Holds the raw sink until the first record triggers the lazy build.
     raw_writer_slot: Option<Box<dyn Write + Send>>,
     sink_byte_counter: Option<clinker_format::SharedByteCounter>,
@@ -406,6 +407,7 @@ impl SinkStreamConsumer {
         raw_writer: Box<dyn Write + Send>,
         spec: StreamingSinkSpec,
         sink_byte_counter: Option<clinker_format::SharedByteCounter>,
+        writer_resources: clinker_format::preparation::WriterResources,
     ) -> Self {
         debug_assert!(spec.writer_boundary.is_incremental_streaming());
         let structured_guard = StructuredOutputDocumentGuard::new(&spec.out_cfg.format);
@@ -413,6 +415,7 @@ impl SinkStreamConsumer {
         let output_name = spec.output_name.clone();
         let out_cfg = spec.out_cfg.clone();
         Self {
+            writer_resources,
             spec,
             out: StreamingOutputTaskOutput {
                 records_written: 0,
@@ -508,6 +511,7 @@ impl StreamingConsumer for SinkStreamConsumer {
                 schema,
                 crate::output::staging::OutputStagingRegistry::default(),
                 self.sink_byte_counter.clone(),
+                self.writer_resources.clone(),
             ) {
                 Ok(w) => {
                     self.writer = Some(w);
@@ -559,6 +563,7 @@ impl StreamingConsumer for SinkStreamConsumer {
                 if self.spec.strategy != ErrorStrategy::FailFast
                     && let Some(entry) = dispatch::sink_collision_dlq_entry(
                         &record,
+                        &projected,
                         row_num,
                         &self.spec.output_name,
                         &e,
@@ -628,6 +633,12 @@ impl StreamingConsumer for SinkStreamConsumer {
     }
 }
 
+/// Writer staging and allocation admission retain their distinct run lifetimes.
+pub(super) struct StreamingSinkResources {
+    pub(super) writer_resources: clinker_format::preparation::WriterResources,
+    pub(super) allocation_resources: clinker_record::owned_storage::AllocationResources,
+}
+
 /// Streaming-output writer thread body — the `Sink` instantiation of the
 /// generalized streaming-consumer substrate. Builds an
 /// [`SinkStreamConsumer`] over the writer lifecycle and drives it with
@@ -641,15 +652,35 @@ pub(super) fn streaming_sink(
     charge_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
     telemetry_producer: Option<crate::telemetry::TelemetryProducer>,
     shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
-    allocation_resources: clinker_record::owned_storage::AllocationResources,
+    resources: StreamingSinkResources,
 ) -> StreamingOutputTaskOutput {
+    let StreamingSinkResources {
+        writer_resources,
+        allocation_resources,
+    } = resources;
     let mut signal = telemetry_producer
         .map(|producer| crate::telemetry::SinkSignal::new(producer, spec.output_name.clone()));
     let sink_byte_counter = signal
         .as_ref()
         .map(|_| clinker_format::SharedByteCounter::new());
-    let mut consumer = SinkStreamConsumer::new(raw_writer, spec, sink_byte_counter.clone());
+    let mut consumer = SinkStreamConsumer::new(
+        raw_writer,
+        spec,
+        sink_byte_counter.clone(),
+        writer_resources,
+    );
     drain_streaming_channel(&rx, &charge_handle, &mut consumer, &allocation_resources);
+    let errors = consumer
+        .out
+        .errors
+        .iter()
+        .filter(|error| !super::preparation::is_explicit_cancellation(error))
+        .count();
+    let has_interrupted_error = consumer
+        .out
+        .errors
+        .iter()
+        .any(super::preparation::is_explicit_cancellation);
     if let Some(mut signal) = signal.take() {
         signal.record_records(consumer.out.records_written);
         signal.record_bytes(
@@ -657,18 +688,8 @@ pub(super) fn streaming_sink(
                 .as_ref()
                 .map_or(0, clinker_format::SharedByteCounter::bytes_written),
         );
-        let errors = consumer.out.errors.len();
         signal.record_errors(u64::try_from(errors).unwrap_or(u64::MAX));
-        let has_interrupted_error = consumer
-            .out
-            .errors
-            .iter()
-            .any(|error| matches!(error, PipelineError::Interrupted));
-        let has_failure = consumer
-            .out
-            .errors
-            .iter()
-            .any(|error| !matches!(error, PipelineError::Interrupted));
+        let has_failure = errors > 0;
         let interrupted = has_interrupted_error
             || shutdown_token
                 .as_ref()

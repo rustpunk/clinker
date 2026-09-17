@@ -486,6 +486,11 @@ fn execute_composition_body(
     let walk_and_harvest: Result<ReservedPortRecords, PipelineError> = (|| {
         for node_idx in topo {
             if let Err(inner) = dispatch_plan_node(ctx, &body_dag, node_idx) {
+                // Interruption is control flow through nested bodies, not a
+                // diagnostic to wrap into a genuine composition failure.
+                if matches!(inner, PipelineError::Interrupted) {
+                    return Err(inner);
+                }
                 return Err(PipelineError::compose_body_error(
                     composition_name.to_string(),
                     Box::new(inner),
@@ -571,7 +576,9 @@ fn execute_composition_body(
         None => Ok(Vec::new()),
     };
     let activation_cleanup = activation_cleanup.and_then(|outcomes| {
+        let mut source_interrupted = false;
         for outcome in outcomes {
+            source_interrupted |= outcome.interrupted;
             ctx.counters.total_count = ctx
                 .counters
                 .total_count
@@ -586,7 +593,12 @@ fn execute_composition_body(
                     .observe(&outcome.source_name, &file, timestamp);
             }
         }
-        Ok(())
+        if source_interrupted {
+            ctx.interrupted = true;
+            Err(PipelineError::Interrupted)
+        } else {
+            Ok(())
+        }
     });
     ctx.source_records = saved_source_records;
     ctx.source_consumers = saved_source_consumers;
@@ -604,6 +616,7 @@ fn execute_composition_body(
     ctx.window_runtime.remove_body_scope(bound_body.body_scope);
 
     match (walk_and_harvest, activation_cleanup) {
+        (Err(PipelineError::Interrupted), Err(error)) => Err(error),
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
         (Ok(output), Ok(())) => Ok(output),

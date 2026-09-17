@@ -381,12 +381,9 @@ impl<R: Read + Send> FormatReader for EdifactReader<R> {
         self.pull_next()
     }
 
-    fn prepare_document(
-        &mut self,
-        config: &EnvelopeConfig,
-    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
+    fn prepare_document(&mut self, config: &EnvelopeConfig) -> Result<OwnedMap, FormatError> {
         if config.is_empty() {
-            return Ok(IndexMap::new());
+            return Ok(OwnedMap::from_map(IndexMap::new()));
         }
         self.ensure_initialized()?;
 
@@ -442,7 +439,7 @@ impl<R: Read + Send> FormatReader for EdifactReader<R> {
                 Value::Map(OwnedMap::from_map(typed)),
             );
         }
-        Ok(out)
+        Ok(OwnedMap::from_map(out))
     }
 }
 

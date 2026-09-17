@@ -13,7 +13,7 @@
 # input records to disk under pressure and re-running synthesis on reload.
 pipeline:
   name: scd_type2_backfill
-  # Include headroom for complete row groups and their retained storage.
+  # Include headroom for complete row groups and the prepared CSV writer.
   # The spill policy permits disk-backed execution when memory is pressured.
   memory: { limit: "128K", backpressure: spill }
 

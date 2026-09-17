@@ -269,16 +269,20 @@ fn assert_success_signals(actual: &SinkTelemetry, records: u64, bytes: u64) {
         actual.spans.len() <= 1,
         "Sink spans are admission-controlled"
     );
+    assert_admitted_spans(actual, SpanStatus::Ok);
+}
+
+fn assert_admitted_spans(actual: &SinkTelemetry, status: SpanStatus) {
     assert!(
-        actual
-            .spans
-            .iter()
-            .all(|span| span.status == SpanStatus::Ok && span.logical_node == "delivered")
+        actual.spans.len() <= 1,
+        "Sink spans are admission-controlled"
     );
-    assert!(
-        actual.spans[0].ended_at_unix_nanos >= actual.spans[0].started_at_unix_nanos,
-        "the complete span is closed at both ends"
-    );
+    for span in &actual.spans {
+        assert_eq!(span.status, status);
+        assert_eq!(span.logical_node, "delivered");
+        assert!(span.started_at_unix_nanos > 0);
+        assert!(span.ended_at_unix_nanos >= span.started_at_unix_nanos);
+    }
 }
 
 #[test]
@@ -331,29 +335,14 @@ fn telemetry_sink_failure_has_one_error_span_and_no_completion() {
     assert_eq!(actual.completed, 0, "failed work did not complete");
     assert_eq!(actual.failed, 1, "failed work has one terminal outcome");
     assert_eq!(actual.interrupted, 0);
-    assert_eq!(
-        actual.records, 2,
-        "both rows reached the buffered writer before its flush failed"
-    );
-    assert!(
-        actual.errors >= 1,
-        "the writer failure is counted: {actual:?}"
-    );
-    assert_eq!(
-        actual.bytes,
-        b"id,label\n1,alpha\n2,beta\n".len() as u64,
-        "bytes accepted before the flush failure remain observable"
-    );
+    assert_eq!(actual.records, 0, "the failed operation never committed");
+    assert_eq!(actual.errors, 1, "one destination refusal");
+    assert_eq!(actual.bytes, 0, "an Err write accepted no bytes");
     assert!(
         actual.spans.len() <= 1,
         "Sink spans are admission-controlled"
     );
-    assert!(
-        actual
-            .spans
-            .iter()
-            .all(|span| span.status == SpanStatus::Error)
-    );
+    assert_admitted_spans(&actual, SpanStatus::Error);
 }
 
 #[test]
@@ -392,12 +381,7 @@ fn telemetry_streaming_sink_interruption_has_one_terminal_outcome() {
         actual.spans.len() <= 1,
         "Sink spans are admission-controlled"
     );
-    assert!(
-        actual
-            .spans
-            .iter()
-            .all(|span| span.status == SpanStatus::Unset)
-    );
+    assert_admitted_spans(&actual, SpanStatus::Unset);
 }
 
 #[test]
@@ -435,6 +419,309 @@ fn telemetry_full_arena_cannot_change_sink_bytes_or_exit_status() {
         actual.spans.is_empty(),
         "the full ordinary lane drops the optional Sink span"
     );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DestinationFault {
+    Refuse { prefix: usize },
+    Flush,
+    CancelAfterWrite,
+}
+
+struct FaultWriter {
+    fault: DestinationFault,
+    shutdown: Option<clinker_exec::pipeline::shutdown::ShutdownToken>,
+    output: SharedBuffer,
+    calls: Arc<Mutex<(usize, usize)>>,
+}
+
+impl Write for FaultWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut calls = self.calls.lock().unwrap();
+        calls.0 += 1;
+        match self.fault {
+            DestinationFault::Refuse { prefix } => {
+                if prefix > 0 && calls.0 == 1 {
+                    return self.output.write(&bytes[..prefix.min(bytes.len())]);
+                }
+                if let Some(token) = &self.shutdown {
+                    token.request();
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "destination refusal",
+                ))
+            }
+            DestinationFault::Flush => self.output.write(bytes),
+            DestinationFault::CancelAfterWrite => {
+                let accepted = self.output.write(bytes)?;
+                self.shutdown.as_ref().unwrap().request();
+                Ok(accepted)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.calls.lock().unwrap().1 += 1;
+        assert!(
+            matches!(self.fault, DestinationFault::Flush),
+            "terminal writer reused"
+        );
+        if let Some(token) = &self.shutdown {
+            token.request();
+        }
+        Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush refusal"))
+    }
+}
+
+fn fill_both_lanes(producer: &TelemetryProducer) {
+    for status in [SpanStatus::Ok, SpanStatus::Error] {
+        loop {
+            let snapshot = producer.snapshot();
+            if (status == SpanStatus::Ok && snapshot.ordinary_full_drops > 0)
+                || (status == SpanStatus::Error && snapshot.high_full_drops > 0)
+            {
+                break;
+            }
+            let now = unix_nanos_now();
+            let _ = producer.emit_span(SpanFact {
+                name: SpanName::Transform,
+                status,
+                logical_node: "bounded-prefill",
+                started_at_unix_nanos: now,
+                ended_at_unix_nanos: now,
+            });
+        }
+    }
+}
+
+fn assert_broken_pipe(error: &PipelineError) {
+    match error {
+        PipelineError::Multiple(errors) => {
+            assert_eq!(errors.len(), 1, "no derivative errors: {errors:?}");
+            assert_broken_pipe(&errors[0]);
+        }
+        PipelineError::Format(clinker_format::FormatError::Io(error))
+        | PipelineError::Io(error) => assert_eq!(error.kind(), io::ErrorKind::BrokenPipe),
+        other => panic!("original destination error lost: {other:?}"),
+    }
+}
+
+fn destination_fault_matrix(yaml: &str) {
+    for fault in [
+        DestinationFault::Refuse { prefix: 0 },
+        DestinationFault::Refuse { prefix: 1 },
+        DestinationFault::Flush,
+        DestinationFault::CancelAfterWrite,
+    ] {
+        for requests_shutdown in [false, true] {
+            if matches!(fault, DestinationFault::CancelAfterWrite) && !requests_shutdown {
+                continue;
+            }
+            // Absence, ordinary admission, and both lanes full use the same
+            // destination and exact outcome assertions.
+            for telemetry_mode in 0..3 {
+                let (producer, receiver) =
+                    TelemetryArena::reserve(&observability_policy()).unwrap();
+                if telemetry_mode == 2 {
+                    fill_both_lanes(&producer);
+                }
+                let before = producer.snapshot();
+                let token = clinker_exec::pipeline::shutdown::ShutdownToken::detached();
+                let output = SharedBuffer::default();
+                let calls = Arc::new(Mutex::new((0, 0)));
+                let writer = FaultWriter {
+                    fault,
+                    shutdown: requests_shutdown.then(|| token.clone()),
+                    output: output.clone(),
+                    calls: calls.clone(),
+                };
+                let writers: HashMap<String, Box<dyn Write + Send>> =
+                    HashMap::from([("delivered".to_string(), Box::new(writer) as _)]);
+                let result = PipelineExecutor::run_plan_with_readers_writers(
+                    &compile(yaml),
+                    readers(),
+                    writers,
+                    &PipelineRunParams {
+                        shutdown_token: Some(token),
+                        telemetry_producer: (telemetry_mode != 0).then(|| producer.clone()),
+                        ..PipelineRunParams::default()
+                    },
+                );
+                let interrupted = matches!(fault, DestinationFault::CancelAfterWrite);
+                if interrupted {
+                    let report = result.expect("explicit cancellation remains interruption");
+                    assert!(report.interrupted);
+                    assert_eq!(
+                        report.counters.records_written, 0,
+                        "accepted bytes do not commit a cancelled operation"
+                    );
+                } else {
+                    assert_broken_pipe(&result.expect_err("real failure wins over shutdown"));
+                }
+                let (writes, flushes) = *calls.lock().unwrap();
+                let records = if matches!(fault, DestinationFault::Flush) {
+                    2
+                } else {
+                    0
+                };
+                match fault {
+                    DestinationFault::Refuse { prefix } => {
+                        assert_eq!(output.bytes().len(), prefix);
+                        assert_eq!(writes, usize::from(prefix > 0) + 1);
+                        assert_eq!(flushes, 0);
+                    }
+                    DestinationFault::Flush => {
+                        let expected = if yaml == STREAMING_PIPELINE {
+                            b"id,label\n2,beta\n1,alpha\n"
+                        } else {
+                            b"id,label\n1,alpha\n2,beta\n"
+                        };
+                        assert_eq!(output.bytes(), expected);
+                        assert_eq!(flushes, 1);
+                    }
+                    DestinationFault::CancelAfterWrite => {
+                        let expected = if yaml == STREAMING_PIPELINE {
+                            b"id,label\n2,beta\n".as_slice()
+                        } else {
+                            b"id,label\n1,alpha\n".as_slice()
+                        };
+                        assert_eq!(output.bytes(), expected);
+                        assert_eq!((writes, flushes), (1, 0));
+                    }
+                }
+                let after = producer.snapshot();
+                assert_eq!(after.owned_bytes, before.owned_bytes);
+                assert_eq!(
+                    after.ordinary_capacity_bytes,
+                    before.ordinary_capacity_bytes
+                );
+                assert_eq!(after.high_capacity_bytes, before.high_capacity_bytes);
+                let actual = drain_sink(&receiver);
+                if telemetry_mode == 0 {
+                    assert_eq!(actual.started, 0);
+                } else {
+                    assert_eq!(actual.started, 1, "{fault:?}");
+                    assert_eq!(actual.completed, 0);
+                    assert_eq!(actual.failed, u64::from(!interrupted));
+                    assert_eq!(actual.interrupted, u64::from(interrupted));
+                    assert_eq!(actual.errors, u64::from(!interrupted));
+                    assert_eq!(actual.records, records);
+                    assert_eq!(actual.bytes, output.bytes().len() as u64);
+                    assert_admitted_spans(
+                        &actual,
+                        if interrupted {
+                            SpanStatus::Unset
+                        } else {
+                            SpanStatus::Error
+                        },
+                    );
+                    if telemetry_mode == 2 {
+                        assert!(actual.spans.is_empty());
+                        assert!(after.full_drops > before.full_drops);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sync_destination_faults_preserve_outcomes_under_shutdown_and_saturation() {
+    destination_fault_matrix(SYNC_PIPELINE);
+}
+
+#[test]
+fn streaming_destination_faults_preserve_outcomes_under_shutdown_and_saturation() {
+    destination_fault_matrix(STREAMING_PIPELINE);
+}
+
+#[test]
+fn correlated_destination_faults_preserve_outcomes_under_shutdown_and_saturation() {
+    destination_fault_matrix(CORRELATED_PIPELINE);
+}
+
+#[test]
+fn terminal_fan_out_writers_are_not_reused_and_sibling_failures_survive() {
+    use clinker_exec::executor::WriterRegistry;
+    for cancelled in [false, true] {
+        let (producer, receiver) = TelemetryArena::reserve(&observability_policy()).unwrap();
+        let token = clinker_exec::pipeline::shutdown::ShutdownToken::detached();
+        let output = SharedBuffer::default();
+        let primary_calls = Arc::new(Mutex::new((0, 0)));
+        let sibling_calls = Arc::new(Mutex::new((0, 0)));
+        let mut files: HashMap<Arc<str>, Box<dyn Write + Send>> = HashMap::from([(
+            Arc::from("input.csv"),
+            Box::new(FaultWriter {
+                fault: if cancelled {
+                    DestinationFault::CancelAfterWrite
+                } else {
+                    DestinationFault::Refuse { prefix: 1 }
+                },
+                shutdown: cancelled.then(|| token.clone()),
+                output: output.clone(),
+                calls: primary_calls.clone(),
+            }) as _,
+        )]);
+        if !cancelled {
+            files.insert(
+                Arc::from("independent.csv"),
+                Box::new(FaultWriter {
+                    fault: DestinationFault::Flush,
+                    shutdown: None,
+                    output: SharedBuffer::default(),
+                    calls: sibling_calls.clone(),
+                }),
+            );
+        }
+        let registry = WriterRegistry {
+            fan_out: HashMap::from([("delivered".into(), files)]),
+            ..WriterRegistry::default()
+        };
+        let result = PipelineExecutor::run_plan_with_readers_writers(
+            &compile(SYNC_PIPELINE),
+            readers(),
+            registry,
+            &PipelineRunParams {
+                shutdown_token: Some(token),
+                ..params(producer)
+            },
+        );
+        if cancelled {
+            let report = result.expect("no poisoned continuation after cancellation");
+            assert!(report.interrupted);
+            assert_eq!(report.counters.records_written, 0);
+            assert_eq!(*primary_calls.lock().unwrap(), (1, 0));
+            assert_eq!(output.bytes(), b"id,label\n1,alpha\n");
+        } else {
+            let PipelineError::Multiple(errors) = result.unwrap_err() else {
+                panic!("two independent errors")
+            };
+            assert_eq!(errors.len(), 2);
+            for error in errors {
+                assert_broken_pipe(&error);
+            }
+            assert_eq!(*primary_calls.lock().unwrap(), (2, 0));
+            assert_eq!(*sibling_calls.lock().unwrap(), (0, 1));
+            assert_eq!(output.bytes(), b"i");
+        }
+        let actual = drain_sink(&receiver);
+        assert_eq!(actual.started, 1);
+        assert_eq!(actual.completed, 0);
+        assert_eq!(actual.failed, u64::from(!cancelled));
+        assert_eq!(actual.interrupted, u64::from(cancelled));
+        assert_eq!(actual.errors, if cancelled { 0 } else { 2 });
+        assert_eq!(actual.records, 0);
+        assert_eq!(actual.bytes, output.bytes().len() as u64);
+        assert_admitted_spans(
+            &actual,
+            if cancelled {
+                SpanStatus::Unset
+            } else {
+                SpanStatus::Error
+            },
+        );
+    }
 }
 
 #[test]

@@ -685,7 +685,7 @@ fn has_present_leaf(body: &PlanBody, values: &[Value]) -> bool {
 /// `serde_json::Value`. A non-finite float is rejected with the same message
 /// `clinker_to_json` raises, surfaced through the serializer's error type so it
 /// arrives at the caller as [`FormatError::Json`] with identical text.
-struct ValueSer<'a>(&'a Value);
+pub(crate) struct ValueSer<'a>(pub(crate) &'a Value);
 
 impl serde::Serialize for ValueSer<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -708,10 +708,10 @@ impl serde::Serialize for ValueSer<'_> {
             }
             // JSON has no exact-decimal type; emit the scale-preserving string
             // form (matches `clinker_to_json`).
-            Value::Decimal(d) => serializer.serialize_str(&d.to_string()),
+            Value::Decimal(d) => serializer.collect_str(d),
             Value::String(s) => serializer.serialize_str(s.as_str()),
-            Value::Date(d) => serializer.serialize_str(&d.to_string()),
-            Value::DateTime(dt) => serializer.serialize_str(&dt.to_string()),
+            Value::Date(d) => serializer.collect_str(d),
+            Value::DateTime(dt) => serializer.collect_str(dt),
             Value::Array(arr) => {
                 let mut seq = serializer.serialize_seq(Some(arr.len()))?;
                 for v in arr {

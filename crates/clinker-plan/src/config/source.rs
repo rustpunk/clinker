@@ -646,7 +646,11 @@ pub struct CsvInputOptions {
     pub quote_char: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_header: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Strict UTF-8 (default) or true ISO-8859-1, shared by header and body cells.
+    #[serde(
+        deserialize_with = "super::format::deserialize_encoding",
+        serialize_with = "super::format::serialize_encoding"
+    )]
     pub encoding: Option<String>,
 }
 
@@ -783,7 +787,10 @@ pub struct X12InputOptions {
     /// here and defaults to UTF-8. Supported values are `utf-8` and
     /// `iso-8859-1` (Latin-1); an unsupported value is rejected with a
     /// precise error naming it.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        deserialize_with = "super::format::deserialize_encoding",
+        serialize_with = "super::format::serialize_encoding"
+    )]
     pub encoding: Option<String>,
     /// Optional user-declared section name and typed field schema for the
     /// `GS` functional-group nested envelope level. The interchange header

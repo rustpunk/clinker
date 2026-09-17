@@ -12,9 +12,11 @@ use clinker_record::owned_storage::{OwnedValues, SharedStorage};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use clinker_format::csv::{CsvWriter, CsvWriterConfig};
+use clinker_format::csv::writer::{CsvEncoder, CsvWriterConfig};
+use clinker_format::error::OutputEncodingKind;
 use clinker_format::fixed_width::{FixedWidthWriter, FixedWidthWriterConfig};
 use clinker_format::json::writer::{JsonWriter, JsonWriterConfig};
+use clinker_format::preparation::{MemoryOnlyResources, PreparedWriter};
 use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
 use clinker_format::{Column, FormatError, FormatWriter};
 use clinker_record::{Record, Schema, Value};
@@ -67,7 +69,9 @@ fn csv_writer_joins_array_into_delimited_cell() {
             declared_multiple: BTreeSet::from(["tags".to_string()]),
             ..CsvWriterConfig::default()
         };
-        let mut writer = CsvWriter::new(&mut buf, schema.clone(), config);
+        let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let encoder = CsvEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+        let mut writer = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         writer
             .write_record(&record)
             .expect("CSV writer joins a scalar array into one cell");
@@ -80,11 +84,14 @@ fn csv_writer_joins_array_into_delimited_cell() {
 #[test]
 fn csv_writer_rejects_array_in_undeclared_column() {
     let (schema, record) = record_with_array();
-    let mut writer = CsvWriter::new(Vec::new(), schema, CsvWriterConfig::default());
+    let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+    let encoder =
+        CsvEncoder::new(schema, &CsvWriterConfig::default(), provider.resources()).unwrap();
+    let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
     let err = writer.write_record(&record).unwrap_err();
     assert!(
-        matches!(&err, FormatError::UnserializableArrayValue { format, column }
-            if *format == "CSV" && column == "tags"),
+        matches!(&err, FormatError::OutputEncoding { format: "CSV", field: 2, offset: 0, kind: OutputEncodingKind::Array, field_name, element: None }
+            if field_name.to_string() == "tags"),
         "expected undeclared CSV array rejection, got {err:?}"
     );
     assert_lists_remedies(&err);

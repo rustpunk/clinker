@@ -1,5 +1,8 @@
 //! Source-scoped identity coverage for failure evidence and retraction state.
 
+#[path = "common/pipeline_resource_fixtures.rs"]
+mod resource_fixtures;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -88,6 +91,13 @@ fn run_failure_pipeline(
             SourceInput::Files(vec![slot("b.csv", src_b)]),
         ),
     ]);
+    run_failure_pipeline_with_readers(plan, readers)
+}
+
+fn run_failure_pipeline_with_readers(
+    plan: &CompiledPlan,
+    readers: SourceReaders,
+) -> (ExecutionReport, String) {
     let output = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
         "out".to_string(),
@@ -189,8 +199,17 @@ fn dlq_document_collateral_preserves_identity_and_records_when_spilled() {
     let src_b = large_source("b");
     let resident_plan = compile_failure_pipeline("document", "1G");
     let spilled_plan = compile_failure_pipeline("document", "1M");
-    let (resident, _) = run_failure_pipeline(&resident_plan, src_a.clone(), src_b.clone());
-    let (spilled, output) = run_failure_pipeline(&spilled_plan, src_a, src_b);
+    // Document collateral, not the CSV decoder, owns this pressure fixture.
+    let readers = |plan: &CompiledPlan| {
+        resource_fixtures::predecoded_csv_readers(
+            plan.config(),
+            &CompileContext::default(),
+            &[("src_a", &src_a), ("src_b", &src_b)],
+        )
+    };
+    let (resident, _) = run_failure_pipeline_with_readers(&resident_plan, readers(&resident_plan));
+    let (spilled, output) =
+        run_failure_pipeline_with_readers(&spilled_plan, readers(&spilled_plan));
 
     assert_eq!(resident.dlq_entries.len(), 640);
     assert_eq!(spilled.dlq_entries.len(), resident.dlq_entries.len());

@@ -7,6 +7,1580 @@ use clinker_exec::{
 };
 use clinker_record::owned_storage::ResourceErrorKind;
 
+fn decode_coercion_reader(
+    bytes: Vec<u8>,
+    config: clinker_format::csv::reader::CsvReaderConfig,
+    columns: &[clinker_format::Column],
+    policy: clinker_plan::config::pipeline_node::OnUnmapped,
+    resources: clinker_record::owned_storage::AllocationResources,
+) -> Box<dyn clinker_format::FormatReader> {
+    use clinker_exec::pipeline::schema_coerce::CoercingReader;
+    use clinker_format::preparation::{DecodeWorkspace, TextStorage};
+    let reader = clinker_format::csv::reader::CsvReader::from_reader_admitted(
+        std::io::Cursor::new(bytes),
+        config,
+        DecodeWorkspace::new(resources.clone()).unwrap(),
+        TextStorage::Shared,
+    )
+    .unwrap();
+    Box::new(
+        CoercingReader::new_csv_admitted(Box::new(reader), columns, policy, "rows", resources)
+            .unwrap(),
+    )
+}
+
+#[test]
+fn decode_coercion_owns_projected_schema_slots_widening_and_unique_text() {
+    use clinker_format::{Column, csv::reader::CsvReaderConfig, preparation::MemoryOnlyResources};
+    use clinker_plan::config::pipeline_node::OnUnmapped;
+    use clinker_record::Value;
+    use cxl::typecheck::Type;
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+    let text = "long-decoded-field-".repeat(8);
+    let input = format!("physical,unique,extra\n{text},{text},{text}\n");
+    let columns = [
+        Column {
+            source_name: Some("physical".into()),
+            ..Column::bare("logical", Type::String)
+        },
+        Column {
+            long_unique: Some(true),
+            ..Column::bare("unique", Type::String)
+        },
+    ];
+    let mut reader = decode_coercion_reader(
+        input.into_bytes(),
+        CsvReaderConfig::default(),
+        &columns,
+        OnUnmapped::AutoWiden,
+        provider.resources().allocation().clone(),
+    );
+    let schema = reader.schema().unwrap();
+    assert_eq!(schema.legacy_estimated_outer_heap_size(), 0);
+    assert_eq!(schema.legacy_estimated_heap_size(), 0);
+    let row = reader.next_record().unwrap().unwrap();
+    assert!(row.values_are_governed());
+    for name in ["logical", "unique"] {
+        let Value::String(value) = row.get(name).unwrap() else {
+            panic!("text")
+        };
+        assert_eq!(value.as_str(), text);
+        assert_eq!(value.legacy_heap_size(), 0);
+    }
+    let Value::Map(widened) = row.get("$widened").unwrap() else {
+        panic!("sidecar")
+    };
+    assert_eq!(widened.legacy_heap_size(), 0);
+    assert_eq!(widened.keys().next().unwrap().legacy_heap_size(), 0);
+    let alias = row.get("logical").unwrap().clone();
+    let independent = row.get("unique").unwrap().clone();
+    let Value::String(unique) = &independent else {
+        panic!("unique")
+    };
+    assert!(
+        unique.legacy_heap_size() > 0,
+        "independent legacy copies never inherit grants"
+    );
+    drop(row);
+    drop(reader);
+    assert!(
+        provider.used() > 0,
+        "bare schema and text aliases keep their owners"
+    );
+    drop(schema);
+    assert!(
+        provider.used() > 0,
+        "bare Value keeps the shared text owner"
+    );
+    drop(alias);
+    assert_eq!(provider.used(), 0);
+    assert_eq!(unique.as_str(), text);
+}
+
+#[test]
+fn decode_coercion_repeated_values_are_admitted_and_rejections_keep_originals() {
+    use clinker_format::{Column, csv::reader::CsvReaderConfig, preparation::MemoryOnlyResources};
+    use clinker_plan::config::pipeline_node::OnUnmapped;
+    use clinker_record::Value;
+    use cxl::typecheck::Type;
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+    let config = CsvReaderConfig {
+        split_values: vec![clinker_format::multi_value::SplitValues {
+            field: "values".into(),
+            delimiter: ";".into(),
+            escape: String::new(),
+            json: false,
+        }],
+        ..Default::default()
+    };
+    let columns = [Column {
+        multiple: Some(true),
+        ..Column::bare("values", Type::Int)
+    }];
+    let mut reader = decode_coercion_reader(
+        b"values\n1;2\n3;invalid\n".to_vec(),
+        config,
+        &columns,
+        OnUnmapped::Drop,
+        provider.resources().allocation().clone(),
+    );
+    let row = reader.next_record().unwrap().unwrap();
+    let Value::Array(values) = row.get("values").unwrap() else {
+        panic!("array")
+    };
+    assert!(values.is_governed());
+    assert_eq!(values.as_slice(), &[Value::Integer(1), Value::Integer(2)]);
+    let clinker_format::FormatError::DeclaredType(failure) = reader.next_record().unwrap_err()
+    else {
+        panic!("typed rejection")
+    };
+    assert_eq!(
+        failure.original_record.get("values"),
+        Some(&failure.original_value)
+    );
+    let Value::Array(original) = failure.original_record.get("values").unwrap() else {
+        panic!("array")
+    };
+    assert_eq!(original[0], Value::String("3".into()));
+    drop(failure);
+    drop(row);
+    drop(reader);
+    assert_eq!(provider.used(), 0);
+}
+
+#[test]
+fn decode_coercion_long_unique_reaches_repeated_and_nested_text() {
+    use clinker_format::{Column, csv::reader::CsvReaderConfig, preparation::MemoryOnlyResources};
+    use clinker_plan::config::pipeline_node::OnUnmapped;
+    use clinker_record::Value;
+    use cxl::typecheck::Type;
+    fn assert_unique(value: &Value) {
+        match value {
+            Value::String(text) => {
+                assert_eq!(text.legacy_heap_size(), 0);
+                if text.heap_size() > 0 {
+                    let independent = text.clone();
+                    assert_ne!(
+                        text.as_str().as_ptr(),
+                        independent.as_str().as_ptr(),
+                        "every long leaf must use unique storage"
+                    );
+                    assert!(independent.legacy_heap_size() > 0);
+                    assert_eq!(independent, *text);
+                }
+            }
+            Value::Array(items) => {
+                assert!(items.is_governed());
+                for item in items.iter() {
+                    assert_unique(item);
+                }
+            }
+            Value::Map(items) => {
+                assert_eq!(items.legacy_heap_size(), 0);
+                for (key, item) in items.iter() {
+                    assert_eq!(key.legacy_heap_size(), 0);
+                    assert_unique(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    let text = "unique-nested-text-".repeat(12);
+    for json in [false, true] {
+        let split = if json { "json: true" } else { "delimiter: ';'" };
+        let ty = if json { "any" } else { "string" };
+        let yaml = format!(
+            r#"
+pipeline: {{ name: repeated_text_storage }}
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: rows.csv
+      split_values: [{{ field: values, {split} }}]
+      schema: [{{ name: values, type: {ty}, multiple: true, long_unique: true }}]
+  - type: sink
+    name: result
+    input: rows
+    config: {{ name: result, type: json, path: result.json }}
+"#
+        );
+        clinker_plan::config::parse_config(&yaml)
+            .unwrap()
+            .compile(&clinker_plan::config::CompileContext::default())
+            .unwrap();
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+        let config = CsvReaderConfig {
+            split_values: vec![clinker_format::multi_value::SplitValues {
+                field: "values".into(),
+                delimiter: ";".into(),
+                escape: String::new(),
+                json,
+            }],
+            ..Default::default()
+        };
+        let input = if json {
+            let cell = format!(r#"["{text}",{{"nested":["{text}",null,42]}},["{text}","short"]]"#);
+            format!("values\n\"{}\"\n", cell.replace('"', "\"\""))
+        } else {
+            format!("values\n{text};{text};short\n")
+        };
+        let columns = [Column {
+            multiple: Some(true),
+            long_unique: Some(true),
+            ..Column::bare("values", if json { Type::Any } else { Type::String })
+        }];
+        let mut reader = decode_coercion_reader(
+            input.into_bytes(),
+            config,
+            &columns,
+            OnUnmapped::Drop,
+            provider.resources().allocation().clone(),
+        );
+        let row = reader.next_record().unwrap().unwrap();
+        assert_unique(row.get("values").unwrap());
+        drop(row);
+        drop(reader);
+        assert_eq!(provider.used(), 0);
+    }
+}
+
+#[test]
+fn decode_second_file_header_refusal_remains_resource_error() {
+    let root = tempfile::tempdir().unwrap();
+    let header = format!("{}\n", "x".repeat(2 * 1024 * 1024));
+    let error = decode_file_run(
+        root.path(),
+        &[b"value\n1\n", header.as_bytes()],
+        "",
+        "        - { name: value, type: int }",
+        "1M",
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, clinker_plan::error::PipelineError::Format(
+        clinker_format::FormatError::Resource(ref error)) if error.kind == ResourceErrorKind::Budget),
+        "{error:?}"
+    );
+}
+
+#[derive(Default)]
+struct DecodeFaultAuthority {
+    calls: std::sync::atomic::AtomicUsize,
+    fail_at: usize,
+    fail_allocator_at: usize,
+    used: std::sync::atomic::AtomicUsize,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl clinker_record::owned_storage::AllocationAuthority for DecodeFaultAuthority {
+    fn try_reserve(
+        self: Arc<Self>,
+        owner: clinker_record::owned_storage::OwnerId,
+        layout: Layout,
+    ) -> Result<
+        clinker_record::owned_storage::AllocationLease,
+        clinker_record::owned_storage::ResourceError,
+    > {
+        use clinker_record::owned_storage::{AllocationLease, ResourceError};
+        use std::sync::atomic::Ordering::SeqCst;
+        self.check_cancelled()?;
+        let call = self.calls.fetch_add(1, SeqCst) + 1;
+        if call == self.fail_at {
+            return Err(ResourceError::new(
+                ResourceErrorKind::Budget,
+                layout.size(),
+                0,
+            ));
+        }
+        self.used
+            .fetch_update(SeqCst, SeqCst, |used| {
+                used.checked_add(layout.size())
+                    .filter(|n| *n <= 1024 * 1024)
+            })
+            .map_err(|_| ResourceError::new(ResourceErrorKind::Budget, layout.size(), 0))?;
+        let fail_allocator = call == self.fail_allocator_at;
+        let lease = AllocationLease::admitted(self, owner, layout.size())?;
+        if fail_allocator {
+            ALLOCATIONS.with(|count| count.set(Some(0)));
+            FAIL_ALLOCATION.with(|fail| fail.set(Some(1)));
+        }
+        Ok(lease)
+    }
+    fn release(&self, _: clinker_record::owned_storage::OwnerId, bytes: usize) {
+        self.used
+            .fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn check_cancelled(&self) -> Result<(), clinker_record::owned_storage::ResourceError> {
+        if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(clinker_record::owned_storage::ResourceError::new(
+                ResourceErrorKind::Cancelled,
+                0,
+                0,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn decode_coercion_every_reservation_failure_releases_all_owners() {
+    use clinker_exec::pipeline::schema_coerce::CoercingReader;
+    use clinker_format::{
+        Column, FormatReader,
+        csv::reader::{CsvReader, CsvReaderConfig},
+        preparation::{DecodeWorkspace, TextStorage},
+    };
+    use clinker_plan::config::pipeline_node::OnUnmapped;
+    use clinker_record::owned_storage::AllocationResources;
+    use cxl::typecheck::Type;
+    let long = "long-independent-text-".repeat(4);
+    let nested = format!(r#"[{{"inside":["{long}"]}}]"#).replace('"', "\"\"");
+    let input = format!("value,numbers,nested,extra\n{long},1;2,\"{nested}\",{long}\n");
+    let columns = [
+        Column {
+            long_unique: Some(true),
+            ..Column::bare("value", Type::String)
+        },
+        Column {
+            multiple: Some(true),
+            ..Column::bare("numbers", Type::Int)
+        },
+        Column {
+            multiple: Some(true),
+            long_unique: Some(true),
+            ..Column::bare("nested", Type::Any)
+        },
+    ];
+    let mut failures = 0;
+    for fail_at in 1..200 {
+        let authority = Arc::new(DecodeFaultAuthority {
+            fail_at,
+            ..Default::default()
+        });
+        let resources = AllocationResources::new(authority.clone());
+        let result = (|| -> Result<(), clinker_format::FormatError> {
+            let raw = CsvReader::from_reader_admitted(
+                std::io::Cursor::new(input.clone()),
+                CsvReaderConfig {
+                    split_values: vec![
+                        clinker_format::multi_value::SplitValues {
+                            field: "numbers".into(),
+                            delimiter: ";".into(),
+                            escape: String::new(),
+                            json: false,
+                        },
+                        clinker_format::multi_value::SplitValues {
+                            field: "nested".into(),
+                            delimiter: ";".into(),
+                            escape: String::new(),
+                            json: true,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                DecodeWorkspace::new(resources.clone())?,
+                TextStorage::Shared,
+            )?;
+            let mut reader = CoercingReader::new_csv_admitted(
+                Box::new(raw),
+                &columns,
+                OnUnmapped::AutoWiden,
+                "rows",
+                resources,
+            )?;
+            let row = reader.next_record()?.unwrap();
+            assert!(row.values_are_governed());
+            Ok(())
+        })();
+        assert_eq!(
+            authority.used.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "leaked grant at refusal {fail_at}"
+        );
+        match result {
+            Err(clinker_format::FormatError::Resource(error)) => {
+                assert_eq!(error.kind, ResourceErrorKind::Budget);
+                failures += 1;
+            }
+            Ok(()) => {
+                assert!(failures > 30, "must exercise every allocation boundary");
+                return;
+            }
+            other => panic!("typed resource failure required: {other:?}"),
+        }
+    }
+    panic!("fault enumeration never reached success");
+}
+
+#[test]
+fn decode_replacement_keeps_cached_schema_and_bare_value_until_last_drop() {
+    use clinker_exec::source::{
+        RecordSource,
+        multi_file::{FileSlot, MultiFileFormatReader},
+    };
+    use clinker_format::{
+        FormatReader,
+        csv::reader::{CsvReader, CsvReaderConfig},
+        preparation::{DecodeWorkspace, MemoryOnlyResources, TextStorage},
+    };
+    use clinker_record::{Value, owned_storage::SharedStorage};
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+    let resources = provider.resources().allocation().clone();
+    let first = "first-admitted-text-".repeat(8);
+    let second = "second-admitted-text-".repeat(8);
+    let mut reader: Box<dyn FormatReader> = Box::new(MultiFileFormatReader::new(
+        vec![
+            FileSlot::new(
+                "first.csv",
+                Box::new(std::io::Cursor::new(format!("value\n{first}\n"))),
+            ),
+            FileSlot::new(
+                "second.csv",
+                Box::new(std::io::Cursor::new(format!("value\n{second}\n"))),
+            ),
+        ],
+        Box::new(move |source| {
+            Ok(Box::new(CsvReader::from_reader_admitted(
+                source.open()?,
+                CsvReaderConfig::default(),
+                DecodeWorkspace::new(resources.clone())?,
+                TextStorage::Shared,
+            )?))
+        }),
+    ));
+    let schema = RecordSource::schema(&mut reader).unwrap();
+    let row = RecordSource::next_record(&mut reader).unwrap().unwrap();
+    let value = row.get("value").unwrap().clone();
+    let before = provider.used();
+    drop(row);
+    assert!(
+        provider.used() < before,
+        "dropping slots releases only their own grant"
+    );
+    let next = RecordSource::next_record(&mut reader).unwrap().unwrap();
+    assert_eq!(next.get("value"), Some(&Value::String(second.into())));
+    assert!(SharedStorage::ptr_eq(
+        &schema,
+        &RecordSource::schema(&mut reader).unwrap()
+    ));
+    drop(next);
+    assert!(RecordSource::next_record(&mut reader).unwrap().is_none());
+    drop(reader);
+    let before = provider.used();
+    drop(schema);
+    assert!(provider.used() < before);
+    assert!(provider.used() > 0);
+    assert_eq!(value, Value::String(first.into()));
+    drop(value);
+    assert_eq!(provider.used(), 0);
+}
+
+#[test]
+fn decode_take_value_moves_unique_nested_storage_without_cloning() {
+    use clinker_format::preparation::MemoryOnlyResources;
+    use clinker_record::{FieldStr, Record, SchemaBuilder, Value, owned_storage::OwnedValues};
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(65536).unwrap());
+    let scope = provider.resources().allocation().scope().unwrap();
+    let text = FieldStr::try_new_unique(&"unique-".repeat(30), &scope).unwrap();
+    let pointer = text.as_str().as_ptr();
+    let mut nested = OwnedValues::try_with_capacity(1, &scope).unwrap();
+    nested.try_push(Value::String(text), &scope).unwrap();
+    let mut slots = OwnedValues::try_with_capacity(1, &scope).unwrap();
+    slots.try_push(Value::Array(nested), &scope).unwrap();
+    let mut row =
+        Record::from_owned_values(SchemaBuilder::new().with_field("nested").build(), slots)
+            .unwrap();
+    let before = provider.used();
+    let value = row.take_value_at(0).unwrap();
+    assert_eq!(provider.used(), before);
+    assert!(matches!(row.get("nested"), Some(Value::Null)));
+    drop(row);
+    assert!(provider.used() < before);
+    let Value::Array(items) = &value else {
+        panic!("nested")
+    };
+    let Value::String(text) = &items[0] else {
+        panic!("unique")
+    };
+    assert_eq!(text.as_str().as_ptr(), pointer);
+    assert_eq!(text.legacy_heap_size(), 0);
+    assert!(items.is_governed());
+    drop(value);
+    assert_eq!(provider.used(), 0);
+}
+
+#[test]
+fn decode_ordered_spill_reload_keeps_original_aliases_and_context_owners() {
+    use clinker_exec::pipeline::sort_buffer::{SortBuffer, SortedOutput};
+    use clinker_format::{Column, csv::reader::CsvReaderConfig};
+    use clinker_plan::config::{SortField, SortOrder, pipeline_node::OnUnmapped};
+    use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues};
+    use clinker_record::{
+        AdmittedSchemaBuilder, DocumentContext, DocumentId, EnvelopeRecord, FieldStr,
+        RecordPayload, Value,
+    };
+    use cxl::typecheck::Type;
+    let arb = Arc::new(MemoryArbitrator::with_policy(
+        16 * 1024 * 1024,
+        0.8,
+        0.7,
+        Box::new(NoOpPolicy),
+    ));
+    let observer = arb.writer_resource_observer();
+    let provider = ExecutorResources::new(
+        arb.clone(),
+        ShutdownToken::detached(),
+        None,
+        NonZeroUsize::new(1).unwrap(),
+        None,
+    )
+    .unwrap();
+    let scope = provider.allocation().scope().unwrap();
+    let text = "original-decoded-text-".repeat(8);
+    let mut reader = decode_coercion_reader(
+        format!("value\n{text}\n").into_bytes(),
+        CsvReaderConfig::default(),
+        &[Column::bare("value", Type::String)],
+        OnUnmapped::Drop,
+        provider.allocation(),
+    );
+    let mut row = reader.next_record().unwrap().unwrap();
+    let schema = row.schema().clone();
+    // Exercise an existing admitted context crossing coercion/spill. CSV
+    // multi-record section construction is tested with its own document carrier.
+    let mut section = OwnedMap::try_with_capacity(1, &scope).unwrap();
+    section
+        .try_insert(
+            OwnedKey::try_new("origin", &scope).unwrap(),
+            Value::String(FieldStr::try_new(&text, &scope).unwrap()),
+            &scope,
+        )
+        .unwrap();
+    let mut sections = OwnedValues::try_with_capacity(1, &scope).unwrap();
+    sections.try_push(Value::Map(section), &scope).unwrap();
+    let mut builder = AdmittedSchemaBuilder::try_with_capacity(1, &scope).unwrap();
+    builder
+        .try_push(
+            OwnedKey::try_new("batch_info", &scope).unwrap(),
+            None,
+            &scope,
+        )
+        .unwrap();
+    let context = DocumentContext::try_new(
+        DocumentId::next(),
+        Arc::from("input.csv"),
+        EnvelopeRecord::from_owned_values(builder.finish(&scope).unwrap(), sections).unwrap(),
+        &scope,
+    )
+    .unwrap();
+    row.set_doc_ctx(context.clone());
+    let alias = row.get("value").unwrap().clone();
+    let previous = row.clone();
+    let payload = RecordPayload::from_record(&row);
+    let root = tempfile::tempdir().unwrap();
+    let mut sorter = SortBuffer::<()>::new(
+        vec![SortField {
+            field: "value".into(),
+            order: SortOrder::Asc,
+            null_order: None,
+        }],
+        1,
+        Some(root.path().to_owned()),
+        false,
+        schema.clone(),
+        provider.allocation(),
+    );
+    sorter.push(row, ());
+    assert!(sorter.should_spill());
+    assert!(
+        sorter.sort_and_spill().unwrap() > 0,
+        "must write an actual sorted run"
+    );
+    let (SortedOutput::Spilled(files), _) = sorter.finish().unwrap() else {
+        panic!("must spill")
+    };
+    assert_eq!(files.len(), 1);
+    assert!(files[0].bytes() > 0);
+    let mut reload = files[0].reader().unwrap();
+    let (mut reloaded, ()) = reload.next().unwrap().unwrap();
+    assert!(reload.next().is_none());
+    let Value::String(original) = &alias else {
+        panic!("text")
+    };
+    let Value::String(copy) = reloaded.get("value").unwrap() else {
+        panic!("text")
+    };
+    assert_eq!(copy.as_str(), original.as_str());
+    assert_ne!(copy.as_str().as_ptr(), original.as_str().as_ptr());
+    assert!(
+        copy.legacy_heap_size() > 0,
+        "reload is an independent legacy allocation"
+    );
+    assert!(!reloaded.values_are_governed());
+    // The ordered barrier reattaches original document attribution after
+    // deserialization; that exact shared owner must survive the run too.
+    reloaded.set_doc_ctx(context.clone());
+    drop(reload);
+    drop(files);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    drop(reader);
+    drop(schema);
+    drop(provider);
+    arb.close_writer_resources();
+    assert_eq!(arb.consumer_count(), 0);
+    drop(arb);
+    assert!(observer.is_closed());
+    assert!(observer.usage().memory > 0);
+    drop(previous);
+    drop(alias);
+    assert!(
+        observer.usage().memory > 0,
+        "serializer payload still aliases original text"
+    );
+    drop(payload);
+    drop(context);
+    assert!(
+        observer.usage().memory > 0,
+        "reattached original context is still owned"
+    );
+    drop(reloaded);
+    assert_eq!(observer.usage().memory, 0);
+}
+
+#[test]
+fn decode_dispatch_paths_retain_shared_leaves_past_executor_teardown() {
+    use clinker_exec::executor::{
+        PipelineExecutor, PipelineRunParams, WriterRegistry, single_file_reader,
+    };
+    use clinker_record::Value;
+    for mode in ["fused", "merge", "fanout"] {
+        let text = "detached-source-text-".repeat(40);
+        let source = |name: &str| {
+            format!(
+                r#"
+  - type: source
+    name: {name}
+    config:
+      name: {name}
+      type: csv
+      path: {name}.csv
+      schema:
+        - {{ name: exposed, source_name: physical, type: string }}
+"#
+            )
+        };
+        let mut yaml = format!(
+            r#"
+pipeline:
+  name: decoded_ownership
+  memory: {{ limit: 256M }}
+error_handling:
+  strategy: continue
+  dlq: {{ path: rejected.csv }}
+nodes:
+{}"#,
+            source("rows")
+        );
+        let mut inputs = std::collections::HashMap::from([(
+            "rows".into(),
+            single_file_reader(
+                "rows.csv",
+                Box::new(std::io::Cursor::new(format!(
+                    "physical,extra\n{text},{text}\n"
+                ))),
+            ),
+        )]);
+        let upstream = if mode == "merge" {
+            yaml.push_str(&source("peer"));
+            yaml.push_str("  - type: merge\n    name: merged\n    inputs: [rows, peer]\n    config: { mode: interleave }\n");
+            inputs.insert(
+                "peer".into(),
+                single_file_reader(
+                    "peer.csv",
+                    Box::new(std::io::Cursor::new(format!(
+                        "physical,extra\n{text},{text}\n"
+                    ))),
+                ),
+            );
+            "merged"
+        } else {
+            "rows"
+        };
+        let branches = if mode == "fanout" { 2 } else { 1 };
+        let mut writers = WriterRegistry::default();
+        for index in 0..branches {
+            yaml.push_str(&format!(
+                r#"  - type: transform
+    name: reject_{index}
+    input: {upstream}
+    config:
+      cxl: "emit failure = 1 / 0"
+  - type: sink
+    name: out_{index}
+    input: reject_{index}
+    config:
+      name: out_{index}
+      type: csv
+      path: out_{index}.csv
+"#
+            ));
+            writers
+                .single
+                .insert(format!("out_{index}"), Box::new(std::io::sink()));
+        }
+        let plan = clinker_plan::config::parse_config(&yaml)
+            .unwrap()
+            .compile(&clinker_plan::config::CompileContext::default())
+            .unwrap();
+        let report = PipelineExecutor::run_plan_with_readers_writers(
+            &plan,
+            inputs,
+            writers,
+            &PipelineRunParams::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            report.dlq_entries.len(),
+            if mode == "fused" { 1 } else { 2 },
+            "{mode}"
+        );
+        let aliases: Vec<_> = report
+            .dlq_entries
+            .iter()
+            .map(|entry| {
+                let row = &entry.original_record;
+                let leaf = row.get("exposed").unwrap().clone();
+                let Value::String(value) = &leaf else {
+                    panic!("text")
+                };
+                assert_eq!(value.as_str(), text);
+                assert_eq!(
+                    value.legacy_heap_size(),
+                    0,
+                    "{mode}: canonicalization must preserve the actual shared owner"
+                );
+                (leaf, row.schema().clone(), row.doc_ctx().clone())
+            })
+            .collect();
+        drop(report);
+        for (leaf, schema, document) in aliases {
+            assert_eq!(leaf, Value::String(text.as_str().into()));
+            assert!(schema.contains("exposed"));
+            assert!(document.source_file().ends_with(".csv"));
+        }
+    }
+}
+
+#[test]
+fn decode_coercion_cancellation_precedes_schema_and_subsequent_reads() {
+    use clinker_exec::pipeline::schema_coerce::CoercingReader;
+    use clinker_format::{Column, FormatReader};
+    use clinker_plan::config::pipeline_node::OnUnmapped;
+    use clinker_record::{
+        Record, Schema, SchemaBuilder, Value,
+        owned_storage::{AllocationResources, SharedStorage},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    struct ObservedReader {
+        calls: Arc<AtomicUsize>,
+        schema: SharedStorage<Schema>,
+    }
+    impl FormatReader for ObservedReader {
+        fn schema(&mut self) -> Result<SharedStorage<Schema>, clinker_format::FormatError> {
+            self.calls.fetch_add(1, SeqCst);
+            Ok(self.schema.clone())
+        }
+        fn next_record(&mut self) -> Result<Option<Record>, clinker_format::FormatError> {
+            self.calls.fetch_add(1, SeqCst);
+            Ok(Some(Record::new(
+                self.schema.clone(),
+                vec![Value::Integer(1)],
+            )))
+        }
+    }
+    for before_schema in [true, false] {
+        let authority = Arc::new(DecodeFaultAuthority::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let raw = ObservedReader {
+            calls: calls.clone(),
+            schema: SchemaBuilder::new().with_field("value").build(),
+        };
+        authority.cancelled.store(before_schema, SeqCst);
+        let result = CoercingReader::new_csv_admitted(
+            Box::new(raw),
+            &[Column::bare("value", cxl::typecheck::Type::Int)],
+            OnUnmapped::Drop,
+            "rows",
+            AllocationResources::new(authority.clone()),
+        );
+        let error = if before_schema {
+            assert_eq!(calls.load(SeqCst), 0);
+            result.err().unwrap()
+        } else {
+            let mut reader = result.unwrap();
+            assert!(reader.next_record().unwrap().is_some());
+            let before = calls.load(SeqCst);
+            authority.cancelled.store(true, SeqCst);
+            let error = reader.next_record().unwrap_err();
+            assert_eq!(calls.load(SeqCst), before);
+            error
+        };
+        assert!(
+            matches!(error, clinker_format::FormatError::Resource(error) if error.kind == ResourceErrorKind::Cancelled)
+        );
+        assert_eq!(authority.used.load(SeqCst), 0);
+    }
+}
+
+fn decode_file_run(
+    root: &std::path::Path,
+    inputs: &[&[u8]],
+    source_options: &str,
+    schema: &str,
+    memory_limit: &str,
+    shutdown: Option<ShutdownToken>,
+) -> Result<clinker_exec::executor::ExecutionReport, clinker_plan::error::PipelineError> {
+    decode_file_run_with_params(
+        root,
+        inputs,
+        source_options,
+        schema,
+        memory_limit,
+        &clinker_exec::executor::PipelineRunParams {
+            shutdown_token: shutdown,
+            ..Default::default()
+        },
+    )
+}
+
+fn decode_file_run_with_params(
+    root: &std::path::Path,
+    inputs: &[&[u8]],
+    source_options: &str,
+    schema: &str,
+    memory_limit: &str,
+    params: &clinker_exec::executor::PipelineRunParams,
+) -> Result<clinker_exec::executor::ExecutionReport, clinker_plan::error::PipelineError> {
+    use clinker_exec::executor::{PipelineExecutor, WriterRegistry};
+    use clinker_exec::source::{SourceInput, multi_file::FileSlot};
+    let yaml = format!(
+        r#"
+pipeline:
+  name: admitted_csv_ingest
+  memory:
+    limit: {memory_limit}
+    backpressure: spill
+error_handling:
+  strategy: continue
+  dlq: {{ path: rejected.csv }}
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: input.csv
+{source_options}
+      schema:
+{schema}
+  - type: sink
+    name: result
+    input: rows
+    config:
+      name: result
+      type: csv
+      path: output.csv
+"#
+    );
+    let plan = clinker_plan::config::parse_config(&yaml)
+        .unwrap()
+        .compile(&clinker_plan::config::CompileContext::default())
+        .unwrap();
+    let files = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            let path = root.join(format!("input-{index}.csv"));
+            std::fs::write(&path, bytes).unwrap();
+            FileSlot::new(path.clone(), Box::new(std::fs::File::open(path).unwrap()))
+        })
+        .collect();
+    let writers = WriterRegistry {
+        single: [(
+            "result".into(),
+            Box::new(std::fs::File::create(root.join("output.csv")).unwrap())
+                as Box<dyn Write + Send>,
+        )]
+        .into(),
+        ..Default::default()
+    };
+    PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        [("rows".into(), SourceInput::Files(files))].into(),
+        writers,
+        params,
+    )
+}
+
+#[test]
+fn decode_single_schema_ingest_tracer() {
+    let root = tempfile::tempdir().unwrap();
+    let invalid = "not-an-integer-".repeat(100);
+    let input = format!("value\n42\n{invalid}\n");
+    let report = decode_file_run(
+        root.path(),
+        &[input.as_bytes()],
+        "",
+        "        - { name: value, type: int }",
+        "256M",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("output.csv")).unwrap(),
+        b"value\n42\n"
+    );
+    assert_eq!(report.counters.total_count, 2);
+    assert_eq!(report.counters.dlq_count, 1);
+    let clinker_record::Value::String(alias) = report.dlq_entries[0]
+        .original_record
+        .get("value")
+        .unwrap()
+        .clone()
+    else {
+        panic!("the rejected row must retain decoded text");
+    };
+    assert_eq!(alias.as_str(), invalid);
+    assert!(alias.heap_size() > 0);
+    assert_eq!(
+        alias.legacy_heap_size(),
+        0,
+        "real source decoding must own its allocation grant after run teardown"
+    );
+    drop(report);
+    assert_eq!(alias.as_str(), invalid);
+    assert_eq!(
+        alias.legacy_heap_size(),
+        0,
+        "a detached alias must keep its allocation owner"
+    );
+}
+
+#[test]
+fn decode_physical_files_preserve_latin1_bytes_and_owned_rejections() {
+    let root = tempfile::tempdir().unwrap();
+    let invalid = "é".repeat(100);
+    let mut first = b"value\n42\n".to_vec();
+    first.extend(std::iter::repeat_n(0xe9, 100));
+    first.push(b'\n');
+    let mut second = b"value\n43\n".to_vec();
+    second.extend(std::iter::repeat_n(0xe9, 100));
+    second.push(b'\n');
+    let report = decode_file_run(
+        root.path(),
+        &[&first, &second],
+        "      options: { encoding: iso-8859-1 }",
+        "        - { name: value, type: int }",
+        "256M",
+        None,
+    )
+    .unwrap();
+    assert_eq!(report.counters.total_count, 4);
+    assert_eq!(report.dlq_entries.len(), 2);
+    assert_eq!(
+        std::fs::read(root.path().join("output.csv")).unwrap(),
+        b"value\n42\n43\n"
+    );
+    for entry in &report.dlq_entries {
+        let clinker_record::Value::String(value) = entry.original_record.get("value").unwrap()
+        else {
+            panic!("original decoded text must survive each physical reader");
+        };
+        assert_eq!(value.as_str(), invalid);
+        assert!(value.heap_size() > 0);
+        assert_eq!(value.legacy_heap_size(), 0);
+    }
+}
+
+#[test]
+fn decode_split_json_rejection_retains_nested_original_owners() {
+    for json in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let long = "invalid-integer-".repeat(20);
+        let (input, options) = if json {
+            (
+                format!("value\n\"[\"\"{long}\"\",null]\"\n"),
+                "      split_values: [{ field: value, json: true }]",
+            )
+        } else {
+            (
+                format!("value\n{long};42\n"),
+                "      split_values: [{ field: value, delimiter: ';' }]",
+            )
+        };
+        let report = decode_file_run(
+            root.path(),
+            &[input.as_bytes()],
+            options,
+            "        - { name: value, type: int, multiple: true }",
+            "256M",
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.dlq_entries.len(), 1);
+        assert!(
+            std::fs::read(root.path().join("output.csv"))
+                .unwrap()
+                .is_empty()
+        );
+        let clinker_record::Value::Array(values) =
+            report.dlq_entries[0].original_record.get("value").unwrap()
+        else {
+            panic!("rejection must retain the decoded array");
+        };
+        assert_eq!(values.len(), 2);
+        if json {
+            assert_eq!(values[1], clinker_record::Value::Null);
+        }
+        let clinker_record::Value::String(alias) = values[0].clone() else {
+            panic!("decoded nested text must survive");
+        };
+        drop(report);
+        assert_eq!(alias.as_str(), long);
+        assert!(alias.heap_size() > 0);
+        assert_eq!(alias.legacy_heap_size(), 0);
+    }
+}
+
+#[test]
+fn decode_header_and_body_refusal_remain_typed() {
+    for header in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let oversized = "x".repeat(2 * 1024 * 1024);
+        let input = if header {
+            format!("{oversized}\n")
+        } else {
+            format!("value\n{oversized}\n")
+        };
+        let error = decode_file_run(
+            root.path(),
+            &[input.as_bytes()],
+            "",
+            "        - { name: value, type: string }",
+            "1M",
+            None,
+        )
+        .unwrap_err();
+        let clinker_plan::error::PipelineError::Format(clinker_format::FormatError::Resource(
+            resource,
+        )) = error
+        else {
+            panic!("decoder allocation must fail with typed budget evidence: {error:?}");
+        };
+        assert_eq!(resource.kind, ResourceErrorKind::Budget);
+        assert!(resource.requested >= oversized.len());
+        assert!(resource.available <= 1024 * 1024);
+        assert!(resource.requested > resource.available);
+        assert!(
+            std::fs::read(root.path().join("output.csv"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn decode_no_header_keeps_pending_first_row_and_utf8_is_strict() {
+    let root = tempfile::tempdir().unwrap();
+    let report = decode_file_run(
+        root.path(),
+        &[b"41\n42\n"],
+        "      options: { has_header: false }",
+        "        - { name: col_0, type: int }",
+        "256M",
+        None,
+    )
+    .unwrap();
+    assert_eq!(report.counters.total_count, 2);
+    assert_eq!(
+        std::fs::read(root.path().join("output.csv")).unwrap(),
+        b"col_0\n41\n42\n"
+    );
+    let error = decode_file_run(
+        root.path(),
+        &[b"value\n\xff\n"],
+        "",
+        "        - { name: value, type: string }",
+        "256M",
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            clinker_plan::error::PipelineError::Format(clinker_format::FormatError::Charset(_))
+        ),
+        "{error:?}"
+    );
+    assert!(
+        std::fs::read(root.path().join("output.csv"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn interrupted_source_retains_actual_progress_and_watermarks() {
+    use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, WriterRegistry};
+    use clinker_exec::source::{RecordSource, SourceInput};
+    use clinker_format::FormatError;
+    use clinker_record::owned_storage::{ResourceError, SharedStorage};
+    struct PartialSource {
+        schema: SharedStorage<clinker_record::Schema>,
+        row: Option<clinker_record::Record>,
+        resource: bool,
+        rejected: bool,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl RecordSource for PartialSource {
+        fn schema(&mut self) -> Result<SharedStorage<clinker_record::Schema>, FormatError> {
+            Ok(self.schema.clone())
+        }
+        fn next_record(&mut self) -> Result<Option<clinker_record::Record>, FormatError> {
+            if let Some(row) = self.row.take() {
+                return Ok(Some(row));
+            }
+            if !std::mem::replace(&mut self.rejected, true) {
+                let original_value = clinker_record::Value::from("invalid timestamp");
+                return Err(FormatError::DeclaredType(Box::new(
+                    clinker_format::error::DeclaredTypeFailure {
+                        source: "rows".into(),
+                        column: 1,
+                        field: "event_ts".into(),
+                        declared_type: "date_time".into(),
+                        original_value: original_value.clone(),
+                        original_record: clinker_record::Record::new(
+                            self.schema.clone(),
+                            vec![original_value],
+                        ),
+                        message: "invalid timestamp".into(),
+                    },
+                )));
+            }
+            Err(if self.resource {
+                FormatError::Resource(ResourceError::new(ResourceErrorKind::Cancelled, 42, 7))
+            } else {
+                FormatError::Interrupted
+            })
+        }
+    }
+    impl Drop for PartialSource {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let plan = clinker_plan::config::parse_config(
+        r#"
+pipeline: { name: interrupted_progress }
+error_handling:
+  strategy: continue
+  dlq: { path: rejected.csv }
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: input.csv
+      watermark: { column: event_ts }
+      schema: [{ name: event_ts, type: date_time }]
+  - type: sink
+    name: result
+    input: rows
+    config: { name: result, type: csv, path: output.csv }
+"#,
+    )
+    .unwrap()
+    .compile(&clinker_plan::config::CompileContext::default())
+    .unwrap();
+    for resource in [false, true] {
+        for telemetry_mode in 0..3 {
+            let schema = clinker_record::SchemaBuilder::new()
+                .with_field("event_ts")
+                .build();
+            let timestamp = chrono::DateTime::from_timestamp(42, 0).unwrap().naive_utc();
+            let row = clinker_record::Record::new(
+                schema.clone(),
+                vec![clinker_record::Value::DateTime(timestamp)],
+            );
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (producer, receiver) = telemetry();
+            if telemetry_mode == 2 {
+                use clinker_exec::telemetry::{
+                    AdmissionOutcome, DropReason, SpanFact, SpanName, SpanStatus,
+                };
+                for status in [SpanStatus::Ok, SpanStatus::Error] {
+                    loop {
+                        if producer.emit_span(SpanFact {
+                            name: SpanName::Transform,
+                            status,
+                            logical_node: "fill",
+                            started_at_unix_nanos: 1,
+                            ended_at_unix_nanos: 2,
+                        }) == AdmissionOutcome::Dropped(DropReason::Full)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            let output = clinker_bench_support::io::SharedBuffer::new();
+            let report = PipelineExecutor::run_plan_with_readers_writers(
+                &plan,
+                [(
+                    "rows".into(),
+                    SourceInput::Records(Box::new(PartialSource {
+                        schema,
+                        row: Some(row),
+                        resource,
+                        rejected: false,
+                        dropped: dropped.clone(),
+                    })),
+                )]
+                .into(),
+                WriterRegistry {
+                    single: [("result".into(), Box::new(output) as Box<dyn Write + Send>)].into(),
+                    ..Default::default()
+                },
+                &PipelineRunParams {
+                    telemetry_producer: (telemetry_mode > 0).then_some(producer),
+                    ..Default::default()
+                },
+            )
+            .expect("explicit source cancellation is a graceful interrupted outcome");
+            assert!(report.interrupted);
+            assert_eq!(
+                report.counters.total_count, 2,
+                "one accepted read and one rejected attempt"
+            );
+            assert_eq!(report.counters.dlq_count, 1);
+            assert_eq!(
+                report
+                    .per_source_file_watermarks
+                    .get(&("rows".into(), "input.csv".into())),
+                Some(&Some(42_000_000_000))
+            );
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            if telemetry_mode > 0 {
+                let batch = receiver.try_recv_batch().unwrap();
+                assert_eq!(
+                    batch.metric(clinker_exec::telemetry::MetricKey::SourceInterrupted),
+                    1
+                );
+                assert_eq!(
+                    batch.metric(clinker_exec::telemetry::MetricKey::SourceFailed),
+                    0
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn multiple_source_failures_beat_cancellation_in_either_join_order() {
+    use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, WriterRegistry};
+    use clinker_exec::source::{RecordSource, SourceInput};
+    use clinker_format::FormatError;
+    use clinker_record::owned_storage::{ResourceError, SharedStorage};
+    struct FailingSource {
+        kind: ResourceErrorKind,
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl RecordSource for FailingSource {
+        fn schema(&mut self) -> Result<SharedStorage<clinker_record::Schema>, FormatError> {
+            Err(FormatError::Resource(ResourceError::new(self.kind, 42, 7)))
+        }
+        fn next_record(&mut self) -> Result<Option<clinker_record::Record>, FormatError> {
+            panic!("a failed schema cannot produce rows");
+        }
+    }
+    impl Drop for FailingSource {
+        fn drop(&mut self) {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let plan = clinker_plan::config::parse_config(
+        r#"
+pipeline: { name: source_failure_precedence }
+nodes:
+  - type: source
+    name: first
+    config: { name: first, type: csv, path: first.csv, schema: [{ name: id, type: int }] }
+  - type: source
+    name: second
+    config: { name: second, type: csv, path: second.csv, schema: [{ name: id, type: int }] }
+  - type: merge
+    name: combined
+    inputs: [first, second]
+    config: { mode: concat }
+  - type: sink
+    name: out
+    input: combined
+    config: { name: out, type: csv, path: output.csv }
+"#,
+    )
+    .unwrap()
+    .compile(&clinker_plan::config::CompileContext::default())
+    .unwrap();
+    for kinds in [
+        [ResourceErrorKind::Cancelled, ResourceErrorKind::Budget],
+        [ResourceErrorKind::Budget, ResourceErrorKind::Cancelled],
+    ] {
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let readers = ["first", "second"]
+            .into_iter()
+            .zip(kinds)
+            .map(|(name, kind)| {
+                (
+                    name.into(),
+                    SourceInput::Records(Box::new(FailingSource {
+                        kind,
+                        dropped: dropped.clone(),
+                    })),
+                )
+            })
+            .collect();
+        let error = PipelineExecutor::run_plan_with_readers_writers(
+            &plan,
+            readers,
+            WriterRegistry {
+                single: [(
+                    "out".into(),
+                    Box::new(clinker_bench_support::io::SharedBuffer::new())
+                        as Box<dyn Write + Send>,
+                )]
+                .into(),
+                ..Default::default()
+            },
+            &PipelineRunParams::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, clinker_plan::error::PipelineError::Format(FormatError::Resource(resource))
+            if resource.kind == ResourceErrorKind::Budget && resource.requested == 42 && resource.available == 7)
+        );
+        assert_eq!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "all readers must be gone before returning failure"
+        );
+    }
+}
+
+#[test]
+fn decode_cancelled_run_refuses_before_header_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let shutdown = ShutdownToken::detached();
+    shutdown.request();
+    let report = decode_file_run(
+        root.path(),
+        &[b"value\n42\n"],
+        "",
+        "        - { name: value, type: int }",
+        "256M",
+        Some(shutdown),
+    )
+    .expect("cancellation returns a graceful report");
+    assert!(report.interrupted);
+    assert_eq!(report.counters.total_count, 0);
+    assert!(
+        std::fs::read(root.path().join("output.csv"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn decode_cancelled_source_lifecycle_is_independent_of_telemetry_admission() {
+    use clinker_exec::telemetry::{
+        AdmissionOutcome, DropReason, MetricKey, SpanFact, SpanName, SpanStatus,
+    };
+    for full in [false, true] {
+        let (producer, receiver) = telemetry();
+        if full {
+            for status in [SpanStatus::Ok, SpanStatus::Error] {
+                loop {
+                    let result = producer.emit_span(SpanFact {
+                        name: SpanName::Transform,
+                        status,
+                        logical_node: "fill",
+                        started_at_unix_nanos: 1,
+                        ended_at_unix_nanos: 2,
+                    });
+                    if result == AdmissionOutcome::Dropped(DropReason::Full) {
+                        break;
+                    }
+                    assert!(matches!(result, AdmissionOutcome::Accepted { .. }));
+                }
+            }
+        }
+        let baseline = producer.snapshot();
+        let root = tempfile::tempdir().unwrap();
+        let shutdown = ShutdownToken::detached();
+        shutdown.request();
+        let report = decode_file_run_with_params(
+            root.path(),
+            &[b"value\n42\n"],
+            "",
+            "        - { name: value, type: int }",
+            "256M",
+            &clinker_exec::executor::PipelineRunParams {
+                shutdown_token: Some(shutdown),
+                telemetry_producer: Some(producer.clone()),
+                ..Default::default()
+            },
+        )
+        .expect("cancellation returns a graceful report");
+        assert!(report.interrupted);
+        assert_eq!(report.counters.total_count, 0);
+        assert!(
+            std::fs::read(root.path().join("output.csv"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(producer.snapshot().owned_bytes, baseline.owned_bytes);
+        if full {
+            assert_eq!(producer.snapshot().accepted, baseline.accepted);
+        }
+        let batch = receiver.try_recv_batch().unwrap();
+        assert_eq!(batch.metric(MetricKey::SourceStarted), 1);
+        assert_eq!(batch.metric(MetricKey::SourceInterrupted), 1);
+        assert_eq!(batch.metric(MetricKey::SourceFailed), 0);
+        assert_eq!(batch.metric(MetricKey::SourceCompleted), 0);
+        let spans: Vec<_> = batch
+            .traces()
+            .iter()
+            .filter(|span| span.name == SpanName::Source)
+            .collect();
+        if full {
+            assert!(spans.is_empty());
+        } else {
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].status, SpanStatus::Unset);
+            assert!(spans[0].started_at_unix_nanos > 0);
+            assert!(spans[0].started_at_unix_nanos <= spans[0].ended_at_unix_nanos);
+        }
+    }
+}
+
+#[test]
+fn decode_source_failure_stays_failed_when_shutdown_is_requested() {
+    use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, WriterRegistry};
+    use clinker_exec::source::{RecordSource, SourceInput};
+    use clinker_exec::telemetry::{MetricKey, SpanName, SpanStatus};
+    use clinker_format::FormatError;
+    use clinker_record::owned_storage::{ResourceError, SharedStorage};
+    struct FailingSource {
+        error: Option<FormatError>,
+        shutdown: ShutdownToken,
+    }
+    impl RecordSource for FailingSource {
+        fn schema(&mut self) -> Result<SharedStorage<clinker_record::Schema>, FormatError> {
+            self.shutdown.request();
+            Err(self.error.take().expect("schema requested once"))
+        }
+        fn next_record(&mut self) -> Result<Option<clinker_record::Record>, FormatError> {
+            panic!("schema failure must prevent record reads");
+        }
+    }
+    let plan = clinker_plan::config::parse_config(
+        r#"
+pipeline:
+  name: source_failure
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: input.csv
+      schema: [{ name: value, type: int }]
+  - type: sink
+    name: result
+    input: rows
+    config: { name: result, type: csv, path: output.csv }
+"#,
+    )
+    .unwrap()
+    .compile(&clinker_plan::config::CompileContext::default())
+    .unwrap();
+    for telemetry_enabled in [false, true] {
+        for failure in [
+            FormatError::Resource(ResourceError::new(ResourceErrorKind::Budget, 42, 7)),
+            FormatError::Charset("invalid byte".into()),
+        ] {
+            let expected = failure.to_string();
+            let (producer, receiver) = telemetry();
+            let shutdown = ShutdownToken::detached();
+            let output = clinker_bench_support::io::SharedBuffer::new();
+            let error = PipelineExecutor::run_plan_with_readers_writers(
+                &plan,
+                [(
+                    "rows".into(),
+                    SourceInput::Records(Box::new(FailingSource {
+                        error: Some(failure),
+                        shutdown: shutdown.clone(),
+                    })),
+                )]
+                .into(),
+                WriterRegistry {
+                    single: [(
+                        "result".into(),
+                        Box::new(output.clone()) as Box<dyn Write + Send>,
+                    )]
+                    .into(),
+                    ..Default::default()
+                },
+                &PipelineRunParams {
+                    shutdown_token: Some(shutdown.clone()),
+                    telemetry_producer: telemetry_enabled.then_some(producer),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(shutdown.is_requested());
+            let clinker_plan::error::PipelineError::Format(actual) = error else {
+                panic!("shutdown must not mask a source failure: {error:?}");
+            };
+            assert_eq!(actual.to_string(), expected);
+            assert!(output.contents().is_empty());
+            if telemetry_enabled {
+                let batch = receiver.try_recv_batch().unwrap();
+                assert_eq!(batch.metric(MetricKey::SourceStarted), 1);
+                assert_eq!(batch.metric(MetricKey::SourceFailed), 1);
+                assert_eq!(batch.metric(MetricKey::SourceInterrupted), 0);
+                assert_eq!(batch.metric(MetricKey::SourceCompleted), 0);
+                let spans: Vec<_> = batch
+                    .traces()
+                    .iter()
+                    .filter(|span| span.name == SpanName::Source)
+                    .collect();
+                assert_eq!(spans.len(), 1);
+                assert_eq!(spans[0].status, SpanStatus::Error);
+                assert!(spans[0].started_at_unix_nanos > 0);
+                assert!(spans[0].started_at_unix_nanos <= spans[0].ended_at_unix_nanos);
+            }
+        }
+    }
+}
+
 #[test]
 fn allocation_capability_clone_and_query_do_not_allocate() {
     let arb = Arc::new(MemoryArbitrator::with_policy(
@@ -333,6 +1907,185 @@ fn allocation_shutdown_before_or_after_reservation_preserves_release() {
             drop(lease);
             assert_eq!(observer.usage().memory, 0);
         }
+    }
+}
+
+#[derive(Default)]
+enum CsvRuntimeFault {
+    #[default]
+    None,
+    InvalidBody,
+    Prefix(Arc<std::sync::atomic::AtomicUsize>),
+}
+
+fn csv_runtime_run(
+    root: &std::path::Path,
+    spill: bool,
+    cap: Option<u64>,
+    fault: CsvRuntimeFault,
+) -> (
+    Result<clinker_exec::executor::ExecutionReport, clinker_plan::error::PipelineError>,
+    clinker_exec::output::staging::OutputStagingRegistry,
+    std::path::PathBuf,
+) {
+    use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, WriterRegistry};
+    let yaml = r#"
+pipeline:
+  name: prepared_csv
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: input.csv
+      schema:
+        - { name: value, type: string }
+  - type: sink
+    name: result
+    input: rows
+    config:
+      name: result
+      type: csv
+      path: output.csv
+"#;
+    let invalid = matches!(fault, CsvRuntimeFault::InvalidBody);
+    let yaml = if invalid {
+        yaml.replace(
+            "type: csv\n      path: input.csv",
+            "type: json\n      path: input.json",
+        )
+        .replace("type: string", "type: any")
+    } else {
+        yaml.to_owned()
+    };
+    let config = clinker_plan::config::parse_config(&yaml).unwrap();
+    let plan = config
+        .compile(&clinker_plan::config::CompileContext::default())
+        .unwrap();
+    let destination = root.join("output.csv");
+    let staging = clinker_exec::output::staging::OutputStagingRegistry::default();
+    let (_, file) = staging
+        .stage_output(
+            "result",
+            clinker_plan::config::IfExistsPolicy::Error,
+            false,
+            |_| Ok(destination.clone()),
+        )
+        .unwrap();
+    struct PrefixFile {
+        file: std::fs::File,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Write for PrefixFile {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                self.file.write(&bytes[..1])
+            } else {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            panic!("failed delivery must not be retried or flushed")
+        }
+    }
+    let raw: Box<dyn Write + Send> = match fault {
+        CsvRuntimeFault::Prefix(calls) => Box::new(PrefixFile { file, calls }),
+        _ => Box::new(file),
+    };
+    let registry = WriterRegistry {
+        single: [("result".into(), raw)].into(),
+        output_staging: staging.clone(),
+        ..Default::default()
+    };
+    let input = if invalid {
+        r#"[{"value":["invalid"]}]"#.to_owned()
+    } else {
+        format!("value\n{}\n", "x".repeat(100_000))
+    };
+    let readers = [(
+        "rows".into(),
+        clinker_exec::executor::single_file_reader(
+            "input.csv",
+            Box::new(std::io::Cursor::new(input.into_bytes())),
+        ),
+    )]
+    .into();
+    let params = PipelineRunParams {
+        spill_root_dir: spill.then(|| root.to_owned()),
+        spill_disk_cap_bytes: cap,
+        ..Default::default()
+    };
+    (
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, registry, &params),
+        staging,
+        destination,
+    )
+}
+
+#[test]
+fn csv_runtime_disk_stage_denial_never_publishes_header_or_body() {
+    let root = tempfile::tempdir().unwrap();
+    let (result, staging, destination) =
+        csv_runtime_run(root.path(), true, Some(1), CsvRuntimeFault::None);
+    assert!(
+        result.is_err(),
+        "CSV output must obey the same run spill quota"
+    );
+    assert!(!destination.exists());
+    for partial in staging.partials() {
+        assert_eq!(std::fs::metadata(partial.partial_path).unwrap().len(), 0);
+    }
+}
+
+#[test]
+fn csv_runtime_memory_and_spill_files_are_byte_identical() {
+    let memory_root = tempfile::tempdir().unwrap();
+    let spill_root = tempfile::tempdir().unwrap();
+    let (memory, _, memory_path) =
+        csv_runtime_run(memory_root.path(), false, None, CsvRuntimeFault::None);
+    let (spill, _, spill_path) = csv_runtime_run(
+        spill_root.path(),
+        true,
+        Some(1024 * 1024),
+        CsvRuntimeFault::None,
+    );
+    memory.unwrap();
+    spill.unwrap();
+    let expected = format!("value\n{}\n", "x".repeat(100_000)).into_bytes();
+    assert_eq!(std::fs::read(memory_path).unwrap(), expected);
+    assert_eq!(std::fs::read(spill_path).unwrap(), expected);
+    assert_eq!(std::fs::read_dir(spill_root.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn csv_runtime_invalid_body_never_publishes_automatic_header() {
+    let root = tempfile::tempdir().unwrap();
+    let (result, staging, destination) =
+        csv_runtime_run(root.path(), true, None, CsvRuntimeFault::InvalidBody);
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("CSV") && error.contains("array"), "{error}");
+    assert!(!destination.exists());
+    for partial in staging.partials() {
+        assert_eq!(std::fs::metadata(partial.partial_path).unwrap().len(), 0);
+    }
+}
+
+#[test]
+fn csv_runtime_partial_destination_failure_does_not_publish_or_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (result, staging, destination) = csv_runtime_run(
+        root.path(),
+        true,
+        None,
+        CsvRuntimeFault::Prefix(calls.clone()),
+    );
+    assert!(result.is_err());
+    assert!(!destination.exists());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    for partial in staging.partials() {
+        assert_eq!(std::fs::metadata(partial.partial_path).unwrap().len(), 1);
     }
 }
 
@@ -739,6 +2492,25 @@ fn configured(root: &std::path::Path) -> clinker_exec::executor::ResolvedStorage
     }
 }
 
+fn saturate_writer_telemetry(producer: &clinker_exec::telemetry::TelemetryProducer) {
+    use clinker_exec::telemetry::{AdmissionOutcome, DropReason, SpanFact, SpanName, SpanStatus};
+    for status in [SpanStatus::Ok, SpanStatus::Error] {
+        loop {
+            let outcome = producer.emit_span(SpanFact {
+                name: SpanName::Transform,
+                status,
+                logical_node: "fill",
+                started_at_unix_nanos: 1,
+                ended_at_unix_nanos: 2,
+            });
+            if outcome == AdmissionOutcome::Dropped(DropReason::Full) {
+                break;
+            }
+            assert!(matches!(outcome, AdmissionOutcome::Accepted { .. }));
+        }
+    }
+}
+
 fn cancelled_delivery_releases_resources(empty: bool) {
     use clinker_exec::telemetry::{MetricKey, SpanName, SpanStatus};
     use clinker_format::{
@@ -764,8 +2536,15 @@ fn cancelled_delivery_releases_resources(empty: bool) {
             panic!("delivery does not flush")
         }
     }
-    for spill in [false, true] {
+    for (spill, mode) in [false, true]
+        .into_iter()
+        .flat_map(|spill| (0..3).map(move |mode| (spill, mode)))
+    {
         let (producer, receiver) = telemetry();
+        if mode == 2 {
+            saturate_writer_telemetry(&producer);
+        }
+        let arena_before = producer.snapshot();
         let root = tempfile::tempdir().unwrap();
         let arb = Arc::new(MemoryArbitrator::with_policy(
             128 * 1024,
@@ -780,7 +2559,7 @@ fn cancelled_delivery_releases_resources(empty: bool) {
             token.clone(),
             spill.then_some(&storage),
             NonZeroUsize::new(1).unwrap(),
-            Some(producer),
+            (mode != 0).then(|| producer.clone()),
         )
         .unwrap();
         let baseline = arb.writer_resource_usage().memory;
@@ -819,6 +2598,23 @@ fn cancelled_delivery_releases_resources(empty: bool) {
         assert_eq!(arb.writer_resource_usage().descriptors, 0);
         assert_eq!(provider.cleanup_debt_count(), 0);
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        let arena_after = producer.snapshot();
+        assert_eq!(arena_after.owned_bytes, arena_before.owned_bytes);
+        assert_eq!(
+            arena_after.ordinary_capacity_bytes,
+            arena_before.ordinary_capacity_bytes
+        );
+        assert_eq!(
+            arena_after.high_capacity_bytes,
+            arena_before.high_capacity_bytes
+        );
+        if mode == 0 {
+            assert!(receiver.try_recv_batch().is_none());
+            drop(provider);
+            assert_eq!(arb.writer_resource_usage().memory, 0);
+            assert_eq!(arb.consumer_count(), 0);
+            continue;
+        }
         let batch = receiver.try_recv_batch().unwrap();
         assert_eq!(batch.metric(MetricKey::WriterStageStarted), 1);
         assert_eq!(batch.metric(MetricKey::WriterStageInterrupted), 1);
@@ -834,9 +2630,15 @@ fn cancelled_delivery_releases_resources(empty: bool) {
             .iter()
             .filter(|span| span.name == SpanName::WriterStage)
             .collect();
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].status, SpanStatus::Unset);
-        assert!(spans[0].started_at_unix_nanos <= spans[0].ended_at_unix_nanos);
+        if mode == 1 {
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].status, SpanStatus::Unset);
+            assert!(spans[0].started_at_unix_nanos > 0);
+            assert!(spans[0].started_at_unix_nanos <= spans[0].ended_at_unix_nanos);
+        } else {
+            assert!(spans.is_empty());
+            assert!(arena_after.full_drops > arena_before.full_drops);
+        }
         drop(provider);
         assert_eq!(arb.writer_resource_usage().memory, 0);
         assert_eq!(arb.consumer_count(), 0);
@@ -851,6 +2653,90 @@ fn empty_delivery_cancellation_is_interrupted_and_releases_resources() {
 #[test]
 fn final_write_cancellation_is_interrupted_and_releases_resources() {
     cancelled_delivery_releases_resources(false);
+}
+
+#[test]
+fn empty_finalize_cancellation_never_commits_or_touches_destination() {
+    use clinker_format::FormatError;
+    use clinker_format::preparation::{
+        FormatEncoder, OutputOperation, PreparedWriter, WriterScope,
+    };
+
+    struct CancelFinalize {
+        token: ShutdownToken,
+        commits: usize,
+    }
+    impl FormatEncoder for CancelFinalize {
+        type Pending = ();
+        fn prepare(
+            &self,
+            operation: OutputOperation<'_>,
+            _: &mut dyn Write,
+            _: &WriterScope,
+        ) -> Result<(), FormatError> {
+            assert!(matches!(operation, OutputOperation::Finalize));
+            self.token.request();
+            Ok(())
+        }
+        fn commit(&mut self, (): ()) {
+            self.commits += 1;
+        }
+    }
+    struct Untouched;
+    impl Write for Untouched {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            panic!("cancelled empty finalize wrote")
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            panic!("cancelled empty finalize flushed")
+        }
+    }
+    for spill in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            128 * 1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let token = ShutdownToken::detached();
+        let storage = configured(root.path());
+        let (producer, receiver) = telemetry();
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            token.clone(),
+            spill.then_some(&storage),
+            NonZeroUsize::new(1).unwrap(),
+            Some(producer),
+        )
+        .unwrap();
+        let baseline = arb.writer_resource_usage().memory;
+        let mut writer = PreparedWriter::new(
+            Untouched,
+            CancelFinalize { token, commits: 0 },
+            provider.resources(),
+        )
+        .unwrap();
+        assert!(
+            matches!(writer.flush(), Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Cancelled)
+        );
+        assert_eq!(writer.encoder().commits, 0);
+        drop(writer);
+        assert_eq!(arb.writer_resource_usage().memory, baseline);
+        assert_eq!(arb.writer_resource_usage().disk, 0);
+        assert_eq!(arb.writer_resource_usage().descriptors, 0);
+        assert_eq!(provider.cleanup_debt_count(), 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        let batch = receiver.try_recv_batch().unwrap();
+        use clinker_exec::telemetry::MetricKey;
+        assert_eq!(batch.metric(MetricKey::WriterStageStarted), 1);
+        assert_eq!(batch.metric(MetricKey::WriterStageInterrupted), 1);
+        assert_eq!(batch.metric(MetricKey::WriterStageCompleted), 0);
+        assert_eq!(batch.metric(MetricKey::WriterStageFailed), 0);
+        drop(provider);
+        assert_eq!(arb.writer_resource_usage().memory, 0);
+        assert_eq!(arb.consumer_count(), 0);
+    }
 }
 
 #[test]
@@ -1220,4 +3106,332 @@ fn stage_memory_sealed_bytes_match_standalone() {
     stage.finish().unwrap().deliver(&mut destination).unwrap();
     assert_eq!(destination, b"exact bytes\n");
     assert_eq!(arb.writer_resource_usage().memory, 0);
+}
+
+#[test]
+fn decode_allocator_refusal_is_typed_at_admitted_reader_growth() {
+    use clinker_format::{
+        FormatReader,
+        csv::{CsvReader, CsvReaderConfig},
+        preparation::{DecodeWorkspace, TextStorage},
+    };
+    use clinker_record::owned_storage::AllocationResources;
+    use std::sync::atomic::Ordering::SeqCst;
+    let input = b"parts,nested\nlong_long_long_long_long\\;part;tail,\"[{\"\"long_long_long_long_key\"\":[null,\"\"long_long_long_long_long_value\"\"]}]\"\n";
+    let mut failures = 0;
+    for fail_allocator_at in 1..200 {
+        let authority = Arc::new(DecodeFaultAuthority {
+            fail_allocator_at,
+            ..Default::default()
+        });
+        let config = CsvReaderConfig {
+            charset: clinker_format::charset::Charset::Latin1,
+            split_values: vec![
+                clinker_format::multi_value::SplitValues {
+                    field: "parts".into(),
+                    delimiter: ";".into(),
+                    escape: "\\".into(),
+                    json: false,
+                },
+                clinker_format::multi_value::SplitValues {
+                    field: "nested".into(),
+                    delimiter: ";".into(),
+                    escape: String::new(),
+                    json: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let result = (|| {
+            let mut reader = CsvReader::from_reader_admitted(
+                input.as_slice(),
+                config,
+                DecodeWorkspace::new(AllocationResources::new(authority.clone()))?,
+                TextStorage::Shared,
+            )?;
+            reader.next_record()
+        })();
+        FAIL_ALLOCATION.with(|fail| fail.set(None));
+        let attempts = ALLOCATIONS.with(|count| count.replace(None));
+        let reached = authority.calls.load(SeqCst) >= fail_allocator_at;
+        if reached {
+            assert!(attempts.is_some_and(|count| count > 0));
+            assert!(
+                matches!(&result, Err(clinker_format::FormatError::Resource(error)) if error.kind == ResourceErrorKind::Allocation),
+                "allocation {fail_allocator_at}: {result:?}"
+            );
+            failures += 1;
+        } else {
+            assert!(result.as_ref().unwrap().is_some());
+        }
+        drop(result);
+        assert_eq!(
+            authority.used.load(SeqCst),
+            0,
+            "allocation {fail_allocator_at}"
+        );
+        if !reached {
+            assert!(
+                failures > 20,
+                "header, schema, Latin-1 scratch, split and nested owners"
+            );
+            return;
+        }
+    }
+    panic!("allocator enumeration did not terminate");
+}
+
+#[test]
+fn decode_concurrent_source_handoff_retains_charge_until_last_alias() {
+    use clinker_exec::source::{
+        RecordSource,
+        multi_file::{FileSlot, MultiFileFormatReader},
+    };
+    use clinker_format::{
+        FormatReader,
+        csv::{CsvReader, CsvReaderConfig},
+        preparation::{DecodeWorkspace, TextStorage},
+    };
+    use clinker_record::{Value, owned_storage::AllocationResources};
+    use std::sync::atomic::Ordering::SeqCst;
+    let authority = Arc::new(DecodeFaultAuthority::default());
+    let resources = AllocationResources::new(authority.clone());
+    let first = "first-source-owned-value-".repeat(20);
+    let second = "second-source-owned-value-".repeat(20);
+    let mut reader: Box<dyn FormatReader> = Box::new(MultiFileFormatReader::new(
+        vec![
+            FileSlot::new(
+                "first.csv",
+                Box::new(std::io::Cursor::new(format!("value\n{first}\n"))),
+            ),
+            FileSlot::new(
+                "second.csv",
+                Box::new(std::io::Cursor::new(format!("value\n{second}\n"))),
+            ),
+        ],
+        Box::new(move |source| {
+            Ok(Box::new(CsvReader::from_reader_admitted(
+                source.open()?,
+                CsvReaderConfig::default(),
+                DecodeWorkspace::new(resources.clone())?,
+                TextStorage::Shared,
+            )?))
+        }),
+    ));
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let (released, proceed) = std::sync::mpsc::sync_channel(0);
+    std::thread::scope(|threads| {
+        let producer = threads.spawn(move || {
+            let row = RecordSource::next_record(&mut reader).unwrap().unwrap();
+            sender.send(row).unwrap();
+            // Wait until the consumer has detached a leaf before replacing the
+            // physical reader and destroying all producer-side ownership.
+            proceed.recv().unwrap();
+            let row = RecordSource::next_record(&mut reader).unwrap().unwrap();
+            assert_eq!(row.get("value"), Some(&Value::from(second.as_str())));
+            assert!(RecordSource::next_record(&mut reader).unwrap().is_none());
+        });
+        let row = receiver.recv().unwrap();
+        let leaf = row.get("value").unwrap().clone();
+        let another = leaf.clone();
+        let before = authority.used.load(SeqCst);
+        drop(row);
+        assert!(
+            authority.used.load(SeqCst) < before,
+            "record slots release while the leaf remains live"
+        );
+        released.send(()).unwrap();
+        producer.join().unwrap();
+        let Value::String(text) = &leaf else {
+            panic!("text")
+        };
+        assert_eq!(text.as_str(), first);
+        assert_eq!(text.legacy_heap_size(), 0);
+        let only_leaf = authority.used.load(SeqCst);
+        assert!(only_leaf >= first.len());
+        drop(leaf);
+        assert_eq!(
+            authority.used.load(SeqCst),
+            only_leaf,
+            "one shared alias still owns exactly the same charge"
+        );
+        drop(another);
+        assert_eq!(
+            authority.used.load(SeqCst),
+            0,
+            "the final alias releases the allocation"
+        );
+    });
+}
+
+#[test]
+fn decode_multi_record_pending_growth_refuses_admission_and_allocator() {
+    use clinker_format::envelope::{
+        EnvelopeConfig, EnvelopeExtract, EnvelopeFieldType, EnvelopeSection,
+    };
+    use clinker_format::{
+        Column, FormatReader,
+        charset::Charset,
+        multi_record::{CsvDialect, MultiRecordReader, MultiRecordSpec},
+        preparation::{DecodeWorkspace, TextStorage},
+        schema::{Discriminator, RecordType},
+    };
+    use clinker_record::owned_storage::AllocationResources;
+    use std::sync::atomic::Ordering::SeqCst;
+    let text = "long-admitted-cell-".repeat(20);
+    let tag = "long-admitted-discriminator-".repeat(3);
+    let input = format!("kind,label\nH,{text}\n{tag},{text}\n");
+    for allocator in [false, true] {
+        let mut failures = 0;
+        for fail_at in 1..300 {
+            let authority = Arc::new(DecodeFaultAuthority {
+                fail_at: if allocator { 0 } else { fail_at },
+                fail_allocator_at: if allocator { fail_at } else { 0 },
+                ..Default::default()
+            });
+            let record_type = |id: &str, tag: &str| RecordType {
+                id: id.into(),
+                tag: tag.into(),
+                description: None,
+                parent: None,
+                join_key: None,
+                columns: vec![
+                    Column::bare("kind", cxl::typecheck::Type::String),
+                    Column::bare("label", cxl::typecheck::Type::String),
+                ],
+            };
+            let spec = MultiRecordSpec {
+                discriminator: Discriminator {
+                    start: None,
+                    width: None,
+                    field: Some("kind".into()),
+                },
+                record_types: vec![record_type("metadata", "H"), record_type("detail", &tag)],
+                structure: vec![],
+                // A duplicate extraction request keeps pre-scan open until
+                // the body row becomes the retained pending lookahead.
+                header_tags: vec!["H".into(), "H".into()],
+            };
+            let envelope = EnvelopeConfig {
+                sections: indexmap::IndexMap::from([(
+                    "manifest".into(),
+                    EnvelopeSection {
+                        extract: EnvelopeExtract::RecordType("H".into()),
+                        fields: indexmap::IndexMap::from([(
+                            "label".into(),
+                            EnvelopeFieldType::String,
+                        )]),
+                    },
+                )]),
+            };
+            let result = (|| -> Result<(), clinker_format::FormatError> {
+                let mut reader = MultiRecordReader::new_csv_admitted(
+                    input.as_bytes(),
+                    spec,
+                    CsvDialect {
+                        delimiter: b',',
+                        quote_char: b'"',
+                        has_header: true,
+                    },
+                    Charset::Latin1,
+                    DecodeWorkspace::new(AllocationResources::new(authority.clone()))?,
+                    TextStorage::Shared,
+                )?;
+                let sections = reader.prepare_document(&envelope)?;
+                let row = reader.next_record()?.unwrap();
+                assert_eq!(
+                    row.get("label"),
+                    Some(&clinker_record::Value::from(text.as_str()))
+                );
+                assert!(reader.next_record()?.is_none());
+                drop(reader);
+                drop(sections);
+                drop(row);
+                Ok(())
+            })();
+            FAIL_ALLOCATION.with(|fail| fail.set(None));
+            let attempts = ALLOCATIONS.with(|count| count.replace(None));
+            let reached = authority.calls.load(SeqCst) >= fail_at;
+            if reached {
+                if allocator {
+                    assert!(attempts.is_some_and(|count| count > 0));
+                }
+                let kind = if allocator {
+                    ResourceErrorKind::Allocation
+                } else {
+                    ResourceErrorKind::Budget
+                };
+                assert!(
+                    matches!(&result, Err(clinker_format::FormatError::Resource(error)) if error.kind == kind),
+                    "boundary {fail_at}, allocator={allocator}: {result:?}"
+                );
+                failures += 1;
+            } else {
+                result.as_ref().unwrap();
+            }
+            drop(result);
+            assert_eq!(
+                authority.used.load(SeqCst),
+                0,
+                "boundary {fail_at}, allocator={allocator}"
+            );
+            if !reached {
+                break;
+            }
+        }
+        assert!(
+            failures > 30 && failures < 299,
+            "all metadata/header/discriminator/cell/lookahead/section/final boundaries must execute"
+        );
+    }
+}
+
+#[test]
+fn decode_multi_record_resource_refusal_aborts_despite_continue() {
+    let oversized = "x".repeat(2 * 1024 * 1024);
+    let schema = r#"        discriminator: { field: kind }
+        records:
+          - id: metadata
+            tag: H
+            columns:
+              - { name: kind, type: string }
+              - { name: label, type: string }
+          - id: detail
+            tag: D
+            columns:
+              - { name: kind, type: string }
+              - { name: label, type: string }
+      envelope:
+        sections:
+          manifest:
+            extract: { record_type: H }
+            fields:
+              label: string"#;
+    for (has_header, input) in [
+        (true, format!("kind,{oversized}\nH,ok\nD,ok\n")),
+        (false, format!("{oversized},ok\n")),
+        (false, format!("H,{oversized}\nD,ok\n")),
+        (false, format!("D,{oversized}\n")),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let options =
+            format!("      options: {{ has_header: {has_header}, encoding: iso-8859-1 }}");
+        let error = decode_file_run(
+            root.path(),
+            &[input.as_bytes()],
+            &options,
+            schema,
+            "1M",
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, clinker_plan::error::PipelineError::Format(clinker_format::FormatError::Resource(error)) if error.kind == ResourceErrorKind::Budget)
+        );
+        assert!(
+            std::fs::read(root.path().join("output.csv"))
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

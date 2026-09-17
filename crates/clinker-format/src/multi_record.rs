@@ -3,8 +3,9 @@
 //! A multi-record flat file interleaves heterogeneous record types in one
 //! file: a header row, many body rows, and a trailer row, each distinguished
 //! by a discriminator (a fixed byte range for fixed-width, a named column for
-//! CSV). This reader streams **one [`Record`] per physical line** on a single
-//! static superset schema whose lead column is the matched record type's id
+//! CSV). This reader streams **one [`Record`] per logical CSV row or fixed-width
+//! physical line** on a single static superset schema whose lead column is the
+//! matched record type's id
 //! and whose remaining columns are the union of every type's declared fields.
 //! A downstream `Route` discriminates on the `record_type` column; the reader
 //! never binds a different physical schema per type and never buffers the
@@ -18,11 +19,20 @@
 //! after the body they close, so a trailer record type is validated as it
 //! streams rather than surfaced as a `$doc` pre-scan section.
 //!
+//! Runtime CSV retains admitted decoded text and metadata; the unchanged raw
+//! CSV parser buffers remain outside decoded-storage admission. Fixed-width
+//! and the explicit non-executing CSV constructor retain legacy allocation.
+//!
 //! Field parsing is delegated to [`crate::fixed_width::field`] so a declared
 //! `type:` parses byte-for-byte identically to the single-record fixed-width
 //! reader; CSV fields share the same scalar coercion.
 
-use clinker_record::owned_storage::{OwnedKey, OwnedMap, SharedStorage};
+use crate::charset::Charset;
+use crate::csv::reader::CsvInput;
+use crate::preparation::{DecodeWorkspace, TextStorage};
+use crate::reserved::ReservedVec;
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
+use clinker_record::{AdmittedSchemaBuilder, FieldStr};
 use std::collections::HashMap;
 use std::io::{BufReader, Read};
 use std::sync::Arc;
@@ -118,8 +128,9 @@ enum LineScanner<R: Read> {
         line_buf: Vec<u8>,
     },
     Csv {
-        reader: csv::Reader<SkipBom<R>>,
-        record_buf: csv::StringRecord,
+        reader: csv::Reader<CsvInput<R>>,
+        record_buf: csv::ByteRecord,
+        charset: Charset,
         /// `true` until the column-header row has been consumed (when the
         /// dialect declares one).
         pending_header: bool,
@@ -146,7 +157,7 @@ type ResolvedBackend = (SharedStorage<Schema>, HashMap<String, ResolvedType>, us
 /// Holds the line scanner, the static superset schema, a `tag → ResolvedType`
 /// map, the running counts, and the trailer structural constraints. Stamps
 /// each matched line as one record on the superset schema.
-pub struct MultiRecordReader<R: Read> {
+struct LegacyMultiRecordReader<R: Read> {
     scanner: LineScanner<R>,
     schema: SharedStorage<Schema>,
     discrimination: Discrimination,
@@ -205,7 +216,704 @@ pub struct MultiRecordSpec {
     pub header_tags: Vec<String>,
 }
 
+/// A streaming multi-record reader. Runtime CSV construction requires a finite
+/// decoding workspace; fixed-width and non-executing tooling retain their
+/// existing allocation contract. Decoded CSV rows and document sections carry
+/// their own grants beyond the reader's lifetime.
+pub struct MultiRecordReader<R: Read> {
+    inner: MultiRecordBackend<R>,
+}
+
+enum MultiRecordBackend<R: Read> {
+    Legacy(LegacyMultiRecordReader<R>),
+    Admitted(AdmittedCsvReader<R>),
+}
+
 impl<R: Read> MultiRecordReader<R> {
+    /// Construct the unchanged fixed-width streaming backend.
+    pub fn new_fixed_width(
+        reader: R,
+        spec: MultiRecordSpec,
+        separator: LineSeparator,
+    ) -> Result<Self, FormatError> {
+        LegacyMultiRecordReader::new_fixed_width(reader, spec, separator).map(|reader| Self {
+            inner: MultiRecordBackend::Legacy(reader),
+        })
+    }
+
+    /// Construct a CSV reader for non-executing authoring tools. The charset
+    /// must be resolved explicitly. Runtime callers use `new_csv_admitted`.
+    pub fn new_csv(
+        reader: R,
+        spec: MultiRecordSpec,
+        dialect: CsvDialect,
+        charset: Charset,
+    ) -> Result<Self, FormatError> {
+        LegacyMultiRecordReader::new_csv(reader, spec, dialect, charset).map(|reader| Self {
+            inner: MultiRecordBackend::Legacy(reader),
+        })
+    }
+
+    /// Admit retained metadata before reading any CSV input. Raw csv parser
+    /// buffers and existing typed scalar-parser scratch keep their established
+    /// allowance; every decoded row, name, field mapping and final value owns
+    /// admission. Refusal and cancellation remain typed resource errors.
+    pub fn new_csv_admitted(
+        reader: R,
+        spec: MultiRecordSpec,
+        dialect: CsvDialect,
+        charset: Charset,
+        workspace: DecodeWorkspace,
+        storage: TextStorage,
+    ) -> Result<Self, FormatError> {
+        AdmittedCsvReader::new(reader, spec, dialect, charset, workspace, storage).map(|reader| {
+            Self {
+                inner: MultiRecordBackend::Admitted(reader),
+            }
+        })
+    }
+
+    #[must_use]
+    pub fn with_numeric_observer(mut self, observer: NumericObserver) -> Self {
+        match &mut self.inner {
+            MultiRecordBackend::Legacy(reader) => reader.numeric_observer = Some(observer),
+            MultiRecordBackend::Admitted(reader) => reader.numeric_observer = Some(observer),
+        }
+        self
+    }
+}
+
+impl<R: Read + Send> FormatReader for MultiRecordReader<R> {
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+        match &mut self.inner {
+            MultiRecordBackend::Legacy(reader) => reader.schema(),
+            MultiRecordBackend::Admitted(reader) => {
+                reader.workspace.scope().check_cancelled()?;
+                Ok(reader.schema.clone())
+            }
+        }
+    }
+
+    fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
+        match &mut self.inner {
+            MultiRecordBackend::Legacy(reader) => reader.next_record(),
+            MultiRecordBackend::Admitted(reader) => reader.next_record(),
+        }
+    }
+
+    fn prepare_document(&mut self, config: &EnvelopeConfig) -> Result<OwnedMap, FormatError> {
+        match &mut self.inner {
+            MultiRecordBackend::Legacy(reader) => reader.prepare_document(config),
+            MultiRecordBackend::Admitted(reader) => reader.prepare_document(config),
+        }
+    }
+}
+
+struct CsvTypeField {
+    column: usize,
+    name: OwnedKey,
+    // Move the already-validated type declaration; no new type tree is copied.
+    ty: Type,
+    format: Option<OwnedKey>,
+    precision: Option<u8>,
+    scale: Option<u8>,
+    trim: bool,
+    justify: Option<Justify>,
+    pad: Option<char>,
+}
+
+impl CsvTypeField {
+    fn text<'a>(&self, raw: &'a str) -> &'a str {
+        if !self.trim {
+            return raw;
+        }
+        let stripped = match (self.pad, &self.justify) {
+            (Some(pad), Some(Justify::Right)) => raw.trim_start_matches(pad),
+            (Some(pad), _) => raw.trim_end_matches(pad),
+            (None, _) => raw,
+        };
+        stripped.trim()
+    }
+}
+
+struct CsvRecordType {
+    tag: OwnedKey,
+    id: FieldStr,
+    fields: ReservedVec<CsvTypeField>,
+    header: bool,
+    trailer: bool,
+    captured: Option<OwnedValues>,
+}
+
+struct CsvCountConstraint {
+    record: usize,
+    field: OwnedKey,
+}
+
+struct AdmittedCsvReader<R: Read> {
+    reader: csv::Reader<CsvInput<R>>,
+    raw: csv::ByteRecord,
+    charset: Charset,
+    workspace: DecodeWorkspace,
+    storage: TextStorage,
+    schema: SharedStorage<Schema>,
+    types: ReservedVec<CsvRecordType>,
+    constraints: ReservedVec<CsvCountConstraint>,
+    header_request_count: usize,
+    discriminator: usize,
+    pending_header: bool,
+    pending: Option<OwnedValues>,
+    last_trailer: Option<(usize, OwnedValues)>,
+    prescanned: bool,
+    row: u64,
+    body_count: u64,
+    done: bool,
+    numeric_observer: Option<NumericObserver>,
+}
+
+impl<R: Read> AdmittedCsvReader<R> {
+    fn store_text(&self, text: &str) -> Result<FieldStr, FormatError> {
+        Ok(match self.storage {
+            TextStorage::Shared => FieldStr::try_new(text, self.workspace.scope())?,
+            TextStorage::Unique => FieldStr::try_new_unique(text, self.workspace.scope())?,
+        })
+    }
+
+    fn new(
+        reader: R,
+        spec: MultiRecordSpec,
+        dialect: CsvDialect,
+        charset: Charset,
+        workspace: DecodeWorkspace,
+        storage: TextStorage,
+    ) -> Result<Self, FormatError> {
+        let scope = workspace.scope();
+        scope.check_cancelled()?;
+        let disc_field = spec.discriminator.field.as_deref().ok_or_else(|| {
+            FormatError::Csv(csv_error(
+                "multi-record CSV discriminator requires a `field` name",
+            ))
+        })?;
+        let mut types: ReservedVec<CsvRecordType> = ReservedVec::new(scope.clone());
+        types.reserve_exact(spec.record_types.len())?;
+        let mut discriminator = None;
+        let mut column_count = 1;
+        for rt in spec.record_types {
+            if rt.tag.is_empty() {
+                return Err(FormatError::Csv(csv_error(&format!(
+                    "record type '{}' declares an empty `tag`; a discriminator tag is required",
+                    rt.id
+                ))));
+            }
+            let tag = rt.tag.trim();
+            if types
+                .as_slice()
+                .iter()
+                .any(|prior| prior.tag.as_str() == tag)
+            {
+                return Err(FormatError::Csv(csv_error(&format!(
+                    "discriminator tag '{tag}' is declared by more than one record type; tags must be unique"
+                ))));
+            }
+            if types
+                .as_slice()
+                .iter()
+                .any(|prior| prior.id.as_str() == rt.id)
+            {
+                return Err(FormatError::Csv(csv_error(&format!(
+                    "record type id '{}' is declared more than once; ids must be unique",
+                    rt.id
+                ))));
+            }
+            let local = rt
+                .columns
+                .iter()
+                .position(|f| f.name == disc_field)
+                .ok_or_else(|| {
+                    FormatError::Csv(csv_error(&format!(
+                        "multi-record CSV discriminator field '{disc_field}' is absent from record \
+                         type '{}'; every record type must declare it at the same column",
+                        rt.id
+                    )))
+                })?;
+            if let Some(column) = discriminator
+                && column != local
+            {
+                return Err(FormatError::Csv(csv_error(&format!(
+                    "multi-record CSV discriminator field '{disc_field}' is at column {local} in record type '{}' but column {column} elsewhere; it must be at a consistent column across every type",
+                    rt.id
+                ))));
+            }
+            discriminator = Some(local);
+            let mut fields: ReservedVec<CsvTypeField> = ReservedVec::new(scope.clone());
+            fields.reserve_exact(rt.columns.len())?;
+            for f in rt.columns {
+                reject_record_type_field(&f.name)
+                    .map_err(|message| FormatError::Csv(csv_error(&message)))?;
+                field::validate_pad(&f.name, f.pad.as_deref())?;
+                let prior = types
+                    .as_slice()
+                    .iter()
+                    .flat_map(|rt| rt.fields.as_slice())
+                    .chain(fields.as_slice())
+                    .find(|prior| prior.name.as_str() == f.name);
+                let column = if let Some(prior) = prior {
+                    if prior.ty.unify(&f.ty).is_none() {
+                        return Err(FormatError::Csv(csv_error(&format!(
+                            "field '{}' is declared by more than one record type with incompatible types ({} vs {}); a shared superset column must have unifiable types",
+                            f.name, prior.ty, f.ty
+                        ))));
+                    }
+                    prior.column
+                } else {
+                    let index = column_count;
+                    column_count += 1;
+                    index
+                };
+                fields.push(CsvTypeField {
+                    column,
+                    name: OwnedKey::try_new(&f.name, scope)?,
+                    ty: f.ty,
+                    format: f
+                        .format
+                        .as_deref()
+                        .map(|text| OwnedKey::try_new(text, scope))
+                        .transpose()?,
+                    precision: f.precision,
+                    scale: f.scale,
+                    trim: f.trim.unwrap_or(true),
+                    justify: f.justify,
+                    pad: f.pad.as_deref().unwrap_or(" ").chars().next(),
+                })?;
+            }
+            let header = spec.header_tags.iter().any(|entry| entry == tag);
+            let trailer = spec.structure.iter().any(|entry| entry.record == rt.id);
+            types.push(CsvRecordType {
+                tag: OwnedKey::try_new(tag, scope)?,
+                id: FieldStr::try_new(&rt.id, scope)?,
+                fields,
+                header,
+                trailer,
+                captured: None,
+            })?;
+        }
+        let discriminator = discriminator.ok_or_else(|| {
+            FormatError::Csv(csv_error(
+                "multi-record CSV schema declares no record types",
+            ))
+        })?;
+        let header_request_count = spec.header_tags.len();
+        for tag in spec.header_tags {
+            if !types.as_slice().iter().any(|rt| rt.tag.as_str() == tag) {
+                return Err(FormatError::SchemaInference(format!(
+                    "envelope `record_type: {tag}` matches no declared `records:` entry"
+                )));
+            }
+        }
+        let mut constraints = ReservedVec::new(scope.clone());
+        constraints.reserve_exact(spec.structure.len())?;
+        for constraint in spec.structure {
+            let record = types
+                .as_slice()
+                .iter()
+                .position(|rt| rt.id.as_str() == constraint.record)
+                .ok_or_else(|| {
+                    FormatError::SchemaInference(format!(
+                        "structure constraint names record type '{}', which no `records:` entry \
+                         declares (id mismatch)",
+                        constraint.record
+                    ))
+                })?;
+            constraints.push(CsvCountConstraint {
+                record,
+                field: OwnedKey::try_new(&constraint.count, scope)?,
+            })?;
+        }
+        let mut schema = AdmittedSchemaBuilder::try_with_capacity(column_count, scope)?;
+        schema.try_push(OwnedKey::try_new(RECORD_TYPE_COLUMN, scope)?, None, scope)?;
+        for index in 1..column_count {
+            let field = types
+                .as_slice()
+                .iter()
+                .flat_map(|rt| rt.fields.as_slice())
+                .find(|field| field.column == index)
+                .ok_or_else(|| {
+                    FormatError::SchemaInference("multi-record column mapping is incomplete".into())
+                })?;
+            schema.try_push(OwnedKey::try_new(field.name.as_str(), scope)?, None, scope)?;
+        }
+        let schema = schema.finish(scope)?;
+        let reader = csv::ReaderBuilder::new()
+            .delimiter(dialect.delimiter)
+            .quote(dialect.quote_char)
+            .flexible(true)
+            .has_headers(false)
+            .from_reader(CsvInput::new(reader, charset));
+        Ok(Self {
+            reader,
+            raw: csv::ByteRecord::new(),
+            charset,
+            workspace,
+            storage,
+            schema,
+            types,
+            constraints,
+            header_request_count,
+            discriminator,
+            pending_header: dialect.has_header,
+            pending: None,
+            last_trailer: None,
+            prescanned: false,
+            row: 0,
+            body_count: 0,
+            done: false,
+            numeric_observer: None,
+        })
+    }
+
+    fn cell(row: &OwnedValues, index: usize) -> &str {
+        match row.as_slice().get(index) {
+            Some(Value::String(text)) => text.as_str(),
+            _ => "",
+        }
+    }
+
+    fn scan(&mut self) -> Result<Option<OwnedValues>, FormatError> {
+        loop {
+            self.workspace.scope().check_cancelled()?;
+            if !self.reader.read_byte_record(&mut self.raw)? {
+                return Ok(None);
+            }
+            self.row += 1;
+            let mut decoded =
+                OwnedValues::try_with_capacity(self.raw.len(), self.workspace.scope())?;
+            for bytes in self.raw.iter() {
+                let value = Value::String(self.workspace.decode_text(
+                    bytes,
+                    self.charset,
+                    self.storage,
+                )?);
+                decoded
+                    .try_push(value, self.workspace.scope())
+                    .map_err(|(error, _)| error)?;
+            }
+            // Validate even skipped column headers and blank rows.
+            if self.pending_header {
+                self.pending_header = false;
+                continue;
+            }
+            if (0..decoded.len()).all(|i| Self::cell(&decoded, i).trim().is_empty()) {
+                continue;
+            }
+            return Ok(Some(decoded));
+        }
+    }
+
+    fn matched(&self, row: &OwnedValues) -> Option<usize> {
+        let tag = Self::cell(row, self.discriminator).trim();
+        self.types
+            .as_slice()
+            .iter()
+            .position(|rt| rt.tag.as_str() == tag)
+    }
+
+    fn observe(&self, index: usize, row: &OwnedValues) {
+        let Some(observer) = &self.numeric_observer else {
+            return;
+        };
+        let rt = &self.types.as_slice()[index];
+        for (index, field) in rt.fields.as_slice().iter().enumerate() {
+            if !matches!(field.ty.unwrap_nullable(), Type::Numeric) {
+                continue;
+            }
+            let raw = field.text(Self::cell(row, index));
+            if raw.is_empty() {
+                continue;
+            }
+            let observed = field::coerce_scalar_with_constraints_observed(
+                &field.ty,
+                field.format.as_ref().map(OwnedKey::as_str),
+                field.precision,
+                field.scale,
+                raw,
+            );
+            if let Some(observation) = observed.numeric_observation() {
+                observer.observe_record_field(
+                    rt.id.as_str(),
+                    field.name.as_str(),
+                    observation.clone(),
+                );
+            }
+        }
+    }
+
+    fn prescan(&mut self) -> Result<(), FormatError> {
+        if self.prescanned {
+            return Ok(());
+        }
+        self.prescanned = true;
+        loop {
+            // Duplicate extraction requests keep the prescan open through the
+            // header region, matching the legacy first-capture observation rule.
+            if self
+                .types
+                .as_slice()
+                .iter()
+                .filter(|rt| rt.captured.is_some())
+                .count()
+                == self.header_request_count
+            {
+                return Ok(());
+            }
+            let Some(row) = self.scan()? else {
+                return Ok(());
+            };
+            let Some(index) = self
+                .matched(&row)
+                .filter(|&index| self.types.as_slice()[index].header)
+            else {
+                self.pending = Some(row);
+                return Ok(());
+            };
+            if self.types.as_slice()[index].captured.is_some() {
+                continue;
+            }
+            self.observe(index, &row);
+            self.types.as_mut_slice()[index].captured = Some(row);
+        }
+    }
+
+    fn build_record(&self, index: usize, row: &OwnedValues) -> Result<Record, FormatError> {
+        let scope = self.workspace.scope();
+        let rt = &self.types.as_slice()[index];
+        let mut values = OwnedValues::try_with_capacity(self.schema.column_count(), scope)?;
+        for _ in 0..self.schema.column_count() {
+            values
+                .try_push(Value::Null, scope)
+                .map_err(|(error, _)| error)?;
+        }
+        values.as_mut_slice()[0] = Value::String(rt.id.clone());
+        for (index, field) in rt.fields.as_slice().iter().enumerate() {
+            let raw = field.text(Self::cell(row, index));
+            let value = if raw.is_empty() {
+                if field.ty.is_nullable() || matches!(field.ty.unwrap_nullable(), Type::Null) {
+                    Value::Null
+                } else {
+                    return Err(FormatError::InvalidRecord {
+                        row: self.row,
+                        message: format!(
+                            "field '{}': null is not a valid {}",
+                            field.name, field.ty
+                        ),
+                    });
+                }
+            } else if matches!(
+                field.ty.unwrap_nullable(),
+                Type::String | Type::Any | Type::Null
+            ) {
+                Value::String(self.store_text(raw)?)
+            } else {
+                let observed = field::coerce_scalar_with_constraints_observed(
+                    &field.ty,
+                    field.format.as_ref().map(OwnedKey::as_str),
+                    field.precision,
+                    field.scale,
+                    raw,
+                );
+                if let Some(observation) = observed.numeric_observation()
+                    && let Some(observer) = &self.numeric_observer
+                {
+                    observer.observe_record_field(
+                        rt.id.as_str(),
+                        field.name.as_str(),
+                        observation.clone(),
+                    );
+                }
+                let value =
+                    observed
+                        .into_result()
+                        .map_err(|message| FormatError::InvalidRecord {
+                            row: self.row,
+                            message: format!("field '{}': {message}", field.name),
+                        })?;
+                // The legacy scalar parser's fallback text must not escape as
+                // ungoverned final storage, including Type::Null on nonempty input.
+                match value {
+                    Value::String(text) => Value::String(self.store_text(&text)?),
+                    other => other,
+                }
+            };
+            values.as_mut_slice()[field.column] = value;
+        }
+        Record::from_owned_values(self.schema.clone(), values)
+            .map_err(|error| FormatError::SchemaInference(error.to_string()))
+    }
+
+    fn unknown(&self, row: &OwnedValues) -> Result<FormatError, FormatError> {
+        // Existing diagnostic strings and serde scratch keep their established
+        // allowance. The retained raw payload is admitted before handoff.
+        struct Cells<'a>(&'a OwnedValues);
+        impl serde::Serialize for Cells<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+                let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+                for value in self.0.as_slice() {
+                    if let Value::String(text) = value {
+                        sequence.serialize_element(text.as_str())?;
+                    }
+                }
+                sequence.end()
+            }
+        }
+        let tag = Self::cell(row, self.discriminator).trim().to_string();
+        let serialized = serde_json::to_string(&Cells(row))
+            .map_err(|error| FormatError::Json(error.to_string()))?;
+        let raw_record = Value::String(self.store_text(&serialized)?);
+        let message = format!(
+            "E345 line {}: unknown record-type discriminator {tag:?} — no `records:` entry declares this tag. Declare a record type with `tag: {tag}`, use `error_handling.strategy: continue` with record-grained DLQ to reject only this row, or set `dlq_granularity: document` to dead-letter the file. See: clinker explain --code E345",
+            self.row
+        );
+        Ok(FormatError::UnknownRecordType(Box::new(
+            crate::error::UnknownRecordTypeFailure {
+                row: self.row,
+                discriminator: tag,
+                raw_record,
+                message,
+            },
+        )))
+    }
+
+    fn validate_structure(&self) -> Result<(), FormatError> {
+        for constraint in self.constraints.as_slice() {
+            let rt = &self.types.as_slice()[constraint.record];
+            let Some((_, row)) = self
+                .last_trailer
+                .as_ref()
+                .filter(|(index, _)| *index == constraint.record)
+            else {
+                return Err(FormatError::multi_record_structural_count(format!(
+                    "trailer record '{}' is declared in `structure` but no such row appeared; the document is incomplete (expected a trailer carrying field '{}')",
+                    rt.id, constraint.field
+                )));
+            };
+            let raw = rt
+                .fields
+                .as_slice()
+                .iter()
+                .enumerate()
+                .rfind(|(_, field)| field.name == constraint.field)
+                .map(|(index, field)| field.text(Self::cell(row, index)))
+                .filter(|text| !text.is_empty())
+                .ok_or_else(|| {
+                    FormatError::multi_record_structural_count(format!(
+                        "trailer record '{}' carries no value for count field '{}' — the trailer \
+                         line is truncated or misconfigured",
+                        rt.id, constraint.field
+                    ))
+                })?;
+            let declared: u64 = raw.trim().parse().map_err(|_| {
+                FormatError::multi_record_structural_count(format!(
+                    "trailer record '{}' field '{}' value {raw:?} is not a non-negative integer count",
+                    rt.id, constraint.field
+                ))
+            })?;
+            if declared != self.body_count {
+                return Err(FormatError::multi_record_structural_count(format!(
+                    "trailer record '{}' declares count {} (field '{}'), but the file streamed {} body records",
+                    rt.id, declared, constraint.field, self.body_count
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
+        self.workspace.scope().check_cancelled()?;
+        if self.done {
+            return Ok(None);
+        }
+        self.prescan()?;
+        loop {
+            let row = match self.pending.take() {
+                Some(row) => row,
+                None => match self.scan()? {
+                    Some(row) => row,
+                    None => {
+                        self.validate_structure()?;
+                        self.done = true;
+                        return Ok(None);
+                    }
+                },
+            };
+            let Some(index) = self.matched(&row) else {
+                return Err(self.unknown(&row)?);
+            };
+            let rt = &self.types.as_slice()[index];
+            if rt.header {
+                self.observe(index, &row);
+                continue;
+            }
+            if rt.trailer {
+                self.observe(index, &row);
+                self.last_trailer = Some((index, row));
+                continue;
+            }
+            if self.last_trailer.is_some() {
+                return Err(FormatError::multi_record_structural_validation(format!(
+                    "line {}: body record of type '{}' appears after the trailer that closes the document",
+                    self.row, rt.id
+                )));
+            }
+            self.body_count += 1;
+            return self.build_record(index, &row).map(Some);
+        }
+    }
+
+    fn prepare_document(&mut self, config: &EnvelopeConfig) -> Result<OwnedMap, FormatError> {
+        self.workspace.scope().check_cancelled()?;
+        if !config.is_empty() {
+            self.prescan()?;
+        }
+        let scope = self.workspace.scope();
+        let mut sections = OwnedMap::try_with_capacity(config.sections.len(), scope)?;
+        for (name, section) in &config.sections {
+            let EnvelopeExtract::RecordType(tag) = &section.extract else {
+                return Err(FormatError::SchemaInference(format!(
+                    "envelope section {name:?}: declared a non-`record_type` extract against a multi-record flat-file source. Use `record_type` (e.g. `extract: {{ record_type: H }}`) for multi-record CSV / fixed-width."
+                )));
+            };
+            let Some(rt) = self
+                .types
+                .as_slice()
+                .iter()
+                .find(|rt| rt.tag.as_str() == tag)
+            else {
+                continue;
+            };
+            let Some(row) = &rt.captured else {
+                continue;
+            };
+            let raw = rt
+                .fields
+                .as_slice()
+                .iter()
+                .enumerate()
+                .map(|(index, field)| (field.name.as_str(), field.text(Self::cell(row, index))));
+            let typed = crate::envelope::coerce_section_fields_admitted(
+                raw,
+                &section.fields,
+                &self.workspace,
+                self.storage,
+            )?;
+            sections
+                .try_insert(OwnedKey::try_new(name, scope)?, Value::Map(typed), scope)
+                .map_err(|(error, _, _)| error)?;
+        }
+        Ok(sections)
+    }
+}
+
+impl<R: Read> LegacyMultiRecordReader<R> {
     /// Build a fixed-width multi-record reader.
     ///
     /// # Errors
@@ -256,6 +964,7 @@ impl<R: Read> MultiRecordReader<R> {
         reader: R,
         spec: MultiRecordSpec,
         dialect: CsvDialect,
+        charset: Charset,
     ) -> Result<Self, FormatError> {
         let field = spec.discriminator.field.as_deref().ok_or_else(|| {
             FormatError::Csv(csv_error(
@@ -274,10 +983,11 @@ impl<R: Read> MultiRecordReader<R> {
             // The reader handles the column-header row itself (skipping it as a
             // pending header), so the csv crate never treats a row as headers.
             .has_headers(false)
-            .from_reader(SkipBom::new(reader));
+            .from_reader(CsvInput::new(reader, charset));
         let scanner = LineScanner::Csv {
             reader: csv_reader,
-            record_buf: csv::StringRecord::new(),
+            record_buf: csv::ByteRecord::new(),
+            charset,
             pending_header: dialect.has_header,
         };
         Self::assemble(scanner, schema, discrimination, by_tag, spec)
@@ -355,14 +1065,6 @@ impl<R: Read> MultiRecordReader<R> {
         })
     }
 
-    /// Stream parser-owned numeric observations while preserving ordinary
-    /// reader output and error behavior.
-    #[must_use]
-    pub fn with_numeric_observer(mut self, observer: NumericObserver) -> Self {
-        self.numeric_observer = Some(observer);
-        self
-    }
-
     /// Read one non-blank physical line from the scanner, or `None` at end of
     /// input. Blank lines (empty, or whitespace-only — common after file
     /// concatenation) are skipped rather than rejected.
@@ -393,22 +1095,27 @@ impl<R: Read> MultiRecordReader<R> {
                 LineScanner::Csv {
                     reader,
                     record_buf,
+                    charset,
                     pending_header,
                 } => {
-                    if !reader.read_record(record_buf)? {
+                    if !reader.read_byte_record(record_buf)? {
                         return Ok(None);
                     }
                     self.physical_row += 1;
+                    let mut decoded = csv::StringRecord::new();
+                    for bytes in record_buf.iter() {
+                        decoded.push_field(&charset.decode(bytes.to_vec())?);
+                    }
                     // The first physical row is the textual column header when
                     // the dialect declares one — skip it once.
                     if *pending_header {
                         *pending_header = false;
                         continue;
                     }
-                    if csv_row_is_blank(record_buf) {
+                    if csv_row_is_blank(&decoded) {
                         continue;
                     }
-                    return Ok(Some(ScannedLine::Csv(record_buf.clone())));
+                    return Ok(Some(ScannedLine::Csv(decoded)));
                 }
             }
         }
@@ -667,7 +1374,7 @@ impl<R: Read> MultiRecordReader<R> {
     }
 }
 
-impl<R: Read + Send> FormatReader for MultiRecordReader<R> {
+impl<R: Read + Send> FormatReader for LegacyMultiRecordReader<R> {
     fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
         Ok(self.schema.clone())
     }
@@ -679,12 +1386,9 @@ impl<R: Read + Send> FormatReader for MultiRecordReader<R> {
         self.pull_next()
     }
 
-    fn prepare_document(
-        &mut self,
-        config: &EnvelopeConfig,
-    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
+    fn prepare_document(&mut self, config: &EnvelopeConfig) -> Result<OwnedMap, FormatError> {
         if config.is_empty() {
-            return Ok(IndexMap::new());
+            return Ok(OwnedMap::from_map(IndexMap::new()));
         }
         self.ensure_prescanned()?;
         let mut out: IndexMap<OwnedKey, Value> = IndexMap::with_capacity(config.sections.len());
@@ -713,7 +1417,7 @@ impl<R: Read + Send> FormatReader for MultiRecordReader<R> {
                 .map_err(FormatError::SchemaInference)?;
             out.insert(name.as_str().into(), Value::Map(OwnedMap::from_map(typed)));
         }
-        Ok(out)
+        Ok(OwnedMap::from_map(out))
     }
 }
 
@@ -1286,6 +1990,7 @@ mod tests {
                 quote_char: b'"',
                 has_header: false,
             },
+            Charset::Utf8,
         )
         .unwrap();
         assert!(reader.next_record().unwrap().is_some());
@@ -1537,6 +2242,7 @@ mod tests {
                 quote_char: b'"',
                 has_header: false,
             },
+            Charset::Utf8,
         )
         .unwrap();
         let recs = collect(reader);
@@ -1585,6 +2291,7 @@ mod tests {
                 quote_char: b'"',
                 has_header: true,
             },
+            Charset::Utf8,
         )
         .unwrap();
         let recs = collect(reader);
@@ -1613,6 +2320,7 @@ mod tests {
                 quote_char: b'"',
                 has_header: false,
             },
+            Charset::Utf8,
         );
         let err = match result {
             Ok(_) => panic!("expected discriminator-absent error"),
@@ -1625,5 +2333,72 @@ mod tests {
     fn empty_file_yields_no_records() {
         let reader = fw_reader(&b""[..], fw_types(), Vec::new(), Vec::new()).unwrap();
         assert!(collect(reader).is_empty());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn csv_input_retry_preserves_partial_prefix() {
+    use std::io::{self, Read};
+    struct RetryPrefix<'a> {
+        bytes: &'a [u8],
+        consumed: usize,
+        fail_after: usize,
+        failure: io::ErrorKind,
+        failed: bool,
+    }
+    impl Read for RetryPrefix<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.consumed == self.fail_after && !self.failed {
+                self.failed = true;
+                return Err(self.failure.into());
+            }
+            let count = usize::from(!out.is_empty() && self.consumed < self.bytes.len());
+            if count != 0 {
+                out[0] = self.bytes[self.consumed];
+                self.consumed += 1;
+            }
+            Ok(count)
+        }
+    }
+    for charset in [Charset::Latin1, Charset::Utf8] {
+        for bytes in [
+            b"\xef\xbb\xbfvalue\n".as_slice(),
+            b"\xef",
+            b"\xef\xbb",
+            b"xyvalue\n",
+        ] {
+            for fail_after in 1..=bytes.len().min(2) {
+                for failure in [io::ErrorKind::Interrupted, io::ErrorKind::WouldBlock] {
+                    let mut reader = crate::csv::reader::CsvInput::new(
+                        RetryPrefix {
+                            bytes,
+                            consumed: 0,
+                            fail_after,
+                            failure,
+                            failed: false,
+                        },
+                        charset,
+                    );
+                    let mut actual = Vec::new();
+                    let first = reader.read_to_end(&mut actual);
+                    if failure == io::ErrorKind::WouldBlock {
+                        assert_eq!(first.unwrap_err().kind(), failure);
+                        reader.read_to_end(&mut actual).unwrap();
+                    } else {
+                        first.unwrap();
+                    }
+                    let expected = if charset == Charset::Utf8 {
+                        bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes)
+                    } else {
+                        bytes
+                    };
+                    assert_eq!(
+                        actual, expected,
+                        "{charset:?}, {failure:?} after {fail_after}"
+                    );
+                }
+            }
+        }
     }
 }

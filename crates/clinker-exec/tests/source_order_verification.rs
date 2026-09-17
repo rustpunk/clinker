@@ -1,5 +1,8 @@
 //! Source-order policy admission and compiled per-file scope contracts.
 
+#[path = "common/pipeline_resource_fixtures.rs"]
+mod resource_fixtures;
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -89,7 +92,8 @@ nodes:
       path: out.csv
 "#
     );
-    let config = parse(&yaml);
+    let mut config = parse(&yaml);
+    resource_fixtures::add_csv_workspace(&mut config, &CompileContext::default());
     let plan = PipelineConfig::compile(&config, &CompileContext::default()).expect("compile");
     let slots = files
         .iter()

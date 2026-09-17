@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use clinker_record::owned_storage::{OwnedKey, SharedStorage};
-use clinker_record::{DocumentContext, Record, Schema, Value};
+use clinker_record::owned_storage::{OwnedMap, SharedStorage};
+use clinker_record::{DocumentContext, Record, Schema};
 use indexmap::IndexMap;
 
 use crate::envelope::{EnvelopeConfig, EnvelopeEvent};
@@ -43,26 +43,26 @@ pub trait FormatReader: Send {
     /// One-time envelope pre-scan for the current file, run by the
     /// executor's source ingest before any `next_record` call. Each
     /// declared section in `config.sections` resolves to a
-    /// [`Value::Map`] of typed field values keyed by the section's
-    /// declared field names; the returned map is then attached to
-    /// every body record's `SharedStorage<DocumentContext>`.
+    /// [`Value::Map`](clinker_record::Value::Map) of typed field values keyed
+    /// by the section's declared field names. The returned [`OwnedMap`] moves its backing
+    /// allocation and section values to the caller, preserving any attached
+    /// allocation grants. Wrappers must forward it without rebuilding or
+    /// cloning it; ingest uses the sections to construct the
+    /// `SharedStorage<DocumentContext>` attached to body records.
     ///
     /// Default impl returns an empty map — a reader takes the no-op
-    /// path when the config asked nothing of it (no declared sections),
-    /// or when multi-record CSV / fixed-width extraction is not yet
-    /// wired (pending #101). A *plain* single-schema CSV / fixed-width
+    /// path when the config asked nothing of it (no declared sections).
+    /// The empty default uses legacy storage with no input-sized state.
+    /// Multi-record CSV / fixed-width readers override this hook to extract
+    /// their document sections. A *plain* single-schema CSV / fixed-width
     /// source that declares envelope sections never reaches this path:
     /// the planner rejects it (E356), because a plain flat file carries
-    /// no header/trailer document to pre-scan. Format-specific
-    /// implementations (XML, JSON) are added per-reader; if
+    /// no header/trailer document to pre-scan. If
     /// `config.sections` declares an extract rule the reader does not
     /// support, that reader returns a format error surfacing the
     /// mismatch at startup rather than mid-stream.
-    fn prepare_document(
-        &mut self,
-        _config: &EnvelopeConfig,
-    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
-        Ok(IndexMap::new())
+    fn prepare_document(&mut self, _config: &EnvelopeConfig) -> Result<OwnedMap, FormatError> {
+        Ok(OwnedMap::from_map(IndexMap::new()))
     }
 
     /// Drain the envelope-nesting events the reader queued while serving
@@ -149,8 +149,7 @@ pub trait FormatWriter: Send {
     ///
     /// Wrapper writers that hold an inner writer
     /// ([`CountedFormatWriter`](crate::counting::CountedFormatWriter),
-    /// [`SplittingWriter`](crate::splitting::SplittingWriter),
-    /// `HeaderCapturingCsvWriter`) must delegate to the inner writer's
+    /// [`SplittingWriter`](crate::splitting::SplittingWriter)) must delegate to the inner writer's
     /// `flush_bytes` — taking this default would replace a finalizing inner
     /// writer's non-finalizing drain with its finalizing `flush`.
     ///
@@ -177,8 +176,7 @@ pub trait FormatWriter: Send {
     ///
     /// Wrapper writers that hold an inner writer
     /// ([`CountedFormatWriter`](crate::counting::CountedFormatWriter),
-    /// [`SplittingWriter`](crate::splitting::SplittingWriter),
-    /// `HeaderCapturingCsvWriter`) must forward this hook to the inner writer,
+    /// [`SplittingWriter`](crate::splitting::SplittingWriter)) must forward this hook to the inner writer,
     /// or an enveloped inner writer's per-document framing is silently dropped.
     ///
     /// # Errors
@@ -213,6 +211,89 @@ pub trait FormatWriter: Send {
     /// byte-counting inner writer's total is not masked by this `None` default.
     fn bytes_written(&self) -> Option<u64> {
         None
+    }
+}
+
+/// Unique writer owner that retains backing admission through deallocation.
+///
+/// Construction admits the concrete writer's layout before allocation. The
+/// writer's internal buffers must have their own owners; this handle accounts
+/// only for the outer box. Moving the handle does not allocate. Dropping it
+/// destroys and frees the writer before releasing its backing charge.
+///
+/// No raw box or detachable lease is exposed:
+/// ```compile_fail
+/// fn extract(writer: clinker_format::FormatWriterHandle) {
+///     let _ = writer.inner;
+/// }
+/// ```
+pub struct FormatWriterHandle {
+    // Field order is load-bearing: Box deallocation precedes lease release.
+    inner: Box<dyn FormatWriter>,
+    _allocation: Option<clinker_record::owned_storage::AllocationLease>,
+}
+impl FormatWriterHandle {
+    /// Admit and allocate one concrete writer fallibly. On refusal the intact
+    /// writer is dropped, retaining any resources its payload already owns.
+    pub fn try_new<T: FormatWriter + 'static>(
+        writer: T,
+        scope: &clinker_record::owned_storage::AllocationScope,
+    ) -> Result<Self, clinker_record::owned_storage::ResourceError> {
+        let allocation = scope.reserve(std::alloc::Layout::new::<T>())?;
+        let inner = clinker_record::owned_storage::try_box(writer).map_err(|(error, writer)| {
+            drop(writer);
+            error
+        })?;
+        Ok(Self {
+            inner,
+            _allocation: Some(allocation),
+        })
+    }
+
+    /// Retain an existing legacy writer without claiming allocation admission.
+    /// This migration boundary is for unchanged implementations; it cannot
+    /// establish a finite-resource contract for a newly allocated writer.
+    pub fn from_legacy(writer: Box<dyn FormatWriter>) -> Self {
+        Self {
+            inner: writer,
+            _allocation: None,
+        }
+    }
+}
+impl std::ops::Deref for FormatWriterHandle {
+    type Target = dyn FormatWriter;
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref()
+    }
+}
+impl std::ops::DerefMut for FormatWriterHandle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner.as_mut()
+    }
+}
+impl AsMut<dyn FormatWriter> for FormatWriterHandle {
+    fn as_mut(&mut self) -> &mut (dyn FormatWriter + 'static) {
+        self.inner.as_mut()
+    }
+}
+impl FormatWriter for FormatWriterHandle {
+    fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
+        self.inner.write_record(record)
+    }
+    fn flush(&mut self) -> Result<(), FormatError> {
+        self.inner.flush()
+    }
+    fn flush_bytes(&mut self) -> Result<(), FormatError> {
+        self.inner.flush_bytes()
+    }
+    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        self.inner.begin_document(doc)
+    }
+    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        self.inner.end_document(doc)
+    }
+    fn bytes_written(&self) -> Option<u64> {
+        self.inner.bytes_written()
     }
 }
 
@@ -273,6 +354,76 @@ pub(crate) mod test_support {
         fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
             self.record(format!("end:{}", doc.source_file()));
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod writer_owner_tests {
+    use super::*;
+    use crate::preparation::MemoryOnlyResources;
+    use clinker_record::{DocumentId, EnvelopeRecord};
+    use std::num::NonZeroUsize;
+
+    struct Probe(u64);
+    impl FormatWriter for Probe {
+        fn write_record(&mut self, _: &Record) -> Result<(), FormatError> {
+            self.0 |= 1;
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), FormatError> {
+            self.0 |= 2;
+            Ok(())
+        }
+        fn flush_bytes(&mut self) -> Result<(), FormatError> {
+            self.0 |= 4;
+            Ok(())
+        }
+        fn begin_document(&mut self, _: &DocumentContext) -> Result<(), FormatError> {
+            self.0 |= 8;
+            Ok(())
+        }
+        fn end_document(&mut self, _: &DocumentContext) -> Result<(), FormatError> {
+            self.0 |= 16;
+            Ok(())
+        }
+        fn bytes_written(&self) -> Option<u64> {
+            Some(self.0)
+        }
+    }
+
+    #[test]
+    fn owned_writer_forwards_every_hook_and_byte_counter() {
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024).unwrap());
+        let scope = provider.resources().scope().unwrap();
+        for admitted in [true, false] {
+            let mut writer = if admitted {
+                FormatWriterHandle::try_new(Probe(0), scope.allocation()).unwrap()
+            } else {
+                FormatWriterHandle::from_legacy(Box::new(Probe(0)))
+            };
+            let record = Record::new(
+                SharedStorage::from_arc(Arc::new(Schema::new(vec![]))),
+                vec![],
+            );
+            let doc = DocumentContext::new(
+                DocumentId::next(),
+                Arc::from("input.csv"),
+                EnvelopeRecord::empty(),
+            );
+            assert_eq!(writer.bytes_written(), Some(0));
+            writer.write_record(&record).unwrap();
+            assert_eq!(writer.bytes_written(), Some(1));
+            writer.flush_bytes().unwrap();
+            assert_eq!(writer.bytes_written(), Some(5));
+            writer.begin_document(&doc).unwrap();
+            assert_eq!(writer.bytes_written(), Some(13));
+            writer.end_document(&doc).unwrap();
+            assert_eq!(writer.bytes_written(), Some(29));
+            writer.as_mut().flush().unwrap();
+            assert_eq!(writer.bytes_written(), Some(31));
+            drop(writer);
+            assert_eq!(provider.used(), 0);
         }
     }
 }

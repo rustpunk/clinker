@@ -1,9 +1,10 @@
 use clinker_bench_support::{CsvPayload, MEDIUM, RecordFactory, SMALL};
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
-use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig};
+use clinker_format::csv::writer::{CsvEncoder, CsvWriterConfig};
 use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConfig};
 use clinker_format::json::reader::{JsonReader, JsonReaderConfig};
 use clinker_format::json::writer::{JsonWriter, JsonWriterConfig};
+use clinker_format::preparation::{MemoryOnlyResources, PreparedWriter};
 use clinker_format::schema::Column;
 use clinker_format::traits::{FormatReader, FormatWriter};
 use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
@@ -64,8 +65,16 @@ fn bench_csv_write(c: &mut Criterion) {
             |b, recs| {
                 b.iter(|| {
                     let buf = Vec::with_capacity(record_count * field_count * 20);
+                    let provider =
+                        MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+                    let encoder = CsvEncoder::new(
+                        schema.clone(),
+                        &CsvWriterConfig::default(),
+                        provider.resources(),
+                    )
+                    .unwrap();
                     let mut writer =
-                        CsvWriter::new(buf, schema.clone(), CsvWriterConfig::default());
+                        PreparedWriter::new(buf, encoder, provider.resources()).unwrap();
                     for rec in recs {
                         writer.write_record(rec).unwrap();
                     }

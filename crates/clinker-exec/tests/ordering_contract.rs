@@ -1,5 +1,8 @@
 //! Differential contract tests for authored ordering promises.
 
+#[path = "common/pipeline_resource_fixtures.rs"]
+mod resource_fixtures;
+
 use clinker_record::owned_storage::SharedStorage;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -28,6 +31,16 @@ fn compile(yaml: &str) -> clinker_plan::plan::compiled::CompiledPlan {
     let config: PipelineConfig =
         clinker_plan::yaml::from_str(yaml).expect("ordering fixture must parse");
     PipelineConfig::compile(&config, &CompileContext::default()).expect("fixture must compile")
+}
+
+// Pressure fixtures budget operator state separately from admitted writer work.
+fn compile_with_writer_workspace(yaml: &str) -> clinker_plan::plan::compiled::CompiledPlan {
+    let mut config: PipelineConfig =
+        clinker_plan::yaml::from_str(yaml).expect("ordering pressure fixture parses");
+    resource_fixtures::add_csv_workspace(&mut config, &CompileContext::default());
+    config
+        .compile(&CompileContext::default())
+        .expect("ordering pressure fixture compiles")
 }
 
 fn ordering_record(values: Vec<Value>) -> Record {
@@ -335,11 +348,12 @@ nodes:
 fn run_split_order(memory_limit: &str) -> Vec<String> {
     let root = tempfile::tempdir().expect("temporary split destination");
     let output_path = root.path().join("ordered.csv");
-    let config: PipelineConfig =
+    let mut config: PipelineConfig =
         clinker_plan::yaml::from_str(&split_order_yaml(&output_path, memory_limit))
             .expect("split fixture must parse");
     let mut compile_ctx = CompileContext::new(root.path());
     compile_ctx.allow_absolute_paths = true;
+    resource_fixtures::add_csv_workspace(&mut config, &compile_ctx);
     let plan = PipelineConfig::compile(&config, &compile_ctx).expect("split fixture must compile");
     let readers: SourceReaders = HashMap::from([(
         "rows".to_string(),
@@ -510,23 +524,8 @@ nodes:
     )
 }
 
-fn run_correlation_writer(require_spill: bool) -> String {
-    let mut plan = compile(&correlation_writer_pipeline("64M"));
-    if require_spill {
-        // Materialization must hold all four rows, including compiled hidden
-        // columns. The sort's lower spill threshold still forces disk use.
-        let columns = plan
-            .dag()
-            .graph
-            .node_weights()
-            .filter_map(|node| node.stored_output_schema())
-            .map(|schema| schema.column_count())
-            .max()
-            .expect("correlation fixture has a compiled schema");
-        let row_bytes = std::mem::size_of::<(Record, clinker_exec::executor::SourceRowId)>()
-            + columns * std::mem::size_of::<Value>();
-        plan = compile(&correlation_writer_pipeline(&(4 * row_bytes).to_string()));
-    }
+fn run_correlation_writer(memory_limit: &str) -> String {
+    let plan = compile_with_writer_workspace(&correlation_writer_pipeline(memory_limit));
     let readers: SourceReaders = HashMap::from([(
         "rows".to_string(),
         single_file_reader(
@@ -549,7 +548,7 @@ fn run_correlation_writer(require_spill: bool) -> String {
         &PipelineRunParams::default(),
     )
     .expect("correlation writer-boundary fixture must run");
-    if require_spill {
+    if memory_limit == "1200" {
         assert!(
             report.cumulative_spill_bytes > 0,
             "low-budget correlation must actually spill"
@@ -562,7 +561,7 @@ fn run_per_source_file_writer(
     memory_limit: &str,
     worker_threads: usize,
 ) -> HashMap<String, String> {
-    let plan = compile(&format!(
+    let plan = compile_with_writer_workspace(&format!(
         r#"
 pipeline:
   name: per_source_file_writer_boundary
@@ -652,7 +651,7 @@ fn writer_boundary_mode_matrix() {
     assert_eq!(fan_out["a"], "key,payload\n1,a1-first\n1,a1-second\n2,a2\n");
     assert_eq!(fan_out["b"], "key,payload\n0,b0\n3,b3\n");
 
-    let output = run_correlation_writer(false);
+    let output = run_correlation_writer("64M");
     assert_eq!(
         output, "key,group,payload\n0,b,b0\n1,b,b1\n2,a,a2\n3,a,a3\n",
         "correlation-deferred commit must enforce the complete physical writer boundary"
@@ -718,21 +717,34 @@ fn equal_key_csv() -> String {
     csv
 }
 
+// The large ordering fixture deliberately pressures terminal sort storage.
+// Decode before execution so decoder ownership cannot consume that operator
+// budget. Keep the supplied physical identity and all writer behavior intact;
+// real byte-stream admission is exercised by the resource and CLI contracts.
+fn ordering_pressure_readers(
+    plan: &clinker_plan::plan::compiled::CompiledPlan,
+    source_file: &str,
+) -> SourceReaders {
+    HashMap::from([(
+        "rows".to_string(),
+        resource_fixtures::predecoded_csv_source(
+            plan.config(),
+            &CompileContext::default(),
+            "rows",
+            &[(source_file, &equal_key_csv())],
+        ),
+    )])
+}
+
 fn run_output_fixture(
     memory_limit: &str,
     worker_threads: usize,
     fanout: bool,
     source_file: &str,
 ) -> HashMap<String, String> {
-    let plan = compile(&output_pipeline(memory_limit, worker_threads, fanout));
-    let mut readers: SourceReaders = HashMap::new();
-    readers.insert(
-        "rows".to_string(),
-        single_file_reader(
-            source_file,
-            Box::new(Cursor::new(equal_key_csv().into_bytes())),
-        ),
-    );
+    let plan =
+        compile_with_writer_workspace(&output_pipeline(memory_limit, worker_threads, fanout));
+    let readers = ordering_pressure_readers(&plan, source_file);
 
     let out_a = SharedBuffer::new();
     let out_b = SharedBuffer::new();
@@ -744,13 +756,31 @@ fn run_output_fixture(
         writers.insert("out_b".to_string(), Box::new(out_b.clone()));
     }
 
-    PipelineExecutor::run_plan_with_readers_writers(
+    let report = PipelineExecutor::run_plan_with_readers_writers(
         &plan,
         readers,
         writers,
         &PipelineRunParams::default(),
     )
     .expect("output ordering fixture must run");
+    assert_eq!(report.counters.total_count, 600);
+    if memory_limit == "160K" {
+        assert!(
+            report.cumulative_spill_bytes > 0,
+            "ordering pressure must actually spill"
+        );
+    }
+
+    let mut expected = String::from("key,payload\n");
+    for key in 0..5 {
+        for ordinal in (key..600).step_by(5) {
+            expected.push_str(&format!("{key},row-{ordinal:04}-{}\n", "x".repeat(48)));
+        }
+    }
+    assert_eq!(out_a.as_string(), expected);
+    if fanout {
+        assert_eq!(out_b.as_string(), expected);
+    }
 
     HashMap::from([
         ("out_a".to_string(), out_a.as_string()),
@@ -805,8 +835,8 @@ fn writer_boundary_resident_spill_parity() {
     assert_eq!(resident_fan_out, spilled_fan_out);
 
     assert_eq!(
-        run_correlation_writer(false),
-        run_correlation_writer(true),
+        run_correlation_writer("64M"),
+        run_correlation_writer("1200"),
         "correlation-deferred bytes must not depend on resident versus spill sorting"
     );
 }
@@ -875,7 +905,7 @@ pipeline:
 }
 
 fn run_compound_boundary(memory_limit: &str, mode: &str) -> String {
-    let plan = compile(&compound_sort_yaml(memory_limit, mode));
+    let plan = compile_with_writer_workspace(&compound_sort_yaml(memory_limit, mode));
     let readers: SourceReaders = HashMap::from([(
         "rows".to_string(),
         SourceInput::Files(vec![
@@ -912,7 +942,7 @@ fn run_compound_boundary_reported(
     memory_limit: &str,
     mode: &str,
 ) -> clinker_exec::executor::ExecutionReport {
-    let plan = compile(&compound_sort_yaml(memory_limit, mode));
+    let plan = compile_with_writer_workspace(&compound_sort_yaml(memory_limit, mode));
     let readers: SourceReaders = HashMap::from([(
         "rows".to_string(),
         SourceInput::Files(vec![
@@ -1104,14 +1134,8 @@ impl Write for BoundaryFailingWriter {
 
 #[test]
 fn writer_boundary_failure_cleanup() {
-    let plan = compile(&output_pipeline("160K", 4, true));
-    let readers: SourceReaders = HashMap::from([(
-        "rows".to_string(),
-        single_file_reader(
-            "rows.csv",
-            Box::new(Cursor::new(equal_key_csv().into_bytes())),
-        ),
-    )]);
+    let plan = compile_with_writer_workspace(&output_pipeline("160K", 4, true));
+    let readers = ordering_pressure_readers(&plan, "rows.csv");
     let sibling = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([
         (
@@ -1211,7 +1235,7 @@ nodes:
 }
 
 fn run_merge_output(memory_limit: &str) -> String {
-    let plan = compile(&merge_output_pipeline(memory_limit, true));
+    let plan = compile_with_writer_workspace(&merge_output_pipeline(memory_limit, true));
     let readers: SourceReaders = HashMap::from([
         (
             "left".to_string(),

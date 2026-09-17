@@ -50,7 +50,7 @@ pub use schema::{
     RECORD_TYPE_COLUMN, RecordType, SourceSchema, StructureConstraint, multi_record_superset,
 };
 pub use source::{ByteTally, ReopenableSource, RetainedFileGuard};
-pub use traits::{FormatReader, FormatWriter, SourceLifecycleEvent};
+pub use traits::{FormatReader, FormatWriter, FormatWriterHandle, SourceLifecycleEvent};
 
 // Default positional-element/field ceilings each reader enforces on a
 // body segment, re-exported under format-disambiguated names so the

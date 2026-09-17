@@ -877,14 +877,39 @@ pub(crate) fn push_write_error(
 /// (E315/E316) is still enforced.
 pub(crate) fn sink_collision_dlq_entry(
     record: &Record,
+    projected: &Record,
     row_num: crate::executor::stream_event::SourceRowId,
     output_name: &str,
     err: &clinker_format::error::FormatError,
 ) -> Option<DlqEntry> {
-    let clinker_format::error::FormatError::MultiValueDelimiterCollision { column, value, .. } =
-        err
-    else {
-        return None;
+    let (column, value) = match err {
+        clinker_format::FormatError::MultiValueDelimiterCollision { column, value, .. } => {
+            (column.as_str(), Value::String(value.clone().into()))
+        }
+        clinker_format::FormatError::OutputEncoding {
+            field,
+            element: Some(element),
+            kind: clinker_format::error::OutputEncodingKind::JoinCollision,
+            ..
+        } => {
+            let column = projected
+                .schema()
+                .columns()
+                .get(field.checked_sub(1)?)?
+                .as_ref();
+            let Value::Array(values) = projected.get(column)? else {
+                return None;
+            };
+            let value = values.get(element.get() - 1)?;
+            // Full evidence belongs to the existing DLQ record owner, not the
+            // writer diagnostic. Reuse the codec's exact scalar representation.
+            let value = clinker_format::csv::writer::scalar_text(value, *field, |text| {
+                Ok(Value::String(text.into()))
+            })
+            .ok()?;
+            (column, value)
+        }
+        _ => return None,
     };
     Some(DlqEntry {
         source_row: row_num,
@@ -895,8 +920,8 @@ pub(crate) fn sink_collision_dlq_entry(
         route: None,
         trigger: true,
         source_name: source_name_arc_of(record),
-        triggering_field: Some(Arc::from(column.as_str())),
-        triggering_value: Some(Value::String(value.clone().into())),
+        triggering_field: Some(Arc::from(column)),
+        triggering_value: Some(value),
     })
 }
 
@@ -1113,6 +1138,7 @@ impl NodeBufferReaderLedger {
 /// * `collector` — stage-metrics collector receiving per-arm timing.
 pub(crate) struct ExecutorContext<'a> {
     /// Shared run authority; cloning it never starts another memory budget.
+    pub(crate) writer_resources: clinker_format::preparation::WriterResources,
     /// Allocation admission borrows the run weakly, independently of writer staging.
     pub(crate) allocation_resources: clinker_record::owned_storage::AllocationResources,
     // Borrowed plan-time state.

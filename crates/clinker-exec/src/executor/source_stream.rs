@@ -155,6 +155,14 @@ const fn ewma_step(prev: u64, sample: u64) -> u64 {
 }
 
 impl SourceIngestChannel {
+    /// Borrow the same run authority used to exclude admitted row storage from
+    /// legacy queue estimates. Decoder allocations keep their own grants.
+    pub(super) fn allocation_resources(
+        &self,
+    ) -> &clinker_record::owned_storage::AllocationResources {
+        &self.allocation_resources
+    }
+
     #[cfg(test)]
     pub(super) fn assert_allocation_domain(
         &self,

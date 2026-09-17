@@ -243,6 +243,7 @@ struct RunExecutionContext<'a> {
 /// [`DagExecInputs`] because every field here transfers ownership into
 /// the walk rather than being borrowed for its duration.
 struct DagExecResources {
+    writer_resources: clinker_format::preparation::WriterResources,
     allocation_resources: clinker_record::owned_storage::AllocationResources,
     /// Executor-owned sealed Source capabilities for body activation.
     source_activation: Option<source_activation::SourceActivationController>,
@@ -769,6 +770,7 @@ impl PipelineExecutor {
             params.telemetry_producer.clone(),
         )
         .map_err(|error| PipelineError::Format(error.into()))?;
+        let writer_resources = writer_provider.resources();
         let allocation_resources = writer_provider.allocation();
         #[cfg(test)]
         RUN_ALLOCATION_OBSERVER.with_borrow_mut(|slot| {
@@ -1013,138 +1015,133 @@ impl PipelineExecutor {
             // there for why zero is not a denominator.
             progress.seal_bytes_total(bytes_total);
         }
-        for src_cfg in &source_configs {
-            let source_id = plan
-                .graph
-                .node_weights()
-                .find_map(|node| match node {
-                    clinker_plan::plan::execution::PlanNode::Source { name, id, .. }
-                        if name == &src_cfg.name =>
-                    {
-                        Some(*id)
-                    }
-                    _ => None,
-                })
-                .ok_or_else(|| PipelineError::Internal {
-                    op: "source-ingest-identity",
-                    node: src_cfg.name.clone(),
-                    detail: String::from(
-                        "compiled source has no stable PlanNodeId in the execution DAG",
+        let spawn_result: Result<(), PipelineError> = (|| {
+            for src_cfg in &source_configs {
+                let source_id =
+                    plan.graph
+                        .node_weights()
+                        .find_map(|node| match node {
+                            clinker_plan::plan::execution::PlanNode::Source {
+                                name, id, ..
+                            } if name == &src_cfg.name => Some(*id),
+                            _ => None,
+                        })
+                        .ok_or_else(|| PipelineError::Internal {
+                            op: "source-ingest-identity",
+                            node: src_cfg.name.clone(),
+                            detail: String::from(
+                                "compiled source has no stable PlanNodeId in the execution DAG",
+                            ),
+                        })?;
+                // Pre-declare so the report's `iter_declared_sources` view
+                // emits a per-source rollup entry even when ingest produces
+                // zero observable records (e.g. empty input file).
+                if src_cfg.watermark.is_some() {
+                    watermarks.declare(&src_cfg.name);
+                }
+                let source_input = readers.remove(&src_cfg.name).ok_or_else(|| {
+                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                        "no reader registered for source '{}'",
+                        src_cfg.name
+                    )))
+                })?;
+                // Single ConsumerHandle shared between the SourceConsumer
+                // wrapper (BackPressurePreferred / Priority pause target)
+                // and the SourceIngestChannel that mirrors the channel queue
+                // depth × per-record bytes into the handle's counter on
+                // every `push`. The registration travels with the receiver:
+                // whichever dispatch arm drains this source's channel releases
+                // the wrapper at receiver disconnect, so a drained source
+                // stops contributing its last queue estimate to
+                // `sum_consumer_usage` — downstream spill / abort decisions
+                // would otherwise keep seeing bytes that already moved on.
+                let source_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
+                let source_body = validated_plan
+                    .config()
+                    .source_bodies()
+                    .find(|body| body.source.name == src_cfg.name)
+                    .ok_or_else(|| PipelineError::Internal {
+                        op: "source-order-contract",
+                        node: src_cfg.name.clone(),
+                        detail: "compiled Source has no matching bound source body".to_string(),
+                    })?;
+                let compiled_order = plan.order_contract().source_order_by_id(source_id);
+                let order_config = match compiled_order {
+                    Some(order) => Some(
+                        crate::source::order_barrier::SourceOrderConfig::from_compiled(
+                            order,
+                            source_id,
+                            &src_cfg.name,
+                            &source_body.schema,
+                        )?,
                     ),
-                })?;
-            // Pre-declare so the report's `iter_declared_sources` view
-            // emits a per-source rollup entry even when ingest produces
-            // zero observable records (e.g. empty input file).
-            if src_cfg.watermark.is_some() {
-                watermarks.declare(&src_cfg.name);
-            }
-            let source_input = readers.remove(&src_cfg.name).ok_or_else(|| {
-                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                    "no reader registered for source '{}'",
-                    src_cfg.name
-                )))
-            })?;
-            // Single ConsumerHandle shared between the SourceConsumer
-            // wrapper (BackPressurePreferred / Priority pause target)
-            // and the SourceIngestChannel that mirrors the channel queue
-            // depth × per-record bytes into the handle's counter on
-            // every `push`. The registration travels with the receiver:
-            // whichever dispatch arm drains this source's channel releases
-            // the wrapper at receiver disconnect, so a drained source
-            // stops contributing its last queue estimate to
-            // `sum_consumer_usage` — downstream spill / abort decisions
-            // would otherwise keep seeing bytes that already moved on.
-            let source_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-            let source_body = validated_plan
-                .config()
-                .source_bodies()
-                .find(|body| body.source.name == src_cfg.name)
-                .ok_or_else(|| PipelineError::Internal {
-                    op: "source-order-contract",
-                    node: src_cfg.name.clone(),
-                    detail: "compiled Source has no matching bound source body".to_string(),
-                })?;
-            let compiled_order = plan.order_contract().source_order_by_id(source_id);
-            let order_config = match compiled_order {
-                Some(order) => Some(
-                    crate::source::order_barrier::SourceOrderConfig::from_compiled(
-                        order,
-                        source_id,
-                        &src_cfg.name,
-                        &source_body.schema,
-                    )?,
-                ),
-                None if src_cfg.sort_order.is_some() => {
-                    return Err(PipelineError::Internal {
+                    None if src_cfg.sort_order.is_some() => {
+                        return Err(PipelineError::Internal {
                         op: "source-order-contract",
                         node: src_cfg.name.clone(),
                         detail: "source declares `sort_order`, but the finalized DAG retained no compiled source-order proof".to_string(),
                     });
-                }
-                None => None,
-            };
-            let source_column_count = source_body
-                .schema
-                .bound_columns()
-                .map_or(1, |columns| columns.len());
-            let source_batch_size = config
-                .pipeline
-                .batch_size
-                .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE);
-            let (stream, rx) = match order_config {
-                Some(order_config) => {
-                    crate::executor::source_stream::SourceIngestChannel::new_ordered(
+                    }
+                    None => None,
+                };
+                let source_column_count = source_body
+                    .schema
+                    .bound_columns()
+                    .map_or(1, |columns| columns.len());
+                let source_batch_size = config
+                    .pipeline
+                    .batch_size
+                    .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE);
+                let (stream, rx) = match order_config {
+                    Some(order_config) => {
+                        crate::executor::source_stream::SourceIngestChannel::new_ordered(
+                            crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
+                            source_consumer_handle.clone(),
+                            source_id,
+                            order_config,
+                            Arc::clone(&memory_budget),
+                            spill_root.path().to_path_buf(),
+                            params
+                                .spill_compress
+                                .resolve_for_schema(source_column_count, source_batch_size as u64),
+                            allocation_resources.clone(),
+                        )
+                    }
+                    None => crate::executor::source_stream::SourceIngestChannel::new(
                         crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
                         source_consumer_handle.clone(),
                         source_id,
-                        order_config,
-                        Arc::clone(&memory_budget),
-                        spill_root.path().to_path_buf(),
-                        params
-                            .spill_compress
-                            .resolve_for_schema(source_column_count, source_batch_size as u64),
                         allocation_resources.clone(),
-                    )
-                }
-                None => crate::executor::source_stream::SourceIngestChannel::new(
-                    crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
-                    source_consumer_handle.clone(),
-                    source_id,
-                    allocation_resources.clone(),
-                ),
-            };
-            let source_consumer_id = memory_budget.register_consumer(Arc::new(
-                crate::executor::source_stream::SourceConsumer::new(Arc::clone(
-                    &source_consumer_handle,
-                )),
-            ));
-            source_records.insert(src_cfg.name.clone(), rx);
-            source_consumers.insert(
-                src_cfg.name.clone(),
-                (source_consumer_id, source_consumer_handle),
-            );
-            let src_cfg_owned = src_cfg.clone();
-            let config_clone = config.clone();
-            // Per-thread clone of the run's cancellation handle. A network
-            // ingest reader polls it at page/row-batch boundaries to stop
-            // within the documented shutdown bound; the file arm ignores
-            // it (dropped-receiver stop suffices).
-            let ingest_shutdown = params.shutdown_token.clone();
-            let lifecycle_shutdown = ingest_shutdown.clone();
-            let lifecycle_telemetry = params.telemetry_producer.clone();
-            let ingest_progress = params.progress.clone();
-            let ingest_source_runtime = source_runtime.clone();
-            // One OS thread per Source. Spawned before the DAG dispatch
-            // drains so the producers fill the bounded channels while the
-            // consumer dispatch loop runs concurrently. Joined after
-            // dispatch returns (receivers already drained).
-            let handle = std::thread::Builder::new()
-                .name(format!("clinker-ingest-{}", src_cfg.name))
-                .spawn(move || {
-                    source_activation::observe_source(
-                        lifecycle_telemetry.as_ref(),
-                        lifecycle_shutdown.as_ref(),
-                        || {
+                    ),
+                };
+                let source_consumer_id = memory_budget.register_consumer(Arc::new(
+                    crate::executor::source_stream::SourceConsumer::new(Arc::clone(
+                        &source_consumer_handle,
+                    )),
+                ));
+                source_records.insert(src_cfg.name.clone(), rx);
+                source_consumers.insert(
+                    src_cfg.name.clone(),
+                    (source_consumer_id, source_consumer_handle),
+                );
+                let src_cfg_owned = src_cfg.clone();
+                let config_clone = config.clone();
+                // Per-thread clone of the run's cancellation handle. A network
+                // ingest reader polls it at page/row-batch boundaries to stop
+                // within the documented shutdown bound; the file arm ignores
+                // it (dropped-receiver stop suffices).
+                let ingest_shutdown = params.shutdown_token.clone();
+                let lifecycle_telemetry = params.telemetry_producer.clone();
+                let ingest_progress = params.progress.clone();
+                let ingest_source_runtime = source_runtime.clone();
+                // One OS thread per Source. Spawned before the DAG dispatch
+                // drains so the producers fill the bounded channels while the
+                // consumer dispatch loop runs concurrently. Joined after
+                // dispatch returns (receivers already drained).
+                let handle = std::thread::Builder::new()
+                    .name(format!("clinker-ingest-{}", src_cfg.name))
+                    .spawn(move || {
+                        source_activation::observe_source(lifecycle_telemetry.as_ref(), || {
                             ingest_source(
                                 src_cfg_owned,
                                 source_input,
@@ -1154,15 +1151,26 @@ impl PipelineExecutor {
                                 ingest_progress,
                                 ingest_source_runtime,
                             )
-                        },
-                    )
-                })
-                .map_err(|e| PipelineError::Internal {
-                    op: "source-ingest-spawn",
-                    node: src_cfg.name.clone(),
-                    detail: format!("failed to spawn source ingest thread: {e}"),
-                })?;
-            ingest_handles.push(handle);
+                        })
+                    })
+                    .map_err(|e| PipelineError::Internal {
+                        op: "source-ingest-spawn",
+                        node: src_cfg.name.clone(),
+                        detail: format!("failed to spawn source ingest thread: {e}"),
+                    })?;
+                ingest_handles.push(handle);
+            }
+            Ok(())
+        })();
+        if let Err(error) = spawn_result {
+            drop(source_records);
+            for (_, (id, handle)) in source_consumers {
+                handle.resume();
+                handle.set_bytes(0);
+                memory_budget.unregister_consumer(id);
+            }
+            let _ = ingest::join_source_workers(ingest_handles, "source-ingest-thread");
+            return Err(error);
         }
 
         let dispatch_outcome = match Self::execute_dag(
@@ -1176,6 +1184,7 @@ impl PipelineExecutor {
                 run_policy,
             },
             DagExecResources {
+                writer_resources,
                 allocation_resources,
                 source_activation,
                 source_records,
@@ -1228,15 +1237,10 @@ impl PipelineExecutor {
         // first) propagates after dispatch's own result.
         let mut total_ingested: u64 = 0;
         let mut counters = counters;
-        for handle in ingest_handles {
-            // `join()` Err is the panic payload (`Box<dyn Any>`); the
-            // inner `??` then unwraps the ingest fn's own
-            // `Result<IngestTaskOutcome, PipelineError>`.
-            let outcome = handle.join().map_err(|_| PipelineError::Internal {
-                op: "source-ingest-thread",
-                node: String::new(),
-                detail: String::from("source ingest thread panicked"),
-            })??;
+        // Join every worker before selecting the terminal result. An earlier
+        // failure must never detach later workers holding readers or grants.
+        for outcome in ingest::join_source_workers(ingest_handles, "source-ingest-thread")? {
+            interrupted |= outcome.interrupted;
             counters.total_count += outcome.total_count;
             total_ingested += outcome.total_count;
             for (file_arc, ts) in outcome.watermark_observations {
@@ -1422,6 +1426,7 @@ impl PipelineExecutor {
             run_policy,
         } = inputs;
         let DagExecResources {
+            writer_resources,
             allocation_resources,
             source_activation,
             source_records,
@@ -1728,7 +1733,10 @@ impl PipelineExecutor {
             let writer_charge_handle = charge_handle.clone();
             let telemetry_producer = params.telemetry_producer.clone();
             let sink_shutdown_token = params.shutdown_token.clone();
-            let sink_allocation_resources = allocation_resources.clone();
+            let sink_resources = streaming::StreamingSinkResources {
+                writer_resources: writer_resources.clone(),
+                allocation_resources: allocation_resources.clone(),
+            };
             let handle = std::thread::Builder::new()
                 .name(format!("clinker-output-{output_name}"))
                 .spawn(move || {
@@ -1739,7 +1747,7 @@ impl PipelineExecutor {
                         writer_charge_handle,
                         telemetry_producer,
                         sink_shutdown_token,
-                        sink_allocation_resources,
+                        sink_resources,
                     )
                 })
                 .map_err(|e| PipelineError::Internal {
@@ -1754,6 +1762,7 @@ impl PipelineExecutor {
         }
 
         let mut ctx = dispatch::ExecutorContext {
+            writer_resources,
             allocation_resources,
             config,
             composition_bodies,
@@ -2002,26 +2011,18 @@ impl PipelineExecutor {
         // a failure, so swallow it here (the interruption is recorded in
         // `ctx.interrupted` and surfaced through the report) and let the
         // run finish draining. Every other walk error still propagates.
-        let writer_cancelled = |error: &PipelineError| {
-            matches!(
-                error,
-                PipelineError::Format(clinker_format::FormatError::Resource(
-                    clinker_format::preparation::ResourceError {
-                        kind: clinker_format::preparation::ResourceErrorKind::Cancelled,
-                        ..
-                    }
-                ))
-            )
-        };
-        let cancelled_output = ctx.output_errors.iter().any(writer_cancelled);
+        let cancelled_output = ctx
+            .output_errors
+            .iter()
+            .any(preparation::is_explicit_cancellation);
         if cancelled_output {
             ctx.interrupted = true;
-            ctx.output_errors.retain(|error| !writer_cancelled(error));
+            ctx.output_errors
+                .retain(|error| !preparation::is_explicit_cancellation(error));
         }
         let walk_completed = match walk_result {
             Ok(()) => !cancelled_output,
-            Err(PipelineError::Interrupted) => false,
-            Err(error) if writer_cancelled(&error) => {
+            Err(error) if preparation::is_explicit_cancellation(&error) => {
                 ctx.interrupted = true;
                 false
             }

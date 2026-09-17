@@ -1,5 +1,8 @@
 //! End-to-end effects of source-scoped row identity on terminal accounting.
 
+#[path = "common/pipeline_resource_fixtures.rs"]
+mod resource_fixtures;
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -261,7 +264,8 @@ nodes:
 }
 
 fn fanout_plan(memory_limit: &str) -> CompiledPlan {
-    compile(&format!(
+    let payload = "x".repeat(4 * 1024);
+    let yaml = format!(
         r#"
 pipeline:
   name: delivery_identity_spill
@@ -275,7 +279,6 @@ nodes:
       path: a.csv
       schema:
         - {{ name: id, type: string }}
-        - {{ name: payload, type: string }}
   - type: source
     name: src_b
     config:
@@ -284,10 +287,23 @@ nodes:
       path: b.csv
       schema:
         - {{ name: id, type: string }}
-        - {{ name: payload, type: string }}
+  - type: transform
+    name: expand_a
+    input: src_a
+    config:
+      cxl: |
+        emit id = id
+        emit payload = "".concat("{payload}")
+  - type: transform
+    name: expand_b
+    input: src_b
+    config:
+      cxl: |
+        emit id = id
+        emit payload = "".concat("{payload}")
   - type: merge
     name: merged
-    inputs: [src_a, src_b]
+    inputs: [expand_a, expand_b]
   - type: route
     name: fanout
     input: merged
@@ -314,39 +330,57 @@ nodes:
       path: report.csv
       include_unmapped: true
 "#,
-    ))
+    );
+    let mut config = parse_config(&yaml).expect("fanout fixture parses");
+    resource_fixtures::add_csv_workspace(&mut config, &CompileContext::default());
+    config
+        .compile(&CompileContext::default())
+        .expect("fanout fixture compiles")
 }
 
 fn large_csv(prefix: &str) -> String {
-    let payload = "x".repeat(4 * 1024);
-    let mut csv = String::from("id,payload\n");
+    // Source queues carry only identity. Independent payload allocations are
+    // created by the fused transforms to pressure downstream fan-out storage.
+    let mut csv = String::from("id\n");
     for ordinal in 1..=48 {
-        csv.push_str(&format!("{prefix}{ordinal},{payload}\n"));
+        csv.push_str(&format!("{prefix}{ordinal}\n"));
     }
     csv
 }
 
-fn large_readers() -> SourceReaders {
-    HashMap::from([
-        (
-            "src_a".to_string(),
-            SourceInput::Files(vec![slot("a.csv", &large_csv("a"))]),
-        ),
-        (
-            "src_b".to_string(),
-            SourceInput::Files(vec![slot("b.csv", &large_csv("b"))]),
-        ),
-    ])
+fn large_readers(plan: &CompiledPlan) -> SourceReaders {
+    resource_fixtures::predecoded_csv_readers(
+        plan.config(),
+        &CompileContext::default(),
+        &[("src_a", &large_csv("a")), ("src_b", &large_csv("b"))],
+    )
 }
 
 #[test]
 fn deliveries_match_across_resident_and_forced_spill_fanout() {
-    let resident = run(&fanout_plan("1G"), large_readers(), &["audit", "report"]);
-    let spilled = run(&fanout_plan("64K"), large_readers(), &["audit", "report"]);
+    let resident_plan = fanout_plan("1G");
+    let spilled_plan = fanout_plan("64K");
+    let resident = run(
+        &resident_plan,
+        large_readers(&resident_plan),
+        &["audit", "report"],
+    );
+    let spilled = run(
+        &spilled_plan,
+        large_readers(&spilled_plan),
+        &["audit", "report"],
+    );
     assert!(
         spilled.0.cumulative_spill_bytes > 0,
         "fanout must exercise spill"
     );
+
+    let mut expected = (1..=48)
+        .flat_map(|ordinal| {
+            ["a", "b"].map(|prefix| format!("{prefix}{ordinal},{}", "x".repeat(4 * 1024)))
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
 
     for (label, (report, outputs)) in [("resident", resident), ("spilled", spilled)] {
         assert_eq!(report.counters.ok_count, 96, "{label}");
@@ -354,6 +388,20 @@ fn deliveries_match_across_resident_and_forced_spill_fanout() {
         assert_eq!(report.counters.dlq_count, 0, "{label}");
         assert_eq!(outputs["audit"].lines().skip(1).count(), 96, "{label}");
         assert_eq!(outputs["report"].lines().skip(1).count(), 96, "{label}");
+        for output in ["audit", "report"] {
+            assert_eq!(
+                outputs[output].lines().next(),
+                Some("id,payload"),
+                "{label}"
+            );
+            let mut actual = outputs[output].lines().skip(1).collect::<Vec<_>>();
+            actual.sort();
+            assert_eq!(
+                actual,
+                expected.iter().map(String::as_str).collect::<Vec<_>>(),
+                "{label} {output} preserves every source identity and complete payload"
+            );
+        }
     }
 }
 

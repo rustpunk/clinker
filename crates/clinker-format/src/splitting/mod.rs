@@ -7,14 +7,17 @@
 //! Architecture: Beam FileIO.Sink pattern — the splitter is a pure rotation
 //! orchestrator, the factory owns format lifecycle.
 
+use std::alloc::Layout;
 use std::io::{self, Write};
 
-use clinker_record::owned_storage::SharedStorage;
+use clinker_record::owned_storage::{
+    AllocationLease, AllocationScope, ResourceError, SharedStorage,
+};
 use clinker_record::{DocumentContext, GroupByKey, Record, Schema, Value, value_to_group_key};
 
 use crate::counting::{CountingWriter, SharedByteCounter};
 use crate::error::FormatError;
-use crate::traits::FormatWriter;
+use crate::traits::{FormatWriter, FormatWriterHandle};
 
 #[cfg(test)]
 mod tests;
@@ -52,23 +55,111 @@ pub enum OversizeGroupPolicy {
 }
 
 // ---------------------------------------------------------------------------
-// Type aliases for factory closures
+// Factories
 // ---------------------------------------------------------------------------
 
 /// Factory that creates a new raw I/O sink for each split file.
 /// `seq` is the 1-based file sequence number.
 pub type FileFactory = Box<dyn Fn(u32) -> io::Result<Box<dyn Write + Send>> + Send>;
 
-/// Factory that creates a new format writer wrapping a `CountingWriter`.
-/// Called on each rotation (including the first file). The factory closure
-/// owns all format-specific state (e.g. CSV shared header for replay).
-pub type WriterFactory = Box<
-    dyn Fn(
-            CountingWriter<Box<dyn Write + Send>>,
-            SharedStorage<Schema>,
-        ) -> Result<Box<dyn FormatWriter>, FormatError>
-        + Send,
->;
+type FactoryFn = dyn Fn(
+        CountingWriter<Box<dyn Write + Send>>,
+        SharedStorage<Schema>,
+    ) -> Result<FormatWriterHandle, FormatError>
+    + Send;
+
+/// Retains a writer-construction closure and its backing allocation admission.
+///
+/// Called on each rotation, including the first file. Captured format state
+/// (such as a CSV header shared between files) retains its separate owners.
+/// The admitted closure remains charged until its Box backing is deallocated;
+/// this handle stays inline and never exposes the Box or its lease.
+///
+/// The owned callable cannot be detached from its charge:
+///
+/// ```compile_fail
+/// use clinker_format::splitting::WriterFactory;
+/// fn detach(factory: WriterFactory) {
+///     let _callable = factory.callable;
+/// }
+/// ```
+///
+/// The backing lease cannot be independently released:
+///
+/// ```compile_fail
+/// use clinker_format::splitting::WriterFactory;
+/// fn release(factory: WriterFactory) {
+///     drop(factory._allocation);
+/// }
+/// ```
+pub struct WriterFactory {
+    // Field order is load-bearing: dropping the Box must finish deallocation
+    // before the external lease releases its exact concrete closure charge.
+    callable: Box<FactoryFn>,
+    _allocation: Option<AllocationLease>,
+}
+
+impl WriterFactory {
+    /// Reserve the actual concrete closure layout before fallible allocation.
+    ///
+    /// This admits only the closure backing. Captured allocations need their
+    /// own owners; it does not infer their sizes from the closure layout.
+    /// Allocation failure drops the intact closure while its backing grant is
+    /// still live.
+    ///
+    /// # Errors
+    /// Returns the authority's refusal or the backing allocation failure.
+    pub fn try_new<F>(factory: F, scope: &AllocationScope) -> Result<Self, ResourceError>
+    where
+        F: Fn(
+                CountingWriter<Box<dyn Write + Send>>,
+                SharedStorage<Schema>,
+            ) -> Result<FormatWriterHandle, FormatError>
+            + Send
+            + 'static,
+    {
+        let allocation = scope.reserve(Layout::new::<F>())?;
+        let callable = crate::reserved::try_box(factory).map_err(|(error, factory)| {
+            drop(factory);
+            error
+        })?;
+        Ok(Self {
+            callable,
+            _allocation: Some(allocation),
+        })
+    }
+
+    /// Preserve an unchanged non-CSV implementation or test probe at migration.
+    ///
+    /// This explicitly leaves the closure backing ungoverned. CSV factories
+    /// and newly changed production closure allocations must use [`Self::try_new`].
+    pub fn from_legacy<F>(factory: F) -> Self
+    where
+        F: Fn(
+                CountingWriter<Box<dyn Write + Send>>,
+                SharedStorage<Schema>,
+            ) -> Result<FormatWriterHandle, FormatError>
+            + Send
+            + 'static,
+    {
+        Self {
+            callable: Box::new(factory),
+            _allocation: None,
+        }
+    }
+
+    /// Construct one writer while retaining this factory's closure ownership.
+    ///
+    /// The callback determines whether construction performs I/O. The returned
+    /// writer keeps its own backing admission independently of the factory.
+    pub fn create(
+        &self,
+        counting: CountingWriter<Box<dyn Write + Send>>,
+        schema: SharedStorage<Schema>,
+    ) -> Result<FormatWriterHandle, FormatError> {
+        (self.callable)(counting, schema)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SplittingWriter
@@ -88,7 +179,7 @@ pub struct SplittingWriter {
     writer_factory: WriterFactory,
     schema: SharedStorage<Schema>,
     policy: SplitPolicy,
-    current_writer: Option<Box<dyn FormatWriter>>,
+    current_writer: Option<FormatWriterHandle>,
     /// Shared byte counter — owned by SplittingWriter, passed to each
     /// `CountingWriter` on rotation. Reset to zero on file open.
     byte_counter: SharedByteCounter,
@@ -131,7 +222,7 @@ impl SplittingWriter {
         self.total_bytes += self.byte_counter.bytes_written();
         self.byte_counter.reset();
         let counting = CountingWriter::new(raw, self.byte_counter.clone());
-        let writer = (self.writer_factory)(counting, self.schema.clone())?;
+        let writer = self.writer_factory.create(counting, self.schema.clone())?;
         self.current_writer = Some(writer);
         self.records_in_file = 0;
         self.oversize_warned = false;

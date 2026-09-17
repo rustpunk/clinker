@@ -17,7 +17,7 @@
 //! ingest thread) driving a blocking `ureq` client to exhaustion, with
 //! no async runtime.
 
-use clinker_record::owned_storage::{OwnedKey, SharedStorage};
+use clinker_record::owned_storage::{OwnedMap, SharedStorage};
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::time::Duration;
@@ -30,7 +30,7 @@ use clinker_format::traits::FormatReader;
 use clinker_format::{EnvelopeConfig, FormatError};
 use clinker_plan::config::pipeline_node::{OnUnmapped, WIDENED_SIDECAR_COLUMN};
 use clinker_plan::config::{InputFormat, RestAuth, RestPagination, RestSourceConfig, SourceConfig};
-use clinker_record::{FieldMetadata, Record, Schema, SchemaBuilder, Value};
+use clinker_record::{FieldMetadata, Record, Schema, SchemaBuilder};
 use indexmap::IndexMap;
 
 use crate::schema_err;
@@ -936,13 +936,10 @@ impl RecordSource for RestRecordSource {
         }
     }
 
-    fn prepare_document(
-        &mut self,
-        _config: &EnvelopeConfig,
-    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
+    fn prepare_document(&mut self, _config: &EnvelopeConfig) -> Result<OwnedMap, FormatError> {
         // Envelope sections span a whole document; a paginated REST pull
         // has no single document envelope, so it carries none.
-        Ok(IndexMap::new())
+        Ok(OwnedMap::from_map(IndexMap::new()))
     }
 
     fn set_shutdown_token(&mut self, token: ShutdownToken) {

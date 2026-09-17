@@ -27,6 +27,229 @@ impl From<ResourceError> for FormatError {
     }
 }
 
+/// Internal storage choice for final decoded text; never a format option.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextStorage {
+    Shared,
+    Unique,
+}
+
+/// Allocation-only decoding capability. Construct before reading headers or
+/// body rows. Final storage owns its grants independently of this workspace;
+/// the unchanged CSV and serde_json parser intermediates remain legacy.
+#[derive(Clone)]
+pub struct DecodeWorkspace {
+    scope: AllocationScope,
+}
+
+impl DecodeWorkspace {
+    /// Create a finite scope without acquiring any output-stage capability.
+    pub fn new(resources: AllocationResources) -> Result<Self, ResourceError> {
+        Ok(Self {
+            scope: resources.scope()?,
+        })
+    }
+
+    pub fn scope(&self) -> &AllocationScope {
+        &self.scope
+    }
+
+    /// Validate UTF-8 by borrowing. Latin-1 counts its checked expansion and
+    /// admits scratch before copying, retaining it through final construction.
+    pub(crate) fn with_decoded<T>(
+        &self,
+        bytes: &[u8],
+        charset: crate::charset::Charset,
+        use_text: impl FnOnce(&str) -> Result<T, FormatError>,
+    ) -> Result<T, FormatError> {
+        self.scope.check_cancelled()?;
+        match charset {
+            crate::charset::Charset::Utf8 => {
+                let text = std::str::from_utf8(bytes).map_err(|error| {
+                    FormatError::Charset(format!(
+                        "input is not valid UTF-8: {error}. Declare the source's character \
+                         set (e.g. `encoding: iso-8859-1`) if the input uses a \
+                         non-UTF-8 repertoire"
+                    ))
+                })?;
+                use_text(text)
+            }
+            crate::charset::Charset::Latin1 => {
+                let capacity = bytes.iter().try_fold(0usize, |len, byte| {
+                    len.checked_add(if byte.is_ascii() { 1 } else { 2 })
+                        .ok_or_else(|| {
+                            ResourceError::new(ResourceErrorKind::Layout, bytes.len(), 0)
+                        })
+                })?;
+                let mut scratch = ReservedBuffer::new(self.scope.clone());
+                scratch.reserve_exact(capacity)?;
+                for &byte in bytes {
+                    let mut encoded = [0; 4];
+                    scratch
+                        .extend_from_slice(char::from(byte).encode_utf8(&mut encoded).as_bytes())?;
+                }
+                // All appended fragments came from char::encode_utf8.
+                let text = std::str::from_utf8(scratch.as_slice())
+                    .map_err(|_| ResourceError::new(ResourceErrorKind::Layout, capacity, 0))?;
+                use_text(text)
+            }
+        }
+    }
+
+    /// Copy final text only after admission. Shared clones retain the original
+    /// backing; unique clones follow the existing independent-copy policy.
+    pub fn decode_text(
+        &self,
+        bytes: &[u8],
+        charset: crate::charset::Charset,
+        storage: TextStorage,
+    ) -> Result<clinker_record::FieldStr, FormatError> {
+        self.with_decoded(bytes, charset, |text| self.store_text(text, storage))
+    }
+
+    fn store_text(
+        &self,
+        text: &str,
+        storage: TextStorage,
+    ) -> Result<clinker_record::FieldStr, FormatError> {
+        Ok(match storage {
+            TextStorage::Shared => clinker_record::FieldStr::try_new(text, &self.scope)?,
+            TextStorage::Unique => clinker_record::FieldStr::try_new_unique(text, &self.scope)?,
+        })
+    }
+
+    /// Borrow the existing parser tree while admitting every final container,
+    /// key and text leaf. The intermediate tree is never relabeled as admitted.
+    pub fn decode_json_value(
+        &self,
+        parsed: &serde_json::Value,
+        storage: TextStorage,
+    ) -> Result<clinker_record::Value, FormatError> {
+        use clinker_record::Value;
+        use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues};
+        self.scope.check_cancelled()?;
+        Ok(match parsed {
+            serde_json::Value::Null => Value::Null,
+            serde_json::Value::Bool(value) => Value::Bool(*value),
+            serde_json::Value::Number(value) => {
+                if let Some(value) = value.as_i64() {
+                    Value::Integer(value)
+                } else if value.is_u64() {
+                    return Err(FormatError::Json("JSON integer exceeds the supported range and would lose precision as a float".into()));
+                } else if let Some(value) = value.as_f64() {
+                    Value::Float(value)
+                } else {
+                    // The existing arbitrary-precision parser retains numbers
+                    // outside the numeric domain as text. Borrow its spelling
+                    // directly, without a new unadmitted to_string buffer.
+                    Value::String(self.store_text(value.as_str(), storage)?)
+                }
+            }
+            serde_json::Value::String(value) => Value::String(self.store_text(value, storage)?),
+            serde_json::Value::Array(items) => {
+                let mut values = OwnedValues::try_with_capacity(items.len(), &self.scope)?;
+                for item in items {
+                    let value = self.decode_json_value(item, storage)?;
+                    values
+                        .try_push(value, &self.scope)
+                        .map_err(|(error, _)| error)?;
+                }
+                Value::Array(values)
+            }
+            serde_json::Value::Object(items) => {
+                let mut values = OwnedMap::try_with_capacity(items.len(), &self.scope)?;
+                for (key, item) in items {
+                    let key = OwnedKey::try_new(key, &self.scope)?;
+                    let value = self.decode_json_value(item, storage)?;
+                    values
+                        .try_insert(key, value, &self.scope)
+                        .map_err(|(error, _, _)| error)?;
+                }
+                Value::Map(values)
+            }
+        })
+    }
+
+    /// Decode a repeated cell using the shared split grammar or the unchanged
+    /// JSON parser. Empty cells are empty arrays in every mode.
+    pub fn decode_split_cell(
+        &self,
+        text: &str,
+        spec: &crate::multi_value::SplitValues,
+        storage: TextStorage,
+    ) -> Result<clinker_record::Value, FormatError> {
+        use crate::multi_value::{SplitFragment, visit_split_text};
+        use clinker_record::Value;
+        use clinker_record::owned_storage::OwnedValues;
+        self.scope.check_cancelled()?;
+        if text.is_empty() {
+            return Ok(Value::Array(OwnedValues::try_with_capacity(
+                0,
+                &self.scope,
+            )?));
+        }
+        if spec.json {
+            let field = crate::error::OutputFieldName::new(&spec.field);
+            let parsed: serde_json::Value = serde_json::from_str(text).map_err(|error| {
+                FormatError::Json(format!(
+                    "split_values `json: true` on field '{field}': cell is not valid JSON: {error}"
+                ))
+            })?;
+            if !parsed.is_array() {
+                return Err(FormatError::Json(format!(
+                    "split_values `json: true` on field '{field}': cell is JSON but not an array (a `multiple:` column holds an array)"
+                )));
+            }
+            if let Some(n) = crate::csv::reader::first_lossy_integer(&parsed) {
+                return Err(FormatError::Json(format!(
+                    "split_values `json: true` on field '{field}': integer {n} exceeds the supported range and would lose precision as a float"
+                )));
+            }
+            return self.decode_json_value(&parsed, storage);
+        }
+        let mut count = 0usize;
+        visit_split_text(text, &spec.delimiter, &spec.escape, |fragment| {
+            if matches!(fragment, SplitFragment::Part(_) | SplitFragment::End) {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| ResourceError::new(ResourceErrorKind::Layout, count, 0))?;
+            }
+            Ok::<_, ResourceError>(())
+        })?;
+        let mut values = OwnedValues::try_with_capacity(count, &self.scope)?;
+        let mut scratch = crate::reserved::ReservedText::new(self.scope.clone());
+        visit_split_text(text, &spec.delimiter, &spec.escape, |fragment| {
+            let value = match fragment {
+                SplitFragment::Part(part) => self.store_text(part, storage)?,
+                SplitFragment::Text(part) => {
+                    scratch.push_str(part)?;
+                    return Ok(());
+                }
+                SplitFragment::End => {
+                    let value = self.store_text(scratch.as_str(), storage)?;
+                    scratch = crate::reserved::ReservedText::new(self.scope.clone());
+                    value
+                }
+            };
+            values
+                .try_push(Value::String(value), &self.scope)
+                .map_err(|(error, _)| FormatError::from(error))
+        })?;
+        Ok(Value::Array(values))
+    }
+
+    /// Move the exact admitted vector into a record without a second copy.
+    pub fn finish_record(
+        &self,
+        schema: clinker_record::owned_storage::SharedStorage<clinker_record::Schema>,
+        values: clinker_record::owned_storage::OwnedValues,
+    ) -> Result<Record, FormatError> {
+        self.scope.check_cancelled()?;
+        Record::from_owned_values(schema, values)
+            .map_err(|error| FormatError::SchemaInference(error.to_string()))
+    }
+}
+
 /// Format-only stage capability. Allocation admission belongs to the core
 /// authority; a stage receives the matching writer's explicit finite scope.
 pub trait ResourceAuthority: Send + Sync {

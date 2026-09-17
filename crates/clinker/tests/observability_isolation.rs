@@ -229,10 +229,12 @@ fn otlp_bulkhead_drains_three_signals_and_shares_lifecycle_facts() {
     );
     if !signals.contains("logs") {
         assert!(
-            summary["admission"]["dropped"]["contended"]
-                .as_u64()
-                .is_some_and(|count| count > 0),
-            "an omitted optional log is accounted as nonblocking contention"
+            ["contended", "queue_full"].iter().any(|reason| {
+                summary["admission"]["dropped"][reason]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+            }),
+            "an omitted optional log is accounted as nonblocking admission loss"
         );
     }
     assert!(
@@ -783,13 +785,14 @@ fn a_run_that_reserved_an_arena_reports_its_admission_however_early_it_stops() {
 
 /// Four customers with varying amounts, and a per-record event gated on a
 /// field the directive never requests. The gate reads `amount`; only
-/// `customer_id` is exported.
+/// `customer_id` is exported. JSON keeps this log-selection fixture independent
+/// of the CSV allocation-span load without changing the fixed telemetry arena.
 fn write_gated_pipeline(root: &Path, output: &str) {
     std::fs::create_dir_all(root.join("private/source")).expect("source directory");
     std::fs::create_dir_all(root.join("private/output")).expect("output directory");
     std::fs::write(
-        root.join("private/source/customers.csv"),
-        "customer_id,amount\ncustomer-1,500\ncustomer-2,5000\ncustomer-3,900\ncustomer-4,2000\n",
+        root.join("private/source/customers.json"),
+        br#"[{"customer_id":"customer-1","amount":500},{"customer_id":"customer-2","amount":5000},{"customer_id":"customer-3","amount":900},{"customer_id":"customer-4","amount":2000}]"#,
     )
     .expect("input fixture");
     std::fs::write(
@@ -802,9 +805,8 @@ nodes:
     name: customers
     config:
       name: customers
-      type: csv
-      path: ./private/source/customers.csv
-      options: {{ has_header: true }}
+      type: json
+      path: ./private/source/customers.json
       schema:
         - {{ name: customer_id, type: string }}
         - {{ name: amount, type: int }}
@@ -828,8 +830,9 @@ nodes:
     input: normalize
     config:
       name: published_customers
-      type: csv
+      type: json
       path: {output}
+      options: {{ format: ndjson }}
 "#
         ),
     )
@@ -886,7 +889,7 @@ fn captured_log_attributes(capture: &Path) -> Vec<BTreeMap<String, String>> {
 #[test]
 fn authored_condition_gates_the_exported_payload() {
     let root = fixture();
-    write_gated_pipeline(root.path(), "./private/output/customers.csv");
+    write_gated_pipeline(root.path(), "./private/output/customers.json");
     write_observability_policy(
         root.path(),
         "https://collector.example.com",
@@ -904,12 +907,17 @@ fn authored_condition_gates_the_exported_payload() {
     // Every input record reached the transform, so a missing log event is the
     // gate's doing and not a short input. Without this the assertion below
     // would also pass on a pipeline that silently processed two rows.
-    let published = std::fs::read_to_string(root.path().join("private/output/customers.csv"))
+    let published = std::fs::read_to_string(root.path().join("private/output/customers.json"))
         .expect("published output");
     assert_eq!(
-        published.lines().count(),
-        5,
-        "header plus four records must be published regardless of gating: {published}"
+        published.lines().collect::<Vec<_>>(),
+        vec![
+            r#"{"customer_id":"customer-1","amount":500}"#,
+            r#"{"customer_id":"customer-2","amount":5000}"#,
+            r#"{"customer_id":"customer-3","amount":900}"#,
+            r#"{"customer_id":"customer-4","amount":2000}"#,
+        ],
+        "all four input records must be published regardless of log gating"
     );
 
     let events = captured_log_attributes(&capture)
@@ -1400,21 +1408,13 @@ fn invoke_fault_matrix(
 /// The observability summary with its scheduling-dependent numbers removed,
 /// so the rest can be compared across runs for exact equality.
 ///
-/// All four are one fact. A signal is refused with `contended` when the drain
-/// thread held the arena lock at the moment it was offered, and that single
-/// lost signal moves everything downstream of it: `accepted` counts one
-/// fewer, and `fields` counts one record's field-policy effects fewer,
-/// because a privacy scan is credited only once its record is admitted
-/// (`clinker-exec/src/telemetry.rs`, `emit_log`). `peak_retained_bytes` is a
-/// high-water mark over the same concurrently drained queue.
-///
-/// Measured, not assumed: over 20 runs the `accepted`/`contended` pair moved
-/// in 6, and over a further 30 with that pair excluded, `fields.denied` moved
-/// in 3. Asserting any of them equal across two process runs would be
-/// asserting something false. Every one of them is asserted exactly, on a
-/// single run, by `arena_admission_loss_reaches_the_machine_terminal_and_
-/// standard_error`; what is checked here is what this test is about, which is
-/// that a lineage fault changes none of it.
+/// The producer never waits for the drain: both lock contention and a full
+/// queue can reject an otherwise eligible signal. The CSV resource lifecycle
+/// also offers spans, so fullness is reached in this finite arena and depends
+/// on drain scheduling. Accepted signals, field-policy effects and the retained
+/// high-water mark move with those decisions. Export outcomes and fixed limits
+/// remain comparable; offered-signal conservation and lane totals are checked
+/// independently below. No arena capacity is enlarged to retain optional work.
 fn without_scheduling_dependent_counters(observability: &Value) -> Value {
     let mut observability = observability.clone();
     if let Some(admission) = observability
@@ -1426,16 +1426,21 @@ fn without_scheduling_dependent_counters(observability: &Value) -> Value {
         admission.remove("fields");
         if let Some(dropped) = admission.get_mut("dropped").and_then(Value::as_object_mut) {
             dropped.remove("contended");
+            dropped.remove("queue_full");
+        }
+        for lane in ["ordinary", "high_severity"] {
+            admission["lanes"][lane]
+                .as_object_mut()
+                .expect("admission lane")
+                .remove("queue_full");
         }
     }
     observability
 }
 
-/// Every signal the producer offered is either taken or refused, so the two
-/// counters the arena lock moves between sum to a constant the scheduler
-/// cannot change. That is a stronger claim than comparing either alone — it
-/// says the run produced the same telemetry, and only the timing of the drain
-/// differed.
+/// Admission must account for every eligible offered signal, regardless of
+/// whether it was accepted, contended or refused by the finite queue. A lineage
+/// delivery outcome cannot change that total or hide loss in an unchecked lane.
 fn assert_offered_signal_count_is_unchanged(run: &Value, baseline: &Value, label: &str) {
     let offered = |observability: &Value| {
         observability["admission"]["accepted"]
@@ -1444,6 +1449,9 @@ fn assert_offered_signal_count_is_unchanged(run: &Value, baseline: &Value, label
             + observability["admission"]["dropped"]["contended"]
                 .as_u64()
                 .expect("contended drops")
+            + observability["admission"]["dropped"]["queue_full"]
+                .as_u64()
+                .expect("queue-full drops")
     };
     assert_eq!(
         offered(run),
@@ -1463,6 +1471,21 @@ fn assert_offered_signal_count_is_unchanged(run: &Value, baseline: &Value, label
 /// it was measured in.
 fn assert_peak_retained_is_bounded(observability: &Value, label: &str) {
     let admission = &observability["admission"];
+    let lane_full: u64 = ["ordinary", "high_severity"]
+        .iter()
+        .map(|lane| {
+            admission["lanes"][lane]["queue_full"]
+                .as_u64()
+                .expect("lane full drops")
+        })
+        .sum();
+    assert_eq!(
+        admission["dropped"]["queue_full"]
+            .as_u64()
+            .expect("total full drops"),
+        lane_full,
+        "{label}: queue-full loss must equal the sum of both lanes"
+    );
     let peak = admission["peak_retained_bytes"]
         .as_u64()
         .expect("peak retained bytes");
@@ -1729,10 +1752,9 @@ fn fault_matrix_lineage_outcomes_leave_otlp_and_authoritative_truth_unchanged() 
             run.oracle, baseline.oracle,
             "lineage {mode} changed authoritative truth"
         );
-        // Everything deterministic, which is every export counter and every
-        // admission counter the scheduler cannot move. The three it can move
-        // are excluded here and asserted just below for the properties that
-        // do hold, rather than for equalities that do not.
+        // Export outcomes and fixed admission policy remain identical. The
+        // concurrent drain can move signals between acceptance, contention and
+        // queue refusal; check their conserved total and both lane counts.
         assert_eq!(
             without_scheduling_dependent_counters(&run.observability),
             without_scheduling_dependent_counters(&baseline.observability),

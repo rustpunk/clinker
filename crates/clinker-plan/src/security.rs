@@ -496,20 +496,40 @@ mod tests {
 
     #[test]
     fn test_unsaved_buffer_uses_cwd_base() {
-        // When a buffer has no on-disk path, tooling passes
-        // `std::env::current_dir()` as the base_dir.
-        let dir = tempfile::tempdir().unwrap();
-        let original_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        let result = {
-            fs::write("sibling.yaml", "pipeline: {name: x}").unwrap();
+        const CHILD: &str = "CLINKER_TEST_UNSAVED_BUFFER_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // Tooling resolves an unsaved buffer against its actual CWD.
             let base = std::env::current_dir().unwrap();
-            validate_path(Path::new("sibling.yaml"), &base, false)
-        };
-        // Always restore cwd, even if the assertion below fails.
-        std::env::set_current_dir(&original_cwd).unwrap();
-        let vp = result.expect("unsaved-buffer validation must succeed");
-        assert!(vp.as_path().ends_with("sibling.yaml"));
+            fs::write(base.join("sibling.yaml"), "pipeline: {name: x}").unwrap();
+            let vp = validate_path(Path::new("sibling.yaml"), &base, false)
+                .expect("unsaved-buffer validation must succeed");
+            assert_eq!(vp.as_path(), base.join("sibling.yaml"));
+            return;
+        }
+
+        // CWD is process-wide. Changing it here races concurrent planner tests
+        // that capture a default workspace and may outlive this directory.
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "security::tests::test_unsaved_buffer_uses_cwd_base",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .current_dir(dir.path())
+            .output()
+            .expect("run isolated working-directory test");
+        assert!(
+            output.status.success(),
+            "isolated test failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "the child must execute the exact test, not an empty filter"
+        );
     }
 
     // ── compile() pre-pass scaffold ───────────────────────────────

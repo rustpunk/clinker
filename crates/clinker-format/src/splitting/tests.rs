@@ -11,7 +11,7 @@ use clinker_record::{Record, Schema, Value};
 
 use super::*;
 use crate::counting::{CountingWriter, SharedByteCounter};
-use crate::csv::writer::{CsvWriter, CsvWriterConfig};
+use crate::csv::writer::{CsvEncoder, CsvWriterConfig};
 use crate::traits::FormatWriter;
 
 // ---------------------------------------------------------------------------
@@ -92,47 +92,65 @@ fn make_record(schema: &SharedStorage<Schema>, values: Vec<Value>) -> Record {
     Record::new(schema.clone(), values)
 }
 
-/// Build a CSV writer factory with header capture support.
-///
-/// Creates `HeaderCapturingCsvWriter` on first call (captures header from
-/// first record into shared state). Subsequent calls create a `CsvWriter`
-/// and replay the captured header via `write_preset_header()`.
+/// Build a finite prepared CSV factory sharing successful header captures.
 fn csv_writer_factory(config: CsvWriterConfig, repeat_header: bool) -> WriterFactory {
-    let shared_header: Arc<Mutex<Option<Vec<Box<str>>>>> = Arc::new(Mutex::new(None));
-    let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-
-    Box::new(
-        move |counting: CountingWriter<Box<dyn Write + Send>>, schema: SharedStorage<Schema>| {
-            let seq = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if seq == 0 {
-                // First file: use HeaderCapturingCsvWriter to capture header
-                use crate::csv::writer::HeaderCapturingCsvWriter;
-                let csv = CsvWriter::new(counting, schema.clone(), config.clone());
-                Ok(Box::new(HeaderCapturingCsvWriter::new(
-                    csv,
-                    schema.clone(),
-                    Arc::clone(&shared_header),
-                )) as Box<dyn FormatWriter>)
+    use crate::csv::writer::{CsvEncoder, CsvEncoderConfig, CsvHeaderCapture};
+    let provider = crate::preparation::MemoryOnlyResources::new(
+        std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+    );
+    let resources = provider.resources();
+    let options = crate::csv::writer::CsvEncoderOptions::from(&config);
+    let subsequent =
+        (!repeat_header && options.include_header && config.envelope.is_none()).then(|| {
+            CsvEncoderConfig::new(
+                crate::csv::writer::CsvEncoderOptions {
+                    include_header: false,
+                    ..options
+                },
+                &resources,
+            )
+            .unwrap()
+        });
+    let config = CsvEncoderConfig::new(options, &resources).unwrap();
+    let capture = repeat_header.then(|| CsvHeaderCapture::new(&resources).unwrap());
+    let opened = std::cell::Cell::new(false);
+    let scope = resources.allocation().scope().unwrap();
+    WriterFactory::try_new(
+        move |counting, schema| {
+            let policy = if opened.get() {
+                subsequent.as_ref().unwrap_or(&config)
             } else {
-                // Subsequent files: replay captured header
-                let mut csv = CsvWriter::new(counting, schema.clone(), config.clone());
-                if repeat_header && let Some(ref header) = *shared_header.lock().unwrap() {
-                    csv.write_preset_header(header)?;
-                }
-                Ok(Box::new(csv) as Box<dyn FormatWriter>)
-            }
+                &config
+            };
+            let encoder = CsvEncoder::from_config(schema, policy.clone(), resources.clone())?;
+            let encoder = match &capture {
+                Some(capture) => encoder.with_header_capture(capture.clone()),
+                None => encoder,
+            };
+            let writer = encoder.into_boxed_writer(counting, resources.clone())?;
+            opened.set(true);
+            Ok(writer)
         },
+        &scope,
     )
+    .unwrap()
 }
 
 /// Build a simple CSV writer factory (no header capture — for tests with `include_header: false`).
 fn csv_writer_factory_simple(config: CsvWriterConfig) -> WriterFactory {
-    Box::new(
+    let provider = crate::preparation::MemoryOnlyResources::new(
+        std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+    );
+    let resources = provider.resources();
+    let scope = resources.allocation().scope().unwrap();
+    WriterFactory::try_new(
         move |counting: CountingWriter<Box<dyn Write + Send>>, schema: SharedStorage<Schema>| {
-            let csv = CsvWriter::new(counting, schema, config.clone());
-            Ok(Box::new(csv) as Box<dyn FormatWriter>)
+            let encoder = CsvEncoder::new(schema, &config, resources.clone())?;
+            encoder.into_boxed_writer(counting, resources.clone())
         },
+        &scope,
     )
+    .unwrap()
 }
 
 fn count_csv_data_rows(csv_text: &str) -> usize {
@@ -740,12 +758,13 @@ fn test_splitting_writer_json_produces_valid_files() {
         envelope: None,
     };
 
-    let json_factory: WriterFactory = Box::new(
+    let json_factory = WriterFactory::from_legacy(
         move |counting: CountingWriter<Box<dyn Write + Send>>, schema: SharedStorage<Schema>| {
-            Ok(
-                Box::new(JsonWriter::new(counting, schema, json_config.clone()))
-                    as Box<dyn FormatWriter>,
-            )
+            Ok(FormatWriterHandle::from_legacy(Box::new(JsonWriter::new(
+                counting,
+                schema,
+                json_config.clone(),
+            ))))
         },
     );
 
@@ -808,12 +827,13 @@ fn test_splitting_writer_xml_produces_valid_files() {
         ..Default::default()
     };
 
-    let xml_factory: WriterFactory = Box::new(
+    let xml_factory = WriterFactory::from_legacy(
         move |counting: CountingWriter<Box<dyn Write + Send>>, schema: SharedStorage<Schema>| {
-            Ok(
-                Box::new(XmlWriter::new(counting, schema, xml_config.clone()))
-                    as Box<dyn FormatWriter>,
-            )
+            Ok(FormatWriterHandle::from_legacy(Box::new(XmlWriter::new(
+                counting,
+                schema,
+                xml_config.clone(),
+            ))))
         },
     );
 
@@ -880,12 +900,13 @@ fn test_splitting_writer_json_array_byte_split_valid_files() {
         envelope: None,
     };
 
-    let json_factory: WriterFactory = Box::new(
+    let json_factory = WriterFactory::from_legacy(
         move |counting: CountingWriter<Box<dyn Write + Send>>, schema: SharedStorage<Schema>| {
-            Ok(
-                Box::new(JsonWriter::new(counting, schema, json_config.clone()))
-                    as Box<dyn FormatWriter>,
-            )
+            Ok(FormatWriterHandle::from_legacy(Box::new(JsonWriter::new(
+                counting,
+                schema,
+                json_config.clone(),
+            ))))
         },
     );
 
@@ -976,12 +997,13 @@ fn test_splitting_writer_xml_byte_split_valid_files() {
         ..Default::default()
     };
 
-    let xml_factory: WriterFactory = Box::new(
+    let xml_factory = WriterFactory::from_legacy(
         move |counting: CountingWriter<Box<dyn Write + Send>>, schema: SharedStorage<Schema>| {
-            Ok(
-                Box::new(XmlWriter::new(counting, schema, xml_config.clone()))
-                    as Box<dyn FormatWriter>,
-            )
+            Ok(FormatWriterHandle::from_legacy(Box::new(XmlWriter::new(
+                counting,
+                schema,
+                xml_config.clone(),
+            ))))
         },
     );
 
@@ -1052,8 +1074,10 @@ fn hook_probe_splitter() -> (SplittingWriter, Arc<Mutex<Vec<String>>>) {
     let registry = FileRegistry::new();
     let log = Arc::new(Mutex::new(Vec::new()));
     let log_for_factory = Arc::clone(&log);
-    let writer_factory: WriterFactory = Box::new(move |_counting, _schema| {
-        Ok(Box::new(HookProbe::with_log(Arc::clone(&log_for_factory))) as Box<dyn FormatWriter>)
+    let writer_factory = WriterFactory::from_legacy(move |_counting, _schema| {
+        Ok(FormatWriterHandle::from_legacy(Box::new(
+            HookProbe::with_log(Arc::clone(&log_for_factory)),
+        )))
     });
     let policy = SplitPolicy {
         max_records: None,

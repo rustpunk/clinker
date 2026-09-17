@@ -6,22 +6,36 @@ soft or hard memory threshold trips, rather than running the process out of
 memory. By default those spill files land in the operating system's temporary
 directory. The `[storage]` block in `clinker.toml` lets you redirect them.
 
-## Output preparation in library integrations
+## Output preparation
 
-Library integrations can prepare a complete output operation before sending
-its bytes to a destination. This API requires a finite memory budget and uses
-temporary disk storage only when a spill location is explicitly supplied.
-Temporary files remain charged until their removal is confirmed, including
-when cleanup must be retried. A failed cleanup is not free disk capacity.
+CSV output in the CLI and executor prepares each complete output operation
+before delivering its bytes. The first body row and its automatic header share
+one operation; explicit document start and end are separate operations. The
+same finite-resource preparation API is available to library integrations.
 
-Failure before delivery writes nothing. Once destination delivery starts,
-ordinary I/O can accept a prefix before failing, so the writer refuses further
-operations after a delivery error. Preparation does not promise atomic
-publication to an arbitrary destination.
+Prepared CSV bytes stay in memory unless `storage.spill.dir` supplies an explicit
+spill location. This differs from the operator spill default described below:
+output preparation does not silently use the operating system's temporary
+directory. Configured spill uses the run's disk budget and a finite descriptor
+allowance. It does not remove the memory required for a rendered cell or retained
+header. See [Memory Tuning](memory.md#what-the-budget-measures).
 
-This additive library API has not yet been connected to the CLI's existing
-format writers. It adds no storage setting and changes neither the configured
-spill defaults below nor the separate publication controls.
+Failure before delivery writes none of that operation's bytes. Once delivery
+starts, ordinary I/O can accept a prefix before failing. The writer then refuses
+further operations, including flush, so the original failure is not hidden by
+later calls. Prepared bytes and accepted destination bytes are different counts;
+a partly delivered operation does not become a committed record.
+
+Temporary files remain charged until their removal is confirmed, including when
+cleanup must be retried. Dropping a handle or requesting cancellation does not
+turn failed cleanup into free disk capacity. Resource telemetry can be dropped
+when its fixed arena is full; admission, output and cleanup do not depend on
+those signals being retained.
+
+These rules add no storage setting and make no atomic-publication promise for
+an arbitrary destination. [Output publication](#output-publication-and-retained-attempts)
+governs the separate file-publication boundary. Other format writers retain their
+existing behavior; CSV preparation does not establish all-format migration.
 
 ## The `[storage]` block
 
@@ -31,7 +45,7 @@ the per-pipeline YAML:
 
 ```toml
 [storage.spill]
-dir = "/var/clinker/spill"   # optional; default = OS temp dir
+dir = "/var/clinker/spill"   # optional; operator default = OS temp dir
 disk_cap_bytes = "10GB"      # optional; default = unlimited
 compress = "auto"            # optional; auto | off | on   (default = auto)
 
@@ -47,8 +61,8 @@ failed_retention_seconds = 86400   # 24 hours; zero is allowed
 ```
 
 The whole block is optional. With no `clinker.toml`, or a `clinker.toml` that
-omits `[storage]`, Clinker spills to the OS temp directory exactly as it
-always has.
+omits `[storage]`, blocking operators spill to the OS temp directory. CSV
+output preparation stays in memory unless `storage.spill.dir` is set.
 
 ## Table names are checked
 

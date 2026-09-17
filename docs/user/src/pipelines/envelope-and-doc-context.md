@@ -78,9 +78,8 @@ how `dlq_granularity: document` dead-letters a malformed file instead of
 aborting the run.
 
 The pre-scan reads the envelope-bearing segments of the file before
-body streaming begins. Envelope payloads are small (a few hundred bytes
-per document is typical), and how much of the file the reader retains to
-reach a trailing section depends on the format:
+body streaming begins. The amount of retained data depends on the declared
+sections, their payloads, and the format's path to a trailing section:
 
 - **JSON** streams the pre-scan. The reader walks the document once and
   deserializes *only* the subtrees the declared sections point at —
@@ -98,8 +97,18 @@ reach a trailing section depends on the format:
   backs both the body parser and the pre-scan), but the pre-scan no longer
   materializes the undeclared section subtrees.
 
-Only the envelope sections live in the document context — body records
-still flow through the pipeline one at a time, for every format.
+For multi-record CSV, retained section names, field names, values and document
+containers carry allocation ownership against the run's finite memory budget.
+Their charge lasts through downstream document use and any surviving aliases.
+A repeated header does not create an unbounded history of section snapshots;
+resource refusal remains fatal even under `strategy: continue`. CSV accepts the
+same UTF-8 and Latin-1 policy for section cells as for body cells.
+
+Only the envelope sections live in the document context. This separation does
+not mean the executor retains only one body record: downstream Source and
+Combine paths can still materialize whole inputs. See
+[what the memory budget measures](../ops/memory.md#what-the-budget-measures).
+Other formats' existing document-index limits remain as described below.
 
 ### Bounding envelope retention with `max_index_bytes`
 

@@ -21,9 +21,16 @@
 //! whole run is wrapped in a wall-clock timeout so a regression to a stall
 //! fails fast instead of hanging CI.
 //!
+//! CSV fixtures are decoded before either run using the real configured reader.
+//! This isolates operator spill behavior from decoder admission competing for
+//! the deliberately tight aggregate budget. Both runs retain the same typed
+//! records and physical file boundary; whole-input CSV admission is covered by
+//! the format-resource tests, not this spill-directory fault test.
+//!
 //! [`SpillDir`]: crate::executor::spill_purge::SpillDir
 //! [`SpillError::DirUnavailable`]: clinker_plan::SpillError::DirUnavailable
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::mpsc;
@@ -35,7 +42,7 @@ use clinker_plan::config::{CompileContext, PipelineConfig};
 use clinker_plan::error::PipelineError;
 
 use crate::executor::spill_purge;
-use crate::executor::{PipelineExecutor, PipelineRunParams, SourceReaders, single_file_reader};
+use crate::executor::{PipelineExecutor, PipelineRunParams};
 
 // A layout-derived memory budget forces the HashAggregator's dual-threshold spill:
 // with many distinct keys the group count crosses the budget-derived
@@ -97,10 +104,55 @@ nodes:
 
 const ROWS: usize = 4_000;
 
-fn config_with_materialization_headroom() -> PipelineConfig {
+fn config_with_writer_headroom(root: &std::path::Path, csv: &str) -> PipelineConfig {
+    use clinker_record::{Record, Schema, Value};
+    use std::sync::Arc;
     let config: PipelineConfig = clinker_plan::yaml::from_str(PIPELINE_YAML).unwrap();
+    let document_bytes = crate::test_support::single_csv_document_metadata_bytes(
+        &config,
+        &CompileContext::default(),
+        &[("events", csv)],
+    );
     let plan = config.compile(&CompileContext::default()).unwrap();
-    // Retain the original spare allowance above the actual compiled row layout.
+    let arb = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+        1024 * 1024,
+        0.8,
+        0.7,
+        Box::new(crate::pipeline::memory::NoOpPolicy),
+    ));
+    let provider = crate::executor::preparation::ExecutorResources::with_spill_root(
+        arb.clone(),
+        crate::pipeline::shutdown::ShutdownToken::detached(),
+        Some(root),
+        std::num::NonZeroUsize::new(2).unwrap(),
+        None,
+    )
+    .unwrap();
+    let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["k".into(), "n".into()])));
+    let mut writer = crate::executor::registry::build_format_writer(
+        plan.config().sink_configs().next().unwrap(),
+        Box::new(std::io::sink()),
+        schema.clone(),
+        crate::output::staging::OutputStagingRegistry::default(),
+        None,
+        provider.resources(),
+    )
+    .unwrap();
+    writer
+        .write_record(&Record::new(
+            schema,
+            vec![Value::String("key_3999".into()), Value::Integer(1)],
+        ))
+        .unwrap();
+    writer.flush().unwrap();
+    let headroom = arb.writer_resource_usage().peak_memory;
+    assert!(
+        headroom > 0 && headroom < 64 * 1024,
+        "unexpected writer workspace: {headroom}"
+    );
+    // Preserve the original spare allowance above the materialized output,
+    // while deriving the output itself from its compiled record layout. Both
+    // runs keep the same distinct-key workload and prove a real aggregate spill.
     const MATERIALIZATION_SPARE: u64 = 655_360 - 608_000;
     let dag = plan.dag();
     let aggregate = dag
@@ -108,11 +160,18 @@ fn config_with_materialization_headroom() -> PipelineConfig {
         .node_indices()
         .find(|idx| dag.graph[*idx].name() == "by_key")
         .expect("aggregate node exists");
+    // Compiled columns include the engine-owned identity carried to the sink.
     let width = dag.graph[aggregate].output_schema_in(dag).column_count();
     let materialized = super::super::node_buffer::record_byte_cost(width) * ROWS as u64;
+    let aggregate_allowance = materialized + MATERIALIZATION_SPARE;
+    eprintln!(
+        "admitted CSV writer headroom: {headroom} bytes; aggregate allowance: {aggregate_allowance} bytes; empty document metadata: {document_bytes} bytes"
+    );
+    // One admitted empty document stays live alongside the existing writer
+    // workspace and materialized output; this is measured storage, not padding.
     clinker_plan::yaml::from_str(&PIPELINE_YAML.replace(
         "655360",
-        &(materialized + MATERIALIZATION_SPARE).to_string(),
+        &(aggregate_allowance + headroom + document_bytes).to_string(),
     ))
     .unwrap()
 }
@@ -137,18 +196,15 @@ fn spill_dir_removed_mid_run_surfaces_dir_unavailable_without_panic_or_stall() {
     let spill_root_path = spill_root.path().to_path_buf();
 
     let csv = build_events_csv();
-    let config = config_with_materialization_headroom();
+    let config = config_with_writer_headroom(spill_root.path(), &csv);
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile pipeline");
 
-    let mut readers: SourceReaders = HashMap::new();
-    readers.insert(
-        "events".to_string(),
-        single_file_reader(
-            "events.csv",
-            Box::new(std::io::Cursor::new(csv.into_bytes())),
-        ),
+    let readers = crate::test_support::predecoded_csv_readers(
+        &config,
+        &CompileContext::default(),
+        &[("events", &csv)],
     );
 
     let out = SharedBuffer::new();
@@ -242,23 +298,22 @@ fn unarmed_seam_lets_a_real_spilling_run_complete() {
     let spill_root_path = spill_root.path().to_path_buf();
 
     let csv = build_events_csv();
-    let config = config_with_materialization_headroom();
+    let config = config_with_writer_headroom(spill_root.path(), &csv);
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile pipeline");
 
-    let mut readers: SourceReaders = HashMap::new();
-    readers.insert(
-        "events".to_string(),
-        single_file_reader(
-            "events.csv",
-            Box::new(std::io::Cursor::new(csv.into_bytes())),
-        ),
+    let readers = crate::test_support::predecoded_csv_readers(
+        &config,
+        &CompileContext::default(),
+        &[("events", &csv)],
     );
 
     let out = SharedBuffer::new();
-    let writers: HashMap<String, Box<dyn Write + Send>> =
-        HashMap::from([("out".to_string(), Box::new(out) as Box<dyn Write + Send>)]);
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(out.clone()) as Box<dyn Write + Send>,
+    )]);
 
     let params = PipelineRunParams {
         execution_id: "spill-dir-unarmed-control".to_string(),
@@ -283,4 +338,15 @@ fn unarmed_seam_lets_a_real_spilling_run_complete() {
         "the tiny budget must have driven a real disk spill; otherwise the armed test would not \
          exercise the spill-open fault seam"
     );
+    // Hash aggregation does not promise output order. Compare every literal
+    // row after sorting, preserving duplicates so missing/repeated groups fail.
+    let output = String::from_utf8(out.contents()).expect("CSV output is UTF-8");
+    let (header, body) = output.split_once('\n').expect("CSV output has a header");
+    assert_eq!(header, "k,n");
+    assert!(body.ends_with('\n'), "CSV output ends with a full record");
+    let mut actual: Vec<_> = body.split_inclusive('\n').collect();
+    actual.sort_unstable();
+    let mut expected: Vec<_> = (0..ROWS).map(|i| format!("key_{i},1\n")).collect();
+    expected.sort_unstable();
+    assert_eq!(actual, expected, "every distinct key has exactly one input");
 }
