@@ -20,7 +20,10 @@
 //! consumer's drain re-emits the same `(Record, SourceRowId)` pairs the
 //! producer wrote.
 
+#[cfg(test)]
+use clinker_record::owned_storage::SharedStorage;
 use std::path::Path;
+#[cfg(test)]
 use std::sync::Arc;
 
 use clinker_record::Record;
@@ -53,7 +56,7 @@ where
     let Some((first, _)) = rows.first() else {
         return Ok(None);
     };
-    let schema = Arc::clone(first.schema());
+    let schema = first.schema().clone();
     let mut writer: SpillWriter<SourceRowId> = SpillWriter::new(schema, spill_dir, compress)?;
     let count = rows.len() as u64;
     for (record, rn) in &rows {
@@ -70,15 +73,12 @@ mod tests {
 
     use crate::executor::node_buffer::NodeBuffer;
 
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec!["id".into(), "v".into()]))
+    fn schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "v".into()])))
     }
 
-    fn rec(s: &Arc<Schema>, id: i64, v: &str) -> Record {
-        Record::new(
-            Arc::clone(s),
-            vec![Value::Integer(id), Value::String(v.into())],
-        )
+    fn rec(s: &SharedStorage<Schema>, id: i64, v: &str) -> Record {
+        Record::new(s.clone(), vec![Value::Integer(id), Value::String(v.into())])
     }
 
     #[test]

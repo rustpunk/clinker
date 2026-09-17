@@ -57,6 +57,7 @@
 //! diagnostic, naming the offending `partition_by` group, rather than risking
 //! an out-of-memory crash on reload.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -71,7 +72,7 @@ use crate::executor::dispatch::{
     crosses_into_deferred_consumer, node_buffer_spill_allowed,
     require_single_input_node_buffer_slot, source_file_arc_of, source_name_arc_of,
 };
-use crate::executor::node_buffer::record_byte_cost;
+use crate::executor::node_buffer::unaccounted_record_byte_cost;
 use crate::executor::{GroupedNodeKind, giant_group_error};
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
@@ -297,7 +298,7 @@ fn run_cull_grouped(
     node_idx: NodeIndex,
     name: &str,
     config: &CullBody,
-    output_schema: &Arc<Schema>,
+    output_schema: &SharedStorage<Schema>,
     compiled: &Arc<cxl::plan::CompiledAggregate>,
     typed: &Arc<cxl::typecheck::TypedProgram>,
     input: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
@@ -325,11 +326,15 @@ fn run_cull_grouped(
     let budget = Arc::clone(&ctx.memory_budget);
     let spill_root = Arc::clone(&ctx.spill_root_path);
 
-    let mut buffer = CullGroupBuffer::new(Arc::clone(&input_schema), spill_compress);
+    let mut buffer = CullGroupBuffer::new(
+        input_schema.clone(),
+        spill_compress,
+        ctx.allocation_resources.clone(),
+    );
     for (record, row_num) in input {
         let key = partition_key(name, &record, &config.partition_by)?;
         buffer.push(key, record, row_num);
-        handle.set_bytes(buffer.resident_bytes() as u64);
+        handle.set_bytes(buffer.unaccounted_resident_bytes() as u64);
         // Poll for self-spill pressure at every admission. `should_spill_self`
         // updates the peak and reports the soft-threshold crossing WITHOUT
         // running the pausing arbitration round: Cull relieves pressure by
@@ -340,7 +345,7 @@ fn run_cull_grouped(
         // stage's arbitration round set on this consumer.
         if budget.should_spill_self() || handle.take_spill_request() {
             buffer.spill_until_under_budget(name, &budget, &spill_root, handle)?;
-            handle.set_bytes(buffer.resident_bytes() as u64);
+            handle.set_bytes(buffer.unaccounted_resident_bytes() as u64);
         }
     }
 
@@ -355,7 +360,7 @@ fn run_cull_grouped(
     let group_order = buffer.take_group_order();
     for key in group_order {
         let mut group = buffer.take_group(name, &config.partition_by, &key, hard_limit)?;
-        handle.set_bytes(buffer.resident_bytes() as u64);
+        handle.set_bytes(buffer.unaccounted_resident_bytes() as u64);
         if !config.order_by.is_empty() {
             sort_group(&mut group, &config.order_by);
         }
@@ -430,14 +435,14 @@ fn compute_drop_decisions(
     // Spill schema is unused (the predicate aggregate runs in-memory: budget
     // 0 disables the group-count cap and `spill_dir: None` keeps every group
     // resident), but `AggregatorConfig` still requires a value.
-    let drop_output_schema: Arc<Schema> = config
+    let drop_output_schema: SharedStorage<Schema> = config
         .partition_by
         .iter()
         .map(|s| Box::<str>::from(s.as_str()))
         .chain([Box::<str>::from(DROP_DECISION_COLUMN)])
         .collect::<SchemaBuilder>()
         .build();
-    let spill_schema: Arc<Schema> = config
+    let spill_schema: SharedStorage<Schema> = config
         .partition_by
         .iter()
         .map(|s| Box::<str>::from(s.as_str()))
@@ -449,7 +454,7 @@ fn compute_drop_decisions(
     let mut stream = HashAggregator::new(AggregatorConfig {
         compiled: Arc::clone(compiled),
         evaluator,
-        output_schema: Arc::clone(&drop_output_schema),
+        output_schema: drop_output_schema.clone(),
         spill_schema,
         // In-memory only: the raw-record buffer carries the spill burden,
         // and the aggregate state is O(groups) — never spilled. The ingest
@@ -513,8 +518,12 @@ fn compute_drop_decisions(
     let per_entry = std::mem::size_of::<(Vec<GroupByKey>, bool)>()
         + config.partition_by.len() * std::mem::size_of::<GroupByKey>();
     let decisions_bytes = (emitted.len() as u64).saturating_mul(per_entry as u64);
-    let emitted_bytes =
-        record_byte_cost(drop_output_schema.column_count()).saturating_mul(emitted.len() as u64);
+    let emitted_bytes = emitted.iter().fold(0u64, |bytes, (record, _)| {
+        bytes.saturating_add(unaccounted_record_byte_cost(
+            record,
+            &ctx.allocation_resources,
+        ))
+    });
     let projected = ctx
         .memory_budget
         .sum_consumer_usage()
@@ -710,6 +719,7 @@ type CullSpillPayload = (u64, crate::executor::stream_event::SourceRowId);
 struct CullGroupState {
     resident: Vec<BufferedRecord>,
     resident_bytes: usize,
+    unaccounted_resident_bytes: usize,
     spilled_bytes: usize,
     spilled: Vec<SpillFile<CullSpillPayload>>,
 }
@@ -719,6 +729,7 @@ impl CullGroupState {
         Self {
             resident: Vec::new(),
             resident_bytes: 0,
+            unaccounted_resident_bytes: 0,
             spilled_bytes: 0,
             spilled: Vec::new(),
         }
@@ -735,28 +746,41 @@ impl CullGroupState {
 /// — resident records plus reloaded spill slices in arrival order — and split
 /// onto the output ports.
 struct CullGroupBuffer {
-    input_schema: Arc<Schema>,
+    allocation_resources: clinker_record::owned_storage::AllocationResources,
+    input_schema: SharedStorage<Schema>,
     compress: bool,
     group_order: Vec<Vec<GroupByKey>>,
     groups: HashMap<Vec<GroupByKey>, CullGroupState>,
     resident_bytes: usize,
+    unaccounted_resident_bytes: usize,
     next_seq: u64,
 }
 
 impl CullGroupBuffer {
-    fn new(input_schema: Arc<Schema>, compress: bool) -> Self {
+    fn new(
+        input_schema: SharedStorage<Schema>,
+        compress: bool,
+        allocation_resources: clinker_record::owned_storage::AllocationResources,
+    ) -> Self {
         Self {
             input_schema,
+            allocation_resources,
             compress,
             group_order: Vec::new(),
             groups: HashMap::new(),
             resident_bytes: 0,
+            unaccounted_resident_bytes: 0,
             next_seq: 0,
         }
     }
 
+    #[cfg(test)]
     fn resident_bytes(&self) -> usize {
         self.resident_bytes
+    }
+
+    fn unaccounted_resident_bytes(&self) -> usize {
+        self.unaccounted_resident_bytes
     }
 
     /// Admit one record into its group, stamping a Cull-local admission
@@ -768,6 +792,7 @@ impl CullGroupBuffer {
         row_num: crate::executor::stream_event::SourceRowId,
     ) {
         let bytes = estimated_input_bytes(&record);
+        let unaccounted = unaccounted_input_bytes(&record, &self.allocation_resources);
         let seq = self.next_seq;
         self.next_seq += 1;
         let order = &mut self.group_order;
@@ -782,6 +807,8 @@ impl CullGroupBuffer {
         });
         state.resident_bytes += bytes;
         self.resident_bytes += bytes;
+        state.unaccounted_resident_bytes += unaccounted;
+        self.unaccounted_resident_bytes += unaccounted;
     }
 
     /// Take the first-seen group order, consuming it for the finalize drain.
@@ -812,7 +839,7 @@ impl CullGroupBuffer {
             } else {
                 self.spill_group_whole(node_name, budget, spill_root, &key)?;
             }
-            handle.set_bytes(self.resident_bytes as u64);
+            handle.set_bytes(self.unaccounted_resident_bytes as u64);
         }
         Ok(())
     }
@@ -842,6 +869,7 @@ impl CullGroupBuffer {
         let records = std::mem::take(&mut state.resident);
         let freed = std::mem::take(&mut state.resident_bytes);
         self.resident_bytes -= freed;
+        self.unaccounted_resident_bytes -= std::mem::take(&mut state.unaccounted_resident_bytes);
         let file = write_spill_slice(
             node_name,
             budget,
@@ -880,6 +908,7 @@ impl CullGroupBuffer {
         let resident = std::mem::take(&mut state.resident);
         let total_bytes = std::mem::take(&mut state.resident_bytes);
         self.resident_bytes -= total_bytes;
+        self.unaccounted_resident_bytes -= std::mem::take(&mut state.unaccounted_resident_bytes);
 
         let parts_wanted = total_bytes.div_ceil(soft.max(1)).max(2);
         let bits =
@@ -926,7 +955,13 @@ impl CullGroupBuffer {
             .groups
             .get_mut(key)
             .expect("partition-spill target group present");
+        let retained_unaccounted = tail
+            .iter()
+            .map(|row| unaccounted_input_bytes(&row.record, &self.allocation_resources))
+            .sum::<usize>();
         state.resident = tail;
+        state.unaccounted_resident_bytes = retained_unaccounted;
+        self.unaccounted_resident_bytes += retained_unaccounted;
         state.resident_bytes = remaining;
         state.spilled_bytes += spilled_now;
         state.spilled.extend(spilled_files);
@@ -962,6 +997,7 @@ impl CullGroupBuffer {
     ) -> Result<Vec<(Record, crate::executor::stream_event::SourceRowId)>, PipelineError> {
         let state = self.groups.remove(key).expect("group key present in order");
         self.resident_bytes -= state.resident_bytes;
+        self.unaccounted_resident_bytes -= state.unaccounted_resident_bytes;
 
         let group_bytes = (state.resident_bytes + state.spilled_bytes) as u64;
         if hard_limit > 0 && group_bytes > hard_limit {
@@ -1008,12 +1044,12 @@ fn write_spill_slice<'a>(
     node_name: &str,
     budget: &MemoryArbitrator,
     spill_root: &std::path::Path,
-    input_schema: &Arc<Schema>,
+    input_schema: &SharedStorage<Schema>,
     compress: bool,
     records: impl Iterator<Item = &'a BufferedRecord>,
 ) -> Result<SpillFile<CullSpillPayload>, PipelineError> {
     let mut writer: SpillWriter<CullSpillPayload> =
-        SpillWriter::new(Arc::clone(input_schema), Some(spill_root), compress)
+        SpillWriter::new(input_schema.clone(), Some(spill_root), compress)
             .map_err(|e| cull_spill_error(node_name, e))?;
     for buffered in records {
         writer
@@ -1039,6 +1075,14 @@ fn write_spill_slice<'a>(
 /// owning [`BufferedRecord`] header overhead.
 fn estimated_input_bytes(record: &Record) -> usize {
     record.estimated_heap_size() + std::mem::size_of::<BufferedRecord>()
+}
+
+/// Contribution of the actual row excluding only allocations charged by this run.
+fn unaccounted_input_bytes(
+    record: &Record,
+    resources: &clinker_record::owned_storage::AllocationResources,
+) -> usize {
+    record.unaccounted_heap_size(resources) + std::mem::size_of::<BufferedRecord>()
 }
 
 /// Extract the `partition_by` key tuple from a record, using the **exact**
@@ -1180,8 +1224,8 @@ mod tests {
     use clinker_plan::plan::{EntityRef, PlanNodeId};
     use clinker_record::Schema;
 
-    fn record(schema: &Arc<Schema>, account: Value) -> Record {
-        Record::new(Arc::clone(schema), vec![account])
+    fn record(schema: &SharedStorage<Schema>, account: Value) -> Record {
+        Record::new(schema.clone(), vec![account])
     }
 
     /// An arbitrator whose soft limit is `soft_bytes` and whose seeded peak
@@ -1200,9 +1244,225 @@ mod tests {
     // `Null`. The dispatch buffer MUST key identically, or an empty-string row
     // and a null row would merge in one but split in the other, and the merged
     // group would be routed by whichever decision the HashMap inserted last.
+    fn admitted_input(
+        schema: &SharedStorage<Schema>,
+        resources: &clinker_record::owned_storage::AllocationResources,
+        value: Value,
+    ) -> Record {
+        let scope = resources.scope().unwrap();
+        let mut values =
+            clinker_record::owned_storage::OwnedValues::try_with_capacity(8, &scope).unwrap();
+        values.try_push(value, &scope).unwrap();
+        Record::from_owned_values(schema.clone(), values).unwrap()
+    }
+
+    #[test]
+    fn group_cache_classifies_mixed_vector_and_leaf_authorities_per_row() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        let local = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let foreign = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let resources = local.resources().allocation().clone();
+        let foreign_resources = foreign.resources().allocation().clone();
+        let local_text =
+            clinker_record::FieldStr::try_new(&"local".repeat(100), &resources.scope().unwrap())
+                .unwrap();
+        let foreign_text = clinker_record::FieldStr::try_new(
+            &"foreign".repeat(100),
+            &foreign_resources.scope().unwrap(),
+        )
+        .unwrap();
+        let local_leaf = local.used();
+        let foreign_leaf = foreign.used();
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["v".into()])));
+        let rows = [
+            admitted_input(&schema, &resources, Value::String(local_text.clone())),
+            admitted_input(&schema, &resources, Value::String(foreign_text.clone())),
+            admitted_input(
+                &schema,
+                &foreign_resources,
+                Value::String(local_text.clone()),
+            ),
+            Record::new(schema.clone(), vec![Value::String(local_text.clone())]),
+        ];
+        let key = vec![GroupByKey::Null];
+        let mut buffer = CullGroupBuffer::new(schema, false, resources.clone());
+        let mut physical = 0;
+        let mut relative = 0;
+        for (i, row) in rows.into_iter().enumerate() {
+            physical += estimated_input_bytes(&row);
+            relative += unaccounted_input_bytes(&row, &resources);
+            buffer.push(key.clone(), row, (i as u64).into());
+            assert_eq!(buffer.resident_bytes(), physical);
+            assert_eq!(buffer.unaccounted_resident_bytes(), relative);
+            assert_eq!(buffer.groups[&key].unaccounted_resident_bytes, relative);
+        }
+        assert!(physical > relative);
+        let rows = buffer
+            .take_group("mixed", &["v".into()], &key, u64::MAX)
+            .unwrap();
+        assert_eq!(buffer.resident_bytes(), 0);
+        assert_eq!(buffer.unaccounted_resident_bytes(), 0);
+        assert_eq!(
+            rows.iter()
+                .map(|(r, _)| unaccounted_input_bytes(r, &resources))
+                .sum::<usize>(),
+            relative
+        );
+        drop(rows);
+        assert_eq!(local.used(), local_leaf);
+        assert_eq!(foreign.used(), foreign_leaf);
+        drop(local_text);
+        drop(foreign_text);
+        assert_eq!(local.used(), 0);
+        assert_eq!(foreign.used(), 0);
+    }
+
+    #[test]
+    fn failed_group_spills_preserve_sibling_caches_and_escaped_grants() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        for partitioned in [false, true] {
+            let owner = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+            let foreign =
+                MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+            let resources = owner.resources().allocation().clone();
+            let escaped = clinker_record::FieldStr::try_new(
+                &"foreign".repeat(100),
+                &foreign.resources().allocation().scope().unwrap(),
+            )
+            .unwrap();
+            let leaf_bytes = foreign.used();
+            let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["v".into()])));
+            let failing = vec![GroupByKey::Null];
+            let sibling = vec![GroupByKey::Str("sibling".into())];
+            let mut buffer = CullGroupBuffer::new(schema.clone(), false, resources.clone());
+            buffer.push(
+                sibling.clone(),
+                admitted_input(&schema, &resources, Value::Integer(9)),
+                99u64.into(),
+            );
+            let sibling_intrinsic = owner.used();
+            let sibling_physical = buffer.resident_bytes();
+            let sibling_relative = buffer.unaccounted_resident_bytes();
+            for i in 0..32u64 {
+                buffer.push(
+                    failing.clone(),
+                    admitted_input(&schema, &resources, Value::String(escaped.clone())),
+                    i.into(),
+                );
+            }
+            let handle = ConsumerHandle::new();
+            let published = buffer.unaccounted_resident_bytes() as u64;
+            handle.set_bytes(published);
+            let arb = arbitrator(1024 * 1024);
+            let dir = tempfile::tempdir().unwrap();
+            let unavailable = dir.path().join("missing").join("spill");
+            let result = if partitioned {
+                buffer.spill_group_partitioned("failure", &arb, &unavailable, &failing, 1)
+            } else {
+                buffer.spill_group_whole("failure", &arb, &unavailable, &failing)
+            };
+            assert!(result.is_err());
+            assert_eq!(buffer.resident_bytes(), sibling_physical);
+            assert_eq!(buffer.unaccounted_resident_bytes(), sibling_relative);
+            assert!(buffer.groups[&failing].resident.is_empty());
+            assert_eq!(buffer.groups[&failing].unaccounted_resident_bytes, 0);
+            assert_eq!(owner.used(), sibling_intrinsic);
+            assert_eq!(foreign.used(), leaf_bytes);
+            assert_eq!(
+                handle.bytes(),
+                published,
+                "failed write leaves a conservative published value until dispatch cleanup"
+            );
+            let rows = buffer
+                .take_group("failure", &["v".into()], &sibling, u64::MAX)
+                .unwrap();
+            assert_eq!(rows[0].1.ordinal(), 99);
+            drop(rows);
+            assert_eq!(owner.used(), 0);
+            drop(escaped);
+            assert_eq!(foreign.used(), 0);
+        }
+    }
+
+    #[test]
+    fn group_spill_uses_physical_sizes_and_reloads_independent_legacy_vectors() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        for partitioned in [false, true] {
+            let owner = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+            let resources = owner.resources().allocation().clone();
+            let escaped =
+                clinker_record::FieldStr::try_new(&"leaf".repeat(100), &resources.scope().unwrap())
+                    .unwrap();
+            let leaf_bytes = owner.used();
+            let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["v".into()])));
+            let key = vec![GroupByKey::Null];
+            let mut buffer = CullGroupBuffer::new(schema.clone(), true, resources.clone());
+            for i in 0..32u64 {
+                buffer.push(
+                    key.clone(),
+                    admitted_input(&schema, &resources, Value::String(escaped.clone())),
+                    i.into(),
+                );
+            }
+            let physical = buffer.resident_bytes();
+            assert!(physical > buffer.unaccounted_resident_bytes());
+            let arb = arbitrator(1024 * 1024);
+            let directory = tempfile::tempdir().unwrap();
+            if partitioned {
+                buffer
+                    .spill_group_partitioned("groups", &arb, directory.path(), &key, physical / 2)
+                    .unwrap();
+                assert!(buffer.resident_bytes() > 0);
+                assert!(buffer.resident_bytes() <= physical / 2);
+            } else {
+                buffer
+                    .spill_group_whole("groups", &arb, directory.path(), &key)
+                    .unwrap();
+                assert_eq!(buffer.unaccounted_resident_bytes(), 0);
+                buffer.push(
+                    key.clone(),
+                    admitted_input(&schema, &resources, Value::String(escaped.clone())),
+                    32u64.into(),
+                );
+            }
+            assert!(!buffer.groups[&key].spilled.is_empty());
+            let actual = buffer.groups[&key]
+                .resident
+                .iter()
+                .map(|r| unaccounted_input_bytes(&r.record, &resources))
+                .sum::<usize>();
+            assert_eq!(buffer.unaccounted_resident_bytes(), actual);
+            let physical_group =
+                buffer.groups[&key].resident_bytes + buffer.groups[&key].spilled_bytes;
+            assert!(physical_group >= physical);
+            let rows = buffer
+                .take_group("groups", &["v".into()], &key, physical_group as u64)
+                .unwrap();
+            assert_eq!(buffer.unaccounted_resident_bytes(), 0);
+            assert_eq!(rows.len(), if partitioned { 32 } else { 33 });
+            assert!(
+                rows.iter()
+                    .any(|(r, _)| r.values_are_accounted_by(&resources))
+            );
+            assert!(
+                rows.iter()
+                    .any(|(r, _)| !r.values_are_accounted_by(&resources))
+            );
+            for (i, (record, row_id)) in rows.iter().enumerate() {
+                assert_eq!(row_id.ordinal(), i as u64);
+                assert_eq!(record.values()[0], Value::String(escaped.clone()));
+            }
+            drop(rows);
+            assert_eq!(owner.used(), leaf_bytes);
+            drop(escaped);
+            assert_eq!(owner.used(), 0);
+        }
+    }
+
     #[test]
     fn partition_key_keeps_empty_string_distinct_from_null() {
-        let schema: Arc<Schema> = Arc::new(Schema::new(vec!["account".into()]));
+        let schema: SharedStorage<Schema> =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["account".into()])));
         let part = vec!["account".to_string()];
 
         let empty = partition_key("c", &record(&schema, Value::String("".into())), &part).unwrap();
@@ -1237,7 +1497,8 @@ mod tests {
     // "internal error" that implies a broken engine.
     #[test]
     fn take_group_rejects_a_group_larger_than_the_hard_limit_with_e310() {
-        let schema: Arc<Schema> = Arc::new(Schema::new(vec!["account".into()]));
+        let schema: SharedStorage<Schema> =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["account".into()])));
         let spill_root = tempfile::tempdir().unwrap();
         let arb = arbitrator(512);
         let handle = ConsumerHandle::new();
@@ -1247,7 +1508,16 @@ mod tests {
         // One group, ~5 KiB across 64 records against a 512 B soft limit, so
         // part of it partition-spills — exercising the reload path the hard
         // limit gates rather than a purely resident group.
-        let mut buffer = CullGroupBuffer::new(Arc::clone(&schema), true);
+        let mut buffer = CullGroupBuffer::new(
+            schema.clone(),
+            true,
+            clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+            )
+            .resources()
+            .allocation()
+            .clone(),
+        );
         for row_num in 0..64u64 {
             let payload = format!("{row_num:063}");
             buffer.push(
@@ -1255,7 +1525,7 @@ mod tests {
                 record(&schema, Value::String(payload.into())),
                 crate::executor::stream_event::SourceRowId::new(PlanNodeId::new(0), row_num),
             );
-            handle.set_bytes(buffer.resident_bytes() as u64);
+            handle.set_bytes(buffer.unaccounted_resident_bytes() as u64);
             if arb.spill_threshold_bytes() < buffer.resident_bytes() as u64 {
                 buffer
                     .spill_until_under_budget("cl", &arb, spill_root.path(), &handle)
@@ -1347,12 +1617,22 @@ mod tests {
     // `record_spill_bytes` returns, so eviction kept writing unbounded.
     #[test]
     fn spill_past_disk_cap_fails_with_spill_cap_exceeded() {
-        let schema: Arc<Schema> = Arc::new(Schema::new(vec!["account".into()]));
+        let schema: SharedStorage<Schema> =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["account".into()])));
         let spill_root = tempfile::tempdir().unwrap();
         let arb = arbitrator(512);
         arb.set_max_spill_bytes(1).unwrap();
         let handle = ConsumerHandle::new();
-        let mut buffer = CullGroupBuffer::new(Arc::clone(&schema), true);
+        let mut buffer = CullGroupBuffer::new(
+            schema.clone(),
+            true,
+            clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+            )
+            .resources()
+            .allocation()
+            .clone(),
+        );
         // One group, ~5 KiB resident against a 512 B soft limit, so the
         // spill loop must evict — and the first flush already exceeds the
         // one-byte disk cap.
@@ -1364,7 +1644,7 @@ mod tests {
                 crate::executor::stream_event::SourceRowId::new(PlanNodeId::new(0), row_num),
             );
         }
-        handle.set_bytes(buffer.resident_bytes() as u64);
+        handle.set_bytes(buffer.unaccounted_resident_bytes() as u64);
         let err = buffer
             .spill_until_under_budget("cl", &arb, spill_root.path(), &handle)
             .expect_err("a one-byte disk cap must abort the first spill write");

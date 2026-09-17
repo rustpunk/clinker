@@ -8,6 +8,7 @@
 //! `multiple: true`; an undeclared array remains a loud routing error. JSON
 //! output serializes arrays natively. See #46, #917, #916, and #944.
 
+use clinker_record::owned_storage::{OwnedValues, SharedStorage};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -21,13 +22,16 @@ use cxl::typecheck::Type;
 
 /// A two-column record whose second column (`tags`) carries a `Value::Array`,
 /// the shape a `match: collect` combine build side produces.
-fn record_with_array() -> (Arc<Schema>, Record) {
-    let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+fn record_with_array() -> (SharedStorage<Schema>, Record) {
+    let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "tags".into()])));
     let record = Record::new(
-        Arc::clone(&schema),
+        schema.clone(),
         vec![
             Value::Integer(7),
-            Value::Array(vec![Value::String("a".into()), Value::String("b".into())]),
+            Value::Array(OwnedValues::from_vec(vec![
+                Value::String("a".into()),
+                Value::String("b".into()),
+            ])),
         ],
     );
     (schema, record)
@@ -63,7 +67,7 @@ fn csv_writer_joins_array_into_delimited_cell() {
             declared_multiple: BTreeSet::from(["tags".to_string()]),
             ..CsvWriterConfig::default()
         };
-        let mut writer = CsvWriter::new(&mut buf, Arc::clone(&schema), config);
+        let mut writer = CsvWriter::new(&mut buf, schema.clone(), config);
         writer
             .write_record(&record)
             .expect("CSV writer joins a scalar array into one cell");
@@ -99,7 +103,7 @@ fn xml_writer_emits_repeated_elements_for_array() {
             declared_multiple: BTreeSet::from(["tags".to_string()]),
             ..XmlWriterConfig::default()
         };
-        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), config);
+        let mut writer = XmlWriter::new(&mut buf, schema.clone(), config);
         writer
             .write_record(&record)
             .expect("XML writer emits repeated elements for a scalar array");
@@ -154,8 +158,7 @@ fn json_writer_serializes_array_natively() {
     let (schema, record) = record_with_array();
     let mut buf = Vec::new();
     {
-        let mut writer =
-            JsonWriter::new(&mut buf, Arc::clone(&schema), JsonWriterConfig::default());
+        let mut writer = JsonWriter::new(&mut buf, schema.clone(), JsonWriterConfig::default());
         writer
             .write_record(&record)
             .expect("JSON writer serializes an array natively");

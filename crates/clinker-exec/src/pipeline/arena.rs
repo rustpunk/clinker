@@ -3,6 +3,7 @@
 //! Stores only the fields needed by window expressions. Built by streaming
 //! a `FormatReader` and projecting to the required field subset.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::sync::Arc;
 
 use clinker_format::traits::FormatReader;
@@ -19,13 +20,13 @@ use super::memory::{ConsumerHandle, ConsumerSpillError, MemoryArbitrator, Memory
 /// rayon workers during Phase 2.
 #[derive(Debug)]
 pub struct Arena {
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     records: Vec<MinimalRecord>,
 }
 
 impl Arena {
     /// Create an empty Arena with the given schema (for sources with no indices).
-    pub fn empty(schema: Arc<Schema>) -> Self {
+    pub fn empty(schema: SharedStorage<Schema>) -> Self {
         Arena {
             schema,
             records: Vec::new(),
@@ -37,7 +38,7 @@ impl Arena {
     ///
     /// Used by benchmarks that need a populated Arena from synthetic
     /// `MinimalRecord`s without driving a `FormatReader`.
-    pub fn from_parts(schema: Arc<Schema>, records: Vec<MinimalRecord>) -> Self {
+    pub fn from_parts(schema: SharedStorage<Schema>, records: Vec<MinimalRecord>) -> Self {
         Arena { schema, records }
     }
 
@@ -86,18 +87,18 @@ impl Arena {
             // D5 defense-in-depth: every record fed into the Arena must
             // carry the same schema the Arena was initialized against.
             // `field_indices` was computed once at the top of this
-            // function; a mid-stream Arc or column-list shift would
+            // function; a mid-stream handle or column-list shift would
             // silently misproject `values()` positions. Fast path is
-            // `Arc::ptr_eq`; the structural fallback exists for
+            // `SharedStorage::ptr_eq`; the structural fallback exists for
             // streaming drift surfaces (IPC boundaries, spill rehydrate)
-            // where the upstream emits a fresh Arc whose columns are
+            // where the upstream emits a fresh schema whose columns are
             // still structurally identical.
-            if !Arc::ptr_eq(record.schema(), &source_schema)
+            if !SharedStorage::ptr_eq(record.schema(), &source_schema)
                 && record.schema().columns() != source_schema.columns()
             {
                 return Err(ArenaError::SchemaMismatch {
-                    expected: Arc::clone(&source_schema),
-                    actual: Arc::clone(record.schema()),
+                    expected: source_schema.clone(),
+                    actual: record.schema().clone(),
                 });
             }
             // Project: extract only the requested fields
@@ -156,10 +157,10 @@ impl Arena {
     pub fn from_records<R>(
         rows: &[(clinker_record::Record, R)],
         fields: &[String],
-        anchor_schema: &Arc<Schema>,
+        anchor_schema: &SharedStorage<Schema>,
         budget: &MemoryArbitrator,
     ) -> Result<Self, ArenaError> {
-        let schema: Arc<Schema> = fields
+        let schema: SharedStorage<Schema> = fields
             .iter()
             .map(|f| f.clone().into_boxed_str())
             .collect::<SchemaBuilder>()
@@ -174,7 +175,7 @@ impl Arena {
     }
 
     /// Schema of the projected fields stored in this Arena.
-    pub fn schema(&self) -> &Arc<Schema> {
+    pub fn schema(&self) -> &SharedStorage<Schema> {
         &self.schema
     }
 
@@ -338,7 +339,7 @@ pub(crate) fn estimated_size(record: &MinimalRecord) -> usize {
 /// surfaces here as a per-column variant mismatch between rows. Null
 /// is exempted because it is the unit element for every type.
 #[cfg(debug_assertions)]
-fn debug_assert_uniform_column_variants(schema: &Arc<Schema>, records: &[MinimalRecord]) {
+fn debug_assert_uniform_column_variants(schema: &SharedStorage<Schema>, records: &[MinimalRecord]) {
     let column_count = schema.column_count();
     let mut expected: Vec<Option<&'static str>> = vec![None; column_count];
     for (row, rec) in records.iter().enumerate() {
@@ -379,8 +380,8 @@ pub enum ArenaError {
     /// depends on column-position alignment, so mid-stream drift would
     /// corrupt projected values — raise E314 at the ingest boundary.
     SchemaMismatch {
-        expected: Arc<Schema>,
-        actual: Arc<Schema>,
+        expected: SharedStorage<Schema>,
+        actual: SharedStorage<Schema>,
     },
 }
 
@@ -610,21 +611,21 @@ mod tests {
         use clinker_record::Record;
 
         struct HeterogenousReader {
-            first_schema: Arc<Schema>,
-            second_schema: Arc<Schema>,
+            first_schema: SharedStorage<Schema>,
+            second_schema: SharedStorage<Schema>,
             emitted: usize,
         }
 
         impl FormatReader for HeterogenousReader {
-            fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-                Ok(Arc::clone(&self.first_schema))
+            fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+                Ok(self.first_schema.clone())
             }
             fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
                 match self.emitted {
                     0 => {
                         self.emitted += 1;
                         Ok(Some(Record::new(
-                            Arc::clone(&self.first_schema),
+                            self.first_schema.clone(),
                             vec![Value::String("A".into()), Value::String("100".into())],
                         )))
                     }
@@ -635,7 +636,7 @@ mod tests {
                         // misalign `values()` positions without the
                         // defense-in-depth guard.
                         Ok(Some(Record::new(
-                            Arc::clone(&self.second_schema),
+                            self.second_schema.clone(),
                             vec![
                                 Value::String("B".into()),
                                 Value::String("200".into()),
@@ -648,15 +649,16 @@ mod tests {
             }
         }
 
-        let first_schema = Arc::new(Schema::new(vec!["dept".into(), "amount".into()]));
-        let second_schema = Arc::new(Schema::new(vec![
+        let first_schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["dept".into(), "amount".into()])));
+        let second_schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "dept".into(),
             "amount".into(),
             "extra".into(),
-        ]));
+        ])));
         let mut reader = HeterogenousReader {
-            first_schema: Arc::clone(&first_schema),
-            second_schema: Arc::clone(&second_schema),
+            first_schema: first_schema.clone(),
+            second_schema: second_schema.clone(),
             emitted: 0,
         };
         let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
@@ -669,8 +671,8 @@ mod tests {
         );
         match result {
             Err(ArenaError::SchemaMismatch { expected, actual }) => {
-                assert!(Arc::ptr_eq(&expected, &first_schema));
-                assert!(Arc::ptr_eq(&actual, &second_schema));
+                assert!(SharedStorage::ptr_eq(&expected, &first_schema));
+                assert!(SharedStorage::ptr_eq(&actual, &second_schema));
                 let rendered = format!("{}", ArenaError::SchemaMismatch { expected, actual });
                 assert!(rendered.contains("E314"));
                 assert!(rendered.contains("arena"));
@@ -682,8 +684,9 @@ mod tests {
     #[test]
     fn estimated_bytes_sums_records_and_zero_when_empty() {
         use clinker_record::Schema;
-        let schema = Arc::new(Schema::new(vec!["id".into(), "name".into()]));
-        let empty = Arena::empty(Arc::clone(&schema));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "name".into()])));
+        let empty = Arena::empty(schema.clone());
         assert_eq!(empty.estimated_bytes(), 0);
 
         let records = vec![
@@ -729,7 +732,8 @@ mod tests {
     #[test]
     fn from_records_passes_uniform_column_variants() {
         use clinker_record::Record;
-        let schema = Arc::new(Schema::new(vec!["id".into(), "name".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "name".into()])));
         let rows: Vec<(Record, u64)> = (0..50)
             .map(|i| {
                 let v = if i % 5 == 0 {
@@ -737,7 +741,7 @@ mod tests {
                 } else {
                     vec![Value::Integer(i), Value::String(format!("r{i}").into())]
                 };
-                (Record::new(Arc::clone(&schema), v), i as u64)
+                (Record::new(schema.clone(), v), i as u64)
             })
             .collect();
         let budget = MemoryArbitrator::with_policy(u64::MAX, 1.0, 0.70, Box::new(NoOpPolicy));

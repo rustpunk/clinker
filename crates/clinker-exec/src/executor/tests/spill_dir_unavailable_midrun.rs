@@ -37,11 +37,12 @@ use clinker_plan::error::PipelineError;
 use crate::executor::spill_purge;
 use crate::executor::{PipelineExecutor, PipelineRunParams, SourceReaders, single_file_reader};
 
-// A 640 KiB memory budget forces the HashAggregator's dual-threshold spill:
+// A layout-derived memory budget forces the HashAggregator's dual-threshold spill:
 // with many distinct keys the group count crosses the budget-derived
 // `max_groups` well before EOF, so `add_record` calls `spill()` mid-run — the
-// open this test intercepts. The limit still admits the output's exact 608,000
-// byte materialization reservation after the spilled aggregate completes.
+// open this test intercepts. The limit also admits all output rows at their
+// compiled layout after the spilled aggregate completes, plus the existing
+// fixed allowance and measured writer workspace.
 // `backpressure: spill` is required: the budget can remain below the process
 // baseline RSS, which the default `pause` policy rejects at startup (E312);
 // the spill policy never pauses a producer and so spills mid-run as this test
@@ -96,6 +97,26 @@ nodes:
 
 const ROWS: usize = 4_000;
 
+fn config_with_materialization_headroom() -> PipelineConfig {
+    let config: PipelineConfig = clinker_plan::yaml::from_str(PIPELINE_YAML).unwrap();
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    // Retain the original spare allowance above the actual compiled row layout.
+    const MATERIALIZATION_SPARE: u64 = 655_360 - 608_000;
+    let dag = plan.dag();
+    let aggregate = dag
+        .graph
+        .node_indices()
+        .find(|idx| dag.graph[*idx].name() == "by_key")
+        .expect("aggregate node exists");
+    let width = dag.graph[aggregate].output_schema_in(dag).column_count();
+    let materialized = super::super::node_buffer::record_byte_cost(width) * ROWS as u64;
+    clinker_plan::yaml::from_str(&PIPELINE_YAML.replace(
+        "655360",
+        &(materialized + MATERIALIZATION_SPARE).to_string(),
+    ))
+    .unwrap()
+}
+
 /// Many distinct keys so the aggregate's group table outgrows the tiny budget
 /// and spills before EOF.
 fn build_events_csv() -> String {
@@ -116,8 +137,7 @@ fn spill_dir_removed_mid_run_surfaces_dir_unavailable_without_panic_or_stall() {
     let spill_root_path = spill_root.path().to_path_buf();
 
     let csv = build_events_csv();
-    let config: PipelineConfig =
-        clinker_plan::yaml::from_str(PIPELINE_YAML).expect("parse pipeline YAML");
+    let config = config_with_materialization_headroom();
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile pipeline");
@@ -222,8 +242,7 @@ fn unarmed_seam_lets_a_real_spilling_run_complete() {
     let spill_root_path = spill_root.path().to_path_buf();
 
     let csv = build_events_csv();
-    let config: PipelineConfig =
-        clinker_plan::yaml::from_str(PIPELINE_YAML).expect("parse pipeline YAML");
+    let config = config_with_materialization_headroom();
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile pipeline");

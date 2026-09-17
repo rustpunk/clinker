@@ -1,13 +1,14 @@
 use clinker_bench_support::RecordFactory;
+use clinker_record::owned_storage::{OwnedKey, SharedStorage};
 use clinker_record::{Record, Schema, Value};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::sync::Arc;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-fn make_schema(n: usize) -> Arc<Schema> {
-    let cols: Vec<Box<str>> = (0..n).map(|i| format!("f{i}").into_boxed_str()).collect();
-    Arc::new(Schema::new(cols))
+fn make_schema(n: usize) -> SharedStorage<Schema> {
+    let cols: Vec<OwnedKey> = (0..n).map(|i| format!("f{i}").into()).collect();
+    SharedStorage::from_arc(Arc::new(Schema::new(cols)))
 }
 
 fn make_values(n: usize) -> Vec<Value> {
@@ -33,7 +34,7 @@ fn bench_record_create(c: &mut Criterion) {
             BenchmarkId::from_parameter(field_count),
             &field_count,
             |b, _| {
-                b.iter(|| Record::new(Arc::clone(&schema), values.clone()));
+                b.iter(|| Record::new(schema.clone(), values.clone()));
             },
         );
     }
@@ -47,7 +48,7 @@ fn bench_record_get(c: &mut Criterion) {
     for field_count in [5, 20, 50] {
         let schema = make_schema(field_count);
         let values = make_values(field_count);
-        let record = Record::new(Arc::clone(&schema), values);
+        let record = Record::new(schema.clone(), values);
         // Lookup the middle field to avoid branch-predictor bias
         let target = format!("f{}", field_count / 2);
         group.bench_with_input(
@@ -68,7 +69,7 @@ fn bench_record_set(c: &mut Criterion) {
     for field_count in [5, 20, 50] {
         let schema = make_schema(field_count);
         let values = make_values(field_count);
-        let mut record = Record::new(Arc::clone(&schema), values);
+        let mut record = Record::new(schema.clone(), values);
         let target = format!("f{}", field_count / 2);
         group.bench_with_input(
             BenchmarkId::from_parameter(field_count),
@@ -164,16 +165,16 @@ fn bench_widened_schema_set_get(c: &mut Criterion) {
     for extra_count in [1, 10, 50] {
         // Widen the schema to include every extra field up front. Every
         // `Record::set` emit site writes to a schema-declared slot.
-        let mut cols: Vec<Box<str>> = (0..5).map(|i| format!("f{i}").into_boxed_str()).collect();
-        cols.extend((0..extra_count).map(|i| format!("extra_{i}").into_boxed_str()));
-        let schema = Arc::new(clinker_record::Schema::new(cols));
+        let mut cols: Vec<OwnedKey> = (0..5).map(|i| format!("f{i}").into()).collect();
+        cols.extend((0..extra_count).map(|i| format!("extra_{i}").into()));
+        let schema = SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(cols)));
         group.bench_with_input(
             BenchmarkId::from_parameter(extra_count),
             &extra_count,
             |b, &count| {
                 b.iter(|| {
                     let mut record =
-                        Record::new(Arc::clone(&schema), vec![Value::Null; 5 + count as usize]);
+                        Record::new(schema.clone(), vec![Value::Null; 5 + count as usize]);
                     for i in 0..count {
                         record.set(&format!("extra_{i}"), Value::Integer(i as i64));
                     }

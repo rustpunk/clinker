@@ -18,6 +18,8 @@
 use std::io::{BufReader, Read};
 use std::sync::Arc;
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
+
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
@@ -63,7 +65,7 @@ impl Default for EdifactReaderConfig {
 /// `UNB` envelope section without re-reading the source.
 pub struct EdifactReader<R: Read> {
     tokenizer: SegmentTokenizer<BufReader<R>>,
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     max_elements: usize,
     initialized: bool,
     /// Raw `UNB` data elements, stashed at init for envelope serving and
@@ -362,13 +364,13 @@ impl<R: Read> EdifactReader<R> {
                 None => values.push(Value::Null),
             }
         }
-        Ok(Record::new(Arc::clone(&self.schema), values))
+        Ok(Record::new(self.schema.clone(), values))
     }
 }
 
 impl<R: Read + Send> FormatReader for EdifactReader<R> {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-        Ok(Arc::clone(&self.schema))
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+        Ok(self.schema.clone())
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
@@ -382,13 +384,13 @@ impl<R: Read + Send> FormatReader for EdifactReader<R> {
     fn prepare_document(
         &mut self,
         config: &EnvelopeConfig,
-    ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
+    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
         if config.is_empty() {
             return Ok(IndexMap::new());
         }
         self.ensure_initialized()?;
 
-        let mut out: IndexMap<Box<str>, Value> = IndexMap::with_capacity(config.sections.len());
+        let mut out: IndexMap<OwnedKey, Value> = IndexMap::with_capacity(config.sections.len());
         for (name, section) in &config.sections {
             let segment_tag = match &section.extract {
                 EnvelopeExtract::Segment(tag) => tag.as_str(),
@@ -431,8 +433,14 @@ impl<R: Read + Send> FormatReader for EdifactReader<R> {
                 .iter()
                 .map(|e| Value::String(e.as_str().into()))
                 .collect();
-            typed.insert(Box::from(RAW_ELEMENTS_KEY), Value::Array(raw_elements));
-            out.insert(Box::from(name.as_str()), Value::Map(Box::new(typed)));
+            typed.insert(
+                OwnedKey::from(RAW_ELEMENTS_KEY),
+                Value::Array(OwnedValues::from_vec(raw_elements)),
+            );
+            out.insert(
+                OwnedKey::from(name.as_str()),
+                Value::Map(OwnedMap::from_map(typed)),
+            );
         }
         Ok(out)
     }
@@ -461,12 +469,12 @@ pub fn generated_columns(max_elements: usize) -> Vec<Column> {
 /// e01..e<max>]`. Column names come from [`generated_columns`] so element text
 /// is stored verbatim (lossless round-trip) and the reader schema stays in
 /// lockstep with the planner's Generated-source bind.
-fn build_schema(max_elements: usize) -> Arc<Schema> {
+fn build_schema(max_elements: usize) -> SharedStorage<Schema> {
     let columns = generated_columns(max_elements)
         .into_iter()
-        .map(|c| c.name.into_boxed_str())
+        .map(|c| c.name.into())
         .collect();
-    Arc::new(Schema::new(columns))
+    SharedStorage::from_arc(Arc::new(Schema::new(columns)))
 }
 
 /// Positional element column name for element index `i`: `e01`, `e02`, …
@@ -939,17 +947,17 @@ mod tests {
         );
 
         // 2. Attach the document context and re-emit through the writer.
-        let ctx = Arc::new(DocumentContext::new(
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
             EnvelopeRecord::from_sections(sections),
-        ));
+        )));
         let schema = r.schema().unwrap();
         let out = {
             let mut buf = Vec::new();
             let mut w = EdifactWriter::new(
                 std::io::Cursor::new(&mut buf),
-                Arc::clone(&schema),
+                schema.clone(),
                 EdifactWriterConfig {
                     interchange_from_doc: Some("interchange".into()),
                     segment_newline: false,
@@ -958,7 +966,7 @@ mod tests {
             );
             for rec in &body_recs {
                 let mut rec = rec.clone();
-                rec.set_doc_ctx(Arc::clone(&ctx));
+                rec.set_doc_ctx(ctx.clone());
                 w.write_record(&rec).unwrap();
             }
             w.flush().unwrap();
@@ -1012,17 +1020,17 @@ mod tests {
         );
 
         // 2. Re-emit through the writer.
-        let ctx = Arc::new(DocumentContext::new(
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
             EnvelopeRecord::from_sections(sections),
-        ));
+        )));
         let schema = r.schema().unwrap();
         let out = {
             let mut buf = Vec::new();
             let mut w = EdifactWriter::new(
                 std::io::Cursor::new(&mut buf),
-                Arc::clone(&schema),
+                schema.clone(),
                 EdifactWriterConfig {
                     interchange_from_doc: Some("interchange".into()),
                     segment_newline: false,
@@ -1031,7 +1039,7 @@ mod tests {
             );
             for rec in &body_recs {
                 let mut rec = rec.clone();
-                rec.set_doc_ctx(Arc::clone(&ctx));
+                rec.set_doc_ctx(ctx.clone());
                 w.write_record(&rec).unwrap();
             }
             w.flush().unwrap();
@@ -1152,17 +1160,17 @@ mod tests {
 
         // 2. Re-emit through the writer, which negotiates UNOC from the
         // echoed UNB and re-encodes the high-byte elements to single bytes.
-        let ctx = Arc::new(DocumentContext::new(
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
             EnvelopeRecord::from_sections(sections),
-        ));
+        )));
         let schema = r.schema().unwrap();
         let out_bytes = {
             let mut buf = Vec::new();
             let mut w = EdifactWriter::new(
                 std::io::Cursor::new(&mut buf),
-                Arc::clone(&schema),
+                schema.clone(),
                 EdifactWriterConfig {
                     interchange_from_doc: Some("interchange".into()),
                     segment_newline: false,
@@ -1171,7 +1179,7 @@ mod tests {
             );
             for rec in &body_recs {
                 let mut rec = rec.clone();
-                rec.set_doc_ctx(Arc::clone(&ctx));
+                rec.set_doc_ctx(ctx.clone());
                 w.write_record(&rec).unwrap();
             }
             w.flush().unwrap();
@@ -1234,17 +1242,17 @@ mod tests {
 
         // Re-emit: the UNB must be encoded under UNOC, so the sender's é is
         // the single byte 0xE9 again — byte-identical to the input.
-        let ctx = Arc::new(DocumentContext::new(
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
             EnvelopeRecord::from_sections(sections),
-        ));
+        )));
         let schema = r.schema().unwrap();
         let out_bytes = {
             let mut buf = Vec::new();
             let mut w = EdifactWriter::new(
                 std::io::Cursor::new(&mut buf),
-                Arc::clone(&schema),
+                schema.clone(),
                 EdifactWriterConfig {
                     interchange_from_doc: Some("interchange".into()),
                     segment_newline: false,
@@ -1253,7 +1261,7 @@ mod tests {
             );
             for rec in &body_recs {
                 let mut rec = rec.clone();
-                rec.set_doc_ctx(Arc::clone(&ctx));
+                rec.set_doc_ctx(ctx.clone());
                 w.write_record(&rec).unwrap();
             }
             w.flush().unwrap();
@@ -1299,17 +1307,17 @@ mod tests {
         let body_recs: Vec<Record> = std::iter::from_fn(|| r.next_record().unwrap()).collect();
         assert_eq!(body_recs.len(), 2);
 
-        let ctx = Arc::new(DocumentContext::new(
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
             EnvelopeRecord::from_sections(sections),
-        ));
+        )));
         let schema = r.schema().unwrap();
         let out_bytes = {
             let mut buf = Vec::new();
             let mut w = EdifactWriter::new(
                 std::io::Cursor::new(&mut buf),
-                Arc::clone(&schema),
+                schema.clone(),
                 EdifactWriterConfig {
                     interchange_from_doc: Some("interchange".into()),
                     segment_newline: false,
@@ -1318,7 +1326,7 @@ mod tests {
             );
             for rec in &body_recs {
                 let mut rec = rec.clone();
-                rec.set_doc_ctx(Arc::clone(&ctx));
+                rec.set_doc_ctx(ctx.clone());
                 w.write_record(&rec).unwrap();
             }
             w.flush().unwrap();

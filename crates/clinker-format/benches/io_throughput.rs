@@ -7,6 +7,7 @@ use clinker_format::json::writer::{JsonWriter, JsonWriterConfig};
 use clinker_format::schema::Column;
 use clinker_format::traits::{FormatReader, FormatWriter};
 use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
+use clinker_record::owned_storage::SharedStorage;
 use clinker_record::{Record, Schema, Value};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use cxl::typecheck::Type;
@@ -64,7 +65,7 @@ fn bench_csv_write(c: &mut Criterion) {
                 b.iter(|| {
                     let buf = Vec::with_capacity(record_count * field_count * 20);
                     let mut writer =
-                        CsvWriter::new(buf, Arc::clone(&schema), CsvWriterConfig::default());
+                        CsvWriter::new(buf, schema.clone(), CsvWriterConfig::default());
                     for rec in recs {
                         writer.write_record(rec).unwrap();
                     }
@@ -169,8 +170,7 @@ fn bench_json_write(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(label), &records, |b, recs| {
             b.iter(|| {
                 let buf = Vec::with_capacity(record_count * field_count * string_len);
-                let mut writer =
-                    JsonWriter::new(buf, Arc::clone(&schema), JsonWriterConfig::default());
+                let mut writer = JsonWriter::new(buf, schema.clone(), JsonWriterConfig::default());
                 for rec in recs {
                     writer.write_record(rec).unwrap();
                 }
@@ -187,8 +187,8 @@ fn bench_json_write(c: &mut Criterion) {
 /// Build `count` records over a dotted + attribute schema (shared-prefix
 /// branches with their own attributes), the shape the precompiled tree plan
 /// targets. Values vary per record so the fill path does real work.
-fn dotted_records(count: usize) -> (Arc<Schema>, Vec<Record>) {
-    let schema = Arc::new(Schema::new(vec![
+fn dotted_records(count: usize) -> (SharedStorage<Schema>, Vec<Record>) {
+    let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
         "@id".into(),
         "name".into(),
         "Address.@type".into(),
@@ -196,11 +196,11 @@ fn dotted_records(count: usize) -> (Arc<Schema>, Vec<Record>) {
         "Address.State".into(),
         "Contact.Email".into(),
         "Contact.Phone".into(),
-    ]));
+    ])));
     let records = (0..count)
         .map(|i| {
             Record::new(
-                Arc::clone(&schema),
+                schema.clone(),
                 vec![
                     Value::Integer(i as i64),
                     Value::String(format!("name{i}").into()),
@@ -232,7 +232,7 @@ fn bench_xml_write(c: &mut Criterion) {
             b.iter(|| {
                 let buf = Vec::with_capacity(MEDIUM * 50 * 20);
                 let mut writer =
-                    XmlWriter::new(buf, Arc::clone(&flat_schema), XmlWriterConfig::default());
+                    XmlWriter::new(buf, flat_schema.clone(), XmlWriterConfig::default());
                 for rec in recs {
                     writer.write_record(rec).unwrap();
                 }
@@ -252,7 +252,7 @@ fn bench_xml_write(c: &mut Criterion) {
             b.iter(|| {
                 let buf = Vec::with_capacity(MEDIUM * 200);
                 let mut writer =
-                    XmlWriter::new(buf, Arc::clone(&dotted_schema), XmlWriterConfig::default());
+                    XmlWriter::new(buf, dotted_schema.clone(), XmlWriterConfig::default());
                 for rec in recs {
                     writer.write_record(rec).unwrap();
                 }

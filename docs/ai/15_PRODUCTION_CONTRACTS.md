@@ -201,6 +201,38 @@ completion of that delivery group.
 |---|---|---|---|---|---|---|---|---|---|
 | D-56 | Pipeline authors, library consumers, and endpoint implementers | implemented | The terminal node is `PipelineNode::Sink` with `SinkConfig`, Sink dispatch, canonical Sink documentation, and public YAML `type: sink`. The retired `type: output` spelling fails with source-located E376 and a paste-ready correction. | Keep only the terminal destination concept named Sink. Preserve composition and node output ports, artifacts and paths, serialization formats, stdout, command and machine output, writer results, and OpenLineage output datasets. | CONT-08, AUTH-09 | AUTH-09, wholly before endpoint expansion | One-way breaking YAML and serialized-plan migration; retired variants safe-miss and no compatibility alias is accepted. | `crates/clinker-plan/src/config/pipeline_node.rs`; `crates/clinker-plan/src/config/sink.rs`; `crates/clinker-exec/src/executor/sink_dispatch.rs`; `crates/clinker/tests/sink_surface.rs`; current examples and docs | 2026-08-17 |
 
+## Decoded allocation ownership
+
+**Status: locked, implementation pending.** The maintainer approved this
+AUTH-06 design on 2026-09-15, including the necessary MEM-01/MEM-02/MEM-03
+accounting subset. Shared strings can outlive their original Record through
+clones, projections and nested values. A reservation beside a Record or
+source event does not establish final allocation lifetime.
+
+The locked target attaches leases to actual decoded storage through final
+backing destruction and retains release-capable ledger state for escaped
+values without retaining the run. Core containers and shared schema/context
+handles migrate together. Matched legacy retention charges structurally
+exclude governed storage; estimates for future independent copies retain
+the cost of their new allocations. The exact approved fallible shared-allocation
+dependency stays behind a sealed API.
+
+The design permits breaking Rust storage APIs and inline layout changes while
+preserving logical values, serialization and existing independent clone
+behavior. Existing parser intermediates and unchanged downstream copies and
+reloads remain explicit legacy allowances. This does not establish whole-reader
+or whole-engine allocation admission.
+
+The [core ownership foundation #1199](https://github.com/rustpunk/clinker/issues/1199)
+owns the supporting API, lifetime and accounting changes; [CSV integration
+#1189](https://github.com/rustpunk/clinker/issues/1189) owns complete decoder
+integration. The broader [variable-payload contract
+#1183](https://github.com/rustpunk/clinker/issues/1183) remains open. Source
+evidence is in `crates/clinker-record/src/field_str.rs`,
+`crates/clinker-record/src/record/mod.rs` and
+`crates/clinker-format/src/preparation.rs`; implementation and qualification
+must precede changing this section to implemented.
+
 ## Authority and update rules
 
 - Update **Observed now** only after checking the current source, tests,

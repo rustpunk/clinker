@@ -1,9 +1,11 @@
 use crate::document_context::{DocumentContext, DocumentId, synthetic_document_context};
+use crate::owned_storage::{AllocationResources, OwnedValues, SharedStorage};
 use crate::resolver::FieldResolver;
 use crate::schema::Schema;
 use crate::value::Value;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use std::sync::Arc;
 
 /// Maximum number of `$record.<key>` user-declared scoped variables per record.
@@ -11,37 +13,37 @@ const MAX_RECORD_VARS: usize = 64;
 
 /// Schema-indexed row record.
 ///
-/// Values live in a positional `Vec<Value>` whose length equals
+/// Values live in a positional [`OwnedValues`] whose length equals
 /// `schema.column_count()`. Every write lands at a known schema slot;
 /// there is no side map for unknown fields. The reader's
 /// `OnUnmapped` policy decides at read time whether undeclared input
-/// fields widen the source's `Arc<Schema>` (`auto_widen`), are
+/// fields widen the source's `SharedStorage<Schema>` (`auto_widen`), are
 /// silently dropped (`drop`), or cause the source to fail (`reject`)
 /// — by the time a Record exists, its schema already names every
 /// value it carries.
 ///
-/// Every record carries an `Arc<DocumentContext>` exposing
+/// Every record carries a `SharedStorage<DocumentContext>` exposing
 /// `$doc.<section>.<field>` envelope data. Records emitted from a
-/// source file share that file's `Arc` (one allocation per document,
+/// source file share that file's handle (one allocation per document,
 /// refcount-bump per record); records synthesized in-pipeline
 /// (Transform projection, test fixtures) share the process-wide
 /// [`synthetic_document_context`] whose section map is empty.
 #[derive(Debug, Clone)]
 pub struct Record {
-    schema: Arc<Schema>,
-    values: Vec<Value>,
+    schema: SharedStorage<Schema>,
+    values: OwnedValues,
     /// Per-record user-declared `$record.<key>` scoped variables.
     /// Written by Transforms whose `declares:` entries have
     /// `scope: record`. Lazy-initialized on first `set_record_var()`
     /// call.
     record_vars: Option<Box<IndexMap<Box<str>, Value>>>,
     /// Envelope context shared per source file. CXL `$doc.*`
-    /// expressions resolve through this Arc. Source ingest replaces
+    /// expressions resolve through this shared handle. Source ingest replaces
     /// the default synthetic context via [`Record::set_doc_ctx`]
     /// after assembly; records that pre-date envelope-aware ingest
     /// (synthesized in-pipeline, test fixtures) keep the synthetic
     /// default.
-    doc_ctx: Arc<DocumentContext>,
+    doc_ctx: SharedStorage<DocumentContext>,
 }
 
 /// Wire payload for a [`Record`] in binary spill streams.
@@ -52,7 +54,7 @@ pub struct Record {
 /// [`DocumentId`] keying its envelope context. The full
 /// [`DocumentContext`] is **not** inlined per record: the spill writer
 /// interns one context frame per distinct document per file, and
-/// [`RecordPayload::into_record`] reattaches the shared `Arc` looked up
+/// [`RecordPayload::into_record`] reattaches the shared handle looked up
 /// by this `doc_id`. So the per-record cost is one `u64`, and reload
 /// memory is `O(distinct documents)`, never `O(records)`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -89,11 +91,15 @@ impl RecordPayload {
     /// Reconstruct a [`Record`] from this payload, attaching the
     /// caller-supplied schema and the shared envelope context.
     ///
-    /// `doc_ctx` is the single `Arc<DocumentContext>` the spill reader
+    /// `doc_ctx` is the single `SharedStorage<DocumentContext>` the spill reader
     /// re-hydrated for this payload's `doc_id`; every record of one
-    /// document clones that same `Arc` (refcount bump only, no per-record
+    /// document clones that same handle (refcount bump only, no per-record
     /// context copy).
-    pub fn into_record(self, schema: Arc<Schema>, doc_ctx: Arc<DocumentContext>) -> Record {
+    pub fn into_record(
+        self,
+        schema: SharedStorage<Schema>,
+        doc_ctx: SharedStorage<DocumentContext>,
+    ) -> Record {
         let mut record = Record::new(schema, self.values);
         if let Some(rv_pairs) = self.record_vars {
             for (k, v) in rv_pairs {
@@ -105,8 +111,72 @@ impl RecordPayload {
     }
 }
 
+/// Positional input did not match its schema; rejected values are consumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordWidthError {
+    pub expected: usize,
+    pub actual: usize,
+}
+impl std::fmt::Display for RecordWidthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "record has {} values; schema requires {}",
+            self.actual, self.expected
+        )
+    }
+}
+impl std::error::Error for RecordWidthError {}
+
 impl Record {
-    pub fn new(schema: Arc<Schema>, mut values: Vec<Value>) -> Self {
+    pub fn values_are_accounted_by(&self, resources: &AllocationResources) -> bool {
+        self.values.is_accounted_by(resources)
+    }
+    /// Excludes shared schema/document, retaining independently foreign children.
+    pub fn unaccounted_heap_size(&self, resources: &AllocationResources) -> usize {
+        self.values.unaccounted_heap_size(resources)
+            + self.record_vars.as_ref().map_or(0, |map| {
+                crate::value::indexmap_backing_size::<Box<str>>(map.capacity())
+                    + map
+                        .iter()
+                        .map(|(key, value)| key.len() + value.unaccounted_heap_size(resources))
+                        .sum::<usize>()
+            })
+    }
+
+    /// Move exact-width values without changing their allocation ownership.
+    pub fn from_owned_values(
+        schema: SharedStorage<Schema>,
+        values: OwnedValues,
+    ) -> Result<Self, RecordWidthError> {
+        if schema.column_count() != values.len() {
+            return Err(RecordWidthError {
+                expected: schema.column_count(),
+                actual: values.len(),
+            });
+        }
+        Ok(Self {
+            schema,
+            values,
+            record_vars: None,
+            doc_ctx: synthetic_document_context(),
+        })
+    }
+    pub fn values_are_governed(&self) -> bool {
+        self.values.is_governed()
+    }
+    /// Excludes shared schema/context, whose ancestor owner reports them once.
+    pub fn legacy_estimated_heap_size(&self) -> usize {
+        self.values.legacy_heap_size()
+            + self.record_vars.as_ref().map_or(0, |m| {
+                crate::value::indexmap_backing_size::<Box<str>>(m.capacity())
+                    + m.iter()
+                        .map(|(key, value)| key.len() + value.legacy_heap_size())
+                        .sum::<usize>()
+            })
+    }
+
+    pub fn new(schema: SharedStorage<Schema>, mut values: Vec<Value>) -> Self {
         debug_assert_eq!(
             schema.column_count(),
             values.len(),
@@ -123,7 +193,7 @@ impl Record {
         }
         Self {
             schema,
-            values,
+            values: OwnedValues::from_vec(values),
             record_vars: None,
             doc_ctx: synthetic_document_context(),
         }
@@ -131,10 +201,10 @@ impl Record {
 
     /// Replace the per-document envelope context for this record. Used
     /// by Source ingest immediately after `Record::new` to attach the
-    /// per-file `Arc<DocumentContext>` produced by the reader's
+    /// per-file `SharedStorage<DocumentContext>` produced by the reader's
     /// envelope pre-scan. Subsequent CXL `$doc.<section>.<field>`
     /// evaluation resolves through this context.
-    pub fn set_doc_ctx(&mut self, doc_ctx: Arc<DocumentContext>) {
+    pub fn set_doc_ctx(&mut self, doc_ctx: SharedStorage<DocumentContext>) {
         self.doc_ctx = doc_ctx;
     }
 
@@ -142,7 +212,7 @@ impl Record {
     /// the synthetic context for records that don't have a real source
     /// document (Transform synthesis, test fixtures); section lookups
     /// against the synthetic context return `None` (CXL maps to `Value::Null`).
-    pub fn doc_ctx(&self) -> &Arc<DocumentContext> {
+    pub fn doc_ctx(&self) -> &SharedStorage<DocumentContext> {
         &self.doc_ctx
     }
 
@@ -171,7 +241,7 @@ impl Record {
         }
     }
 
-    pub fn schema(&self) -> &Arc<Schema> {
+    pub fn schema(&self) -> &SharedStorage<Schema> {
         &self.schema
     }
 
@@ -340,15 +410,14 @@ impl Record {
     /// present). Used by `SortBuffer` for self-tracking allocation
     /// counting.
     pub fn estimated_heap_size(&self) -> usize {
-        let values_backing = self.values.capacity() * std::mem::size_of::<Value>();
-        let values_heap: usize = self.values.iter().map(Value::heap_size).sum();
+        let values_heap = self.values.heap_size();
         // The `$record.<key>` vars map and any `Value::Map` field share one
         // IndexMap-backing estimator so the two accounting paths cannot drift.
         let record_vars_size = self
             .record_vars
             .as_ref()
             .map_or(0, |m| crate::value::indexmap_heap_size(m));
-        values_backing + values_heap + record_vars_size
+        values_heap + record_vars_size
     }
 }
 
@@ -380,15 +449,15 @@ impl FieldResolver for Record {
 mod tests {
     use super::*;
 
-    fn test_schema() -> Arc<Schema> {
-        let cols: Vec<Box<str>> = vec![
+    fn test_schema() -> SharedStorage<Schema> {
+        let cols: Vec<crate::owned_storage::OwnedKey> = vec![
             "id".into(),
             "name".into(),
             "age".into(),
             "email".into(),
             "active".into(),
         ];
-        Arc::new(Schema::new(cols))
+        crate::owned_storage::SharedStorage::from_arc(Arc::new(Schema::new(cols)))
     }
 
     #[test]
@@ -468,9 +537,12 @@ mod tests {
     #[test]
     fn test_record_iter_user_fields_skips_engine_stamped() {
         use crate::schema::FieldMetadata;
-        let cols: Vec<Box<str>> = vec!["employee_id".into(), "$ck.employee_id".into()];
+        let cols: Vec<crate::owned_storage::OwnedKey> =
+            vec!["employee_id".into(), "$ck.employee_id".into()];
         let meta = vec![None, Some(FieldMetadata::source_correlation("employee_id"))];
-        let schema = Arc::new(Schema::with_metadata(cols, meta));
+        let schema = crate::owned_storage::SharedStorage::from_arc(Arc::new(
+            Schema::with_metadata(cols, meta),
+        ));
         let record = Record::new(schema, vec![Value::Integer(7), Value::Integer(7)]);
 
         let user_fields: Vec<(&str, &Value)> = record.iter_user_fields().collect();
@@ -543,7 +615,10 @@ mod tests {
     fn test_record_implements_field_resolver() {
         use crate::resolver::FieldResolver;
 
-        let schema = Arc::new(Schema::new(vec!["name".into(), "age".into()]));
+        let schema = crate::owned_storage::SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "name".into(),
+            "age".into(),
+        ])));
         let record = Record::new(
             schema,
             vec![Value::String("Ada".into()), Value::Integer(30)],
@@ -568,7 +643,10 @@ mod tests {
         use crate::document_context::{DocumentId, synthetic_document_context};
         let schema = test_schema();
         let record = Record::new(schema, vec![Value::Null; 5]);
-        assert!(Arc::ptr_eq(record.doc_ctx(), &synthetic_document_context()));
+        assert!(SharedStorage::ptr_eq(
+            record.doc_ctx(),
+            &synthetic_document_context()
+        ));
         assert_eq!(record.doc_ctx().id(), DocumentId::SYNTHETIC);
     }
 
@@ -580,20 +658,23 @@ mod tests {
         let id = DocumentId::next();
         let mut sections = IndexMap::new();
         sections.insert(
-            Box::from("Head"),
-            Value::Map(Box::new({
+            crate::owned_storage::OwnedKey::from("Head"),
+            Value::Map(crate::owned_storage::OwnedMap::from_map({
                 let mut m = IndexMap::new();
-                m.insert(Box::from("batch"), Value::String("R-1".into()));
+                m.insert(
+                    crate::owned_storage::OwnedKey::from("batch"),
+                    Value::String("R-1".into()),
+                );
                 m
             })),
         );
-        let ctx = Arc::new(DocumentContext::new(
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             id,
             Arc::from("doc.xml"),
             EnvelopeRecord::from_sections(sections),
-        ));
-        record.set_doc_ctx(Arc::clone(&ctx));
-        assert!(Arc::ptr_eq(record.doc_ctx(), &ctx));
+        )));
+        record.set_doc_ctx(ctx.clone());
+        assert!(SharedStorage::ptr_eq(record.doc_ctx(), &ctx));
         assert_eq!(record.doc_ctx().id(), id);
         assert_eq!(
             record.doc_ctx().get_section_field("Head", "batch"),
@@ -603,7 +684,10 @@ mod tests {
 
     #[test]
     fn test_record_estimated_heap_size() {
-        let schema = Arc::new(Schema::new(vec!["name".into(), "value".into()]));
+        let schema = crate::owned_storage::SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "name".into(),
+            "value".into(),
+        ])));
         let record = Record::new(
             schema,
             vec![Value::String("hello".into()), Value::Integer(42)],
@@ -617,7 +701,10 @@ mod tests {
 
     #[test]
     fn test_record_estimated_heap_size_heap_backed_string() {
-        let schema = Arc::new(Schema::new(vec!["name".into(), "value".into()]));
+        let schema = crate::owned_storage::SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "name".into(),
+            "value".into(),
+        ])));
         let long = "a field value that exceeds the 23-byte inline capacity of the field type";
         assert!(long.len() > crate::field_str::INLINE_CAP);
         let record = Record::new(schema, vec![Value::String(long.into()), Value::Integer(42)]);

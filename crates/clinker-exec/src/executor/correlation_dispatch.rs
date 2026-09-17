@@ -377,7 +377,7 @@ fn flush_clean_records_to_writers(
                 continue 'outputs;
             }
         }
-        let output_schema = Arc::clone(slots[0].projected.schema());
+        let output_schema = slots[0].projected.schema().clone();
 
         let Some(raw_writer) = ctx.writers.remove(&output_name) else {
             if let Some(mut signal) = signal.take() {
@@ -390,7 +390,7 @@ fn flush_clean_records_to_writers(
         match build_format_writer(
             out_cfg,
             raw_writer,
-            Arc::clone(&output_schema),
+            output_schema.clone(),
             ctx.output_staging.clone(),
             sink_byte_counter.clone(),
         ) {

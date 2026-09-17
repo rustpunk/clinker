@@ -29,10 +29,10 @@
 //! written, the writer emits that document's context frame **before** the
 //! record's pair frame; every later record of the same document carries
 //! only its `doc_id` (a `u64`) in the `RecordPayload`. On read the context
-//! frames build a `HashMap<DocumentId, Arc<DocumentContext>>` incrementally
-//! and each record clones the shared `Arc` keyed by its `doc_id`. This is
+//! frames build a `HashMap<DocumentId, SharedStorage<DocumentContext>>` incrementally
+//! and each record clones the shared handle keyed by its `doc_id`. This is
 //! bounded-memory: `O(distinct documents in file)` context frames, never
-//! `O(records)`, and exactly one `Arc<DocumentContext>` per document on
+//! `O(records)`, and exactly one context allocation per document on
 //! reload. [`DocumentId::SYNTHETIC`] is never interned — a synthetic
 //! `doc_id` resolves on read to the process-wide
 //! [`synthetic_document_context`] singleton; a non-synthetic `doc_id`
@@ -49,6 +49,7 @@
 //! manifest written once per file. Record bodies use postcard for compact
 //! binary encoding of `Value`s and the per-record metadata map.
 
+use clinker_record::owned_storage::{AllocationResources, SharedStorage};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::marker::PhantomData;
@@ -183,7 +184,7 @@ impl SpillSink {
 /// that bounds context interning to one frame per document.
 pub struct SpillWriter<P> {
     sink: SpillSink,
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     /// Documents whose context frame has already been emitted, so each
     /// non-synthetic [`DocumentId`] is interned exactly once per file. Holds
     /// at most one entry per distinct document in the stream
@@ -210,7 +211,7 @@ impl<P: Serialize> SpillWriter<P> {
     /// directory. `compress` selects LZ4 framing (`true`) or a raw postcard
     /// stream (`false`); the choice is recorded in the file's leading tag.
     pub fn new(
-        schema: Arc<Schema>,
+        schema: SharedStorage<Schema>,
         spill_dir: Option<&Path>,
         compress: bool,
     ) -> Result<Self, SpillError> {
@@ -309,7 +310,7 @@ impl<P: Serialize> SpillWriter<P> {
         let doc_ctx = record.doc_ctx();
         let doc_id = doc_ctx.id();
         if doc_id != DocumentId::SYNTHETIC && self.seen_docs.insert(doc_id) {
-            let ctx_bytes = postcard::to_stdvec(doc_ctx.as_ref())?;
+            let ctx_bytes = postcard::to_stdvec(&**doc_ctx)?;
             self.write_frame(FRAME_CONTEXT_INTERN, &ctx_bytes)?;
         }
 
@@ -336,7 +337,36 @@ impl<P: Serialize> SpillWriter<P> {
     /// byte length (leading tag + schema header + every frame, post-compression)
     /// so a caller can charge it against the disk-spill quota without a `stat`
     /// that could fail and silently under-count.
-    pub fn finish_with_bytes(self) -> Result<(SpillFile<P>, u64), SpillError> {
+    pub fn finish_with_bytes(mut self) -> Result<(SpillFile<P>, u64), SpillError> {
+        let decoder_workspace_bytes = match &mut self.sink {
+            SpillSink::Uncompressed(_) => 0,
+            SpillSink::Lz4(encoder) => {
+                // The nonempty JSON schema write has resolved Auto already.
+                // lz4_flex 0.11.6 retains src = block size and dst = block
+                // size (independent) or 2 * block size + 64 KiB (linked).
+                // Preserve this opaque allowance beside the file; no frame
+                // parsing or compression-profile change is needed at reopen.
+                use lz4_flex::frame::{BlockMode, BlockSize};
+                let info = encoder.frame_info();
+                let block = match info.block_size {
+                    BlockSize::Max64KB => 64 * 1024,
+                    BlockSize::Max256KB => 256 * 1024,
+                    BlockSize::Max1MB => 1024 * 1024,
+                    BlockSize::Max4MB => 4 * 1024 * 1024,
+                    BlockSize::Max8MB => 8 * 1024 * 1024,
+                    BlockSize::Auto => {
+                        return Err(SpillError::InvalidSchema(
+                            "spill encoder frame profile was not established".into(),
+                        ));
+                    }
+                };
+                if info.block_mode == BlockMode::Linked {
+                    3 * block + 64 * 1024
+                } else {
+                    2 * block
+                }
+            }
+        };
         let temp_file = self.sink.into_temp_file(&self.spill_dir)?;
         // Read the counter after the buffered and LZ4-framed tails have flushed,
         // so it reflects every byte on disk.
@@ -347,6 +377,7 @@ impl<P: Serialize> SpillWriter<P> {
                 path,
                 schema: self.schema,
                 bytes: written,
+                decoder_workspace_bytes,
                 _payload: PhantomData,
             },
             written,
@@ -356,8 +387,9 @@ impl<P: Serialize> SpillWriter<P> {
 
 /// Handle to a completed spill file. Auto-deletes on drop via TempPath.
 pub struct SpillFile<P> {
+    decoder_workspace_bytes: usize,
     path: tempfile::TempPath,
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     /// Exact on-disk byte length of this run — the same figure
     /// [`SpillWriter::finish_with_bytes`] returned for it (leading tag + schema
     /// header + every frame, post-compression). Carried so a consumer that
@@ -392,8 +424,10 @@ impl<P: DeserializeOwned> SpillFile<P> {
             }
         };
         let mut reader = SpillReader {
+            decoder_workspace_bytes: self.decoder_workspace_bytes,
+            context_heap_bytes: 0,
             source,
-            schema: Arc::clone(&self.schema),
+            schema: self.schema.clone(),
             doc_table: HashMap::new(),
             len_buf: [0u8; 4],
             _payload: PhantomData,
@@ -419,7 +453,7 @@ impl<P: DeserializeOwned> SpillFile<P> {
 
 impl<P> SpillFile<P> {
     /// Schema stored in this spill file.
-    pub fn schema(&self) -> &Arc<Schema> {
+    pub fn schema(&self) -> &SharedStorage<Schema> {
         &self.schema
     }
 
@@ -475,19 +509,50 @@ impl BufRead for SpillSource {
 /// format tag for the compressed or uncompressed record stream.
 ///
 /// Memory model: streaming — one frame is decoded per `next` call. The only
-/// retained state is `doc_table`, the per-file `DocumentId → Arc` interning
-/// table built incrementally from context frames; it holds one `Arc` per
+/// retained state is `doc_table`, the per-file `DocumentId → SharedStorage` interning
+/// table built incrementally from context frames; it holds one shared handle per
 /// distinct document (`O(distinct documents)`), and every record of a
-/// document clones that shared `Arc` rather than decoding the context again.
+/// document clones that shared handle rather than decoding the context again.
 pub struct SpillReader<P> {
+    context_heap_bytes: usize,
+    /// Pinned-source bound from the frame profile the owning writer established.
+    /// Separate from directly observable BufReader and intern-table capacities.
+    decoder_workspace_bytes: usize,
     source: SpillSource,
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     /// Per-file envelope-context interning table. A context-intern frame
-    /// decodes its [`DocumentContext`] into exactly one `Arc` here; every
-    /// later record carrying that `DocumentId` clones the shared `Arc`.
-    doc_table: HashMap<DocumentId, Arc<DocumentContext>>,
+    /// decodes its [`DocumentContext`] into exactly one shared handle here; every
+    /// later record carrying that `DocumentId` clones the shared handle.
+    doc_table: HashMap<DocumentId, SharedStorage<DocumentContext>>,
     len_buf: [u8; 4],
     _payload: PhantomData<P>,
+}
+
+impl<P> SpillReader<P> {
+    /// Physical retained-memory estimate. The record schema is borrowed from the
+    /// file owner; each newly decoded context is charged once by this intern table.
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        let io_capacity = match &self.source {
+            SpillSource::Uncompressed(reader) => reader.capacity(),
+            SpillSource::Lz4(reader) => reader.capacity(),
+        };
+        let slots = self.doc_table.capacity().saturating_mul(2);
+        io_capacity
+            + self.decoder_workspace_bytes
+            + slots * (std::mem::size_of::<(DocumentId, SharedStorage<DocumentContext>)>() + 1)
+            + usize::from(slots != 0) * 16
+            + self.context_heap_bytes
+    }
+
+    /// Reader-owned buffers and freshly decoded contexts are independent legacy
+    /// allocations for every target ledger. The borrowed schema belongs to the
+    /// file inventory; row backing belongs to the caller after extraction.
+    pub(crate) fn retained_unaccounted_heap_bytes(
+        &self,
+        _resources: &AllocationResources,
+    ) -> usize {
+        self.retained_heap_bytes()
+    }
 }
 
 impl<P: DeserializeOwned> Iterator for SpillReader<P> {
@@ -546,11 +611,18 @@ impl<P: DeserializeOwned> Iterator for SpillReader<P> {
 }
 
 impl<P: DeserializeOwned> SpillReader<P> {
-    /// Decode a context-intern frame into one shared `Arc<DocumentContext>`
+    /// Decode a context-intern frame into one legacy shared context
     /// and insert it into the per-file table keyed by the document's id.
     fn intern_context(&mut self, body: &[u8]) -> Result<(), SpillError> {
         let ctx: DocumentContext = postcard::from_bytes(body)?;
-        self.doc_table.insert(ctx.id(), Arc::new(ctx));
+        let ctx = SharedStorage::from_arc(Arc::new(ctx));
+        let retained = |context: &SharedStorage<DocumentContext>| {
+            context.estimated_outer_heap_size() + context.estimated_heap_size()
+        };
+        self.context_heap_bytes += retained(&ctx);
+        if let Some(previous) = self.doc_table.insert(ctx.id(), ctx) {
+            self.context_heap_bytes -= retained(&previous);
+        }
         Ok(())
     }
 
@@ -565,7 +637,7 @@ impl<P: DeserializeOwned> SpillReader<P> {
             synthetic_document_context()
         } else {
             match self.doc_table.get(&rec_payload.doc_id) {
-                Some(ctx) => Arc::clone(ctx),
+                Some(ctx) => ctx.clone(),
                 None => {
                     return Err(SpillError::InvalidSchema(format!(
                         "spill record references document {:?} with no interned context frame; \
@@ -575,48 +647,186 @@ impl<P: DeserializeOwned> SpillReader<P> {
                 }
             }
         };
-        let record = rec_payload.into_record(Arc::clone(&self.schema), doc_ctx);
+        let record = rec_payload.into_record(self.schema.clone(), doc_ctx);
         Ok((record, payload))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decoded_context_replacement_keeps_one_exact_legacy_owner() {
+        let authority = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1 << 20).unwrap(),
+        );
+        let foreign = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1 << 20).unwrap(),
+        );
+        let resources = authority.resources().allocation().clone();
+        let foreign_resources = foreign.resources().allocation().clone();
+        for compressed in [false, true] {
+            let schema = test_schema();
+            let context = make_doc_ctx(7, "input.csv");
+            let mut record = make_record(
+                &schema,
+                "retained decoded text beyond inline storage",
+                7,
+                true,
+            );
+            record.set_doc_ctx(context.clone());
+            let mut writer = SpillWriter::<u64>::new(schema, None, compressed).unwrap();
+            writer.write_pair(&record, &1).unwrap();
+            writer.write_pair(&record, &2).unwrap();
+            let file = writer.finish().unwrap();
+            let mut reader = file.reader().unwrap();
+            let before = reader.retained_unaccounted_heap_bytes(&resources);
+            let (first, _) = reader.next().unwrap().unwrap();
+            let with_context = reader.retained_unaccounted_heap_bytes(&resources);
+            assert!(with_context > before);
+            let (second, _) = reader.next().unwrap().unwrap();
+            assert!(SharedStorage::ptr_eq(first.doc_ctx(), second.doc_ctx()));
+            assert_eq!(
+                reader.retained_unaccounted_heap_bytes(&resources),
+                with_context
+            );
+            assert_eq!(
+                reader.retained_unaccounted_heap_bytes(&foreign_resources),
+                with_context
+            );
+            let old_bytes =
+                first.doc_ctx().estimated_outer_heap_size() + first.doc_ctx().estimated_heap_size();
+            let replacement =
+                context.with_replaced_envelope(clinker_record::EnvelopeRecord::empty());
+            reader
+                .intern_context(&postcard::to_stdvec(&replacement).unwrap())
+                .unwrap();
+            let current = reader.doc_table.get(&context.id()).unwrap();
+            let new_bytes = current.estimated_outer_heap_size() + current.estimated_heap_size();
+            assert!(old_bytes > new_bytes);
+            assert_eq!(reader.context_heap_bytes, new_bytes);
+            assert_eq!(
+                reader.retained_unaccounted_heap_bytes(&resources),
+                with_context - old_bytes + new_bytes
+            );
+            assert_eq!(
+                reader.retained_heap_bytes(),
+                reader.retained_unaccounted_heap_bytes(&resources)
+            );
+            assert_eq!(
+                first.unaccounted_heap_size(&resources),
+                first.estimated_heap_size()
+            );
+            assert!(!SharedStorage::ptr_eq(first.doc_ctx(), current));
+            drop(reader);
+            assert!(SharedStorage::ptr_eq(first.doc_ctx(), second.doc_ctx()));
+            assert_eq!((authority.used(), foreign.used()), (0, 0));
+        }
+    }
+    use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues};
+    #[test]
+    fn output_reader_profile_survives_empty_narrow_and_wide_reopens() {
+        for (name_bytes, decoder_bytes) in [
+            (0, 128 * 1024),
+            (8, 128 * 1024),
+            (70_000, 512 * 1024),
+            (300_000, 8 * 1024 * 1024),
+        ] {
+            let columns = if name_bytes == 0 {
+                Vec::new()
+            } else {
+                vec!["n".repeat(name_bytes).into()]
+            };
+            let schema = SharedStorage::from_arc(Arc::new(Schema::new(columns)));
+            // Even a zero-record file writes a nonempty schema header, which
+            // fixes Auto before finish captures the public frame profile.
+            let file = SpillWriter::<u64>::new(schema, None, true)
+                .unwrap()
+                .finish()
+                .unwrap();
+            assert_eq!(file.decoder_workspace_bytes, decoder_bytes);
+            for _ in 0..2 {
+                let mut reader = file.reader().unwrap();
+                assert_eq!(reader.decoder_workspace_bytes, decoder_bytes);
+                assert!(reader.retained_heap_bytes() >= decoder_bytes + 8192);
+                assert!(reader.next().is_none());
+            }
+        }
+    }
+    #[test]
+    fn output_drain_reader_retains_resolved_decoder_and_context_charge() {
+        for compressed in [false, true] {
+            let schema =
+                SharedStorage::from_arc(std::sync::Arc::new(clinker_record::Schema::new(vec![
+                    "v".into(),
+                ])));
+            let mut writer =
+                super::SpillWriter::<u64>::new(schema.clone(), None, compressed).unwrap();
+            let context = make_doc_ctx(7, "input.csv");
+            let mut record =
+                clinker_record::Record::new(schema, vec![clinker_record::Value::Integer(1)]);
+            record.set_doc_ctx(context);
+            writer.write_pair(&record, &1).unwrap();
+            let file = writer.finish().unwrap();
+            assert_eq!(
+                file.decoder_workspace_bytes,
+                if compressed { 128 * 1024 } else { 0 }
+            );
+            let mut reader = file.reader().unwrap();
+            let before = reader.retained_heap_bytes();
+            let (decoded, _) = reader.next().unwrap().unwrap();
+            let after = reader.retained_heap_bytes();
+            assert!(
+                after > before,
+                "the intern table and decoded context are owned while the reader lives"
+            );
+            drop(decoded);
+            assert_eq!(
+                reader.retained_heap_bytes(),
+                after,
+                "record release must not release its reader's shared context"
+            );
+        }
+    }
     use super::*;
     use clinker_record::Value;
     use indexmap::IndexMap;
 
-    fn test_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
+    fn test_schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "name".into(),
             "amount".into(),
             "active".into(),
-        ]))
+        ])))
     }
 
     /// Build a `DocumentContext` with the given id, file, and a single
     /// `Head` section carrying `(batch_id, total)` — a typical envelope
     /// shape with a nested `Value::Map` payload exercising the recursive
     /// `Value` path through the context frame.
-    fn make_doc_ctx(id_seed: i64, file: &str) -> Arc<DocumentContext> {
+    fn make_doc_ctx(id_seed: i64, file: &str) -> SharedStorage<DocumentContext> {
         let mut head = IndexMap::new();
         head.insert(
-            Box::from("batch_id"),
+            OwnedKey::from("batch_id"),
             Value::String(format!("RUN-{id_seed:03}").into()),
         );
         head.insert("total".into(), Value::Integer(id_seed * 10));
         let mut sections = IndexMap::new();
-        sections.insert(Box::from("Head"), Value::Map(Box::new(head)));
-        Arc::new(DocumentContext::new(
+        sections.insert(OwnedKey::from("Head"), Value::Map(OwnedMap::from_map(head)));
+        SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from(file),
             clinker_record::EnvelopeRecord::from_sections(sections),
-        ))
+        )))
     }
 
-    fn make_record(schema: &Arc<Schema>, name: &str, amount: i64, active: bool) -> Record {
+    fn make_record(
+        schema: &SharedStorage<Schema>,
+        name: &str,
+        amount: i64,
+        active: bool,
+    ) -> Record {
         Record::new(
-            Arc::clone(schema),
+            schema.clone(),
             vec![
                 Value::String(name.into()),
                 Value::Integer(amount),
@@ -631,7 +841,7 @@ mod tests {
     #[test]
     fn test_spill_roundtrip_all_value_types() {
         for compress in [true, false] {
-            let schema = Arc::new(Schema::new(vec![
+            let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
                 "null_col".into(),
                 "bool_col".into(),
                 "int_col".into(),
@@ -640,14 +850,14 @@ mod tests {
                 "date_col".into(),
                 "dt_col".into(),
                 "arr_col".into(),
-            ]));
+            ])));
 
             let mut writer: SpillWriter<()> =
-                SpillWriter::new(Arc::clone(&schema), None, compress).unwrap();
+                SpillWriter::new(schema.clone(), None, compress).unwrap();
 
             for i in 0..100 {
                 let record = Record::new(
-                    Arc::clone(&schema),
+                    schema.clone(),
                     vec![
                         Value::Null,
                         Value::Bool(i % 2 == 0),
@@ -665,7 +875,10 @@ mod tests {
                                 .unwrap()
                                 + chrono::Duration::seconds(i as i64),
                         ),
-                        Value::Array(vec![Value::Integer(i as i64), Value::String("x".into())]),
+                        Value::Array(OwnedValues::from_vec(vec![
+                            Value::Integer(i as i64),
+                            Value::String("x".into()),
+                        ])),
                     ],
                 );
                 writer.write_record(&record).unwrap();
@@ -696,16 +909,15 @@ mod tests {
     #[test]
     fn test_spill_schema_preserved() {
         // Non-alphabetical column order
-        let schema = Arc::new(Schema::new(vec![
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "z_col".into(),
             "a_col".into(),
             "m_col".into(),
-        ]));
+        ])));
 
-        let mut writer: SpillWriter<()> =
-            SpillWriter::new(Arc::clone(&schema), None, true).unwrap();
+        let mut writer: SpillWriter<()> = SpillWriter::new(schema.clone(), None, true).unwrap();
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
         );
         writer.write_record(&record).unwrap();
@@ -729,8 +941,7 @@ mod tests {
     #[test]
     fn test_spill_lz4_compression_ratio() {
         let schema = test_schema();
-        let mut writer: SpillWriter<()> =
-            SpillWriter::new(Arc::clone(&schema), None, true).unwrap();
+        let mut writer: SpillWriter<()> = SpillWriter::new(schema.clone(), None, true).unwrap();
 
         // Write 1000 records; postcard binary is significantly more compact
         // than NDJSON. Assert the spill file is under 50% of the equivalent
@@ -766,7 +977,7 @@ mod tests {
         let schema = test_schema();
         for (compress, expected_tag) in [(true, 0x01u8), (false, 0x00u8)] {
             let mut writer: SpillWriter<()> =
-                SpillWriter::new(Arc::clone(&schema), None, compress).unwrap();
+                SpillWriter::new(schema.clone(), None, compress).unwrap();
             writer
                 .write_record(&make_record(&schema, "Alice", 100, true))
                 .unwrap();
@@ -785,8 +996,7 @@ mod tests {
     #[test]
     fn uncompressed_spill_has_no_lz4_frame_header() {
         let schema = test_schema();
-        let mut writer: SpillWriter<()> =
-            SpillWriter::new(Arc::clone(&schema), None, false).unwrap();
+        let mut writer: SpillWriter<()> = SpillWriter::new(schema.clone(), None, false).unwrap();
         writer
             .write_record(&make_record(&schema, "Alice", 100, true))
             .unwrap();
@@ -813,8 +1023,7 @@ mod tests {
     #[test]
     fn uncompressed_spill_roundtrips_payload() {
         let schema = test_schema();
-        let mut writer: SpillWriter<u64> =
-            SpillWriter::new(Arc::clone(&schema), None, false).unwrap();
+        let mut writer: SpillWriter<u64> = SpillWriter::new(schema.clone(), None, false).unwrap();
         writer
             .write_pair(&make_record(&schema, "Alice", 100, true), &7)
             .unwrap();
@@ -833,8 +1042,7 @@ mod tests {
     #[test]
     fn test_spill_tempfile_cleanup() {
         let schema = test_schema();
-        let mut writer: SpillWriter<()> =
-            SpillWriter::new(Arc::clone(&schema), None, true).unwrap();
+        let mut writer: SpillWriter<()> = SpillWriter::new(schema.clone(), None, true).unwrap();
         writer
             .write_record(&make_record(&schema, "Alice", 100, true))
             .unwrap();
@@ -850,7 +1058,7 @@ mod tests {
     #[test]
     fn test_spill_empty_chunk() {
         let schema = test_schema();
-        let writer: SpillWriter<()> = SpillWriter::new(Arc::clone(&schema), None, true).unwrap();
+        let writer: SpillWriter<()> = SpillWriter::new(schema.clone(), None, true).unwrap();
         // Finish immediately — no records written
         let spill_file = writer.finish().unwrap();
 
@@ -864,18 +1072,17 @@ mod tests {
         // Widened schema includes every field the upstream operator emits.
         // Spill rehydrate reads values positionally out of the schema —
         // there is no off-schema side channel to round-trip.
-        let schema = Arc::new(Schema::new(vec![
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "name".into(),
             "amount".into(),
             "active".into(),
             "extra_field".into(),
             "score".into(),
-        ]));
-        let mut writer: SpillWriter<()> =
-            SpillWriter::new(Arc::clone(&schema), None, true).unwrap();
+        ])));
+        let mut writer: SpillWriter<()> = SpillWriter::new(schema.clone(), None, true).unwrap();
 
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("Alice".into()),
                 Value::Integer(100),
@@ -904,7 +1111,7 @@ mod tests {
         let custom_dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut writer: SpillWriter<()> =
-            SpillWriter::new(Arc::clone(&schema), Some(custom_dir.path()), true).unwrap();
+            SpillWriter::new(schema.clone(), Some(custom_dir.path()), true).unwrap();
         writer
             .write_record(&make_record(&schema, "Alice", 100, true))
             .unwrap();
@@ -931,7 +1138,7 @@ mod tests {
         let schema = test_schema();
         std::fs::remove_dir(&spill_dir).unwrap();
 
-        let err = match SpillWriter::<()>::new(Arc::clone(&schema), Some(&spill_dir), true) {
+        let err = match SpillWriter::<()>::new(schema.clone(), Some(&spill_dir), true) {
             Ok(_) => panic!("spill writer creation should fail when the dir is gone"),
             Err(e) => e,
         };
@@ -958,9 +1165,9 @@ mod tests {
             let schema = test_schema();
             let doc = make_doc_ctx(1, "payments/run-001.xml");
             let mut writer: SpillWriter<()> =
-                SpillWriter::new(Arc::clone(&schema), None, compress).unwrap();
+                SpillWriter::new(schema.clone(), None, compress).unwrap();
             let mut rec = make_record(&schema, "Alice", 100, true);
-            rec.set_doc_ctx(Arc::clone(&doc));
+            rec.set_doc_ctx(doc.clone());
             writer.write_record(&rec).unwrap();
 
             let spill_file = writer.finish().unwrap();
@@ -987,18 +1194,17 @@ mod tests {
     }
 
     // Every record of one document re-hydrates the SAME shared
-    // `Arc<DocumentContext>` — one allocation per document on reload, not
-    // per record. `Arc::ptr_eq` across all three records of the document
-    // proves the interning table hands back a single shared Arc.
+    // `SharedStorage<DocumentContext>` — one allocation per document on reload, not
+    // per record. `SharedStorage::ptr_eq` across all three records of the document
+    // proves the interning table hands back a single shared handle.
     #[test]
     fn spill_shares_one_arc_per_document() {
         let schema = test_schema();
         let doc = make_doc_ctx(2, "claims/batch.xml");
-        let mut writer: SpillWriter<()> =
-            SpillWriter::new(Arc::clone(&schema), None, true).unwrap();
+        let mut writer: SpillWriter<()> = SpillWriter::new(schema.clone(), None, true).unwrap();
         for i in 0..3 {
             let mut rec = make_record(&schema, &format!("row{i}"), i, true);
-            rec.set_doc_ctx(Arc::clone(&doc));
+            rec.set_doc_ctx(doc.clone());
             writer.write_record(&rec).unwrap();
         }
         let spill_file = writer.finish().unwrap();
@@ -1007,8 +1213,8 @@ mod tests {
         let first = records[0].doc_ctx();
         for rec in &records[1..] {
             assert!(
-                Arc::ptr_eq(first, rec.doc_ctx()),
-                "all records of one document must share one re-hydrated Arc",
+                SharedStorage::ptr_eq(first, rec.doc_ctx()),
+                "all records of one document must share one re-hydrated context",
             );
         }
     }
@@ -1020,8 +1226,7 @@ mod tests {
     #[test]
     fn spill_synthetic_doc_ctx_roundtrips_as_synthetic() {
         let schema = test_schema();
-        let mut writer: SpillWriter<()> =
-            SpillWriter::new(Arc::clone(&schema), None, true).unwrap();
+        let mut writer: SpillWriter<()> = SpillWriter::new(schema.clone(), None, true).unwrap();
         // make_record leaves the default synthetic context attached.
         writer
             .write_record(&make_record(&schema, "syn", 1, false))
@@ -1039,7 +1244,7 @@ mod tests {
         let records: Vec<Record> = spill_file.reader().unwrap().map(|r| r.unwrap().0).collect();
         assert_eq!(records.len(), 1);
         assert!(
-            Arc::ptr_eq(records[0].doc_ctx(), &synthetic_document_context()),
+            SharedStorage::ptr_eq(records[0].doc_ctx(), &synthetic_document_context()),
             "synthetic doc_id must re-hydrate to the shared singleton",
         );
         assert_eq!(records[0].doc_ctx().id(), DocumentId::SYNTHETIC);
@@ -1054,15 +1259,14 @@ mod tests {
         let schema = test_schema();
         const DOCS: usize = 3;
         const RECS_PER_DOC: usize = 20;
-        let docs: Vec<Arc<DocumentContext>> = (0..DOCS)
+        let docs: Vec<SharedStorage<DocumentContext>> = (0..DOCS)
             .map(|d| make_doc_ctx(d as i64 + 1, &format!("doc-{d}.xml")))
             .collect();
-        let mut writer: SpillWriter<()> =
-            SpillWriter::new(Arc::clone(&schema), None, false).unwrap();
+        let mut writer: SpillWriter<()> = SpillWriter::new(schema.clone(), None, false).unwrap();
         for doc in &docs {
             for i in 0..RECS_PER_DOC {
                 let mut rec = make_record(&schema, "r", i as i64, true);
-                rec.set_doc_ctx(Arc::clone(doc));
+                rec.set_doc_ctx(doc.clone());
                 writer.write_record(&rec).unwrap();
             }
         }
@@ -1076,17 +1280,20 @@ mod tests {
             "one record frame per record",
         );
 
-        // Each document's records share that document's single Arc, and the
-        // three documents' Arcs are mutually distinct.
+        // Each document's records share that document's single shared handle, and the
+        // three documents' contexts are mutually distinct.
         let records: Vec<Record> = spill_file.reader().unwrap().map(|r| r.unwrap().0).collect();
         assert_eq!(records.len(), DOCS * RECS_PER_DOC);
         let doc_a = records[0].doc_ctx();
         let doc_b = records[RECS_PER_DOC].doc_ctx();
         assert!(
-            !Arc::ptr_eq(doc_a, doc_b),
-            "distinct docs get distinct Arcs"
+            !SharedStorage::ptr_eq(doc_a, doc_b),
+            "distinct docs get distinct contexts"
         );
-        assert!(Arc::ptr_eq(doc_a, records[RECS_PER_DOC - 1].doc_ctx()));
+        assert!(SharedStorage::ptr_eq(
+            doc_a,
+            records[RECS_PER_DOC - 1].doc_ctx()
+        ));
     }
 
     // A non-synthetic record whose context frame never landed is a
@@ -1098,10 +1305,9 @@ mod tests {
         let schema = test_schema();
         let doc = make_doc_ctx(9, "lone.xml");
         // Uncompressed so the body frames are byte-addressable for surgery.
-        let mut writer: SpillWriter<()> =
-            SpillWriter::new(Arc::clone(&schema), None, false).unwrap();
+        let mut writer: SpillWriter<()> = SpillWriter::new(schema.clone(), None, false).unwrap();
         let mut rec = make_record(&schema, "z", 1, true);
-        rec.set_doc_ctx(Arc::clone(&doc));
+        rec.set_doc_ctx(doc.clone());
         writer.write_record(&rec).unwrap();
         let spill_file = writer.finish().unwrap();
 
@@ -1146,7 +1352,10 @@ mod tests {
     // surface the cap error rather than attempting the allocation. Covers
     // both the context-intern frame (doc-attached record opens with one) and
     // the record-pair frame (synthetic record opens with one).
-    fn assert_over_cap_first_frame_rejected(spill_file: &SpillFile<()>, schema: &Arc<Schema>) {
+    fn assert_over_cap_first_frame_rejected(
+        spill_file: &SpillFile<()>,
+        schema: &SharedStorage<Schema>,
+    ) {
         let mut raw = std::fs::read(spill_file.path()).unwrap();
         let nl = raw.iter().position(|&b| b == b'\n').unwrap();
         // Overwrite the first body frame's 4-byte LE length prefix with an
@@ -1175,8 +1384,7 @@ mod tests {
         // A doc-attached record opens the body with a context-intern frame.
         // Uncompressed so the first frame's length prefix sits at a fixed
         // offset right after the JSON schema header line.
-        let mut writer: SpillWriter<()> =
-            SpillWriter::new(Arc::clone(&schema), None, false).unwrap();
+        let mut writer: SpillWriter<()> = SpillWriter::new(schema.clone(), None, false).unwrap();
         let mut rec = make_record(&schema, "a", 1, true);
         rec.set_doc_ctx(make_doc_ctx(5, "big.xml"));
         writer.write_record(&rec).unwrap();
@@ -1189,8 +1397,7 @@ mod tests {
         let schema = test_schema();
         // A synthetic-context record interns no context frame, so the first
         // body frame is the record pair.
-        let mut writer: SpillWriter<()> =
-            SpillWriter::new(Arc::clone(&schema), None, false).unwrap();
+        let mut writer: SpillWriter<()> = SpillWriter::new(schema.clone(), None, false).unwrap();
         writer
             .write_record(&make_record(&schema, "a", 1, true))
             .unwrap();
@@ -1244,7 +1451,10 @@ mod tests {
     /// the production `SpillReader` frame loop, returning the first decode
     /// error encountered. Mirrors `SpillFile::reader` without needing a
     /// `SpillFile` handle (the surgical file isn't one).
-    fn decode_surgical(path: &Path, schema: &Arc<Schema>) -> Result<Vec<Record>, SpillError> {
+    fn decode_surgical(
+        path: &Path,
+        schema: &SharedStorage<Schema>,
+    ) -> Result<Vec<Record>, SpillError> {
         let mut file = std::fs::File::open(path)?;
         let mut tag = [0u8; 1];
         file.read_exact(&mut tag)?;
@@ -1258,8 +1468,16 @@ mod tests {
             }
         };
         let mut reader: SpillReader<()> = SpillReader {
+            context_heap_bytes: 0,
+            // This corruption-test helper has no owning SpillFile metadata.
+            // Unknown compressed profiles use the supported format maximum.
+            decoder_workspace_bytes: if matches!(&source, SpillSource::Lz4(_)) {
+                3 * 8 * 1024 * 1024 + 64 * 1024
+            } else {
+                0
+            },
             source,
-            schema: Arc::clone(schema),
+            schema: schema.clone(),
             doc_table: HashMap::new(),
             len_buf: [0u8; 4],
             _payload: PhantomData,

@@ -77,6 +77,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ahash::RandomState;
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
 use clinker_record::{Record, Schema, Value};
 use cxl::ast::Expr;
 use cxl::eval::{EvalContext, EvalError, EvalResult, ProgramEvaluator};
@@ -530,6 +531,7 @@ fn pwmj_numeric_capped(
 /// function signature stays under clippy's `too_many_arguments` cap and
 /// callers can update one field without rewriting the call site.
 pub(crate) struct IEJoinExec<'a> {
+    pub(crate) allocation_resources: &'a clinker_record::owned_storage::AllocationResources,
     pub name: &'a str,
     pub build_qualifier: &'a str,
     pub driver_records: Vec<(Record, RecordOrder)>,
@@ -537,7 +539,7 @@ pub(crate) struct IEJoinExec<'a> {
     pub decomposed: &'a DecomposedPredicate,
     pub body_program: Option<&'a Arc<TypedProgram>>,
     pub resolver_mapping: &'a CombineResolverMapping,
-    pub output_schema: Option<&'a Arc<Schema>>,
+    pub output_schema: Option<&'a SharedStorage<Schema>>,
     pub match_mode: MatchMode,
     pub on_miss: OnMiss,
     /// Opt-in runtime cap on the combine's emitted-row count (E325 on breach);
@@ -580,6 +582,7 @@ pub(crate) fn execute_combine_iejoin(
     args: IEJoinExec<'_>,
 ) -> Result<BlockBandOutput, PipelineError> {
     let IEJoinExec {
+        allocation_resources,
         name,
         build_qualifier,
         driver_records,
@@ -799,6 +802,7 @@ pub(crate) fn execute_combine_iejoin(
     // a hot equality value degrades to a pure-range band join over its own
     // same-hash blocks rather than materializing that group resident.
     block::execute_block_band(block::BlockBandExec {
+        allocation_resources,
         name,
         build_qualifier,
         driver_records,
@@ -835,6 +839,7 @@ pub(crate) fn execute_combine_iejoin(
 /// synthesize output rows identically. Private to this module and its
 /// `block` child.
 struct EmitConfig<'a> {
+    allocation_resources: &'a clinker_record::owned_storage::AllocationResources,
     name: &'a str,
     /// Build-side qualifier (the combine input name the build rows carry), under
     /// which a collect row nests its build array. Combine-wide, so it rides on
@@ -842,7 +847,7 @@ struct EmitConfig<'a> {
     build_qualifier: &'a str,
     ctx: &'a EvalContext<'a>,
     resolver_mapping: &'a CombineResolverMapping,
-    output_schema: Option<&'a Arc<Schema>>,
+    output_schema: Option<&'a SharedStorage<Schema>>,
     match_mode: MatchMode,
     propagate_ck: &'a clinker_plan::config::pipeline_node::PropagateCkSpec,
     budget: &'a MemoryArbitrator,
@@ -930,6 +935,19 @@ fn collect_entry_cost(entry: &CollectEntry) -> u64 {
     (std::mem::size_of::<CollectEntry>() + entry.value.heap_size()) as u64
 }
 
+fn record_unaccounted_held_cost(
+    record: &Record,
+    resources: &clinker_record::owned_storage::AllocationResources,
+) -> u64 {
+    (std::mem::size_of::<Record>() + record.unaccounted_heap_size(resources)) as u64
+}
+fn collect_entry_unaccounted_cost(
+    entry: &CollectEntry,
+    resources: &clinker_record::owned_storage::AllocationResources,
+) -> u64 {
+    (std::mem::size_of::<CollectEntry>() + entry.value.unaccounted_heap_size(resources)) as u64
+}
+
 /// Keep the `(idx, record)` with the smallest `idx` for `key` in `map`,
 /// adjusting `held_bytes` for whichever record is now resident. Shared by the
 /// `First`-mode candidate and the collect `$ck` build so the min-selection rule
@@ -937,6 +955,8 @@ fn collect_entry_cost(entry: &CollectEntry) -> u64 {
 /// pass two disjoint `MatchState` fields (`&mut self.first_match`,
 /// `&mut self.held_bytes`) without aliasing.
 fn keep_min(
+    resources: &clinker_record::owned_storage::AllocationResources,
+    unaccounted_bytes: &mut u64,
     map: &mut HashMap<usize, (u64, Record)>,
     held_bytes: &mut u64,
     key: usize,
@@ -945,21 +965,31 @@ fn keep_min(
 ) {
     match map.entry(key) {
         std::collections::hash_map::Entry::Occupied(mut e) if idx < e.get().0 => {
+            let cloned = record.clone();
             *held_bytes = held_bytes.saturating_sub(record_held_cost(&e.get().1));
-            *held_bytes = held_bytes.saturating_add(record_held_cost(record));
-            e.insert((idx, record.clone()));
+            *held_bytes = held_bytes.saturating_add(record_held_cost(&cloned));
+            *unaccounted_bytes = unaccounted_bytes
+                .saturating_sub(record_unaccounted_held_cost(&e.get().1, resources));
+            *unaccounted_bytes =
+                unaccounted_bytes.saturating_add(record_unaccounted_held_cost(&cloned, resources));
+            e.insert((idx, cloned));
         }
         std::collections::hash_map::Entry::Occupied(_) => {}
         std::collections::hash_map::Entry::Vacant(e) => {
-            *held_bytes = held_bytes.saturating_add(record_held_cost(record));
-            e.insert((idx, record.clone()));
+            let cloned = record.clone();
+            *held_bytes = held_bytes.saturating_add(record_held_cost(&cloned));
+            *unaccounted_bytes =
+                unaccounted_bytes.saturating_add(record_unaccounted_held_cost(&cloned, resources));
+            e.insert((idx, cloned));
         }
     }
 }
 
 /// Per-driver match tracking shared by the pair-emit loop and the collect /
 /// on_miss finalizers, keyed by [`DriverRef::key`].
-struct MatchState {
+struct MatchState<'a> {
+    allocation_resources: &'a clinker_record::owned_storage::AllocationResources,
+    unaccounted_held_bytes: u64,
     /// `matched[key]` is set once a driver has emitted at least one match.
     /// Drives the `First`-mode dedup (equi+range path) and, for the `All`
     /// mode, the end-of-join unmatched sweep. The block path's `First`
@@ -996,9 +1026,14 @@ struct MatchState {
     held_bytes: u64,
 }
 
-impl MatchState {
-    fn new(driver_count: usize) -> Self {
+impl<'a> MatchState<'a> {
+    fn new(
+        driver_count: usize,
+        allocation_resources: &'a clinker_record::owned_storage::AllocationResources,
+    ) -> Self {
         Self {
+            allocation_resources,
+            unaccounted_held_bytes: 0,
             matched: vec![false; driver_count],
             collect_accum: HashMap::new(),
             collect_truncated: HashMap::new(),
@@ -1015,12 +1050,18 @@ impl MatchState {
         self.held_bytes
     }
 
+    fn unaccounted_held_bytes(&self) -> u64 {
+        self.unaccounted_held_bytes
+    }
+
     /// Record one residual-passing collect match for `key`: extract the build's
     /// user fields, keep the bounded smallest-`order_key` set, and track the
     /// min-`order_key` build for `$ck`. Marking a driver truncated once its
     /// heap is full and a further match cannot displace a kept element.
     fn record_collect_match(&mut self, key: usize, order_key: u64, build_record: &Record) {
         keep_min(
+            self.allocation_resources,
+            &mut self.unaccounted_held_bytes,
             &mut self.first_collected_builds,
             &mut self.held_bytes,
             key,
@@ -1032,19 +1073,24 @@ impl MatchState {
         // correlation lineage and the `$widened` auto-widen sidecar) so neither
         // nests inside a collect-array entry and trips the writer's
         // `UnserializableMapValue` guard.
-        let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut m: IndexMap<OwnedKey, Value> = IndexMap::new();
         for (fname, val) in build_record.iter_user_fields() {
             m.insert(fname.into(), val.clone());
         }
         let entry = CollectEntry {
             order_key,
-            value: Value::Map(Box::new(m)),
+            value: Value::Map(OwnedMap::from_map(m)),
         };
         let entry_cost = collect_entry_cost(&entry);
+        let unaccounted_entry_cost =
+            collect_entry_unaccounted_cost(&entry, self.allocation_resources);
         let heap = self.collect_accum.entry(key).or_default();
         if heap.len() < COLLECT_PER_GROUP_CAP {
             heap.push(entry);
             self.held_bytes = self.held_bytes.saturating_add(entry_cost);
+            self.unaccounted_held_bytes = self
+                .unaccounted_held_bytes
+                .saturating_add(unaccounted_entry_cost);
         } else {
             // Heap is full: keep the smallest-`order_key` CAP entries. Displace
             // the current largest only when this match is smaller.
@@ -1052,9 +1098,18 @@ impl MatchState {
             if entry.order_key < heap.peek().expect("full heap is non-empty").order_key {
                 if let Some(popped) = heap.pop() {
                     self.held_bytes = self.held_bytes.saturating_sub(collect_entry_cost(&popped));
+                    self.unaccounted_held_bytes =
+                        self.unaccounted_held_bytes
+                            .saturating_sub(collect_entry_unaccounted_cost(
+                                &popped,
+                                self.allocation_resources,
+                            ));
                 }
                 heap.push(entry);
                 self.held_bytes = self.held_bytes.saturating_add(entry_cost);
+                self.unaccounted_held_bytes = self
+                    .unaccounted_held_bytes
+                    .saturating_add(unaccounted_entry_cost);
             }
         }
     }
@@ -1064,20 +1119,27 @@ impl MatchState {
     /// min-`order_key` build for `$ck`. Releases the drained entries' held-byte
     /// charge.
     fn take_collect(&mut self, key: usize) -> CollectFlush {
-        let arr = match self.collect_accum.remove(&key) {
-            Some(heap) => {
-                let sorted = heap.into_sorted_vec();
-                for e in &sorted {
-                    self.held_bytes = self.held_bytes.saturating_sub(collect_entry_cost(e));
+        let arr =
+            match self.collect_accum.remove(&key) {
+                Some(heap) => {
+                    let sorted = heap.into_sorted_vec();
+                    for e in &sorted {
+                        self.held_bytes = self.held_bytes.saturating_sub(collect_entry_cost(e));
+                        self.unaccounted_held_bytes = self.unaccounted_held_bytes.saturating_sub(
+                            collect_entry_unaccounted_cost(e, self.allocation_resources),
+                        );
+                    }
+                    sorted.into_iter().map(|e| e.value).collect()
                 }
-                sorted.into_iter().map(|e| e.value).collect()
-            }
-            None => Vec::new(),
-        };
+                None => Vec::new(),
+            };
         let truncated = self.collect_truncated.remove(&key).is_some();
         let first_build = match self.first_collected_builds.remove(&key) {
             Some((_, r)) => {
                 self.held_bytes = self.held_bytes.saturating_sub(record_held_cost(&r));
+                self.unaccounted_held_bytes = self
+                    .unaccounted_held_bytes
+                    .saturating_sub(record_unaccounted_held_cost(&r, self.allocation_resources));
                 Some(r)
             }
             None => None,
@@ -1094,6 +1156,8 @@ impl MatchState {
     /// driver block finalizes.
     fn note_first_candidate(&mut self, key: usize, build_idx: u64, build_record: &Record) {
         keep_min(
+            self.allocation_resources,
+            &mut self.unaccounted_held_bytes,
             &mut self.first_match,
             &mut self.held_bytes,
             key,
@@ -1108,6 +1172,9 @@ impl MatchState {
         let taken = self.first_match.remove(&key);
         if let Some((_, ref r)) = taken {
             self.held_bytes = self.held_bytes.saturating_sub(record_held_cost(r));
+            self.unaccounted_held_bytes = self
+                .unaccounted_held_bytes
+                .saturating_sub(record_unaccounted_held_cost(r, self.allocation_resources));
         }
         taken
     }
@@ -1177,18 +1244,21 @@ impl EmitSink<'_> {
         // arbitrator's pull-mode view reflects the output sort's live footprint.
         // Spilling on the buffer's own threshold, not global pressure, is what
         // bounds this axis; the charge releases the bytes it moves to disk.
-        let pre = self.buf.bytes_used();
+        let pre = self.buf.unaccounted_bytes_used();
         self.buf.push(record, (order, driver_idx, build_idx));
         self.consumer
-            .add_bytes(self.buf.bytes_used().saturating_sub(pre) as u64);
+            .add_bytes(self.buf.unaccounted_bytes_used().saturating_sub(pre) as u64);
         if self.buf.should_spill() {
-            let pre_spill = self.buf.bytes_used() as u64;
-            let written = self.buf.sort_and_spill().map_err(|e| {
+            let pre_spill = self.buf.unaccounted_bytes_used() as u64;
+            let spill_result = self.buf.sort_and_spill();
+            self.consumer
+                .sub_bytes(pre_spill.saturating_sub(self.buf.unaccounted_bytes_used() as u64));
+            let written = spill_result.map_err(|e| {
                 PipelineError::Io(std::io::Error::other(format!(
                     "iejoin block-band output spill failed: {e}"
                 )))
             })?;
-            self.consumer.sub_bytes(pre_spill);
+
             if written > 0 && self.budget.record_spill_bytes(self.name, written) {
                 return Err(PipelineError::spill_cap_exceeded(
                     self.name,
@@ -1204,8 +1274,8 @@ impl EmitSink<'_> {
     /// The output sort buffer's in-RAM bytes (bounded by its spill threshold),
     /// folded into the block-band per-pair consumer charge so the arbitrator's
     /// pull-mode view reflects the output axis alongside the input.
-    fn output_buffer_bytes(&self) -> u64 {
-        self.buf.bytes_used() as u64
+    fn output_buffer_unaccounted_bytes(&self) -> u64 {
+        self.buf.unaccounted_bytes_used() as u64
     }
 
     /// Defer one recoverable output-eval failure, recording its
@@ -1455,7 +1525,7 @@ fn emit_match_row(
                 ),
             });
         }
-        let rec = Record::new(Arc::clone(target_schema), values);
+        let rec = Record::new(target_schema.clone(), values);
         sink.push_row(rec, driver_order, driver_idx, build_idx)?;
         Ok(true)
     }
@@ -1492,7 +1562,10 @@ fn flush_collect_row(
     if let Some(first_build) = first_build {
         crate::executor::copy_build_ck_columns(&mut rec, &first_build, cfg.propagate_ck);
     }
-    rec.set(cfg.build_qualifier, Value::Array(arr));
+    rec.set(
+        cfg.build_qualifier,
+        Value::Array(OwnedValues::from_vec(arr)),
+    );
     // A collect row carries no single build index; tag it `MAX` so the block
     // path's final sort places it after that driver's match rows (of which a
     // collect driver has none) and orders collect rows by driver input order.
@@ -1893,9 +1966,245 @@ impl clinker_record::RecordStorage for NullStorage {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use proptest::prelude::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn governed_match_candidates_measure_stored_clones_through_replacement_and_drain() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        use clinker_record::FieldStr;
+        use std::num::NonZeroUsize;
+
+        fn assert_retained(state: &MatchState<'_>) {
+            let records = state
+                .first_match
+                .values()
+                .chain(state.first_collected_builds.values())
+                .map(|(_, record)| record);
+            let mut physical = 0;
+            let mut relative = 0;
+            for record in records {
+                physical += record_held_cost(record);
+                relative += record_unaccounted_held_cost(record, state.allocation_resources);
+            }
+            for entry in state.collect_accum.values().flat_map(|heap| heap.iter()) {
+                physical += collect_entry_cost(entry);
+                relative += collect_entry_unaccounted_cost(entry, state.allocation_resources);
+            }
+            assert_eq!(state.held_bytes(), physical, "physical stored allocations");
+            assert_eq!(state.unaccounted_held_bytes(), relative);
+        }
+
+        for capacity in [2, 17] {
+            for foreign in [false, true] {
+                let local = MemoryOnlyResources::new(NonZeroUsize::new(1 << 20).unwrap());
+                let other = MemoryOnlyResources::new(NonZeroUsize::new(1 << 20).unwrap());
+                let resources = local.resources().allocation().clone();
+                let owner = if foreign { &other } else { &local };
+                let owner_resources = owner.resources().allocation().clone();
+                let scope = owner_resources.scope().unwrap();
+                let mut values = OwnedValues::try_with_capacity(capacity, &scope).unwrap();
+                values
+                    .try_push(
+                        Value::String(FieldStr::try_new(&"s".repeat(257), &scope).unwrap()),
+                        &scope,
+                    )
+                    .unwrap();
+                values
+                    .try_push(
+                        Value::String(FieldStr::try_new_unique(&"u".repeat(513), &scope).unwrap()),
+                        &scope,
+                    )
+                    .unwrap();
+                let input = Record::from_owned_values(
+                    SharedStorage::from_arc(Arc::new(Schema::new(vec![
+                        "shared".into(),
+                        "unique".into(),
+                    ]))),
+                    values,
+                )
+                .unwrap();
+                let original_charge = owner.used();
+                assert!(original_charge > 0);
+                assert_eq!(if foreign { local.used() } else { other.used() }, 0);
+                assert!(record_held_cost(&input) > record_held_cost(&input.clone()));
+
+                let mut first = MatchState::new(1, &resources);
+                let mut collect = MatchState::new(1, &resources);
+                for index in [9, 7, 4, 1] {
+                    first.note_first_candidate(0, index, &input);
+                    collect.record_collect_match(0, index, &input);
+                    assert_retained(&first);
+                    assert_retained(&collect);
+                    assert_eq!(first.first_match[&0].0, index);
+                    assert_eq!(collect.first_collected_builds[&0].0, index);
+                    assert!(first.unaccounted_held_bytes() > 0);
+                    assert!(collect.unaccounted_held_bytes() > 0);
+                    if foreign {
+                        assert_eq!(first.held_bytes(), first.unaccounted_held_bytes());
+                    } else {
+                        assert!(first.held_bytes() > first.unaccounted_held_bytes());
+                    }
+                    // Discarding a worse candidate leaves the retained winner intact.
+                    first.note_first_candidate(0, index + 1, &input);
+                    assert_retained(&first);
+                    assert_eq!(first.first_match[&0].0, index);
+                    assert_eq!(owner.used(), original_charge);
+                }
+                let taken = first.take_first_candidate(0).unwrap();
+                let collected = collect.take_collect(0);
+                assert_retained(&first);
+                assert_retained(&collect);
+                assert_eq!((first.held_bytes(), collect.held_bytes()), (0, 0));
+                assert_eq!(
+                    (
+                        first.unaccounted_held_bytes(),
+                        collect.unaccounted_held_bytes()
+                    ),
+                    (0, 0)
+                );
+                assert_eq!(taken.0, 1);
+                assert_eq!(collected.arr.len(), 4);
+                assert!(!collected.truncated);
+                assert!(collected.first_build.is_some());
+                drop(input);
+                assert!(
+                    owner.used() > 0,
+                    "drained rows still retain the shared text"
+                );
+                assert!(
+                    owner.used() < original_charge,
+                    "input vector and unique text released"
+                );
+                drop(taken);
+                drop(collected);
+                assert_eq!(local.used(), 0);
+                assert_eq!(other.used(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn governed_collect_candidates_obey_actual_clone_budget_boundary() {
+        use crate::pipeline::memory::NoOpPolicy;
+        use clinker_format::preparation::MemoryOnlyResources;
+        use clinker_plan::config::pipeline_node::PropagateCkSpec;
+        use clinker_record::FieldStr;
+        use cxl::eval::StableEvalContext;
+        use std::num::NonZeroUsize;
+
+        let owner = MemoryOnlyResources::new(NonZeroUsize::new(1 << 20).unwrap());
+        let resources = owner.resources().allocation().clone();
+        let scope = resources.scope().unwrap();
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["text".into()])));
+        let mut values = OwnedValues::try_with_capacity(19, &scope).unwrap();
+        values
+            .try_push(
+                Value::String(FieldStr::try_new_unique(&"x".repeat(513), &scope).unwrap()),
+                &scope,
+            )
+            .unwrap();
+        let input = Record::from_owned_values(schema.clone(), values).unwrap();
+        let stored = input.clone();
+        let entry = CollectEntry {
+            order_key: 0,
+            value: Value::Map(OwnedMap::from_map(
+                input
+                    .iter_user_fields()
+                    .map(|(key, value)| (key.into(), value.clone()))
+                    .collect(),
+            )),
+        };
+        let floor = 71;
+        let actual_peak = floor + record_held_cost(&stored) + collect_entry_cost(&entry);
+        assert!(record_held_cost(&input) > record_held_cost(&stored));
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        let resolver =
+            CombineResolverMapping::from_pre_resolved(&Arc::new(HashMap::new()), &IndexMap::new());
+        for limit in [actual_peak - 1, actual_peak, actual_peak + 1] {
+            let budget = MemoryArbitrator::with_policy(limit, 0.80, 0.70, Box::new(NoOpPolicy));
+            let consumer = ConsumerHandle::new();
+            let mut state = MatchState::new(1, &resources);
+            let cfg = EmitConfig {
+                allocation_resources: &resources,
+                name: "collect_boundary",
+                build_qualifier: "build",
+                ctx: &ctx,
+                resolver_mapping: &resolver,
+                output_schema: None,
+                match_mode: MatchMode::Collect,
+                propagate_ck: &PropagateCkSpec::Driver,
+                budget: &budget,
+                strategy: clinker_plan::config::ErrorStrategy::FailFast,
+            };
+            let mut evals = Evaluators {
+                residual: None,
+                body: None,
+            };
+            let driver = [DriverRef {
+                record: &input,
+                order: 0.into(),
+                key: 0,
+                driver_idx: 0,
+            }];
+            let batch = EmitBatch {
+                pairs: &[(0, 0)],
+                driver_slice: &driver,
+                build_slice: &[&input],
+                build_idx: &[0],
+            };
+            let mut buffer = SortBuffer::new_payload_ordered(
+                usize::MAX,
+                None,
+                false,
+                schema.clone(),
+                resources.clone(),
+            );
+            let mut failures = Vec::new();
+            let mut sink = EmitSink {
+                buf: &mut buffer,
+                budget: &budget,
+                name: "collect_boundary",
+                consumer: &consumer,
+                max_output_rows: None,
+                output_eval_failures: &mut failures,
+                failure_tags: None,
+            };
+            let result = emit_pairs(
+                &cfg,
+                &mut evals,
+                &batch,
+                &mut state,
+                &mut sink,
+                &PairBudget {
+                    floor,
+                    budget: &budget,
+                    name: "collect_boundary",
+                    consumer: &consumer,
+                },
+            );
+            if limit < actual_peak {
+                assert!(
+                    matches!(result, Err(PipelineError::MemoryBudgetExceeded { used, limit: actual_limit, source: BudgetCategory::Arena, .. }) if used == actual_peak && actual_limit == limit)
+                );
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(state.held_bytes(), actual_peak - floor);
+            assert_eq!(buffer.total_rows(), 0, "collect has not published output");
+            drop(state.take_collect(0));
+            assert_eq!((state.held_bytes(), state.unaccounted_held_bytes()), (0, 0));
+        }
+        drop(input);
+        assert_eq!(
+            owner.used(),
+            0,
+            "unique text copies are independent legacy storage"
+        );
+    }
 
     #[test]
     fn test_bit_array_set_and_scan() {

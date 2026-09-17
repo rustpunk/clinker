@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
 use clinker_record::{Record, Schema, Value};
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason};
 
@@ -77,7 +78,7 @@ pub(super) struct EmitArgs<'a> {
     pub(super) name: &'a str,
     pub(super) decomposed: &'a DecomposedPredicate,
     pub(super) resolver_mapping: &'a CombineResolverMapping,
-    pub(super) output_schema: Option<&'a Arc<Schema>>,
+    pub(super) output_schema: Option<&'a SharedStorage<Schema>>,
     pub(super) match_mode: MatchMode,
     pub(super) on_miss: OnMiss,
     pub(super) build_qualifier: &'a str,
@@ -162,11 +163,11 @@ pub(super) fn emit_for_probe<'a>(
                 // `Value::Map` and reaches the writer as a nested
                 // Map, triggering
                 // `FormatError::UnserializableMapValue`.
-                let mut m: indexmap::IndexMap<Box<str>, Value> = indexmap::IndexMap::new();
+                let mut m: indexmap::IndexMap<OwnedKey, Value> = indexmap::IndexMap::new();
                 for (fname, val) in cand.record.iter_user_fields() {
                     m.insert(fname.into(), val.clone());
                 }
-                arr.push(Value::Map(Box::new(m)));
+                arr.push(Value::Map(OwnedMap::from_map(m)));
             }
             if truncated {
                 eprintln!(
@@ -182,7 +183,7 @@ pub(super) fn emit_for_probe<'a>(
             if let Some(b) = first_build.as_ref() {
                 crate::executor::copy_build_ck_columns(&mut rec, b, propagate_ck);
             }
-            rec.set(build_qualifier, Value::Array(arr));
+            rec.set(build_qualifier, Value::Array(OwnedValues::from_vec(arr)));
             sink.push_row(rec, rn)?;
         }
         MatchMode::First | MatchMode::All => {
@@ -353,7 +354,7 @@ pub(super) fn emit_for_probe<'a>(
                             ),
                         });
                     }
-                    let rec = Record::new(Arc::clone(target_schema), values);
+                    let rec = Record::new(target_schema.clone(), values);
                     sink.push_row(rec, rn)?;
                 }
             }

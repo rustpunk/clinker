@@ -112,14 +112,14 @@ pub(crate) struct SourceIngestChannel {
     /// the handle untouched.
     consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
     /// Exponentially weighted moving average (alpha = 1/8) of recent
-    /// per-record heap sizes, in bytes. Updated on each body push and
+    /// per-record bytes not independently charged by this run, in bytes. Updated on each body push and
     /// multiplied by the post-send queue depth to mirror the channel's
     /// in-flight footprint into `consumer_handle`. Smoothing the
     /// per-record cost across recent samples keeps the mirrored estimate
     /// stable when record sizes drift (variable-width strings, optional
     /// payload columns, mixed `Value` variants), which sharpens
-    /// pause-victim ranking. This is ranking telemetry only — the abort
-    /// gate trips on real OS RSS, never on this estimate. `0` means
+    /// pause-victim ranking and sampled legacy attribution. This remains an
+    /// estimate, separate from exact allocation grants and physical pressure. `0` means
     /// "unseeded": the first push adopts its own sample as the baseline
     /// rather than climbing from zero over several records.
     record_bytes_ewma: u64,
@@ -128,6 +128,7 @@ pub(crate) struct SourceIngestChannel {
     /// must fail the attempt instead of wrapping to zero.
     next_row_id: Option<SourceRowId>,
     source: PlanNodeId,
+    allocation_resources: clinker_record::owned_storage::AllocationResources,
     /// Present only for a source declaring record-level `sort_order`.
     order_barrier: Option<crate::source::order_barrier::SourceFileOrderBarrier>,
 }
@@ -154,6 +155,17 @@ const fn ewma_step(prev: u64, sample: u64) -> u64 {
 }
 
 impl SourceIngestChannel {
+    #[cfg(test)]
+    pub(super) fn assert_allocation_domain(
+        &self,
+        resources: &clinker_record::owned_storage::AllocationResources,
+    ) {
+        assert_eq!(self.allocation_resources.identity(), resources.identity());
+        if let Some(barrier) = &self.order_barrier {
+            assert_eq!(barrier.allocation_identity(), resources.identity());
+        }
+    }
+
     /// Default channel capacity. Bounds the in-flight depth between the
     /// ingest thread and the dispatch loop's Source arm; the producer's
     /// `send` blocks once this many events are buffered, so the value
@@ -175,6 +187,7 @@ impl SourceIngestChannel {
         capacity: usize,
         consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
         source: PlanNodeId,
+        allocation_resources: clinker_record::owned_storage::AllocationResources,
     ) -> (Self, crossbeam_channel::Receiver<SourceStreamEvent>) {
         let (tx, rx) = crossbeam_channel::bounded(capacity);
         (
@@ -184,6 +197,7 @@ impl SourceIngestChannel {
                 record_bytes_ewma: 0,
                 next_row_id: Some(SourceRowId::first(source)),
                 source,
+                allocation_resources,
                 order_barrier: None,
             },
             rx,
@@ -192,6 +206,8 @@ impl SourceIngestChannel {
 
     /// Create the same bounded channel with a per-physical-file order barrier
     /// inserted before its sender.
+    // Retained-row accounting and allocation admission have separate lifetimes.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_ordered(
         capacity: usize,
         consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
@@ -200,6 +216,7 @@ impl SourceIngestChannel {
         memory: Arc<crate::pipeline::memory::MemoryArbitrator>,
         spill_dir: std::path::PathBuf,
         spill_compress: bool,
+        allocation_resources: clinker_record::owned_storage::AllocationResources,
     ) -> (Self, crossbeam_channel::Receiver<SourceStreamEvent>) {
         let (tx, rx) = crossbeam_channel::bounded(capacity);
         let order_barrier = crate::source::order_barrier::SourceFileOrderBarrier::new(
@@ -209,6 +226,7 @@ impl SourceIngestChannel {
             memory,
             spill_dir,
             spill_compress,
+            allocation_resources.clone(),
         );
         (
             Self {
@@ -217,6 +235,7 @@ impl SourceIngestChannel {
                 record_bytes_ewma: 0,
                 next_row_id: Some(SourceRowId::first(source)),
                 source,
+                allocation_resources,
                 order_barrier: Some(order_barrier),
             },
             rx,
@@ -238,16 +257,17 @@ impl SourceIngestChannel {
         // pause/resume from the arbitrator side and the producer-
         // side wait participate in the same primitive.
         self.consumer_handle.wait_while_paused();
-        // Sample this record's estimated heap size before moving it
+        // Sample this record's target-relative heap size before moving it
         // into the channel, then fold it into a per-stream EWMA. The
         // smoothed value (not the raw last sample) multiplies the
         // post-send queue depth, so the mirrored estimate stays stable
         // when record sizes drift instead of swinging with whichever
         // record was pushed most recently — sharpening pause-victim
         // ranking. The accumulator is plain per-task state: `&mut self`
-        // means no synchronization is needed. Ranking telemetry only;
-        // the abort gate trips on real OS RSS, never on this estimate.
-        let sample = (std::mem::size_of::<Record>() + record.estimated_heap_size()) as u64;
+        // means no synchronization is needed. This sampled legacy contribution
+        // excludes only allocations already charged to this run's ledger.
+        let sample = (std::mem::size_of::<Record>()
+            + record.unaccounted_heap_size(&self.allocation_resources)) as u64;
         self.record_bytes_ewma = ewma_step(self.record_bytes_ewma, sample);
         let row_id = self
             .next_row_id
@@ -269,7 +289,7 @@ impl SourceIngestChannel {
         // buffer waiting for the consumer — the in-flight queue depth. The
         // product approximates the channel's in-flight memory footprint
         // and is what the arbitrator's `current_usage` reports.
-        self.update_usage(0);
+        self.update_usage();
         Ok(row_id)
     }
 
@@ -299,7 +319,7 @@ impl SourceIngestChannel {
     ) -> Result<(), SourceStreamError> {
         self.consumer_handle.wait_while_paused();
         let sample = (std::mem::size_of::<crate::executor::dlq::SourceRejectionEvent>()
-            + event.estimated_heap_size()) as u64;
+            + event.unaccounted_heap_size(&self.allocation_resources)) as u64;
         self.record_bytes_ewma = ewma_step(self.record_bytes_ewma, sample);
         let event = SourceAttemptEvent::Rejection(Box::new(event));
         if let Some(barrier) = self.order_barrier.as_mut() {
@@ -312,7 +332,7 @@ impl SourceIngestChannel {
                 })
                 .map_err(|_| SourceStreamError::Closed)?;
         }
-        self.update_usage(0);
+        self.update_usage();
         Ok(())
     }
 
@@ -332,16 +352,16 @@ impl SourceIngestChannel {
         }
     }
 
-    fn update_usage(&self, releasing_spool_bytes: u64) {
-        let staged = self
-            .order_barrier
-            .as_ref()
-            .map(|barrier| barrier.staged_bytes())
-            .unwrap_or(0)
-            .saturating_add(releasing_spool_bytes);
+    fn update_usage(&self) {
+        if let Some(barrier) = &self.order_barrier {
+            // The barrier owns staging, readers and the actual released-row
+            // samples. A spill reload can have a different allocation owner
+            // from the original row sampled by this channel.
+            barrier.refresh_accounted_charge();
+            return;
+        }
         let queued = (self.tx.len() as u64).saturating_mul(self.record_bytes_ewma);
-        self.consumer_handle
-            .set_bytes(staged.saturating_add(queued));
+        self.consumer_handle.set_bytes(queued);
     }
 }
 
@@ -409,6 +429,252 @@ impl crate::pipeline::memory::MemoryConsumer for SourceConsumer {
 mod tests {
     use super::*;
     use crate::pipeline::memory::{ConsumerHandle, MemoryConsumer};
+    use clinker_plan::plan::EntityRef;
+
+    fn admitted_record(
+        resources: &clinker_record::owned_storage::AllocationResources,
+        value: clinker_record::Value,
+    ) -> Record {
+        use clinker_record::owned_storage::{OwnedValues, SharedStorage};
+        let scope = resources.scope().unwrap();
+        let mut values = OwnedValues::try_with_capacity(4, &scope).unwrap();
+        values.try_push(value, &scope).unwrap();
+        Record::from_owned_values(
+            SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(vec!["v".into()]))),
+            values,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn source_queue_samples_actual_local_foreign_and_mixed_owners() {
+        use crate::executor::preparation::ExecutorResources;
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        use crate::pipeline::shutdown::ShutdownToken;
+        use clinker_format::preparation::MemoryOnlyResources;
+        use clinker_record::{FieldStr, Value};
+        use std::num::NonZeroUsize;
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            1024 * 1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let observer = arb.writer_resource_observer();
+        let weak = Arc::downgrade(&arb);
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            ShutdownToken::detached(),
+            None,
+            NonZeroUsize::MIN,
+            None,
+        )
+        .unwrap();
+        let resources = provider.allocation();
+        let foreign = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+        let foreign_resources = foreign.resources().allocation().clone();
+        let local_text =
+            FieldStr::try_new(&"local shared".repeat(60), &resources.scope().unwrap()).unwrap();
+        let foreign_text = FieldStr::try_new(
+            &"foreign shared".repeat(60),
+            &foreign_resources.scope().unwrap(),
+        )
+        .unwrap();
+        let escaped_local_bytes = observer.usage().memory;
+        let escaped_foreign_bytes = foreign.used();
+        let rows = [
+            admitted_record(&resources, Value::String(local_text.clone())),
+            admitted_record(&resources, Value::String(foreign_text.clone())),
+            admitted_record(&foreign_resources, Value::String(local_text.clone())),
+        ];
+        assert_eq!(rows[0].unaccounted_heap_size(&resources), 0);
+        assert_eq!(
+            rows[1].unaccounted_heap_size(&resources),
+            foreign_text.heap_size()
+        );
+        assert!(rows[2].unaccounted_heap_size(&resources) > 0);
+        let handle = ConsumerHandle::new();
+        let (mut channel, rx) =
+            SourceIngestChannel::new(4, handle.clone(), PlanNodeId::new(7), resources.clone());
+        let mut average = 0;
+        for (i, record) in rows.into_iter().enumerate() {
+            let sample =
+                (std::mem::size_of::<Record>() + record.unaccounted_heap_size(&resources)) as u64;
+            average = ewma_step(average, sample);
+            let row = channel.push(record).unwrap();
+            assert_eq!(row.ordinal(), i as u64 + 1);
+            assert_eq!(channel.record_bytes_ewma, average);
+            assert_eq!(handle.bytes(), average * (i as u64 + 1));
+        }
+        let event = crate::executor::dlq::SourceRejectionEvent {
+            source_row: channel.reserve_rejected_row_id().unwrap(),
+            source_name: Arc::from("rows"),
+            source_file: Arc::from("data.csv"),
+            row: 4,
+            kind: crate::executor::dlq::SourceRejectionKind::DeclaredType,
+            message: "type mismatch".into(),
+            triggering_field: "v".into(),
+            triggering_value: Value::String(foreign_text.clone()),
+            original_record: admitted_record(&resources, Value::String(local_text.clone())),
+        };
+        let diagnostic = event.source_name.len()
+            + event.source_file.len()
+            + event.message.len()
+            + event.triggering_field.len();
+        assert_eq!(
+            event.unaccounted_heap_size(&resources),
+            diagnostic + foreign_text.heap_size()
+        );
+        let sample =
+            (std::mem::size_of_val(&event) + event.unaccounted_heap_size(&resources)) as u64;
+        average = ewma_step(average, sample);
+        channel.push_rejection(event).unwrap();
+        assert_eq!(handle.bytes(), average * 4);
+        assert_eq!(rx.len(), 4);
+        assert!(observer.usage().memory > escaped_local_bytes);
+        assert!(foreign.used() > escaped_foreign_bytes);
+        let queued_local = observer.usage().memory;
+        let queued_foreign = foreign.used();
+        drop(rx);
+        // The bounded channel retains buffered messages until its last endpoint
+        // drops. Disconnect alone is not destruction of those allocations.
+        assert_eq!(observer.usage().memory, queued_local);
+        assert_eq!(foreign.used(), queued_foreign);
+        let record = admitted_record(&resources, Value::Null);
+        assert!(matches!(
+            channel.push(record),
+            Err(SourceStreamError::Closed)
+        ));
+        assert_eq!(observer.usage().memory, queued_local);
+        assert_eq!(foreign.used(), queued_foreign);
+        drop(channel);
+        assert_eq!(observer.usage().memory, escaped_local_bytes);
+        assert_eq!(foreign.used(), escaped_foreign_bytes);
+        drop(provider);
+        drop(arb);
+        assert!(weak.upgrade().is_none());
+        assert!(observer.is_closed());
+        assert_eq!(observer.usage().memory, escaped_local_bytes);
+        drop(local_text);
+        drop(foreign_text);
+        assert_eq!(observer.usage().memory, 0);
+        assert_eq!(foreign.used(), 0);
+    }
+
+    #[test]
+    fn ordered_channel_refresh_preserves_decoded_queue_attribution() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        use clinker_format::preparation::MemoryOnlyResources;
+        use clinker_plan::config::{CompileContext, PipelineConfig};
+        use clinker_record::owned_storage::{OwnedValues, SharedStorage};
+        use clinker_record::{FieldStr, Schema, Value, synthetic_document_context};
+        use std::num::NonZeroUsize;
+        let config: PipelineConfig = clinker_plan::yaml::from_str(
+            r#"
+pipeline: { name: ordered_queue_owner }
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: rows.csv
+      schema: [{ name: key, type: int }, { name: payload, type: string }]
+      sort_order: [key]
+  - type: sink
+    name: out
+    input: rows
+    config: { name: out, type: csv, path: out.csv }
+"#,
+        )
+        .unwrap();
+        let plan = config.compile(&CompileContext::default()).unwrap();
+        let order = &plan.dag().order_contract().source_orders[0];
+        let order_config = crate::source::order_barrier::SourceOrderConfig::from_compiled(
+            order,
+            order.source_id,
+            "rows",
+            &plan.config().source_bodies().next().unwrap().schema,
+        )
+        .unwrap();
+        // Independent finite storage permits deliberately tiny spill pressure;
+        // the public lazy-source regression separately binds real run admission.
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+        let resources = provider.resources().allocation().clone();
+        let memory = Arc::new(MemoryArbitrator::with_policy(
+            1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        let handle = ConsumerHandle::new();
+        let (mut channel, rx) = SourceIngestChannel::new_ordered(
+            32,
+            handle.clone(),
+            order.source_id,
+            order_config,
+            memory.clone(),
+            directory.path().to_path_buf(),
+            false,
+            resources.clone(),
+        );
+        let doc = synthetic_document_context();
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["key".into(), "payload".into()])));
+        let scope = resources.scope().unwrap();
+        let text = FieldStr::try_new(&"payload".repeat(300), &scope).unwrap();
+        let make = |key| {
+            let mut values = OwnedValues::try_with_capacity(2, &scope).unwrap();
+            values.try_push(Value::Integer(key), &scope).unwrap();
+            values
+                .try_push(Value::String(text.clone()), &scope)
+                .unwrap();
+            let mut record = Record::from_owned_values(schema.clone(), values).unwrap();
+            record.set_doc_ctx(doc.clone());
+            record
+        };
+        channel
+            .push_punctuation(Punctuation::document_open(doc.clone()))
+            .unwrap();
+        for key in 1..=3 {
+            channel.push(make(key)).unwrap();
+        }
+        assert!(
+            memory.cumulative_spill_bytes() > 0,
+            "fixture must actually spill"
+        );
+        channel
+            .push_punctuation(Punctuation::document_close(doc.clone()))
+            .unwrap();
+        let decoded_queue = handle.bytes();
+        assert!(decoded_queue > rx.len() as u64 * channel.record_bytes_ewma);
+        channel.update_usage();
+        assert_eq!(
+            handle.bytes(),
+            decoded_queue,
+            "channel refresh must preserve the barrier's decoded-row estimate"
+        );
+        channel
+            .push_punctuation(Punctuation::document_open(doc.clone()))
+            .unwrap();
+        channel.push(make(4)).unwrap();
+        let published = handle.bytes();
+        channel
+            .order_barrier
+            .as_ref()
+            .unwrap()
+            .refresh_accounted_charge();
+        assert_eq!(
+            handle.bytes(),
+            published,
+            "a later file must not reinstall the old original-row estimate"
+        );
+        drop(channel);
+        drop(rx);
+        drop(text);
+        assert_eq!(provider.used(), 0);
+    }
 
     #[test]
     fn source_consumer_reports_handle_bytes_and_never_spills() {
@@ -479,5 +745,111 @@ mod tests {
             ewma = ewma_step(ewma, 1);
         }
         assert!(ewma >= 1);
+    }
+    #[test]
+    fn source_channels_preserve_allocation_domain_and_release_run_ownership() {
+        use crate::executor::preparation::ExecutorResources;
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        use crate::pipeline::shutdown::ShutdownToken;
+        use clinker_plan::config::{CompileContext, PipelineConfig};
+        use std::alloc::Layout;
+        use std::num::NonZeroUsize;
+
+        let memory = Arc::new(MemoryArbitrator::with_policy(
+            4096,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let weak = Arc::downgrade(&memory);
+        let observer = memory.writer_resource_observer();
+        let provider = ExecutorResources::new(
+            memory.clone(),
+            ShutdownToken::detached(),
+            None,
+            NonZeroUsize::MIN,
+            None,
+        )
+        .unwrap();
+        let allocation = provider.allocation();
+        let writers = provider.resources();
+        assert_eq!(allocation.identity(), writers.allocation().identity());
+        let scope = allocation.scope().unwrap();
+        let lease = scope.reserve(Layout::new::<[u8; 64]>()).unwrap();
+        let foreign =
+            clinker_format::preparation::MemoryOnlyResources::new(NonZeroUsize::new(4096).unwrap());
+        let foreign_resources = foreign.resources();
+        let foreign_lease = foreign_resources
+            .allocation()
+            .reserve(scope.owner(), Layout::new::<[u8; 64]>())
+            .unwrap();
+        assert_eq!(lease.owner(), foreign_lease.owner());
+        assert!(!foreign_lease.is_accounted_by(&allocation));
+        assert!(lease.is_accounted_by(writers.allocation()));
+
+        let (ordinary, ordinary_rx) = SourceIngestChannel::new(
+            2,
+            ConsumerHandle::new(),
+            PlanNodeId::new(7),
+            allocation.clone(),
+        );
+        ordinary.assert_allocation_domain(&allocation);
+        let config: PipelineConfig = clinker_plan::yaml::from_str(
+            r#"
+pipeline: { name: allocation_domain }
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: rows.csv
+      schema: [{ name: key, type: int }]
+      sort_order: [key]
+  - type: sink
+    name: out
+    input: rows
+    config: { name: out, type: csv, path: out.csv }
+"#,
+        )
+        .unwrap();
+        let plan = PipelineConfig::compile(&config, &CompileContext::default()).unwrap();
+        let order = &plan.dag().order_contract().source_orders[0];
+        let source_schema = &plan.config().source_bodies().next().unwrap().schema;
+        let order_config = crate::source::order_barrier::SourceOrderConfig::from_compiled(
+            order,
+            order.source_id,
+            "rows",
+            source_schema,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (ordered, ordered_rx) = SourceIngestChannel::new_ordered(
+            2,
+            ConsumerHandle::new(),
+            order.source_id,
+            order_config,
+            memory.clone(),
+            dir.path().to_path_buf(),
+            false,
+            allocation.clone(),
+        );
+        ordered.assert_allocation_domain(&allocation);
+        assert_eq!(memory.consumer_count(), 1);
+        assert_eq!(observer.usage().memory, 64);
+        drop(ordered);
+        drop(ordered_rx);
+        drop(ordinary);
+        drop(ordinary_rx);
+        assert_eq!(memory.consumer_count(), 1);
+        drop(writers);
+        drop(provider);
+        drop(memory);
+        assert!(weak.upgrade().is_none());
+        assert!(observer.is_closed());
+        assert!(!observer.has_managed_handle());
+        assert_eq!(observer.usage().memory, 64);
+        drop(lease);
+        assert_eq!(observer.usage().memory, 0);
     }
 }

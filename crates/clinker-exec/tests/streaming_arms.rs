@@ -55,6 +55,22 @@ use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceReaders}
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
 
+// Keep the fixed-width materialization at 90% of the hard limit: it fits the
+// scan while remaining above the 80% soft-spill threshold. Use the compiled
+// schema, including engine-stamped columns, and the live carrier layouts.
+fn tight_scan_limit(plan: &clinker_plan::plan::CompiledPlan, rows: usize) -> usize {
+    let dag = plan.dag();
+    let columns = dag
+        .graph
+        .node_weights()
+        .map(|node| node.output_schema_in(dag).column_count())
+        .max()
+        .unwrap();
+    let per_row = std::mem::size_of::<clinker_record::Value>() * columns
+        + std::mem::size_of::<(clinker_record::Record, clinker_exec::executor::SourceRowId)>();
+    (rows * per_row * 10).div_ceil(9)
+}
+
 fn run_params() -> PipelineRunParams {
     PipelineRunParams {
         execution_id: "e".to_string(),
@@ -197,7 +213,7 @@ nodes:
 /// soft-threshold trip instead of materializing the whole stage. A
 /// single-branch `Route → Output` streams its records through the slot's
 /// per-batch charge handle, whose `should_spill()` poll fires per flushed
-/// batch; under a 1 MiB budget the test process's own RSS crosses the
+/// batch; under the layout-sized budget the test process's own RSS crosses the
 /// 80 % soft floor, so each batch's records round-trip through a
 /// `SpillFile<u64>` (re-read and forwarded to the writer). The run
 /// completes — the streaming path never polls the hard-limit
@@ -220,14 +236,13 @@ nodes:
 /// Skipped silently when `rss_bytes()` is unavailable — the spill
 /// predicate is RSS-based, so without it the path stays in memory.
 #[test]
-fn streaming_arm_soft_spills_under_one_megabyte_budget() {
+fn streaming_arm_soft_spills_with_layout_sized_scan_budget() {
     if clinker_exec::pipeline::memory::rss_bytes().is_none() {
         return;
     }
 
-    // The materialized Source → Route edge is 280 bytes per row. Keep its
-    // exact 980,000-byte admission below 1 MiB while retaining enough
-    // 128-row batches to exercise repeated streaming spills.
+    // Keep the same population and streaming batches; derive the hard limit
+    // from the compiled record shape while preserving soft-spill pressure.
     const ROWS: usize = 3_500;
     let yaml = r#"
 pipeline:
@@ -262,7 +277,11 @@ nodes:
       type: csv
       path: ./out.csv
 "#;
-    let config = parse_config(yaml).expect("parse_config");
+    let mut config = parse_config(yaml).expect("parse_config");
+    let sizing_plan = config
+        .compile(&CompileContext::default())
+        .expect("compile sizing plan");
+    config.pipeline.memory.limit = Some(tight_scan_limit(&sizing_plan, ROWS).to_string());
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile pipeline");
@@ -286,7 +305,7 @@ nodes:
 
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .expect("streaming soft-spill run must complete under a 1 MiB budget");
+            .expect("streaming soft-spill run must complete under the layout-sized budget");
 
     assert_eq!(
         report.counters.total_count as usize, ROWS,
@@ -299,7 +318,7 @@ nodes:
     );
     assert!(
         report.cumulative_spill_bytes > 0,
-        "a streaming pipeline under a 1 MiB budget must spill at least one \
+        "a streaming pipeline under the layout-sized budget must spill at least one \
          batch; report.cumulative_spill_bytes = {}",
         report.cumulative_spill_bytes,
     );

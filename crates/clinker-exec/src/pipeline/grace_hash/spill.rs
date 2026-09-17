@@ -6,9 +6,9 @@
 //! bounded-memory BNL path.
 
 use std::path::Path;
-use std::sync::Arc;
 
 use ahash::RandomState;
+use clinker_record::owned_storage::SharedStorage;
 use clinker_record::{Record, Schema, Value};
 use cxl::eval::{EvalContext, ProgramEvaluator};
 
@@ -64,7 +64,7 @@ pub(crate) struct SpilledPartition {
 
 /// Bundle of reload-phase context shared across recursive
 /// [`process_spilled_partition`] calls. Lifetimes track the executor's
-/// owned data: `build_schema` is owned (Arc-cloned at every recursive
+/// owned data: `build_schema` is owned (handle-cloned at every recursive
 /// step) so the spill reader can attach it to each rehydrated record.
 pub(super) struct ReloadContext<'a> {
     pub(super) name: &'a str,
@@ -72,7 +72,7 @@ pub(super) struct ReloadContext<'a> {
     pub(super) driver_extractor: &'a KeyExtractor,
     pub(super) emit: &'a EmitArgs<'a>,
     pub(super) ctx: &'a EvalContext<'a>,
-    pub(super) build_schema: Arc<Schema>,
+    pub(super) build_schema: SharedStorage<Schema>,
     pub(super) spill_dir: &'a Path,
     /// Whether repartition spill files written during reload are
     /// LZ4-compressed. Carried from the dispatcher's resolved
@@ -97,7 +97,7 @@ pub(super) fn process_spilled_partition(
     let build_extractor = rc.build_extractor;
     let driver_extractor = rc.driver_extractor;
     let ctx = rc.ctx;
-    let build_schema = Arc::clone(&rc.build_schema);
+    let build_schema = rc.build_schema.clone();
     let spill_dir = rc.spill_dir;
     let spill_compress = rc.spill_compress;
     let hash_state = rc.hash_state;
@@ -107,7 +107,7 @@ pub(super) fn process_spilled_partition(
     // surfaces as an error rather than a silent join miscompute.
     let mut build_records: Vec<Record> = Vec::with_capacity(sp.build_count as usize);
     for path in &sp.build_files {
-        let reader = GraceSpillReader::open(path, Arc::clone(&build_schema)).map_err(|e| {
+        let reader = GraceSpillReader::open(path, build_schema.clone()).map_err(|e| {
             PipelineError::Internal {
                 op: "combine",
                 node: name.to_string(),
@@ -282,7 +282,7 @@ pub(super) fn process_spilled_partition(
             let mut probe_files: Vec<SpillFile<RecordOrder>> = Vec::new();
             if !child_probe.is_empty() {
                 let mut pw = SpillWriter::new(
-                    Arc::clone(child_probe[0].0.schema()),
+                    child_probe[0].0.schema().clone(),
                     Some(spill_dir),
                     spill_compress,
                 )?;

@@ -22,11 +22,12 @@
 //!   `buffer_schema` filters the producer's `output_schema` columns to
 //!   that consumed set, preserving the producer's own emit order.
 //!   Producer-order matters because every downstream operator carries an
-//!   `expected: Arc<Schema>` stamped at plan-compile time against the
+//!   `expected: SharedStorage<Schema>` stamped at plan-compile time against the
 //!   producer's `output_schema`; a buffer projection that reorders the
 //!   columns trips the per-record `check_input_schema` at the first
 //!   downstream consumer.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use petgraph::Direction;
@@ -894,7 +895,7 @@ fn pass_b_body(
 /// columns trips `SchemaMismatch` at the first consumer regardless of
 /// whether the operators' CXL programs reach them via `support_into`.
 fn add_producer_engine_stamped_columns(
-    producer_schema: Option<&std::sync::Arc<clinker_record::Schema>>,
+    producer_schema: Option<&SharedStorage<clinker_record::Schema>>,
     consumed: &mut HashSet<String>,
 ) {
     let Some(schema) = producer_schema else {
@@ -918,7 +919,7 @@ fn add_producer_engine_stamped_columns(
 /// an Aggregate, which always carries `output_schema` — but kept total
 /// so a degraded plan does not panic the buffer build).
 fn project_in_producer_order(
-    producer_schema: Option<&std::sync::Arc<clinker_record::Schema>>,
+    producer_schema: Option<&SharedStorage<clinker_record::Schema>>,
     consumed: &HashSet<String>,
 ) -> Vec<String> {
     if let Some(schema) = producer_schema {
@@ -1251,7 +1252,7 @@ pub(crate) fn continuation_support(
 fn first_schema_bearing_ancestor(
     graph: &DiGraph<PlanNode, PlanEdge>,
     start: NodeIndex,
-) -> Option<&std::sync::Arc<clinker_record::Schema>> {
+) -> Option<&SharedStorage<clinker_record::Schema>> {
     let mut cursor = graph
         .neighbors_directed(start, Direction::Incoming)
         .next()?;

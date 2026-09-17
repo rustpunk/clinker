@@ -42,6 +42,7 @@ pub use spill::{AggSpillFile, SpillState};
 
 pub(crate) use hash::{empty_global_fold_row, finalize_group_inner, group_by_sort_fields};
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -188,7 +189,7 @@ fn eval_expr_in_agg_scope_inner(
                     charge_aggregate_construction(constructed_bytes, value.heap_size())?;
                     values.push(value);
                 }
-                Ok(Value::Array(values))
+                Ok(Value::Array(OwnedValues::from_vec(values)))
             })();
             *construction_depth -= 1;
             result
@@ -196,12 +197,12 @@ fn eval_expr_in_agg_scope_inner(
         Expr::MapLiteral { entries, .. } => {
             enter_aggregate_construction(construction_depth)?;
             let result = (|| {
-                let entry_bytes = std::mem::size_of::<Box<str>>()
+                let entry_bytes = std::mem::size_of::<OwnedKey>()
                     + std::mem::size_of::<Value>()
                     + std::mem::size_of::<u64>()
                     + std::mem::size_of::<usize>();
                 charge_aggregate_construction(constructed_bytes, entries.len() * entry_bytes)?;
-                let mut values: indexmap::IndexMap<Box<str>, Value> =
+                let mut values: indexmap::IndexMap<OwnedKey, Value> =
                     indexmap::IndexMap::with_capacity(entries.len());
                 for entry in entries {
                     let key: Box<str> = match &entry.key {
@@ -249,9 +250,9 @@ fn eval_expr_in_agg_scope_inner(
                         construction_depth,
                     )?;
                     charge_aggregate_construction(constructed_bytes, value.heap_size())?;
-                    values.insert(key, value);
+                    values.insert(OwnedKey::from_box(key), value);
                 }
-                Ok(Value::Map(Box::new(values)))
+                Ok(Value::Map(OwnedMap::from_map(values)))
             })();
             *construction_depth -= 1;
             result
@@ -322,7 +323,7 @@ fn eval_expr_in_agg_scope_inner(
                     charge_aggregate_construction(constructed_bytes, value.heap_size())?;
                     values.push(value);
                 }
-                Ok(Value::Array(values))
+                Ok(Value::Array(OwnedValues::from_vec(values)))
             })();
             if let Some(previous) = previous {
                 env.insert(binding.to_string(), previous);
@@ -1126,7 +1127,7 @@ pub(super) fn fold_buffered_state(
 /// emit byte-identical `SortRow` values on identical inputs.
 pub struct StreamingAggregator<Op: AccumulatorOp> {
     factory: AccumulatorFactory,
-    output_schema: Arc<Schema>,
+    output_schema: SharedStorage<Schema>,
     group_by_indices: Vec<u32>,
     group_by_fields: Vec<String>,
     /// Pre-aggregation row filter, lowered once at construction.
@@ -1155,7 +1156,7 @@ impl StreamingAggregator<AddRaw> {
     pub fn new_for_raw(
         compiled: Arc<CompiledAggregate>,
         evaluator: ProgramEvaluator,
-        output_schema: Arc<Schema>,
+        output_schema: SharedStorage<Schema>,
         transform_name: impl Into<String>,
     ) -> Self {
         let group_by_indices = compiled.group_by_indices.clone();
@@ -1370,7 +1371,7 @@ impl StreamingAggregator<MergeState> {
     pub fn new_for_merge(
         compiled: Arc<CompiledAggregate>,
         evaluator: ProgramEvaluator,
-        output_schema: Arc<Schema>,
+        output_schema: SharedStorage<Schema>,
         transform_name: impl Into<String>,
     ) -> Self {
         let group_by_indices = compiled.group_by_indices.clone();
@@ -1465,7 +1466,10 @@ mod accumulator_op_tests {
         );
         assert_eq!(
             map["items"],
-            Value::Array(vec![Value::Integer(6), Value::Integer(4)])
+            Value::Array(OwnedValues::from_vec(vec![
+                Value::Integer(6),
+                Value::Integer(4)
+            ]))
         );
     }
 
@@ -1551,9 +1555,10 @@ mod accumulator_op_tests {
         }];
         let mut row: AccumulatorRow = vec![AccumulatorEnum::for_type(&AggregateType::Sum)];
 
-        let schema = Arc::new(clinker_record::Schema::new(vec!["x".into()]));
-        let r1 = Record::new(Arc::clone(&schema), vec![Value::Integer(10)]);
-        let r2 = Record::new(Arc::clone(&schema), vec![Value::Integer(32)]);
+        let schema =
+            SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(vec!["x".into()])));
+        let r1 = Record::new(schema.clone(), vec![Value::Integer(10)]);
+        let r2 = Record::new(schema.clone(), vec![Value::Integer(32)]);
 
         <AddRaw as AccumulatorOp>::apply_row(&mut row, &bindings, &r1);
         <AddRaw as AccumulatorOp>::apply_row(&mut row, &bindings, &r2);

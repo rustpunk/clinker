@@ -16,6 +16,7 @@
 //! errors surface as E201 (missing source schema) and E102–E108 / W101
 //! (composition binding).
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -5120,7 +5121,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 // ─── Upstream schema helpers ────────────────────────────────────────
 
-/// Build a runtime `Arc<Schema>` from an iterator of column names,
+/// Build a runtime `SharedStorage<Schema>` from an iterator of column names,
 /// stamping engine-stamp metadata on every column whose name begins
 /// with a recognized engine prefix:
 ///
@@ -5143,7 +5144,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// Mirrors the deduction in `lower_node_to_plan_node`'s
 /// `schema_from_bound` closure so a composition body's port-synthetic
 /// Source carries the same marker.
-pub(crate) fn schema_from_field_names<'a, I>(names: I) -> Arc<clinker_record::Schema>
+pub(crate) fn schema_from_field_names<'a, I>(names: I) -> SharedStorage<clinker_record::Schema>
 where
     I: IntoIterator<Item = &'a str>,
 {

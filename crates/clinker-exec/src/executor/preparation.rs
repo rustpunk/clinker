@@ -240,8 +240,9 @@ use crate::pipeline::{
 use clinker_format::{
     FormatError,
     preparation::{
-        AllocationGrant, MemoryStorage, OperationStage, OwnerId, ResourceAuthority, ResourceError,
-        ResourceErrorKind, StageStorage, StorageStage, WriterResources, WriterScope, io_resource,
+        AllocationAuthority, AllocationLease, AllocationResources, MemoryStorage, OperationStage,
+        OwnerId, ResourceAuthority, ResourceError, ResourceErrorKind, StageStorage, StorageStage,
+        WriterResources, WriterScope, io_resource,
     },
     reserved::ReservedVec,
 };
@@ -266,10 +267,42 @@ struct ExecutorAuthority {
 }
 struct AdmissionAuthority {
     arbitrator: AdmissionLink,
+    release: Arc<ReleaseAuthority>,
     handle: Arc<ConsumerHandle>,
-    id: ConsumerId,
     shutdown: ShutdownToken,
     telemetry: Option<TelemetryProducer>,
+}
+
+struct ReleaseAuthority {
+    state: Arc<crate::pipeline::memory::reservation::ReservationState>,
+    arbitrator: std::sync::Weak<MemoryArbitrator>,
+    id: ConsumerId,
+}
+impl AllocationAuthority for ReleaseAuthority {
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.state) as usize
+    }
+    fn try_reserve(
+        self: Arc<Self>,
+        _: OwnerId,
+        _: Layout,
+    ) -> Result<AllocationLease, ResourceError> {
+        // Only live admission providers can create new reservations.
+        Err(ResourceError::new(ResourceErrorKind::Authority, 0, 0))
+    }
+    fn release(&self, _: OwnerId, bytes: usize) {
+        self.state.release_writer_memory(bytes);
+    }
+    fn check_cancelled(&self) -> Result<(), ResourceError> {
+        self.state.check_open()
+    }
+}
+impl Drop for ReleaseAuthority {
+    fn drop(&mut self) {
+        if let Some(arb) = self.arbitrator.upgrade() {
+            arb.detach_writer_handle(self.id);
+        }
+    }
 }
 
 // Debt owners may be retained by the arbitrator itself. Their grant release
@@ -290,32 +323,8 @@ impl AdmissionLink {
     fn admit_writer_descriptor(&self, limit: usize) -> Result<(), ResourceError> {
         self.live()?.admit_writer_descriptor(limit)
     }
-    fn release_writer_memory(&self, bytes: usize) {
-        if let Some(arb) = self.0.upgrade() {
-            arb.release_writer_memory(bytes);
-        }
-    }
-    fn release_writer_disk(&self, bytes: u64) {
-        if let Some(arb) = self.0.upgrade() {
-            arb.release_writer_disk(bytes);
-        }
-    }
-    fn release_writer_descriptor(&self) {
-        if let Some(arb) = self.0.upgrade() {
-            arb.release_writer_descriptor();
-        }
-    }
-    fn unregister_consumer(&self, id: ConsumerId) {
-        if let Some(arb) = self.0.upgrade() {
-            arb.unregister_consumer(id);
-        }
-    }
-    fn detach_writer_handle(&self) {
-        if let Some(arb) = self.0.upgrade() {
-            arb.detach_writer_handle();
-        }
-    }
 }
+
 impl Drop for ExecutorAuthority {
     fn drop(&mut self) {
         if let Some(storage) = self.storage.take() {
@@ -349,12 +358,6 @@ impl MemoryConsumer for WriterResourceConsumer {
         false
     }
 }
-impl Drop for AdmissionAuthority {
-    fn drop(&mut self) {
-        self.arbitrator.unregister_consumer(self.id);
-        self.arbitrator.detach_writer_handle();
-    }
-}
 impl ExecutorResources {
     /// Establish one run consumer. The control blocks are fixed run-startup
     /// allowances; storage inventory/path allocations are admitted separately.
@@ -367,19 +370,44 @@ impl ExecutorResources {
         descriptors: NonZeroUsize,
         telemetry: Option<TelemetryProducer>,
     ) -> Result<Self, ResourceError> {
+        Self::with_spill_root(
+            arbitrator,
+            shutdown,
+            storage.and_then(|storage| storage.spill_root_dir.as_deref()),
+            descriptors,
+            telemetry,
+        )
+    }
+
+    /// Borrow the runtime's already-resolved root without constructing a second
+    /// owned storage config. Root retention remains admitted by the provider.
+    /// The optional producer uses the same arena as the run's other work.
+    pub fn with_spill_root(
+        arbitrator: Arc<MemoryArbitrator>,
+        shutdown: ShutdownToken,
+        spill_root: Option<&std::path::Path>,
+        descriptors: NonZeroUsize,
+        telemetry: Option<TelemetryProducer>,
+    ) -> Result<Self, ResourceError> {
         let handle = ConsumerHandle::new();
         arbitrator.attach_writer_handle(handle.clone())?;
         let id = arbitrator.register_consumer(Arc::new(WriterResourceConsumer {
             handle: handle.clone(),
         }));
+        arbitrator.bind_writer_consumer(id)?;
+        let release = Arc::new(ReleaseAuthority {
+            state: arbitrator.writer_reservation_state(),
+            arbitrator: Arc::downgrade(&arbitrator),
+            id,
+        });
         let admission = Arc::new(AdmissionAuthority {
             arbitrator: AdmissionLink(Arc::downgrade(&arbitrator)),
+            release,
             handle,
-            id,
             shutdown,
             telemetry,
         });
-        let storage = match storage.and_then(|storage| storage.spill_root_dir.as_ref()) {
+        let storage = match spill_root {
             Some(root) => Some(StorageCapability::new(
                 admission.clone(),
                 root,
@@ -401,6 +429,11 @@ impl ExecutorResources {
     pub fn resources(&self) -> WriterResources {
         WriterResources::new(self.authority.clone())
     }
+    /// Allocation-only capability with a weak run link. Returned leases retain
+    /// only release state, never staging, telemetry or the executor itself.
+    pub fn allocation(&self) -> AllocationResources {
+        AllocationResources::new(self.authority.admission.clone())
+    }
     /// Retry each debt slot once; filesystem calls run outside admission locks.
     pub fn cleanup(&self) {
         if let Some(storage) = &self.authority.storage {
@@ -420,34 +453,37 @@ impl ExecutorResources {
         })
     }
 }
-impl ResourceAuthority for AdmissionAuthority {
+impl AllocationAuthority for AdmissionAuthority {
+    fn identity(&self) -> usize {
+        self.release.identity()
+    }
     fn try_reserve(
         self: Arc<Self>,
         owner: OwnerId,
         layout: Layout,
-    ) -> Result<AllocationGrant, ResourceError> {
+    ) -> Result<AllocationLease, ResourceError> {
         let mut signal = ResourceSignal::new(self.telemetry.clone(), ResourceWork::Admission);
         let result = self
             .check_cancelled()
-            .and_then(|()| self.arbitrator.admit_writer_memory(layout.size()));
-        signal.finish(result);
-        result?;
-        Ok(AllocationGrant::admitted(self, owner, layout.size()))
+            .and_then(|()| self.arbitrator.admit_writer_memory(layout.size()))
+            .and_then(|()| AllocationLease::admitted(self.release.clone(), owner, layout.size()));
+        signal.finish(result.as_ref().map(|_| ()).map_err(|error| *error));
+        result
     }
     fn release(&self, _: OwnerId, bytes: usize) {
-        self.arbitrator.release_writer_memory(bytes);
+        self.release.state.release_writer_memory(bytes);
     }
     fn check_cancelled(&self) -> Result<(), ResourceError> {
+        self.release.state.check_open()?;
         if self.shutdown.is_requested() {
             Err(ResourceError::new(ResourceErrorKind::Cancelled, 0, 0))
         } else {
             Ok(())
         }
     }
-    fn create_stage(
-        self: Arc<Self>,
-        scope: WriterScope,
-    ) -> Result<Box<dyn OperationStage>, FormatError> {
+}
+impl ResourceAuthority for AdmissionAuthority {
+    fn create_stage(self: Arc<Self>, scope: WriterScope) -> Result<OperationStage, FormatError> {
         let signal = ResourceSignal::new(self.telemetry.clone(), ResourceWork::Stage);
         StorageStage::create(
             scope.clone(),
@@ -458,7 +494,7 @@ impl ResourceAuthority for AdmissionAuthority {
         )
     }
 }
-impl ResourceAuthority for ExecutorAuthority {
+impl AllocationAuthority for ExecutorAuthority {
     fn identity(&self) -> usize {
         self.admission.identity()
     }
@@ -466,7 +502,7 @@ impl ResourceAuthority for ExecutorAuthority {
         self: Arc<Self>,
         owner: OwnerId,
         layout: Layout,
-    ) -> Result<AllocationGrant, ResourceError> {
+    ) -> Result<AllocationLease, ResourceError> {
         self.admission.clone().try_reserve(owner, layout)
     }
     fn release(&self, owner: OwnerId, bytes: usize) {
@@ -475,10 +511,9 @@ impl ResourceAuthority for ExecutorAuthority {
     fn check_cancelled(&self) -> Result<(), ResourceError> {
         self.admission.check_cancelled()
     }
-    fn create_stage(
-        self: Arc<Self>,
-        scope: WriterScope,
-    ) -> Result<Box<dyn OperationStage>, FormatError> {
+}
+impl ResourceAuthority for ExecutorAuthority {
+    fn create_stage(self: Arc<Self>, scope: WriterScope) -> Result<OperationStage, FormatError> {
         let mut signal = ResourceSignal::new(self.admission.telemetry.clone(), ResourceWork::Stage);
         match &self.storage {
             None => StorageStage::create(
@@ -533,7 +568,7 @@ struct Debt {
     close_uncertain: bool,
     path: tempfile::TempPath,
     bytes: u64,
-    _metadata: AllocationGrant,
+    _metadata: AllocationLease,
 }
 struct StorageCapability {
     active_owner: std::sync::atomic::AtomicBool,
@@ -542,7 +577,7 @@ struct StorageCapability {
     admission: Arc<AdmissionAuthority>,
     descriptor_limit: usize,
     file_layout: Layout,
-    _root: AllocationGrant,
+    _root: AllocationLease,
 }
 
 const TEMP_PREFIX: &str = "writer-";
@@ -645,7 +680,7 @@ impl StorageCapability {
         // independent of records or writer multiplicity. On Windows absolute()
         // also preserves drive-relative semantics. The retained clone below is
         // admitted before allocation; this temporary lookup result is then freed.
-        let scope = WriterResources::new(admission.clone()).scope()?;
+        let scope = AllocationResources::new(admission.clone()).scope()?;
         let mut startup_grant = None;
         let startup_root = if root.is_absolute() {
             None
@@ -730,7 +765,7 @@ impl StorageCapability {
             *slot = Slot::Active;
             Ok(index)
         } else {
-            self.admission.arbitrator.release_writer_descriptor();
+            self.admission.release.state.release_writer_descriptor();
             Err(ResourceError::new(ResourceErrorKind::DescriptorQuota, 1, 0))
         }
     }
@@ -739,7 +774,7 @@ impl StorageCapability {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_mut_slice()[index] = Slot::Free;
-        self.admission.arbitrator.release_writer_descriptor();
+        self.admission.release.state.release_writer_descriptor();
     }
     fn cleanup(&self) {
         for index in 0..self.descriptor_limit {
@@ -768,7 +803,7 @@ impl StorageCapability {
             match std::fs::remove_file(&debt.path) {
                 Ok(()) => {
                     debt.path.disable_cleanup(true);
-                    self.admission.arbitrator.release_writer_disk(debt.bytes);
+                    self.admission.release.state.release_writer_disk(debt.bytes);
                     self.release_slot(index);
                     signal.finish(Ok(()));
                 }
@@ -794,7 +829,7 @@ impl Drop for StorageCapability {
             if let Slot::Debt(mut debt) = std::mem::replace(slot, Slot::Free) {
                 debt.path.disable_cleanup(true);
                 if !debt.close_uncertain {
-                    self.admission.arbitrator.release_writer_descriptor();
+                    self.admission.release.state.release_writer_descriptor();
                 }
             }
         }
@@ -831,7 +866,7 @@ struct SpillStorage {
     file: Option<(File, tempfile::TempPath)>,
     storage: Arc<StorageCapability>,
     slot: Option<usize>,
-    metadata: Option<AllocationGrant>,
+    metadata: Option<AllocationLease>,
     bytes: u64,
     failed: Option<ResourceError>,
     admission: Arc<AdmissionAuthority>,
@@ -905,7 +940,8 @@ impl SpillStorage {
         );
         let written = result.as_ref().copied().unwrap_or(0);
         self.admission
-            .arbitrator
+            .release
+            .state
             .release_writer_disk((amount - written) as u64);
         self.bytes += written as u64;
         if let Some(producer) = &self.admission.telemetry {
@@ -1005,7 +1041,7 @@ impl SpillStorage {
         let uncertain = close.as_ref().is_err_and(|error| error.uncertain);
         if !uncertain && std::fs::remove_file(&path).is_ok() {
             path.disable_cleanup(true);
-            self.admission.arbitrator.release_writer_disk(self.bytes);
+            self.admission.release.state.release_writer_disk(self.bytes);
             self.storage.release_slot(slot);
             return close.map_err(|_| ResourceError::new(ResourceErrorKind::Storage, 0, 0));
         }
@@ -1036,6 +1072,45 @@ impl Drop for SpillStorage {
 mod tests {
     use super::*;
     use crate::pipeline::memory::NoOpPolicy;
+
+    #[test]
+    fn allocation_lease_drops_live_control_before_final_release() {
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let observer = arb.writer_resource_observer();
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            ShutdownToken::detached(),
+            None,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        )
+        .unwrap();
+        let admission = Arc::downgrade(&provider.authority.admission);
+        let run = Arc::downgrade(&arb);
+        let scope = provider.allocation().scope().unwrap();
+        let lease = scope.reserve(Layout::new::<[u8; 64]>()).unwrap();
+        drop(scope);
+        drop(provider);
+        assert!(
+            admission.upgrade().is_none(),
+            "a lease must not retain admission signals or stage control"
+        );
+        assert_eq!(
+            arb.consumer_count(),
+            1,
+            "live storage still owns managed registration"
+        );
+        drop(arb);
+        assert!(run.upgrade().is_none());
+        assert_eq!(observer.usage().memory, 64);
+        drop(lease);
+        assert_eq!(observer.usage().memory, 0);
+    }
 
     #[test]
     fn stage_cancellation_bypasses_an_already_paused_handle() {
@@ -1120,6 +1195,13 @@ mod tests {
             let mut writer =
                 PreparedWriter::new(Vec::new(), Encoder { commits: 0 }, provider.resources())
                     .unwrap();
+            let observer = arb.writer_resource_observer();
+            let lease = provider
+                .allocation()
+                .scope()
+                .unwrap()
+                .reserve(Layout::new::<[u8; 64]>())
+                .unwrap();
             CLOSE_CALLS.with(|calls| calls.set(0));
             CLOSE_FAULT.with(|fault| fault.set(Some(uncertain)));
             assert!(writer.write_operation(OutputOperation::Finalize).is_err());
@@ -1145,7 +1227,21 @@ mod tests {
                 assert_eq!(arb.retry_writer_cleanup(), 1);
                 assert_eq!(CLOSE_CALLS.with(|calls| calls.get()), 1);
                 assert_eq!(arb.writer_resource_usage().descriptors, 1);
+            } else {
+                drop(provider);
             }
+            drop(arb);
+            assert!(observer.is_closed());
+            assert!(!observer.has_managed_handle());
+            assert_eq!(observer.usage().memory, 64);
+            assert_eq!(observer.usage().descriptors, usize::from(uncertain));
+            assert_eq!(
+                observer.usage().disk,
+                if uncertain { 100 * 1024 } else { 0 }
+            );
+            assert_eq!(CLOSE_CALLS.with(|calls| calls.get()), 1);
+            drop(lease);
+            assert_eq!(observer.usage().memory, 0);
         }
     }
 

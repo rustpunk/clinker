@@ -28,6 +28,22 @@ const TICKET_UUID_3: &str = "c2b8d6a4-1f37-4a90-b5e2-8d0c4f6a9b71";
 const AGENT_UUID_EAST: &str = "9b1d7c34-2e5a-4f80-a6c9-1d3b7e2f5a88";
 const AGENT_UUID_WEST: &str = "7f2c5a18-9d3e-4061-b8a4-2c6f9e1d7a05";
 
+// Keep the fixed-width materialization at 90% of the hard limit: it fits the
+// scan while remaining above the 80% soft-spill threshold. Use the compiled
+// schema, including engine-stamped columns, and the live carrier layouts.
+fn tight_scan_limit(plan: &clinker_plan::plan::CompiledPlan, rows: usize) -> usize {
+    let dag = plan.dag();
+    let columns = dag
+        .graph
+        .node_weights()
+        .map(|node| node.output_schema_in(dag).column_count())
+        .max()
+        .unwrap();
+    let per_row = std::mem::size_of::<clinker_record::Value>() * columns
+        + std::mem::size_of::<(clinker_record::Record, clinker_exec::executor::SourceRowId)>();
+    (rows * per_row * 10).div_ceil(9)
+}
+
 /// Asserts that every value the test relies on is genuinely heap-backed,
 /// so the coverage exercises the Arc path rather than inline storage.
 fn assert_all_heap_backed(values: &[&str]) {
@@ -389,7 +405,7 @@ nodes:
 
 // ── Spill round-trip: long-field-heavy data forced over the budget ─────────
 
-/// Under a 1 MiB spill budget, a long-field-heavy buffer is forced to disk
+/// Under a layout-sized spill budget, a long-field-heavy buffer is forced to disk
 /// and reloaded; the run still emits every row with its long values intact.
 /// This exercises the Arc-backed `SmolStr` postcard serde path through a real
 /// spill commit + reload, not just the in-memory clone path.
@@ -434,10 +450,8 @@ nodes:
       include_unmapped: true
 "#;
 
-    // Each row carries a 36-char UUID plus a long free-text note (>23B), so
-    // the Source's node_buffer is dominated by Arc-backed strings. 4 000 rows
-    // charge well past the 819 KiB soft floor but stay under the 1 MiB hard
-    // limit, so the producer-side buffer spills and reloads.
+    // Preserve the workload while sizing the scan from the compiled schema.
+    // Heap-backed notes add pressure beyond this fixed-width admission floor.
     const ROWS: usize = 4_000;
     let note = "free-text customer note that comfortably exceeds the inline boundary";
     assert!(note.len() > 23);
@@ -450,12 +464,32 @@ nodes:
         ));
     }
 
-    let (report, output) = run_pipeline(yaml, &[("src", &csv)], "out", "spill-long");
+    let config = parse_config(yaml).unwrap();
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    let schema = plan
+        .dag()
+        .graph
+        .node_weights()
+        .find(|node| node.name() == "fan")
+        .unwrap()
+        .output_schema_in(plan.dag())
+        .clone();
+    // Route retains its input reservation while sending one charged batch
+    // into the 256-event output channel. The default batch is unchanged.
+    let row_bytes =
+        std::mem::size_of::<(clinker_record::Record, clinker_exec::executor::SourceRowId)>()
+            + schema.column_count() * std::mem::size_of::<clinker_record::Value>();
+    let overlap = (ROWS + clinker_exec::executor::DEFAULT_BATCH_SIZE + 256) * row_bytes;
+    let yaml = yaml.replace(
+        "\"1M\"",
+        &format!("\"{}\"", tight_scan_limit(&plan, ROWS).max(overlap)),
+    );
+    let (report, output) = run_pipeline(&yaml, &[("src", &csv)], "out", "spill-long");
     assert_eq!(report.counters.dlq_count, 0);
     assert_eq!(report.counters.total_count as usize, ROWS);
     assert!(
         report.cumulative_spill_bytes > 0,
-        "the long-field-heavy buffer must spill at least once under a 1 MiB budget; \
+        "the long-field-heavy buffer must spill at least once under the layout-sized budget; \
          cumulative_spill_bytes = {}",
         report.cumulative_spill_bytes
     );

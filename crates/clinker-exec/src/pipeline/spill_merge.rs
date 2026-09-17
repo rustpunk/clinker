@@ -41,6 +41,7 @@
 //! materializing convenience wrapper for callers that need the whole run in a
 //! `Vec`.
 
+use clinker_record::owned_storage::{AllocationResources, SharedStorage};
 use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::Arc;
@@ -236,9 +237,9 @@ impl OwnedMergeBudget {
                 detail: "cannot fold an empty payload-ordered run set".to_string(),
             });
         };
-        let schema = Arc::clone(first.schema());
+        let schema = first.schema().clone();
         let spill_dir = first.path().parent().map(Path::to_path_buf);
-        let mut merger = SortedRunMerger::new_payload_ordered(runs, context, self.as_borrowed())?;
+        let mut merger = SortedRunMerger::new_range_output(runs, context, self.as_borrowed())?;
         let input_bytes = merger.spill_bytes();
 
         let folded = (|| {
@@ -415,6 +416,77 @@ impl<P: Ord> SortedRunMerger<P> {
     }
 }
 
+/// Owned run inventory, counting shared schemas once; decoder state belongs
+/// to the later reader owner. Includes unused file-vector capacity.
+pub(crate) fn retained_spill_files_bytes<P>(files: &Vec<SpillFile<P>>) -> usize {
+    retained_spill_files_bytes_with(files, |schema| {
+        schema.estimated_outer_heap_size() + schema.estimated_heap_size()
+    })
+}
+
+/// Retained inventory excluding only schema allocations already owned by the
+/// target ledger. Legacy children under an admitted schema remain attributed.
+pub(crate) fn retained_unaccounted_spill_files_bytes<P>(
+    files: &Vec<SpillFile<P>>,
+    resources: &AllocationResources,
+) -> usize {
+    retained_spill_files_bytes_with(files, |schema| {
+        schema.unaccounted_outer_heap_size(resources) + schema.unaccounted_heap_size(resources)
+    })
+}
+
+fn retained_spill_files_bytes_with<P>(
+    files: &Vec<SpillFile<P>>,
+    schema_bytes: impl Fn(&SharedStorage<clinker_record::Schema>) -> usize,
+) -> usize {
+    let mut bytes = files.capacity() * std::mem::size_of::<SpillFile<P>>();
+    for (index, file) in files.iter().enumerate() {
+        bytes += file.path().as_os_str().len();
+        if !files[..index]
+            .iter()
+            .any(|prior| SharedStorage::ptr_eq(prior.schema(), file.schema()))
+        {
+            bytes += schema_bytes(file.schema());
+        }
+    }
+    bytes
+}
+
+impl<P: Ord + crate::pipeline::sort_buffer::HeapBytes> SortedRunMerger<P> {
+    /// Retained allocations not already owned by the target aggregate ledger.
+    /// File metadata is shared once; decoded frontier and I/O remain independent.
+    pub(crate) fn retained_unaccounted_heap_bytes(&self, resources: &AllocationResources) -> usize {
+        retained_unaccounted_spill_files_bytes(&self._files, resources)
+            + self.readers.capacity() * std::mem::size_of::<SpillReader<P>>()
+            + self.tree.retained_heap_bytes(|run| {
+                run.record.unaccounted_heap_size(resources)
+                    + run.payload.unaccounted_heap_bytes(resources)
+            })
+            + self
+                .readers
+                .iter()
+                .map(|reader| reader.retained_unaccounted_heap_bytes(resources))
+                .sum::<usize>()
+    }
+
+    /// Retained final-merge containers, reader workspaces and decoded frontier.
+    /// File schemas are shared by their readers/cursors and counted once per
+    /// distinct allocation. Context intern tables own their decoded contexts.
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        let bytes = retained_spill_files_bytes(&self._files)
+            + self.readers.capacity() * std::mem::size_of::<SpillReader<P>>()
+            + self.tree.retained_heap_bytes(|run| {
+                run.record.estimated_heap_size() + run.payload.heap_bytes()
+            });
+        bytes
+            + self
+                .readers
+                .iter()
+                .map(SpillReader::retained_heap_bytes)
+                .sum::<usize>()
+    }
+}
+
 impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
     /// Field-ordered merge: runs are ordered by [`compare_authored_keys`]
     /// over `sort_by`, matching a field-ordered
@@ -458,6 +530,40 @@ impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
         Self::open(files, RunOrdering::Payload, context, budget, MERGE_FAN_IN)
     }
 
+    /// Open a final range-output merge, refusing an initial physical frontier
+    /// that alone exceeds the node's hard budget before any output is published.
+    /// Readers are seeded by the existing merge policy before this local check;
+    /// this is not pre-allocation admission or a bound on later context growth.
+    /// Refusal drops all owned readers/files and releases their surviving charge.
+    pub(crate) fn new_range_output(
+        files: Vec<SpillFile<P>>,
+        context: &'static str,
+        budget: MergeBudget<'_>,
+    ) -> Result<Self, PipelineError>
+    where
+        P: crate::pipeline::sort_buffer::HeapBytes,
+    {
+        let merger = Self::new_payload_ordered(files, context, budget)?;
+        let used = merger.retained_heap_bytes() as u64;
+        let limit = budget.budget.hard_limit();
+        if limit != 0 && used > limit {
+            let spill_bytes = merger.spill_bytes();
+            let readers = merger.reader_count();
+            drop(merger);
+            budget.release_spill_bytes(spill_bytes);
+            return Err(PipelineError::MemoryBudgetExceeded {
+                node: budget.node.to_string(),
+                used,
+                limit,
+                source: clinker_plan::BudgetCategory::Arena,
+                detail: Some(format!(
+                    "range output merge frontier ({readers} readers, {spill_bytes} spill bytes) exceeds the local hard budget"
+                )),
+            });
+        }
+        Ok(merger)
+    }
+
     /// Fold `files` down to at most `fan_in` runs (a no-op when it already is),
     /// then open a reader over each surviving run and seed the loser tree with
     /// one record per run under `ordering`. Returns an I/O error if a run fails
@@ -498,7 +604,7 @@ impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
         let (readers, tree) = match opened {
             Ok(opened) => opened,
             Err(error) => {
-                budget.budget.release_spill_bytes(budget.node, live_bytes);
+                budget.release_spill_bytes(live_bytes);
                 return Err(error);
             }
         };
@@ -573,9 +679,7 @@ fn reduce_to_fan_in<P: Serialize + DeserializeOwned + Ord>(
                             .chain(remaining.iter())
                             .map(SpillFile::bytes)
                             .sum();
-                        budget
-                            .budget
-                            .release_spill_bytes(budget.node, cleanup_bytes);
+                        budget.release_spill_bytes(cleanup_bytes);
                         return Err(error);
                     }
                 },
@@ -605,7 +709,7 @@ fn merge_group<P: Serialize + DeserializeOwned + Ord>(
     context: &'static str,
     budget: &MergeBudget<'_>,
 ) -> Result<SpillFile<P>, PipelineError> {
-    let schema = Arc::clone(group[0].schema());
+    let schema = group[0].schema().clone();
     // Write the intermediate run beside its inputs, on the same spill volume the
     // caller's runs already live on, so a cascade never crosses onto a different
     // device or escapes the run's spill root.
@@ -761,8 +865,342 @@ mod tests {
     use clinker_record::{Schema, Value};
     use rust_decimal::Decimal;
 
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec!["k".into(), "id".into()]))
+    fn allocation_resources() -> AllocationResources {
+        clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap(),
+        )
+        .resources()
+        .allocation()
+        .clone()
+    }
+
+    fn range_output_files(schema: &SharedStorage<Schema>, count: usize) -> Vec<SpillFile<u64>> {
+        (0..count)
+            .map(|i| {
+                let mut writer = SpillWriter::new(schema.clone(), None, true).unwrap();
+                writer
+                    .write_pair(&rec(schema, i as i64, i as i64), &(i as u64))
+                    .unwrap();
+                writer.finish().unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn range_output_frontier_checks_exact_physical_boundaries_and_preserves_relative_queries() {
+        let local = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1 << 20).unwrap(),
+        );
+        let foreign = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1 << 20).unwrap(),
+        );
+        let resources = local.resources().allocation().clone();
+        let foreign_resources = foreign.resources().allocation().clone();
+        let mut physical_by_domain = Vec::new();
+        for domain in [&resources, &foreign_resources] {
+            let schema = SharedStorage::try_new(
+                Schema::new(vec!["k".into(), "id".into()]),
+                &domain.scope().unwrap(),
+            )
+            .unwrap();
+            for boundary in [0, 1, 2, 3] {
+                let arb = Arc::new(unlimited_arbitrator());
+                arb.record_spill_bytes("test", 777);
+                let owner = SpillChargeGuard::new(arb.clone(), Arc::<str>::from("test"));
+                let files = range_output_files(&schema, 2);
+                let paths = files
+                    .iter()
+                    .map(|f| f.path().to_owned())
+                    .collect::<Vec<_>>();
+                let bytes = files.iter().map(SpillFile::bytes).sum();
+                owner.record(bytes);
+                let budget = MergeBudget {
+                    budget: &arb,
+                    node: "test",
+                    compress: true,
+                    charge_owner: Some(&owner),
+                };
+                let probe =
+                    SortedRunMerger::new_payload_ordered(files, "range boundary probe", budget)
+                        .unwrap();
+                let physical = probe.retained_heap_bytes() as u64;
+                let relative = probe.retained_unaccounted_heap_bytes(&resources);
+                assert_eq!(
+                    physical as usize - relative,
+                    if std::ptr::eq(domain, &resources) {
+                        schema.estimated_outer_heap_size()
+                    } else {
+                        0
+                    }
+                );
+                if boundary == 0 {
+                    physical_by_domain.push(physical);
+                }
+                let SortedRunMerger {
+                    _files: files,
+                    readers,
+                    tree,
+                    ..
+                } = probe;
+                drop((readers, tree));
+                let limit = match boundary {
+                    0 => physical - 1,
+                    1 => physical,
+                    2 => physical + 1,
+                    _ => 0,
+                };
+                arb.set_limit(limit).unwrap();
+                assert_eq!(arb.cumulative_spill_bytes(), 777 + bytes);
+                match SortedRunMerger::new_range_output(files, "range boundary", budget) {
+                    Ok(merger) => {
+                        assert_ne!(boundary, 0);
+                        assert_eq!(merger.retained_heap_bytes() as u64, physical);
+                        assert_eq!(merger.retained_unaccounted_heap_bytes(&resources), relative);
+                        drop(merger);
+                        assert_eq!(
+                            owner.bytes(),
+                            bytes,
+                            "existing owner retains the successful merge's charge"
+                        );
+                    }
+                    Err(PipelineError::MemoryBudgetExceeded {
+                        node,
+                        used,
+                        limit: actual,
+                        source,
+                        detail,
+                    }) => {
+                        assert_eq!(boundary, 0);
+                        assert_eq!(node, "test");
+                        assert_eq!(used, physical);
+                        assert_eq!(actual, limit);
+                        assert_eq!(source, clinker_plan::BudgetCategory::Arena);
+                        assert!(detail.unwrap().contains("range output merge frontier"));
+                        assert_eq!(owner.bytes(), 0);
+                        assert_eq!(arb.cumulative_spill_bytes(), 777);
+                    }
+                    Err(error) => panic!("unexpected range failure: {error:?}"),
+                }
+                assert!(paths.iter().all(|p| !p.exists()));
+                drop(owner);
+                assert_eq!(arb.cumulative_spill_bytes(), 777);
+            }
+        }
+        assert_eq!(
+            physical_by_domain[0], physical_by_domain[1],
+            "schema authority cannot change physical pressure"
+        );
+    }
+
+    #[test]
+    fn range_output_frontier_open_and_cascade_errors_release_only_the_owned_charge() {
+        for count in [2, MERGE_FAN_IN + 3] {
+            let arb = Arc::new(unlimited_arbitrator());
+            arb.record_spill_bytes("test", 777);
+            let owner = SpillChargeGuard::new(arb.clone(), Arc::<str>::from("test"));
+            let files = range_output_files(&schema(), count);
+            let paths = files
+                .iter()
+                .map(|f| f.path().to_owned())
+                .collect::<Vec<_>>();
+            owner.record(files.iter().map(SpillFile::bytes).sum());
+            let failed = if count > MERGE_FAN_IN {
+                MERGE_FAN_IN
+            } else {
+                0
+            };
+            std::fs::write(&paths[failed], b"corrupt range run").unwrap();
+            let error = SortedRunMerger::new_range_output(
+                files,
+                "range failure",
+                MergeBudget {
+                    budget: &arb,
+                    node: "test",
+                    compress: true,
+                    charge_owner: Some(&owner),
+                },
+            )
+            .err()
+            .expect("corrupt run must fail");
+            assert!(matches!(error, PipelineError::Io(_)));
+            assert!(error.to_string().contains("spill run open failed"));
+            assert_eq!(owner.bytes(), 0);
+            assert_eq!(arb.cumulative_spill_bytes(), 777);
+            assert!(paths.iter().all(|p| !p.exists()));
+            drop(owner);
+            assert_eq!(
+                arb.cumulative_spill_bytes(),
+                777,
+                "guard drop must not discharge the same files twice"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_inventory_classifies_shared_schema_owners_once() {
+        use clinker_record::owned_storage::OwnedKey;
+        let local = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1 << 20).unwrap(),
+        );
+        let foreign = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1 << 20).unwrap(),
+        );
+        let resources = local.resources().allocation().clone();
+        let other_resources = foreign.resources().allocation().clone();
+        let scope = resources.scope().unwrap();
+        let other_scope = other_resources.scope().unwrap();
+        let mut builder =
+            clinker_record::AdmittedSchemaBuilder::try_with_capacity(2, &scope).unwrap();
+        builder
+            .try_push(OwnedKey::try_new("k", &scope).unwrap(), None, &scope)
+            .unwrap();
+        // Legacy child beneath admitted vectors and outer backing stays visible.
+        builder.try_push("id".into(), None, &scope).unwrap();
+        let local_schema = builder.finish(&scope).unwrap();
+        let foreign_schema =
+            SharedStorage::try_new(Schema::new(vec!["k".into(), "id".into()]), &other_scope)
+                .unwrap();
+        let legacy_schema = schema();
+        let mut files = Vec::with_capacity(8);
+        for schema in [
+            &local_schema,
+            &local_schema,
+            &foreign_schema,
+            &legacy_schema,
+        ] {
+            files.push(
+                SpillWriter::<u64>::new(schema.clone(), None, false)
+                    .unwrap()
+                    .finish()
+                    .unwrap(),
+            );
+        }
+        let containers = files.capacity() * std::mem::size_of::<SpillFile<u64>>()
+            + files
+                .iter()
+                .map(|file| file.path().as_os_str().len())
+                .sum::<usize>();
+        let physical = [&local_schema, &foreign_schema, &legacy_schema]
+            .into_iter()
+            .map(|schema| schema.estimated_outer_heap_size() + schema.estimated_heap_size())
+            .sum::<usize>();
+        let local_inner = local_schema.unaccounted_heap_size(&resources);
+        assert!(
+            local_inner > 0,
+            "legacy column key stays charged under admitted schema"
+        );
+        let foreign_physical =
+            foreign_schema.estimated_outer_heap_size() + foreign_schema.estimated_heap_size();
+        let legacy_physical =
+            legacy_schema.estimated_outer_heap_size() + legacy_schema.estimated_heap_size();
+        assert_eq!(retained_spill_files_bytes(&files), containers + physical);
+        assert_eq!(
+            retained_unaccounted_spill_files_bytes(&files, &resources),
+            containers + local_inner + foreign_physical + legacy_physical
+        );
+        let other_expected = containers
+            + local_schema.estimated_outer_heap_size()
+            + local_schema.estimated_heap_size()
+            + foreign_schema.unaccounted_heap_size(&other_resources)
+            + legacy_physical;
+        assert_eq!(
+            retained_unaccounted_spill_files_bytes(&files, &other_resources),
+            other_expected
+        );
+        let local_charge = local.used();
+        let foreign_charge = foreign.used();
+        assert!(local_charge > 0 && foreign_charge > 0);
+        drop((local_schema, foreign_schema, legacy_schema));
+        assert_eq!(local.used(), local_charge);
+        assert_eq!(foreign.used(), foreign_charge);
+        drop(files);
+        assert_eq!((local.used(), foreign.used()), (0, 0));
+    }
+
+    #[test]
+    fn decoded_frontier_retains_legacy_rows_and_contexts_beside_admitted_schema() {
+        for compressed in [false, true] {
+            let authority = clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(1 << 20).unwrap(),
+            );
+            let resources = authority.resources().allocation().clone();
+            let scope = resources.scope().unwrap();
+            let schema =
+                SharedStorage::try_new(Schema::new(vec!["k".into(), "id".into()]), &scope).unwrap();
+            let governed_outer = authority.used();
+            let context = clinker_record::DocumentContext::try_new(
+                clinker_record::DocumentId::next(),
+                Arc::from("input.csv"),
+                clinker_record::EnvelopeRecord::empty(),
+                &scope,
+            )
+            .unwrap();
+            let mut files = Vec::new();
+            for run in 0..2 {
+                let mut writer = SpillWriter::<u64>::new(schema.clone(), None, compressed).unwrap();
+                for offset in 0..2 {
+                    let id = run + offset * 2;
+                    let mut row = rec(&schema, id * 10, id);
+                    row.set_doc_ctx(context.clone());
+                    writer.write_pair(&row, &(id as u64)).unwrap();
+                }
+                files.push(writer.finish().unwrap());
+            }
+            drop(context);
+            assert_eq!(authority.used(), governed_outer);
+            let paths = files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect::<Vec<_>>();
+            let arb = unlimited_arbitrator();
+            let mut merger = SortedRunMerger::new(
+                files,
+                &sort_by_k_asc(),
+                "relative frontier",
+                test_budget(&arb),
+            )
+            .unwrap();
+            drop(schema);
+            let before = merger.retained_unaccounted_heap_bytes(&resources);
+            assert_eq!(merger.retained_heap_bytes() - before, governed_outer);
+            let (first, _) = merger.next().unwrap().unwrap();
+            assert_eq!(
+                first.unaccounted_heap_size(&resources),
+                first.estimated_heap_size()
+            );
+            let escaped = first.doc_ctx().clone();
+            drop(first);
+            let after_one = merger.retained_unaccounted_heap_bytes(&resources);
+            assert_eq!(
+                after_one, before,
+                "replacement cursor has equal owned shape"
+            );
+            let (second, _) = merger.next().unwrap().unwrap();
+            let (third, _) = merger.next().unwrap().unwrap();
+            assert!(SharedStorage::ptr_eq(&escaped, third.doc_ctx()));
+            assert!(
+                !SharedStorage::ptr_eq(&escaped, second.doc_ctx()),
+                "each reader owns its independent decoded intern"
+            );
+            drop((second, third));
+            let after_exhausting_run = merger.retained_unaccounted_heap_bytes(&resources);
+            assert!(
+                after_exhausting_run < after_one,
+                "exhausted cursor releases its own value backing"
+            );
+            assert_eq!(
+                merger.retained_heap_bytes() - after_exhausting_run,
+                governed_outer
+            );
+            drop(merger);
+            assert_eq!(authority.used(), 0);
+            assert!(paths.iter().all(|path| !path.exists()));
+            assert_eq!(escaped.source_file().as_ref(), "input.csv");
+        }
+    }
+
+    fn schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["k".into(), "id".into()])))
     }
 
     /// An unbounded-disk-quota arbitrator for the merge tests that only care
@@ -782,7 +1220,7 @@ mod tests {
 
     /// A record whose sort key `k` is a `Decimal` (mantissa/10) and whose
     /// `id` mirrors the carried payload for readback.
-    fn rec(schema: &Arc<Schema>, k_mantissa: i64, id: i64) -> Record {
+    fn rec(schema: &SharedStorage<Schema>, k_mantissa: i64, id: i64) -> Record {
         Record::new(
             schema.clone(),
             vec![
@@ -802,11 +1240,11 @@ mod tests {
 
     #[test]
     fn authored_comparator_matches_resident_sort_for_every_tested_spill_fan_in() {
-        let schema = Arc::new(Schema::new(vec![
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "primary".into(),
             "secondary".into(),
             "identity".into(),
-        ]));
+        ])));
         let sort_by = vec![
             SortField {
                 field: "primary".into(),
@@ -846,8 +1284,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let mut resident_buffer: SortBuffer<SourceRowId> =
-            SortBuffer::new(sort_by.clone(), usize::MAX, None, true, schema.clone());
+        let mut resident_buffer: SortBuffer<SourceRowId> = SortBuffer::new(
+            sort_by.clone(),
+            usize::MAX,
+            None,
+            true,
+            schema.clone(),
+            allocation_resources(),
+        );
         for (record, source_row) in input.iter().cloned() {
             resident_buffer.push(record, source_row);
         }
@@ -861,8 +1305,14 @@ mod tests {
         let resident_identities = resident.iter().map(|(_, id)| *id).collect::<Vec<_>>();
 
         for fan_in in [2, 3, MERGE_FAN_IN] {
-            let mut spill_buffer: SortBuffer<SourceRowId> =
-                SortBuffer::new(sort_by.clone(), 1, None, true, schema.clone());
+            let mut spill_buffer: SortBuffer<SourceRowId> = SortBuffer::new(
+                sort_by.clone(),
+                1,
+                None,
+                true,
+                schema.clone(),
+                allocation_resources(),
+            );
             for (record, source_row) in input.iter().cloned() {
                 spill_buffer.push(record, source_row);
                 spill_buffer.sort_and_spill().unwrap();
@@ -904,8 +1354,14 @@ mod tests {
         let sort_by = sort_by_k_asc();
         // budget=1 is the spill-everything threshold; runs are flushed
         // explicitly below so each carries several unsorted records.
-        let mut buf: SortBuffer<u64> =
-            SortBuffer::new(sort_by.clone(), 1, None, true, schema.clone());
+        let mut buf: SortBuffer<u64> = SortBuffer::new(
+            sort_by.clone(),
+            1,
+            None,
+            true,
+            schema.clone(),
+            allocation_resources(),
+        );
 
         // Run A: keys 3.0, 1.0, 2.0 (payload 0,1,2).
         buf.push(rec(&schema, 30, 0), 0);
@@ -979,8 +1435,14 @@ mod tests {
     fn merge_sorted_runs_unit_payload_orders_globally() {
         let schema = schema();
         let sort_by = sort_by_k_asc();
-        let mut buf: SortBuffer<()> =
-            SortBuffer::new(sort_by.clone(), 1, None, true, schema.clone());
+        let mut buf: SortBuffer<()> = SortBuffer::new(
+            sort_by.clone(),
+            1,
+            None,
+            true,
+            schema.clone(),
+            allocation_resources(),
+        );
         // Interleaved keys across four explicit runs.
         for (i, k) in [50, 10, 40, 20, 30, 0].into_iter().enumerate() {
             buf.push(rec(&schema, k, i as i64), ());
@@ -1019,8 +1481,14 @@ mod tests {
     fn merge_sorted_runs_single_run_is_identity() {
         let schema = schema();
         let sort_by = sort_by_k_asc();
-        let mut buf: SortBuffer<u64> =
-            SortBuffer::new(sort_by.clone(), 1_000_000, None, true, schema.clone());
+        let mut buf: SortBuffer<u64> = SortBuffer::new(
+            sort_by.clone(),
+            1_000_000,
+            None,
+            true,
+            schema.clone(),
+            allocation_resources(),
+        );
         buf.push(rec(&schema, 30, 0), 0);
         buf.push(rec(&schema, 10, 1), 1);
         buf.sort_and_spill().unwrap(); // force a single explicit run
@@ -1067,7 +1535,7 @@ mod tests {
         // budget=1 with explicit flushes: three runs carrying several unsorted
         // tuples each, the last flushed by finish() as the residue.
         let mut buf: SortBuffer<(i64, i64, u64)> =
-            SortBuffer::new_payload_ordered(1, None, true, schema.clone());
+            SortBuffer::new_payload_ordered(1, None, true, schema.clone(), allocation_resources());
         let push_chunk = |buf: &mut SortBuffer<(i64, i64, u64)>, chunk: &[(i64, i64, u64)]| {
             for &t in chunk {
                 // id column mirrors the payload's RecordOrder tag for readback.
@@ -1112,7 +1580,7 @@ mod tests {
     fn payload_ordered_merge_breaks_ties_by_run_then_input_order() {
         let schema = schema();
         let mut buf: SortBuffer<(i64, i64, u64)> =
-            SortBuffer::new_payload_ordered(1, None, true, schema.clone());
+            SortBuffer::new_payload_ordered(1, None, true, schema.clone(), allocation_resources());
         // Run A: two records with the same payload, ids 0 then 1 (input order).
         buf.push(rec(&schema, 0, 0), (7, 7, 7));
         buf.push(rec(&schema, 0, 1), (7, 7, 7));
@@ -1145,8 +1613,14 @@ mod tests {
     fn sorted_run_merger_streams_in_order() {
         let schema = schema();
         let sort_by = sort_by_k_asc();
-        let mut buf: SortBuffer<u64> =
-            SortBuffer::new(sort_by.clone(), 1, None, true, schema.clone());
+        let mut buf: SortBuffer<u64> = SortBuffer::new(
+            sort_by.clone(),
+            1,
+            None,
+            true,
+            schema.clone(),
+            allocation_resources(),
+        );
         for (i, k) in [30, 10, 20].into_iter().enumerate() {
             buf.push(rec(&schema, k, i as i64), i as u64);
             buf.sort_and_spill().unwrap();
@@ -1205,8 +1679,14 @@ mod tests {
         let sort_by = sort_by_k_asc();
         // budget=1 spills on every push; an explicit flush per run makes exactly
         // `num_runs` individually-sorted runs.
-        let mut buf: SortBuffer<u64> =
-            SortBuffer::new(sort_by.clone(), 1, None, true, schema.clone());
+        let mut buf: SortBuffer<u64> = SortBuffer::new(
+            sort_by.clone(),
+            1,
+            None,
+            true,
+            schema.clone(),
+            allocation_resources(),
+        );
         let mut oracle: Vec<(Decimal, u64)> = Vec::new();
         let mut counter: u64 = 0;
         for _ in 0..num_runs {
@@ -1236,7 +1716,7 @@ mod tests {
     fn build_dup_payload_runs(num_runs: usize, per_run: usize) -> PayloadRuns {
         let schema = schema();
         let mut buf: SortBuffer<(i64, i64, u64)> =
-            SortBuffer::new_payload_ordered(1, None, true, schema.clone());
+            SortBuffer::new_payload_ordered(1, None, true, schema.clone(), allocation_resources());
         let mut rows: Vec<(i64, i64, u64, u64)> = Vec::new();
         let mut counter: u64 = 0;
         for _ in 0..num_runs {
@@ -1495,6 +1975,7 @@ mod tests {
             Some(dir.path().to_path_buf()),
             true,
             schema.clone(),
+            allocation_resources(),
         );
         for i in 0..20u64 {
             let k = ((i % 3) as i64 + 1) * 10;

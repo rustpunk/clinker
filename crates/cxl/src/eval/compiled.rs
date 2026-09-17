@@ -50,6 +50,7 @@
 //! live in a separate [`EvalState`] the caller threads by `&mut`, so one
 //! compiled program can be shared across records and threads.
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -674,7 +675,7 @@ fn compile_stmt<S: RecordStorage + 'static>(
                     Value::Array(arr) => arr,
                     // A null source is treated as an empty array — the
                     // outer variant's defining difference from `emit each`.
-                    Value::Null => Vec::new(),
+                    Value::Null => OwnedValues::from_vec(Vec::new()),
                     other => {
                         return Err(EvalError::new(
                             EvalErrorKind::TypeMismatch {
@@ -692,7 +693,7 @@ fn compile_stmt<S: RecordStorage + 'static>(
                 // zero records. Driving the same per-element loop over a
                 // synthetic `[null]` keeps the two cases on one code path.
                 let elements = if elements.is_empty() {
-                    vec![Value::Null]
+                    OwnedValues::from_vec(vec![Value::Null])
                 } else {
                     elements
                 };
@@ -743,7 +744,7 @@ fn run_fan_out<'a, 'w, S: RecordStorage + 'static>(
     binding: &str,
     body: &[CompiledStmt<S>],
     body_fans_out: bool,
-    elements: Vec<Value>,
+    elements: OwnedValues,
     span: Span,
 ) -> Result<(), EvalError> {
     // Save any same-named binding shadowed by this block (a nested
@@ -944,7 +945,7 @@ fn compile_expr<S: RecordStorage + 'static>(typed: &TypedProgram, expr: &Expr) -
                         frame.construction.charge(value.heap_size(), span)?;
                         values.push(value);
                     }
-                    Ok(Value::Array(values))
+                    Ok(Value::Array(OwnedValues::from_vec(values)))
                 })();
                 frame.construction.leave();
                 result
@@ -971,14 +972,14 @@ fn compile_expr<S: RecordStorage + 'static>(typed: &TypedProgram, expr: &Expr) -
             Box::new(move |frame| {
                 frame.construction.enter(span)?;
                 let result = (|| {
-                    let entry_bytes = std::mem::size_of::<Box<str>>()
+                    let entry_bytes = std::mem::size_of::<OwnedKey>()
                         + std::mem::size_of::<Value>()
                         + std::mem::size_of::<u64>()
                         + std::mem::size_of::<usize>();
                     frame
                         .construction
                         .charge(entries.len() * entry_bytes, span)?;
-                    let mut values: indexmap::IndexMap<Box<str>, Value> =
+                    let mut values: indexmap::IndexMap<OwnedKey, Value> =
                         indexmap::IndexMap::with_capacity(entries.len());
                     for (key, value, entry_span) in &entries {
                         let key_text: Box<str> = match key {
@@ -1021,9 +1022,9 @@ fn compile_expr<S: RecordStorage + 'static>(typed: &TypedProgram, expr: &Expr) -
                         }
                         let value = value(frame)?;
                         frame.construction.charge(value.heap_size(), *entry_span)?;
-                        values.insert(key_text, value);
+                        values.insert(OwnedKey::from_box(key_text), value);
                     }
-                    Ok(Value::Map(Box::new(values)))
+                    Ok(Value::Map(OwnedMap::from_map(values)))
                 })();
                 frame.construction.leave();
                 result
@@ -1080,7 +1081,7 @@ fn compile_expr<S: RecordStorage + 'static>(typed: &TypedProgram, expr: &Expr) -
                             frame.construction.charge(value.heap_size(), span)?;
                             values.push(value);
                         }
-                        Ok(Value::Array(values))
+                        Ok(Value::Array(OwnedValues::from_vec(values)))
                     })();
                     if let Some(previous) = previous {
                         frame.env.insert(binding.clone(), previous);
@@ -1868,7 +1869,9 @@ fn compile_maplike<S: RecordStorage + 'static>(
         }
 
         Ok(match kind {
-            MapLikeKind::Filter | MapLikeKind::Map | MapLikeKind::FlatMap => Value::Array(output),
+            MapLikeKind::Filter | MapLikeKind::Map | MapLikeKind::FlatMap => {
+                Value::Array(OwnedValues::from_vec(output))
+            }
             MapLikeKind::Find => found.unwrap_or(Value::Null),
             MapLikeKind::Any => Value::Bool(found_any),
         })

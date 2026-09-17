@@ -20,7 +20,8 @@
 //! stream.
 
 use std::io::Write;
-use std::sync::Arc;
+
+use clinker_record::owned_storage::SharedStorage;
 
 use clinker_record::{Record, Schema, Value};
 
@@ -107,7 +108,7 @@ impl<W: Write> EdifactWriter<W> {
     /// Build a writer over a sink with the given schema and config. The
     /// schema's `seg_id` / `msg_ref` / `msg_type` / `eNN` columns are
     /// resolved to positional indices once.
-    pub fn new(writer: W, schema: Arc<Schema>, config: EdifactWriterConfig) -> Self {
+    pub fn new(writer: W, schema: SharedStorage<Schema>, config: EdifactWriterConfig) -> Self {
         let mut element_columns = Vec::new();
         let mut seg_id_idx = None;
         let mut msg_ref_idx = None;
@@ -603,18 +604,20 @@ fn value_to_element(value: &Value, column: &str) -> Result<String, FormatError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues};
     use std::io::Cursor;
+    use std::sync::Arc;
 
-    fn schema() -> Arc<Schema> {
-        let mut cols: Vec<Box<str>> = vec!["seg_id".into(), "msg_ref".into(), "msg_type".into()];
+    fn schema() -> SharedStorage<Schema> {
+        let mut cols: Vec<OwnedKey> = vec!["seg_id".into(), "msg_ref".into(), "msg_type".into()];
         for i in 1..=4 {
-            cols.push(format!("e{i:02}").into_boxed_str());
+            cols.push(format!("e{i:02}").into());
         }
-        Arc::new(Schema::new(cols))
+        SharedStorage::from_arc(Arc::new(Schema::new(cols)))
     }
 
     fn body(
-        schema: &Arc<Schema>,
+        schema: &SharedStorage<Schema>,
         seg: &str,
         msg_ref: &str,
         msg_type: &str,
@@ -639,12 +642,16 @@ mod tests {
                 None => values.push(Value::Null),
             }
         }
-        Record::new(Arc::clone(schema), values)
+        Record::new(schema.clone(), values)
     }
 
-    fn write_all(config: EdifactWriterConfig, records: &[Record], schema: &Arc<Schema>) -> String {
+    fn write_all(
+        config: EdifactWriterConfig,
+        records: &[Record],
+        schema: &SharedStorage<Schema>,
+    ) -> String {
         let mut buf = Vec::new();
-        let mut w = EdifactWriter::new(Cursor::new(&mut buf), Arc::clone(schema), config);
+        let mut w = EdifactWriter::new(Cursor::new(&mut buf), schema.clone(), config);
         for r in records {
             w.write_record(r).unwrap();
         }
@@ -686,19 +693,19 @@ mod tests {
         // e01..e05 UNB elements, as the EDIFACT reader's prepare_document
         // would attach.
         let s = schema();
-        let mut unb: IndexMap<Box<str>, RecVal> = IndexMap::new();
+        let mut unb: IndexMap<OwnedKey, RecVal> = IndexMap::new();
         unb.insert("e01".into(), RecVal::String("UNOA:1".into()));
         unb.insert("e02".into(), RecVal::String("S".into()));
         unb.insert("e03".into(), RecVal::String("R".into()));
         unb.insert("e04".into(), RecVal::String("240101:1200".into()));
         unb.insert("e05".into(), RecVal::String("REF1".into()));
-        let mut sections: IndexMap<Box<str>, RecVal> = IndexMap::new();
-        sections.insert("unb".into(), RecVal::Map(Box::new(unb)));
-        let ctx = Arc::new(DocumentContext::new(
+        let mut sections: IndexMap<OwnedKey, RecVal> = IndexMap::new();
+        sections.insert("unb".into(), RecVal::Map(OwnedMap::from_map(unb)));
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
             EnvelopeRecord::from_sections(sections),
-        ));
+        )));
 
         let mut record = body(&s, "BGM", "M1", "ORDERS", &["220"]);
         record.set_doc_ctx(ctx);
@@ -726,23 +733,23 @@ mod tests {
         // empty element, so the control reference "REF9" (element 6)
         // survives.
         let s = schema();
-        let raw = RecVal::Array(vec![
+        let raw = RecVal::Array(OwnedValues::from_vec(vec![
             RecVal::String("UNOA:1".into()),
             RecVal::String("S".into()),
             RecVal::String("R".into()),
             RecVal::String("".into()),
             RecVal::String("240101:1200".into()),
             RecVal::String("REF9".into()),
-        ]);
-        let mut unb: IndexMap<Box<str>, RecVal> = IndexMap::new();
+        ]));
+        let mut unb: IndexMap<OwnedKey, RecVal> = IndexMap::new();
         unb.insert(super::RAW_ELEMENTS_KEY.into(), raw);
-        let mut sections: IndexMap<Box<str>, RecVal> = IndexMap::new();
-        sections.insert("unb".into(), RecVal::Map(Box::new(unb)));
-        let ctx = Arc::new(DocumentContext::new(
+        let mut sections: IndexMap<OwnedKey, RecVal> = IndexMap::new();
+        sections.insert("unb".into(), RecVal::Map(OwnedMap::from_map(unb)));
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
             EnvelopeRecord::from_sections(sections),
-        ));
+        )));
         let mut record = body(&s, "BGM", "M1", "ORDERS", &["220"]);
         record.set_doc_ctx(ctx);
 
@@ -776,23 +783,23 @@ mod tests {
         // that contradicts its own header; the structural locator echoes
         // the real reference so the output validates on re-read.
         let s = schema();
-        let raw = RecVal::Array(vec![
+        let raw = RecVal::Array(OwnedValues::from_vec(vec![
             RecVal::String("UNOA:1".into()),
             RecVal::String("S".into()),
             RecVal::String("R".into()),
             RecVal::String("240101:1200".into()),
             RecVal::String("".into()),
             RecVal::String("REF1".into()),
-        ]);
-        let mut unb: IndexMap<Box<str>, RecVal> = IndexMap::new();
+        ]));
+        let mut unb: IndexMap<OwnedKey, RecVal> = IndexMap::new();
         unb.insert(super::RAW_ELEMENTS_KEY.into(), raw);
-        let mut sections: IndexMap<Box<str>, RecVal> = IndexMap::new();
-        sections.insert("unb".into(), RecVal::Map(Box::new(unb)));
-        let ctx = Arc::new(DocumentContext::new(
+        let mut sections: IndexMap<OwnedKey, RecVal> = IndexMap::new();
+        sections.insert("unb".into(), RecVal::Map(OwnedMap::from_map(unb)));
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
             EnvelopeRecord::from_sections(sections),
-        ));
+        )));
         let mut record = body(&s, "BGM", "M1", "ORDERS", &["220"]);
         record.set_doc_ctx(ctx);
 
@@ -824,23 +831,23 @@ mod tests {
         // and the UNZ echo must skip the time part to name the real
         // reference so the output validates on re-read.
         let s = schema();
-        let raw = RecVal::Array(vec![
+        let raw = RecVal::Array(OwnedValues::from_vec(vec![
             RecVal::String("UNOA:1".into()),
             RecVal::String("SENDER".into()),
             RecVal::String("RECEIVER".into()),
             RecVal::String("240101".into()),
             RecVal::String("1200".into()),
             RecVal::String("REF1".into()),
-        ]);
-        let mut unb: IndexMap<Box<str>, RecVal> = IndexMap::new();
+        ]));
+        let mut unb: IndexMap<OwnedKey, RecVal> = IndexMap::new();
         unb.insert(super::RAW_ELEMENTS_KEY.into(), raw);
-        let mut sections: IndexMap<Box<str>, RecVal> = IndexMap::new();
-        sections.insert("unb".into(), RecVal::Map(Box::new(unb)));
-        let ctx = Arc::new(DocumentContext::new(
+        let mut sections: IndexMap<OwnedKey, RecVal> = IndexMap::new();
+        sections.insert("unb".into(), RecVal::Map(OwnedMap::from_map(unb)));
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
             EnvelopeRecord::from_sections(sections),
-        ));
+        )));
         let mut record = body(&s, "BGM", "M1", "ORDERS", &["220"]);
         record.set_doc_ctx(ctx);
 
@@ -875,7 +882,7 @@ mod tests {
             ..Default::default()
         };
         let mut buf = Vec::new();
-        let mut w = EdifactWriter::new(Cursor::new(&mut buf), Arc::clone(&s), cfg);
+        let mut w = EdifactWriter::new(Cursor::new(&mut buf), s.clone(), cfg);
         let err = w
             .write_record(&body(&s, "BGM", "M1", "ORDERS", &["220"]))
             .unwrap_err();
@@ -1053,14 +1060,14 @@ mod tests {
     fn engine_stamped_columns_excluded() {
         // A `$`-prefixed engine column on the schema must not trip the
         // unknown-column rejection, and must not be emitted.
-        let cols: Vec<Box<str>> = vec![
+        let cols: Vec<OwnedKey> = vec![
             "seg_id".into(),
             "msg_ref".into(),
             "msg_type".into(),
             "e01".into(),
             "$source.file".into(),
         ];
-        let schema = Arc::new(Schema::new(cols));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let values = vec![
             Value::String("BGM".into()),
             Value::String("M1".into()),
@@ -1068,7 +1075,7 @@ mod tests {
             Value::String("220".into()),
             Value::String("/tmp/x.edi".into()),
         ];
-        let record = Record::new(Arc::clone(&schema), values);
+        let record = Record::new(schema.clone(), values);
         let out = write_all(literal_config(), &[record], &schema);
         assert!(out.contains("BGM+220'"));
         assert!(!out.contains("/tmp/x.edi"));
@@ -1076,15 +1083,15 @@ mod tests {
 
     #[test]
     fn unrecognized_column_errors_by_name() {
-        let cols: Vec<Box<str>> = vec![
+        let cols: Vec<OwnedKey> = vec![
             "seg_id".into(),
             "msg_ref".into(),
             "msg_type".into(),
             "amount".into(),
         ];
-        let schema = Arc::new(Schema::new(cols));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("BGM".into()),
                 Value::String("M1".into()),
@@ -1093,8 +1100,7 @@ mod tests {
             ],
         );
         let mut buf = Vec::new();
-        let mut w =
-            EdifactWriter::new(Cursor::new(&mut buf), Arc::clone(&schema), literal_config());
+        let mut w = EdifactWriter::new(Cursor::new(&mut buf), schema.clone(), literal_config());
         let err = w.write_record(&record).unwrap_err();
         assert!(matches!(err, FormatError::Edifact(m) if m.contains("amount")));
     }
@@ -1103,7 +1109,7 @@ mod tests {
     fn flush_finalize_idempotent() {
         let s = schema();
         let mut buf = Vec::new();
-        let mut w = EdifactWriter::new(Cursor::new(&mut buf), Arc::clone(&s), literal_config());
+        let mut w = EdifactWriter::new(Cursor::new(&mut buf), s.clone(), literal_config());
         w.write_record(&body(&s, "BGM", "M1", "ORDERS", &["220"]))
             .unwrap();
         w.flush().unwrap();
@@ -1124,10 +1130,10 @@ mod tests {
         // A schema declaring only `seg_id, e01, e03` must place e03's value
         // at wire element 3 with element 2 empty — never collapse it left
         // into element 2.
-        let cols: Vec<Box<str>> = vec!["seg_id".into(), "e01".into(), "e03".into()];
-        let schema = Arc::new(Schema::new(cols));
+        let cols: Vec<OwnedKey> = vec!["seg_id".into(), "e01".into(), "e03".into()];
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("BGM".into()),
                 Value::String("a".into()),
@@ -1143,10 +1149,10 @@ mod tests {
     #[test]
     fn reordered_element_columns_emit_in_position_order() {
         // A schema declaring `e02` before `e01` must still emit e01 first.
-        let cols: Vec<Box<str>> = vec!["seg_id".into(), "e02".into(), "e01".into()];
-        let schema = Arc::new(Schema::new(cols));
+        let cols: Vec<OwnedKey> = vec!["seg_id".into(), "e02".into(), "e01".into()];
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("BGM".into()),
                 Value::String("second".into()),
@@ -1184,7 +1190,7 @@ mod tests {
         // byte 0xE9, not the two-byte UTF-8 sequence.
         let s = schema();
         let mut buf = Vec::new();
-        let mut w = EdifactWriter::new(Cursor::new(&mut buf), Arc::clone(&s), unoc_config());
+        let mut w = EdifactWriter::new(Cursor::new(&mut buf), s.clone(), unoc_config());
         w.write_record(&body(&s, "NAD", "M1", "ORDERS", &["Café"]))
             .unwrap();
         w.flush().unwrap();
@@ -1208,7 +1214,7 @@ mod tests {
         // data byte 0x2B survive as ?+ rather than splitting the element.
         let s = schema();
         let mut buf = Vec::new();
-        let mut w = EdifactWriter::new(Cursor::new(&mut buf), Arc::clone(&s), unoc_config());
+        let mut w = EdifactWriter::new(Cursor::new(&mut buf), s.clone(), unoc_config());
         // U+002B is '+', which round-trips through Latin-1 to byte 0x2B.
         w.write_record(&body(&s, "BGM", "M1", "ORDERS", &["A+B"]))
             .unwrap();
@@ -1226,7 +1232,7 @@ mod tests {
         // writer must reject it, not truncate.
         let s = schema();
         let mut buf = Vec::new();
-        let mut w = EdifactWriter::new(Cursor::new(&mut buf), Arc::clone(&s), unoc_config());
+        let mut w = EdifactWriter::new(Cursor::new(&mut buf), s.clone(), unoc_config());
         let err = w
             .write_record(&body(&s, "FTX", "M1", "ORDERS", &["price €5"]))
             .unwrap_err();
@@ -1241,7 +1247,7 @@ mod tests {
         // Under a UNOA (ASCII) header a non-ASCII element is rejected loudly.
         let s = schema();
         let mut buf = Vec::new();
-        let mut w = EdifactWriter::new(Cursor::new(&mut buf), Arc::clone(&s), literal_config());
+        let mut w = EdifactWriter::new(Cursor::new(&mut buf), s.clone(), literal_config());
         let err = w
             .write_record(&body(&s, "NAD", "M1", "ORDERS", &["Café"]))
             .unwrap_err();
@@ -1268,7 +1274,7 @@ mod tests {
             ..Default::default()
         };
         let mut buf = Vec::new();
-        let mut w = EdifactWriter::new(Cursor::new(&mut buf), Arc::clone(&s), cfg);
+        let mut w = EdifactWriter::new(Cursor::new(&mut buf), s.clone(), cfg);
         let err = w
             .write_record(&body(&s, "BGM", "M1", "ORDERS", &["220"]))
             .unwrap_err();
@@ -1284,18 +1290,21 @@ mod tests {
         // A nested object in an `eNN` column has no scalar EDIFACT element
         // form; the writer must reject it explicitly rather than emit an
         // empty element.
-        let cols: Vec<Box<str>> = vec!["seg_id".into(), "e01".into()];
-        let schema = Arc::new(Schema::new(cols));
-        let mut nested: IndexMap<Box<str>, Value> = IndexMap::new();
+        let cols: Vec<OwnedKey> = vec!["seg_id".into(), "e01".into()];
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
+        let mut nested: IndexMap<OwnedKey, Value> = IndexMap::new();
         nested.insert("k".into(), Value::String("v".into()));
         let record = Record::new(
-            Arc::clone(&schema),
-            vec![Value::String("BGM".into()), Value::Map(Box::new(nested))],
+            schema.clone(),
+            vec![
+                Value::String("BGM".into()),
+                Value::Map(OwnedMap::from_map(nested)),
+            ],
         );
         let mut cfg = literal_config();
         cfg.message_type = Some("ORDERS".into());
         let mut buf = Vec::new();
-        let mut w = EdifactWriter::new(Cursor::new(&mut buf), Arc::clone(&schema), cfg);
+        let mut w = EdifactWriter::new(Cursor::new(&mut buf), schema.clone(), cfg);
         let err = w.write_record(&record).unwrap_err();
         assert!(
             matches!(&err, FormatError::UnserializableMapValue { format: "edifact", column } if column == "e01"),

@@ -1,3 +1,4 @@
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,9 +23,9 @@ use indexmap::IndexMap;
 struct AggregateFixture {
     compiled: Arc<CompiledAggregate>,
     typed: Arc<TypedProgram>,
-    input_schema: Arc<Schema>,
-    output_schema: Arc<Schema>,
-    spill_schema: Arc<Schema>,
+    input_schema: SharedStorage<Schema>,
+    output_schema: SharedStorage<Schema>,
+    spill_schema: SharedStorage<Schema>,
 }
 
 fn aggregate_fixture() -> AggregateFixture {
@@ -56,20 +57,23 @@ fn aggregate_fixture() -> AggregateFixture {
     let compiled = Arc::new(
         extract_aggregates(&typed, &group_by, &["k".to_string()]).expect("extract aggregates"),
     );
-    let output_schema = Arc::new(Schema::new(
+    let output_schema = SharedStorage::from_arc(Arc::new(Schema::new(
         compiled
             .emits
             .iter()
-            .map(|emit| emit.output_name.clone())
+            .map(|emit| emit.output_name.clone().into())
             .collect(),
-    ));
+    )));
 
     AggregateFixture {
         compiled,
         typed,
-        input_schema: Arc::new(Schema::new(vec!["k".into()])),
+        input_schema: SharedStorage::from_arc(Arc::new(Schema::new(vec!["k".into()]))),
         output_schema,
-        spill_schema: Arc::new(Schema::new(vec!["k".into(), "__acc_state".into()])),
+        spill_schema: SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "k".into(),
+            "__acc_state".into(),
+        ]))),
     }
 }
 
@@ -81,8 +85,8 @@ fn hash_aggregator(
     HashAggregator::new(AggregatorConfig {
         compiled: Arc::clone(&fixture.compiled),
         evaluator: ProgramEvaluator::new(Arc::clone(&fixture.typed), false),
-        output_schema: Arc::clone(&fixture.output_schema),
-        spill_schema: Arc::clone(&fixture.spill_schema),
+        output_schema: fixture.output_schema.clone(),
+        spill_schema: fixture.spill_schema.clone(),
         memory_budget,
         spill_dir,
         spill_compress: true,
@@ -97,8 +101,8 @@ fn hash_aggregator(
     })
 }
 
-fn record(schema: &Arc<Schema>, key: impl Into<Value>) -> Record {
-    Record::new(Arc::clone(schema), vec![key.into()])
+fn record(schema: &SharedStorage<Schema>, key: impl Into<Value>) -> Record {
+    Record::new(schema.clone(), vec![key.into()])
 }
 
 fn context<'a>(stable: &'a StableEvalContext, file: &'a Arc<str>, row: u64) -> EvalContext<'a> {
@@ -141,7 +145,7 @@ fn aggregate_representative_resident_and_streaming_keep_typed_minimum() {
     let mut streaming = StreamingAggregator::<AddRaw>::new_for_raw(
         Arc::clone(&fixture.compiled),
         ProgramEvaluator::new(Arc::clone(&fixture.typed), false),
-        Arc::clone(&fixture.output_schema),
+        fixture.output_schema.clone(),
         "identity_aggregate",
     );
     let mut streaming_rows = Vec::new();
@@ -195,7 +199,7 @@ fn aggregate_representative_maximum_identity_survives_resident_streaming_and_spi
     let mut streaming = StreamingAggregator::<AddRaw>::new_for_raw(
         Arc::clone(&fixture.compiled),
         ProgramEvaluator::new(Arc::clone(&fixture.typed), false),
-        Arc::clone(&fixture.output_schema),
+        fixture.output_schema.clone(),
         "identity_aggregate",
     );
     let mut streaming_rows = Vec::new();
@@ -242,7 +246,7 @@ fn aggregate_representative_maximum_identity_survives_resident_streaming_and_spi
 
 #[test]
 fn combine_driver_identity_survives_resident_collect_fanout_and_spill_carriers() {
-    let schema = Arc::new(Schema::new(vec!["driver".into()]));
+    let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["driver".into()])));
     let first = SourceRowId::new(PlanNodeId::new(21), 7);
     let second = SourceRowId::new(PlanNodeId::new(22), 7);
     let drivers = [
@@ -278,9 +282,8 @@ fn combine_driver_identity_survives_resident_collect_fanout_and_spill_carriers()
     );
 
     let spill_dir = tempfile::tempdir().expect("combine spill tempdir");
-    let mut writer =
-        SpillWriter::<SourceRowId>::new(Arc::clone(&schema), Some(spill_dir.path()), true)
-            .expect("open combine spill");
+    let mut writer = SpillWriter::<SourceRowId>::new(schema.clone(), Some(spill_dir.path()), true)
+        .expect("open combine spill");
     for (driver, identity) in &fanout {
         writer
             .write_pair(driver, identity)

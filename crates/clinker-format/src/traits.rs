@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use clinker_record::owned_storage::{OwnedKey, SharedStorage};
 use clinker_record::{DocumentContext, Record, Schema, Value};
 use indexmap::IndexMap;
 
@@ -24,7 +25,7 @@ pub enum SourceLifecycleEvent {
 /// the first row to discover column names. Must be `Send` for executor
 /// ownership transfer; not `Sync` — single-threaded streaming.
 pub trait FormatReader: Send {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError>;
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError>;
     fn next_record(&mut self) -> Result<Option<Record>, FormatError>;
 
     /// Borrow the path of the file that produced the most-recently-
@@ -44,7 +45,7 @@ pub trait FormatReader: Send {
     /// declared section in `config.sections` resolves to a
     /// [`Value::Map`] of typed field values keyed by the section's
     /// declared field names; the returned map is then attached to
-    /// every body record's `Arc<DocumentContext>`.
+    /// every body record's `SharedStorage<DocumentContext>`.
     ///
     /// Default impl returns an empty map — a reader takes the no-op
     /// path when the config asked nothing of it (no declared sections),
@@ -60,7 +61,7 @@ pub trait FormatReader: Send {
     fn prepare_document(
         &mut self,
         _config: &EnvelopeConfig,
-    ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
+    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
         Ok(IndexMap::new())
     }
 
@@ -125,7 +126,7 @@ pub trait FormatReader: Send {
 
 /// Streaming record writer. Consumes records one at a time.
 ///
-/// Writer stores `Arc<Schema>` internally (passed at construction).
+/// Writer stores `SharedStorage<Schema>` internally (passed at construction).
 /// Must be `Send` for executor ownership transfer; not `Sync`.
 pub trait FormatWriter: Send {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError>;

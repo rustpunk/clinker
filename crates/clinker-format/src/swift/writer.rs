@@ -34,7 +34,8 @@
 //! only ever flushed at true end of stream.
 
 use std::io::Write;
-use std::sync::Arc;
+
+use clinker_record::owned_storage::SharedStorage;
 
 use clinker_record::{Record, Schema, Value};
 
@@ -116,7 +117,7 @@ impl<W: Write> SwiftWriter<W> {
     /// Build a writer over a sink with the given schema and config. The
     /// `block`, `tag`, and `value` columns are resolved to positional indices
     /// once; the body lines stream one record at a time thereafter.
-    pub fn new(writer: W, schema: Arc<Schema>, config: SwiftWriterConfig) -> Self {
+    pub fn new(writer: W, schema: SharedStorage<Schema>, config: SwiftWriterConfig) -> Self {
         let mut block_idx = None;
         let mut tag_idx = None;
         let mut value_idx = None;
@@ -445,28 +446,34 @@ mod tests {
         DEFAULT_APP_HEADER_SECTION, DEFAULT_BASIC_HEADER_SECTION, DEFAULT_TRAILER_SECTION,
         DEFAULT_USER_HEADER_SECTION,
     };
+    use clinker_record::owned_storage::{OwnedKey, OwnedMap};
     use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
     use indexmap::IndexMap;
     use std::io::Cursor;
+    use std::sync::Arc;
 
     /// A `[block, tag, value]` schema, the one the reader emits.
-    fn schema() -> Arc<Schema> {
-        let cols: Vec<Box<str>> = vec!["block".into(), "tag".into(), "value".into()];
-        Arc::new(Schema::new(cols))
+    fn schema() -> SharedStorage<Schema> {
+        let cols: Vec<OwnedKey> = vec!["block".into(), "tag".into(), "value".into()];
+        SharedStorage::from_arc(Arc::new(Schema::new(cols)))
     }
 
-    fn record(schema: &Arc<Schema>, block: &str, tag: &str, value: &str) -> Record {
+    fn record(schema: &SharedStorage<Schema>, block: &str, tag: &str, value: &str) -> Record {
         let values = vec![
             Value::String(block.into()),
             Value::String(tag.into()),
             Value::String(value.into()),
         ];
-        Record::new(Arc::clone(schema), values)
+        Record::new(schema.clone(), values)
     }
 
-    fn write_all(config: SwiftWriterConfig, records: &[Record], schema: &Arc<Schema>) -> String {
+    fn write_all(
+        config: SwiftWriterConfig,
+        records: &[Record],
+        schema: &SharedStorage<Schema>,
+    ) -> String {
         let mut buf = Vec::new();
-        let mut w = SwiftWriter::new(Cursor::new(&mut buf), Arc::clone(schema), config);
+        let mut w = SwiftWriter::new(Cursor::new(&mut buf), schema.clone(), config);
         for r in records {
             w.write_record(r).unwrap();
         }
@@ -476,18 +483,21 @@ mod tests {
 
     /// Build a document context exposing each named service-block section
     /// under the shared `body` field, the shape the reader produces.
-    fn doc_ctx(sections: &[(&str, &str)]) -> Arc<DocumentContext> {
-        let mut out: IndexMap<Box<str>, Value> = IndexMap::new();
+    fn doc_ctx(sections: &[(&str, &str)]) -> SharedStorage<DocumentContext> {
+        let mut out: IndexMap<OwnedKey, Value> = IndexMap::new();
         for (name, body) in sections {
-            let mut fields: IndexMap<Box<str>, Value> = IndexMap::new();
+            let mut fields: IndexMap<OwnedKey, Value> = IndexMap::new();
             fields.insert(BODY_FIELD.into(), Value::String((*body).into()));
-            out.insert(Box::from(*name), Value::Map(Box::new(fields)));
+            out.insert(
+                OwnedKey::from(*name),
+                Value::Map(OwnedMap::from_map(fields)),
+            );
         }
-        Arc::new(DocumentContext::new(
+        SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("a.swift"),
             EnvelopeRecord::from_sections(out),
-        ))
+        )))
     }
 
     #[test]
@@ -591,7 +601,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut w = SwiftWriter::new(
             Cursor::new(&mut buf),
-            Arc::clone(&s),
+            s.clone(),
             SwiftWriterConfig {
                 trailer: Some("{CHK:AB}".into()),
                 ..Default::default()
@@ -616,7 +626,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut w = SwiftWriter::new(
             Cursor::new(&mut buf),
-            Arc::clone(&s),
+            s.clone(),
             SwiftWriterConfig::default(),
         );
         let err = w.write_record(&rec).unwrap_err();
@@ -648,7 +658,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut w = SwiftWriter::new(
             Cursor::new(&mut buf),
-            Arc::clone(&s),
+            s.clone(),
             SwiftWriterConfig::default(),
         );
         let err = w.write_record(&rec).unwrap_err();
@@ -667,7 +677,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut w = SwiftWriter::new(
             Cursor::new(&mut buf),
-            Arc::clone(&s),
+            s.clone(),
             SwiftWriterConfig::default(),
         );
         let err = w.write_record(&rec).unwrap_err();
@@ -692,7 +702,7 @@ mod tests {
     fn missing_tag_errors() {
         let s = schema();
         let rec = Record::new(
-            Arc::clone(&s),
+            s.clone(),
             vec![
                 Value::String("4".into()),
                 Value::Null,
@@ -702,7 +712,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut w = SwiftWriter::new(
             Cursor::new(&mut buf),
-            Arc::clone(&s),
+            s.clone(),
             SwiftWriterConfig::default(),
         );
         let err = w.write_record(&rec).unwrap_err();
@@ -715,20 +725,20 @@ mod tests {
     #[test]
     fn map_value_in_value_column_errors() {
         let s = schema();
-        let mut nested: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut nested: IndexMap<OwnedKey, Value> = IndexMap::new();
         nested.insert("k".into(), Value::String("v".into()));
         let rec = Record::new(
-            Arc::clone(&s),
+            s.clone(),
             vec![
                 Value::String("4".into()),
                 Value::String("20".into()),
-                Value::Map(Box::new(nested)),
+                Value::Map(OwnedMap::from_map(nested)),
             ],
         );
         let mut buf = Vec::new();
         let mut w = SwiftWriter::new(
             Cursor::new(&mut buf),
-            Arc::clone(&s),
+            s.clone(),
             SwiftWriterConfig::default(),
         );
         let err = w.write_record(&rec).unwrap_err();
@@ -747,7 +757,7 @@ mod tests {
             ..Default::default()
         };
         let mut buf = Vec::new();
-        let mut w = SwiftWriter::new(Cursor::new(&mut buf), Arc::clone(&s), config);
+        let mut w = SwiftWriter::new(Cursor::new(&mut buf), s.clone(), config);
         let err = w.write_record(&rec).unwrap_err();
         assert!(
             matches!(&err, FormatError::Swift(m) if m.contains("no `body` field")),

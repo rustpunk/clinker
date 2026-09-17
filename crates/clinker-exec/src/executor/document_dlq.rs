@@ -379,6 +379,7 @@ fn remaining_document_keys(buckets: &HashMap<DocKey, DocBucket>) -> Vec<DocKey> 
 /// lazily on the first clean record and reused across this arm's document
 /// decisions, then flushed at the driver's end.
 pub(crate) struct DocumentDlqDriver<'cfg> {
+    allocation_resources: clinker_record::owned_storage::AllocationResources,
     output_name: String,
     out_cfg: &'cfg SinkConfig,
     cxl_emit_names: Option<Vec<String>>,
@@ -420,6 +421,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
             Some(cxl_emit_names)
         };
         Self {
+            allocation_resources: ctx.allocation_resources.clone(),
             output_name: output_name.to_string(),
             out_cfg,
             cxl_emit_names,
@@ -475,9 +477,11 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         let column_count = record.schema().column_count();
         let bucket = Self::bucket_for(&mut self.buckets, &self.arbitrator, key);
         bucket.buffer.push(record, source_row);
-        bucket
-            .handle
-            .set_bytes(bucket.buffer.estimated_memory_bytes());
+        bucket.handle.set_bytes(
+            bucket
+                .buffer
+                .unaccounted_memory_bytes(&self.allocation_resources),
+        );
         self.arbitrator.sample_peak_consumer_usage();
         if self.arbitrator.should_spill() {
             spill_bucket_in_place(
@@ -653,7 +657,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                 // sibling already took it): nothing to write to.
                 return;
             };
-            let output_schema = Arc::clone(projected[0].schema());
+            let output_schema = projected[0].schema().clone();
             match build_format_writer(
                 self.out_cfg,
                 raw_writer,
@@ -1157,34 +1161,32 @@ fn reject_document_now(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_record::owned_storage::SharedStorage;
     use clinker_record::{
         DocumentContext, DocumentId, EnvelopeRecord, FieldMetadata, Schema, SchemaBuilder, Value,
     };
 
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec!["id".into(), "value".into()]))
+    fn schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "value".into()])))
     }
 
-    fn rec(s: &Arc<Schema>, id: i64, value: i64) -> Record {
-        Record::new(
-            Arc::clone(s),
-            vec![Value::Integer(id), Value::Integer(value)],
-        )
+    fn rec(s: &SharedStorage<Schema>, id: i64, value: i64) -> Record {
+        Record::new(s.clone(), vec![Value::Integer(id), Value::Integer(value)])
     }
 
     fn rejected_document_fixture() -> (
         Arc<crate::pipeline::memory::MemoryArbitrator>,
         DocumentDlqState,
         HashMap<DocKey, DocBucket>,
-        Arc<DocumentContext>,
+        SharedStorage<DocumentContext>,
     ) {
         let key: DocKey = Arc::from("broken.x12");
         let source_name: Arc<str> = Arc::from("orders");
-        let doc = Arc::new(DocumentContext::new(
+        let doc = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::clone(&key),
             EnvelopeRecord::empty(),
-        ));
+        )));
         let schema = SchemaBuilder::with_capacity(4)
             .with_field("id")
             .with_field("value")
@@ -1193,7 +1195,7 @@ mod tests {
             .build();
         let record = |id: i64| {
             let mut record = Record::new(
-                Arc::clone(&schema),
+                schema.clone(),
                 vec![
                     Value::Integer(id),
                     Value::Integer(id * 10),
@@ -1201,7 +1203,7 @@ mod tests {
                     Value::from(source_name.as_ref()),
                 ],
             );
-            record.set_doc_ctx(Arc::clone(&doc));
+            record.set_doc_ctx(doc.clone());
             record
         };
         let trigger_record = record(1);
@@ -1252,8 +1254,8 @@ mod tests {
         let (arbitrator, mut state, mut buckets, doc) = rejected_document_fixture();
         let key = Arc::clone(doc.source_file());
         let closes = [
-            crate::executor::stream_event::Punctuation::document_close(Arc::clone(&doc)),
-            crate::executor::stream_event::Punctuation::document_close(Arc::clone(&doc)),
+            crate::executor::stream_event::Punctuation::document_close(doc.clone()),
+            crate::executor::stream_event::Punctuation::document_close(doc.clone()),
         ];
         let mut decided = HashSet::new();
         let mut rejections = Vec::new();

@@ -1,6 +1,7 @@
 use clinker_bench_support::{LARGE, MEDIUM, RecordFactory, SMALL};
 use clinker_exec::pipeline::arena::Arena;
 use clinker_exec::pipeline::index::SecondaryIndex;
+use clinker_record::owned_storage::SharedStorage;
 use clinker_record::{MinimalRecord, RecordStorage, Schema, Value};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::sync::Arc;
@@ -24,7 +25,7 @@ fn bench_arena_build(c: &mut Criterion) {
                         .iter()
                         .map(|r| MinimalRecord::new(r.values().to_vec()))
                         .collect();
-                    let arena = Arena::from_parts(Arc::clone(&schema), minimals);
+                    let arena = Arena::from_parts(schema.clone(), minimals);
                     black_box(&arena);
                 });
             },
@@ -45,7 +46,7 @@ fn bench_arena_field_access(c: &mut Criterion) {
             .iter()
             .map(|r| MinimalRecord::new(r.values().to_vec()))
             .collect();
-        let arena = Arena::from_parts(Arc::clone(&schema), minimals);
+        let arena = Arena::from_parts(schema.clone(), minimals);
 
         group.throughput(Throughput::Elements(record_count as u64));
         group.bench_with_input(
@@ -75,7 +76,8 @@ fn bench_index_build(c: &mut Criterion) {
         } else {
             5000
         };
-        let schema = Arc::new(Schema::new(vec!["group".into(), "value".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["group".into(), "value".into()])));
         let minimals: Vec<MinimalRecord> = (0..record_count)
             .map(|i| {
                 MinimalRecord::new(vec![
@@ -84,7 +86,7 @@ fn bench_index_build(c: &mut Criterion) {
                 ])
             })
             .collect();
-        let arena = Arena::from_parts(Arc::clone(&schema), minimals);
+        let arena = Arena::from_parts(schema.clone(), minimals);
 
         group.throughput(Throughput::Elements(record_count as u64));
         group.bench_with_input(
@@ -108,7 +110,8 @@ fn bench_index_lookup(c: &mut Criterion) {
     let num_groups = 100;
     let record_count = MEDIUM;
 
-    let schema = Arc::new(Schema::new(vec!["group".into(), "value".into()]));
+    let schema =
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["group".into(), "value".into()])));
     let minimals: Vec<MinimalRecord> = (0..record_count)
         .map(|i| {
             MinimalRecord::new(vec![

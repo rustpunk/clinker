@@ -204,7 +204,7 @@ permanent stability.
 
 - **Classification:** Preferred.
 - **Where:** Format readers, projection, planning, aggregation, combine,
-  benchmarks, and executor tests build fresh `Arc<Schema>` values while
+  benchmarks, and executor tests build fresh shared schema handles while
   preserving column/metadata alignment.
 - **Use:** Use `SchemaBuilder::new` or `with_capacity`, add fields and metadata,
   then call `build` when a schema is assembled incrementally or metadata must
@@ -366,12 +366,17 @@ permanent stability.
 - **Where:** `Value::String` uses `FieldStr` because string width affects
   record memory and spill accounting.
 - **Use:** Use its public string API and preserve layout/size invariants when
-  modifying the representation.
-- **Evidence:** `crates/clinker-record/src/field_str.rs` and the `smol_str`
-  workspace manifest rationale.
+  modifying the representation. Finite constructors admit complete text and
+  owner backing through an allocation scope; shared clones retain the original
+  lease. Admission accounting uses the structural unaccounted contribution
+  relative to the run's live allocation resources; a governed allocation from
+  another provider still counts. Keep physical estimates for pressure decisions.
+- **Evidence:** `crates/clinker-record/src/field_str.rs`,
+  `crates/clinker-record/src/owned_storage.rs`, and actual allocator/lifetime
+  tests in `crates/clinker-record/tests/decoded_ownership.rs`.
 - **Counterexamples / limits:** This does not justify a second compact-string
   type or make storage hints part of serialized equality/content semantics.
-- **Verified:** 2026-07-29.
+- **Verified:** 2026-09-15.
 
 ### `bench-alloc` allocation accounting
 

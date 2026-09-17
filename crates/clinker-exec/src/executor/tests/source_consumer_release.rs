@@ -274,6 +274,16 @@ struct GateWriter {
     tripped: bool,
 }
 
+struct ReleaseWriter(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl Drop for ReleaseWriter {
+    fn drop(&mut self) {
+        let (flag, cv) = &*self.0;
+        *flag.lock().unwrap() = true;
+        cv.notify_all();
+    }
+}
+
 impl std::io::Write for GateWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if !self.tripped {
@@ -301,7 +311,8 @@ impl std::io::Write for GateWriter {
 /// disconnects, while the final materialized reader keeps the slot's
 /// exact charge registered through its synchronous Output turn. The
 /// gated writer freezes the run after the Source turn completed and
-/// proves that only the transferred node-buffer registration remains.
+/// proves that the transferred node-buffer and idle run resource provider
+/// remain registered, with no source consumer left behind.
 #[test]
 fn source_charge_is_replaced_by_output_input_registration_before_write() {
     let yaml = r#"
@@ -327,6 +338,7 @@ nodes:
 "#;
     let reached = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release_writer = ReleaseWriter(Arc::clone(&release));
     let writer = GateWriter {
         reached: Arc::clone(&reached),
         release: Arc::clone(&release),
@@ -371,8 +383,13 @@ nodes:
     // registration until the synchronous write completes.
     assert_eq!(
         arb.consumer_count(),
-        1,
-        "the Output turn must retain exactly one transferred node-buffer registration"
+        2,
+        "the Output retains its transferred node-buffer and the run writer consumer"
+    );
+    assert_eq!(
+        arb.writer_resource_usage().memory,
+        0,
+        "the legacy CSV writer does not allocate through the run resource provider"
     );
     assert_eq!(
         arb.backpressureable_consumer_count(),
@@ -381,11 +398,7 @@ nodes:
     );
     assert!(arb.sum_consumer_usage() > 0);
 
-    {
-        let (flag, cv) = &*release;
-        *flag.lock().unwrap() = true;
-        cv.notify_all();
-    }
+    drop(release_writer);
     run_thread
         .join()
         .expect("run thread must not panic")

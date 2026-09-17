@@ -15,10 +15,10 @@ pub mod combine;
 pub mod generators;
 pub mod io;
 
+use clinker_record::owned_storage::SharedStorage;
 use clinker_record::{FieldStr, Record, Schema, SchemaBuilder, Value};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 /// Returns the workspace root by walking up from `CARGO_MANIFEST_DIR`.
 ///
@@ -231,7 +231,7 @@ pub fn write_field_value(
 
 /// Deterministic record factory with configurable field layout.
 pub struct RecordFactory {
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     rng: fastrand::Rng,
     string_len: usize,
     null_ratio: f64,
@@ -257,7 +257,7 @@ impl RecordFactory {
     }
 
     /// Schema used by all records from this factory.
-    pub fn schema(&self) -> &Arc<Schema> {
+    pub fn schema(&self) -> &SharedStorage<Schema> {
         &self.schema
     }
 
@@ -274,7 +274,7 @@ impl RecordFactory {
                 values.push(Value::String(self.random_string()));
             }
         }
-        Record::new(Arc::clone(&self.schema), values)
+        Record::new(self.schema.clone(), values)
     }
 
     /// Generate `count` records.

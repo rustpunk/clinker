@@ -8,6 +8,8 @@
 //! `Sort` arm is a single delegating call into [`dispatch_sort`].
 
 use clinker_record::Record;
+#[cfg(test)]
+use clinker_record::owned_storage::SharedStorage;
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
@@ -234,6 +236,7 @@ pub(super) fn sort_records_by_authored_fields(
         Some(ctx.spill_root_path.to_path_buf()),
         spill_compress,
         schema,
+        ctx.allocation_resources.clone(),
     );
 
     let sort_count = input_records.len() as u64;
@@ -311,6 +314,7 @@ where
                 Some(ctx.spill_root_path.to_path_buf()),
                 spill_compress,
                 record.schema().clone(),
+                ctx.allocation_resources.clone(),
             )
         });
         buf.push(record, source_row);
@@ -425,6 +429,15 @@ fn charge_enforcer_spill(
 
 #[cfg(test)]
 mod tests {
+    fn test_allocation_resources() -> clinker_record::owned_storage::AllocationResources {
+        clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024 * 1024).unwrap(),
+        )
+        .resources()
+        .allocation()
+        .clone()
+    }
+
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -457,13 +470,13 @@ mod tests {
         assert_eq!(selected, NodeBufferKey::from(sort_idx));
     }
 
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec!["k".into(), "id".into()]))
+    fn schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["k".into(), "id".into()])))
     }
 
     /// A record whose sort key `k` is a `Decimal` (mantissa/10) and whose
     /// `id` mirrors the carried source ordinal for readback.
-    fn rec(schema: &Arc<Schema>, k_mantissa: i64, id: i64) -> Record {
+    fn rec(schema: &SharedStorage<Schema>, k_mantissa: i64, id: i64) -> Record {
         Record::new(
             schema.clone(),
             vec![
@@ -509,6 +522,7 @@ mod tests {
             Some(spill_root.path().to_path_buf()),
             true,
             schema.clone(),
+            test_allocation_resources(),
         );
         let input: Vec<(Record, crate::executor::stream_event::SourceRowId)> = (0..6)
             .map(|i| {
@@ -556,7 +570,7 @@ mod tests {
 
         fn run_sort(
             budget: &Arc<MemoryArbitrator>,
-            schema: &Arc<Schema>,
+            schema: &SharedStorage<Schema>,
         ) -> Result<u64, PipelineError> {
             let spill_root = tempfile::tempdir().unwrap();
             let buf = SortBuffer::new(
@@ -564,7 +578,8 @@ mod tests {
                 1,
                 Some(spill_root.path().to_path_buf()),
                 true,
-                Arc::clone(schema),
+                schema.clone(),
+                test_allocation_resources(),
             );
             let input = (0..6)
                 .map(|i| {
@@ -632,7 +647,7 @@ mod tests {
         use crate::pipeline::spill_merge::{MergeBudget, SortedRunMerger, SpillChargeGuard};
 
         fn runs(
-            schema: &Arc<Schema>,
+            schema: &SharedStorage<Schema>,
             dir: &std::path::Path,
         ) -> Vec<SpillFile<crate::executor::stream_event::SourceRowId>> {
             let mut buffer = SortBuffer::new(
@@ -640,7 +655,8 @@ mod tests {
                 1,
                 Some(dir.to_path_buf()),
                 true,
-                Arc::clone(schema),
+                schema.clone(),
+                test_allocation_resources(),
             );
             for i in 0..3 {
                 buffer.push(

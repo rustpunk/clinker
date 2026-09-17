@@ -10,6 +10,7 @@
 //! plan layer's `certify_streaming_edge`, so this runtime install can never
 //! disagree with the `--explain` buffer-class annotation.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashSet;
 use std::io::Write;
 use std::ops::ControlFlow;
@@ -117,7 +118,7 @@ pub(super) fn compute_streaming_sink_specs(
         };
 
         // Pre-compute the schema-check + projection metadata so the
-        // spawned task carries owned `Arc<Schema>` / `Vec<String>` / the
+        // spawned task carries owned `SharedStorage<Schema>` / `Vec<String>` / the
         // upstream node name for E314 diagnostics, with no borrow back
         // into the plan.
         let expected_input_schema = plan.graph[output_idx]
@@ -177,7 +178,7 @@ pub(crate) struct StreamingSinkSpec {
     /// Compile-time input schema for the Output; used by the streaming
     /// task to run the same `check_input_schema` invariant the buffered
     /// path enforces (E314 SchemaMismatch diagnostics).
-    pub(crate) expected_input_schema: Option<Arc<Schema>>,
+    pub(crate) expected_input_schema: Option<SharedStorage<Schema>>,
     /// Upstream `cxl_emit_names_in` result — passed to
     /// `project_output_from_record` so the streaming projection drops
     /// passthroughs the user didn't explicitly emit (matching the
@@ -314,21 +315,20 @@ pub(super) trait StreamingConsumer {
 /// Source through the bounded channel, and the per-batch admit/discharge
 /// model keeps the slot's live byte count tracking only the batches in
 /// flight, never the whole stage. For each body record the skeleton
-/// discharges the record's `record_byte_cost` from `charge_handle` *before*
+/// discharges the record's `unaccounted_record_byte_cost` from `charge_handle` *before*
 /// handing it to [`StreamingConsumer::on_record`] — the consume half of the
-/// producer's per-batch `EventBatch::estimated_bytes` charge, so a fully
+/// producer's per-batch `EventBatch::unaccounted_estimated_bytes` charge, so a fully
 /// drained stream nets the counter back to zero. On an `on_record`
 /// `Break`, the skeleton drains the rest of the channel (so the producer's
-/// bounded `send` never blocks forever on a dead consumer) and pins the
-/// charge to zero without finalizing the consumer. On clean disconnect it
-/// finalizes the consumer, then pins the charge to zero defensively so a
-/// heuristic mismatch between the batch charge and the per-record discharge
-/// can never leave a stale positive charge for the post-join arbitrator
-/// read.
+/// bounded `send` never blocks forever on a dead consumer) and discharges each
+/// discarded row without finalizing the consumer. On clean disconnect it
+/// finalizes the consumer. Both paths preserve any unrelated reservation on
+/// the shared counter; exact discharge is never replaced by a reset.
 pub(super) fn drain_streaming_channel<C: StreamingConsumer>(
     rx: &crossbeam_channel::Receiver<StreamEvent>,
     charge_handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
     consumer: &mut C,
+    resources: &clinker_record::owned_storage::AllocationResources,
 ) {
     while let Ok(event) = rx.recv() {
         let (record, rn) = match event {
@@ -341,15 +341,15 @@ pub(super) fn drain_streaming_channel<C: StreamingConsumer>(
         // Discharge this record's per-row cost from the shared charge
         // handle — the consume half of the per-batch admit/discharge
         // model. The producer charged the whole batch's
-        // `EventBatch::estimated_bytes` on flush; subtracting each
-        // record's `record_byte_cost` as it drains keeps the slot's live
+        // `EventBatch::unaccounted_estimated_bytes` on flush; subtracting each
+        // record's authority-relative cost as it drains keeps the slot's live
         // count tracking exactly what is still buffered between producer
         // and consumer. The formula matches the producer's charge, so a
         // fully-drained stream nets the counter back to zero. It runs
         // before `on_record` so a consumer that drops the record still
         // accounts for it.
-        charge_handle.sub_bytes(crate::executor::node_buffer::record_byte_cost(
-            record.schema().column_count(),
+        charge_handle.sub_bytes(crate::executor::node_buffer::unaccounted_record_byte_cost(
+            &record, resources,
         ));
         if consumer.on_record(record, rn).is_break() {
             // Drain the rest of the channel so the producer's bounded
@@ -358,20 +358,23 @@ pub(super) fn drain_streaming_channel<C: StreamingConsumer>(
             // otherwise the producer blocks forever on a full bounded
             // channel. The consumer is not finalized: a fatal `on_record`
             // already abandoned its work.
-            while rx.recv().is_ok() {}
-            // Nothing is buffered downstream once the channel drains, so
-            // zero the slot's charge unconditionally — the fatal path never
-            // discharged the records it dropped on the floor above.
-            charge_handle.set_bytes(0);
+            while let Ok(event) = rx.recv() {
+                if let StreamEvent::Record(record, _) = event {
+                    charge_handle.sub_bytes(
+                        crate::executor::node_buffer::unaccounted_record_byte_cost(
+                            &record, resources,
+                        ),
+                    );
+                }
+            }
             return;
         }
     }
 
     // Channel closed — every sender dropped (`recv` returned `Err`), so no
     // more records will arrive. Let the consumer finalize (flush a writer,
-    // emit a final group), then pin the charge to zero.
+    // emit a final group), without changing unrelated reservations.
     consumer.on_close();
-    charge_handle.set_bytes(0);
 }
 
 /// The `Output` instantiation of [`StreamingConsumer`]: projects each
@@ -492,13 +495,13 @@ impl StreamingConsumer for SinkStreamConsumer {
         // projected schema so the writer's column list matches what
         // `project_output_from_record` actually emits (same source of truth
         // as the buffered Output arm at dispatch.rs's `output_schema =
-        // Arc::clone(projected.schema())`).
+        // projected.schema().clone()`).
         if self.writer.is_none() {
             let raw = self
                 .raw_writer_slot
                 .take()
                 .expect("raw_writer_slot is Some until first record arrives");
-            let schema = Arc::clone(projected.schema());
+            let schema = projected.schema().clone();
             match build_format_writer(
                 &self.spec.out_cfg,
                 raw,
@@ -638,6 +641,7 @@ pub(super) fn streaming_sink(
     charge_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
     telemetry_producer: Option<crate::telemetry::TelemetryProducer>,
     shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
+    allocation_resources: clinker_record::owned_storage::AllocationResources,
 ) -> StreamingOutputTaskOutput {
     let mut signal = telemetry_producer
         .map(|producer| crate::telemetry::SinkSignal::new(producer, spec.output_name.clone()));
@@ -645,7 +649,7 @@ pub(super) fn streaming_sink(
         .as_ref()
         .map(|_| clinker_format::SharedByteCounter::new());
     let mut consumer = SinkStreamConsumer::new(raw_writer, spec, sink_byte_counter.clone());
-    drain_streaming_channel(&rx, &charge_handle, &mut consumer);
+    drain_streaming_channel(&rx, &charge_handle, &mut consumer, &allocation_resources);
     if let Some(mut signal) = signal.take() {
         signal.record_records(consumer.out.records_written);
         signal.record_bytes(
@@ -677,6 +681,7 @@ pub(super) fn streaming_sink(
             signal.complete();
         }
     }
+    drop(allocation_resources);
     consumer.out
 }
 
@@ -687,13 +692,14 @@ mod tests {
     use crate::executor::stream_event::PunctuationKind;
     use crate::pipeline::memory::ConsumerHandle;
     use clinker_record::{Schema, Value, synthetic_document_context};
+    #[cfg(test)]
     use std::sync::Arc;
 
     /// One-column record used to size the per-record discharge against
     /// `record_byte_cost(1)`.
     fn rec(id: i64) -> Record {
         Record::new(
-            Arc::new(Schema::new(vec!["id".into()])),
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into()]))),
             vec![Value::Integer(id)],
         )
     }
@@ -744,6 +750,122 @@ mod tests {
     }
 
     #[test]
+    fn mixed_authority_discharge_preserves_baseline_on_success_and_callback_failure() {
+        use crate::executor::node_buffer::unaccounted_record_byte_cost;
+        use clinker_format::preparation::MemoryOnlyResources;
+        use clinker_record::owned_storage::OwnedValues;
+        struct Observe {
+            charge: Arc<ConsumerHandle>,
+            costs: Vec<u64>,
+            remaining: u64,
+            seen: usize,
+            fail: bool,
+            closed: bool,
+        }
+        impl StreamingConsumer for Observe {
+            fn on_record(
+                &mut self,
+                _: Record,
+                _: crate::executor::stream_event::SourceRowId,
+            ) -> ControlFlow<()> {
+                self.remaining -= self.costs[self.seen];
+                assert_eq!(
+                    self.charge.bytes(),
+                    self.remaining,
+                    "each row discharges before callback"
+                );
+                self.seen += 1;
+                if self.fail {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            }
+            fn on_punctuation(&mut self, _: Punctuation) {}
+            fn on_close(&mut self) {
+                self.closed = true;
+            }
+        }
+        for fail in [false, true] {
+            let local = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+            let foreign =
+                MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+            let resources = local.resources().allocation().clone();
+            let local_scope = resources.scope().unwrap();
+            let escaped = clinker_record::FieldStr::try_new(
+                "a shared leaf retained beyond its original record",
+                &local_scope,
+            )
+            .unwrap();
+            let leaf_bytes = local.used();
+            let make = |domain: &clinker_record::owned_storage::AllocationResources,
+                        width: usize| {
+                let scope = domain.scope().unwrap();
+                let mut values = OwnedValues::try_with_capacity(width + 2, &scope).unwrap();
+                for _ in 0..width {
+                    values
+                        .try_push(Value::String(escaped.clone()), &scope)
+                        .unwrap();
+                }
+                Record::from_owned_values(
+                    SharedStorage::from_arc(Arc::new(Schema::new(
+                        (0..width).map(|i| format!("f{i}").into()).collect(),
+                    ))),
+                    values,
+                )
+                .unwrap()
+            };
+            let rows = [
+                make(&resources, 1),
+                make(foreign.resources().allocation(), 3),
+                rec(2),
+            ];
+            let costs: Vec<_> = rows
+                .iter()
+                .map(|r| unaccounted_record_byte_cost(r, &resources))
+                .collect();
+            assert_eq!(
+                costs[0],
+                std::mem::size_of::<(Record, crate::executor::stream_event::SourceRowId)>() as u64
+            );
+            assert_eq!(costs[1], record_byte_cost(3));
+            let baseline = 123;
+            let total = baseline + costs.iter().sum::<u64>();
+            let charge = ConsumerHandle::new();
+            charge.add_bytes(total);
+            let (tx, rx) = crossbeam_channel::unbounded();
+            for (i, record) in rows.into_iter().enumerate() {
+                tx.send(StreamEvent::record(record, i as u64)).unwrap();
+            }
+            drop(tx);
+            let mut consumer = Observe {
+                charge: charge.clone(),
+                costs,
+                remaining: total,
+                seen: 0,
+                fail,
+                closed: false,
+            };
+            drain_streaming_channel(&rx, &charge, &mut consumer, &resources);
+            assert_eq!(
+                charge.bytes(),
+                baseline,
+                "cleanup must not reset unrelated ownership"
+            );
+            assert_eq!(consumer.seen, if fail { 1 } else { 3 });
+            assert_eq!(consumer.closed, !fail);
+            assert_eq!(foreign.used(), 0);
+            assert_eq!(
+                local.used(),
+                leaf_bytes,
+                "escaped leaf retains its intrinsic grant"
+            );
+            drop(escaped);
+            assert_eq!(local.used(), 0);
+        }
+    }
+
+    #[test]
     fn full_drain_nets_charge_to_zero_and_preserves_order() {
         let (tx, rx) = crossbeam_channel::unbounded::<StreamEvent>();
         let charge = ConsumerHandle::new();
@@ -758,7 +880,16 @@ mod tests {
         drop(tx);
 
         let mut consumer = Recorder::new(None);
-        drain_streaming_channel(&rx, &charge, &mut consumer);
+        drain_streaming_channel(
+            &rx,
+            &charge,
+            &mut consumer,
+            clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+            )
+            .resources()
+            .allocation(),
+        );
 
         assert_eq!(consumer.records, vec![0, 1, 2, 3], "records seen in order");
         assert_eq!(consumer.closes, 1, "on_close fires once on clean drain");
@@ -779,7 +910,16 @@ mod tests {
         // Break on row 1: rows 2..5 remain in the channel and must be
         // drained so a bounded producer `send` could not deadlock.
         let mut consumer = Recorder::new(Some(1));
-        drain_streaming_channel(&rx, &charge, &mut consumer);
+        drain_streaming_channel(
+            &rx,
+            &charge,
+            &mut consumer,
+            clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+            )
+            .resources()
+            .allocation(),
+        );
 
         assert_eq!(
             consumer.records,
@@ -802,18 +942,27 @@ mod tests {
         charge.add_bytes(record_byte_cost(1));
         let doc = synthetic_document_context();
         tx.send(StreamEvent::punctuation(Punctuation::document_open(
-            Arc::clone(&doc),
+            doc.clone(),
         )))
         .unwrap();
         tx.send(StreamEvent::record(rec(0), 0)).unwrap();
         tx.send(StreamEvent::punctuation(Punctuation::document_close(
-            Arc::clone(&doc),
+            doc.clone(),
         )))
         .unwrap();
         drop(tx);
 
         let mut consumer = Recorder::new(None);
-        drain_streaming_channel(&rx, &charge, &mut consumer);
+        drain_streaming_channel(
+            &rx,
+            &charge,
+            &mut consumer,
+            clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+            )
+            .resources()
+            .allocation(),
+        );
 
         assert_eq!(
             consumer.puncts,
@@ -839,7 +988,16 @@ mod tests {
         drop(tx);
 
         let mut consumer = Recorder::new(None);
-        drain_streaming_channel(&rx, &charge, &mut consumer);
+        drain_streaming_channel(
+            &rx,
+            &charge,
+            &mut consumer,
+            clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+            )
+            .resources()
+            .allocation(),
+        );
 
         assert!(consumer.records.is_empty(), "no records on an empty stream");
         assert_eq!(

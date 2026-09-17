@@ -21,10 +21,10 @@
 //! writer retains only a schema-derived tree plan across calls; it retains no
 //! rendered record values or record-sized scalar capacity.
 
+use clinker_record::owned_storage::{OwnedKey, SharedStorage};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::sync::Arc;
 
 use quick_xml::Writer as XmlEmitter;
 use quick_xml::events::{BytesEnd, BytesStart, Event};
@@ -100,7 +100,7 @@ pub struct XmlWriter<W: Write> {
     /// Schema pinned for the writer's lifetime. The borrowed emit path walks
     /// each record positionally, while this ownership keeps factory callers
     /// honest about the stream's declared schema.
-    _schema: Arc<Schema>,
+    _schema: SharedStorage<Schema>,
     config: XmlWriterConfig,
     header_written: bool,
     /// Per-document envelope framer, present only when `config.envelope` is.
@@ -116,7 +116,7 @@ pub struct XmlWriter<W: Write> {
 }
 
 impl<W: Write> XmlWriter<W> {
-    pub fn new(writer: W, schema: Arc<Schema>, config: XmlWriterConfig) -> Self {
+    pub fn new(writer: W, schema: SharedStorage<Schema>, config: XmlWriterConfig) -> Self {
         let framer = config
             .envelope
             .clone()
@@ -132,7 +132,7 @@ impl<W: Write> XmlWriter<W> {
     }
 
     /// Ensure `plan_cache` holds a tree plan for this record's schema. The plan
-    /// is rebuilt only when the schema identity changes (`Arc::ptr_eq`), so a
+    /// is rebuilt only when the schema identity changes (`SharedStorage::ptr_eq`), so a
     /// single-schema stream builds it once. Attribute-name validation happens
     /// here (at build time), before any bytes are written, so a malformed
     /// attribute name still fails `write_record` cleanly.
@@ -141,7 +141,7 @@ impl<W: Write> XmlWriter<W> {
         let current = self
             .plan_cache
             .as_ref()
-            .is_some_and(|c| Arc::ptr_eq(&c.schema, schema));
+            .is_some_and(|c| SharedStorage::ptr_eq(&c.schema, schema));
         if !current {
             self.plan_cache = Some(build_plan_cache(record, &self.config)?);
         }
@@ -157,7 +157,7 @@ impl<W: Write> XmlWriter<W> {
         writer: &mut XmlEmitter<W>,
         config: &XmlWriterConfig,
         wrapper: &str,
-        fields: &indexmap::IndexMap<Box<str>, Value>,
+        fields: &indexmap::IndexMap<OwnedKey, Value>,
         count: Option<(&str, i64)>,
     ) -> Result<(), FormatError> {
         let values = SectionFields::new(fields, count);
@@ -573,12 +573,12 @@ impl FieldSource for RecordFields<'_> {
 }
 
 struct SectionFields<'a> {
-    fields: &'a indexmap::IndexMap<Box<str>, Value>,
+    fields: &'a indexmap::IndexMap<OwnedKey, Value>,
     count: Option<(&'a str, Value)>,
 }
 
 impl<'a> SectionFields<'a> {
-    fn new(fields: &'a indexmap::IndexMap<Box<str>, Value>, count: Option<(&'a str, i64)>) -> Self {
+    fn new(fields: &'a indexmap::IndexMap<OwnedKey, Value>, count: Option<(&'a str, i64)>) -> Self {
         Self {
             fields,
             count: count.map(|(name, value)| (name, Value::Integer(value))),
@@ -674,7 +674,7 @@ struct XmlRepeat {
 /// nodes retain only raw schema indices and validated XML names; record values
 /// remain borrowed from the caller throughout validation and emission.
 struct PlanCache {
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     plan: TreePlan,
 }
 
@@ -691,7 +691,7 @@ fn build_plan_cache(record: &Record, config: &XmlWriterConfig) -> Result<PlanCac
         .map(|(index, name)| (index, name.as_ref()));
     let plan = build_tree_plan(fields, config)?;
     Ok(PlanCache {
-        schema: Arc::clone(record.schema()),
+        schema: record.schema().clone(),
         plan,
     })
 }
@@ -1207,7 +1207,7 @@ fn emit_named_value<W: Write>(
 }
 
 fn map_has_content(
-    entries: &indexmap::IndexMap<Box<str>, Value>,
+    entries: &indexmap::IndexMap<OwnedKey, Value>,
     preserve_nulls: bool,
     attribute_prefix: &str,
 ) -> bool {
@@ -1308,6 +1308,8 @@ mod tests {
     use super::*;
     use crate::traits::FormatReader;
     use crate::xml::reader::{XmlReader, XmlReaderConfig};
+    use clinker_record::owned_storage::{OwnedMap, OwnedValues};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone, Default)]
@@ -1330,20 +1332,24 @@ mod tests {
         }
     }
 
-    fn test_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec!["name".into(), "age".into()]))
+    fn test_schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["name".into(), "age".into()])))
     }
 
-    fn make_record(schema: &Arc<Schema>, name: &str, age: i64) -> Record {
+    fn make_record(schema: &SharedStorage<Schema>, name: &str, age: i64) -> Record {
         Record::new(
-            Arc::clone(schema),
+            schema.clone(),
             vec![Value::String(name.into()), Value::Integer(age)],
         )
     }
 
-    fn write_records(config: XmlWriterConfig, records: &[Record], schema: &Arc<Schema>) -> String {
+    fn write_records(
+        config: XmlWriterConfig,
+        records: &[Record],
+        schema: &SharedStorage<Schema>,
+    ) -> String {
         let mut buf = Vec::new();
-        let mut w = XmlWriter::new(&mut buf, Arc::clone(schema), config);
+        let mut w = XmlWriter::new(&mut buf, schema.clone(), config);
         for r in records {
             w.write_record(r).unwrap();
         }
@@ -1387,9 +1393,12 @@ mod tests {
 
     #[test]
     fn test_xml_write_nested_expansion() {
-        let schema = Arc::new(Schema::new(vec!["Address.City".into(), "name".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "Address.City".into(),
+            "name".into(),
+        ])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::String("NYC".into()), Value::String("Alice".into())],
         );
         let output = write_records(XmlWriterConfig::default(), &[record], &schema);
@@ -1404,8 +1413,8 @@ mod tests {
         // `.` is a legal XML NameChar, so an escaped separator produces one
         // element rather than a nesting level. This is the replacement for the
         // literal dotted name that unconditional expansion takes away.
-        let schema = Arc::new(Schema::new(vec![r"a\.b".into()]));
-        let record = Record::new(Arc::clone(&schema), vec![Value::String("v".into())]);
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![r"a\.b".into()])));
+        let record = Record::new(schema.clone(), vec![Value::String("v".into())]);
         let output = write_records(XmlWriterConfig::default(), &[record], &schema);
         assert!(output.contains("<a.b>v</a.b>"), "{output}");
 
@@ -1431,13 +1440,10 @@ mod tests {
     fn a_column_that_is_also_a_container_is_refused() {
         // Previously emitted two sibling `<a>` elements, which this crate's own
         // reader then refused on the way back in.
-        let schema = Arc::new(Schema::new(vec!["a".into(), "a.b".into()]));
-        let record = Record::new(
-            Arc::clone(&schema),
-            vec![Value::Integer(1), Value::Integer(2)],
-        );
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["a".into(), "a.b".into()])));
+        let record = Record::new(schema.clone(), vec![Value::Integer(1), Value::Integer(2)]);
         let mut buf = Vec::new();
-        let mut w = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let mut w = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
         let err = w.write_record(&record).unwrap_err();
         assert!(
             matches!(err, FormatError::FieldPath { format: "XML", .. }),
@@ -1453,13 +1459,13 @@ mod tests {
 
     #[test]
     fn test_xml_write_shared_prefix_grouping() {
-        let schema = Arc::new(Schema::new(vec![
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "Address.City".into(),
             "Address.State".into(),
             "name".into(),
-        ]));
+        ])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("NYC".into()),
                 Value::String("NY".into()),
@@ -1479,9 +1485,9 @@ mod tests {
 
     #[test]
     fn test_xml_write_preserve_nulls_true() {
-        let schema = Arc::new(Schema::new(vec!["a".into(), "b".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["a".into(), "b".into()])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::String("hello".into()), Value::Null],
         );
         let config = XmlWriterConfig {
@@ -1497,9 +1503,9 @@ mod tests {
 
     #[test]
     fn test_xml_write_preserve_nulls_false() {
-        let schema = Arc::new(Schema::new(vec!["a".into(), "b".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["a".into(), "b".into()])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::String("hello".into()), Value::Null],
         );
         let config = XmlWriterConfig {
@@ -1515,9 +1521,9 @@ mod tests {
 
     #[test]
     fn test_xml_write_escaping() {
-        let schema = Arc::new(Schema::new(vec!["val".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["val".into()])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::String("a & b < c > d \"e\" 'f'".into())],
         );
         let output = write_records(XmlWriterConfig::default(), &[record], &schema);
@@ -1532,14 +1538,15 @@ mod tests {
 
     #[test]
     fn test_xml_roundtrip_reader_writer() {
-        let schema = Arc::new(Schema::new(vec!["name".into(), "value".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["name".into(), "value".into()])));
         let records = vec![
             Record::new(
-                Arc::clone(&schema),
+                schema.clone(),
                 vec![Value::String("Alice".into()), Value::Integer(42)],
             ),
             Record::new(
-                Arc::clone(&schema),
+                schema.clone(),
                 vec![Value::String("Bob".into()), Value::Integer(99)],
             ),
         ];
@@ -1580,29 +1587,30 @@ mod tests {
     #[test]
     fn test_xml_writer_emits_recursive_map_and_array_values() {
         use indexmap::IndexMap;
-        let schema = Arc::new(Schema::new(vec!["id".into(), "payload".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "payload".into()])));
 
-        let mut first: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut first: IndexMap<OwnedKey, Value> = IndexMap::new();
         first.insert("@id".into(), Value::Integer(1));
         first.insert("#text".into(), Value::String("alpha".into()));
-        let mut second: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut second: IndexMap<OwnedKey, Value> = IndexMap::new();
         second.insert("@id".into(), Value::Integer(2));
         second.insert("#text".into(), Value::String("beta".into()));
 
-        let mut payload: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut payload: IndexMap<OwnedKey, Value> = IndexMap::new();
         payload.insert("@kind".into(), Value::String("event".into()));
         payload.insert("#text".into(), Value::String("before".into()));
         payload.insert(
             "item".into(),
-            Value::Array(vec![
-                Value::Map(Box::new(first)),
-                Value::Map(Box::new(second)),
-            ]),
+            Value::Array(OwnedValues::from_vec(vec![
+                Value::Map(OwnedMap::from_map(first)),
+                Value::Map(OwnedMap::from_map(second)),
+            ])),
         );
         payload.insert("tail".into(), Value::String("after".into()));
         let record = Record::new(
-            Arc::clone(&schema),
-            vec![Value::Integer(7), Value::Map(Box::new(payload))],
+            schema.clone(),
+            vec![Value::Integer(7), Value::Map(OwnedMap::from_map(payload))],
         );
         let output = write_records(XmlWriterConfig::default(), &[record], &schema);
         assert_eq!(
@@ -1613,17 +1621,20 @@ mod tests {
 
     #[test]
     fn large_authored_text_does_not_grow_retained_preparation_state() {
-        let schema = Arc::new(Schema::new(vec!["@kind".into(), "payload".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "@kind".into(),
+            "payload".into(),
+        ])));
         let large = "large <&> \"quoted\"\n".repeat(64 * 1024);
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String(large.clone().into()),
                 Value::String(large.into()),
             ],
         );
         let sink = ByteCounter::default();
-        let mut writer = XmlWriter::new(sink, Arc::clone(&schema), XmlWriterConfig::default());
+        let mut writer = XmlWriter::new(sink, schema.clone(), XmlWriterConfig::default());
 
         writer.write_record(&record).expect("large record writes");
 
@@ -1638,7 +1649,7 @@ mod tests {
     fn complete_validation_failures_add_no_record_bytes() {
         use indexmap::IndexMap;
 
-        let schema = Arc::new(Schema::new(vec!["payload".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["payload".into()])));
         let mut invalid_name = IndexMap::new();
         invalid_name.insert("1bad".into(), Value::Integer(1));
 
@@ -1648,28 +1659,37 @@ mod tests {
 
         let mut too_deep = Value::Null;
         for _ in 0..=clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH {
-            too_deep = Value::Map(Box::new(IndexMap::from([("next".into(), too_deep)])));
+            too_deep = Value::Map(OwnedMap::from_map(IndexMap::from([(
+                "next".into(),
+                too_deep,
+            )])));
         }
 
         for (case, invalid) in [
-            ("malformed name", Value::Map(Box::new(invalid_name))),
+            (
+                "malformed name",
+                Value::Map(OwnedMap::from_map(invalid_name)),
+            ),
             ("invalid text", Value::String("bad\u{1}".into())),
             ("excess depth", too_deep),
-            ("decoded-key collision", Value::Map(Box::new(collision))),
+            (
+                "decoded-key collision",
+                Value::Map(OwnedMap::from_map(collision)),
+            ),
         ] {
             let sink = ByteCounter::default();
             let observation = sink.clone();
-            let mut writer = XmlWriter::new(sink, Arc::clone(&schema), XmlWriterConfig::default());
+            let mut writer = XmlWriter::new(sink, schema.clone(), XmlWriterConfig::default());
             writer
                 .write_record(&Record::new(
-                    Arc::clone(&schema),
+                    schema.clone(),
                     vec![Value::String("valid".into())],
                 ))
                 .expect("control record writes");
             let before = observation.bytes();
 
             writer
-                .write_record(&Record::new(Arc::clone(&schema), vec![invalid]))
+                .write_record(&Record::new(schema.clone(), vec![invalid]))
                 .expect_err(case);
 
             assert_eq!(
@@ -1682,13 +1702,13 @@ mod tests {
 
     #[test]
     fn repeated_records_never_accumulate_preparation_state() {
-        let schema = Arc::new(Schema::new(vec!["payload".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["payload".into()])));
         let sink = ByteCounter::default();
-        let mut writer = XmlWriter::new(sink, Arc::clone(&schema), XmlWriterConfig::default());
+        let mut writer = XmlWriter::new(sink, schema.clone(), XmlWriterConfig::default());
 
         for width in [1, 4096, 17, 128 * 1024, 2] {
             let record = Record::new(
-                Arc::clone(&schema),
+                schema.clone(),
                 vec![Value::String("<&".repeat(width).into())],
             );
             writer.write_record(&record).expect("record writes");
@@ -1699,13 +1719,16 @@ mod tests {
     #[test]
     fn test_xml_writer_rejects_duplicate_decoded_map_keys_before_output() {
         use indexmap::IndexMap;
-        let schema = Arc::new(Schema::new(vec!["payload".into()]));
-        let mut payload: IndexMap<Box<str>, Value> = IndexMap::new();
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["payload".into()])));
+        let mut payload: IndexMap<OwnedKey, Value> = IndexMap::new();
         payload.insert("@id".into(), Value::Integer(1));
         payload.insert("\\@id".into(), Value::Integer(2));
-        let record = Record::new(Arc::clone(&schema), vec![Value::Map(Box::new(payload))]);
+        let record = Record::new(
+            schema.clone(),
+            vec![Value::Map(OwnedMap::from_map(payload))],
+        );
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let mut writer = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
         let err = writer.write_record(&record).unwrap_err();
         assert!(
             matches!(&err, FormatError::Xml(message) if message.contains("duplicate logical nested key \"@id\"")),
@@ -1718,12 +1741,18 @@ mod tests {
     #[test]
     fn test_xml_writer_rejects_collection_valued_nested_attribute_before_output() {
         use indexmap::IndexMap;
-        let schema = Arc::new(Schema::new(vec!["payload".into()]));
-        let mut payload: IndexMap<Box<str>, Value> = IndexMap::new();
-        payload.insert("@ids".into(), Value::Array(vec![Value::Integer(1)]));
-        let record = Record::new(Arc::clone(&schema), vec![Value::Map(Box::new(payload))]);
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["payload".into()])));
+        let mut payload: IndexMap<OwnedKey, Value> = IndexMap::new();
+        payload.insert(
+            "@ids".into(),
+            Value::Array(OwnedValues::from_vec(vec![Value::Integer(1)])),
+        );
+        let record = Record::new(
+            schema.clone(),
+            vec![Value::Map(OwnedMap::from_map(payload))],
+        );
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let mut writer = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
         let err = writer.write_record(&record).unwrap_err();
         assert!(
             matches!(&err, FormatError::Xml(message) if message.contains("attribute '@ids' must hold a scalar")),
@@ -1734,10 +1763,13 @@ mod tests {
     }
 
     /// Build a `[id, tags]` record whose `tags` field carries `values`.
-    fn record_with_tags(schema: &Arc<Schema>, id: i64, values: Vec<Value>) -> Record {
+    fn record_with_tags(schema: &SharedStorage<Schema>, id: i64, values: Vec<Value>) -> Record {
         Record::new(
-            Arc::clone(schema),
-            vec![Value::Integer(id), Value::Array(values)],
+            schema.clone(),
+            vec![
+                Value::Integer(id),
+                Value::Array(OwnedValues::from_vec(values)),
+            ],
         )
     }
 
@@ -1771,7 +1803,8 @@ mod tests {
     /// after the field — the XML counterpart to CSV's delimited join (#916).
     #[test]
     fn test_xml_write_multi_value_emits_repeated_elements() {
-        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "tags".into()])));
         let record = record_with_tags(
             &schema,
             7,
@@ -1788,11 +1821,12 @@ mod tests {
     /// scalar field's output (criterion 3).
     #[test]
     fn test_xml_write_multi_value_single_element_matches_scalar() {
-        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "tags".into()])));
         let array = record_with_tags(&schema, 7, vec![Value::String("a".into())]);
         let array_out = write_records(xml_multiple_config(&["tags"]), &[array], &schema);
         let scalar = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::Integer(7), Value::String("a".into())],
         );
         let scalar_out = write_records(XmlWriterConfig::default(), &[scalar], &schema);
@@ -1807,7 +1841,8 @@ mod tests {
     /// set, no container either (criterion 3).
     #[test]
     fn test_xml_write_multi_value_empty_array_emits_nothing() {
-        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "tags".into()])));
         let bare = record_with_tags(&schema, 7, vec![]);
         assert_eq!(
             write_records(xml_multiple_config(&["tags"]), &[bare], &schema),
@@ -1829,7 +1864,8 @@ mod tests {
     /// mixed present/empty values round-trips its per-item shape.
     #[test]
     fn test_xml_write_multi_value_empty_string_value_self_closes() {
-        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "tags".into()])));
         let record = record_with_tags(
             &schema,
             7,
@@ -1846,7 +1882,8 @@ mod tests {
     /// element name.
     #[test]
     fn test_xml_write_multi_value_repeat_as_renames_item() {
-        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "tags".into()])));
         let record = record_with_tags(
             &schema,
             7,
@@ -1866,7 +1903,8 @@ mod tests {
     /// `wrap_in` alone adds a container around items still named after the field.
     #[test]
     fn test_xml_write_multi_value_wrap_in_adds_container() {
-        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "tags".into()])));
         let record = record_with_tags(
             &schema,
             7,
@@ -1887,7 +1925,8 @@ mod tests {
     /// items (criterion 2).
     #[test]
     fn test_xml_write_multi_value_repeat_as_and_wrap_in_together() {
-        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "tags".into()])));
         let record = record_with_tags(
             &schema,
             7,
@@ -1910,9 +1949,10 @@ mod tests {
     /// value arrived bare (`a`) or wrapped (`[a]`).
     #[test]
     fn test_xml_write_multi_value_scalar_applies_repeat_and_wrap() {
-        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "tags".into()])));
         let scalar = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::Integer(7), Value::String("a".into())],
         );
         let scalar_out = write_records(
@@ -1941,12 +1981,13 @@ mod tests {
     fn test_xml_write_multi_value_invalid_override_name_rejected() {
         for (repeat_as, wrap_in, bad) in [(Some("1bad"), None, "1bad"), (None, Some("a b"), "a b")]
         {
-            let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+            let schema =
+                SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "tags".into()])));
             let record = record_with_tags(&schema, 7, vec![Value::String("a".into())]);
             let mut buf = Vec::new();
             let mut writer = XmlWriter::new(
                 &mut buf,
-                Arc::clone(&schema),
+                schema.clone(),
                 xml_join_config("tags", repeat_as, wrap_in),
             );
             let err = writer.write_record(&record).unwrap_err();
@@ -1972,13 +2013,15 @@ mod tests {
     /// attribute holds a single value and cannot repeat.
     #[test]
     fn test_xml_write_multi_value_array_on_attribute_rejected() {
-        let schema = Arc::new(Schema::new(vec!["@tags".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["@tags".into()])));
         let record = Record::new(
-            Arc::clone(&schema),
-            vec![Value::Array(vec![Value::String("a".into())])],
+            schema.clone(),
+            vec![Value::Array(OwnedValues::from_vec(vec![Value::String(
+                "a".into(),
+            )]))],
         );
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let mut writer = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
         let err = writer.write_record(&record).unwrap_err();
         match err {
             FormatError::Xml(msg) => {
@@ -2000,18 +2043,17 @@ mod tests {
     /// itself an array) has no element body and is still rejected.
     #[test]
     fn test_xml_write_multi_value_nested_collection_element_rejected() {
-        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "tags".into()])));
         let record = record_with_tags(
             &schema,
             7,
-            vec![Value::Array(vec![Value::String("a".into())])],
+            vec![Value::Array(OwnedValues::from_vec(vec![Value::String(
+                "a".into(),
+            )]))],
         );
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(
-            &mut buf,
-            Arc::clone(&schema),
-            xml_multiple_config(&["tags"]),
-        );
+        let mut writer = XmlWriter::new(&mut buf, schema.clone(), xml_multiple_config(&["tags"]));
         let err = writer.write_record(&record).unwrap_err();
         assert!(
             matches!(&err, FormatError::UnserializableArrayValue { column, .. } if column == "tags"),
@@ -2040,10 +2082,10 @@ mod tests {
         assert!(reader.next_record().unwrap().is_none());
         assert_eq!(
             record.get("tags"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::String("b".into()),
-            ]))
+            ])))
         );
 
         let output = write_records(
@@ -2062,10 +2104,10 @@ mod tests {
     /// fails with `FormatError::Xml` naming the field and explaining the
     /// malformed element name, leaving no partial bytes behind.
     fn assert_element_name_rejected(field: &str) {
-        let schema = Arc::new(Schema::new(vec![field.into()]));
-        let record = Record::new(Arc::clone(&schema), vec![Value::Integer(1)]);
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![field.into()])));
+        let record = Record::new(schema.clone(), vec![Value::Integer(1)]);
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let mut writer = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
         let err = writer.write_record(&record).unwrap_err();
         match err {
             FormatError::Xml(msg) => {
@@ -2109,8 +2151,8 @@ mod tests {
     fn test_xml_write_unicode_leaf_element_name_accepted() {
         // `café` is a well-formed XML name (`é` is a NameChar), so the new
         // element-name validation does not over-reject non-ASCII field names.
-        let schema = Arc::new(Schema::new(vec!["café".into()]));
-        let record = Record::new(Arc::clone(&schema), vec![Value::Integer(1)]);
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["café".into()])));
+        let record = Record::new(schema.clone(), vec![Value::Integer(1)]);
         let output = write_records(XmlWriterConfig::default(), &[record], &schema);
         assert_eq!(output, "<Root><Record><café>1</café></Record></Root>");
     }
@@ -2119,14 +2161,14 @@ mod tests {
     fn test_xml_write_invalid_record_element_name_rejected() {
         // The configured record element name flows straight into
         // `BytesStart::new`; a malformed one fails loud before any output.
-        let schema = Arc::new(Schema::new(vec!["name".into()]));
-        let record = Record::new(Arc::clone(&schema), vec![Value::String("A".into())]);
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["name".into()])));
+        let record = Record::new(schema.clone(), vec![Value::String("A".into())]);
         let config = XmlWriterConfig {
             record_element: "1record".into(),
             ..Default::default()
         };
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), config);
+        let mut writer = XmlWriter::new(&mut buf, schema.clone(), config);
         let err = writer.write_record(&record).unwrap_err();
         match err {
             FormatError::Xml(msg) => {
@@ -2149,14 +2191,14 @@ mod tests {
     fn test_xml_write_invalid_root_element_name_rejected() {
         // The configured root element name is validated at header open, so a
         // malformed one fails loud rather than emitting `<1root>`.
-        let schema = Arc::new(Schema::new(vec!["name".into()]));
-        let record = Record::new(Arc::clone(&schema), vec![Value::String("A".into())]);
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["name".into()])));
+        let record = Record::new(schema.clone(), vec![Value::String("A".into())]);
         let config = XmlWriterConfig {
             root_element: "1root".into(),
             ..Default::default()
         };
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), config);
+        let mut writer = XmlWriter::new(&mut buf, schema.clone(), config);
         let err = writer.write_record(&record).unwrap_err();
         match err {
             FormatError::Xml(msg) => {
@@ -2177,9 +2219,10 @@ mod tests {
 
     #[test]
     fn test_xml_write_attribute_prefixed_field_as_record_attribute() {
-        let schema = Arc::new(Schema::new(vec!["@id".into(), "name".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["@id".into(), "name".into()])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::Integer(7), Value::String("A".into())],
         );
         let output = write_records(XmlWriterConfig::default(), &[record], &schema);
@@ -2191,12 +2234,12 @@ mod tests {
 
     #[test]
     fn test_xml_write_nested_attribute_attaches_to_branch() {
-        let schema = Arc::new(Schema::new(vec![
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "Address.@type".into(),
             "Address.City".into(),
-        ]));
+        ])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::String("home".into()), Value::String("NYC".into())],
         );
         let output = write_records(XmlWriterConfig::default(), &[record], &schema);
@@ -2208,8 +2251,8 @@ mod tests {
 
     #[test]
     fn test_xml_write_attribute_only_branch_self_closes() {
-        let schema = Arc::new(Schema::new(vec!["Address.@type".into()]));
-        let record = Record::new(Arc::clone(&schema), vec![Value::String("home".into())]);
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["Address.@type".into()])));
+        let record = Record::new(schema.clone(), vec![Value::String("home".into())]);
         let output = write_records(XmlWriterConfig::default(), &[record], &schema);
         assert_eq!(
             output,
@@ -2219,9 +2262,10 @@ mod tests {
 
     #[test]
     fn test_xml_write_custom_attribute_prefix() {
-        let schema = Arc::new(Schema::new(vec!["_id".into(), "name".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["_id".into(), "name".into()])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::Integer(7), Value::String("A".into())],
         );
         let config = XmlWriterConfig {
@@ -2239,16 +2283,16 @@ mod tests {
     fn test_xml_write_default_prefix_leaves_underscore_field_as_element() {
         // Only the configured prefix classifies a field as an attribute;
         // `_id` is a valid element name under the default `@` prefix.
-        let schema = Arc::new(Schema::new(vec!["_id".into()]));
-        let record = Record::new(Arc::clone(&schema), vec![Value::Integer(7)]);
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["_id".into()])));
+        let record = Record::new(schema.clone(), vec![Value::Integer(7)]);
         let output = write_records(XmlWriterConfig::default(), &[record], &schema);
         assert_eq!(output, "<Root><Record><_id>7</_id></Record></Root>");
     }
 
     #[test]
     fn test_xml_write_empty_prefix_disables_attribute_classification() {
-        let schema = Arc::new(Schema::new(vec!["_id".into()]));
-        let record = Record::new(Arc::clone(&schema), vec![Value::Integer(7)]);
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["_id".into()])));
+        let record = Record::new(schema.clone(), vec![Value::Integer(7)]);
         let config = XmlWriterConfig {
             attribute_prefix: String::new(),
             ..Default::default()
@@ -2262,8 +2306,9 @@ mod tests {
         // A null element round-trips as a self-closing tag; an attribute
         // has no form that reads back as null, so it is dropped instead of
         // being emitted as an empty string.
-        let schema = Arc::new(Schema::new(vec!["@id".into(), "name".into()]));
-        let record = Record::new(Arc::clone(&schema), vec![Value::Null, Value::Null]);
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["@id".into(), "name".into()])));
+        let record = Record::new(schema.clone(), vec![Value::Null, Value::Null]);
         let config = XmlWriterConfig {
             preserve_nulls: true,
             ..Default::default()
@@ -2274,9 +2319,9 @@ mod tests {
 
     #[test]
     fn test_xml_write_attribute_value_escaped() {
-        let schema = Arc::new(Schema::new(vec!["@note".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["@note".into()])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::String("a & \"b\" <c>\td\ne".into())],
         );
         let output = write_records(XmlWriterConfig::default(), &[record], &schema);
@@ -2292,9 +2337,10 @@ mod tests {
         // references — a conformant parser would collapse the raw characters
         // to spaces (attribute-value normalization), but references resolve
         // back to the exact bytes.
-        let schema = Arc::new(Schema::new(vec!["@note".into(), "name".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["@note".into(), "name".into()])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("line1\nline2\tend".into()),
                 Value::String("A".into()),
@@ -2322,12 +2368,15 @@ mod tests {
     #[test]
     fn test_xml_write_map_valued_attribute_rejected() {
         use indexmap::IndexMap;
-        let schema = Arc::new(Schema::new(vec!["@meta".into()]));
-        let mut sidecar: IndexMap<Box<str>, Value> = IndexMap::new();
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["@meta".into()])));
+        let mut sidecar: IndexMap<OwnedKey, Value> = IndexMap::new();
         sidecar.insert("a".into(), Value::Integer(1));
-        let record = Record::new(Arc::clone(&schema), vec![Value::Map(Box::new(sidecar))]);
+        let record = Record::new(
+            schema.clone(),
+            vec![Value::Map(OwnedMap::from_map(sidecar))],
+        );
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let mut writer = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
         let err = writer.write_record(&record).unwrap_err();
         match err {
             FormatError::UnserializableMapValue { format, column } => {
@@ -2343,10 +2392,10 @@ mod tests {
         // `@a.b` would need `@a` to be an element to hold `b` — an
         // attribute is a leaf, so the field is rejected instead of
         // emitting an `<@a>` element (invalid XML name).
-        let schema = Arc::new(Schema::new(vec!["@a.b".into()]));
-        let record = Record::new(Arc::clone(&schema), vec![Value::Integer(1)]);
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["@a.b".into()])));
+        let record = Record::new(schema.clone(), vec![Value::Integer(1)]);
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let mut writer = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
         let err = writer.write_record(&record).unwrap_err();
         match err {
             FormatError::Xml(msg) => {
@@ -2368,10 +2417,10 @@ mod tests {
     /// fails with `FormatError::Xml` mentioning both the field and the
     /// stripped attribute name, and leaves no partial bytes behind.
     fn assert_attribute_name_rejected(field: &str, attr_name: &str) {
-        let schema = Arc::new(Schema::new(vec![field.into()]));
-        let record = Record::new(Arc::clone(&schema), vec![Value::Integer(1)]);
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![field.into()])));
+        let record = Record::new(schema.clone(), vec![Value::Integer(1)]);
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let mut writer = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
         let err = writer.write_record(&record).unwrap_err();
         match err {
             FormatError::Xml(msg) => {
@@ -2424,8 +2473,8 @@ mod tests {
         // `é` (U+00E9) is a valid NameStartChar, so a non-ASCII attribute
         // name that round-tripped from a source document writes back
         // unchanged rather than being rejected.
-        let schema = Arc::new(Schema::new(vec!["@café".into()]));
-        let record = Record::new(Arc::clone(&schema), vec![Value::Integer(1)]);
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["@café".into()])));
+        let record = Record::new(schema.clone(), vec![Value::Integer(1)]);
         let output = write_records(XmlWriterConfig::default(), &[record], &schema);
         assert_eq!(output, r#"<Root><Record café="1"></Record></Root>"#);
     }
@@ -2462,16 +2511,16 @@ mod tests {
         // Golden byte-exact output for a wide schema mixing top-level fields,
         // record attributes, and shared-prefix dotted branches with their own
         // attributes — the shape the precompiled plan targets.
-        let schema = Arc::new(Schema::new(vec![
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "@id".into(),
             "name".into(),
             "Address.@type".into(),
             "Address.City".into(),
             "Address.State".into(),
             "Contact.Email".into(),
-        ]));
+        ])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::Integer(7),
                 Value::String("Alice".into()),
@@ -2492,12 +2541,15 @@ mod tests {
     fn test_xml_write_plan_reused_across_records() {
         // The plan is memoized by schema identity, so many records of one
         // schema reuse it. Each record must still render its own values.
-        let schema = Arc::new(Schema::new(vec!["Address.City".into(), "name".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "Address.City".into(),
+            "name".into(),
+        ])));
         let records: Vec<Record> = [("NYC", "Alice"), ("LA", "Bob"), ("SF", "Carol")]
             .into_iter()
             .map(|(city, name)| {
                 Record::new(
-                    Arc::clone(&schema),
+                    schema.clone(),
                     vec![Value::String(city.into()), Value::String(name.into())],
                 )
             })
@@ -2518,17 +2570,17 @@ mod tests {
         // Under preserve_nulls:false a branch whose descendants are all null is
         // never opened; a later record filling the same branch still emits it.
         // Exercises per-record presence pruning over the shared plan.
-        let schema = Arc::new(Schema::new(vec![
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "Address.City".into(),
             "Address.State".into(),
             "name".into(),
-        ]));
+        ])));
         let all_null_branch = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::Null, Value::Null, Value::String("Alice".into())],
         );
         let branch_present = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("NYC".into()),
                 Value::Null,
@@ -2556,16 +2608,17 @@ mod tests {
     /// per-record projection is already lossless under `auto_widen` drift.
     #[test]
     fn test_xml_write_late_widening_is_lossless_per_record() {
-        let schema1 = Arc::new(Schema::new(vec!["id".into()]));
-        let schema2 = Arc::new(Schema::new(vec!["id".into(), "region".into()]));
-        let r1 = Record::new(Arc::clone(&schema1), vec![Value::Integer(1)]);
+        let schema1 = SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into()])));
+        let schema2 =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "region".into()])));
+        let r1 = Record::new(schema1.clone(), vec![Value::Integer(1)]);
         let r2 = Record::new(
-            Arc::clone(&schema2),
+            schema2.clone(),
             vec![Value::Integer(2), Value::String("US".into())],
         );
         let mut buf = Vec::new();
         {
-            let mut w = XmlWriter::new(&mut buf, Arc::clone(&schema1), XmlWriterConfig::default());
+            let mut w = XmlWriter::new(&mut buf, schema1.clone(), XmlWriterConfig::default());
             w.write_record(&r1).unwrap();
             w.write_record(&r2).unwrap();
             w.flush().unwrap();
@@ -2589,9 +2642,13 @@ mod tests {
     /// per-record null pruning.
     #[test]
     fn test_xml_write_non_contiguous_group_null_leader_keeps_group_position() {
-        let schema = Arc::new(Schema::new(vec!["A.x".into(), "b".into(), "A.y".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "A.x".into(),
+            "b".into(),
+            "A.y".into(),
+        ])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::Null,
                 Value::String("B".into()),
@@ -2609,7 +2666,7 @@ mod tests {
 
     #[test]
     fn xml_envelope_wraps_each_document_with_header_and_footer() {
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount".into()])));
         let config = XmlWriterConfig {
             envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
                 header_from_doc: Some("Head".into()),
@@ -2624,11 +2681,11 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         {
-            let mut w = XmlWriter::new(&mut buf, Arc::clone(&schema), config);
+            let mut w = XmlWriter::new(&mut buf, schema.clone(), config);
             w.begin_document(&doc).unwrap();
-            w.write_record(&Record::new(Arc::clone(&schema), vec![Value::Integer(10)]))
+            w.write_record(&Record::new(schema.clone(), vec![Value::Integer(10)]))
                 .unwrap();
-            w.write_record(&Record::new(Arc::clone(&schema), vec![Value::Integer(20)]))
+            w.write_record(&Record::new(schema.clone(), vec![Value::Integer(20)]))
                 .unwrap();
             w.end_document(&doc).unwrap();
             w.flush().unwrap();
@@ -2661,7 +2718,7 @@ mod tests {
     fn xml_envelope_section_attribute_field_attaches_to_wrapper() {
         // Attribute-prefixed section fields (an XML envelope section read
         // with attributes) attach to the section wrapper's start tag.
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount".into()])));
         let config = XmlWriterConfig {
             envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
                 header_from_doc: Some("Head".into()),
@@ -2679,9 +2736,9 @@ mod tests {
         )]);
         let mut buf = Vec::new();
         {
-            let mut w = XmlWriter::new(&mut buf, Arc::clone(&schema), config);
+            let mut w = XmlWriter::new(&mut buf, schema.clone(), config);
             w.begin_document(&doc).unwrap();
-            w.write_record(&Record::new(Arc::clone(&schema), vec![Value::Integer(10)]))
+            w.write_record(&Record::new(schema.clone(), vec![Value::Integer(10)]))
                 .unwrap();
             w.end_document(&doc).unwrap();
             w.flush().unwrap();
@@ -2697,7 +2754,7 @@ mod tests {
     fn xml_envelope_section_writes_native_nested_value() {
         use indexmap::IndexMap;
 
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount".into()])));
         let config = XmlWriterConfig {
             envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
                 header_from_doc: Some("Head".into()),
@@ -2706,13 +2763,16 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut metadata: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut metadata: IndexMap<OwnedKey, Value> = IndexMap::new();
         metadata.insert("@kind".into(), Value::String("batch".into()));
         metadata.insert("name".into(), Value::String("A".into()));
-        let doc = doc_with_sections(&[("Head", &[("metadata", Value::Map(Box::new(metadata)))])]);
+        let doc = doc_with_sections(&[(
+            "Head",
+            &[("metadata", Value::Map(OwnedMap::from_map(metadata)))],
+        )]);
         let mut buf = Vec::new();
         {
-            let mut w = XmlWriter::new(&mut buf, Arc::clone(&schema), config);
+            let mut w = XmlWriter::new(&mut buf, schema.clone(), config);
             w.begin_document(&doc).unwrap();
             w.end_document(&doc).unwrap();
             w.flush().unwrap();
@@ -2732,7 +2792,7 @@ mod tests {
         // across `begin_document` / `end_document` more than once — the section
         // maps are rendered in place off the framer's borrow into each
         // DocumentContext.
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount".into()])));
         let config = XmlWriterConfig {
             envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
                 header_from_doc: Some("Head".into()),
@@ -2751,15 +2811,15 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         {
-            let mut w = XmlWriter::new(&mut buf, Arc::clone(&schema), config);
+            let mut w = XmlWriter::new(&mut buf, schema.clone(), config);
             w.begin_document(&doc1).unwrap();
-            w.write_record(&Record::new(Arc::clone(&schema), vec![Value::Integer(10)]))
+            w.write_record(&Record::new(schema.clone(), vec![Value::Integer(10)]))
                 .unwrap();
             w.end_document(&doc1).unwrap();
             w.begin_document(&doc2).unwrap();
-            w.write_record(&Record::new(Arc::clone(&schema), vec![Value::Integer(20)]))
+            w.write_record(&Record::new(schema.clone(), vec![Value::Integer(20)]))
                 .unwrap();
-            w.write_record(&Record::new(Arc::clone(&schema), vec![Value::Integer(30)]))
+            w.write_record(&Record::new(schema.clone(), vec![Value::Integer(30)]))
                 .unwrap();
             w.end_document(&doc2).unwrap();
             w.flush().unwrap();

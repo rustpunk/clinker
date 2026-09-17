@@ -22,6 +22,7 @@
 //! `type:` parses byte-for-byte identically to the single-record fixed-width
 //! reader; CSV fields share the same scalar coercion.
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, SharedStorage};
 use std::collections::HashMap;
 use std::io::{BufReader, Read};
 use std::sync::Arc;
@@ -134,11 +135,11 @@ enum ScannedLine {
 
 /// The resolved building blocks both backends produce from a `records:` list:
 /// the static superset schema and the tag → record-type map.
-type ResolvedParts = (Arc<Schema>, HashMap<String, ResolvedType>);
+type ResolvedParts = (SharedStorage<Schema>, HashMap<String, ResolvedType>);
 
 /// A backend resolver's output: the [`ResolvedParts`] plus a trailing usize —
 /// the fixed-width record length, or the CSV discriminator column index.
-type ResolvedBackend = (Arc<Schema>, HashMap<String, ResolvedType>, usize);
+type ResolvedBackend = (SharedStorage<Schema>, HashMap<String, ResolvedType>, usize);
 
 /// Streaming multi-record flat-file reader.
 ///
@@ -147,7 +148,7 @@ type ResolvedBackend = (Arc<Schema>, HashMap<String, ResolvedType>, usize);
 /// each matched line as one record on the superset schema.
 pub struct MultiRecordReader<R: Read> {
     scanner: LineScanner<R>,
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     discrimination: Discrimination,
     /// Tag (trimmed) → resolved record type. A row whose tag is absent here is
     /// an unknown discriminator value.
@@ -291,7 +292,7 @@ impl<R: Read> MultiRecordReader<R> {
     /// structural constraint names a record type that does not exist.
     fn assemble(
         scanner: LineScanner<R>,
-        schema: Arc<Schema>,
+        schema: SharedStorage<Schema>,
         discrimination: Discrimination,
         by_tag: HashMap<String, ResolvedType>,
         spec: MultiRecordSpec,
@@ -459,7 +460,7 @@ impl<R: Read> MultiRecordReader<R> {
                 self.numeric_observer.as_ref(),
             )?;
         }
-        Ok(Record::new(Arc::clone(&self.schema), values))
+        Ok(Record::new(self.schema.clone(), values))
     }
 
     /// Run the one-time header pre-scan: forward-scan the contiguous header
@@ -667,8 +668,8 @@ impl<R: Read> MultiRecordReader<R> {
 }
 
 impl<R: Read + Send> FormatReader for MultiRecordReader<R> {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-        Ok(Arc::clone(&self.schema))
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+        Ok(self.schema.clone())
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
@@ -681,12 +682,12 @@ impl<R: Read + Send> FormatReader for MultiRecordReader<R> {
     fn prepare_document(
         &mut self,
         config: &EnvelopeConfig,
-    ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
+    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
         if config.is_empty() {
             return Ok(IndexMap::new());
         }
         self.ensure_prescanned()?;
-        let mut out: IndexMap<Box<str>, Value> = IndexMap::with_capacity(config.sections.len());
+        let mut out: IndexMap<OwnedKey, Value> = IndexMap::with_capacity(config.sections.len());
         for (name, section) in &config.sections {
             let tag = match &section.extract {
                 EnvelopeExtract::RecordType(tag) => tag.as_str(),
@@ -710,7 +711,7 @@ impl<R: Read + Send> FormatReader for MultiRecordReader<R> {
             };
             let typed = coerce_section_fields(captured.clone(), &section.fields)
                 .map_err(FormatError::SchemaInference)?;
-            out.insert(name.as_str().into(), Value::Map(Box::new(typed)));
+            out.insert(name.as_str().into(), Value::Map(OwnedMap::from_map(typed)));
         }
         Ok(out)
     }

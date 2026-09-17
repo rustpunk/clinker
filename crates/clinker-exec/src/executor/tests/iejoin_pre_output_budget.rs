@@ -8,31 +8,12 @@
 //! candidate pair, and run the kernel per surviving pair. These tests drive that
 //! path end-to-end through the public executor entry point.
 //!
-//! The load-bearing guarantee: an input that USED to abort (no spill path) now
-//! COMPLETES with correct NON-EMPTY results while spilling, under a budget far
-//! below process RSS. That is only possible because the per-pair pre-output
-//! abort is a strictly LOCAL check — the one block-pair's resident bytes plus
-//! kernel aux against the hard limit — and never consults global process
-//! pressure (RSS or the consumer-usage sum). The scan/sort/slice phases answer
-//! pressure by spilling. The un-spillable output axis keeps the every-10K
-//! global-aware poll, so these fixtures hold their match sets under 10K.
-//!
-//! Cases:
-//!   1. Tight budget, non-empty, wide input forcing multi-run sort spill and
-//!      multiple blocks per side → COMPLETES with correct rows, non-zero
-//!      per-stage spill, consumer released. (Host-independent: passes on an
-//!      RSS-present host precisely because the gate is local.)
-//!   2. Roomy budget, non-empty → completes fully resident with zero spill.
-//!   3. Tight budget, fully pruned (disjoint ranges) → completes empty while
-//!      spilling — the pipeline-level prune observation.
-//!   4. Budget below a single block-pair's local footprint → aborts with the
-//!      typed pre-output error via the LOCAL arm, consumer released.
-//!   5. The equi+range (HashPartitionIEJoin) path, now generalized onto the same
-//!      block-band machinery (equality is an added prune axis): an input that
-//!      used to hold its hash partitions resident and abort now COMPLETES with
-//!      correct non-empty results while spilling under a tight budget, and its
-//!      output is byte-identical across memory limits — the equi+range
-//!      input-axis bound, proven end-to-end.
+//! Input sort/slice pressure is spillable and the block-pair pre-output gate
+//! remains local. Output merge readers have a separate retained footprint:
+//! compressed frontiers may exceed a budget that fits a block pair. Those runs
+//! must refuse the final range merge before publishing bytes, then release all
+//! owners. Feasible executions retain the exact output and spill oracles.
+//! The unchanged 8 KiB cases separately prove the local pre-output abort.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -42,8 +23,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A tight hard limit far below process RSS, but above the local footprint of a
-/// single block-pair (two 16 KiB-floored blocks plus kernel aux). A non-empty
-/// join completes under it because the pre-output gate is strictly local.
+/// single block-pair (two 16 KiB-floored blocks plus kernel aux). This does not
+/// imply that every compressed output frontier and writer can coexist under it.
 const TIGHT_LIMIT: u64 = 320 * 1024;
 /// Below a single block-pair's local footprint (two 16 KiB block floors plus
 /// aux), so the first surviving pair trips the local pre-output abort.
@@ -282,6 +263,136 @@ fn spilled_bytes(arb: &Arc<crate::pipeline::memory::MemoryArbitrator>) -> u64 {
         .get("banded")
         .copied()
         .unwrap_or(0)
+}
+
+/// Preserve the original low-budget pressure scenario and compare two feasible
+/// executions without changing input shape, batch size, or compression policy.
+fn refused_frontier_then_feasible_output(
+    yaml: &str,
+    orders: String,
+    bands: String,
+) -> (String, Arc<crate::pipeline::memory::MemoryArbitrator>) {
+    let low = no_op_arbitrator(TIGHT_LIMIT);
+    let (result, output) = run_pipeline_yaml(yaml, orders.clone(), bands.clone(), &low);
+    let frontier = assert_range_output_frontier_abort(
+        result.expect_err("the compressed frontier cannot fit the original budget"),
+        TIGHT_LIMIT,
+    );
+    assert!(
+        output.is_empty(),
+        "refused range output must publish no header or body"
+    );
+    assert!(
+        low.per_stage_spill_bytes().contains_key("banded"),
+        "original operator pressure must still record real spills"
+    );
+    assert_released_output_owners(&low);
+
+    let startup = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let observed = startup.clone();
+    let observer = RunAllocationObserverGuard::install(Box::new(move |memory, _| {
+        observed.store(
+            memory.writer_resource_usage().memory,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }));
+    let roomy = no_op_arbitrator(ROOMY_LIMIT);
+    let (result, expected) = run_pipeline_yaml(yaml, orders.clone(), bands.clone(), &roomy);
+    drop(observer);
+    result.expect("roomy reference execution");
+    assert_released_output_owners(&roomy);
+    let columns = expected
+        .lines()
+        .next()
+        .expect("nonempty output header")
+        .split(',')
+        .count();
+    let batch = crate::executor::batch_handoff::DEFAULT_BATCH_SIZE as u64;
+    // The unchanged sender has 256 event slots (executor setup), plus one
+    // record held by its receiver. The producer owns one batch backing; its
+    // replacement is allocated only after routing consumes that backing.
+    // Add this overlap to the rejected physical frontier and the observed
+    // generic run-startup allocation, before any writer is prepared. This
+    // is a sufficient counterpart, not a claim that the low run can progress.
+    // The legacy stream estimate still excludes variable Value heap.
+    let overlap = (batch + 256 + 1) * crate::executor::node_buffer::record_byte_cost(columns)
+        + batch * std::mem::size_of::<crate::executor::stream_event::StreamEvent>() as u64;
+    let startup = startup.load(std::sync::atomic::Ordering::Relaxed);
+    let limit = frontier + overlap + startup;
+    let feasible = no_op_arbitrator(limit);
+    let (result, output) = run_pipeline_yaml(yaml, orders, bands, &feasible);
+    result.expect("physical frontier plus handoff and generic startup overlap must fit");
+    assert_eq!(
+        output, expected,
+        "feasible budgets must emit identical bytes"
+    );
+    assert_released_output_owners(&feasible);
+    eprintln!(
+        "output ownership: refused frontier={frontier}, handoff allowance={overlap}, startup={startup}, feasible limit={limit}, feasible spill={}",
+        spilled_bytes(&feasible)
+    );
+    (output, feasible)
+}
+
+fn assert_range_output_frontier_abort(error: PipelineError, expected_limit: u64) -> u64 {
+    let PipelineError::MemoryBudgetExceeded {
+        node,
+        used,
+        limit,
+        source,
+        detail,
+    } = error
+    else {
+        panic!("expected typed range-output frontier refusal, got {error:?}");
+    };
+    assert_eq!(node, "banded");
+    assert_eq!(source, clinker_plan::BudgetCategory::Arena);
+    assert_eq!(limit, expected_limit);
+    assert!(used > limit);
+    let detail = detail.expect("range refusal explains retained readers and spill bytes");
+    let retained = detail
+        .strip_prefix("range output merge frontier (")
+        .expect("range frontier diagnostic");
+    let (readers, retained) = retained.split_once(" readers, ").unwrap();
+    let (spill_bytes, _) = retained.split_once(" spill bytes)").unwrap();
+    assert!(readers.parse::<u64>().unwrap() > 0);
+    assert!(
+        spill_bytes.parse::<u64>().unwrap() > 0,
+        "refusal must retain real, nonempty spill files"
+    );
+    used
+}
+
+#[test]
+fn range_output_frontier_refusal_precedes_json_lines_writer_publication() {
+    let yaml = EXPLODE_YAML.replace(
+        "type: csv\n    path: out.csv",
+        "type: json\n    path: out.json\n    options:\n      format: ndjson",
+    );
+    assert_ne!(yaml, EXPLODE_YAML);
+    let arb = no_op_arbitrator(TIGHT_LIMIT);
+    let (result, output) = run_pipeline_capture(
+        &yaml,
+        explode_orders_csv(60),
+        explode_bands_csv(60),
+        "json-frontier",
+        &arb,
+    );
+    assert_range_output_frontier_abort(result.unwrap_err(), TIGHT_LIMIT);
+    assert!(
+        output.contents().is_empty(),
+        "JSON output must publish no bytes before frontier refusal"
+    );
+    assert!(arb.per_stage_spill_bytes().contains_key("banded"));
+    assert_released_output_owners(&arb);
+}
+
+fn assert_released_output_owners(arb: &Arc<crate::pipeline::memory::MemoryArbitrator>) {
+    assert_eq!(arb.consumer_count(), 0);
+    assert_eq!(arb.sum_consumer_usage(), 0);
+    let usage = arb.writer_resource_usage();
+    assert_eq!((usage.memory, usage.disk, usage.descriptors), (0, 0, 0));
+    assert_eq!(arb.retry_writer_cleanup(), 0);
 }
 
 #[test]
@@ -676,15 +787,10 @@ fn block_band_output_buffers_under_blocking_downstream() {
 }
 
 #[test]
-fn block_band_output_explosion_streams_and_completes_under_tight_budget() {
-    // The output-axis bound with a STREAMING downstream, end-to-end: the same
-    // 60 x 60 explosion (3600 output rows from 120 tiny resident inputs), but
-    // the combine's sole consumer is a single streaming-eligible Output. The
-    // dispatcher grafts the payload-sorted output DRAIN straight onto the
-    // back-pressure sink instead of admitting a node-buffer, so the output axis
-    // is bounded at the edge as well as the operator: one batch in flight, spilt
-    // under the tight budget, never the whole 3600-row result held at once. The
-    // run COMPLETES and its result equals the nested-loop oracle.
+fn block_band_output_explosion_refuses_insufficient_frontier_budget() {
+    // The same 60 x 60 explosion spills under the original 320 KiB budget,
+    // but its ten compressed readers exceed the range-output frontier limit.
+    // Keep the refusal and verify the full oracle under a feasible budget.
 
     // Proof the streaming path (not the node-buffer path) is exercised: the same
     // plan-derived predicate the runtime sender-install consults classifies the
@@ -698,14 +804,11 @@ fn block_band_output_explosion_streams_and_completes_under_tight_budget() {
 
     const N: usize = 60;
     const M: usize = 60;
-    let arb = no_op_arbitrator(TIGHT_LIMIT);
-    let (result, output) = run_pipeline_yaml(
+    let (output, arb) = refused_frontier_then_feasible_output(
         EXPLODE_YAML,
         explode_orders_csv(N),
         explode_bands_csv(M),
-        &arb,
     );
-    result.expect("the streaming output-explosion join must complete under the tight budget");
 
     let data_lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).skip(1).collect();
     assert_eq!(
@@ -740,13 +843,10 @@ fn block_band_output_explosion_streams_and_completes_under_tight_budget() {
         }
     }
 
-    // The tiny inputs stay resident, so the spill bytes come from the output
-    // axis overflowing under the tight budget (the kernel's output sort buffer,
-    // then the streaming batch spill) — the bound holding rather than the run
-    // aborting.
+    // Preserve real output spill in the feasible execution as well.
     assert!(
         spilled_bytes(&arb) > 0,
-        "the {}-row streamed output must overflow and spill under the tight budget; \
+        "the {}-row streamed output must overflow and spill under the feasible budget; \
          per_stage_spill_bytes[banded] was {}",
         N * M,
         spilled_bytes(&arb)
@@ -921,18 +1021,13 @@ fn equi_range_output_triples(output: &str) -> std::collections::HashSet<(String,
 }
 
 #[test]
-fn equi_range_completes_with_spill_under_tight_budget() {
-    // The headline guarantee, end-to-end: an equi+range join that used to hold its
-    // hash partitions and per-group sort arrays resident (fit-or-abort) now runs
-    // the bounded block-band path — equality is an added prune axis — so under a
-    // tight budget far below process RSS it COMPLETES with correct non-empty
-    // results while SPILLING, instead of aborting. The result equals the
-    // nested-loop oracle exactly.
-    let arb = no_op_arbitrator(TIGHT_LIMIT);
+fn equi_range_refuses_insufficient_frontier_budget_and_preserves_spill_oracle() {
+    // The original 37-reader compressed frontier cannot fit 320 KiB. Keep
+    // that refusal, then prove nonempty exact output with feasible headroom.
     let orders = equi_orders_csv(300, 4);
     let bands = equi_bands_csv(300, 4);
-    let (result, output) = run_pipeline_yaml(EQUI_RANGE_YAML, orders.clone(), bands.clone(), &arb);
-    result.expect("the equi+range join must complete (spilling) under the tight budget");
+    let (output, arb) =
+        refused_frontier_then_feasible_output(EQUI_RANGE_YAML, orders.clone(), bands.clone());
 
     let oracle = equi_range_oracle(&orders, &bands);
     let emitted = equi_range_output_triples(&output);
@@ -955,7 +1050,7 @@ fn equi_range_completes_with_spill_under_tight_budget() {
     // holding rather than the run holding everything resident.
     assert!(
         spilled_bytes(&arb) > 0,
-        "the equi+range join must spill under the tight budget; \
+        "the equi+range join must spill under the feasible budget; \
          per_stage_spill_bytes[banded] was {}",
         spilled_bytes(&arb)
     );
@@ -968,36 +1063,12 @@ fn equi_range_completes_with_spill_under_tight_budget() {
 
 #[test]
 fn equi_range_output_is_identical_across_memory_limits() {
-    // Determinism across budgets for equi+range, mirroring the pure-range
-    // invariant: the tight run spills and re-slices, the roomy run stays
-    // resident, and the final deterministic `(driver order, driver_idx,
-    // build_idx)` output sort makes the emitted CSV byte-identical regardless of
-    // `pipeline.memory.limit`.
-    let orders = equi_orders_csv(300, 4);
-    let bands = equi_bands_csv(300, 4);
-    let (tight_result, tight_out) = run_pipeline_yaml(
+    let (output, _) = refused_frontier_then_feasible_output(
         EQUI_RANGE_YAML,
-        orders.clone(),
-        bands.clone(),
-        &no_op_arbitrator(TIGHT_LIMIT),
+        equi_orders_csv(300, 4),
+        equi_bands_csv(300, 4),
     );
-    tight_result.expect("tight-budget equi+range run must complete");
-    let (roomy_result, roomy_out) = run_pipeline_yaml(
-        EQUI_RANGE_YAML,
-        orders,
-        bands,
-        &no_op_arbitrator(ROOMY_LIMIT),
-    );
-    roomy_result.expect("roomy-budget equi+range run must complete");
-
-    assert_eq!(
-        tight_out, roomy_out,
-        "equi+range output must be a pure function of the data, not of pipeline.memory.limit"
-    );
-    assert!(
-        tight_out.lines().filter(|l| !l.is_empty()).count() > 1,
-        "the fixture must emit rows for the comparison to be meaningful"
-    );
+    assert!(output.lines().filter(|line| !line.is_empty()).count() > 1);
 }
 
 /// Pure-range pipeline whose matched body divides by a band column that is zero

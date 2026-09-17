@@ -1,6 +1,6 @@
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::{BTreeSet, HashSet};
 use std::fs::OpenOptions;
-use std::sync::Arc;
 
 use clinker_exec::executor::{OutputDeliveryId, SourceRowId};
 use clinker_exec::pipeline::spill::SpillWriter;
@@ -78,8 +78,8 @@ fn identity_attempt_local_sequences_can_restart_without_shared_membership() {
     assert_ne!(first_successes, second_successes);
 }
 
-fn record(schema: &Arc<clinker_record::Schema>, value: i64) -> Record {
-    Record::new(Arc::clone(schema), vec![Value::Integer(value)])
+fn record(schema: &SharedStorage<clinker_record::Schema>, value: i64) -> Record {
+    Record::new(schema.clone(), vec![Value::Integer(value)])
 }
 
 #[test]
@@ -100,14 +100,14 @@ fn transport_attempt_sequence_does_not_reset_at_file_boundaries() {
 
 #[test]
 fn transport_spill_round_trip_preserves_source_scope_and_ordinal_bits() {
-    let schema = Arc::new(SchemaBuilder::new().with_field("value").build());
+    let schema = SchemaBuilder::new().with_field("value").build();
     let expected = [
         (record(&schema, 10), SourceRowId::new(source(1), 1)),
         (record(&schema, 20), SourceRowId::new(source(2), 1)),
         (record(&schema, 30), SourceRowId::new(source(1), u64::MAX)),
     ];
-    let mut writer = SpillWriter::<SourceRowId>::new(Arc::clone(&schema), None, false)
-        .expect("spill writer opens");
+    let mut writer =
+        SpillWriter::<SourceRowId>::new(schema.clone(), None, false).expect("spill writer opens");
     for (record, identity) in &expected {
         writer
             .write_pair(record, identity)
@@ -128,9 +128,9 @@ fn transport_spill_round_trip_preserves_source_scope_and_ordinal_bits() {
 
 #[test]
 fn transport_truncated_identity_payload_is_rejected() {
-    let schema = Arc::new(SchemaBuilder::new().with_field("value").build());
-    let mut writer = SpillWriter::<SourceRowId>::new(Arc::clone(&schema), None, false)
-        .expect("spill writer opens");
+    let schema = SchemaBuilder::new().with_field("value").build();
+    let mut writer =
+        SpillWriter::<SourceRowId>::new(schema.clone(), None, false).expect("spill writer opens");
     writer
         .write_pair(&record(&schema, 10), &SourceRowId::new(source(4), u64::MAX))
         .expect("typed identity writes");

@@ -1,3 +1,4 @@
+use clinker_record::owned_storage::OwnedKey;
 use std::io::Write;
 
 use clinker_record::schema_def::{Justify, LineSeparator, TruncationPolicy};
@@ -247,7 +248,7 @@ impl<W: Write> FixedWidthWriter<W> {
     fn write_section_line(
         writer: &mut W,
         config: &FixedWidthWriterConfig,
-        fields: &indexmap::IndexMap<Box<str>, Value>,
+        fields: &indexmap::IndexMap<OwnedKey, Value>,
     ) -> Result<(), FormatError> {
         let mut line = String::new();
         for value in fields.values() {
@@ -401,7 +402,7 @@ fn encode_group(
     };
     for index in 0..slots {
         let values = match selected.get(index) {
-            Some(Value::Map(values)) => Some(values.as_ref()),
+            Some(Value::Map(values)) => Some(values.as_map()),
             Some(_) => {
                 return Err(FormatError::InvalidRecord {
                     row: 0,
@@ -446,7 +447,7 @@ fn encode_group(
 
 fn group_occurrence_is_blank(
     group: &WriteGroup,
-    values: &indexmap::IndexMap<Box<str>, Value>,
+    values: &indexmap::IndexMap<OwnedKey, Value>,
 ) -> Result<bool, FormatError> {
     for (field, resolved) in group.fields.iter().zip(&group.resolved.fields) {
         let value = values.get(field.name.as_str()).unwrap_or(&Value::Null);
@@ -628,6 +629,7 @@ fn value_to_envelope_cell(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_record::owned_storage::{OwnedMap, OwnedValues, SharedStorage};
     use clinker_record::{Record, Schema, Value};
     use std::sync::Arc;
 
@@ -636,7 +638,9 @@ mod tests {
     }
 
     fn make_record(cols: &[&str], vals: Vec<Value>) -> Record {
-        let schema = Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(
+            cols.iter().map(|c| (*c).into()).collect(),
+        )));
         Record::new(schema, vals)
     }
 
@@ -1053,12 +1057,13 @@ mod tests {
     /// expansion).
     #[test]
     fn test_fixed_width_writer_rejects_map_value() {
-        let schema = Arc::new(Schema::new(vec!["id".into(), "payload".into()]));
-        let mut sidecar: indexmap::IndexMap<Box<str>, Value> = indexmap::IndexMap::new();
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "payload".into()])));
+        let mut sidecar: indexmap::IndexMap<OwnedKey, Value> = indexmap::IndexMap::new();
         sidecar.insert("a".into(), Value::Integer(1));
         let record = Record::new(
-            Arc::clone(&schema),
-            vec![Value::Integer(7), Value::Map(Box::new(sidecar))],
+            schema.clone(),
+            vec![Value::Integer(7), Value::Map(OwnedMap::from_map(sidecar))],
         );
         let mut id_field = field("id");
         id_field.width = Some(5);
@@ -1085,12 +1090,16 @@ mod tests {
     /// a `match: collect` combine output sent to a fixed-width output).
     #[test]
     fn test_fixed_width_writer_rejects_array_value() {
-        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "tags".into()])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::Integer(7),
-                Value::Array(vec![Value::String("a".into()), Value::String("b".into())]),
+                Value::Array(OwnedValues::from_vec(vec![
+                    Value::String("a".into()),
+                    Value::String("b".into()),
+                ])),
             ],
         );
         let mut id_field = field("id");

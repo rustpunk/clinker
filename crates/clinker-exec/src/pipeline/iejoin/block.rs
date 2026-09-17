@@ -146,6 +146,7 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use clinker_record::owned_storage::SharedStorage;
 use clinker_record::{Record, Schema};
 
 use cxl::eval::{EvalContext, ProgramEvaluator};
@@ -290,6 +291,17 @@ fn pair_bytes<P: HeapBytes>(record: &Record, payload: &P) -> usize {
         + payload.heap_bytes()
 }
 
+fn pair_unaccounted_bytes<P: HeapBytes>(
+    record: &Record,
+    payload: &P,
+    resources: &clinker_record::owned_storage::AllocationResources,
+) -> usize {
+    std::mem::size_of::<Record>()
+        + record.unaccounted_heap_size(resources)
+        + std::mem::size_of::<P>()
+        + payload.unaccounted_heap_bytes(resources)
+}
+
 /// Per-record byte width of a hoisted range-key column: the `(k1, k2)` tuple a
 /// two-conjunct band feeds to `iejoin_numeric`, or the bare `k1` a
 /// single-inequality PWMJ reads. The pre-output gate charges both sides' key
@@ -325,13 +337,13 @@ fn abort_over_budget(
 /// can silently undercharge by forgetting the output or in-block terms.
 fn charge_working_set(
     consumer: &Arc<ConsumerHandle>,
-    baseline_resident: u64,
+    baseline_unaccounted: u64,
     middle: u64,
     output_bytes: u64,
     inblock_bytes: u64,
 ) {
     consumer.set_bytes(
-        baseline_resident
+        baseline_unaccounted
             .saturating_add(middle)
             .saturating_add(output_bytes)
             .saturating_add(inblock_bytes),
@@ -412,6 +424,7 @@ struct Block<P> {
     /// budget and, for a resident block, the RAM it actually holds. Known at
     /// slice time so the per-pair pre-output gate can evaluate before any load.
     resident_bytes: u64,
+    unaccounted_resident_bytes: u64,
     /// Record count, also known at slice time, so the kernel-aux estimate feeds
     /// the pre-output gate before the block's pairs are materialized.
     len: usize,
@@ -588,6 +601,7 @@ fn sorted_output_stream<P: Serialize + Ord + DeserializeOwned>(
 /// Shared spill / charge context for the drain and slice helpers. Bundled so
 /// each helper stays under clippy's argument cap.
 struct DrainCtx<'a> {
+    allocation_resources: &'a clinker_record::owned_storage::AllocationResources,
     name: &'a str,
     budget: &'a MemoryArbitrator,
     consumer: &'a Arc<ConsumerHandle>,
@@ -622,6 +636,7 @@ pub(super) struct BlockBandOptions {
 /// takes one argument and the parent can update one field without rewriting
 /// the call site.
 pub(super) struct BlockBandExec<'a> {
+    pub(super) allocation_resources: &'a clinker_record::owned_storage::AllocationResources,
     pub(super) name: &'a str,
     pub(super) build_qualifier: &'a str,
     pub(super) driver_records: Vec<(Record, RecordOrder)>,
@@ -633,7 +648,7 @@ pub(super) struct BlockBandExec<'a> {
     pub(super) residual_eval: Option<ProgramEvaluator>,
     pub(super) body_eval: Option<ProgramEvaluator>,
     pub(super) resolver_mapping: &'a CombineResolverMapping,
-    pub(super) output_schema: Option<&'a Arc<Schema>>,
+    pub(super) output_schema: Option<&'a SharedStorage<Schema>>,
     pub(super) match_mode: MatchMode,
     pub(super) on_miss: OnMiss,
     /// Opt-in runtime cap on the combine's emitted-row count (E325 on breach);
@@ -658,7 +673,20 @@ pub(super) struct BlockBandExec<'a> {
 pub(super) fn execute_block_band(
     exec: BlockBandExec<'_>,
 ) -> Result<BlockBandOutput, PipelineError> {
+    // The private kernel consumer has one byte writer; spill callbacks only
+    // request work. Restore the pre-kernel contribution after failed work drops.
+    let consumer = exec.consumer.clone();
+    let baseline = consumer.bytes();
+    let result = execute_block_band_inner(exec);
+    if result.is_err() {
+        consumer.set_bytes(baseline);
+    }
+    result
+}
+
+fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, PipelineError> {
     let BlockBandExec {
+        allocation_resources,
         name,
         build_qualifier,
         driver_records,
@@ -701,6 +729,7 @@ pub(super) fn execute_block_band(
     let inblock_can_fill =
         matches!(match_mode, MatchMode::First | MatchMode::All) && !matches!(on_miss, OnMiss::Skip);
     let drain_ctx = DrainCtx {
+        allocation_resources,
         name,
         budget,
         consumer,
@@ -722,9 +751,9 @@ pub(super) fn execute_block_band(
     // driver records and must decode them on reload exactly as the matched driver
     // buffer does. An empty driver side yields an empty schema — it holds nothing,
     // so no reload occurs.
-    let driver_row_schema: Arc<Schema> = match driver_records.first() {
-        Some((record, _)) => Arc::clone(record.schema()),
-        None => Arc::new(Schema::new(Vec::new())),
+    let driver_row_schema: SharedStorage<Schema> = match driver_records.first() {
+        Some((record, _)) => record.schema().clone(),
+        None => SharedStorage::from_arc(Arc::new(Schema::new(Vec::new()))),
     };
 
     // Schema the emitted output records carry, resolved before the drains
@@ -735,9 +764,9 @@ pub(super) fn execute_block_band(
     // Spilling output rows only happens on high-fan-out combines, which always
     // carry an output schema, so the fallback backs only the never-spilling small
     // cases and the header always matches the rows written.
-    let output_row_schema: Arc<Schema> = output_schema
-        .map(Arc::clone)
-        .unwrap_or_else(|| Arc::clone(&driver_row_schema));
+    let output_row_schema: SharedStorage<Schema> = output_schema
+        .cloned()
+        .unwrap_or_else(|| driver_row_schema.clone());
 
     // Scan-phase unmatched drivers (NULL / non-orderable range key) are retained
     // — spilled to their own buffer during the drain — only when the run will
@@ -783,6 +812,9 @@ pub(super) fn execute_block_band(
     let baseline_resident = resident_bytes_of(&driver_blocks)
         + resident_bytes_of(&build_blocks)
         + scan_unmatched_buf.bytes_used() as u64;
+    let baseline_unaccounted = resident_unaccounted_bytes_of(&driver_blocks)
+        + resident_unaccounted_bytes_of(&build_blocks)
+        + scan_unmatched_buf.unaccounted_bytes_used() as u64;
 
     // Schedule + emit: prune block pairs, run the kernel per surviving pair, and
     // emit through the shared loop. Each emitted row folds its
@@ -798,6 +830,7 @@ pub(super) fn execute_block_band(
         Some(spill_dir.to_path_buf()),
         spill_compress,
         output_row_schema,
+        allocation_resources.clone(),
     );
     let mut output_eval_failures = Vec::new();
     // Parallel `(order, driver_idx, build_idx)` sort key per deferred output-eval
@@ -820,8 +853,10 @@ pub(super) fn execute_block_band(
         Some(spill_dir.to_path_buf()),
         spill_compress,
         driver_row_schema,
+        allocation_resources.clone(),
     );
     let emit_cfg = EmitConfig {
+        allocation_resources,
         name,
         build_qualifier,
         ctx,
@@ -915,7 +950,7 @@ pub(super) fn execute_block_band(
         // this block. Each driver lands in exactly one driver block, so the
         // `First`-mode selection and the collect / on_miss finalization below
         // are globally correct even though the state is block-local.
-        let mut state = MatchState::new(driver_loaded.len());
+        let mut state = MatchState::new(driver_loaded.len(), emit_cfg.allocation_resources);
         let driver_slice: Vec<DriverRef<'_>> = driver_loaded
             .iter()
             .enumerate()
@@ -946,10 +981,10 @@ pub(super) fn execute_block_band(
         // the handle reflects the input, output, and deferred in-block footprints
         // throughout.
         consumer.set_bytes(
-            baseline_resident
+            baseline_unaccounted
                 .saturating_add(driver_held)
-                .saturating_add(sink.output_buffer_bytes())
-                .saturating_add(inblock_buf.bytes_used() as u64),
+                .saturating_add(sink.output_buffer_unaccounted_bytes())
+                .saturating_add(inblock_buf.unaccounted_bytes_used() as u64),
         );
 
         // Equality prune: pair this driver block only with build blocks that
@@ -1044,12 +1079,12 @@ pub(super) fn execute_block_band(
             let build_idx: Vec<u64> = build_loaded.iter().map(|(_, p)| p.build_idx).collect();
             charge_working_set(
                 consumer,
-                baseline_resident,
+                baseline_unaccounted,
                 driver_held
                     .saturating_add(build_held)
-                    .saturating_add(state.held_bytes()),
-                sink.output_buffer_bytes(),
-                inblock_buf.bytes_used() as u64,
+                    .saturating_add(state.unaccounted_held_bytes()),
+                sink.output_buffer_unaccounted_bytes(),
+                inblock_buf.unaccounted_bytes_used() as u64,
             );
 
             let build_slice: Vec<&Record> = build_loaded.iter().map(|(r, _)| r).collect();
@@ -1102,13 +1137,13 @@ pub(super) fn execute_block_band(
                     let pairs_bytes = (pairs.len() as u64).saturating_mul(pair_size);
                     charge_working_set(
                         consumer,
-                        baseline_resident,
+                        baseline_unaccounted,
                         driver_held
                             .saturating_add(build_held_no_aux)
-                            .saturating_add(state.held_bytes())
+                            .saturating_add(state.unaccounted_held_bytes())
                             .saturating_add(pairs_bytes),
-                        sink.output_buffer_bytes(),
-                        inblock_buf.bytes_used() as u64,
+                        sink.output_buffer_unaccounted_bytes(),
+                        inblock_buf.unaccounted_bytes_used() as u64,
                     );
                     let batch = EmitBatch {
                         pairs: &pairs,
@@ -1186,13 +1221,13 @@ pub(super) fn execute_block_band(
                     let tile_reserve = (tile_cap as u64).saturating_mul(pair_size);
                     charge_working_set(
                         consumer,
-                        baseline_resident,
+                        baseline_unaccounted,
                         driver_held
                             .saturating_add(build_held_no_aux)
-                            .saturating_add(state.held_bytes())
+                            .saturating_add(state.unaccounted_held_bytes())
                             .saturating_add(tile_reserve),
-                        sink.output_buffer_bytes(),
-                        inblock_buf.bytes_used() as u64,
+                        sink.output_buffer_unaccounted_bytes(),
+                        inblock_buf.unaccounted_bytes_used() as u64,
                     );
                     let pair_budget = PairBudget {
                         floor: baseline_resident
@@ -1255,10 +1290,10 @@ pub(super) fn execute_block_band(
             // the in-block pile's resident bytes so those charges persist.
             charge_working_set(
                 consumer,
-                baseline_resident,
-                driver_held.saturating_add(state.held_bytes()),
-                sink.output_buffer_bytes(),
-                inblock_buf.bytes_used() as u64,
+                baseline_unaccounted,
+                driver_held.saturating_add(state.unaccounted_held_bytes()),
+                sink.output_buffer_unaccounted_bytes(),
+                inblock_buf.unaccounted_bytes_used() as u64,
             );
         }
 
@@ -1284,9 +1319,9 @@ pub(super) fn execute_block_band(
         // released; leave the resident baseline plus the output sort's and the
         // in-block pile's resident bytes charged.
         consumer.set_bytes(
-            baseline_resident
-                .saturating_add(sink.output_buffer_bytes())
-                .saturating_add(inblock_buf.bytes_used() as u64),
+            baseline_unaccounted
+                .saturating_add(sink.output_buffer_unaccounted_bytes())
+                .saturating_add(inblock_buf.unaccounted_bytes_used() as u64),
         );
     }
 
@@ -1407,6 +1442,13 @@ pub(super) fn execute_block_band(
 
 /// Sum the resident (kept-in-RAM) blocks' byte footprints; spilled blocks hold
 /// no RAM until their per-pair load.
+fn resident_unaccounted_bytes_of<P>(blocks: &[Block<P>]) -> u64 {
+    blocks
+        .iter()
+        .map(|block| block.unaccounted_resident_bytes)
+        .sum()
+}
+
 fn resident_bytes_of<P>(blocks: &[Block<P>]) -> u64 {
     blocks
         .iter()
@@ -1466,12 +1508,24 @@ struct DriverPayload {
 // block sizing, resident admission, and the pre-output abort gate. Empty for a
 // pure-range combine (no equality keys), so its accounting is unchanged.
 impl HeapBytes for BuildPayload {
+    fn unaccounted_heap_bytes(
+        &self,
+        _resources: &clinker_record::owned_storage::AllocationResources,
+    ) -> usize {
+        self.eq.len()
+    }
     fn heap_bytes(&self) -> usize {
         self.eq.len()
     }
 }
 
 impl HeapBytes for DriverPayload {
+    fn unaccounted_heap_bytes(
+        &self,
+        _resources: &clinker_record::owned_storage::AllocationResources,
+    ) -> usize {
+        self.eq.len()
+    }
     fn heap_bytes(&self) -> usize {
         self.eq.len()
     }
@@ -1507,7 +1561,7 @@ fn drain_driver_side(
     driver_records: Vec<(Record, RecordOrder)>,
     driver_scans: Vec<RecordScan>,
     retain_unmatched: bool,
-    schema: &Arc<Schema>,
+    schema: &SharedStorage<Schema>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
 ) -> Result<DriverSide, PipelineError> {
@@ -1517,7 +1571,8 @@ fn drain_driver_side(
         ctx.sort_threshold,
         Some(ctx.spill_dir.to_path_buf()),
         ctx.spill_compress,
-        Arc::clone(schema),
+        schema.clone(),
+        ctx.allocation_resources.clone(),
     );
     if driver_records.is_empty() {
         return Ok((Vec::new(), scan_buf));
@@ -1526,7 +1581,8 @@ fn drain_driver_side(
         ctx.sort_threshold,
         Some(ctx.spill_dir.to_path_buf()),
         ctx.spill_compress,
-        Arc::clone(schema),
+        schema.clone(),
+        ctx.allocation_resources.clone(),
     );
     for (driver_idx, ((record, order), scan)) in
         driver_records.into_iter().zip(driver_scans).enumerate()
@@ -1577,12 +1633,13 @@ fn drain_build_side(
     let Some(first) = build_records.first() else {
         return Ok(Vec::new());
     };
-    let schema = Arc::clone(first.schema());
+    let schema = first.schema().clone();
     let mut buf: SortBuffer<BuildPayload> = SortBuffer::new_payload_ordered(
         ctx.sort_threshold,
         Some(ctx.spill_dir.to_path_buf()),
         ctx.spill_compress,
-        Arc::clone(&schema),
+        schema.clone(),
+        ctx.allocation_resources.clone(),
     );
     for (build_idx, (record, scan)) in build_records.into_iter().zip(build_scans).enumerate() {
         if let RecordScan::Matched {
@@ -1634,18 +1691,21 @@ fn push_charge_spill<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
     payload: P,
     ctx: &DrainCtx<'_>,
 ) -> Result<(), PipelineError> {
-    let pre = buf.bytes_used();
+    let pre = buf.unaccounted_bytes_used();
     buf.push(record, payload);
     ctx.consumer
-        .add_bytes(buf.bytes_used().saturating_sub(pre) as u64);
+        .add_bytes(buf.unaccounted_bytes_used().saturating_sub(pre) as u64);
     if buf.should_spill() {
-        let pre_spill = buf.bytes_used() as u64;
-        let written = buf.sort_and_spill().map_err(|e| {
+        let pre_spill = buf.unaccounted_bytes_used() as u64;
+        let spill_result = buf.sort_and_spill();
+        ctx.consumer
+            .sub_bytes(pre_spill.saturating_sub(buf.unaccounted_bytes_used() as u64));
+        let written = spill_result.map_err(|e| {
             PipelineError::Io(io::Error::other(format!(
                 "iejoin block-band drain spill failed: {e}"
             )))
         })?;
-        ctx.consumer.sub_bytes(pre_spill);
+
         charge_block_spill(ctx, written)?;
     }
     Ok(())
@@ -1661,13 +1721,34 @@ fn push_charge_spill<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
 /// under the consumer mid-slice.
 fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
     buf: SortBuffer<P>,
-    schema: &Arc<Schema>,
+    schema: &SharedStorage<Schema>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
     key_of: &impl Fn(&P) -> (u64, i128, i128),
 ) -> Result<Vec<Block<P>>, PipelineError> {
-    let pre_finish = buf.bytes_used() as u64;
+    let baseline = ctx
+        .consumer
+        .bytes()
+        .saturating_sub(buf.unaccounted_bytes_used() as u64);
+    let resident_baseline = resident.used;
+    let result = finish_and_slice_inner(buf, schema, ctx, resident, key_of);
+    if result.is_err() {
+        ctx.consumer.set_bytes(baseline);
+        resident.used = resident_baseline;
+    }
+    result
+}
+
+fn finish_and_slice_inner<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
+    buf: SortBuffer<P>,
+    schema: &SharedStorage<Schema>,
+    ctx: &DrainCtx<'_>,
+    resident: &mut ResidentBudget,
+    key_of: &impl Fn(&P) -> (u64, i128, i128),
+) -> Result<Vec<Block<P>>, PipelineError> {
+    let pre_finish = buf.unaccounted_bytes_used() as u64;
     let (sorted, residue) = buf.finish().map_err(|e| {
+        ctx.consumer.sub_bytes(pre_finish);
         PipelineError::Io(io::Error::other(format!(
             "iejoin block-band drain finish failed: {e}"
         )))
@@ -1723,7 +1804,7 @@ fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
 /// budget-sized blocks the scheduler pairs one at a time.
 fn slice_side<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
     stream: SortedStream<P>,
-    schema: &Arc<Schema>,
+    schema: &SharedStorage<Schema>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
     key_of: &impl Fn(&P) -> (u64, i128, i128),
@@ -1795,23 +1876,30 @@ fn slice_side<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
 /// it to its own file otherwise. `resident_bytes` is the block's estimated
 /// footprint, already accumulated by the slicer as it filled the block, so it
 /// is not re-summed here.
-fn make_block<P: Serialize + DeserializeOwned + Send + Ord>(
+fn make_block<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
     pairs: Vec<(Record, P)>,
     eq_hash: u64,
     bounds: Bounds,
     resident_bytes: u64,
-    schema: &Arc<Schema>,
+    schema: &SharedStorage<Schema>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
 ) -> Result<Block<P>, PipelineError> {
     let len = pairs.len();
     if resident.admit(resident_bytes) {
-        ctx.consumer.add_bytes(resident_bytes);
+        let unaccounted_resident_bytes = pairs
+            .iter()
+            .map(|(record, payload)| {
+                pair_unaccounted_bytes(record, payload, ctx.allocation_resources) as u64
+            })
+            .sum();
+        ctx.consumer.add_bytes(unaccounted_resident_bytes);
         Ok(Block {
             storage: BlockStorage::Resident(pairs),
             eq_hash,
             bounds,
             resident_bytes,
+            unaccounted_resident_bytes,
             len,
         })
     } else {
@@ -1830,17 +1918,15 @@ fn spill_block<P: Serialize>(
     bounds: Bounds,
     len: usize,
     resident_bytes: u64,
-    schema: &Arc<Schema>,
+    schema: &SharedStorage<Schema>,
     ctx: &DrainCtx<'_>,
 ) -> Result<Block<P>, PipelineError> {
     let mut writer: SpillWriter<P> =
-        SpillWriter::new(Arc::clone(schema), Some(ctx.spill_dir), ctx.spill_compress).map_err(
-            |e| {
-                PipelineError::Io(io::Error::other(format!(
-                    "iejoin block-band block spill open failed: {e}"
-                )))
-            },
-        )?;
+        SpillWriter::new(schema.clone(), Some(ctx.spill_dir), ctx.spill_compress).map_err(|e| {
+            PipelineError::Io(io::Error::other(format!(
+                "iejoin block-band block spill open failed: {e}"
+            )))
+        })?;
     for (record, payload) in &pairs {
         writer.write_pair(record, payload).map_err(|e| {
             PipelineError::Io(io::Error::other(format!(
@@ -1859,6 +1945,7 @@ fn spill_block<P: Serialize>(
         eq_hash,
         bounds,
         resident_bytes,
+        unaccounted_resident_bytes: 0,
         len,
     })
 }
@@ -2100,6 +2187,15 @@ fn note_unmatched(
 
 #[cfg(test)]
 mod tests {
+    fn test_allocation_resources() -> clinker_record::owned_storage::AllocationResources {
+        clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024 * 1024).unwrap(),
+        )
+        .resources()
+        .allocation()
+        .clone()
+    }
+
     use super::*;
     use crate::pipeline::memory::NoOpPolicy;
     use clinker_plan::config::pipeline_node::PropagateCkSpec;
@@ -2148,17 +2244,25 @@ mod tests {
     /// scan routes to `Unmatched`. `id` tags the row for readback.
     type Side = Vec<(Option<(i64, i64)>, i64)>;
 
-    fn driver_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec!["k1".into(), "k2".into(), "id".into()]))
+    fn driver_schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "k1".into(),
+            "k2".into(),
+            "id".into(),
+        ])))
     }
 
-    fn build_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec!["k1".into(), "k2".into(), "id".into()]))
+    fn build_schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "k1".into(),
+            "k2".into(),
+            "id".into(),
+        ])))
     }
 
-    fn make_rec(schema: &Arc<Schema>, k1: i64, k2: i64, id: i64) -> Record {
+    fn make_rec(schema: &SharedStorage<Schema>, k1: i64, k2: i64, id: i64) -> Record {
         Record::new(
-            Arc::clone(schema),
+            schema.clone(),
             vec![Value::Integer(k1), Value::Integer(k2), Value::Integer(id)],
         )
     }
@@ -2220,7 +2324,10 @@ mod tests {
         }
     }
 
-    fn to_records_scans(side: &Side, schema: &Arc<Schema>) -> (Vec<Record>, Vec<RecordScan>) {
+    fn to_records_scans(
+        side: &Side,
+        schema: &SharedStorage<Schema>,
+    ) -> (Vec<Record>, Vec<RecordScan>) {
         let records = side
             .iter()
             .map(|(key, id)| {
@@ -2328,32 +2435,70 @@ mod tests {
         budget: &MemoryArbitrator,
         orders: &[RecordOrder],
     ) -> Result<Vec<(Record, RecordOrder)>, PipelineError> {
+        run_block_with_storage(
+            driver,
+            build,
+            cfg,
+            budget,
+            orders,
+            &test_allocation_resources(),
+            None,
+        )
+    }
+
+    fn run_block_with_storage(
+        driver: &Side,
+        build: &Side,
+        cfg: &RunCfg,
+        budget: &MemoryArbitrator,
+        orders: &[RecordOrder],
+        resources: &clinker_record::owned_storage::AllocationResources,
+        scope: Option<&clinker_record::owned_storage::AllocationScope>,
+    ) -> Result<Vec<(Record, RecordOrder)>, PipelineError> {
+        let adapt = |record: Record| {
+            let Some(scope) = scope else {
+                return record;
+            };
+            let mut values = clinker_record::owned_storage::OwnedValues::try_with_capacity(
+                record.values().len() + 8,
+                scope,
+            )
+            .unwrap();
+            for value in record.values() {
+                values.try_push(value.clone(), scope).unwrap();
+            }
+            Record::from_owned_values(record.schema().clone(), values).unwrap()
+        };
         let d_schema = driver_schema();
         let b_schema = build_schema();
         let out_schema = match cfg.match_mode {
-            MatchMode::Collect => Arc::new(Schema::new(vec![
+            MatchMode::Collect => SharedStorage::from_arc(Arc::new(Schema::new(vec![
                 "k1".into(),
                 "k2".into(),
                 "id".into(),
                 "b".into(),
-            ])),
-            MatchMode::First | MatchMode::All => Arc::new(Schema::new(vec![
-                "d_k1".into(),
-                "d_k2".into(),
-                "d_id".into(),
-                "b_k1".into(),
-                "b_k2".into(),
-                "b_id".into(),
-            ])),
+            ]))),
+            MatchMode::First | MatchMode::All => {
+                SharedStorage::from_arc(Arc::new(Schema::new(vec![
+                    "d_k1".into(),
+                    "d_k2".into(),
+                    "d_id".into(),
+                    "b_k1".into(),
+                    "b_k2".into(),
+                    "b_id".into(),
+                ])))
+            }
         };
 
         let (driver_records_bare, driver_scans) = to_records_scans(driver, &d_schema);
         assert_eq!(driver_records_bare.len(), orders.len());
         let driver_records: Vec<(Record, RecordOrder)> = driver_records_bare
             .into_iter()
+            .map(adapt)
             .zip(orders.iter().copied())
             .collect();
         let (build_records, build_scans) = to_records_scans(build, &b_schema);
+        let build_records = build_records.into_iter().map(adapt).collect();
 
         let stable = StableEvalContext::test_default();
         let ctx = EvalContext::test_default_borrowed(&stable);
@@ -2366,6 +2511,7 @@ mod tests {
         let propagate = PropagateCkSpec::Driver;
 
         let out = execute_block_band(BlockBandExec {
+            allocation_resources: resources,
             name: "block_test",
             build_qualifier: "b",
             driver_records,
@@ -2375,7 +2521,7 @@ mod tests {
             op1: cfg.op1,
             op2: cfg.op2,
             residual_eval: None,
-            body_eval: None,
+            body_eval: matches!(cfg.on_miss, OnMiss::NullFields).then(constant_body),
             resolver_mapping: &resolver,
             output_schema: Some(&out_schema),
             match_mode: cfg.match_mode,
@@ -3565,14 +3711,14 @@ mod tests {
     ) -> Result<Vec<Record>, PipelineError> {
         let d_schema = driver_schema();
         let b_schema = build_schema();
-        let out_schema = Arc::new(Schema::new(vec![
+        let out_schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "d_k1".into(),
             "d_k2".into(),
             "d_id".into(),
             "b_k1".into(),
             "b_k2".into(),
             "b_id".into(),
-        ]));
+        ])));
         let (driver_records_bare, driver_scans) = to_records_scans(driver, &d_schema);
         let driver_records: Vec<(Record, RecordOrder)> = driver_records_bare
             .into_iter()
@@ -3591,6 +3737,7 @@ mod tests {
             .expect("temp dir");
         let propagate = PropagateCkSpec::Driver;
         let out = execute_block_band(BlockBandExec {
+            allocation_resources: &test_allocation_resources(),
             name: "cap_test",
             build_qualifier: "b",
             driver_records,
@@ -3865,14 +4012,14 @@ mod tests {
         // index, so it cannot tell the two apart; this fixture sets them apart.
         let d_schema = driver_schema();
         let b_schema = build_schema();
-        let out_schema = Arc::new(Schema::new(vec![
+        let out_schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "d_k1".into(),
             "d_k2".into(),
             "d_id".into(),
             "b_k1".into(),
             "b_k2".into(),
             "b_id".into(),
-        ]));
+        ])));
         // (k1, k2, id, order). The two matches (key 5,5) keep the miss set from
         // being the whole input; the two misses use an unreachable key.
         let driver_keyed: [(i64, i64, i64, RecordOrder); 4] = [
@@ -3908,6 +4055,7 @@ mod tests {
                 .expect("temp dir");
             let propagate = PropagateCkSpec::Driver;
             execute_block_band(BlockBandExec {
+                allocation_resources: &test_allocation_resources(),
                 name: "miss_order",
                 build_qualifier: "b",
                 driver_records,
@@ -3964,14 +4112,14 @@ mod tests {
         // pure function of the data — identical across block layouts.
         let d_schema = driver_schema();
         let b_schema = build_schema();
-        let out_schema = Arc::new(Schema::new(vec![
+        let out_schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "d_k1".into(),
             "d_k2".into(),
             "d_id".into(),
             "b_k1".into(),
             "b_k2".into(),
             "b_id".into(),
-        ]));
+        ])));
         // Four drivers, all key (5, 5); ids 1 and 2 share the duplicate order 7.
         let driver_keyed: [(i64, i64, i64, RecordOrder); 4] = [
             (5, 5, 0, 0.into()),
@@ -4006,6 +4154,7 @@ mod tests {
                 .expect("temp dir");
             let propagate = PropagateCkSpec::Driver;
             let out = execute_block_band(BlockBandExec {
+                allocation_resources: &test_allocation_resources(),
                 name: "dup_order",
                 build_qualifier: "b",
                 driver_records,
@@ -4066,13 +4215,13 @@ mod tests {
         // per-pair pre-output gate must fold it in and abort with the typed
         // budget error rather than let it grow unbounded.
         let d_schema = driver_schema();
-        let b_schema = Arc::new(Schema::new(vec![
+        let b_schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "k1".into(),
             "k2".into(),
             "id".into(),
             "pad".into(),
-        ]));
-        let out_schema = Arc::new(Schema::new(vec![
+        ])));
+        let out_schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "d_k1".into(),
             "d_k2".into(),
             "d_id".into(),
@@ -4080,7 +4229,7 @@ mod tests {
             "b_k2".into(),
             "b_id".into(),
             "b_pad".into(),
-        ]));
+        ])));
         let n = 300i64;
         let pad = "w".repeat(2048);
         // Driver i has key (i, i); build i has key (i, i) plus a wide pad. Under
@@ -4099,7 +4248,7 @@ mod tests {
         let build_records: Vec<Record> = (0..n)
             .map(|i| {
                 Record::new(
-                    Arc::clone(&b_schema),
+                    b_schema.clone(),
                     vec![
                         Value::Integer(i),
                         Value::Integer(i),
@@ -4128,6 +4277,7 @@ mod tests {
             .expect("temp dir");
         let propagate = PropagateCkSpec::Driver;
         let err = execute_block_band(BlockBandExec {
+            allocation_resources: &test_allocation_resources(),
             name: "held_test",
             build_qualifier: "b",
             driver_records,
@@ -4352,14 +4502,14 @@ mod tests {
         let interval = crate::pipeline::iejoin::MEMORY_CHECK_INTERVAL;
         let d_schema = driver_schema();
         let b_schema = build_schema();
-        let out_schema = Arc::new(Schema::new(vec![
+        let out_schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "d_k1".into(),
             "d_k2".into(),
             "d_id".into(),
             "b_k1".into(),
             "b_k2".into(),
             "b_id".into(),
-        ]));
+        ])));
         let driver: Side = (0..(interval as i64 + 1)).map(|i| (None, i)).collect();
         let build: Side = vec![(Some((5, 5)), 100)];
         let (driver_bare, driver_scans) = to_records_scans(&driver, &d_schema);
@@ -4383,6 +4533,7 @@ mod tests {
         let propagate = PropagateCkSpec::Driver;
 
         let err = execute_block_band(BlockBandExec {
+            allocation_resources: &test_allocation_resources(),
             name: "finalize_backstop",
             build_qualifier: "b",
             driver_records,
@@ -4594,7 +4745,7 @@ mod tests {
     fn run_null_fields_frag(
         driver: &Side,
         build: &Side,
-        out_schema: &Arc<Schema>,
+        out_schema: &SharedStorage<Schema>,
         sort_spill: Option<usize>,
         hard_limit: u64,
     ) -> (Vec<Record>, u64) {
@@ -4620,6 +4771,7 @@ mod tests {
         let budget = arbitrator(hard_limit);
 
         let out = execute_block_band(BlockBandExec {
+            allocation_resources: &test_allocation_resources(),
             name: "cascade_frag",
             build_qualifier: "b",
             driver_records,
@@ -4698,12 +4850,12 @@ mod tests {
         // Driver columns pass through `widen_record_to_schema`, so keep `id` in the
         // output schema to read each miss row's driver identity back; `m` carries
         // the constant marker the null_fields body stamps.
-        let out_schema = Arc::new(Schema::new(vec![
+        let out_schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "k1".into(),
             "k2".into(),
             "id".into(),
             "m".into(),
-        ]));
+        ])));
 
         // Reference: a roomy budget with no spill override keeps every pile
         // resident.
@@ -5007,7 +5159,7 @@ mod tests {
     /// re-verify bytes wide (accounting) independently.
     fn to_records_scans_equi(
         side: &[EqRec],
-        schema: &Arc<Schema>,
+        schema: &SharedStorage<Schema>,
         hash_of: &impl Fn(i64) -> u64,
         eq_of: &impl Fn(i64) -> Vec<u8>,
     ) -> (Vec<Record>, Vec<RecordScan>) {
@@ -5046,20 +5198,22 @@ mod tests {
         let d_schema = driver_schema();
         let b_schema = build_schema();
         let out_schema = match cfg.match_mode {
-            MatchMode::Collect => Arc::new(Schema::new(vec![
+            MatchMode::Collect => SharedStorage::from_arc(Arc::new(Schema::new(vec![
                 "k1".into(),
                 "k2".into(),
                 "id".into(),
                 "b".into(),
-            ])),
-            MatchMode::First | MatchMode::All => Arc::new(Schema::new(vec![
-                "d_k1".into(),
-                "d_k2".into(),
-                "d_id".into(),
-                "b_k1".into(),
-                "b_k2".into(),
-                "b_id".into(),
-            ])),
+            ]))),
+            MatchMode::First | MatchMode::All => {
+                SharedStorage::from_arc(Arc::new(Schema::new(vec![
+                    "d_k1".into(),
+                    "d_k2".into(),
+                    "d_id".into(),
+                    "b_k1".into(),
+                    "b_k2".into(),
+                    "b_id".into(),
+                ])))
+            }
         };
         let (driver_records_bare, driver_scans) =
             to_records_scans_equi(driver, &d_schema, hash_of, eq_of);
@@ -5081,6 +5235,7 @@ mod tests {
         let propagate = PropagateCkSpec::Driver;
 
         let out = execute_block_band(BlockBandExec {
+            allocation_resources: &test_allocation_resources(),
             name: "equi_test",
             build_qualifier: "b",
             driver_records,
@@ -5595,5 +5750,223 @@ mod tests {
             ordered_collect(&roomy),
             "match:collect equi output must be byte-identical across budgets"
         );
+    }
+    #[test]
+    fn resident_block_attribution_differs_from_full_reload_forecast() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        use clinker_record::{FieldStr, owned_storage::OwnedValues};
+        let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let resources = provider.resources().allocation().clone();
+        let scope = resources.scope().unwrap();
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["value".into()])));
+        let make_record = || {
+            let mut values = OwnedValues::try_with_capacity(8, &scope).unwrap();
+            values
+                .try_push(
+                    Value::String(FieldStr::try_new(&"x".repeat(1024), &scope).unwrap()),
+                    &scope,
+                )
+                .unwrap();
+            Record::from_owned_values(schema.clone(), values).unwrap()
+        };
+        let payload = || BuildPayload {
+            eq_hash: 0,
+            k1: 1,
+            k2: 2,
+            build_idx: 0,
+            eq: vec![1, 2, 3],
+        };
+        let budget = MemoryArbitrator::with_policy(
+            1024 * 1024,
+            0.8,
+            0.7,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        );
+        let handle = ConsumerHandle::new();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = DrainCtx {
+            allocation_resources: &resources,
+            name: "ownership",
+            budget: &budget,
+            consumer: &handle,
+            spill_dir: dir.path(),
+            spill_compress: false,
+            block_target: 4096,
+            sort_threshold: 4096,
+        };
+        let record = make_record();
+        let physical = pair_bytes(&record, &payload()) as u64;
+        let relative = pair_unaccounted_bytes(&record, &payload(), &resources) as u64;
+        assert!(relative < physical);
+        let resident = make_block(
+            vec![(record, payload())],
+            0,
+            Bounds::empty(),
+            physical,
+            &schema,
+            &ctx,
+            &mut ResidentBudget::new(physical),
+        )
+        .unwrap();
+        assert_eq!(resident.resident_bytes, physical);
+        assert_eq!(resident.unaccounted_resident_bytes, relative);
+        assert_eq!(handle.bytes(), relative);
+        let borrowed = resident.load("borrow resident").unwrap();
+        assert!(matches!(borrowed, Loaded::Borrowed(_)));
+        assert!(borrowed[0].0.values_are_accounted_by(&resources));
+        assert_eq!(spilled_scratch_bytes(&resident), 0);
+        let spilled = make_block(
+            vec![(make_record(), payload())],
+            0,
+            Bounds::empty(),
+            physical,
+            &schema,
+            &ctx,
+            &mut ResidentBudget::new(0),
+        )
+        .unwrap();
+        assert_eq!(spilled.unaccounted_resident_bytes, 0);
+        assert_eq!(spilled_scratch_bytes(&spilled), physical);
+        assert_eq!(
+            handle.bytes(),
+            relative,
+            "disk-only block adds no resident charge"
+        );
+        let decoded = spilled.load("decode block").unwrap();
+        assert!(matches!(decoded, Loaded::Owned(_)));
+        assert!(!decoded[0].0.values_are_accounted_by(&resources));
+        assert_eq!(decoded[0].0.values(), borrowed[0].0.values());
+        assert_eq!(
+            pair_unaccounted_bytes(&decoded[0].0, &decoded[0].1, &resources),
+            pair_bytes(&decoded[0].0, &decoded[0].1)
+        );
+        drop(borrowed);
+        drop(resident);
+        assert_eq!(provider.used(), 0);
+        handle.sub_bytes(relative);
+        assert_eq!(handle.bytes(), 0);
+    }
+    #[test]
+    fn governed_blocks_preserve_all_first_collect_and_both_unmatched_piles() {
+        let driver = vec![(Some((1, 1)), 10), (None, 11), (Some((9, 9)), 12)];
+        let build = vec![(Some((2, 2)), 20), (Some((3, 3)), 21)];
+        let orders = [0.into(), 1.into(), 2.into()];
+        let provider = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+        );
+        let resources = provider.resources().allocation().clone();
+        let scope = resources.scope().unwrap();
+        for match_mode in [MatchMode::All, MatchMode::First, MatchMode::Collect] {
+            for spilled in [false, true] {
+                let cfg = RunCfg {
+                    op1: RangeOp::Lt,
+                    op2: None,
+                    match_mode,
+                    on_miss: OnMiss::NullFields,
+                    block_target: 2,
+                    hard_limit: u64::MAX,
+                    max_spill_bytes: None,
+                    sort_spill: spilled.then_some(1),
+                    resident_budget: spilled.then_some(0),
+                };
+                let budget = arbitrator(u64::MAX);
+                let expected = run_block_with_storage(
+                    &driver, &build, &cfg, &budget, &orders, &resources, None,
+                )
+                .unwrap();
+                let actual = run_block_with_storage(
+                    &driver,
+                    &build,
+                    &cfg,
+                    &budget,
+                    &orders,
+                    &resources,
+                    Some(&scope),
+                )
+                .unwrap();
+                assert_eq!(
+                    actual
+                        .iter()
+                        .map(|(record, order)| (record.values(), order))
+                        .collect::<Vec<_>>(),
+                    expected
+                        .iter()
+                        .map(|(record, order)| (record.values(), order))
+                        .collect::<Vec<_>>(),
+                    "ownership must not affect output or ordering"
+                );
+                assert_eq!(
+                    provider.used(),
+                    0,
+                    "input vector leases retire after block output handoff"
+                );
+                let expected_orders = if matches!(match_mode, MatchMode::All) {
+                    vec![0, 0, 1, 2]
+                } else {
+                    vec![0, 1, 2]
+                };
+                assert_eq!(
+                    actual
+                        .iter()
+                        .map(|(_, order)| order.ordinal())
+                        .collect::<Vec<_>>(),
+                    expected_orders,
+                    "both unmatched paths emit their original driver identity"
+                );
+            }
+        }
+    }
+    #[test]
+    fn slice_failure_releases_new_blocks_and_preserves_prior_consumer_and_resident_budget() {
+        let resources = test_allocation_resources();
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["k".into()])));
+        let budget = arbitrator(u64::MAX);
+        let consumer = ConsumerHandle::new();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let ctx = DrainCtx {
+            allocation_resources: &resources,
+            name: "slice-failure",
+            budget: &budget,
+            consumer: &consumer,
+            spill_dir: &missing,
+            spill_compress: false,
+            block_target: 1,
+            sort_threshold: usize::MAX,
+        };
+        let mut buffer = SortBuffer::new_payload_ordered(
+            usize::MAX,
+            Some(missing.clone()),
+            false,
+            schema.clone(),
+            resources.clone(),
+        );
+        let mut one_block = 0;
+        for k in 0..3 {
+            let record = Record::new(schema.clone(), vec![Value::Integer(k)]);
+            let payload = BuildPayload {
+                eq_hash: 0,
+                k1: k as i128,
+                k2: 0,
+                build_idx: k as u64,
+                eq: vec![],
+            };
+            one_block = pair_bytes(&record, &payload) as u64;
+            buffer.push(record, payload);
+        }
+        consumer.set_bytes(777 + buffer.unaccounted_bytes_used() as u64);
+        let mut resident = ResidentBudget {
+            total: 999 + one_block,
+            used: 999,
+        };
+        let error = finish_and_slice(buffer, &schema, &ctx, &mut resident, &|p: &BuildPayload| {
+            (p.eq_hash, p.k1, p.k2)
+        })
+        .err()
+        .expect("second block must fail to open its spill");
+        assert!(matches!(error, PipelineError::Io(_)));
+        assert!(error.to_string().contains("block spill open failed"));
+        assert_eq!(consumer.bytes(), 777);
+        assert_eq!(resident.used, 999);
     }
 }

@@ -430,7 +430,10 @@ fn test_collect_produces_array() {
     add_all(&mut a, &[Value::Integer(1), Value::Integer(2)]);
     assert_eq!(
         a.finalize().unwrap(),
-        Value::Array(vec![Value::Integer(1), Value::Integer(2)])
+        Value::Array(crate::owned_storage::OwnedValues::from_vec(vec![
+            Value::Integer(1),
+            Value::Integer(2),
+        ]))
     );
 }
 
@@ -440,14 +443,21 @@ fn test_collect_includes_nulls() {
     add_all(&mut a, &[Value::Integer(1), Value::Null, Value::Integer(3)]);
     assert_eq!(
         a.finalize().unwrap(),
-        Value::Array(vec![Value::Integer(1), Value::Null, Value::Integer(3)])
+        Value::Array(crate::owned_storage::OwnedValues::from_vec(vec![
+            Value::Integer(1),
+            Value::Null,
+            Value::Integer(3),
+        ]))
     );
 }
 
 #[test]
 fn test_collect_empty() {
     let a = collect();
-    assert_eq!(a.finalize().unwrap(), Value::Array(vec![]));
+    assert_eq!(
+        a.finalize().unwrap(),
+        Value::Array(crate::owned_storage::OwnedValues::from_vec(vec![]))
+    );
 }
 
 #[test]
@@ -459,11 +469,11 @@ fn test_collect_merge() {
     a.merge(&b);
     assert_eq!(
         a.finalize().unwrap(),
-        Value::Array(vec![
+        Value::Array(crate::owned_storage::OwnedValues::from_vec(vec![
             Value::Integer(1),
             Value::Integer(2),
             Value::Integer(3),
-        ])
+        ]))
     );
 }
 

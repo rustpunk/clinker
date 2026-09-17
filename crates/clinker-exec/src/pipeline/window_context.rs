@@ -1,5 +1,6 @@
 //! Concrete WindowContext implementation over a sorted Arena partition.
 
+use clinker_record::owned_storage::OwnedValues;
 use std::collections::HashSet;
 
 use clinker_record::{RecordStorage, RecordView, Value, WindowContext};
@@ -269,7 +270,7 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
             .filter(|v| !v.is_null())
             .cloned()
             .collect();
-        Value::Array(values)
+        Value::Array(OwnedValues::from_vec(values))
     }
 
     fn distinct(&self, field: &str) -> Value {
@@ -286,7 +287,7 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
                 }
             }
         }
-        Value::Array(values)
+        Value::Array(OwnedValues::from_vec(values))
     }
 
     fn row_number(&self) -> i64 {

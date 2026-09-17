@@ -7,6 +7,7 @@
 //! the public entry point in `crates/clinker-exec/tests/multi_output.rs`.
 
 use super::*;
+use clinker_record::owned_storage::SharedStorage;
 
 /// Helper: build a [`CompiledRoute`] for a route config against a set of
 /// field names.
@@ -92,8 +93,9 @@ fn test_eval_context() -> cxl::eval::EvalContext<'static> {
 /// take insertion order of `emitted`.
 fn test_record(emitted: &indexmap::IndexMap<String, Value>) -> clinker_record::Record {
     use std::sync::Arc;
-    let columns: Vec<Box<str>> = emitted.keys().map(|k| k.as_str().into()).collect();
-    let schema = Arc::new(clinker_record::Schema::new(columns));
+    let columns: Vec<clinker_record::owned_storage::OwnedKey> =
+        emitted.keys().map(|k| k.as_str().into()).collect();
+    let schema = SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(columns)));
     let values: Vec<Value> = emitted.values().cloned().collect();
     clinker_record::Record::new(schema, values)
 }

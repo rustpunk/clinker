@@ -7,6 +7,7 @@
 //! output-row error path. The dispatcher's `Combine` arm is a single
 //! delegating call into [`dispatch_combine`].
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -37,6 +38,135 @@ use clinker_plan::plan::execution::{
 /// truncation. 10K mirrors the module constants in `pipeline/combine.rs`
 /// and aligns with DataFusion's collect-list bound.
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
+
+/// Keep source materialization charged through a kernel that consumes its
+/// owned inputs. Its returned output has a separate drain owner; freed input
+/// vectors must not remain reported throughout that later drain.
+fn consume_materialized_inputs<T>(
+    reservations: [Option<crate::executor::node_buffer::TransientNodeBufferReservation>; 2],
+    kernel: impl FnOnce() -> Result<T, PipelineError>,
+) -> Result<T, PipelineError> {
+    let result = kernel();
+    drop(reservations);
+    result
+}
+
+#[cfg(test)]
+mod output_ownership_tests {
+    use clinker_record::owned_storage::SharedStorage;
+    #[test]
+    fn input_materialization_charge_ends_after_consuming_kernel() {
+        use crate::executor::node_buffer::reserve_node_buffer_materialization;
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        let budget = std::sync::Arc::new(MemoryArbitrator::with_policy(
+            4096,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let first = reserve_node_buffer_materialization(100, &budget, "join").unwrap();
+        let second = reserve_node_buffer_materialization(200, &budget, "join").unwrap();
+        let result = super::consume_materialized_inputs([Some(first), Some(second)], || {
+            assert_eq!(
+                budget.sum_consumer_usage(),
+                300,
+                "inputs remain charged throughout kernel execution"
+            );
+            Ok(17)
+        })
+        .unwrap();
+        assert_eq!(result, 17);
+        assert_eq!(
+            budget.sum_consumer_usage(),
+            0,
+            "input storage is gone before output drain"
+        );
+        assert_eq!(budget.consumer_count(), 0);
+        let input = reserve_node_buffer_materialization(100, &budget, "join").unwrap();
+        let failed: Result<(), _> = super::consume_materialized_inputs([Some(input), None], || {
+            assert_eq!(budget.sum_consumer_usage(), 100);
+            Err(clinker_plan::error::PipelineError::Interrupted)
+        });
+        assert!(failed.is_err());
+        assert_eq!(
+            budget.consumer_count(),
+            0,
+            "kernel errors release input guards too"
+        );
+    }
+
+    #[test]
+    fn output_drain_excludes_only_local_grants_and_retains_vector_capacity() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        use clinker_record::owned_storage::OwnedValues;
+        use clinker_record::{Record, Schema, Value};
+        let local = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let foreign = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let resources = local.resources().allocation().clone();
+        let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec!["v".into()])));
+        let make = |domain: &clinker_record::owned_storage::AllocationResources| {
+            let scope = domain.scope().unwrap();
+            let mut values = OwnedValues::try_with_capacity(4, &scope).unwrap();
+            values.try_push(Value::Integer(42), &scope).unwrap();
+            Record::from_owned_values(schema.clone(), values).unwrap()
+        };
+        let local_record = make(&resources);
+        let foreign_record = make(foreign.resources().allocation());
+        let foreign_heap = foreign_record.unaccounted_heap_size(&resources);
+        assert_eq!(local_record.unaccounted_heap_size(&resources), 0);
+        assert!(foreign_heap > 0);
+        let mut pairs = Vec::with_capacity(32);
+        pairs.push((local_record, (1u64.into(), 0, 0)));
+        pairs.push((foreign_record, (2u64.into(), 0, 0)));
+        let backing = pairs.capacity() * std::mem::size_of::<super::OutputPair>();
+        let mut rows = super::OutputDrainRows::memory(pairs, resources.clone());
+        assert_eq!(rows.retained_heap_bytes(&resources), backing + foreign_heap);
+        let first = rows.next().unwrap().unwrap();
+        assert_eq!(rows.retained_heap_bytes(&resources), backing + foreign_heap);
+        drop(first);
+        assert_eq!(local.used(), 0);
+        let second = rows.next().unwrap().unwrap();
+        assert_eq!(rows.retained_heap_bytes(&resources), backing);
+        assert!(rows.next().is_none());
+        assert_eq!(
+            rows.retained_heap_bytes(&resources),
+            backing,
+            "IntoIter keeps its allocation until destruction"
+        );
+        assert!(foreign.used() > 0);
+        drop(second);
+        assert_eq!(foreign.used(), 0);
+        drop(rows);
+    }
+
+    #[test]
+    fn output_memory_drain_keeps_backing_after_transferring_a_row() {
+        use clinker_record::{Record, Schema, Value};
+        let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec!["v".into()])));
+        let mut pairs = Vec::with_capacity(32);
+        for ordinal in 0..2u64 {
+            pairs.push((
+                Record::new(schema.clone(), vec![Value::String("x".repeat(1000).into())]),
+                (ordinal.into(), 0, 0),
+            ));
+        }
+        let backing = pairs.capacity() * std::mem::size_of::<super::OutputPair>();
+        let first_heap = pairs[0].0.estimated_heap_size();
+        let resources = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+        )
+        .resources()
+        .allocation()
+        .clone();
+        let mut rows = super::OutputDrainRows::memory(pairs, resources.clone());
+        let before = rows.retained_heap_bytes(&resources);
+        let first = rows.next().unwrap().unwrap();
+        assert_eq!(rows.retained_heap_bytes(&resources), before - first_heap);
+        assert!(rows.retained_heap_bytes(&resources) >= backing);
+        drop(first);
+        drop(rows);
+    }
+}
 
 /// Context carrier kept lazy until the node-kind guard has succeeded. Normal
 /// dispatch passes the live executor context directly; the feature-gated
@@ -173,7 +303,7 @@ where
     };
 
     // Combine's widened output schema — every emitted
-    // record lands on this `Arc<Schema>` so downstream
+    // record lands on this `SharedStorage<Schema>` so downstream
     // operators hit the ptr_eq fast path and
     // `Record::set` always addresses a known slot.
     let combine_output_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
@@ -596,34 +726,52 @@ where
                 // `iejoin_ctx`, so it runs on the shared Rayon pool. Row
                 // order is the deterministic `(driver order, driver_idx,
                 // build_idx)` the output sort returns, not pool scheduling.
-                let kernel = ctx.kernel_pool.install(|| {
-                    execute_combine_iejoin(IEJoinExec {
-                        name,
-                        build_qualifier: &build_qualifier,
-                        driver_records: driver_buf,
-                        build_records,
-                        decomposed,
-                        body_program: body_typed,
-                        resolver_mapping: &resolver_mapping,
-                        output_schema: combine_output_schema_arc.as_ref(),
-                        match_mode: *match_mode,
-                        on_miss: *on_miss,
-                        max_output_rows,
-                        propagate_ck,
-                        ctx: &iejoin_ctx,
-                        budget: &ctx.memory_budget,
-                        consumer: &ie_consumer_handle,
-                        spill_dir: ctx.spill_root_path.as_ref(),
-                        spill_compress: ie_spill_compress,
-                        strategy: ctx.strategy,
-                    })
-                })?;
+                let kernel = consume_materialized_inputs(
+                    [_driver_clone_reservation, _build_clone_reservation],
+                    || {
+                        let kernel = ctx.kernel_pool.install(|| {
+                            execute_combine_iejoin(IEJoinExec {
+                                allocation_resources: &ctx.allocation_resources,
+                                name,
+                                build_qualifier: &build_qualifier,
+                                driver_records: driver_buf,
+                                build_records,
+                                decomposed,
+                                body_program: body_typed,
+                                resolver_mapping: &resolver_mapping,
+                                output_schema: combine_output_schema_arc.as_ref(),
+                                match_mode: *match_mode,
+                                on_miss: *on_miss,
+                                max_output_rows,
+                                propagate_ck,
+                                ctx: &iejoin_ctx,
+                                budget: &ctx.memory_budget,
+                                consumer: &ie_consumer_handle,
+                                spill_dir: ctx.spill_root_path.as_ref(),
+                                spill_compress: ie_spill_compress,
+                                strategy: ctx.strategy,
+                            })
+                        })?;
+                        let prior = crate::executor::batch_handoff::StreamingReservation::retain(
+                            ie_consumer_handle.clone(),
+                            ctx.memory_budget.clone(),
+                            sorted_output_retained_bytes(&kernel.sorted, &ctx.allocation_resources)
+                                as u64,
+                        );
+                        Ok(OwnedKernelOutput { kernel, prior })
+                    },
+                )?;
                 // Route each deferred output-stage eval failure through the same
                 // `combine_output_row` path the inline arm uses. This MUST run
                 // before the snapshot is dropped below —
                 // `dispatch_combine_output_error` reads the installed pre-fold
                 // snapshot to rewind each contributing source's rollback cursor.
-                dispatch_combine_output_errors(ctx, node_idx, name, kernel.output_eval_failures)?;
+                dispatch_combine_output_errors(
+                    ctx,
+                    node_idx,
+                    name,
+                    kernel.kernel.output_eval_failures,
+                )?;
                 // Drain the bounded, payload-sorted output handle incrementally.
                 // When a downstream streaming Output certified this combine as
                 // its producer, the drain streams straight through the
@@ -637,8 +785,11 @@ where
                     current_dag,
                     node_idx,
                     name,
-                    kernel.sorted,
-                    kernel.row_count,
+                    OwnedSortedRows {
+                        sorted: kernel.kernel.sorted,
+                        prior: Some(kernel.prior),
+                    },
+                    kernel.kernel.row_count,
                     combined_puncts,
                 )? {
                     BlockBandDrain::Streamed(count) => {
@@ -882,6 +1033,7 @@ where
                 // deterministic order independent of pool scheduling.
                 let kernel_out = ctx.kernel_pool.install(|| {
                     execute_combine_sort_merge(SortMergeExec {
+                        allocation_resources: &ctx.allocation_resources,
                         name,
                         build_qualifier: &build_qualifier,
                         driver_records: driver_buf,
@@ -923,7 +1075,10 @@ where
                     current_dag,
                     node_idx,
                     name,
-                    sorted,
+                    OwnedSortedRows {
+                        sorted,
+                        prior: None,
+                    },
                     row_count,
                     combined_puncts,
                 )? {
@@ -1341,6 +1496,7 @@ fn run_streaming_combine_probe(
     let stable = ctx.stable;
     let source_batch_arc = ctx.source_batch_arc;
     let ingestion_timestamp = ctx.source_ingestion_timestamp;
+    let allocation_resources = ctx.allocation_resources.clone();
 
     let mut effects = StreamingProbeEffects {
         cursor_advances: Vec::new(),
@@ -1379,9 +1535,12 @@ fn run_streaming_combine_probe(
                 // Discharge this record's per-row cost — the consume half of
                 // the driver's per-batch admit. The formula matches the
                 // charge so a fully-drained stream nets to zero.
-                charge_handle.sub_bytes(crate::executor::node_buffer::record_byte_cost(
-                    record.schema().column_count(),
-                ));
+                charge_handle.sub_bytes(
+                    crate::executor::node_buffer::unaccounted_record_byte_cost(
+                        &record,
+                        &allocation_resources,
+                    ),
+                );
                 input_count += 1;
 
                 let source_file_arc = source_file_arc_of(&record);
@@ -1399,7 +1558,17 @@ fn run_streaming_combine_probe(
                     // A schema mismatch is a fatal E314 in both paths; drain
                     // to disconnect first so the driver `send` cannot
                     // deadlock, then surface.
-                    while rx.recv().is_ok() {}
+                    while let Ok(event) = rx.recv() {
+                        if let crate::executor::stream_event::StreamEvent::Record(record, _) = event
+                        {
+                            charge_handle.sub_bytes(
+                                crate::executor::node_buffer::unaccounted_record_byte_cost(
+                                    &record,
+                                    &allocation_resources,
+                                ),
+                            );
+                        }
+                    }
                     return Err(err);
                 }
 
@@ -1446,7 +1615,18 @@ fn run_streaming_combine_probe(
                         // Fatal (FailFast surfacing, on_miss::error,
                         // planner-invariant) — drain to disconnect, then
                         // surface.
-                        while rx.recv().is_ok() {}
+                        while let Ok(event) = rx.recv() {
+                            if let crate::executor::stream_event::StreamEvent::Record(record, _) =
+                                event
+                            {
+                                charge_handle.sub_bytes(
+                                    crate::executor::node_buffer::unaccounted_record_byte_cost(
+                                        &record,
+                                        &allocation_resources,
+                                    ),
+                                );
+                            }
+                        }
                         return Err(e);
                     }
                 };
@@ -1467,7 +1647,17 @@ fn run_streaming_combine_probe(
                 // and abort the materialized loop uses.
                 budget_cadence += output_records.len() - before;
                 if budget_cadence >= 10_000 && budget.should_abort() {
-                    while rx.recv().is_ok() {}
+                    while let Ok(event) = rx.recv() {
+                        if let crate::executor::stream_event::StreamEvent::Record(record, _) = event
+                        {
+                            charge_handle.sub_bytes(
+                                crate::executor::node_buffer::unaccounted_record_byte_cost(
+                                    &record,
+                                    &allocation_resources,
+                                ),
+                            );
+                        }
+                    }
                     return Err(PipelineError::MemoryBudgetExceeded {
                         node: name.to_string(),
                         used: budget.peak_rss().unwrap_or(0),
@@ -1506,11 +1696,8 @@ fn run_streaming_combine_probe(
     });
 
     // Charge bookkeeping is complete: the driver charged each batch and the
-    // probe thread discharged each record. Pin to zero defensively (a
-    // heuristic mismatch between batch charge and per-record discharge must
-    // not leave a stale positive), then unregister the per-edge charge
-    // consumer.
-    charge_handle.set_bytes(0);
+    // probe thread discharged each processed or discarded record. Unregister
+    // the per-edge consumer without masking an accounting mismatch.
     ctx.streaming_charge_consumers.remove(&producer_idx);
     ctx.memory_budget.unregister_consumer(charge_consumer_id);
 
@@ -1636,7 +1823,7 @@ struct CombineProbeKernel<'k> {
     /// Body typed program, `None` for `match: collect` (empty body) and
     /// body-less synthetic N-ary steps.
     body_program: Option<Arc<TypedProgram>>,
-    combine_output_schema: Option<Arc<clinker_record::Schema>>,
+    combine_output_schema: Option<SharedStorage<clinker_record::Schema>>,
     build_qualifier: &'k str,
     match_mode: clinker_plan::config::pipeline_node::MatchMode,
     on_miss: clinker_plan::config::pipeline_node::OnMiss,
@@ -1783,11 +1970,11 @@ impl CombineProbeKernel<'_> {
                     // filters engine-stamped columns (`$ck.*`, `$widened`)
                     // so a build record's sidecar Map payload never nests
                     // and reaches the writer as a nested Map.
-                    let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
+                    let mut m: IndexMap<OwnedKey, Value> = IndexMap::new();
                     for (fname, val) in candidate.record.iter_user_fields() {
                         m.insert(fname.into(), val.clone());
                     }
-                    arr.push(Value::Map(Box::new(m)));
+                    arr.push(Value::Map(OwnedMap::from_map(m)));
                 }
                 if truncated {
                     eprintln!(
@@ -1807,7 +1994,10 @@ impl CombineProbeKernel<'_> {
                         self.propagate_ck,
                     );
                 }
-                rec.set(self.build_qualifier, Value::Array(arr));
+                rec.set(
+                    self.build_qualifier,
+                    Value::Array(OwnedValues::from_vec(arr)),
+                );
                 self.check_output_cap(out.len())?;
                 out.push((rec, rn));
                 Ok(ProbeRowStep::Continue)
@@ -2000,7 +2190,7 @@ impl CombineProbeKernel<'_> {
                     // decomposition: the encoded output schema concatenates
                     // driver columns then build columns. Emit one record per
                     // match by concatenating value slices onto the encoded
-                    // `Arc<Schema>`. Build-side `$ck.<field>` values are
+                    // `SharedStorage<Schema>`. Build-side `$ck.<field>` values are
                     // already in the concatenated tail under their encoded
                     // names, recovered later by `widen_record_to_schema`.
                     let target_schema =
@@ -2028,7 +2218,7 @@ impl CombineProbeKernel<'_> {
                                 ),
                             });
                         }
-                        let rec = Record::new(Arc::clone(target_schema), values);
+                        let rec = Record::new(target_schema.clone(), values);
                         self.check_output_cap(out.len())?;
                         out.push((rec, rn));
                     }
@@ -2126,11 +2316,12 @@ fn drain_block_band_output(
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     combine_name: &str,
-    sorted: crate::pipeline::sort_buffer::SortedOutput<(RecordOrder, u64, u64)>,
+    owned: OwnedSortedRows,
     row_count: u64,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
 ) -> Result<BlockBandDrain, PipelineError> {
     use crate::pipeline::sort_buffer::SortedOutput;
+    let OwnedSortedRows { sorted, mut prior } = owned;
     let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
     // A window root or cross-region tee needs the whole
     // slice materialized; the traversal that decides this is walked once and
@@ -2157,18 +2348,17 @@ fn drain_block_band_output(
                 &sender,
                 batch_size,
                 combine_name,
-                pairs
-                    .into_iter()
-                    .map(|(record, (order, _, _))| Ok((record, order))),
+                OutputDrainRows::memory(pairs, ctx.allocation_resources.clone()),
                 puncts,
                 &charge,
+                prior,
             )?,
             SortedOutput::Spilled(files) => {
                 // The k-way run merge is lazy — one resident record per open
                 // run — so streaming its rows through the batcher keeps the
                 // spilled result bounded, never re-materializing the slice.
                 let merge_compress = merge_compress_for(ctx, &files, batch_size);
-                let merger = crate::pipeline::spill_merge::SortedRunMerger::new_payload_ordered(
+                let merger = crate::pipeline::spill_merge::SortedRunMerger::new_range_output(
                     files,
                     "combine payload-sorted output merge",
                     crate::pipeline::spill_merge::MergeBudget {
@@ -2182,9 +2372,10 @@ fn drain_block_band_output(
                     &sender,
                     batch_size,
                     combine_name,
-                    merger.map(|item| item.map(|(record, (order, _, _))| (record, order))),
+                    OutputDrainRows::Spilled(merger),
                     puncts,
                     &charge,
+                    prior,
                 )?
             }
         };
@@ -2201,15 +2392,21 @@ fn drain_block_band_output(
                 .into_iter()
                 .map(|(record, (order, _, _))| (record, order))
                 .collect();
+            if let Some(owner) = &mut prior {
+                owner.resize(buffered_output_bytes(&rows, &ctx.allocation_resources) as u64);
+            }
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &rows)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &rows)?;
-            admit_node_buffer(
+            crate::executor::dispatch::admit_node_buffer_with_prior_owner(
                 ctx,
                 current_dag,
                 combine_name,
                 node_idx,
-                rows,
-                puncts,
+                crate::executor::dispatch::NodeBufferAdmission::with_prior_owner(
+                    rows,
+                    puncts,
+                    prior.take(),
+                ),
                 spill_allowed,
             )?;
         }
@@ -2234,7 +2431,7 @@ fn drain_block_band_output(
                 // the whole slice; those surfaces are O(N) regardless, so
                 // re-materialize the sorted stream once and admit it in memory.
                 let merge_compress = merge_compress_for(ctx, &files, ctx.batch_size);
-                let merger = crate::pipeline::spill_merge::SortedRunMerger::new_payload_ordered(
+                let merger = crate::pipeline::spill_merge::SortedRunMerger::new_range_output(
                     files,
                     "combine payload-sorted output merge",
                     crate::pipeline::spill_merge::MergeBudget {
@@ -2246,19 +2443,37 @@ fn drain_block_band_output(
                 )?;
                 let mut rows: Vec<(Record, crate::executor::stream_event::SourceRowId)> =
                     Vec::new();
-                for item in merger {
+                let mut merger = merger;
+                let mut row_heap = 0;
+                while let Some(item) = merger.next() {
                     let (record, (order, _, _)) = item?;
+                    row_heap += record.unaccounted_heap_size(&ctx.allocation_resources);
                     rows.push((record, order));
+                    if let Some(owner) = &mut prior {
+                        owner.resize(
+                            (merger.retained_unaccounted_heap_bytes(&ctx.allocation_resources)
+                                + row_heap
+                                + rows.capacity() * std::mem::size_of::<(Record, RecordOrder)>())
+                                as u64,
+                        );
+                    }
+                }
+                drop(merger);
+                if let Some(owner) = &mut prior {
+                    owner.resize(buffered_output_bytes(&rows, &ctx.allocation_resources) as u64);
                 }
                 finalize_node_rooted_windows(ctx, current_dag, node_idx, &rows)?;
                 tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &rows)?;
-                admit_node_buffer(
+                crate::executor::dispatch::admit_node_buffer_with_prior_owner(
                     ctx,
                     current_dag,
                     combine_name,
                     node_idx,
-                    rows,
-                    puncts,
+                    crate::executor::dispatch::NodeBufferAdmission::with_prior_owner(
+                        rows,
+                        puncts,
+                        prior.take(),
+                    ),
                     spill_allowed,
                 )?;
             }
@@ -2271,54 +2486,198 @@ fn drain_block_band_output(
 /// downstream streaming `Output` over the back-pressure sink, returning the
 /// emitted row count.
 ///
-/// Mirrors [`stream_linear_producer_emit`]'s batcher idiom but pulls from a lazy
-/// sorted iterator — the resident `InMemory` pairs or the k-way
-/// `SortedRunMerger` — so a spilled result never re-materializes: at most one
-/// batch plus the merge's per-run fronts is live at once. Each `(record, order)`
-/// pushes through the [`crate::executor::batch_handoff::EventBatcher`]; a full
-/// batch is charged and routed through `charge` (which spills the batch under
-/// memory pressure) and sent to the writer thread over the bounded channel, so
-/// a slow writer back-pressures this drain. Punctuations follow the records,
-/// matching the buffered path's forwarding to the terminal writer.
+/// The output vector or merge frontier stays charged to the streaming slot
+/// while this drain owns it. Each transferred row switches atomically to the
+/// existing record-width estimate on that same counter; variable Value heap
+/// after transfer remains outside that legacy estimate. One producer batch
+/// backing is retained until routing consumes it. The bounded channel paces
+/// the drain, and punctuations follow records as on the buffered path.
 fn stream_block_band_rows(
     sender: &crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
     batch_size: usize,
     node_name: &str,
-    rows: impl Iterator<
-        Item = Result<(Record, crate::executor::stream_event::SourceRowId), PipelineError>,
-    >,
+    rows: OutputDrainRows,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
     charge: &crate::executor::batch_handoff::StreamingChargeHandle,
+    prior: Option<crate::executor::batch_handoff::StreamingReservation>,
 ) -> Result<u64, PipelineError> {
-    let mut batcher = crate::executor::batch_handoff::EventBatcher::new(
-        batch_size,
-        |batch: crate::executor::batch_handoff::EventBatch| -> Result<(), PipelineError> {
-            charge.charge_and_route(
-                batch,
-                |event: crate::executor::stream_event::StreamEvent| {
-                    sender.send(event).map_err(|_| PipelineError::Internal {
-                        op: "executor",
-                        node: node_name.to_string(),
-                        detail: String::from(
-                            "streaming Sink writer task dropped its receiver before \
-                             the block-band output drain finished",
-                        ),
-                    })
-                },
-            )
-        },
+    let batch_size = batch_size.max(1);
+    let retained = charge.retain_from_prior(
+        rows.retained_heap_bytes(charge.allocation_resources()) as u64,
+        prior,
     );
+    let mut rows = RetainedOutputDrain { rows, retained };
+    let mut batch = RetainedOutputBatch::new(batch_size, charge);
+    let route = |owned: RetainedOutputBatch| {
+        let RetainedOutputBatch {
+            batch,
+            pending,
+            container,
+        } = owned;
+        let result = charge.own_charged_batch(batch, pending).and_then(|batch| charge.route_charged_batch(batch, |event| {
+            sender.send(event).map_err(|_| PipelineError::Internal {
+                op: "executor", node: node_name.to_string(),
+                detail: "streaming Sink writer task dropped its receiver before the output drain finished".into(),
+            })
+        }));
+        drop(container);
+        result
+    };
     let mut count: u64 = 0;
-    for item in rows {
+    while let Some(item) = rows.rows.next() {
         let (record, rn) = item?;
-        batcher.push_record(record, rn)?;
+        rows.retained.transfer_row(
+            &mut batch.pending,
+            rows.rows.retained_heap_bytes(charge.allocation_resources()) as u64,
+            crate::executor::node_buffer::unaccounted_record_byte_cost(
+                &record,
+                charge.allocation_resources(),
+            ),
+        );
+        batch.batch.push_record(record, rn);
+        batch
+            .container
+            .resize(batch.batch.retained_container_overhead());
         count += 1;
+        if batch.batch.len() == batch_size {
+            route(batch)?;
+            // The routed vector is gone before the next one is allocated.
+            batch = RetainedOutputBatch::new(batch_size, charge);
+        }
     }
+    drop(rows);
     for punct in puncts {
-        batcher.push_punctuation(punct)?;
+        batch.batch.push_punctuation(punct);
+        batch
+            .container
+            .resize(batch.batch.retained_container_overhead());
+        if batch.batch.len() == batch_size {
+            route(batch)?;
+            batch = RetainedOutputBatch::new(batch_size, charge);
+        }
     }
-    batcher.finish()?;
+    route(batch)?;
     Ok(count)
+}
+
+struct OwnedKernelOutput {
+    kernel: crate::pipeline::iejoin::BlockBandOutput,
+    prior: crate::executor::batch_handoff::StreamingReservation,
+}
+struct OwnedSortedRows {
+    sorted: crate::pipeline::sort_buffer::SortedOutput<(RecordOrder, u64, u64)>,
+    prior: Option<crate::executor::batch_handoff::StreamingReservation>,
+}
+fn sorted_output_retained_bytes(
+    sorted: &crate::pipeline::sort_buffer::SortedOutput<(RecordOrder, u64, u64)>,
+    resources: &clinker_record::owned_storage::AllocationResources,
+) -> usize {
+    match sorted {
+        crate::pipeline::sort_buffer::SortedOutput::InMemory(rows) => {
+            rows.capacity() * std::mem::size_of::<OutputPair>()
+                + rows
+                    .iter()
+                    .map(|(record, _)| record.unaccounted_heap_size(resources))
+                    .sum::<usize>()
+        }
+        crate::pipeline::sort_buffer::SortedOutput::Spilled(files) => {
+            crate::pipeline::spill_merge::retained_unaccounted_spill_files_bytes(files, resources)
+        }
+    }
+}
+fn buffered_output_bytes(
+    rows: &Vec<(Record, RecordOrder)>,
+    resources: &clinker_record::owned_storage::AllocationResources,
+) -> usize {
+    rows.capacity() * std::mem::size_of::<(Record, RecordOrder)>()
+        + rows
+            .iter()
+            .map(|(record, _)| record.unaccounted_heap_size(resources))
+            .sum::<usize>()
+}
+
+type OutputPair = (Record, (RecordOrder, u64, u64));
+// Fields drop in declaration order: storage always dies before its charge.
+struct RetainedOutputDrain {
+    rows: OutputDrainRows,
+    retained: crate::executor::batch_handoff::StreamingReservation,
+}
+struct RetainedOutputBatch {
+    batch: crate::executor::batch_handoff::EventBatch,
+    pending: crate::executor::batch_handoff::StreamingReservation,
+    container: crate::executor::batch_handoff::StreamingReservation,
+}
+impl RetainedOutputBatch {
+    fn new(
+        capacity: usize,
+        charge: &crate::executor::batch_handoff::StreamingChargeHandle,
+    ) -> Self {
+        let batch = crate::executor::batch_handoff::EventBatch::with_capacity(capacity);
+        let container = charge.retain_bytes(batch.retained_container_overhead());
+        Self {
+            batch,
+            pending: charge.retain_bytes(0),
+            container,
+        }
+    }
+}
+enum OutputDrainRows {
+    Memory {
+        rows: std::vec::IntoIter<OutputPair>,
+        backing_bytes: usize,
+        record_heap_bytes: usize,
+        allocation_resources: clinker_record::owned_storage::AllocationResources,
+    },
+    Spilled(crate::pipeline::spill_merge::SortedRunMerger<(RecordOrder, u64, u64)>),
+}
+impl OutputDrainRows {
+    fn memory(
+        rows: Vec<OutputPair>,
+        resources: clinker_record::owned_storage::AllocationResources,
+    ) -> Self {
+        let backing_bytes = rows.capacity() * std::mem::size_of::<OutputPair>();
+        let record_heap_bytes = rows
+            .iter()
+            .map(|(record, _)| record.unaccounted_heap_size(&resources))
+            .sum();
+        Self::Memory {
+            rows: rows.into_iter(),
+            backing_bytes,
+            record_heap_bytes,
+            allocation_resources: resources,
+        }
+    }
+    fn retained_heap_bytes(
+        &self,
+        resources: &clinker_record::owned_storage::AllocationResources,
+    ) -> usize {
+        match self {
+            Self::Memory {
+                backing_bytes,
+                record_heap_bytes,
+                ..
+            } => *backing_bytes + *record_heap_bytes,
+            Self::Spilled(merger) => merger.retained_unaccounted_heap_bytes(resources),
+        }
+    }
+}
+impl Iterator for OutputDrainRows {
+    type Item = Result<(Record, RecordOrder), PipelineError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Memory {
+                rows,
+                record_heap_bytes,
+                allocation_resources,
+                ..
+            } => rows.next().map(|pair| {
+                *record_heap_bytes -= pair.0.unaccounted_heap_size(allocation_resources);
+                Ok(pair)
+            }),
+            Self::Spilled(merger) => merger.next(),
+        }
+        .map(|item| item.map(|(record, (order, _, _))| (record, order)))
+    }
 }
 
 /// Whether the block-band output must be fully materialized before admission: a

@@ -51,6 +51,7 @@
 //! incrementally-streamed subset. The node registers no spillable stage
 //! consumer of its own.
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, SharedStorage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -338,7 +339,7 @@ fn body_predecessor_excluding(
 /// only the rendered header differs. A body grain with no wired header keeps its
 /// ambient envelope.
 ///
-/// Records re-stamped onto the same grain share one `Arc<DocumentContext>`, so
+/// Records re-stamped onto the same grain share one `SharedStorage<DocumentContext>`, so
 /// the replacement allocates one context per replaced grain, not per record. The
 /// header `EnvelopeRecord` is cloned exactly once per grain — when that single
 /// shared context is built — never copied into an intermediate map.
@@ -393,10 +394,10 @@ fn replace_headers_by_grain(
     }
 
     // Re-stamp each matched body record with a context carrying the replacement
-    // header on the same grain. Cache one rebuilt `Arc<DocumentContext>` per
+    // header on the same grain. Cache one rebuilt `SharedStorage<DocumentContext>` per
     // grain so records of a grain share it (a refcount bump, not a re-build);
     // the header envelope is cloned exactly once, into that shared context.
-    let mut rebuilt: HashMap<DocumentGrain, Arc<DocumentContext>> = HashMap::new();
+    let mut rebuilt: HashMap<DocumentGrain, SharedStorage<DocumentContext>> = HashMap::new();
     for (record, _) in body.iter_mut() {
         let grain = record.doc_ctx().grain();
         let Some(&header_pos) = header_idx_by_grain.get(&grain) else {
@@ -404,9 +405,11 @@ fn replace_headers_by_grain(
         };
         let ctx = rebuilt.entry(grain).or_insert_with(|| {
             let replacement = header_records[header_pos].0.doc_ctx().envelope_record();
-            Arc::new(record.doc_ctx().with_replaced_envelope(replacement.clone()))
+            SharedStorage::from_arc(Arc::new(
+                record.doc_ctx().with_replaced_envelope(replacement.clone()),
+            ))
         });
-        record.set_doc_ctx(Arc::clone(ctx));
+        record.set_doc_ctx(ctx.clone());
     }
     Ok(())
 }
@@ -497,17 +500,17 @@ fn consolidate(
         })
         .unwrap_or_else(|| Arc::from(""));
 
-    let ctx = Arc::new(DocumentContext::new(
+    let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
         DocumentId::next(),
         source_file,
         consolidated_header,
-    ));
+    )));
 
     // Re-stamp every record's document context to the consolidated one in place
     // — only the grain/`$doc.*` view changes; the `$source.*` tail column is
     // untouched, so concat stays lossless on per-record provenance.
     for (record, _) in records.iter_mut() {
-        record.set_doc_ctx(Arc::clone(&ctx));
+        record.set_doc_ctx(ctx.clone());
     }
 
     // Re-frame: replace the incoming per-document boundaries with exactly one
@@ -516,10 +519,10 @@ fn consolidate(
     // that same context and retain its exact typed identity on the new close.
     let close = match structural_reject {
         Some(mut reject) => {
-            reject.record.set_doc_ctx(Arc::clone(&ctx));
-            Punctuation::structural_reject_close(Arc::clone(&ctx), reject)
+            reject.record.set_doc_ctx(ctx.clone());
+            Punctuation::structural_reject_close(ctx.clone(), reject)
         }
-        None => Punctuation::document_close(Arc::clone(&ctx)),
+        None => Punctuation::document_close(ctx.clone()),
     };
     let framing = vec![Punctuation::document_open(ctx), close];
 
@@ -537,7 +540,7 @@ fn consolidate(
 /// record (so `$source.*` / `$doc.*` ground), merges the synthesized sections
 /// into the grain's current envelope (a synthesized section overrides an
 /// existing same-named section; untouched sections ride through), and rebuilds
-/// ONE shared `Arc<DocumentContext>` per grain on the SAME grain via
+/// ONE shared `SharedStorage<DocumentContext>` per grain on the SAME grain via
 /// [`DocumentContext::with_replaced_envelope`]. Every record of the grain is
 /// re-stamped to that shared context (a refcount bump, not a rebuild), and each
 /// boundary punctuation is re-stamped to the rebuilt context for its grain.
@@ -578,7 +581,7 @@ fn synthesize_sections(
     }
 
     // One rebuilt context per grain, shared by every record/punct of the grain.
-    let mut rebuilt: HashMap<DocumentGrain, Arc<DocumentContext>> = HashMap::new();
+    let mut rebuilt: HashMap<DocumentGrain, SharedStorage<DocumentContext>> = HashMap::new();
     for grain in &grain_order {
         let indices = &indices_by_grain[grain];
         // The grain's first record grounds the header eval context and seeds the
@@ -586,14 +589,14 @@ fn synthesize_sections(
         let first_idx = indices[0];
         let base_envelope = records[first_idx].0.doc_ctx().envelope_record().clone();
 
-        let mut synthesized: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut synthesized: IndexMap<OwnedKey, Value> = IndexMap::new();
         // Footer first, header second — declaration order within each is
         // preserved by the spec's section vectors; a header section and a footer
         // section never share a name in practice, and if they did the header
         // (evaluated second) would win, matching the "header overrides" read.
         for section in &synthesis.footer {
             let payload = fold_footer_section(name, section, records, indices)?;
-            synthesized.insert(Box::from(section.section.as_str()), payload);
+            synthesized.insert(OwnedKey::from(section.section.as_str()), payload);
         }
         for section in &synthesis.header {
             let payload = eval_header_section(
@@ -603,20 +606,20 @@ fn synthesize_sections(
                 &records[first_idx].0,
                 records[first_idx].1,
             )?;
-            synthesized.insert(Box::from(section.section.as_str()), payload);
+            synthesized.insert(OwnedKey::from(section.section.as_str()), payload);
         }
 
         let merged = merge_envelope_sections(&base_envelope, synthesized);
-        let new_ctx = Arc::new(
+        let new_ctx = SharedStorage::from_arc(Arc::new(
             records[first_idx]
                 .0
                 .doc_ctx()
                 .with_replaced_envelope(merged),
-        );
-        rebuilt.insert(*grain, Arc::clone(&new_ctx));
+        ));
+        rebuilt.insert(*grain, new_ctx.clone());
 
         for &idx in indices {
-            records[idx].0.set_doc_ctx(Arc::clone(&new_ctx));
+            records[idx].0.set_doc_ctx(new_ctx.clone());
         }
     }
 
@@ -626,7 +629,7 @@ fn synthesize_sections(
     for punct in puncts.iter_mut() {
         let grain = punct.doc_ctx().grain();
         if let Some(new_ctx) = rebuilt.get(&grain) {
-            *punct = punct.clone().with_doc_ctx(Arc::clone(new_ctx));
+            *punct = punct.clone().with_doc_ctx(new_ctx.clone());
         }
     }
 
@@ -701,7 +704,7 @@ fn fold_footer_section(
         key: &[],
         slots: &slots,
     };
-    let mut fields: IndexMap<Box<str>, Value> = IndexMap::with_capacity(compiled.emits.len());
+    let mut fields: IndexMap<OwnedKey, Value> = IndexMap::with_capacity(compiled.emits.len());
     for emit in &compiled.emits {
         let value = eval_expr_in_agg_scope(&emit.residual, &scope).map_err(|e| {
             PipelineError::Internal {
@@ -713,9 +716,9 @@ fn fold_footer_section(
                 ),
             }
         })?;
-        fields.insert(Box::from(emit.output_name.as_ref()), value);
+        fields.insert(OwnedKey::from(emit.output_name.as_ref()), value);
     }
-    Ok(Value::Map(Box::new(fields)))
+    Ok(Value::Map(OwnedMap::from_map(fields)))
 }
 
 /// Evaluate one header section's scalar fields against the grain's first record
@@ -736,7 +739,7 @@ fn eval_header_section(
     let source_name = crate::executor::dispatch::source_name_arc_of(record);
     let eval_ctx = ctx.eval_ctx_for_record(&source_file, &source_name, row_num, record.doc_ctx());
 
-    let mut fields: IndexMap<Box<str>, Value> = IndexMap::with_capacity(section.fields.len());
+    let mut fields: IndexMap<OwnedKey, Value> = IndexMap::with_capacity(section.fields.len());
     for (field, expr) in &section.fields {
         let scalar = cxl::eval::compile_scalar(&section.typed, expr);
         let value = scalar
@@ -749,9 +752,9 @@ fn eval_header_section(
                     section.section
                 ),
             })?;
-        fields.insert(field.clone(), value);
+        fields.insert(OwnedKey::from_box(field.clone()), value);
     }
-    Ok(Value::Map(Box::new(fields)))
+    Ok(Value::Map(OwnedMap::from_map(fields)))
 }
 
 /// Merge synthesized sections onto a base envelope by name: every base section
@@ -761,11 +764,11 @@ fn eval_header_section(
 /// synthesis.
 fn merge_envelope_sections(
     base: &EnvelopeRecord,
-    synthesized: IndexMap<Box<str>, Value>,
+    synthesized: IndexMap<OwnedKey, Value>,
 ) -> EnvelopeRecord {
-    let mut merged: IndexMap<Box<str>, Value> = IndexMap::new();
+    let mut merged: IndexMap<OwnedKey, Value> = IndexMap::new();
     for (section_name, payload) in base.sections() {
-        merged.insert(Box::from(section_name), payload.clone());
+        merged.insert(OwnedKey::from(section_name), payload.clone());
     }
     for (section_name, payload) in synthesized {
         merged.insert(section_name, payload);
@@ -781,32 +784,35 @@ mod tests {
     use clinker_record::{Schema, SchemaBuilder, Value};
     use indexmap::IndexMap;
 
-    fn body_schema() -> Arc<Schema> {
+    fn body_schema() -> SharedStorage<Schema> {
         SchemaBuilder::with_capacity(1).with_field("id").build()
     }
 
     /// An `EnvelopeRecord` with one `interchange` section carrying `batch_id`.
     fn header_envelope(batch_id: &str) -> EnvelopeRecord {
         let mut field = IndexMap::new();
-        field.insert(Box::from("batch_id"), Value::String(batch_id.into()));
+        field.insert(OwnedKey::from("batch_id"), Value::String(batch_id.into()));
         let mut sections = IndexMap::new();
-        sections.insert(Box::from("interchange"), Value::Map(Box::new(field)));
+        sections.insert(
+            OwnedKey::from("interchange"),
+            Value::Map(OwnedMap::from_map(field)),
+        );
         EnvelopeRecord::from_sections(sections)
     }
 
     /// A document context for one file, carrying `header_batch_id` as its
     /// ambient `interchange.batch_id`. Its grain is minted from a fresh id.
-    fn doc_ctx(file: &str, header_batch_id: &str) -> Arc<DocumentContext> {
-        Arc::new(DocumentContext::new(
+    fn doc_ctx(file: &str, header_batch_id: &str) -> SharedStorage<DocumentContext> {
+        SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from(file),
             header_envelope(header_batch_id),
-        ))
+        )))
     }
 
-    fn body_record(ctx: &Arc<DocumentContext>, id: i64) -> Record {
+    fn body_record(ctx: &SharedStorage<DocumentContext>, id: i64) -> Record {
         let mut r = Record::new(body_schema(), vec![Value::Integer(id)]);
-        r.set_doc_ctx(Arc::clone(ctx));
+        r.set_doc_ctx(ctx.clone());
         r
     }
 
@@ -818,9 +824,11 @@ mod tests {
     /// (`with_replaced_envelope` preserves the grain, swaps the header). This is
     /// the shape a grain-preserving header rewrite produces: same body grain,
     /// different header values.
-    fn header_record(ctx: &Arc<DocumentContext>, replacement: EnvelopeRecord) -> Record {
+    fn header_record(ctx: &SharedStorage<DocumentContext>, replacement: EnvelopeRecord) -> Record {
         let mut r = Record::new(body_schema(), vec![Value::Integer(0)]);
-        r.set_doc_ctx(Arc::new(ctx.with_replaced_envelope(replacement)));
+        r.set_doc_ctx(SharedStorage::from_arc(Arc::new(
+            ctx.with_replaced_envelope(replacement),
+        )));
         r
     }
 
@@ -842,7 +850,7 @@ mod tests {
         };
         let records = vec![(representative, identity)];
         let puncts = vec![
-            Punctuation::document_open(Arc::clone(&input_ctx)),
+            Punctuation::document_open(input_ctx.clone()),
             Punctuation::structural_reject_close(input_ctx, reject),
         ];
 
@@ -929,7 +937,7 @@ mod tests {
         // Records of one grain share a single rebuilt context (one allocation
         // per replaced grain, not per record).
         assert!(
-            Arc::ptr_eq(body[0].0.doc_ctx(), body[1].0.doc_ctx()),
+            SharedStorage::ptr_eq(body[0].0.doc_ctx(), body[1].0.doc_ctx()),
             "the two grain-A records share one rebuilt document context"
         );
     }
@@ -964,7 +972,7 @@ mod tests {
             "grain B, having no wired header, keeps its ambient header"
         );
         assert!(
-            Arc::ptr_eq(body[1].0.doc_ctx(), &ctx_b),
+            SharedStorage::ptr_eq(body[1].0.doc_ctx(), &ctx_b),
             "an unreplaced grain keeps its original context Arc untouched"
         );
     }
@@ -1090,7 +1098,7 @@ mod tests {
             "an empty header stream leaves the ambient header in place"
         );
         assert!(
-            Arc::ptr_eq(body[0].0.doc_ctx(), &ctx_a),
+            SharedStorage::ptr_eq(body[0].0.doc_ctx(), &ctx_a),
             "an empty header stream leaves the context Arc untouched"
         );
     }

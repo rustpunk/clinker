@@ -21,9 +21,12 @@
 //! as a spill victim under sustained pressure is flushed by the
 //! dispatcher's per-node sweep through [`NodeBuffer::spill_resident_memory`].
 
+#[cfg(test)]
+use clinker_record::owned_storage::SharedStorage;
 use std::sync::Arc;
 use std::vec::IntoIter as VecIntoIter;
 
+use clinker_record::owned_storage::AllocationResources;
 use clinker_record::{Record, Value};
 
 use crate::executor::stream_event::{Punctuation, SourceRowId, StreamEvent};
@@ -39,13 +42,9 @@ pub(crate) type DrainedEvents = (Vec<(Record, SourceRowId)>, Vec<Punctuation>);
 
 /// Per-record heuristic byte cost for a record of `column_count` columns.
 ///
-/// The single source of truth every memory-accounting surface shares:
-/// `NodeBuffer::estimated_memory_bytes` (full-stage `node_buffers`
-/// admission), the dispatcher's per-batch `estimate_node_buffer_bytes`,
-/// and `EventBatch::estimated_bytes` (streaming per-batch charge). Routing
-/// all three through this fn keeps the charged byte total an operator
-/// reports to the arbitrator consistent whether its output is admitted as
-/// one full slot or streamed batch-by-batch.
+/// Full forecast for newly cloned or decoded storage. Actual resident rows
+/// use [`unaccounted_record_byte_cost`] so independently admitted slots are
+/// excluded only for the same resource authority.
 ///
 /// Counts the `Value` slots plus the `(Record, SourceRowId)` pair overhead; it is
 /// a fixed-width heuristic that ignores per-`Value` heap (string / list
@@ -54,6 +53,21 @@ pub(crate) type DrainedEvents = (Vec<(Record, SourceRowId)>, Vec<Punctuation>);
 pub(crate) fn record_byte_cost(column_count: usize) -> u64 {
     (std::mem::size_of::<Value>() * column_count + std::mem::size_of::<(Record, SourceRowId)>())
         as u64
+}
+
+/// Existing logical-slot estimate for the actual row, excluding only a values
+/// backing already charged to the supplied run. Nested payloads are outside
+/// this fixed-row heuristic; shared allocation owners account for them.
+pub(crate) fn unaccounted_record_byte_cost(
+    record: &Record,
+    resources: &AllocationResources,
+) -> u64 {
+    let slots = if record.values_are_accounted_by(resources) {
+        0
+    } else {
+        std::mem::size_of::<Value>() * record.schema().column_count()
+    };
+    (std::mem::size_of::<(Record, SourceRowId)>() + slots) as u64
 }
 
 /// One slot inside `ExecutorContext::node_buffers`.
@@ -454,17 +468,51 @@ impl NodeBuffer {
             Self::Spilled { .. } | Self::MergeSpilled { .. } => return 0,
             Self::ReReadable(backing) => backing.memory_events(),
         };
-        let mut column_count = None;
-        let mut record_count = 0u64;
-        for event in events {
-            if let StreamEvent::Record(record, _) = event {
-                column_count.get_or_insert_with(|| record.schema().column_count());
-                record_count = record_count.saturating_add(1);
+        events.iter().fold(0u64, |bytes, event| match event {
+            StreamEvent::Record(record, _) => {
+                bytes.saturating_add(record_byte_cost(record.schema().column_count()))
             }
-        }
-        column_count
-            .map(|columns| record_byte_cost(columns).saturating_mul(record_count))
-            .unwrap_or(0)
+            StreamEvent::Punctuation(_) => bytes,
+        })
+    }
+
+    /// Actual resident fixed-row attribution to this run, with each row's
+    /// private values backing classified independently. Does not allocate.
+    pub(crate) fn unaccounted_memory_bytes(&self, resources: &AllocationResources) -> u64 {
+        let events = match self {
+            Self::Memory(events) => events.as_slice(),
+            Self::Mixed { mem, .. } => mem.as_slice(),
+            Self::Spilled { .. } | Self::MergeSpilled { .. } => return 0,
+            Self::ReReadable(backing) => backing.memory_events(),
+        };
+        events.iter().fold(0u64, |bytes, event| match event {
+            StreamEvent::Record(record, _) => {
+                bytes.saturating_add(unaccounted_record_byte_cost(record, resources))
+            }
+            StreamEvent::Punctuation(_) => bytes,
+        })
+    }
+
+    /// Full logical-slot forecast for independently decoded disk rows.
+    fn disk_materialized_bytes(&self) -> u64 {
+        let chunks = match self {
+            Self::Memory(_) => return 0,
+            Self::Spilled { chunks, .. } => chunks.as_slice(),
+            Self::Mixed { spills, .. } => spills.as_slice(),
+            Self::ReReadable(backing) => backing.spill_chunks(),
+            Self::MergeSpilled {
+                runs, row_count, ..
+            } => {
+                return runs.first().map_or(0, |file| {
+                    record_byte_cost(file.schema().column_count()).saturating_mul(*row_count)
+                });
+            }
+        };
+        chunks.iter().fold(0u64, |bytes, (file, count)| {
+            bytes.saturating_add(
+                record_byte_cost(file.schema().column_count()).saturating_mul(*count),
+            )
+        })
     }
 
     /// Estimated bytes for collecting every row in one sequential scan at a
@@ -479,7 +527,23 @@ impl NodeBuffer {
     /// rows currently on disk and is used to reserve a composition port's
     /// unavoidable body-seed materialization before opening the scan.
     pub(crate) fn estimated_materialized_bytes(&self) -> u64 {
-        record_byte_cost(self.first_record_column_count()).saturating_mul(self.len_hint() as u64)
+        self.estimated_memory_bytes()
+            .saturating_add(self.disk_materialized_bytes())
+    }
+
+    /// Additional reservation for a scan with no transferred registration.
+    /// Shared backing remains charged by its original owner; only its new scan
+    /// is charged here. Owned resident storage moves without cloning its slots.
+    pub(crate) fn materialization_bytes_without_transfer(
+        &self,
+        resources: &AllocationResources,
+    ) -> u64 {
+        if matches!(self, Self::ReReadable(_)) {
+            self.estimated_materialized_bytes()
+        } else {
+            self.unaccounted_memory_bytes(resources)
+                .saturating_add(self.disk_materialized_bytes())
+        }
     }
 
     /// Bytes to reserve when a replacement path has already unregistered the
@@ -487,12 +551,16 @@ impl NodeBuffer {
     /// transfers or streams its existing storage into that collection. A
     /// still-shared re-readable buffer must additionally keep its resident
     /// backing alive while the scan clones rows from it.
-    pub(crate) fn replacement_materialization_bytes_after_unregister(&self) -> u64 {
-        let scan_bytes = self.estimated_materialized_bytes();
+    pub(crate) fn replacement_materialization_bytes_after_unregister(
+        &self,
+        resources: &AllocationResources,
+    ) -> u64 {
+        let resident_bytes = self.unaccounted_memory_bytes(resources);
         if matches!(self, Self::ReReadable(_)) {
-            scan_bytes.saturating_add(self.estimated_memory_bytes())
+            self.estimated_materialized_bytes()
+                .saturating_add(resident_bytes)
         } else {
-            scan_bytes
+            resident_bytes.saturating_add(self.disk_materialized_bytes())
         }
     }
 
@@ -507,9 +575,7 @@ impl NodeBuffer {
             Self::Spilled { .. } | Self::MergeSpilled { .. } => self.estimated_materialized_bytes(),
             // Only the disk-backed portion is absent from the existing
             // resident-tail charge.
-            Self::Mixed { .. } => self
-                .estimated_materialized_bytes()
-                .saturating_sub(self.estimated_memory_bytes()),
+            Self::Mixed { .. } => self.disk_materialized_bytes(),
             // A re-readable cursor clones resident events while the immutable
             // backing remains alive for sibling readers.
             Self::ReReadable(_) => self.estimated_materialized_bytes(),
@@ -1016,7 +1082,7 @@ impl Iterator for NodeBufferDrain {
                 if merger.is_none()
                     && let Some(files) = runs.take()
                 {
-                    match SortedRunMerger::new_payload_ordered(
+                    match SortedRunMerger::new_range_output(
                         files,
                         "combine payload-sorted output merge",
                         merge_budget.as_borrowed(),
@@ -1087,7 +1153,7 @@ impl Iterator for NodeBufferDrain {
 
 /// `MemoryConsumer` wrapper for one `ctx.node_buffers` slot. Holds an
 /// `Arc<ConsumerHandle>` shared with the dispatcher: every producer
-/// push updates `handle.bytes` to track `NodeBuffer::estimated_memory_bytes()`;
+/// admission updates `handle.bytes` from `NodeBuffer::unaccounted_memory_bytes`;
 /// every consumer drain decrements it. `try_spill` flips the handle's
 /// spill-request flag but performs no I/O itself; the dispatcher's
 /// per-node sweep `dispatch::service_node_buffer_spill_requests` reads
@@ -1160,18 +1226,15 @@ mod tests {
     use crate::executor::stream_event::{Punctuation, StreamEvent};
     use crate::pipeline::spill::SpillWriter;
 
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec!["id".into(), "v".into()]))
+    fn schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "v".into()])))
     }
 
-    fn rec(s: &Arc<Schema>, id: i64, v: &str) -> Record {
-        Record::new(
-            Arc::clone(s),
-            vec![Value::Integer(id), Value::String(v.into())],
-        )
+    fn rec(s: &SharedStorage<Schema>, id: i64, v: &str) -> Record {
+        Record::new(s.clone(), vec![Value::Integer(id), Value::String(v.into())])
     }
 
-    fn rec_event(s: &Arc<Schema>, id: i64, v: &str, rn: u64) -> StreamEvent {
+    fn rec_event(s: &SharedStorage<Schema>, id: i64, v: &str, rn: u64) -> StreamEvent {
         StreamEvent::record(rec(s, id, v), rn)
     }
 
@@ -1180,7 +1243,7 @@ mod tests {
         R: Copy + Into<SourceRowId>,
     {
         let s = if let Some(first) = rows.first() {
-            Arc::clone(first.0.schema())
+            first.0.schema().clone()
         } else {
             schema()
         };
@@ -1197,6 +1260,129 @@ mod tests {
             StreamEvent::Record(_, rn) => rn.ordinal(),
             StreamEvent::Punctuation(_) => panic!("expected Record event"),
         }
+    }
+
+    fn governed_record(resources: &AllocationResources, columns: usize) -> Record {
+        use clinker_record::owned_storage::OwnedValues;
+        let scope = resources.scope().unwrap();
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(
+            (0..columns).map(|i| format!("field_{i}").into()).collect(),
+        )));
+        let mut values = OwnedValues::try_with_capacity(columns + 3, &scope).unwrap();
+        for i in 0..columns {
+            values.try_push(Value::Integer(i as i64), &scope).unwrap();
+        }
+        Record::from_owned_values(schema, values).unwrap()
+    }
+
+    #[test]
+    fn resident_rows_classify_each_actual_vector_and_width() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        let local = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let foreign = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let resources = local.resources().allocation().clone();
+        let managed = governed_record(&resources, 2);
+        let copied = managed.clone();
+        assert!(managed.values_are_accounted_by(&resources));
+        assert!(!copied.values_are_accounted_by(&resources));
+        let external = governed_record(foreign.resources().allocation(), 3);
+        let intrinsic = local.used();
+        let foreign_intrinsic = foreign.used();
+        let pair = std::mem::size_of::<(Record, SourceRowId)>() as u64;
+        let buffer = NodeBuffer::Memory(vec![
+            StreamEvent::record(managed, 1),
+            StreamEvent::record(copied, 2),
+            StreamEvent::record(external, 3),
+        ]);
+        let relative = pair + record_byte_cost(2) + record_byte_cost(3);
+        assert_eq!(buffer.unaccounted_memory_bytes(&resources), relative);
+        assert_eq!(
+            buffer.estimated_memory_bytes(),
+            record_byte_cost(2) * 2 + record_byte_cost(3)
+        );
+        assert_eq!(
+            buffer.materialization_bytes_without_transfer(&resources),
+            relative
+        );
+        assert_eq!(
+            buffer.replacement_materialization_bytes_after_unregister(&resources),
+            relative
+        );
+        assert_eq!(buffer.transferred_materialization_overlap_bytes(), 0);
+        let (rows, _) = buffer.drain_split().unwrap();
+        assert_eq!(
+            crate::executor::dispatch::estimate_node_buffer_unaccounted_bytes(&rows, &resources),
+            relative
+        );
+        assert_eq!(local.used(), intrinsic);
+        assert_eq!(foreign.used(), foreign_intrinsic);
+        drop(rows);
+        assert_eq!(local.used(), 0);
+        assert_eq!(foreign.used(), 0);
+    }
+
+    #[test]
+    fn shared_scan_forecasts_new_slots_while_governed_backing_remains_live() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        let owner = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let resources = owner.resources().allocation().clone();
+        let record = governed_record(&resources, 2);
+        let pair = std::mem::size_of::<(Record, SourceRowId)>() as u64;
+        let mut original = NodeBuffer::Memory(vec![StreamEvent::record(record, 1)]);
+        let scan = original.reread().unwrap();
+        assert_eq!(scan.unaccounted_memory_bytes(&resources), pair);
+        assert_eq!(
+            scan.materialization_bytes_without_transfer(&resources),
+            record_byte_cost(2)
+        );
+        assert_eq!(
+            scan.replacement_materialization_bytes_after_unregister(&resources),
+            pair + record_byte_cost(2)
+        );
+        let (rows, _) = scan.drain_split().unwrap();
+        assert!(!rows[0].0.values_are_accounted_by(&resources));
+        assert!(owner.used() > 0);
+        drop(rows);
+        assert!(owner.used() > 0);
+        drop(original);
+        assert_eq!(owner.used(), 0);
+    }
+
+    #[test]
+    fn mixed_materialization_moves_governed_tail_and_charges_disk_reload() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        let owner = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let resources = owner.resources().allocation().clone();
+        let record = governed_record(&resources, 2);
+        let chunk = spill_chunk(vec![(record.clone(), 2)]);
+        let pair = std::mem::size_of::<(Record, SourceRowId)>() as u64;
+        let buffer = NodeBuffer::Mixed {
+            mem: vec![StreamEvent::record(record, 1)],
+            spills: vec![chunk],
+            pending_puncts: vec![],
+        };
+        assert_eq!(buffer.unaccounted_memory_bytes(&resources), pair);
+        assert_eq!(
+            buffer.transferred_materialization_overlap_bytes(),
+            record_byte_cost(2)
+        );
+        assert_eq!(
+            buffer.replacement_materialization_bytes_after_unregister(&resources),
+            pair + record_byte_cost(2)
+        );
+        assert_eq!(
+            buffer.estimated_materialized_bytes_for_columns(4),
+            record_byte_cost(4) * 2
+        );
+        let (rows, _) = buffer.drain_split().unwrap();
+        assert!(rows[0].0.values_are_accounted_by(&resources));
+        assert!(!rows[1].0.values_are_accounted_by(&resources));
+        assert_eq!(
+            crate::executor::dispatch::estimate_node_buffer_unaccounted_bytes(&rows, &resources),
+            pair + record_byte_cost(2)
+        );
+        drop(rows);
+        assert_eq!(owner.used(), 0);
     }
 
     #[test]
@@ -1222,7 +1408,7 @@ mod tests {
         let chunk_b = spill_chunk(vec![(rec(&s, 3, "c"), 3)]);
         let nb = NodeBuffer::Spilled {
             chunks: vec![chunk_a, chunk_b],
-            pending_puncts: vec![Punctuation::document_close(Arc::clone(&ctx))],
+            pending_puncts: vec![Punctuation::document_close(ctx.clone())],
         };
 
         assert_eq!(nb.len_hint(), 3);
@@ -1383,7 +1569,13 @@ mod tests {
         let still_shared = slot.into_authoritative();
         assert!(matches!(still_shared, NodeBuffer::ReReadable(_)));
         assert_eq!(
-            still_shared.replacement_materialization_bytes_after_unregister(),
+            still_shared.replacement_materialization_bytes_after_unregister(
+                clinker_format::preparation::MemoryOnlyResources::new(
+                    std::num::NonZeroUsize::new(1024 * 1024).unwrap()
+                )
+                .resources()
+                .allocation()
+            ),
             scan_bytes + backing_bytes
         );
 
@@ -1391,7 +1583,13 @@ mod tests {
         let authoritative = still_shared.into_authoritative();
         assert!(matches!(authoritative, NodeBuffer::Memory(_)));
         assert_eq!(
-            authoritative.replacement_materialization_bytes_after_unregister(),
+            authoritative.replacement_materialization_bytes_after_unregister(
+                clinker_format::preparation::MemoryOnlyResources::new(
+                    std::num::NonZeroUsize::new(1024 * 1024).unwrap()
+                )
+                .resources()
+                .allocation()
+            ),
             scan_bytes
         );
     }
@@ -1505,7 +1703,7 @@ mod tests {
         // Memory: record count × per-row formula; puncts don't count.
         let mem = NodeBuffer::Memory(vec![
             rec_event(&s, 1, "a", 1),
-            StreamEvent::punctuation(Punctuation::document_close(Arc::clone(&ctx))),
+            StreamEvent::punctuation(Punctuation::document_close(ctx.clone())),
             rec_event(&s, 2, "b", 2),
             rec_event(&s, 3, "c", 3),
         ]);
@@ -2057,8 +2255,18 @@ mod tests {
         // budget=1 is the spill-everything threshold; explicit flushes between
         // chunks force several individually-sorted runs. Each returned byte count
         // is charged exactly once, as the emit phase charges its runs.
-        let mut buf: SortBuffer<(SourceRowId, u64, u64)> =
-            SortBuffer::new_payload_ordered(1, None, true, s.clone());
+        let mut buf: SortBuffer<(SourceRowId, u64, u64)> = SortBuffer::new_payload_ordered(
+            1,
+            None,
+            true,
+            s.clone(),
+            clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+            )
+            .resources()
+            .allocation()
+            .clone(),
+        );
         let push_chunk = |buf: &mut SortBuffer<(SourceRowId, u64, u64)>,
                           chunk: &[(SourceRowId, u64, u64)]| {
             for &(order, driver_idx, build_idx) in chunk {
@@ -2146,8 +2354,18 @@ mod tests {
         use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 
         let s = schema();
-        let mut buffer: SortBuffer<(SourceRowId, u64, u64)> =
-            SortBuffer::new_payload_ordered(1, None, true, Arc::clone(&s));
+        let mut buffer: SortBuffer<(SourceRowId, u64, u64)> = SortBuffer::new_payload_ordered(
+            1,
+            None,
+            true,
+            s.clone(),
+            clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+            )
+            .resources()
+            .allocation()
+            .clone(),
+        );
         for (record_id, payload) in [(1, (3.into(), 1, 0)), (2, (1.into(), 2, 0))] {
             buffer.push(rec(&s, record_id, "x"), payload);
         }
@@ -2205,6 +2423,88 @@ mod tests {
             original_paths.iter().all(|path| !path.exists()),
             "the successful fold unlinks every destructive input run"
         );
+    }
+
+    #[test]
+    fn range_output_frontier_delayed_and_shared_refuse_before_rows_or_punctuation() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        for shared in [false, true] {
+            let arb = Arc::new(MemoryArbitrator::with_policy(
+                1,
+                0.8,
+                0.7,
+                Box::new(NoOpPolicy),
+            ));
+            arb.record_spill_bytes("banded", 777);
+            let (mut buffer, paths) = shared_merge_spilled_fixture(&arb);
+            let NodeBuffer::MergeSpilled { pending_puncts, .. } = &mut buffer else {
+                panic!("range runs");
+            };
+            pending_puncts.push(Punctuation::document_close(
+                clinker_record::synthetic_document_context(),
+            ));
+            assert!(arb.cumulative_spill_bytes() > 777);
+            let error = if shared {
+                buffer.reread().err().expect("shared fold must refuse")
+            } else {
+                let mut drain = buffer.drain();
+                let error = drain
+                    .next()
+                    .expect("one error")
+                    .expect_err("first output must refuse");
+                assert!(
+                    drain.next().is_none(),
+                    "failure latches before trailing punctuation"
+                );
+                assert!(drain.next().is_none());
+                error
+            };
+            let PipelineError::MemoryBudgetExceeded {
+                node,
+                used,
+                limit,
+                source,
+                detail,
+            } = error
+            else {
+                panic!("typed range refusal: {error:?}");
+            };
+            assert_eq!(node, "banded");
+            assert_eq!(limit, 1);
+            assert!(used > limit);
+            assert_eq!(source, clinker_plan::BudgetCategory::Arena);
+            assert!(detail.unwrap().contains("range output merge frontier"));
+            assert!(paths.iter().all(|p| !p.exists()));
+            assert_eq!(arb.cumulative_spill_bytes(), 777);
+        }
+    }
+
+    #[test]
+    fn range_output_frontier_delayed_open_failure_latches_and_preserves_other_charge() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            u64::MAX,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        arb.record_spill_bytes("banded", 777);
+        let (mut buffer, paths) = shared_merge_spilled_fixture(&arb);
+        let NodeBuffer::MergeSpilled { pending_puncts, .. } = &mut buffer else {
+            panic!("range runs");
+        };
+        pending_puncts.push(Punctuation::document_close(
+            clinker_record::synthetic_document_context(),
+        ));
+        assert!(arb.cumulative_spill_bytes() > 777);
+        std::fs::write(&paths[0], b"corrupt range run").unwrap();
+        let mut drain = buffer.drain();
+        let error = drain.next().unwrap().unwrap_err();
+        assert!(matches!(error, PipelineError::Io(_)));
+        assert!(error.to_string().contains("spill run open failed"));
+        assert!(drain.next().is_none());
+        assert_eq!(arb.cumulative_spill_bytes(), 777);
+        assert!(paths.iter().all(|p| !p.exists()));
     }
 
     #[test]

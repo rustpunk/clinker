@@ -64,6 +64,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ahash::RandomState;
+use clinker_record::owned_storage::SharedStorage;
 use clinker_record::{Record, Schema, Value};
 use cxl::ast::Expr;
 use cxl::eval::{EvalContext, ProgramEvaluator};
@@ -191,7 +192,7 @@ pub(crate) struct GraceHashExec<'a> {
     pub decomposed: &'a DecomposedPredicate,
     pub body_program: Option<&'a Arc<TypedProgram>>,
     pub resolver_mapping: &'a CombineResolverMapping,
-    pub output_schema: Option<&'a Arc<Schema>>,
+    pub output_schema: Option<&'a SharedStorage<Schema>>,
     pub match_mode: MatchMode,
     pub on_miss: OnMiss,
     /// Opt-in per-combine output-row cap (E325); `None` is unlimited. Enforced at
@@ -592,7 +593,7 @@ impl GraceHashExecutor {
             } => {
                 if probe_writer.is_none() {
                     *probe_writer = Some(Box::new(SpillWriter::new(
-                        Arc::clone(record.schema()),
+                        record.schema().clone(),
                         Some(&self.spill_dir),
                         self.spill_compress,
                     )?));
@@ -760,11 +761,11 @@ pub(crate) fn execute_combine_grace_hash(
 
     // Determine the build-side schema, falling back to the output schema
     // so the spill reader has something to attach even on empty input.
-    let build_schema: Arc<Schema> = build_records
+    let build_schema: SharedStorage<Schema> = build_records
         .first()
-        .map(|r| Arc::clone(r.schema()))
+        .map(|r| r.schema().clone())
         .or_else(|| output_schema.cloned())
-        .unwrap_or_else(|| Arc::new(Schema::new(Vec::new())));
+        .unwrap_or_else(|| SharedStorage::from_arc(Arc::new(Schema::new(Vec::new()))));
     let mut executor = GraceHashExecutor::new(
         partition_bits,
         spill_dir,
@@ -968,7 +969,7 @@ pub(crate) fn execute_combine_grace_hash(
         driver_extractor: &driver_extractor,
         emit: &emit_args,
         ctx,
-        build_schema: Arc::clone(&build_schema),
+        build_schema: build_schema.clone(),
         spill_dir: &spill_dir_path,
         spill_compress,
         hash_state: &hash_state,

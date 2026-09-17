@@ -91,17 +91,20 @@ pub fn compare_values(a: &Value, b: &Value) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_record::owned_storage::SharedStorage;
     use clinker_record::{MinimalRecord, Schema, Value};
     use std::sync::Arc;
 
     struct TestStorage {
-        schema: Arc<Schema>,
+        schema: SharedStorage<Schema>,
         records: Vec<MinimalRecord>,
     }
 
     impl TestStorage {
         fn new(columns: &[&str], rows: Vec<Vec<Value>>) -> Self {
-            let schema = Arc::new(Schema::new(columns.iter().map(|c| (*c).into()).collect()));
+            let schema = SharedStorage::from_arc(Arc::new(Schema::new(
+                columns.iter().map(|c| (*c).into()).collect(),
+            )));
             let records = rows.into_iter().map(MinimalRecord::new).collect();
             TestStorage { schema, records }
         }

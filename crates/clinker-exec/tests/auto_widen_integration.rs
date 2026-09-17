@@ -7,6 +7,7 @@
 //! these tests close the audit-flagged "Pattern D is wired only at
 //! source boundary; downstream paths are X% covered" gap.
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, SharedStorage};
 use std::collections::HashMap;
 use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
@@ -711,10 +712,10 @@ fn h6_value_map_round_trips_postcard() {
     use clinker_record::Value;
     use indexmap::IndexMap;
 
-    let mut sidecar: IndexMap<Box<str>, Value> = IndexMap::new();
+    let mut sidecar: IndexMap<OwnedKey, Value> = IndexMap::new();
     sidecar.insert("foo".into(), Value::String("bar".into()));
     sidecar.insert("count".into(), Value::Integer(42));
-    let original = Value::Map(Box::new(sidecar));
+    let original = Value::Map(OwnedMap::from_map(sidecar));
     let bytes = postcard::to_allocvec(&original).expect("serialize Value::Map");
     let decoded: Value = postcard::from_bytes(&bytes).expect("deserialize Value::Map");
     match decoded {
@@ -755,34 +756,44 @@ fn h6b_record_round_trips_through_sort_spill() {
     use indexmap::IndexMap;
     use std::sync::Arc;
 
-    let schema = Arc::new(Schema::new(vec!["id".into(), "$widened".into()]));
+    let schema =
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "$widened".into()])));
 
-    let mut sidecar_a: IndexMap<Box<str>, Value> = IndexMap::new();
+    let mut sidecar_a: IndexMap<OwnedKey, Value> = IndexMap::new();
     sidecar_a.insert("note".into(), Value::String("alpha".into()));
     sidecar_a.insert("count".into(), Value::Integer(1));
 
-    let mut sidecar_b: IndexMap<Box<str>, Value> = IndexMap::new();
+    let mut sidecar_b: IndexMap<OwnedKey, Value> = IndexMap::new();
     sidecar_b.insert("city".into(), Value::String("Paris".into()));
 
-    let sidecar_c: IndexMap<Box<str>, Value> = IndexMap::new();
+    let sidecar_c: IndexMap<OwnedKey, Value> = IndexMap::new();
 
     let inputs: Vec<Record> = vec![
         Record::new(
-            Arc::clone(&schema),
-            vec![Value::Integer(1), Value::Map(Box::new(sidecar_a.clone()))],
+            schema.clone(),
+            vec![
+                Value::Integer(1),
+                Value::Map(OwnedMap::from_map(sidecar_a.clone())),
+            ],
         ),
         Record::new(
-            Arc::clone(&schema),
-            vec![Value::Integer(2), Value::Map(Box::new(sidecar_b.clone()))],
+            schema.clone(),
+            vec![
+                Value::Integer(2),
+                Value::Map(OwnedMap::from_map(sidecar_b.clone())),
+            ],
         ),
         Record::new(
-            Arc::clone(&schema),
-            vec![Value::Integer(3), Value::Map(Box::new(sidecar_c.clone()))],
+            schema.clone(),
+            vec![
+                Value::Integer(3),
+                Value::Map(OwnedMap::from_map(sidecar_c.clone())),
+            ],
         ),
     ];
 
     let mut writer: SpillWriter<()> =
-        SpillWriter::new(Arc::clone(&schema), None, true).expect("open spill writer");
+        SpillWriter::new(schema.clone(), None, true).expect("open spill writer");
     for rec in &inputs {
         writer.write_record(rec).expect("spill write_record");
     }

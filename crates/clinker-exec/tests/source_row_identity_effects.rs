@@ -343,6 +343,10 @@ fn large_readers() -> SourceReaders {
 fn deliveries_match_across_resident_and_forced_spill_fanout() {
     let resident = run(&fanout_plan("1G"), large_readers(), &["audit", "report"]);
     let spilled = run(&fanout_plan("64K"), large_readers(), &["audit", "report"]);
+    assert!(
+        spilled.0.cumulative_spill_bytes > 0,
+        "fanout must exercise spill"
+    );
 
     for (label, (report, outputs)) in [("resident", resident), ("spilled", spilled)] {
         assert_eq!(report.counters.ok_count, 96, "{label}");

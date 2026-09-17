@@ -17,9 +17,9 @@
 //! ingest thread) driving a blocking `ureq` client to exhaustion, with
 //! no async runtime.
 
+use clinker_record::owned_storage::{OwnedKey, SharedStorage};
 use std::collections::HashSet;
 use std::io::Cursor;
-use std::sync::Arc;
 use std::time::Duration;
 
 use clinker_exec::pipeline::schema_coerce::CoercingReader;
@@ -67,7 +67,7 @@ pub(crate) struct RestRecordSource {
     /// Output schema = authored columns (+ `$widened` sidecar under
     /// AutoWiden). Resolved once from the declaration so every page's
     /// `CoercingReader` projects onto an identical schema.
-    output_schema: Arc<Schema>,
+    output_schema: SharedStorage<Schema>,
     /// Decoder for the page currently being drained. `None` before the
     /// first page is fetched and after the cursor exhausts.
     current_page: Option<Box<dyn FormatReader>>,
@@ -894,8 +894,8 @@ struct PageResponse {
 }
 
 impl RecordSource for RestRecordSource {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-        Ok(Arc::clone(&self.output_schema))
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+        Ok(self.output_schema.clone())
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
@@ -939,7 +939,7 @@ impl RecordSource for RestRecordSource {
     fn prepare_document(
         &mut self,
         _config: &EnvelopeConfig,
-    ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
+    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
         // Envelope sections span a whole document; a paginated REST pull
         // has no single document envelope, so it carries none.
         Ok(IndexMap::new())
@@ -954,7 +954,7 @@ impl RecordSource for RestRecordSource {
 /// `on_unmapped` policy, mirroring [`CoercingReader`]'s own output schema:
 /// the authored columns followed by the `$widened` engine-stamped sidecar
 /// column when the policy reserves it (`AutoWiden`).
-fn build_output_schema(schema_decl: &[Column], on_unmapped: &OnUnmapped) -> Arc<Schema> {
+fn build_output_schema(schema_decl: &[Column], on_unmapped: &OnUnmapped) -> SharedStorage<Schema> {
     let mut builder = SchemaBuilder::with_capacity(schema_decl.len() + 1);
     for c in schema_decl {
         builder = builder.with_field(c.name.as_str());
@@ -1124,6 +1124,7 @@ fn build_xml_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_record::owned_storage::OwnedValues;
 
     /// Which deadlines mean the peer never answered.
     ///
@@ -1457,10 +1458,10 @@ mod tests {
         let rec = reader.next_record().expect("read").expect("one record");
         assert_eq!(
             rec.get("Tag"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::String("b".into())
-            ])),
+            ]))),
             "repeated elements must collect into the declared array"
         );
     }

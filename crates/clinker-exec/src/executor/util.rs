@@ -3,9 +3,9 @@
 //! rendering, the shared grouped-node budget diagnostic, and small
 //! config/plan lookups shared across the dispatch arms.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::sync::Arc;
 
 use clinker_record::{GroupByKey, Record, Schema, SchemaBuilder};
 use indexmap::IndexMap;
@@ -146,10 +146,10 @@ pub(super) fn scheduled_pass_order(
 /// Re-project `input` onto `target`: allocate a fresh `Record` whose
 /// schema is `target`, copying over any upstream field that `target`
 /// still declares. Used at operator boundaries to canonicalize the
-/// `Arc<Schema>` on the Record so downstream `Arc::ptr_eq` checks hit
+/// `SharedStorage<Schema>` on the Record so downstream `SharedStorage::ptr_eq` checks hit
 /// the fast path.
-pub(crate) fn widen_record_to_schema(input: &Record, target: &Arc<Schema>) -> Record {
-    if Arc::ptr_eq(input.schema(), target) {
+pub(crate) fn widen_record_to_schema(input: &Record, target: &SharedStorage<Schema>) -> Record {
+    if SharedStorage::ptr_eq(input.schema(), target) {
         return input.clone();
     }
     let mut values: Vec<clinker_record::Value> = Vec::with_capacity(target.column_count());
@@ -160,12 +160,12 @@ pub(crate) fn widen_record_to_schema(input: &Record, target: &Arc<Schema>) -> Re
         };
         values.push(v);
     }
-    let mut out = Record::new(Arc::clone(target), values);
+    let mut out = Record::new(target.clone(), values);
     // Widening reshapes the schema for the same document's row; carry
     // the envelope context forward so a downstream node reading
     // `$doc.<section>.<field>` resolves against the originating
     // document rather than the empty synthetic context.
-    out.set_doc_ctx(Arc::clone(input.doc_ctx()));
+    out.set_doc_ctx(input.doc_ctx().clone());
     out
 }
 
@@ -181,7 +181,7 @@ pub(crate) fn widen_record_to_schema(input: &Record, target: &Arc<Schema>) -> Re
 /// that never declared the correlation-key field).
 fn recover_engine_stamped_value(
     input: &Record,
-    target: &Arc<Schema>,
+    target: &SharedStorage<Schema>,
     target_idx: usize,
     target_col: &str,
 ) -> clinker_record::Value {
@@ -232,7 +232,7 @@ pub(crate) fn copy_build_ck_columns(
     spec: &clinker_plan::config::pipeline_node::PropagateCkSpec,
 ) {
     use clinker_plan::config::pipeline_node::PropagateCkSpec;
-    let build_schema = Arc::clone(build.schema());
+    let build_schema = build.schema().clone();
     for (idx, col) in build_schema.columns().iter().enumerate() {
         let Some(field_name) = col.strip_prefix("$ck.") else {
             continue;
@@ -274,7 +274,7 @@ pub(crate) fn copy_build_ck_columns(
 }
 
 /// Widen `input`'s schema in place to include every key in `emitted`
-/// that is not already declared. Allocates a fresh `Arc<Schema>` only
+/// that is not already declared. Allocates a fresh `SharedStorage<Schema>` only
 /// when new names appear; otherwise clones `input`. Used by the legacy
 /// linear pipeline path where the emit set is determined at eval time
 /// rather than via a plan-time `output_schema`, and by the

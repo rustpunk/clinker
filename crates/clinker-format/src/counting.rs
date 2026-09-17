@@ -201,14 +201,17 @@ mod tests {
         let counter = SharedByteCounter::new();
         let buf: Vec<u8> = Vec::new();
         let counting = CountingWriter::new(buf, counter.clone());
-        let schema = Arc::new(Schema::new(vec!["x".into()]));
-        let csv = CsvWriter::new(counting, Arc::clone(&schema), CsvWriterConfig::default());
+        let schema =
+            clinker_record::owned_storage::SharedStorage::from_arc(Arc::new(Schema::new(vec![
+                "x".into(),
+            ])));
+        let csv = CsvWriter::new(counting, schema.clone(), CsvWriterConfig::default());
         let mut counted = CountedFormatWriter::new(Box::new(csv), counter.clone());
 
         // FormatWriter::bytes_written should return Some via the shared counter
         assert_eq!(counted.bytes_written(), Some(0));
 
-        let record = Record::new(Arc::clone(&schema), vec![Value::Integer(42)]);
+        let record = Record::new(schema.clone(), vec![Value::Integer(42)]);
         counted.write_record(&record).unwrap();
         counted.flush().unwrap();
 

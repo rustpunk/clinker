@@ -4,6 +4,7 @@
 //! records. A rejected value must become exactly one record error before any
 //! downstream node can observe a raw or substituted value.
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -30,18 +31,18 @@ use indexmap::IndexMap;
 use rust_decimal::Decimal;
 
 struct NativeReader {
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     rows: std::vec::IntoIter<Result<Vec<Value>, FormatError>>,
 }
 
 impl FormatReader for NativeReader {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-        Ok(Arc::clone(&self.schema))
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+        Ok(self.schema.clone())
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
         match self.rows.next() {
-            Some(Ok(values)) => Ok(Some(Record::new(Arc::clone(&self.schema), values))),
+            Some(Ok(values)) => Ok(Some(Record::new(self.schema.clone(), values))),
             Some(Err(error)) => Err(error),
             None => Ok(None),
         }
@@ -54,9 +55,12 @@ fn native_coercer(
     declarations: &[Column],
     pretyped: bool,
 ) -> CoercingReader {
-    let schema = Arc::new(Schema::new(
-        input_columns.iter().map(|name| Box::from(*name)).collect(),
-    ));
+    let schema = SharedStorage::from_arc(Arc::new(Schema::new(
+        input_columns
+            .iter()
+            .map(|name| OwnedKey::from(*name))
+            .collect(),
+    )));
     CoercingReader::new(
         Box::new(NativeReader {
             schema,
@@ -106,8 +110,11 @@ fn native_values() -> Vec<Value> {
                 .and_hms_opt(6, 30, 0)
                 .unwrap(),
         ),
-        Value::Array(vec![Value::Integer(1), Value::Integer(2)]),
-        Value::Map(Box::new(map)),
+        Value::Array(OwnedValues::from_vec(vec![
+            Value::Integer(1),
+            Value::Integer(2),
+        ])),
+        Value::Map(OwnedMap::from_map(map)),
     ]
 }
 
@@ -216,9 +223,12 @@ fn declared_native_type_matrix() {
         (Type::DateTime, Value::DateTime(date_time)),
         (
             Type::Array,
-            Value::Array(vec![Value::Integer(1), Value::String("two".into())]),
+            Value::Array(OwnedValues::from_vec(vec![
+                Value::Integer(1),
+                Value::String("two".into()),
+            ])),
         ),
-        (Type::Map, Value::Map(Box::new(native_map))),
+        (Type::Map, Value::Map(OwnedMap::from_map(native_map))),
         (Type::Numeric, Value::Integer(i64::MIN)),
         (Type::Numeric, Value::Float(-0.5)),
     ];
@@ -251,11 +261,11 @@ fn declared_native_type_matrix() {
         multiple: Some(true),
         ..Column::bare("value", Type::String)
     };
-    let original_array = Value::Array(vec![
+    let original_array = Value::Array(OwnedValues::from_vec(vec![
         Value::String("valid".into()),
         Value::Integer(7),
         Value::String("unreached".into()),
-    ]);
+    ]));
     let failure = reject_native(multiple, original_array.clone());
     assert_eq!(failure.original_value, original_array);
     assert_eq!(
@@ -871,6 +881,10 @@ nodes:
 
     let resident = run_with_limit("1G");
     let spilled = run_with_limit("48K");
+    assert!(
+        spilled.0.cumulative_spill_bytes > 0,
+        "ordered attempts must spill"
+    );
     assert_eq!(resident.0.counters.dlq_count, spilled.0.counters.dlq_count);
     assert_eq!(
         resident.0.per_source_record_counts,

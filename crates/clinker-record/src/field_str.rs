@@ -1,4 +1,4 @@
-//! A 24-byte field-value string with three storage arms behind one `str` API.
+//! A 24-byte field-value string with inline, shared and unique storage.
 //!
 //! `Value::String` is the dominant payload in an ETL record stream, so its
 //! width sets the per-`Value` byte cost that drives the RSS / spill threshold.
@@ -20,13 +20,16 @@
 //! `str`-delegating `Eq`/`Ord`/`Hash`/`Display`), so a shared and a unique
 //! `FieldStr` of equal content compare, sort, hash, and group/join as equal.
 //! That equivalence is what lets the unique arm be a transparent per-column
-//! footprint optimization rather than a new value domain.
+//! footprint optimization rather than a new value domain. Fallible constructors
+//! add governed shared and unique arms whose text and backing retain one complete
+//! admission through destruction. Legacy constructors and their clone allocation
+//! shapes remain unchanged; short governed text stays inline for either policy.
 //!
 //! # Layout & niche
 //!
-//! The three arms share one 24-byte footprint via a private union discriminated
+//! All arms share one 24-byte footprint via a private union discriminated
 //! by the trailing byte. The inline arm stores its length there (`0..=INLINE_CAP`);
-//! the two heap arms use the sentinel tags [`TAG_SHARED`] and [`TAG_UNIQUE`],
+//! legacy and governed heap arms use distinct sentinel tags,
 //! which are chosen above `INLINE_CAP` so they can never collide with a valid
 //! inline length. This is `FieldStr`'s own niche — it owns the tag byte outright
 //! rather than borrowing spare bits from `smol_str`'s private `InlineSize` enum,
@@ -40,6 +43,11 @@ use std::hash::{Hash, Hasher};
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::sync::Arc;
+
+use crate::owned_storage::{
+    AllocationResources, AllocationScope, OwnedText, ResourceError, ResourceErrorKind,
+    SharedAllocation, SharedAllocationError, try_box,
+};
 
 /// Maximum number of bytes stored inline (without heap allocation).
 ///
@@ -55,6 +63,8 @@ const TAG_SHARED: u8 = 0xFF;
 /// Trailing-byte tag marking the `Box<str>`-backed unique arm. Above
 /// [`INLINE_CAP`] so it never aliases a valid inline length.
 const TAG_UNIQUE: u8 = 0xFE;
+const TAG_GOVERNED_SHARED: u8 = 0xFD;
+const TAG_GOVERNED_UNIQUE: u8 = 0xFC;
 
 /// Inline arm: `len` bytes of UTF-8 in `data`, with the discriminant byte at
 /// `data[INLINE_CAP]` holding `len` (always `<= INLINE_CAP`, hence `< TAG_*`).
@@ -83,12 +93,28 @@ struct HeapHeader {
     tag: u8,
 }
 
+/// Governed arms contain actual sealed owners, never reconstructed raw handles.
+#[repr(C)]
+struct GovernedShared {
+    value: ManuallyDrop<SharedAllocation<OwnedText>>,
+    _pad: [u8; INLINE_CAP - std::mem::size_of::<SharedAllocation<OwnedText>>()],
+    tag: u8,
+}
+#[repr(C)]
+struct GovernedUnique {
+    value: ManuallyDrop<Box<OwnedText>>,
+    _pad: [u8; INLINE_CAP - std::mem::size_of::<Box<OwnedText>>()],
+    tag: u8,
+}
+
 /// 24-byte union of the inline and heap representations, discriminated by the
 /// trailing `tag` byte both arms share at offset [`INLINE_CAP`].
 #[repr(C)]
 union Repr {
     inline: Inline,
     heap: HeapHeader,
+    governed_shared: ManuallyDrop<GovernedShared>,
+    governed_unique: ManuallyDrop<GovernedUnique>,
 }
 
 /// A field-value string stored inline, `Arc`-shared, or `Box`-unique behind a
@@ -98,9 +124,9 @@ pub struct FieldStr {
     repr: Repr,
 }
 
-// SAFETY: `FieldStr` owns either inline bytes, an `Arc<str>`, or a `Box<str>`.
-// All three are `Send`/`Sync` (`Arc<str>: Send + Sync`, `Box<str>: Send + Sync`),
-// and the raw `*const u8` is only ever reconstituted back into its owning smart
+// SAFETY: `FieldStr` owns inline bytes, legacy `Arc<str>`/`Box<str>`, or sealed
+// shared/unique OwnedText storage. OwnedText and its authority are Send + Sync.
+// The legacy raw `*const u8` is only ever reconstituted into its owning smart
 // pointer, never shared as a bare pointer, so the auto-trait reasoning matches
 // the owned-pointer arms. The inline arm holds only `Copy` bytes.
 unsafe impl Send for FieldStr {}
@@ -112,18 +138,91 @@ const _: () = {
     // The whole design rests on the 24-byte footprint: a wider `FieldStr` would
     // push `Value` past 32 bytes and inflate the per-`Value` cost model.
     assert!(std::mem::size_of::<FieldStr>() == 24);
-    // The discriminant byte must occupy the same offset in both arms, so reading
-    // `tag` through either union field always reads the live discriminant. Both
+    // The discriminant byte must occupy the same offset in every arm, so reading
+    // `tag` through the inline field always reads the live discriminant. All
     // arms are `#[repr(C)]` with `tag` last; this pins that they coincide.
     assert!(std::mem::offset_of!(Inline, tag) == INLINE_CAP);
     assert!(std::mem::offset_of!(HeapHeader, tag) == INLINE_CAP);
-    // The two heap tags must sit outside the inline-length range so the
+    assert!(std::mem::offset_of!(GovernedShared, tag) == INLINE_CAP);
+    assert!(std::mem::offset_of!(GovernedUnique, tag) == INLINE_CAP);
+    assert!(std::mem::size_of::<GovernedShared>() == 24);
+    assert!(std::mem::size_of::<GovernedUnique>() == 24);
+    // All heap tags must sit outside the inline-length range so the
     // discriminant is unambiguous.
     assert!(TAG_SHARED as usize > INLINE_CAP);
     assert!(TAG_UNIQUE as usize > INLINE_CAP);
+    assert!(TAG_GOVERNED_UNIQUE as usize > INLINE_CAP);
+    assert!(TAG_GOVERNED_SHARED as usize > TAG_GOVERNED_UNIQUE as usize);
+    assert!(TAG_UNIQUE as usize > TAG_GOVERNED_SHARED as usize);
+    assert!(TAG_SHARED as usize > TAG_UNIQUE as usize);
 };
 
 impl FieldStr {
+    /// Copy validated UTF-8 into admitted inline-or-shared storage. Inline text
+    /// allocates nothing; long text reserves both bytes and shared backing before
+    /// allocation. Detached clones retain that admission until the final alias
+    /// is destroyed. This does not retain the scope or provide mutable storage.
+    pub fn try_new(text: &str, scope: &AllocationScope) -> Result<Self, ResourceError> {
+        scope.check_cancelled()?;
+        if text.len() <= INLINE_CAP {
+            return Ok(Self::new_inline(text));
+        }
+        let layout = SharedAllocation::<OwnedText>::layout()
+            .map_err(|_| ResourceError::new(ResourceErrorKind::Layout, text.len(), 0))?;
+        let payload = OwnedText::try_new(text, scope, layout)?;
+        let value = SharedAllocation::try_new(payload).map_err(|error| {
+            ResourceError::new(
+                match error {
+                    SharedAllocationError::Layout => ResourceErrorKind::Layout,
+                    SharedAllocationError::Allocation => ResourceErrorKind::Allocation,
+                },
+                layout.size(),
+                0,
+            )
+        })?;
+        Ok(Self::from_governed_shared(value))
+    }
+
+    /// Copy validated UTF-8 into admitted inline-or-unique storage. Unlike the
+    /// legacy `new_unique`, short input remains inline. Long input retains its
+    /// byte and holder admission until destruction. An ordinary clone creates
+    /// a distinct legacy unique allocation and never copies the original lease.
+    pub fn try_new_unique(text: &str, scope: &AllocationScope) -> Result<Self, ResourceError> {
+        scope.check_cancelled()?;
+        if text.len() <= INLINE_CAP {
+            return Ok(Self::new_inline(text));
+        }
+        let payload = OwnedText::try_new(text, scope, std::alloc::Layout::new::<OwnedText>())?;
+        let value = match try_box(payload) {
+            Ok(value) => value,
+            Err((error, payload)) => {
+                drop(payload);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            repr: Repr {
+                governed_unique: ManuallyDrop::new(GovernedUnique {
+                    value: ManuallyDrop::new(value),
+                    _pad: [0; INLINE_CAP - std::mem::size_of::<Box<OwnedText>>()],
+                    tag: TAG_GOVERNED_UNIQUE,
+                }),
+            },
+        })
+    }
+
+    fn from_governed_shared(value: SharedAllocation<OwnedText>) -> Self {
+        Self {
+            repr: Repr {
+                governed_shared: ManuallyDrop::new(GovernedShared {
+                    value: ManuallyDrop::new(value),
+                    _pad: [0; INLINE_CAP - std::mem::size_of::<SharedAllocation<OwnedText>>()],
+                    tag: TAG_GOVERNED_SHARED,
+                }),
+            },
+        }
+    }
+
     /// Constructs a `FieldStr` choosing inline storage when the value fits,
     /// otherwise the `Arc`-shared arm. This is the default policy: identical
     /// to `smol_str`'s inline-or-shared split, so default-constructed field
@@ -209,16 +308,23 @@ impl FieldStr {
         }
     }
 
-    /// Returns the discriminant byte both arms share at offset [`INLINE_CAP`].
+    /// Returns the discriminant byte all arms share at offset [`INLINE_CAP`].
     #[inline]
     fn tag(&self) -> u8 {
-        // SAFETY: `tag` lives at the same `#[repr(C)]` offset in both union
-        // arms (`Inline::tag` and `HeapHeader::tag`), so reading it through
-        // either field is well-defined regardless of which arm is active.
+        // SAFETY: `tag` lives at the same `#[repr(C)]` offset in every union
+        // arm, so the inline field reads the active discriminant.
         unsafe { self.repr.inline.tag }
     }
 
     /// Borrows the value as a `str`. The single read path for every arm.
+    /// The borrow cannot outlive the owning value, including governed storage.
+    ///
+    /// ```compile_fail
+    /// use clinker_record::FieldStr;
+    /// fn escape(value: FieldStr) -> &'static str {
+    ///     value.as_str()
+    /// }
+    /// ```
     #[inline]
     pub fn as_str(&self) -> &str {
         let tag = self.tag();
@@ -229,6 +335,12 @@ impl FieldStr {
                 let inline = &self.repr.inline;
                 std::str::from_utf8_unchecked(&inline.data[..tag as usize])
             }
+        } else if tag == TAG_GOVERNED_SHARED {
+            // SAFETY: tag selects the initialized owner, borrowed through self.
+            unsafe { self.repr.governed_shared.value.as_str() }
+        } else if tag == TAG_GOVERNED_UNIQUE {
+            // SAFETY: tag selects the initialized owner, borrowed through self.
+            unsafe { self.repr.governed_unique.value.as_str() }
         } else {
             // SAFETY: heap arm — `ptr`/`len` were produced by `Arc::into_raw` /
             // `Box::into_raw` on a `str`, so the bytes are live, owned by this
@@ -244,17 +356,55 @@ impl FieldStr {
 
     /// Heap bytes owned by this value, excluding the 24-byte `FieldStr` itself.
     ///
-    /// Inline values own no heap (`0`). Both heap arms charge their UTF-8 byte
+    /// Inline values own no heap (`0`). Legacy heap arms count their UTF-8 byte
     /// length; the model deliberately ignores the `Arc` header for the shared
     /// arm (consistent with the pre-existing `SmolStr` accounting) and the unique
-    /// arm has no header to charge. Drives `SortBuffer`'s self-tracking budget.
+    /// arm has no header to charge. Governed arms report their complete admitted
+    /// text-plus-backing layouts; aliases refer to the same physical allocation.
     #[inline]
     pub fn heap_size(&self) -> usize {
         if self.tag() <= INLINE_CAP as u8 {
             0
+        } else if self.tag() == TAG_GOVERNED_SHARED {
+            // SAFETY: tag selects the initialized shared owner.
+            unsafe { self.repr.governed_shared.value.heap_size() }
+        } else if self.tag() == TAG_GOVERNED_UNIQUE {
+            // SAFETY: tag selects the initialized unique owner.
+            unsafe { self.repr.governed_unique.value.heap_size() }
         } else {
             // SAFETY: heap arm — `len` is valid in both heap representations.
             unsafe { self.repr.heap.len }
+        }
+    }
+
+    /// Heap not already charged to the supplied live aggregate ledger.
+    pub fn unaccounted_heap_size(&self, resources: &AllocationResources) -> usize {
+        match self.tag() {
+            // SAFETY: each tag selects its initialized owning union member;
+            // this only borrows the owner and cannot release or transfer it.
+            TAG_GOVERNED_SHARED => unsafe {
+                self.repr
+                    .governed_shared
+                    .value
+                    .unaccounted_heap_size(resources)
+            },
+            TAG_GOVERNED_UNIQUE => unsafe {
+                self.repr
+                    .governed_unique
+                    .value
+                    .unaccounted_heap_size(resources)
+            },
+            _ => self.heap_size(),
+        }
+    }
+    /// Text heap contribution for a legacy consumer that separately accounts
+    /// its containing slots. Governed storage retains its own complete charge,
+    /// so contributes zero here. A distinct ordinary unique clone remains a
+    /// legacy allocation and contributes its byte length.
+    pub fn legacy_heap_size(&self) -> usize {
+        match self.tag() {
+            TAG_GOVERNED_SHARED | TAG_GOVERNED_UNIQUE => 0,
+            _ => self.heap_size(),
         }
     }
 
@@ -267,14 +417,25 @@ impl FieldStr {
     #[cfg(test)]
     #[inline]
     pub(crate) fn is_unique(&self) -> bool {
-        self.tag() == TAG_UNIQUE
+        matches!(self.tag(), TAG_UNIQUE | TAG_GOVERNED_UNIQUE)
     }
 }
 
 impl Drop for FieldStr {
     fn drop(&mut self) {
         let tag = self.tag();
-        if tag == TAG_SHARED {
+        if tag == TAG_GOVERNED_SHARED {
+            // SAFETY: tag selects the sole initialized owner in this union.
+            // The sealed wrapper frees backing, then payload, then admission.
+            unsafe {
+                ManuallyDrop::drop(&mut (*self.repr.governed_shared).value);
+            }
+        } else if tag == TAG_GOVERNED_UNIQUE {
+            // SAFETY: take the initialized Box exactly once. Moving its payload
+            // out frees the holder before text and lease destruction below.
+            let payload = unsafe { *ManuallyDrop::take(&mut (*self.repr.governed_unique).value) };
+            drop(payload);
+        } else if tag == TAG_SHARED {
             // SAFETY: the shared arm owns one `Arc<str>` strong count produced by
             // `Arc::into_raw`. Reconstitute the fat pointer from `ptr`/`len` and
             // let the `Arc` drop, releasing exactly that one count.
@@ -307,6 +468,10 @@ impl Clone for FieldStr {
                     inline: unsafe { self.repr.inline },
                 },
             }
+        } else if tag == TAG_GOVERNED_SHARED {
+            // SAFETY: tag selects the live sealed owner; clone only bumps its
+            // library reference count and retains the same payload and lease.
+            Self::from_governed_shared(unsafe { (*self.repr.governed_shared.value).clone() })
         } else if tag == TAG_SHARED {
             // SAFETY: shared arm — reconstitute the `Arc` to bump its strong
             // count, then re-leak both the original (via `ManuallyDrop`, so this

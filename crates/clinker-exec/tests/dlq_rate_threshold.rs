@@ -8,6 +8,7 @@
 //! attribution and the per-source threshold can be exercised in
 //! isolation against `src_b`'s denominator.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -302,12 +303,12 @@ fn per_source_path_partitions_dlq_entries() {
     use clinker_plan::plan::{EntityRef, PlanNodeId};
     use clinker_record::{Record, Schema, Value};
 
-    let schema = Arc::new(Schema::new(vec!["id".into()]));
+    let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into()])));
     let mk = |src: &str| DlqEntry {
         source_row: SourceRowId::new(PlanNodeId::new(0), 0),
         category: DlqErrorCategory::TypeCoercionFailure,
         error_message: String::new(),
-        original_record: Record::new(Arc::clone(&schema), vec![Value::Integer(0)]),
+        original_record: Record::new(schema.clone(), vec![Value::Integer(0)]),
         stage: None,
         route: None,
         trigger: true,

@@ -5,7 +5,7 @@
 //! column set are properties of the grammar rather than of either writer. A
 //! change that made one writer disagree with the other would fail here.
 
-use std::sync::Arc;
+use clinker_record::owned_storage::{OwnedMap, OwnedValues, SharedStorage};
 
 use clinker_format::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
 use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
@@ -14,11 +14,11 @@ use clinker_record::schema::FieldMetadata;
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
 use indexmap::IndexMap;
 
-fn schema_of(columns: &[&str]) -> Arc<Schema> {
+fn schema_of(columns: &[&str]) -> SharedStorage<Schema> {
     columns.iter().copied().collect::<SchemaBuilder>().build()
 }
 
-fn write_json(schema: &Arc<Schema>, values: Vec<Value>, preserve_nulls: bool) -> String {
+fn write_json(schema: &SharedStorage<Schema>, values: Vec<Value>, preserve_nulls: bool) -> String {
     let config = JsonWriterConfig {
         format: JsonOutputMode::Ndjson,
         preserve_nulls,
@@ -26,8 +26,8 @@ fn write_json(schema: &Arc<Schema>, values: Vec<Value>, preserve_nulls: bool) ->
     };
     let mut buf = Vec::new();
     {
-        let mut w = JsonWriter::new(&mut buf, Arc::clone(schema), config);
-        w.write_record(&Record::new(Arc::clone(schema), values))
+        let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
+        w.write_record(&Record::new(schema.clone(), values))
             .expect("json record writes");
         w.flush().expect("json writer flushes");
     }
@@ -37,15 +37,15 @@ fn write_json(schema: &Arc<Schema>, values: Vec<Value>, preserve_nulls: bool) ->
         .to_string()
 }
 
-fn write_xml(schema: &Arc<Schema>, values: Vec<Value>, preserve_nulls: bool) -> String {
+fn write_xml(schema: &SharedStorage<Schema>, values: Vec<Value>, preserve_nulls: bool) -> String {
     let config = XmlWriterConfig {
         preserve_nulls,
         ..Default::default()
     };
     let mut buf = Vec::new();
     {
-        let mut w = XmlWriter::new(&mut buf, Arc::clone(schema), config);
-        w.write_record(&Record::new(Arc::clone(schema), values))
+        let mut w = XmlWriter::new(&mut buf, schema.clone(), config);
+        w.write_record(&Record::new(schema.clone(), values))
             .expect("xml record writes");
         w.flush().expect("xml writer flushes");
     }
@@ -54,22 +54,20 @@ fn write_xml(schema: &Arc<Schema>, values: Vec<Value>, preserve_nulls: bool) -> 
 
 /// The error each writer raises for the same column set, or `None` when it
 /// accepted the set.
-fn refusal(schema: &Arc<Schema>, values: Vec<Value>) -> (Option<FormatError>, Option<FormatError>) {
+fn refusal(
+    schema: &SharedStorage<Schema>,
+    values: Vec<Value>,
+) -> (Option<FormatError>, Option<FormatError>) {
     let mut json_buf = Vec::new();
     let json = {
-        let mut w = JsonWriter::new(
-            &mut json_buf,
-            Arc::clone(schema),
-            JsonWriterConfig::default(),
-        );
-        w.write_record(&Record::new(Arc::clone(schema), values.clone()))
+        let mut w = JsonWriter::new(&mut json_buf, schema.clone(), JsonWriterConfig::default());
+        w.write_record(&Record::new(schema.clone(), values.clone()))
             .err()
     };
     let mut xml_buf = Vec::new();
     let xml = {
-        let mut w = XmlWriter::new(&mut xml_buf, Arc::clone(schema), XmlWriterConfig::default());
-        w.write_record(&Record::new(Arc::clone(schema), values))
-            .err()
+        let mut w = XmlWriter::new(&mut xml_buf, schema.clone(), XmlWriterConfig::default());
+        w.write_record(&Record::new(schema.clone(), values)).err()
     };
     (json, xml)
 }
@@ -171,7 +169,7 @@ fn an_engine_stamped_column_expands_by_the_same_rule() {
         )
         .build();
     let values = vec![Value::Integer(5), Value::String("C-1".into())];
-    let record = || Record::new(Arc::clone(&schema), values.clone());
+    let record = || Record::new(schema.clone(), values.clone());
 
     let mut json_buf = Vec::new();
     {
@@ -180,7 +178,7 @@ fn an_engine_stamped_column_expands_by_the_same_rule() {
             include_engine_stamped: true,
             ..Default::default()
         };
-        let mut w = JsonWriter::new(&mut json_buf, Arc::clone(&schema), config);
+        let mut w = JsonWriter::new(&mut json_buf, schema.clone(), config);
         w.write_record(&record()).expect("json accepts `$ck`");
         w.flush().expect("json flushes");
     }
@@ -194,7 +192,7 @@ fn an_engine_stamped_column_expands_by_the_same_rule() {
         include_engine_stamped: true,
         ..Default::default()
     };
-    let mut w = XmlWriter::new(&mut xml_buf, Arc::clone(&schema), config);
+    let mut w = XmlWriter::new(&mut xml_buf, schema.clone(), config);
     let err = w
         .write_record(&record())
         .expect_err("XML has no well-formed name for `$ck`");
@@ -228,13 +226,13 @@ fn native_nested_values_keep_order_and_format_specific_xml_roles() {
     payload.insert("#text".into(), Value::String("before".into()));
     payload.insert(
         "item".into(),
-        Value::Array(vec![
-            Value::Map(Box::new(first)),
-            Value::Map(Box::new(second)),
-        ]),
+        Value::Array(OwnedValues::from_vec(vec![
+            Value::Map(OwnedMap::from_map(first)),
+            Value::Map(OwnedMap::from_map(second)),
+        ])),
     );
     payload.insert("tail".into(), Value::String("after".into()));
-    let value = Value::Map(Box::new(payload));
+    let value = Value::Map(OwnedMap::from_map(payload));
 
     assert_eq!(
         write_json(&schema, vec![value.clone()], false),
@@ -252,30 +250,29 @@ fn escaped_nested_keys_decode_for_json_and_are_validated_before_output() {
     let mut payload = IndexMap::new();
     payload.insert("\\@literal".into(), Value::Integer(1));
     assert_eq!(
-        write_json(&schema, vec![Value::Map(Box::new(payload))], false),
+        write_json(
+            &schema,
+            vec![Value::Map(OwnedMap::from_map(payload))],
+            false
+        ),
         r#"{"payload":{"@literal":1}}"#
     );
 
     let mut duplicate = IndexMap::new();
     duplicate.insert("@id".into(), Value::Integer(1));
     duplicate.insert("\\@id".into(), Value::Integer(2));
-    let record = Record::new(Arc::clone(&schema), vec![Value::Map(Box::new(duplicate))]);
-    let mut json_buf = Vec::new();
-    let mut json = JsonWriter::new(
-        &mut json_buf,
-        Arc::clone(&schema),
-        JsonWriterConfig::default(),
+    let record = Record::new(
+        schema.clone(),
+        vec![Value::Map(OwnedMap::from_map(duplicate))],
     );
+    let mut json_buf = Vec::new();
+    let mut json = JsonWriter::new(&mut json_buf, schema.clone(), JsonWriterConfig::default());
     assert!(json.write_record(&record).is_err());
     drop(json);
     assert!(json_buf.is_empty());
 
     let mut xml_buf = Vec::new();
-    let mut xml = XmlWriter::new(
-        &mut xml_buf,
-        Arc::clone(&schema),
-        XmlWriterConfig::default(),
-    );
+    let mut xml = XmlWriter::new(&mut xml_buf, schema.clone(), XmlWriterConfig::default());
     assert!(xml.write_record(&record).is_err());
     drop(xml);
     assert!(xml_buf.is_empty());
@@ -286,26 +283,18 @@ fn both_recursive_writers_reject_depth_cap_plus_one_before_output() {
     let schema = schema_of(&["payload"]);
     let mut value = Value::Null;
     for _ in 0..=clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH {
-        value = Value::Array(vec![value]);
+        value = Value::Array(OwnedValues::from_vec(vec![value]));
     }
-    let record = Record::new(Arc::clone(&schema), vec![value]);
+    let record = Record::new(schema.clone(), vec![value]);
 
     let mut json_buf = Vec::new();
-    let mut json = JsonWriter::new(
-        &mut json_buf,
-        Arc::clone(&schema),
-        JsonWriterConfig::default(),
-    );
+    let mut json = JsonWriter::new(&mut json_buf, schema.clone(), JsonWriterConfig::default());
     assert!(json.write_record(&record).is_err());
     drop(json);
     assert!(json_buf.is_empty());
 
     let mut xml_buf = Vec::new();
-    let mut xml = XmlWriter::new(
-        &mut xml_buf,
-        Arc::clone(&schema),
-        XmlWriterConfig::default(),
-    );
+    let mut xml = XmlWriter::new(&mut xml_buf, schema.clone(), XmlWriterConfig::default());
     assert!(xml.write_record(&record).is_err());
     drop(xml);
     assert!(xml_buf.is_empty());

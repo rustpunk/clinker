@@ -1,13 +1,13 @@
 //! Document-level envelope context shared per source file.
 //!
 //! A [`DocumentContext`] is built once per file (per document) by the
-//! source reader's envelope pre-scan, then attached as `Arc<DocumentContext>`
+//! source reader's envelope pre-scan, then attached as `SharedStorage<DocumentContext>`
 //! to every body record emitted from that document. CXL `$doc.<section>.<field>`
 //! expressions resolve against the [`EnvelopeRecord`] held on this struct.
 //!
 //! The envelope is modeled with the same [`Schema`] + [`Value`] machinery as a
 //! body record: one column per declared section, each value the section's
-//! `Value::Map` payload. One [`Arc<Schema>`] backs the envelope, so the ambient
+//! `Value::Map` payload. One [`SharedStorage<Schema>`] backs the envelope, so the ambient
 //! `$doc` view (this module) and any node-input view a downstream consolidation
 //! node takes borrow the SAME record rather than a re-encoding.
 //!
@@ -18,6 +18,10 @@
 //! streams, so all `$doc.*` values are available on every body record
 //! throughout the body stream.
 
+use crate::owned_storage::{
+    AllocationResources, AllocationScope, OwnedKey, OwnedValues, ResourceError, SharedStorage,
+};
+use crate::record::RecordWidthError;
 use crate::schema::Schema;
 use crate::value::Value;
 use indexmap::IndexMap;
@@ -118,7 +122,7 @@ impl DocumentGrain {
 /// section payload's `Value::Map` shape is implicit in the value, not the
 /// schema.
 ///
-/// The whole record is held behind ONE [`Arc<Schema>`]: the ambient `$doc`
+/// The whole record is held behind ONE [`SharedStorage<Schema>`]: the ambient `$doc`
 /// resolver reads it through [`DocumentContext::get_section_field`], and a
 /// downstream consolidation node borrows the same record (via a crate-internal
 /// accessor that goes public with the Envelope node) — neither re-encodes it.
@@ -131,29 +135,43 @@ impl DocumentGrain {
 /// control number).
 #[derive(Debug, Clone)]
 pub struct EnvelopeRecord {
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     /// Section payloads, positional and parallel to `schema.columns()`. Each
     /// is the section's `Value::Map` (or, for a malformed reader emission, some
     /// other `Value`, which `$doc` field access treats as a miss).
-    sections: Vec<Value>,
+    sections: OwnedValues,
 }
 
 impl EnvelopeRecord {
+    /// Move exact-width section slots, preserving their independent owners.
+    pub fn from_owned_values(
+        schema: SharedStorage<Schema>,
+        sections: OwnedValues,
+    ) -> Result<Self, RecordWidthError> {
+        if schema.column_count() != sections.len() {
+            return Err(RecordWidthError {
+                expected: schema.column_count(),
+                actual: sections.len(),
+            });
+        }
+        Ok(Self { schema, sections })
+    }
+
     /// Build an envelope record from the reader/driver's ordered section map.
     ///
     /// The schema columns are the section names in insertion order; the values
     /// are the section payloads positionally. Keeps reader/driver population a
     /// one-line wrap over the `IndexMap` the pre-scan already produces.
-    pub fn from_sections(sections: IndexMap<Box<str>, Value>) -> Self {
-        let mut columns: Vec<Box<str>> = Vec::with_capacity(sections.len());
+    pub fn from_sections(sections: IndexMap<OwnedKey, Value>) -> Self {
+        let mut columns: Vec<OwnedKey> = Vec::with_capacity(sections.len());
         let mut values: Vec<Value> = Vec::with_capacity(sections.len());
         for (name, payload) in sections {
             columns.push(name);
             values.push(payload);
         }
         Self {
-            schema: Arc::new(Schema::new(columns)),
-            sections: values,
+            schema: SharedStorage::from_arc(Arc::new(Schema::new(columns))),
+            sections: OwnedValues::from_vec(values),
         }
     }
 
@@ -175,8 +193,8 @@ impl EnvelopeRecord {
     /// Used for synthetic / zero-body contexts.
     pub fn empty() -> Self {
         Self {
-            schema: Arc::new(Schema::new(Vec::new())),
-            sections: Vec::new(),
+            schema: SharedStorage::from_arc(Arc::new(Schema::new(Vec::new()))),
+            sections: OwnedValues::from_vec(Vec::new()),
         }
     }
 
@@ -207,7 +225,7 @@ impl EnvelopeRecord {
 
     /// Borrow a section's inner field map in declared order, or `None` when the
     /// section is undeclared or its payload is not a [`Value::Map`].
-    fn field_map(&self, section: &str) -> Option<&IndexMap<Box<str>, Value>> {
+    fn field_map(&self, section: &str) -> Option<&IndexMap<OwnedKey, Value>> {
         match self.section_value(section)? {
             Value::Map(m) => Some(m),
             _ => None,
@@ -271,7 +289,7 @@ impl EnvelopeRecord {
     fn section_payload_eq(a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Map(am), Value::Map(bm)) => {
-                let user_key_count = |m: &IndexMap<Box<str>, Value>| {
+                let user_key_count = |m: &IndexMap<OwnedKey, Value>| {
                     m.keys().filter(|k| !k.starts_with('$')).count()
                 };
                 if user_key_count(am) != user_key_count(bm) {
@@ -291,7 +309,7 @@ impl EnvelopeRecord {
     /// payload; a fresh child section appends after the ancestors — the order
     /// an insertion-ordered map union produces.
     ///
-    /// Reuses an existing `Arc<Schema>` instead of rebuilding one wherever the
+    /// Reuses an existing `SharedStorage<Schema>` instead of rebuilding one wherever the
     /// merge cannot change the section list: an empty child keeps the
     /// ancestor's schema outright (the per-message grain mint passes an empty
     /// child, so a K-message file would otherwise rebuild the flattened
@@ -305,7 +323,7 @@ impl EnvelopeRecord {
         if self.is_empty() {
             return child;
         }
-        let mut columns: Vec<Box<str>> =
+        let mut columns: Vec<OwnedKey> =
             Vec::with_capacity(self.sections.len() + child.sections.len());
         let mut values: Vec<Value> = Vec::with_capacity(self.sections.len() + child.sections.len());
         columns.extend(self.schema.columns().iter().cloned());
@@ -328,8 +346,8 @@ impl EnvelopeRecord {
         // duplicate-free, and every child name already present on the
         // ancestor overwrote its payload in place rather than appending.
         EnvelopeRecord {
-            schema: Arc::new(Schema::new(columns)),
-            sections: values,
+            schema: SharedStorage::from_arc(Arc::new(Schema::new(columns))),
+            sections: OwnedValues::from_vec(values),
         }
     }
 }
@@ -338,7 +356,7 @@ impl EnvelopeRecord {
 /// same section names in the same order and each section's payload compares
 /// byte-for-byte equal — engine-injected keys included.
 ///
-/// The section-name list (`schema.columns()`, a `[Box<str>]`) is compared
+/// The section-name list (`schema.columns()`, an `[OwnedKey]`) is compared
 /// positionally, so the same sections in a different declared order are
 /// *distinct* headers. Each section's payload is a [`Value::Map`], whose
 /// equality is by key — field order within a section does not matter — but the
@@ -369,7 +387,7 @@ impl PartialEq for EnvelopeRecord {
 /// field name → typed value. CXL `$doc.<section>.<field>` resolves by
 /// looking up `<section>` in the record, then `<field>` in the inner map.
 ///
-/// Cloned per record as `Arc<DocumentContext>` — refcount bump only,
+/// Cloned per record as `SharedStorage<DocumentContext>` — refcount bump only,
 /// no data duplication.
 #[derive(Debug)]
 pub struct DocumentContext {
@@ -383,13 +401,47 @@ pub struct DocumentContext {
     /// The envelope as a schema-described record: one column per declared
     /// section (insertion-ordered, ancestor-flattened); each value is the
     /// section's `Value::Map` payload, carrying any engine-internal keys
-    /// (`$raw`, `body`) the readers inject. ONE `Arc<Schema>` — the ambient
+    /// (`$raw`, `body`) the readers inject. ONE `SharedStorage<Schema>` — the ambient
     /// `$doc` view and any consolidation-input view borrow THIS, never a
     /// re-encoding.
     envelope: EnvelopeRecord,
 }
 
 impl DocumentContext {
+    pub fn unaccounted_heap_size(&self, resources: &AllocationResources) -> usize {
+        self.source_file.len()
+            + 2 * std::mem::size_of::<usize>()
+            + self.envelope.schema.unaccounted_outer_heap_size(resources)
+            + self.envelope.schema.unaccounted_heap_size(resources)
+            + self.envelope.sections.unaccounted_heap_size(resources)
+    }
+
+    /// Heap retained by this context, including its envelope schema and payload.
+    /// A reader's intern table owns this charge; records borrowing the same Arc
+    /// must not charge it again. Includes shared-allocation reference counters.
+    pub fn estimated_heap_size(&self) -> usize {
+        self.source_file.len()
+            + 2 * std::mem::size_of::<usize>()
+            + self.envelope.schema.estimated_outer_heap_size()
+            + self.envelope.schema.estimated_heap_size()
+            + self.envelope.sections.heap_size()
+    }
+    pub fn legacy_estimated_heap_size(&self) -> usize {
+        self.source_file.len()
+            + 2 * std::mem::size_of::<usize>()
+            + self.envelope.schema.legacy_estimated_outer_heap_size()
+            + self.envelope.schema.legacy_estimated_heap_size()
+            + self.envelope.sections.legacy_heap_size()
+    }
+    /// Admit the shared outer backing and move the existing envelope unchanged.
+    pub fn try_new(
+        id: DocumentId,
+        source_file: Arc<str>,
+        envelope: EnvelopeRecord,
+        scope: &AllocationScope,
+    ) -> Result<SharedStorage<Self>, ResourceError> {
+        SharedStorage::try_new(Self::new(id, source_file, envelope), scope)
+    }
     /// Build a populated document context for a single source file.
     /// Called once per file by the source ingest path after the reader's
     /// envelope pre-scan returns the section map (wrapped in an
@@ -431,7 +483,7 @@ impl DocumentContext {
     /// The document's envelope as a schema-described record — the node-input
     /// view a downstream consolidation node reduces over.
     ///
-    /// The same single [`Arc<Schema>`] backs both this borrow and the ambient
+    /// The same single [`SharedStorage<Schema>`] backs both this borrow and the ambient
     /// `$doc` resolution path ([`Self::get_section_field`] reads through it),
     /// so there is exactly one in-memory encoding of the envelope per document.
     ///
@@ -530,7 +582,7 @@ impl DocumentContext {
     /// unexpected shape). The borrow is O(1) — no field is cloned; the writer
     /// iterates the returned map in insertion order. Reads through
     /// [`Self::envelope_record`].
-    pub fn section_fields(&self, section: &str) -> Option<&IndexMap<Box<str>, Value>> {
+    pub fn section_fields(&self, section: &str) -> Option<&IndexMap<OwnedKey, Value>> {
         self.envelope_record().field_map(section)
     }
 }
@@ -616,7 +668,7 @@ impl<'de> Deserialize<'de> for DocumentContext {
                     .ok_or_else(|| de::Error::invalid_length(3, &self))?;
                 let mut sections = IndexMap::with_capacity(pairs.len());
                 for (k, v) in pairs {
-                    sections.insert(k.into_boxed_str(), v);
+                    sections.insert(OwnedKey::from(k), v);
                 }
                 Ok(DocumentContext {
                     id,
@@ -631,15 +683,15 @@ impl<'de> Deserialize<'de> for DocumentContext {
     }
 }
 
-fn synthetic_storage() -> &'static Arc<DocumentContext> {
-    static SYNTHETIC: OnceLock<Arc<DocumentContext>> = OnceLock::new();
+fn synthetic_storage() -> &'static SharedStorage<DocumentContext> {
+    static SYNTHETIC: OnceLock<SharedStorage<DocumentContext>> = OnceLock::new();
     SYNTHETIC.get_or_init(|| {
-        Arc::new(DocumentContext {
+        SharedStorage::from_arc(Arc::new(DocumentContext {
             id: DocumentId::SYNTHETIC,
             grain: DocumentGrain::SYNTHETIC,
             source_file: Arc::from(""),
             envelope: EnvelopeRecord::empty(),
-        })
+        }))
     })
 }
 
@@ -651,31 +703,46 @@ fn synthetic_storage() -> &'static Arc<DocumentContext> {
 /// allocation backing the singleton; this function bumps the refcount.
 /// The envelope is empty, so `$doc.<section>.<field>` against this
 /// context always returns `None` (callers map to `Value::Null`).
-pub fn synthetic_document_context() -> Arc<DocumentContext> {
+pub fn synthetic_document_context() -> SharedStorage<DocumentContext> {
     synthetic_storage().clone()
 }
 
 /// `'static` reference to the synthetic context's [`Arc`], for sites
-/// that need a `&Arc<DocumentContext>` borrow (e.g. constructing an
+/// that need a `&SharedStorage<DocumentContext>` borrow (e.g. constructing an
 /// `EvalContext<'a>` in a record-free path) without producing a
 /// short-lived owned clone. No refcount bump.
-pub fn synthetic_document_context_ref() -> &'static Arc<DocumentContext> {
+pub fn synthetic_document_context_ref() -> &'static SharedStorage<DocumentContext> {
     synthetic_storage()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retained_context_estimate_includes_unused_section_capacity() {
+        let mut context = super::DocumentContext::new(
+            super::DocumentId::next(),
+            std::sync::Arc::from("input.csv"),
+            super::EnvelopeRecord::empty(),
+        );
+        let before = context.estimated_heap_size();
+        let capacity = context.envelope.sections.capacity();
+        context.envelope.sections = OwnedValues::from_vec(Vec::with_capacity(64));
+        assert_eq!(
+            context.estimated_heap_size() - before,
+            (context.envelope.sections.capacity() - capacity) * std::mem::size_of::<crate::Value>()
+        );
+    }
     use super::*;
 
     fn make_section(fields: &[(&str, Value)]) -> Value {
         let mut m = IndexMap::new();
         for (k, v) in fields {
-            m.insert(Box::from(*k), v.clone());
+            m.insert(crate::owned_storage::OwnedKey::from(*k), v.clone());
         }
-        Value::Map(Box::new(m))
+        Value::Map(crate::owned_storage::OwnedMap::from_map(m))
     }
 
-    fn envelope(sections: IndexMap<Box<str>, Value>) -> EnvelopeRecord {
+    fn envelope(sections: IndexMap<OwnedKey, Value>) -> EnvelopeRecord {
         EnvelopeRecord::from_sections(sections)
     }
 
@@ -691,7 +758,7 @@ mod tests {
     fn synthetic_context_is_shared() {
         let a = synthetic_document_context();
         let b = synthetic_document_context();
-        assert!(Arc::ptr_eq(&a, &b));
+        assert!(SharedStorage::ptr_eq(&a, &b));
         assert_eq!(a.id(), DocumentId::SYNTHETIC);
         // Synthetic context carries no sections — every $doc.* misses.
         assert!(a.get_section_field("anything", "x").is_none());
@@ -700,21 +767,24 @@ mod tests {
     #[test]
     fn synthetic_ref_matches_owned_singleton() {
         let owned = synthetic_document_context();
-        assert!(Arc::ptr_eq(synthetic_document_context_ref(), &owned));
+        assert!(SharedStorage::ptr_eq(
+            synthetic_document_context_ref(),
+            &owned
+        ));
     }
 
     #[test]
     fn get_section_field_resolves_map_payload() {
         let mut sections = IndexMap::new();
         sections.insert(
-            Box::from("Head"),
+            crate::owned_storage::OwnedKey::from("Head"),
             make_section(&[
                 ("batch_id", Value::String("RUN-001".into())),
                 ("run_date", Value::String("2026-05-22".into())),
             ]),
         );
         sections.insert(
-            Box::from("Foot"),
+            crate::owned_storage::OwnedKey::from("Foot"),
             make_section(&[("record_count", Value::Integer(42))]),
         );
         let ctx = DocumentContext::new(
@@ -741,7 +811,7 @@ mod tests {
     fn child_layers_sibling_sections_and_inherits_file() {
         let mut isa = IndexMap::new();
         isa.insert(
-            Box::from("interchange"),
+            crate::owned_storage::OwnedKey::from("interchange"),
             make_section(&[("control_ref", Value::String("000000001".into()))]),
         );
         let file: Arc<str> = Arc::from("claim.x12");
@@ -749,7 +819,7 @@ mod tests {
 
         let mut gs = IndexMap::new();
         gs.insert(
-            Box::from("group"),
+            crate::owned_storage::OwnedKey::from("group"),
             make_section(&[("functional_id", Value::String("HC".into()))]),
         );
         let group_id = DocumentId::next();
@@ -803,7 +873,7 @@ mod tests {
         let file: Arc<str> = Arc::from("messages.hl7");
         let mut fhs = IndexMap::new();
         fhs.insert(
-            Box::from("file_header"),
+            crate::owned_storage::OwnedKey::from("file_header"),
             make_section(&[("sender", Value::String("LAB".into()))]),
         );
         let file_doc = DocumentContext::new(DocumentId::next(), Arc::clone(&file), envelope(fhs));
@@ -846,14 +916,14 @@ mod tests {
     fn child_section_name_collision_shadows_ancestor() {
         let mut outer = IndexMap::new();
         outer.insert(
-            Box::from("meta"),
+            crate::owned_storage::OwnedKey::from("meta"),
             make_section(&[("level", Value::String("interchange".into()))]),
         );
         let parent = DocumentContext::new(DocumentId::next(), Arc::from("f.x12"), envelope(outer));
 
         let mut inner = IndexMap::new();
         inner.insert(
-            Box::from("meta"),
+            crate::owned_storage::OwnedKey::from("meta"),
             make_section(&[("level", Value::String("transaction".into()))]),
         );
         let child = parent.child(DocumentId::next(), envelope(inner));
@@ -873,14 +943,14 @@ mod tests {
         // to the ancestor record.
         let mut sections = IndexMap::new();
         sections.insert(
-            Box::from("file_header"),
+            crate::owned_storage::OwnedKey::from("file_header"),
             make_section(&[("sender", Value::String("LAB".into()))]),
         );
         let ancestor = envelope(sections);
         let merged = ancestor.merged_with(EnvelopeRecord::empty());
         assert!(
-            Arc::ptr_eq(&ancestor.schema, &merged.schema),
-            "an empty child must reuse the ancestor's Arc<Schema>, not rebuild it"
+            SharedStorage::ptr_eq(&ancestor.schema, &merged.schema),
+            "an empty child must reuse the ancestor's SharedStorage<Schema>, not rebuild it"
         );
         assert_eq!(merged, ancestor);
 
@@ -888,7 +958,7 @@ mod tests {
         // child level shares the file-level schema allocation.
         let file_doc = DocumentContext::new(DocumentId::next(), Arc::from("m.hl7"), ancestor);
         let message = file_doc.child_frame(DocumentId::next(), EnvelopeRecord::empty());
-        assert!(Arc::ptr_eq(
+        assert!(SharedStorage::ptr_eq(
             &file_doc.envelope_record().schema,
             &message.envelope_record().schema
         ));
@@ -898,16 +968,16 @@ mod tests {
     fn merged_with_empty_ancestor_reuses_child_schema_arc() {
         let mut sections = IndexMap::new();
         sections.insert(
-            Box::from("group"),
+            crate::owned_storage::OwnedKey::from("group"),
             make_section(&[("functional_id", Value::String("HC".into()))]),
         );
         let child = envelope(sections);
-        let child_schema = Arc::clone(&child.schema);
+        let child_schema = child.schema.clone();
         let expected = child.clone();
         let merged = EnvelopeRecord::empty().merged_with(child);
         assert!(
-            Arc::ptr_eq(&merged.schema, &child_schema),
-            "an empty ancestor must keep the child's Arc<Schema>, not rebuild it"
+            SharedStorage::ptr_eq(&merged.schema, &child_schema),
+            "an empty ancestor must keep the child's SharedStorage<Schema>, not rebuild it"
         );
         assert_eq!(merged, expected);
     }
@@ -919,16 +989,16 @@ mod tests {
         // ancestors first in declared order, fresh child sections appended.
         let mut isa_gs = IndexMap::new();
         isa_gs.insert(
-            Box::from("interchange"),
+            crate::owned_storage::OwnedKey::from("interchange"),
             make_section(&[("control_ref", Value::String("000000001".into()))]),
         );
         isa_gs.insert(
-            Box::from("group"),
+            crate::owned_storage::OwnedKey::from("group"),
             make_section(&[("functional_id", Value::String("HC".into()))]),
         );
         let mut st = IndexMap::new();
         st.insert(
-            Box::from("transaction"),
+            crate::owned_storage::OwnedKey::from("transaction"),
             make_section(&[("set_id", Value::String("837".into()))]),
         );
 
@@ -951,16 +1021,22 @@ mod tests {
         // exactly the map-union semantics, pinned against `from_sections`.
         let mut outer = IndexMap::new();
         outer.insert(
-            Box::from("meta"),
+            crate::owned_storage::OwnedKey::from("meta"),
             make_section(&[("level", Value::String("interchange".into()))]),
         );
-        outer.insert(Box::from("head"), make_section(&[("k", Value::Integer(1))]));
+        outer.insert(
+            crate::owned_storage::OwnedKey::from("head"),
+            make_section(&[("k", Value::Integer(1))]),
+        );
         let mut inner = IndexMap::new();
         inner.insert(
-            Box::from("meta"),
+            crate::owned_storage::OwnedKey::from("meta"),
             make_section(&[("level", Value::String("transaction".into()))]),
         );
-        inner.insert(Box::from("foot"), make_section(&[("k", Value::Integer(2))]));
+        inner.insert(
+            crate::owned_storage::OwnedKey::from("foot"),
+            make_section(&[("k", Value::Integer(2))]),
+        );
 
         let mut union = outer.clone();
         for (name, payload) in inner.clone() {
@@ -996,16 +1072,16 @@ mod tests {
     fn document_context_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DocumentContext>();
-        assert_send_sync::<Arc<DocumentContext>>();
+        assert_send_sync::<SharedStorage<DocumentContext>>();
     }
 
     #[test]
     fn envelope_record_is_single_arc_backing_both_views() {
-        // The same single `Arc<Schema>` backs the ambient `$doc` resolution
+        // The same single `SharedStorage<Schema>` backs the ambient `$doc` resolution
         // path and the node-input borrow — proving one encoding, not two.
         let mut sections = IndexMap::new();
         sections.insert(
-            Box::from("Head"),
+            crate::owned_storage::OwnedKey::from("Head"),
             make_section(&[("batch_id", Value::String("RUN-001".into()))]),
         );
         let ctx = Arc::new(DocumentContext::new(
@@ -1014,12 +1090,12 @@ mod tests {
             envelope(sections),
         ));
 
-        // Cloning the per-record `Arc<DocumentContext>` (as the executor does)
+        // Cloning the per-record `SharedStorage<DocumentContext>` (as the executor does)
         // shares the underlying envelope — the schema Arc is one allocation,
         // pointer-identical across the clone.
         let clone = Arc::clone(&ctx);
         assert!(Arc::ptr_eq(&ctx, &clone));
-        assert!(Arc::ptr_eq(
+        assert!(SharedStorage::ptr_eq(
             &ctx.envelope_record().schema,
             &clone.envelope_record().schema
         ));
@@ -1057,23 +1133,27 @@ mod tests {
         // the strict relation.
         let mut a = IndexMap::new();
         a.insert(
-            Box::from("interchange"),
+            crate::owned_storage::OwnedKey::from("interchange"),
             section_with(&[
                 ("sender", Value::String("ACME".into())),
                 (
                     "$raw",
-                    Value::Array(vec![Value::String("ISA*00*...*000000001".into())]),
+                    Value::Array(OwnedValues::from_vec(vec![Value::String(
+                        "ISA*00*...*000000001".into(),
+                    )])),
                 ),
             ]),
         );
         let mut b = IndexMap::new();
         b.insert(
-            Box::from("interchange"),
+            crate::owned_storage::OwnedKey::from("interchange"),
             section_with(&[
                 ("sender", Value::String("ACME".into())),
                 (
                     "$raw",
-                    Value::Array(vec![Value::String("ISA*00*...*000000002".into())]),
+                    Value::Array(OwnedValues::from_vec(vec![Value::String(
+                        "ISA*00*...*000000002".into(),
+                    )])),
                 ),
             ]),
         );
@@ -1099,11 +1179,23 @@ mod tests {
         // Same two sections, declared in a different order — positionally
         // distinct headers, so `same_header` is FALSE.
         let mut a = IndexMap::new();
-        a.insert(Box::from("head"), section_with(&[("k", Value::Integer(1))]));
-        a.insert(Box::from("foot"), section_with(&[("k", Value::Integer(2))]));
+        a.insert(
+            crate::owned_storage::OwnedKey::from("head"),
+            section_with(&[("k", Value::Integer(1))]),
+        );
+        a.insert(
+            crate::owned_storage::OwnedKey::from("foot"),
+            section_with(&[("k", Value::Integer(2))]),
+        );
         let mut b = IndexMap::new();
-        b.insert(Box::from("foot"), section_with(&[("k", Value::Integer(2))]));
-        b.insert(Box::from("head"), section_with(&[("k", Value::Integer(1))]));
+        b.insert(
+            crate::owned_storage::OwnedKey::from("foot"),
+            section_with(&[("k", Value::Integer(2))]),
+        );
+        b.insert(
+            crate::owned_storage::OwnedKey::from("head"),
+            section_with(&[("k", Value::Integer(1))]),
+        );
 
         assert!(
             !envelope(a).same_header(&envelope(b)),
@@ -1117,12 +1209,12 @@ mod tests {
         // `same_header` TRUE (field order within a section does not matter).
         let mut a = IndexMap::new();
         a.insert(
-            Box::from("head"),
+            crate::owned_storage::OwnedKey::from("head"),
             section_with(&[("x", Value::Integer(1)), ("y", Value::String("v".into()))]),
         );
         let mut b = IndexMap::new();
         b.insert(
-            Box::from("head"),
+            crate::owned_storage::OwnedKey::from("head"),
             section_with(&[("y", Value::String("v".into())), ("x", Value::Integer(1))]),
         );
 
@@ -1138,12 +1230,12 @@ mod tests {
         // proving the exclusion rule does not over-fold.
         let mut a = IndexMap::new();
         a.insert(
-            Box::from("head"),
+            crate::owned_storage::OwnedKey::from("head"),
             section_with(&[("sender", Value::String("ACME".into()))]),
         );
         let mut b = IndexMap::new();
         b.insert(
-            Box::from("head"),
+            crate::owned_storage::OwnedKey::from("head"),
             section_with(&[("sender", Value::String("OTHER".into()))]),
         );
 
@@ -1161,12 +1253,12 @@ mod tests {
         // distinct — the exclusion rule covers only the `$raw` shadow.
         let mut a = IndexMap::new();
         a.insert(
-            Box::from("basic_header"),
+            crate::owned_storage::OwnedKey::from("basic_header"),
             section_with(&[("body", Value::String("F01BANKBEBB".into()))]),
         );
         let mut b = IndexMap::new();
         b.insert(
-            Box::from("basic_header"),
+            crate::owned_storage::OwnedKey::from("basic_header"),
             section_with(&[("body", Value::String("F01OTHERBANK".into()))]),
         );
 
@@ -1180,7 +1272,10 @@ mod tests {
     fn same_header_empty_envelopes_are_equal() {
         assert!(EnvelopeRecord::empty().same_header(&EnvelopeRecord::empty()));
         let mut a = IndexMap::new();
-        a.insert(Box::from("head"), section_with(&[("k", Value::Integer(1))]));
+        a.insert(
+            crate::owned_storage::OwnedKey::from("head"),
+            section_with(&[("k", Value::Integer(1))]),
+        );
         assert!(
             !envelope(a).same_header(&EnvelopeRecord::empty()),
             "a non-empty header is not the same header as the empty envelope"
@@ -1212,24 +1307,30 @@ mod tests {
         // a section exercises the recursive Value path through the frame.
         let mut sections = IndexMap::new();
         sections.insert(
-            Box::from("z_section"),
+            crate::owned_storage::OwnedKey::from("z_section"),
             make_section(&[("k", Value::String("zv".into()))]),
         );
         sections.insert(
-            Box::from("a_section"),
+            crate::owned_storage::OwnedKey::from("a_section"),
             make_section(&[
                 ("count", Value::Integer(7)),
                 (
                     "nested",
-                    Value::Map(Box::new({
+                    Value::Map(crate::owned_storage::OwnedMap::from_map({
                         let mut inner = IndexMap::new();
-                        inner.insert(Box::from("deep"), Value::Bool(true));
+                        inner.insert(
+                            crate::owned_storage::OwnedKey::from("deep"),
+                            Value::Bool(true),
+                        );
                         inner
                     })),
                 ),
             ]),
         );
-        sections.insert(Box::from("m_section"), make_section(&[]));
+        sections.insert(
+            crate::owned_storage::OwnedKey::from("m_section"),
+            make_section(&[]),
+        );
         let id = DocumentId::next();
         // Model an HL7 message frame: build a file-level context, then a
         // `child_frame` whose grain differs from its own id, so the round-trip
@@ -1278,9 +1379,12 @@ mod tests {
         );
         assert_eq!(
             back.get_section_field("a_section", "nested"),
-            Some(Value::Map(Box::new({
+            Some(Value::Map(crate::owned_storage::OwnedMap::from_map({
                 let mut inner = IndexMap::new();
-                inner.insert(Box::from("deep"), Value::Bool(true));
+                inner.insert(
+                    crate::owned_storage::OwnedKey::from("deep"),
+                    Value::Bool(true),
+                );
                 inner
             })))
         );

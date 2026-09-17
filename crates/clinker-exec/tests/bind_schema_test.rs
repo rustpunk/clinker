@@ -9,6 +9,7 @@
 
 use clinker_plan::config::{CompileContext, PipelineConfig};
 use clinker_record::FieldMetadata;
+use clinker_record::owned_storage::SharedStorage;
 
 /// Returns `Some(source_field)` if `meta` is a [`FieldMetadata::SourceCorrelation`],
 /// `None` for any other variant or `None` input. Used by tests that
@@ -236,7 +237,7 @@ fn source_node<'a>(plan: &'a clinker_plan::plan::CompiledPlan, name: &str) -> &'
 fn source_output_schema<'a>(
     plan: &'a clinker_plan::plan::CompiledPlan,
     name: &str,
-) -> &'a std::sync::Arc<clinker_record::Schema> {
+) -> &'a SharedStorage<clinker_record::Schema> {
     match source_node(plan, name) {
         PlanNode::Source { output_schema, .. } => output_schema,
         other => panic!(

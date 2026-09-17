@@ -28,6 +28,8 @@
 use std::io::{BufReader, Read};
 use std::sync::Arc;
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
+
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
@@ -103,7 +105,7 @@ impl Default for X12ReaderConfig {
 /// without re-reading the source.
 pub struct X12Reader<R: Read> {
     tokenizer: SegmentTokenizer<BufReader<R>>,
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     max_elements: usize,
     initialized: bool,
     /// Raw `ISA` data elements, stashed at init for envelope serving.
@@ -471,13 +473,13 @@ impl<R: Read> X12Reader<R> {
                 None => values.push(Value::Null),
             }
         }
-        Ok(Record::new(Arc::clone(&self.schema), values))
+        Ok(Record::new(self.schema.clone(), values))
     }
 }
 
 impl<R: Read + Send> FormatReader for X12Reader<R> {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-        Ok(Arc::clone(&self.schema))
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+        Ok(self.schema.clone())
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
@@ -495,13 +497,13 @@ impl<R: Read + Send> FormatReader for X12Reader<R> {
     fn prepare_document(
         &mut self,
         config: &EnvelopeConfig,
-    ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
+    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
         if config.is_empty() {
             return Ok(IndexMap::new());
         }
         self.ensure_initialized()?;
 
-        let mut out: IndexMap<Box<str>, Value> = IndexMap::with_capacity(config.sections.len());
+        let mut out: IndexMap<OwnedKey, Value> = IndexMap::with_capacity(config.sections.len());
         for (name, section) in &config.sections {
             let segment_tag = match &section.extract {
                 EnvelopeExtract::Segment(tag) => tag.as_str(),
@@ -539,17 +541,23 @@ impl<R: Read + Send> FormatReader for X12Reader<R> {
                 .iter()
                 .map(|e| Value::String(e.as_str().into()))
                 .collect();
-            typed.insert(Box::from(RAW_ELEMENTS_KEY), Value::Array(raw_elements));
+            typed.insert(
+                OwnedKey::from(RAW_ELEMENTS_KEY),
+                Value::Array(OwnedValues::from_vec(raw_elements)),
+            );
             // The element separator and segment terminator are not ISA data
             // elements — they sit between and after them — so the raw list
             // alone cannot reproduce a custom-delimited wire shape. Carry
             // the discovered delimiter set beside it so the writer emits
             // the reconstructed interchange with the original bytes.
             typed.insert(
-                Box::from(DELIMITERS_KEY),
+                OwnedKey::from(DELIMITERS_KEY),
                 self.tokenizer.delimiters().to_doc_value(),
             );
-            out.insert(Box::from(name.as_str()), Value::Map(Box::new(typed)));
+            out.insert(
+                OwnedKey::from(name.as_str()),
+                Value::Map(OwnedMap::from_map(typed)),
+            );
         }
         Ok(out)
     }
@@ -582,8 +590,8 @@ fn nested_sections(
     segment: &ParsedSegment,
     declared: Option<&NestedEnvelopeSection>,
     default_name: &str,
-) -> Result<IndexMap<Box<str>, Value>, FormatError> {
-    let mut sections: IndexMap<Box<str>, Value> = IndexMap::with_capacity(1);
+) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
+    let mut sections: IndexMap<OwnedKey, Value> = IndexMap::with_capacity(1);
     match declared {
         Some(section) => {
             // Coerce the level's positional elements through the declared
@@ -593,17 +601,20 @@ fn nested_sections(
             let raw = positional_pairs(&segment.elements);
             let typed = coerce_section_fields(raw, &section.fields).map_err(FormatError::X12)?;
             sections.insert(
-                Box::from(section.name.as_str()),
-                Value::Map(Box::new(typed)),
+                OwnedKey::from(section.name.as_str()),
+                Value::Map(OwnedMap::from_map(typed)),
             );
         }
         None => {
-            let mut fields: IndexMap<Box<str>, Value> =
+            let mut fields: IndexMap<OwnedKey, Value> =
                 IndexMap::with_capacity(segment.elements.len());
             for (i, e) in segment.elements.iter().enumerate() {
-                fields.insert(positional_key(i).into_boxed_str(), string_or_null(e));
+                fields.insert(positional_key(i).into(), string_or_null(e));
             }
-            sections.insert(Box::from(default_name), Value::Map(Box::new(fields)));
+            sections.insert(
+                OwnedKey::from(default_name),
+                Value::Map(OwnedMap::from_map(fields)),
+            );
         }
     }
     Ok(sections)
@@ -641,12 +652,12 @@ pub fn generated_columns(max_elements: usize) -> Vec<Column> {
 /// e01..e<max>]`. Column names come from [`generated_columns`]; element text
 /// is stored verbatim (lossless round-trip) and the reader schema stays in
 /// lockstep with the planner's Generated-source bind.
-fn build_schema(max_elements: usize) -> Arc<Schema> {
+fn build_schema(max_elements: usize) -> SharedStorage<Schema> {
     let columns = generated_columns(max_elements)
         .into_iter()
-        .map(|c| c.name.into_boxed_str())
+        .map(|c| c.name.into())
         .collect();
-    Arc::new(Schema::new(columns))
+    SharedStorage::from_arc(Arc::new(Schema::new(columns)))
 }
 
 /// Positional element column name for element index `i`: `e01`, `e02`, …
@@ -840,7 +851,7 @@ mod tests {
 
     /// The first body record's two `OpenLevel` events carry the GS section
     /// (index 0) and the ST section (index 1).
-    fn first_open_levels(mut r: X12Reader<Cursor<Vec<u8>>>) -> Vec<IndexMap<Box<str>, Value>> {
+    fn first_open_levels(mut r: X12Reader<Cursor<Vec<u8>>>) -> Vec<IndexMap<OwnedKey, Value>> {
         let _ = r.next_record().unwrap().unwrap();
         r.take_envelope_events()
             .into_iter()
@@ -1205,11 +1216,11 @@ mod tests {
         };
         assert_eq!(
             interchange.get(DELIMITERS_KEY),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::Integer(i64::from(b'*')),
                 Value::Integer(i64::from(b':')),
                 Value::Integer(i64::from(b'~')),
-            ])),
+            ]))),
             "delimiter stamp must carry [element, subelement, terminator] bytes"
         );
     }
@@ -1250,17 +1261,17 @@ mod tests {
         let body_recs: Vec<Record> = std::iter::from_fn(|| r.next_record().unwrap()).collect();
         assert_eq!(body_recs.len(), 3); // ST, BEG, PO1
 
-        let ctx = Arc::new(DocumentContext::new(
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.x12"),
             EnvelopeRecord::from_sections(sections),
-        ));
+        )));
         let schema = r.schema().unwrap();
         let out = {
             let mut buf = Vec::new();
             let mut w = X12Writer::new(
                 std::io::Cursor::new(&mut buf),
-                Arc::clone(&schema),
+                schema.clone(),
                 X12WriterConfig {
                     interchange_from_doc: Some("interchange".into()),
                     group_header: Some(vec![
@@ -1279,7 +1290,7 @@ mod tests {
             );
             for rec in &body_recs {
                 let mut rec = rec.clone();
-                rec.set_doc_ctx(Arc::clone(&ctx));
+                rec.set_doc_ctx(ctx.clone());
                 w.write_record(&rec).unwrap();
             }
             w.flush().unwrap();
@@ -1314,17 +1325,17 @@ mod tests {
         assert_eq!(body_recs.len(), 3); // ST, BEG, PO1
 
         // 2. Attach the document context and re-emit through the writer.
-        let ctx = Arc::new(DocumentContext::new(
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.x12"),
             EnvelopeRecord::from_sections(sections),
-        ));
+        )));
         let schema = r.schema().unwrap();
         let out = {
             let mut buf = Vec::new();
             let mut w = X12Writer::new(
                 std::io::Cursor::new(&mut buf),
-                Arc::clone(&schema),
+                schema.clone(),
                 X12WriterConfig {
                     interchange_from_doc: Some("interchange".into()),
                     group_header: Some(vec![
@@ -1343,7 +1354,7 @@ mod tests {
             );
             for rec in &body_recs {
                 let mut rec = rec.clone();
-                rec.set_doc_ctx(Arc::clone(&ctx));
+                rec.set_doc_ctx(ctx.clone());
                 w.write_record(&rec).unwrap();
             }
             w.flush().unwrap();
@@ -1441,7 +1452,7 @@ mod tests {
             let mut buf = Vec::new();
             let mut w = X12Writer::new(
                 Cursor::new(&mut buf),
-                Arc::clone(&schema),
+                schema.clone(),
                 X12WriterConfig {
                     interchange: Some(
                         split_isa(

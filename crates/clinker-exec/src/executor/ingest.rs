@@ -2,6 +2,9 @@
 //! thread body that widens, stamps, and pushes records into the dispatch
 //! channel.
 
+use clinker_record::owned_storage::SharedStorage;
+#[cfg(test)]
+use clinker_record::owned_storage::{OwnedKey, OwnedMap};
 use std::io::Read;
 use std::sync::Arc;
 
@@ -699,7 +702,7 @@ fn drive_record_source(
         // no separate file-tracking variable is needed — the stack is the
         // single source of truth for both the live nesting and the open
         // file's identity.
-        let mut doc_stack: Vec<Arc<clinker_record::DocumentContext>> = Vec::new();
+        let mut doc_stack: Vec<SharedStorage<clinker_record::DocumentContext>> = Vec::new();
         let mut interrupted = false;
         loop {
             // Ordered sources do not publish body attempts until the complete
@@ -789,11 +792,11 @@ fn drive_record_source(
                     values.push(clinker_record::Value::from(source_name_arc.as_ref()));
                     values.push(event_time_value);
                     let mut widened_record =
-                        clinker_record::Record::new(Arc::clone(&widened_schema), values);
+                        clinker_record::Record::new(widened_schema.clone(), values);
                     // The record carries the INNERMOST open level, so its
                     // `$doc.*` sees every enclosing envelope's sections.
                     if let Some(ctx) = doc_stack.last() {
-                        widened_record.set_doc_ctx(Arc::clone(ctx));
+                        widened_record.set_doc_ctx(ctx.clone());
                     }
                     let representative_record = file_representative
                         .as_ref()
@@ -913,11 +916,11 @@ fn drive_record_source(
                         preserve_empty_physical_files,
                     )?;
                     let doc_ctx = doc_stack.last().cloned().unwrap_or_else(|| {
-                        Arc::new(clinker_record::DocumentContext::new(
+                        SharedStorage::from_arc(Arc::new(clinker_record::DocumentContext::new(
                             clinker_record::DocumentId::next(),
                             Arc::clone(&file_arc),
                             clinker_record::EnvelopeRecord::empty(),
-                        ))
+                        )))
                     });
                     original_record = stamp_source_rejection_record(
                         &rejection_schema,
@@ -1015,11 +1018,11 @@ fn drive_record_source(
                         preserve_empty_physical_files,
                     )?;
                     let doc_ctx = doc_stack.last().cloned().unwrap_or_else(|| {
-                        Arc::new(clinker_record::DocumentContext::new(
+                        SharedStorage::from_arc(Arc::new(clinker_record::DocumentContext::new(
                             clinker_record::DocumentId::next(),
                             Arc::clone(&file_arc),
                             clinker_record::EnvelopeRecord::empty(),
-                        ))
+                        )))
                     });
                     let original_record = stamp_source_rejection_record(
                         &rejection_schema,
@@ -1108,11 +1111,11 @@ fn drive_record_source(
                         preserve_empty_physical_files,
                     )?;
                     let doc_ctx = doc_stack.last().cloned().unwrap_or_else(|| {
-                        Arc::new(clinker_record::DocumentContext::new(
+                        SharedStorage::from_arc(Arc::new(clinker_record::DocumentContext::new(
                             clinker_record::DocumentId::next(),
                             Arc::clone(&file_arc),
                             clinker_record::EnvelopeRecord::empty(),
-                        ))
+                        )))
                     });
                     let mut body_values =
                         vec![clinker_record::Value::Null; reader_schema.column_count()];
@@ -1237,11 +1240,11 @@ fn drive_record_source(
                         // stack empty, so synthesize a file-level context from
                         // the file grain instead.
                         let doc_ctx = doc_stack.last().cloned().unwrap_or_else(|| {
-                            Arc::new(clinker_record::DocumentContext::new(
+                            SharedStorage::from_arc(Arc::new(clinker_record::DocumentContext::new(
                                 clinker_record::DocumentId::next(),
                                 Arc::clone(&file_arc),
                                 clinker_record::EnvelopeRecord::empty(),
-                            ))
+                            )))
                         });
                         let (rep_record, rejected_row_id) = match file_representative
                             .as_ref()
@@ -1334,7 +1337,7 @@ fn drive_record_source(
 /// comparison against that base — the same `Arc::ptr_eq` discriminator the
 /// reader uses to mark file transitions.
 fn stack_belongs_to_other_file(
-    doc_stack: &[Arc<clinker_record::DocumentContext>],
+    doc_stack: &[SharedStorage<clinker_record::DocumentContext>],
     file_arc: &Arc<str>,
 ) -> bool {
     match doc_stack.first() {
@@ -1380,7 +1383,7 @@ fn push_doc_punctuation(
 /// closes before the next file opens) and at end-of-input.
 fn close_open_levels(
     stream: &mut crate::executor::source_stream::SourceIngestChannel,
-    doc_stack: &mut Vec<Arc<clinker_record::DocumentContext>>,
+    doc_stack: &mut Vec<SharedStorage<clinker_record::DocumentContext>>,
 ) -> Result<(), PipelineError> {
     while let Some(level) = doc_stack.pop() {
         push_doc_punctuation(
@@ -1398,8 +1401,8 @@ const SOURCE_RAW_RECORD_COLUMN: &str = "_cxl_dlq_source_record";
 /// ordered-source barrier spill a mixed rejection stream without assuming
 /// every rejected attempt had a declared record type.
 fn build_source_rejection_schema(
-    reader_schema: &Arc<clinker_record::Schema>,
-) -> Arc<clinker_record::Schema> {
+    reader_schema: &SharedStorage<clinker_record::Schema>,
+) -> SharedStorage<clinker_record::Schema> {
     let mut builder =
         clinker_record::SchemaBuilder::with_capacity(reader_schema.column_count() + 4);
     for (idx, column) in reader_schema.columns().iter().enumerate() {
@@ -1430,11 +1433,11 @@ fn build_source_rejection_schema(
 /// undeclared discriminator never causes positional fields to be guessed.
 #[allow(clippy::too_many_arguments)]
 fn stamp_source_rejection_record(
-    rejection_schema: &Arc<clinker_record::Schema>,
+    rejection_schema: &SharedStorage<clinker_record::Schema>,
     reader_column_count: usize,
     mut body_values: Vec<clinker_record::Value>,
     raw_record: clinker_record::Value,
-    doc_ctx: &Arc<clinker_record::DocumentContext>,
+    doc_ctx: &SharedStorage<clinker_record::DocumentContext>,
     file_arc: &Arc<str>,
     source_name_arc: &Arc<str>,
 ) -> Result<clinker_record::Record, PipelineError> {
@@ -1453,8 +1456,8 @@ fn stamp_source_rejection_record(
     body_values.push(clinker_record::Value::from(file_arc.as_ref()));
     body_values.push(clinker_record::Value::from(source_name_arc.as_ref()));
     body_values.push(clinker_record::Value::Null);
-    let mut record = clinker_record::Record::new(Arc::clone(rejection_schema), body_values);
-    record.set_doc_ctx(Arc::clone(doc_ctx));
+    let mut record = clinker_record::Record::new(rejection_schema.clone(), body_values);
+    record.set_doc_ctx(doc_ctx.clone());
     Ok(record)
 }
 
@@ -1471,8 +1474,8 @@ fn stamp_source_rejection_record(
 /// correct file grain. It becomes the `trigger: true` root cause for the
 /// file's reject.
 fn build_representative_record(
-    widened_schema: &Arc<clinker_record::Schema>,
-    doc_ctx: &Arc<clinker_record::DocumentContext>,
+    widened_schema: &SharedStorage<clinker_record::Schema>,
+    doc_ctx: &SharedStorage<clinker_record::DocumentContext>,
     file_arc: &Arc<str>,
     source_name_arc: &Arc<str>,
 ) -> clinker_record::Record {
@@ -1484,8 +1487,8 @@ fn build_representative_record(
     values.push(clinker_record::Value::from(file_arc.as_ref()));
     values.push(clinker_record::Value::from(source_name_arc.as_ref()));
     values.push(clinker_record::Value::Null);
-    let mut record = clinker_record::Record::new(Arc::clone(widened_schema), values);
-    record.set_doc_ctx(Arc::clone(doc_ctx));
+    let mut record = clinker_record::Record::new(widened_schema.clone(), values);
+    record.set_doc_ctx(doc_ctx.clone());
     record
 }
 
@@ -1510,8 +1513,8 @@ fn build_representative_record(
 /// recordless document, so a zero-body malformed file still dead-letters.
 fn emit_structural_reject_close(
     stream: &mut crate::executor::source_stream::SourceIngestChannel,
-    doc_stack: &mut Vec<Arc<clinker_record::DocumentContext>>,
-    synthesized_ctx: &Arc<clinker_record::DocumentContext>,
+    doc_stack: &mut Vec<SharedStorage<clinker_record::DocumentContext>>,
+    synthesized_ctx: &SharedStorage<clinker_record::DocumentContext>,
     reject: crate::executor::stream_event::StructuralReject,
 ) -> Result<(), PipelineError> {
     match doc_stack.pop() {
@@ -1527,7 +1530,7 @@ fn emit_structural_reject_close(
             push_doc_punctuation(
                 stream,
                 crate::executor::stream_event::Punctuation::structural_reject_close(
-                    Arc::clone(synthesized_ctx),
+                    synthesized_ctx.clone(),
                     reject,
                 ),
             )?;
@@ -1554,7 +1557,7 @@ fn emit_structural_reject_close(
 fn open_file_level_doc(
     src_cfg: &clinker_plan::config::SourceConfig,
     stream: &mut crate::executor::source_stream::SourceIngestChannel,
-    doc_stack: &mut Vec<Arc<clinker_record::DocumentContext>>,
+    doc_stack: &mut Vec<SharedStorage<clinker_record::DocumentContext>>,
     src_reader: &mut Box<dyn crate::source::RecordSource>,
     file_arc: &Arc<str>,
 ) -> Result<(), PipelineError> {
@@ -1574,14 +1577,14 @@ fn open_file_level_doc(
             })?,
         None => indexmap::IndexMap::new(),
     };
-    let new_ctx = Arc::new(clinker_record::DocumentContext::new(
+    let new_ctx = SharedStorage::from_arc(Arc::new(clinker_record::DocumentContext::new(
         clinker_record::DocumentId::next(),
         Arc::clone(file_arc),
         clinker_record::EnvelopeRecord::from_sections(envelope_sections),
-    ));
+    )));
     push_doc_punctuation(
         stream,
-        crate::executor::stream_event::Punctuation::document_open(Arc::clone(&new_ctx)),
+        crate::executor::stream_event::Punctuation::document_open(new_ctx.clone()),
     )?;
     doc_stack.push(new_ctx);
     Ok(())
@@ -1609,7 +1612,7 @@ fn open_file_level_doc(
 fn apply_source_lifecycle_events(
     src_cfg: &clinker_plan::config::SourceConfig,
     stream: &mut crate::executor::source_stream::SourceIngestChannel,
-    doc_stack: &mut Vec<Arc<clinker_record::DocumentContext>>,
+    doc_stack: &mut Vec<SharedStorage<clinker_record::DocumentContext>>,
     src_reader: &mut Box<dyn crate::source::RecordSource>,
     file_arc: &Arc<str>,
     preserve_empty_physical_files: bool,
@@ -1640,13 +1643,13 @@ fn apply_source_lifecycle_events(
                 // `Inherit` (an X12 `GS`/`ST`) stays inside the enclosing
                 // interchange frame via `child`.
                 let envelope = clinker_record::EnvelopeRecord::from_sections(sections);
-                let child = Arc::new(match frame {
+                let child = SharedStorage::from_arc(Arc::new(match frame {
                     clinker_format::FrameRole::NewFrame => parent.child_frame(id, envelope),
                     clinker_format::FrameRole::Inherit => parent.child(id, envelope),
-                });
+                }));
                 push_doc_punctuation(
                     stream,
-                    crate::executor::stream_event::Punctuation::document_open(Arc::clone(&child)),
+                    crate::executor::stream_event::Punctuation::document_open(child.clone()),
                 )?;
                 doc_stack.push(child);
             }
@@ -2174,7 +2177,7 @@ mod tests {
     /// multi-level envelope reader. Single pathless file (no per-record
     /// file identity), so the driver uses one stable synthetic id.
     struct ScriptedReader {
-        schema: Arc<Schema>,
+        schema: SharedStorage<Schema>,
         steps: std::collections::VecDeque<Step>,
         pending: Vec<EnvelopeEvent>,
     }
@@ -2190,8 +2193,8 @@ mod tests {
     }
 
     impl crate::source::RecordSource for ScriptedReader {
-        fn schema(&mut self) -> Result<Arc<Schema>, clinker_format::FormatError> {
-            Ok(Arc::clone(&self.schema))
+        fn schema(&mut self) -> Result<SharedStorage<Schema>, clinker_format::FormatError> {
+            Ok(self.schema.clone())
         }
 
         fn next_record(
@@ -2201,9 +2204,10 @@ mod tests {
                 match step {
                     Step::Open(name) => {
                         let mut field = IndexMap::new();
-                        field.insert(Box::from("tag"), Value::String(name.into()));
+                        field.insert(OwnedKey::from("tag"), Value::String(name.into()));
                         let mut sections = IndexMap::new();
-                        sections.insert(Box::from(name), Value::Map(Box::new(field)));
+                        sections
+                            .insert(OwnedKey::from(name), Value::Map(OwnedMap::from_map(field)));
                         self.pending.push(EnvelopeEvent::OpenLevel {
                             sections,
                             frame: clinker_format::FrameRole::Inherit,
@@ -2212,7 +2216,7 @@ mod tests {
                     Step::Close => self.pending.push(EnvelopeEvent::CloseLevel),
                     Step::Record(id) => {
                         return Ok(Some(clinker_record::Record::new(
-                            Arc::clone(&self.schema),
+                            self.schema.clone(),
                             vec![Value::Integer(id)],
                         )));
                     }
@@ -2283,6 +2287,12 @@ nodes:
             crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
             handle,
             <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(0),
+            clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+            )
+            .resources()
+            .allocation()
+            .clone(),
         );
         drive_record_source(
             src_cfg,
@@ -2338,13 +2348,13 @@ nodes:
     #[test]
     fn preview_stops_before_the_next_record_call_at_its_per_source_limit() {
         struct CountingReader {
-            schema: Arc<Schema>,
+            schema: SharedStorage<Schema>,
             calls: Arc<std::sync::atomic::AtomicU64>,
         }
 
         impl crate::source::RecordSource for CountingReader {
-            fn schema(&mut self) -> Result<Arc<Schema>, clinker_format::FormatError> {
-                Ok(Arc::clone(&self.schema))
+            fn schema(&mut self) -> Result<SharedStorage<Schema>, clinker_format::FormatError> {
+                Ok(self.schema.clone())
             }
 
             fn next_record(
@@ -2352,7 +2362,7 @@ nodes:
             ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
                 let value = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(Some(clinker_record::Record::new(
-                    Arc::clone(&self.schema),
+                    self.schema.clone(),
                     vec![Value::Integer(value as i64)],
                 )))
             }
@@ -2370,6 +2380,12 @@ nodes:
             crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
             handle,
             <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(0),
+            clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+            )
+            .resources()
+            .allocation()
+            .clone(),
         );
         drive_record_source(
             src_cfg,

@@ -1,3 +1,5 @@
+use clinker_record::owned_storage::SharedStorage;
+#[cfg(test)]
 use std::sync::Arc;
 
 use clinker_format::error::FormatError;
@@ -28,7 +30,7 @@ impl<R> TakeReader<R> {
 }
 
 impl<R: FormatReader> FormatReader for TakeReader<R> {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
         self.inner.schema()
     }
 
@@ -66,14 +68,14 @@ mod tests {
 
     /// Mock reader that yields `total` records then None.
     struct MockReader {
-        schema: Arc<Schema>,
+        schema: SharedStorage<Schema>,
         total: u64,
         yielded: u64,
     }
 
     impl MockReader {
         fn new(total: u64) -> Self {
-            let schema = Arc::new(Schema::new(vec!["id".into()]));
+            let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into()])));
             Self {
                 schema,
                 total,
@@ -83,8 +85,8 @@ mod tests {
     }
 
     impl FormatReader for MockReader {
-        fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-            Ok(Arc::clone(&self.schema))
+        fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+            Ok(self.schema.clone())
         }
 
         fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
@@ -92,7 +94,7 @@ mod tests {
                 return Ok(None);
             }
             self.yielded += 1;
-            let schema = Arc::clone(&self.schema);
+            let schema = self.schema.clone();
             let record = Record::new(schema, vec![Value::Integer(self.yielded as i64)]);
             Ok(Some(record))
         }

@@ -2,6 +2,7 @@ use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_exec::pipeline::arena::Arena;
 use clinker_exec::pipeline::window_context::PartitionWindowContext;
 use clinker_plan::config::{CompileContext, parse_config};
+use clinker_record::owned_storage::SharedStorage;
 use clinker_record::{MinimalRecord, Schema, Value, WindowContext};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use indexmap::IndexMap;
@@ -11,7 +12,10 @@ use std::sync::{Arc, Mutex};
 
 /// Build an Arena with numeric fields for window benchmarks.
 fn build_numeric_arena(partition_size: usize) -> (Arena, Vec<u64>) {
-    let schema = Arc::new(Schema::new(vec!["amount".into(), "category".into()]));
+    let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
+        "amount".into(),
+        "category".into(),
+    ])));
     let mut rng = fastrand::Rng::with_seed(42);
     let mut minimals = Vec::with_capacity(partition_size);
     for i in 0..partition_size {

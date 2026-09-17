@@ -8,6 +8,50 @@ use clinker_format::preparation::{ResourceError, ResourceErrorKind, StageStorage
 use clinker_format::reserved::ReservedBuffer;
 use clinker_format::reserved::ReservedVec;
 
+#[test]
+fn allocation_only_scope_and_writer_stage_share_one_finite_ledger() {
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+    let resources = provider.resources();
+    let allocation = resources.allocation().scope().unwrap();
+    let writer = resources.scope().unwrap();
+    let mut lease = allocation
+        .reserve(std::alloc::Layout::new::<[u8; 64]>())
+        .unwrap();
+    let identity = lease.allocation_id();
+    lease.transfer(writer.allocation()).unwrap();
+    assert_eq!(lease.owner(), writer.owner());
+    assert_eq!(lease.allocation_id(), identity);
+    let other = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+    assert_eq!(
+        lease
+            .transfer(other.resources().scope().unwrap().allocation())
+            .unwrap_err()
+            .kind,
+        ResourceErrorKind::Authority
+    );
+    assert_eq!(provider.used(), 64);
+    assert_eq!(other.used(), 0);
+
+    let mut stage = writer.stage().unwrap();
+    stage.write_all(b"same ledger").unwrap();
+    let prepared = stage.finish().unwrap();
+    assert!(provider.used() > 64);
+    drop(writer);
+    drop(resources);
+    let mut destination = Vec::new();
+    prepared.deliver(&mut destination).unwrap();
+    assert_eq!(destination, b"same ledger");
+    assert_eq!(provider.used(), 64);
+    lease.transfer(&allocation).unwrap();
+    drop(lease);
+    assert_eq!(provider.used(), 0);
+    let mut buffer = ReservedBuffer::new(allocation);
+    buffer.extend_from_slice(b"allocation only").unwrap();
+    assert_eq!(provider.used(), b"allocation only".len());
+    drop(buffer);
+    assert_eq!(provider.used(), 0);
+}
+
 struct FaultAllocator;
 thread_local! {
     static ALLOCATIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -233,8 +277,8 @@ struct Encoder {
 
 fn cancelled_delivery_never_commits(cancel_after_seal: bool) {
     use clinker_format::preparation::{
-        AllocationGrant, MemoryStorage, OperationStage, OwnerId, PreparedBytes, ResourceAuthority,
-        WriterResources,
+        AllocationAuthority, AllocationLease, MemoryStorage, OperationStage, OwnerId,
+        ResourceAuthority, WriterResources,
     };
     use std::sync::{
         Arc,
@@ -247,34 +291,49 @@ fn cancelled_delivery_never_commits(cancel_after_seal: bool) {
         cancel_after_seal: bool,
     }
     struct CancelAfterSeal {
-        stage: Box<dyn OperationStage>,
+        storage: MemoryStorage,
         cancelled: Arc<AtomicBool>,
     }
     impl Write for CancelAfterSeal {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.stage.write(bytes)
+            self.storage.write(bytes)
         }
         fn flush(&mut self) -> std::io::Result<()> {
-            self.stage.flush()
+            self.storage.flush()
         }
     }
-    impl OperationStage for CancelAfterSeal {
+    impl std::io::Read for CancelAfterSeal {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            self.storage.read(bytes)
+        }
+    }
+    impl StageStorage for CancelAfterSeal {
+        fn resource_failed(&mut self, error: ResourceError) {
+            self.storage.resource_failed(error);
+        }
         fn failure(&self) -> Option<ResourceError> {
-            self.stage.failure()
+            self.storage.failure()
         }
-        fn finish(self: Box<Self>) -> Result<PreparedBytes, FormatError> {
-            let prepared = self.stage.finish()?;
+        fn seal(&mut self) -> Result<u64, ResourceError> {
+            let len = self.storage.seal()?;
             self.cancelled.store(true, Ordering::SeqCst);
-            Ok(prepared)
+            Ok(len)
+        }
+        fn complete(&mut self) -> Result<(), ResourceError> {
+            self.storage.complete()
         }
     }
-    impl ResourceAuthority for Authority {
+    impl AllocationAuthority for Authority {
+        fn identity(&self) -> usize {
+            self.memory.resources().allocation().identity()
+        }
         fn try_reserve(
             self: Arc<Self>,
-            _: OwnerId,
+            owner: OwnerId,
             layout: std::alloc::Layout,
-        ) -> Result<AllocationGrant, ResourceError> {
-            self.memory.resources().scope()?.reserve(layout)
+        ) -> Result<AllocationLease, ResourceError> {
+            self.check_cancelled()?;
+            self.memory.resources().allocation().reserve(owner, layout)
         }
         fn release(&self, _: OwnerId, _: usize) {
             unreachable!("grants belong to the delegated memory authority")
@@ -286,18 +345,23 @@ fn cancelled_delivery_never_commits(cancel_after_seal: bool) {
                 Ok(())
             }
         }
+    }
+    impl ResourceAuthority for Authority {
         fn create_stage(
             self: Arc<Self>,
             scope: WriterScope,
-        ) -> Result<Box<dyn OperationStage>, FormatError> {
-            let stage = StorageStage::create(scope.clone(), MemoryStorage::new(scope))?;
+        ) -> Result<OperationStage, FormatError> {
+            let storage = MemoryStorage::new(scope.clone());
             if self.cancel_after_seal {
-                Ok(Box::new(CancelAfterSeal {
-                    stage,
-                    cancelled: self.cancelled.clone(),
-                }))
+                StorageStage::create(
+                    scope,
+                    CancelAfterSeal {
+                        storage,
+                        cancelled: self.cancelled.clone(),
+                    },
+                )
             } else {
-                Ok(stage)
+                StorageStage::create(scope, storage)
             }
         }
     }
@@ -346,6 +410,11 @@ fn cancelled_delivery_never_commits(cancel_after_seal: bool) {
         cancelled: cancelled.clone(),
         cancel_after_seal,
     });
+    let scope = WriterResources::new(authority.clone()).scope().unwrap();
+    let mut lease = scope.reserve(std::alloc::Layout::new::<u64>()).unwrap();
+    assert_eq!(lease.owner(), scope.owner());
+    lease.transfer(scope.allocation()).unwrap();
+    drop(lease);
     let mut writer = PreparedWriter::new(
         CancelOnWrite {
             cancelled,
@@ -436,7 +505,7 @@ fn memory_stage_seals_and_delivers_exact_bytes() {
 fn memory_growth_reserves_old_and_new_blocks_together() {
     let provider = MemoryOnlyResources::new(NonZeroUsize::new(24).unwrap());
     let scope = provider.resources().scope().unwrap();
-    let mut bytes = ReservedBuffer::new(scope);
+    let mut bytes = ReservedBuffer::new(scope.allocation().clone());
     bytes.extend_from_slice(&[1; 16]).unwrap();
     assert_eq!(provider.used(), 16);
     assert!(bytes.extend_from_slice(&[2; 16]).is_err());
@@ -511,7 +580,7 @@ fn memory_alignment_partial_initialization_and_destructor_panic_release() {
     struct Aligned;
     let provider = MemoryOnlyResources::new(NonZeroUsize::new(4096).unwrap());
     let scope = provider.resources().scope().unwrap();
-    let mut aligned = ReservedVec::new(scope.clone());
+    let mut aligned = ReservedVec::new(scope.allocation().clone());
     aligned.push(Aligned).unwrap();
     assert_eq!(aligned.as_slice().as_ptr() as usize % 256, 0);
     assert_eq!(provider.used(), 0, "aligned ZST needs no allocation");
@@ -523,7 +592,7 @@ fn memory_alignment_partial_initialization_and_destructor_panic_release() {
         }
     }
     let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut values = ReservedVec::new(scope);
+    let mut values = ReservedVec::new(scope.allocation().clone());
     values.reserve_exact(8).unwrap();
     values.push(Drops(count.clone(), true)).unwrap();
     values.push(Drops(count.clone(), false)).unwrap();
@@ -559,7 +628,7 @@ fn memory_zero_capacity_alignment_and_finite_startup_refusal() {
     #[repr(align(256))]
     struct Aligned(u8);
     let provider = MemoryOnlyResources::new(NonZeroUsize::new(4096).unwrap());
-    let mut values = ReservedVec::new(provider.resources().scope().unwrap());
+    let mut values = ReservedVec::new(provider.resources().allocation().scope().unwrap());
     assert!(values.as_slice().is_empty());
     values.push(Aligned(7)).unwrap();
     assert_eq!(values.as_slice().as_ptr() as usize % 256, 0);
@@ -615,7 +684,7 @@ fn memory_standalone_stage_has_no_hidden_operation_byte_cap() {
 #[test]
 fn memory_many_appends_have_geometric_growth_and_exact_fallback() {
     let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
-    let mut bytes = ReservedBuffer::new(provider.resources().scope().unwrap());
+    let mut bytes = ReservedBuffer::new(provider.resources().allocation().scope().unwrap());
     let mut replacements = 0;
     let mut capacity = 0;
     for _ in 0..10000 {
@@ -630,7 +699,7 @@ fn memory_many_appends_have_geometric_growth_and_exact_fallback() {
         "linear append workload must not cause linear reallocations"
     );
     let small = MemoryOnlyResources::new(NonZeroUsize::new(9).unwrap());
-    let mut bytes = ReservedBuffer::new(small.resources().scope().unwrap());
+    let mut bytes = ReservedBuffer::new(small.resources().allocation().scope().unwrap());
     bytes.extend_from_slice(b"1234").unwrap();
     bytes.extend_from_slice(b"5").unwrap();
     assert_eq!(bytes.capacity(), 5);

@@ -159,6 +159,21 @@ impl SourceRejectionEvent {
             .saturating_add(self.original_record.estimated_heap_size())
     }
 
+    /// Retained rejection bytes not already charged by the executing ledger.
+    /// Diagnostic and identity text retain their existing physical estimates.
+    pub(crate) fn unaccounted_heap_size(
+        &self,
+        resources: &clinker_record::owned_storage::AllocationResources,
+    ) -> usize {
+        self.source_name
+            .len()
+            .saturating_add(self.source_file.len())
+            .saturating_add(self.message.len())
+            .saturating_add(self.triggering_field.len())
+            .saturating_add(self.triggering_value.unaccounted_heap_size(resources))
+            .saturating_add(self.original_record.unaccounted_heap_size(resources))
+    }
+
     /// Single-line bounded diagnostic suitable for stderr and DLQ reason text.
     pub(crate) fn diagnostic_message(&self) -> &str {
         &self.message

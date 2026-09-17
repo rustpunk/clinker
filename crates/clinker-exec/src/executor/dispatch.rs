@@ -16,6 +16,7 @@
 //! where `recursive_term.execute(partition, Arc::clone(&task_context))`
 //! re-enters the same execution loop with a different plan.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
@@ -1111,6 +1112,9 @@ impl NodeBufferReaderLedger {
 ///   guards.
 /// * `collector` — stage-metrics collector receiving per-arm timing.
 pub(crate) struct ExecutorContext<'a> {
+    /// Shared run authority; cloning it never starts another memory budget.
+    /// Allocation admission borrows the run weakly, independently of writer staging.
+    pub(crate) allocation_resources: clinker_record::owned_storage::AllocationResources,
     // Borrowed plan-time state.
     pub(crate) config: &'a PipelineConfig,
     /// Bound composition bodies the dispatcher re-enters at runtime. The
@@ -1929,6 +1933,7 @@ impl<'a> ExecutorContext<'a> {
             spill_allowed,
             self.spill_compress,
             self.batch_size,
+            self.allocation_resources.clone(),
         ))
     }
 
@@ -2064,7 +2069,7 @@ impl<'a> ExecutorContext<'a> {
         source_file: &'r Arc<str>,
         source_name: &'r Arc<str>,
         row_num: crate::executor::stream_event::SourceRowId,
-        doc_ctx: &'r Arc<clinker_record::DocumentContext>,
+        doc_ctx: &'r SharedStorage<clinker_record::DocumentContext>,
     ) -> EvalContext<'r>
     where
         'a: 'r,
@@ -2121,7 +2126,7 @@ pub(crate) fn project_rows_to_buffer_schema(
     // / `AggregateGroupIndex` markers the downstream Output's
     // `buffer_key_for_record` keys on, collapsing every narrow record
     // into a per-row `null` group.
-    let narrow_schema: Arc<clinker_record::Schema> = match rows.first() {
+    let narrow_schema: SharedStorage<clinker_record::Schema> = match rows.first() {
         Some((rec, _)) => {
             let wide_schema = rec.schema();
             let mut builder = SchemaBuilder::with_capacity(buffer_schema.len());
@@ -2153,7 +2158,7 @@ pub(crate) fn project_rows_to_buffer_schema(
                     .unwrap_or(Value::Null);
                 values.push(v);
             }
-            let narrow = Record::new(Arc::clone(&narrow_schema), values);
+            let narrow = Record::new(narrow_schema.clone(), values);
             (narrow, rn)
         })
         .collect()
@@ -2230,14 +2235,27 @@ pub(crate) fn crosses_into_deferred_consumer(
 /// Per-row heuristic byte cost. Returns `0` for an empty slice. The
 /// formula matches `NodeBuffer::estimated_memory_bytes` so the
 /// admission surfaces agree on the same per-row size.
+#[cfg(test)]
 pub(crate) fn estimate_node_buffer_bytes(
     rows: &[(Record, crate::executor::stream_event::SourceRowId)],
 ) -> u64 {
-    let Some((first, _)) = rows.first() else {
-        return 0;
-    };
-    crate::executor::node_buffer::record_byte_cost(first.schema().column_count())
-        .saturating_mul(rows.len() as u64)
+    rows.iter().fold(0u64, |bytes, (record, _)| {
+        bytes.saturating_add(crate::executor::node_buffer::record_byte_cost(
+            record.schema().column_count(),
+        ))
+    })
+}
+
+/// Resident fixed-row attribution excluding slots already charged by this authority.
+pub(crate) fn estimate_node_buffer_unaccounted_bytes(
+    rows: &[(Record, crate::executor::stream_event::SourceRowId)],
+    resources: &clinker_record::owned_storage::AllocationResources,
+) -> u64 {
+    rows.iter().fold(0u64, |bytes, (record, _)| {
+        bytes.saturating_add(crate::executor::node_buffer::unaccounted_record_byte_cost(
+            record, resources,
+        ))
+    })
 }
 
 /// Predicate: does this materialized slot permit a soft-threshold spill at
@@ -2320,6 +2338,7 @@ pub(crate) fn missing_node_buffer_input_error(
 /// complete synchronous operation.
 #[must_use = "a materialized input must retain its scan reservation"]
 pub(crate) struct NodeBufferInput {
+    allocation_resources: clinker_record::owned_storage::AllocationResources,
     buffer: NodeBuffer,
     reservation: Option<TransientNodeBufferReservation>,
 }
@@ -2339,7 +2358,9 @@ impl NodeBufferInput {
         budget: &Arc<crate::pipeline::memory::MemoryArbitrator>,
         node: &str,
     ) -> Result<(NodeBuffer, Option<TransientNodeBufferReservation>), PipelineError> {
-        let materialized_bytes = self.buffer.estimated_materialized_bytes();
+        let materialized_bytes = self
+            .buffer
+            .materialization_bytes_without_transfer(&self.allocation_resources);
         let overlap_bytes = self.buffer.transferred_materialization_overlap_bytes();
         let reservation = match self.reservation {
             Some(reservation) => {
@@ -2475,6 +2496,7 @@ fn require_node_buffer_input_inner(
         ctx.node_buffer_readers
             .complete_clone(&key, consumer_name)?;
         return Ok(NodeBufferInput {
+            allocation_resources: ctx.allocation_resources.clone(),
             buffer,
             reservation: None,
         });
@@ -2504,6 +2526,7 @@ fn require_node_buffer_input_inner(
             )
         });
     Ok(NodeBufferInput {
+        allocation_resources: ctx.allocation_resources.clone(),
         buffer,
         reservation,
     })
@@ -2734,6 +2757,68 @@ pub(crate) fn admit_node_buffer_with_readers(
     spill_allowed: bool,
     readers: usize,
 ) -> Result<(), PipelineError> {
+    admit_owned_node_buffer_with_readers(
+        ctx,
+        node_name,
+        key,
+        NodeBufferAdmission {
+            rows,
+            puncts,
+            prior: None,
+        },
+        spill_allowed,
+        readers,
+    )
+}
+
+/// Data precedes its prior charge so error and unused-output drops release
+/// storage first. The token owns only its portion of the producer counter.
+pub(crate) struct NodeBufferAdmission {
+    rows: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
+    puncts: Vec<crate::executor::stream_event::Punctuation>,
+    prior: Option<crate::executor::batch_handoff::StreamingReservation>,
+}
+impl NodeBufferAdmission {
+    pub(crate) fn with_prior_owner(
+        rows: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
+        puncts: Vec<crate::executor::stream_event::Punctuation>,
+        prior: Option<crate::executor::batch_handoff::StreamingReservation>,
+    ) -> Self {
+        Self {
+            rows,
+            puncts,
+            prior,
+        }
+    }
+    fn release_prior(&mut self) {
+        drop(self.prior.take());
+    }
+}
+
+pub(crate) fn admit_node_buffer_with_prior_owner(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    node_name: &str,
+    key: impl Into<NodeBufferKey>,
+    owned: NodeBufferAdmission,
+    spill_allowed: bool,
+) -> Result<(), PipelineError> {
+    let key = key.into();
+    let mut readers = planned_materialized_reader_count(ctx, current_dag, &key)?;
+    if readers == 0 && ctx.current_body_node_input_refs.is_some() {
+        readers = 1;
+    }
+    admit_owned_node_buffer_with_readers(ctx, node_name, key, owned, spill_allowed, readers)
+}
+
+fn admit_owned_node_buffer_with_readers(
+    ctx: &mut ExecutorContext<'_>,
+    node_name: &str,
+    key: impl Into<NodeBufferKey>,
+    owned: NodeBufferAdmission,
+    spill_allowed: bool,
+    readers: usize,
+) -> Result<(), PipelineError> {
     let slot_key = key.into();
     if readers == 0 {
         return Ok(());
@@ -2751,15 +2836,7 @@ pub(crate) fn admit_node_buffer_with_readers(
     }
     ctx.node_buffer_readers
         .publish(slot_key.clone(), readers, node_name)?;
-    match admit_node_buffer_inner(
-        ctx,
-        node_name,
-        slot_key.clone(),
-        rows,
-        puncts,
-        spill_allowed,
-        None,
-    ) {
+    match admit_node_buffer_inner(ctx, node_name, slot_key.clone(), owned, spill_allowed, None) {
         Ok(buffer) => {
             if ctx.node_buffers.insert(slot_key.clone(), buffer).is_some() {
                 ctx.node_buffer_readers.discard(&slot_key);
@@ -2826,8 +2903,11 @@ pub(crate) fn admit_node_buffer_transferred(
         ctx,
         node_name,
         slot_key.clone(),
-        rows,
-        puncts,
+        NodeBufferAdmission {
+            rows,
+            puncts,
+            prior: None,
+        },
         spill_allowed,
         Some(reservation),
     ) {
@@ -2918,15 +2998,16 @@ fn admit_node_buffer_inner(
     ctx: &mut ExecutorContext<'_>,
     node_name: &str,
     slot_key: NodeBufferKey,
-    rows: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
-    puncts: Vec<crate::executor::stream_event::Punctuation>,
+    mut owned: NodeBufferAdmission,
     spill_allowed: bool,
     transferred_reservation: Option<TransientNodeBufferReservation>,
 ) -> Result<NodeBuffer, PipelineError> {
     let bytes = transferred_reservation
         .as_ref()
         .map(TransientNodeBufferReservation::bytes)
-        .unwrap_or_else(|| estimate_node_buffer_bytes(&rows));
+        .unwrap_or_else(|| {
+            estimate_node_buffer_unaccounted_bytes(&owned.rows, &ctx.allocation_resources)
+        });
     // Register a NodeBufferConsumer with the pipeline-scoped
     // arbitrator for every slot admission. The handle's `bytes`
     // counter seeds to the admitted byte estimate so the consumer's
@@ -2982,6 +3063,11 @@ fn admit_node_buffer_inner(
     };
     ctx.node_buffer_consumer_ids
         .insert(slot_key, (consumer_id, handle.clone()));
+    // Establish the NodeBuffer owner first, then release only the prior
+    // producer portion before any local pressure or peak sample. These are
+    // legacy observations, not an atomic whole-engine ledger transfer.
+    owned.release_prior();
+    let NodeBufferAdmission { rows, puncts, .. } = owned;
     // Raise the run's high-water mark now that this slot's charge has
     // joined the registry. Sampling at admission (not only on streaming
     // batch charges) makes `peak_consumer_usage_bytes` a faithful peak
@@ -3126,11 +3212,11 @@ pub(crate) fn stream_linear_producer_emit(
 /// they flow through canonicalize via the per-name copy loop in
 /// `canonicalize_to_source_schema` rather than this engine-stamp
 /// tail.
-pub(crate) fn build_engine_stamped_tail(target: &Arc<Schema>) -> Vec<(usize, Box<str>)> {
+pub(crate) fn build_engine_stamped_tail(target: &SharedStorage<Schema>) -> Vec<(usize, Box<str>)> {
     (0..target.column_count())
         .filter_map(|i| match target.field_metadata(i) {
             Some(clinker_record::FieldMetadata::SourceCorrelation { source_field }) => {
-                Some((i, source_field.clone()))
+                Some((i, Box::<str>::from(source_field.as_ref())))
             }
             Some(clinker_record::FieldMetadata::AggregateGroupIndex { .. })
             | Some(clinker_record::FieldMetadata::WidenedSidecar)
@@ -3144,8 +3230,8 @@ pub(crate) fn build_engine_stamped_tail(target: &Arc<Schema>) -> Vec<(usize, Box
 }
 
 /// Canonicalize a record produced by an ingest reader (or a body-
-/// port seeded record) onto a Source's plan-time `Arc<Schema>` so
-/// every downstream operator hits the `Arc::ptr_eq` fast path on the
+/// port seeded record) onto a Source's plan-time `SharedStorage<Schema>` so
+/// every downstream operator hits the `SharedStorage::ptr_eq` fast path on the
 /// first record. Used by both the legacy Source dispatch arm and the
 /// `Merge.interleave` fusion that consumes Source receivers directly.
 ///
@@ -3164,10 +3250,10 @@ pub(crate) fn build_engine_stamped_tail(target: &Arc<Schema>) -> Vec<(usize, Box
 /// has it, `Null` otherwise).
 pub(crate) fn canonicalize_to_source_schema(
     r: &Record,
-    target: &Arc<Schema>,
+    target: &SharedStorage<Schema>,
     engine_stamped: &[(usize, Box<str>)],
 ) -> Record {
-    if Arc::ptr_eq(r.schema(), target) {
+    if SharedStorage::ptr_eq(r.schema(), target) {
         return r.clone();
     }
     let reader = r.schema();
@@ -3197,11 +3283,11 @@ pub(crate) fn canonicalize_to_source_schema(
             values[*target_idx] = reader_vals[src_idx].clone();
         }
     }
-    let mut out = Record::new(Arc::clone(target), values);
+    let mut out = Record::new(target.clone(), values);
     // Canonicalization reshapes the schema but the record is the same
     // document's row — carry its envelope context forward so
     // `$doc.<section>.<field>` resolves on the canonicalized record.
-    out.set_doc_ctx(Arc::clone(r.doc_ctx()));
+    out.set_doc_ctx(r.doc_ctx().clone());
     out
 }
 
@@ -3290,11 +3376,11 @@ pub(crate) fn finalize_node_rooted_windows(
         };
         // The plan-time `anchor_schema` is the upstream operator's
         // full `output_schema`. The forward pass invokes this helper
-        // with rows carrying that exact `Arc<Schema>`, so projection
+        // with rows carrying that exact `SharedStorage<Schema>`, so projection
         // by `anchor_schema.index(field)` lands on the right value
         // slots. The commit-pass deferred-region path invokes the
         // helper with NARROW rows (column-pruned to
-        // `region.buffer_schema`), which carry their own `Arc<Schema>`
+        // `region.buffer_schema`), which carry their own `SharedStorage<Schema>`
         // — projecting against the wide plan-anchor would index off
         // the end / into the wrong slot. Whenever the actual rows
         // carry a different column count than the plan-anchor, drop
@@ -3503,7 +3589,7 @@ pub(crate) fn merge_fused_interleave(
     current_dag: &ExecutionPlanDag,
     merge_name: &str,
     sorted_preds: &[NodeIndex],
-    merge_output_schema: Option<&Arc<Schema>>,
+    merge_output_schema: Option<&SharedStorage<Schema>>,
     streaming: Option<MergeStreamHandoff<'_>>,
 ) -> Result<FusedMergeOutput, PipelineError> {
     // Per-predecessor state: the source's plan-time schema, its
@@ -3514,7 +3600,7 @@ pub(crate) fn merge_fused_interleave(
     struct PredState {
         source_name_arc: Arc<str>,
         source_name_string: String,
-        source_schema: Option<Arc<Schema>>,
+        source_schema: Option<SharedStorage<Schema>>,
         engine_stamped: Vec<(usize, Box<str>)>,
     }
 
@@ -3736,9 +3822,9 @@ pub(crate) fn merge_fused_interleave(
                         "merge",
                         &state.source_name_string,
                     )?;
-                    let doc_ctx = Arc::clone(rec.doc_ctx());
+                    let doc_ctx = rec.doc_ctx().clone();
                     let values = rec.values().to_vec();
-                    rec = Record::new(Arc::clone(merge_schema), values);
+                    rec = Record::new(merge_schema.clone(), values);
                     rec.set_doc_ctx(doc_ctx);
                 }
                 match stream_batch.as_mut() {
@@ -4162,7 +4248,7 @@ pub(crate) fn transform_fused_consume(
                     let source_file_arc = Arc::clone(&last_file);
                     let rec_source_name_arc = source_name_arc_of(&rec);
                     let source_count = ctx.source_count_by_name(&rec_source_name_arc);
-                    let rec_doc_ctx = Arc::clone(rec.doc_ctx());
+                    let rec_doc_ctx = rec.doc_ctx().clone();
                     (
                         source_file_arc,
                         rec_source_name_arc,
@@ -4205,7 +4291,7 @@ pub(crate) fn transform_fused_consume(
                 let target_schema = output_schema
                     .as_ref()
                     .cloned()
-                    .unwrap_or_else(|| Arc::clone(rec.schema()));
+                    .unwrap_or_else(|| rec.schema().clone());
                 let eval_result = {
                     let _guard = ctx.transform_timer.guard();
                     evaluate_single_transform(&rec, name, evaluator, &eval_ctx, &target_schema)
@@ -4698,4 +4784,88 @@ pub(crate) struct CorrelationErrorRecord {
     pub(crate) error_message: String,
     pub(crate) stage: Option<String>,
     pub(crate) route: Option<String>,
+}
+
+#[cfg(test)]
+mod output_admission_ownership_tests {
+    use super::*;
+    use crate::executor::batch_handoff::StreamingReservation;
+    use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator, NoOpPolicy};
+
+    #[test]
+    fn output_admission_prior_owner_survives_rejection_and_spill_failure() {
+        for mode in ["unused", "adopt", "spill-failure"] {
+            let budget = Arc::new(MemoryArbitrator::with_policy(
+                1024 * 1024,
+                0.8,
+                0.7,
+                Box::new(NoOpPolicy),
+            ));
+            let prior_handle = ConsumerHandle::new();
+            let prior_id = budget.register_consumer(Arc::new(
+                crate::pipeline::sort_buffer::SortConsumer::new(prior_handle.clone()),
+            ));
+            // This unrelated portion must survive release of the output token.
+            prior_handle.add_bytes(7);
+            let schema = SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(vec![
+                "value".into(),
+            ])));
+            let rows = vec![(
+                Record::new(schema, vec![Value::String("retained".into())]),
+                0u64.into(),
+            )];
+            let bytes = estimate_node_buffer_bytes(&rows);
+            let owner = StreamingReservation::retain(prior_handle.clone(), budget.clone(), bytes);
+            let mut owned = NodeBufferAdmission::with_prior_owner(rows, Vec::new(), Some(owner));
+            assert_eq!(prior_handle.bytes(), bytes + 7);
+            if mode == "unused" {
+                // The admission reader checks may reject/drop before a new
+                // registration exists. Data and its token stay in one owner.
+                drop(owned);
+            } else {
+                let next = ConsumerHandle::new();
+                next.set_bytes(bytes);
+                let next_id = budget.register_consumer(Arc::new(
+                    crate::executor::node_buffer::NodeBufferConsumer::new(next.clone()),
+                ));
+                owned.release_prior();
+                budget.sample_peak_consumer_usage();
+                assert_eq!(budget.sum_consumer_usage(), bytes + 7);
+                assert_eq!(
+                    budget.peak_consumer_usage(),
+                    bytes + 7,
+                    "local peak sampling must not record duplicate ownership"
+                );
+                let NodeBufferAdmission { rows, puncts, .. } = owned;
+                if mode == "spill-failure" {
+                    let root = tempfile::tempdir().unwrap();
+                    let missing = root.path().join("missing");
+                    let result = crate::executor::node_buffer_spill::spill_node_buffer(
+                        rows,
+                        Some(&missing),
+                        false,
+                    );
+                    assert!(
+                        result.is_err(),
+                        "failed spill consumes and releases its input rows"
+                    );
+                } else {
+                    let buffer = NodeBuffer::memory_from_records_and_puncts(rows, puncts);
+                    assert_eq!(next.bytes(), bytes);
+                    drop(buffer);
+                }
+                next.set_bytes(0);
+                budget.unregister_consumer(next_id);
+            }
+            assert_eq!(
+                prior_handle.bytes(),
+                7,
+                "only the owned output portion is released"
+            );
+            prior_handle.sub_bytes(7);
+            budget.unregister_consumer(prior_id);
+            assert_eq!(budget.consumer_count(), 0);
+            assert_eq!(budget.sum_consumer_usage(), 0);
+        }
+    }
 }

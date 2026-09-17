@@ -17,3 +17,6 @@ pub mod source;
 pub mod telemetry;
 
 pub use executor::stage_metrics::{StageCollector, StageMetrics, StageName};
+
+#[cfg(test)]
+mod test_support;

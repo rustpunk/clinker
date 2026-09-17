@@ -696,6 +696,10 @@ see the Resolved Archive. This entry keeps the one remaining follow-on.)
 
 ## Resolved Archive
 
+### 61. Decoded allocation ownership
+
+Resolved by maintainer approval on 2026-09-15; [the production-contract register](15_PRODUCTION_CONTRACTS.md#decoded-allocation-ownership) records the locked target. The selected design attaches reservations to actual decoded storage through final destruction, keeps release state alive for escaped values, and adapts shared schema/context handles and matching legacy accounting. The exact fallible shared-allocation dependency and explicit parser/copy allowances are approved. Implementation and qualification are still pending in [#1199](https://github.com/rustpunk/clinker/issues/1199) and [#1189](https://github.com/rustpunk/clinker/issues/1189); the broader [#1183](https://github.com/rustpunk/clinker/issues/1183) contract remains open.
+
 Numbers are never reused. One line per entry: the answer and its evidence.
 
 - **2 (partial, `fixed` lock; resolved 2026-07-03):** The folder overlay carries

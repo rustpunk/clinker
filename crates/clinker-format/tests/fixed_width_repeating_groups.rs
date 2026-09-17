@@ -1,3 +1,4 @@
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
 use std::sync::Arc;
 
 use clinker_format::fixed_width::field::ResolvedRepeatingGroup;
@@ -44,8 +45,8 @@ fn nested_record(fields: &[(&str, Value)]) -> Value {
     let values = fields
         .iter()
         .map(|(name, value)| ((*name).into(), value.clone()))
-        .collect::<IndexMap<Box<str>, Value>>();
-    Value::Map(Box::new(values))
+        .collect::<IndexMap<OwnedKey, Value>>();
+    Value::Map(OwnedMap::from_map(values))
 }
 
 fn occurrence(kind: &str, code: &str) -> Value {
@@ -56,14 +57,17 @@ fn occurrence(kind: &str, code: &str) -> Value {
 }
 
 fn record(name: &str, value: Value) -> Record {
-    Record::new(Arc::new(Schema::new(vec![name.into()])), vec![value])
+    Record::new(
+        SharedStorage::from_arc(Arc::new(Schema::new(vec![name.into()]))),
+        vec![value],
+    )
 }
 
 fn record_fields(fields: &[(&str, Value)]) -> Record {
     Record::new(
-        Arc::new(Schema::new(
+        SharedStorage::from_arc(Arc::new(Schema::new(
             fields.iter().map(|(name, _)| (*name).into()).collect(),
-        )),
+        ))),
         fields.iter().map(|(_, value)| value.clone()).collect(),
     )
 }
@@ -100,7 +104,7 @@ fn read(layout: Vec<Column>, bytes: &[u8]) -> Result<Record, FormatError> {
 #[test]
 fn tracer_group_round_trip() {
     let layout = vec![group("transactions", 0, 2, true)];
-    let input = Value::Array(vec![
+    let input = Value::Array(OwnedValues::from_vec(vec![
         nested_record(&[
             ("kind", Value::String("A".into())),
             ("code", Value::String("01".into())),
@@ -109,7 +113,7 @@ fn tracer_group_round_trip() {
             ("kind", Value::String("B".into())),
             ("code", Value::String("02".into())),
         ]),
-    ]);
+    ]));
 
     let mut bytes = Vec::new();
     {
@@ -143,13 +147,13 @@ fn tracer_group_round_trip() {
     assert_eq!(logical_schema.columns().len(), 1);
     assert_eq!(logical_schema.columns()[0].as_ref(), "transactions");
 
-    let invalid = Value::Array(vec![
+    let invalid = Value::Array(OwnedValues::from_vec(vec![
         nested_record(&[
             ("kind", Value::String("A".into())),
             ("code", Value::String("01".into())),
         ]),
         Value::String("not a nested record".into()),
-    ]);
+    ]));
     let mut destination = Vec::new();
     let mut writer = FixedWidthWriter::new(
         &mut destination,
@@ -230,21 +234,24 @@ fn tracer_group_round_trip() {
 #[test]
 fn zero_null_one_min_and_max_have_exact_pad_bytes() {
     let layout = vec![group("transactions", 0, 2, false)];
-    for zero in [Value::Null, Value::Array(Vec::new())] {
+    for zero in [Value::Null, Value::Array(OwnedValues::from_vec(Vec::new()))] {
         let bytes = write(layout.clone(), &record("transactions", zero)).expect("zero writes");
         assert_eq!(bytes, b"      \n");
         assert_eq!(
             read(layout.clone(), &bytes)
                 .expect("zero reads")
                 .get("transactions"),
-            Some(&Value::Array(Vec::new()))
+            Some(&Value::Array(OwnedValues::from_vec(Vec::new())))
         );
     }
-    let absent = Record::new(Arc::new(Schema::new(Vec::new())), Vec::new());
+    let absent = Record::new(
+        SharedStorage::from_arc(Arc::new(Schema::new(Vec::new()))),
+        Vec::new(),
+    );
     let absent_bytes = write(layout.clone(), &absent).expect("absent group writes as zero");
     assert_eq!(absent_bytes, b"      \n");
 
-    let one = Value::Array(vec![occurrence("A", "01")]);
+    let one = Value::Array(OwnedValues::from_vec(vec![occurrence("A", "01")]));
     let one_bytes = write(layout.clone(), &record("transactions", one.clone())).expect("one");
     assert_eq!(one_bytes, b"A01   \n");
     assert_eq!(
@@ -254,7 +261,10 @@ fn zero_null_one_min_and_max_have_exact_pad_bytes() {
         Some(&one)
     );
 
-    let maximum = Value::Array(vec![occurrence("A", "01"), occurrence("B", "02")]);
+    let maximum = Value::Array(OwnedValues::from_vec(vec![
+        occurrence("A", "01"),
+        occurrence("B", "02"),
+    ]));
     let max_bytes =
         write(layout.clone(), &record("transactions", maximum.clone())).expect("maximum");
     assert_eq!(max_bytes, b"A01B02\n");
@@ -275,7 +285,10 @@ fn zero_null_one_min_and_max_have_exact_pad_bytes() {
     assert!(error.to_string().contains("minimum is 1"), "{error}");
     write(
         vec![minimum_layout],
-        &record("transactions", Value::Array(vec![occurrence("A", "01")])),
+        &record(
+            "transactions",
+            Value::Array(OwnedValues::from_vec(vec![occurrence("A", "01")])),
+        ),
     )
     .expect("minimum writes");
 }
@@ -283,7 +296,7 @@ fn zero_null_one_min_and_max_have_exact_pad_bytes() {
 #[test]
 fn pad_and_shift_keep_adjacent_fields_at_deterministic_offsets() {
     let pad_layout = vec![group("transactions", 0, 2, false), scalar("tail", 6, 1)];
-    let value = Value::Array(vec![occurrence("A", "01")]);
+    let value = Value::Array(OwnedValues::from_vec(vec![occurrence("A", "01")]));
     let pad_record = record_fields(&[
         ("transactions", value.clone()),
         ("tail", Value::String("Z".into())),
@@ -332,11 +345,11 @@ fn pad_and_shift_keep_adjacent_fields_at_deterministic_offsets() {
 
 #[test]
 fn overflow_errors_or_retains_the_selected_end_atomically() {
-    let values = Value::Array(vec![
+    let values = Value::Array(OwnedValues::from_vec(vec![
         occurrence("A", "01"),
         occurrence("B", "02"),
         occurrence("C", "03"),
-    ]);
+    ]));
     let error = write(
         vec![group("transactions", 0, 2, false)],
         &record("transactions", values.clone()),
@@ -381,16 +394,18 @@ fn count_field_controls_cardinality_and_detects_extra_payload() {
     let one = read(layout.clone(), b"1A01   \n").expect("count one");
     assert_eq!(
         one.get("transactions"),
-        Some(&Value::Array(vec![occurrence("A", "01")]))
+        Some(&Value::Array(OwnedValues::from_vec(vec![occurrence(
+            "A", "01"
+        )])))
     );
 
     let two = read(layout.clone(), b"2A01   \n").expect("count two");
     assert_eq!(
         two.get("transactions"),
-        Some(&Value::Array(vec![
+        Some(&Value::Array(OwnedValues::from_vec(vec![
             occurrence("A", "01"),
             nested_record(&[("kind", Value::Null), ("code", Value::Null)]),
-        ]))
+        ])))
     );
 
     let error = read(layout, b"1A01B02\n").expect_err("count/payload mismatch");
@@ -402,10 +417,10 @@ fn count_field_controls_cardinality_and_detects_extra_payload() {
 
 #[test]
 fn ambiguous_padding_and_non_record_shapes_fail_before_destination_write() {
-    let blank = Value::Array(vec![nested_record(&[
+    let blank = Value::Array(OwnedValues::from_vec(vec![nested_record(&[
         ("kind", Value::Null),
         ("code", Value::Null),
-    ])]);
+    ])]));
     let error = write(
         vec![group("transactions", 0, 2, false)],
         &record("transactions", blank),
@@ -415,7 +430,9 @@ fn ambiguous_padding_and_non_record_shapes_fail_before_destination_write() {
 
     for invalid in [
         Value::String("not an array".into()),
-        Value::Array(vec![Value::String("not a record".into())]),
+        Value::Array(OwnedValues::from_vec(vec![Value::String(
+            "not a record".into(),
+        )])),
     ] {
         let mut destination = Vec::new();
         let mut writer = FixedWidthWriter::new(
@@ -438,8 +455,14 @@ fn adjacent_groups_preserve_equal_occurrences_and_never_exchange_bytes() {
     let second = group("second", 7, 2, true);
     let equal = occurrence("A", "01");
     let record = record_fields(&[
-        ("first", Value::Array(vec![equal.clone(), equal.clone()])),
-        ("second", Value::Array(vec![occurrence("B", "02")])),
+        (
+            "first",
+            Value::Array(OwnedValues::from_vec(vec![equal.clone(), equal.clone()])),
+        ),
+        (
+            "second",
+            Value::Array(OwnedValues::from_vec(vec![occurrence("B", "02")])),
+        ),
     ]);
     let layout = vec![first, second];
     let bytes = write(layout.clone(), &record).expect("adjacent groups write");

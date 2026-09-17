@@ -1,6 +1,7 @@
 use clinker_bench_support::{LARGE, MEDIUM, RecordFactory, SMALL};
 use clinker_exec::pipeline::arena::Arena;
 use clinker_plan::config::{NullOrder, SortField, SortOrder};
+use clinker_record::owned_storage::SharedStorage;
 use clinker_record::{MinimalRecord, Schema, Value};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::sync::Arc;
@@ -105,7 +106,7 @@ fn bench_sort_presorted(c: &mut Criterion) {
 
     for count in [SMALL, MEDIUM, LARGE] {
         // Build a pre-sorted arena: sequential integers in f0
-        let schema = Arc::new(Schema::new(vec!["f0".into(), "f1".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["f0".into(), "f1".into()])));
         let minimals: Vec<MinimalRecord> = (0..count)
             .map(|i| MinimalRecord::new(vec![Value::Integer(i as i64), Value::Null]))
             .collect();
@@ -131,7 +132,7 @@ fn bench_sort_reverse(c: &mut Criterion) {
     let sort_by = vec![sort_field("f0", SortOrder::Asc, None)];
 
     for count in [SMALL, MEDIUM, LARGE] {
-        let schema = Arc::new(Schema::new(vec!["f0".into(), "f1".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["f0".into(), "f1".into()])));
         let minimals: Vec<MinimalRecord> = (0..count)
             .rev()
             .map(|i| MinimalRecord::new(vec![Value::Integer(i as i64), Value::Null]))
