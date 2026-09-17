@@ -182,7 +182,7 @@ fn generate_workload(
             // count.
             let rate = (10 + b * 5) as i64;
             brackets.push(Record::new(
-                Arc::clone(&brackets_schema),
+                brackets_schema.clone(),
                 vec![
                     Value::Integer(ent as i64),
                     Value::Integer(bracket_id as i64),
@@ -215,7 +215,7 @@ fn generate_workload(
                 & 0xFFFF_FFFF;
             let income = (mix as i64) % BRACKET_SPAN;
             employees.push(Record::new(
-                Arc::clone(&employees_schema),
+                employees_schema.clone(),
                 vec![
                     Value::Integer(ent as i64),
                     Value::Integer(employee_id as i64),
@@ -507,7 +507,7 @@ fn generate_pure_range_workload(
         let lo = b as i64 * band_step;
         let hi = lo + band_step;
         bands.push(Record::new(
-            Arc::clone(&bands_schema),
+            bands_schema.clone(),
             vec![
                 Value::Integer(b as i64),
                 Value::Integer(lo),
@@ -527,7 +527,7 @@ fn generate_pure_range_workload(
             & 0xFFFF_FFFF;
         let amount = (mix as i64) % SPAN;
         readings.push(Record::new(
-            Arc::clone(&readings_schema),
+            readings_schema.clone(),
             vec![Value::Integer(r as i64), Value::Integer(amount)],
         ));
         writeln!(readings_csv, "{r},{amount}").unwrap();

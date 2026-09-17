@@ -12,6 +12,7 @@
 //! variants surface as a format error so a config-wrong-for-format
 //! mistake fails fast.
 
+use clinker_record::owned_storage::OwnedKey;
 use clinker_record::{
     DEFAULT_DATE_FORMATS, DEFAULT_DATETIME_FORMATS, Value, coerce_to_bool, coerce_to_date,
     coerce_to_datetime, coerce_to_float, coerce_to_int, coerce_to_string,
@@ -54,7 +55,7 @@ pub enum EnvelopeEvent {
     /// interchange frame); a level the format treats as a self-contained
     /// document — each HL7 `MSH` message — is [`FrameRole::NewFrame`].
     OpenLevel {
-        sections: IndexMap<Box<str>, Value>,
+        sections: IndexMap<OwnedKey, Value>,
         frame: FrameRole,
     },
     /// Leave the innermost open nested envelope level. The driver closes
@@ -213,8 +214,8 @@ pub enum EnvelopeFieldType {
 pub(crate) fn coerce_section_fields(
     raw: Vec<(String, String)>,
     schema: &IndexMap<String, EnvelopeFieldType>,
-) -> Result<IndexMap<Box<str>, Value>, String> {
-    let mut out: IndexMap<Box<str>, Value> = IndexMap::with_capacity(schema.len());
+) -> Result<IndexMap<OwnedKey, Value>, String> {
+    let mut out: IndexMap<OwnedKey, Value> = IndexMap::with_capacity(schema.len());
     let mut by_name: IndexMap<&str, &str> = IndexMap::with_capacity(raw.len());
     for (k, v) in &raw {
         by_name.entry(k.as_str()).or_insert(v.as_str());
@@ -239,7 +240,7 @@ pub(crate) fn coerce_section_fields(
                  cannot coerce value {raw_str:?}: {e}"
             )
         })?;
-        out.insert(Box::from(field.as_str()), coerced);
+        out.insert(OwnedKey::from(field.as_str()), coerced);
     }
     Ok(out)
 }

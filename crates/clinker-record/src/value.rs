@@ -1,4 +1,5 @@
 use crate::field_str::FieldStr;
+use crate::owned_storage::{AllocationResources, OwnedKey, OwnedMap, OwnedValues};
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use indexmap::IndexMap;
 use rust_decimal::Decimal;
@@ -36,11 +37,11 @@ pub enum Value {
     String(FieldStr),
     Date(NaiveDate),
     DateTime(NaiveDateTime),
-    Array(Vec<Value>),
+    Array(OwnedValues),
     /// Nested key-value map (ordered, insertion-preserving).
     /// `Box<IndexMap>` is 8 bytes; the enum width is set by `String(SmolStr)`
-    /// and `Array(Vec<Value>)`, not by this variant.
-    Map(Box<IndexMap<Box<str>, Value>>),
+    /// and `Array(OwnedValues)`, not by this variant.
+    Map(OwnedMap),
 }
 
 // ── Serialize (tagged, postcard-compatible) ────────────────────────────────
@@ -186,15 +187,15 @@ impl<'de> Visitor<'de> for ValueVisitor {
             }
             7 => {
                 let arr: Vec<Value> = va.newtype_variant()?;
-                Ok(Value::Array(arr))
+                Ok(Value::Array(OwnedValues::from_vec(arr)))
             }
             8 => {
                 let pairs: Vec<(std::string::String, Value)> = va.newtype_variant()?;
                 let mut m = IndexMap::with_capacity(pairs.len());
                 for (k, v) in pairs {
-                    m.insert(k.into_boxed_str(), v);
+                    m.insert(OwnedKey::from(k), v);
                 }
-                Ok(Value::Map(Box::new(m)))
+                Ok(Value::Map(OwnedMap::from_map(m)))
             }
             9 => {
                 // Exact 16-byte reconstruction (inherent `Decimal::deserialize`).
@@ -388,17 +389,44 @@ pub(crate) fn indexmap_heap_size(m: &IndexMap<Box<str>, Value>) -> usize {
     // The index table's per-slot control byte and its power-of-two load slack are
     // not modelled, so a fully-loaded map is under-read by a few percent — a
     // small residual, far tighter than dropping the index table entirely.
-    let entry_size = std::mem::size_of::<Box<str>>()
-        + std::mem::size_of::<Value>()
-        + std::mem::size_of::<u64>()
-        + std::mem::size_of::<usize>();
-    let map_backing = m.capacity() * entry_size;
+    let map_backing = indexmap_backing_size::<Box<str>>(m.capacity());
     let keys_heap: usize = m.keys().map(|k| k.len()).sum();
     let values_heap: usize = m.values().map(Value::heap_size).sum();
     map_backing + keys_heap + values_heap
 }
 
+/// Existing legacy structural estimate, shared with owned-storage traversal.
+/// This deliberately remains an estimate, not an allocation admission bound.
+pub(crate) fn indexmap_backing_size<K>(capacity: usize) -> usize {
+    capacity
+        * (std::mem::size_of::<K>()
+            + std::mem::size_of::<Value>()
+            + std::mem::size_of::<u64>()
+            + std::mem::size_of::<usize>())
+}
+
 impl Value {
+    /// Recursively count storage outside the supplied aggregate ledger.
+    pub fn unaccounted_heap_size(&self, resources: &AllocationResources) -> usize {
+        match self {
+            Self::String(text) => text.unaccounted_heap_size(resources),
+            Self::Array(values) => values.unaccounted_heap_size(resources),
+            Self::Map(map) => map.unaccounted_heap_size(resources),
+            _ => 0,
+        }
+    }
+
+    /// Recursive contribution to a legacy container's heap estimate. Only
+    /// actually governed string allocations are excluded; distinct legacy
+    /// vectors, map backing, keys and copied text retain their contributions.
+    pub fn legacy_heap_size(&self) -> usize {
+        match self {
+            Value::String(text) => text.legacy_heap_size(),
+            Value::Array(values) => values.legacy_heap_size(),
+            Value::Map(map) => map.legacy_heap_size(),
+            _ => 0,
+        }
+    }
     /// Returns the CXL type name as a static string.
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -436,11 +464,8 @@ impl Value {
     pub fn heap_size(&self) -> usize {
         match self {
             Value::String(s) => s.heap_size(),
-            Value::Array(arr) => {
-                arr.capacity() * std::mem::size_of::<Value>()
-                    + arr.iter().map(Value::heap_size).sum::<usize>()
-            }
-            Value::Map(m) => indexmap_heap_size(m),
+            Value::Array(arr) => arr.heap_size(),
+            Value::Map(m) => m.heap_size(),
             _ => 0,
         }
     }
@@ -458,19 +483,19 @@ impl Value {
     }
 
     /// Create a Map from an iterator of key-value pairs.
-    pub fn map(pairs: impl IntoIterator<Item = (impl Into<Box<str>>, Value)>) -> Self {
-        let map: IndexMap<Box<str>, Value> =
+    pub fn map(pairs: impl IntoIterator<Item = (impl Into<OwnedKey>, Value)>) -> Self {
+        let map: IndexMap<OwnedKey, Value> =
             pairs.into_iter().map(|(k, v)| (k.into(), v)).collect();
-        Value::Map(Box::new(map))
+        Value::Map(OwnedMap::from_map(map))
     }
 
     /// Create an empty Map.
     pub fn empty_map() -> Self {
-        Value::Map(Box::default())
+        Value::Map(OwnedMap::from_map(IndexMap::new()))
     }
 
     /// Borrow the inner IndexMap if this is a Map variant.
-    pub fn as_map(&self) -> Option<&IndexMap<Box<str>, Value>> {
+    pub fn as_map(&self) -> Option<&IndexMap<OwnedKey, Value>> {
         match self {
             Value::Map(m) => Some(m),
             _ => None,
@@ -478,7 +503,7 @@ impl Value {
     }
 
     /// Mutably borrow the inner IndexMap if this is a Map variant.
-    pub fn as_map_mut(&mut self) -> Option<&mut IndexMap<Box<str>, Value>> {
+    pub fn as_map_mut(&mut self) -> Option<&mut OwnedMap> {
         match self {
             Value::Map(m) => Some(m),
             _ => None,
@@ -488,13 +513,6 @@ impl Value {
     /// Get a field from a Map by name. Returns None if not a Map or field missing.
     pub fn get_field(&self, name: &str) -> Option<&Value> {
         self.as_map().and_then(|m| m.get(name))
-    }
-
-    /// Set a field on a Map. No-op if not a Map variant.
-    pub fn set_field(&mut self, name: impl Into<Box<str>>, value: Value) {
-        if let Value::Map(m) = self {
-            m.insert(name.into(), value);
-        }
     }
 }
 
@@ -519,7 +537,10 @@ mod tests {
         assert_eq!(Value::Date(d).to_string(), "2024-01-15");
         let dt = d.and_hms_opt(10, 30, 0).unwrap();
         assert_eq!(Value::DateTime(dt).to_string(), "2024-01-15T10:30:00");
-        let arr = Value::Array(vec![Value::Integer(1), Value::Integer(2)]);
+        let arr = Value::Array(OwnedValues::from_vec(vec![
+            Value::Integer(1),
+            Value::Integer(2),
+        ]));
         assert_eq!(arr.to_string(), "[1, 2]");
     }
 
@@ -546,9 +567,15 @@ mod tests {
             Value::Date(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
             Value::Date(NaiveDate::from_ymd_opt(2000, 2, 29).unwrap()),
             Value::DateTime(dt),
-            Value::Array(vec![]),
-            Value::Array(vec![Value::Integer(1), Value::Bool(true)]),
-            Value::Array(vec![Value::Null, Value::String("x".into())]),
+            Value::Array(OwnedValues::from_vec(vec![])),
+            Value::Array(OwnedValues::from_vec(vec![
+                Value::Integer(1),
+                Value::Bool(true),
+            ])),
+            Value::Array(OwnedValues::from_vec(vec![
+                Value::Null,
+                Value::String("x".into()),
+            ])),
             Value::Decimal(rust_decimal::Decimal::new(0, 0)),
             Value::Decimal(rust_decimal::Decimal::new(1050, 2)),
             Value::Decimal(rust_decimal::Decimal::new(-1050, 2)),
@@ -611,10 +638,10 @@ mod tests {
 
     #[test]
     fn test_value_postcard_roundtrip_nested() {
-        let nested = Value::Array(vec![
+        let nested = Value::Array(OwnedValues::from_vec(vec![
             Value::map([("x", Value::Integer(10)), ("y", Value::Float(1.5))]),
-            Value::Array(vec![Value::Null, Value::Bool(false)]),
-        ]);
+            Value::Array(OwnedValues::from_vec(vec![Value::Null, Value::Bool(false)])),
+        ]));
         let recovered = roundtrip(&nested);
         assert_eq!(nested, recovered);
     }
@@ -840,7 +867,10 @@ mod tests {
 
     #[test]
     fn test_value_heap_size_array() {
-        let arr = Value::Array(vec![Value::Integer(1), Value::String("ab".into())]);
+        let arr = Value::Array(OwnedValues::from_vec(vec![
+            Value::Integer(1),
+            Value::String("ab".into()),
+        ]));
         // Vec backing (capacity=2) + Integer heap (0) + inline String "ab" heap (0).
         let expected = 2 * std::mem::size_of::<Value>();
         assert_eq!(arr.heap_size(), expected);
@@ -848,7 +878,10 @@ mod tests {
         // A heap-backed element string adds its byte length on top of the Vec backing.
         let long = "an element string well past the inline boundary of the field type";
         assert!(long.len() > crate::field_str::INLINE_CAP);
-        let arr2 = Value::Array(vec![Value::Integer(1), Value::String(long.into())]);
+        let arr2 = Value::Array(OwnedValues::from_vec(vec![
+            Value::Integer(1),
+            Value::String(long.into()),
+        ]));
         let expected2 = 2 * std::mem::size_of::<Value>() + long.len();
         assert_eq!(arr2.heap_size(), expected2);
     }
@@ -859,7 +892,7 @@ mod tests {
         // eight-slot capacity holding one element still costs eight strides.
         let mut backing = Vec::with_capacity(8);
         backing.push(Value::Integer(1));
-        let arr = Value::Array(backing);
+        let arr = Value::Array(OwnedValues::from_vec(backing));
         assert_eq!(arr.heap_size(), 8 * std::mem::size_of::<Value>());
     }
 
@@ -879,13 +912,13 @@ mod tests {
         let inner = map.as_map().unwrap();
 
         // heap_size charges the structural backing on top of the key + value
-        // bytes: capacity × (key pointer + Value + bucket hash word + index slot).
+        // bytes: boxed map header plus capacity × (key + Value + hash + index).
         let keys_and_values: usize = inner.iter().map(|(k, v)| k.len() + v.heap_size()).sum();
         let entry_size = std::mem::size_of::<Box<str>>()
             + std::mem::size_of::<Value>()
             + std::mem::size_of::<u64>()
             + std::mem::size_of::<usize>();
-        let structural_backing = inner.capacity() * entry_size;
+        let structural_backing = std::mem::size_of_val(inner) + inner.capacity() * entry_size;
 
         assert_eq!(map.heap_size(), keys_and_values + structural_backing);
         // At least one slot's backing per occupied entry is charged beyond the bytes.
@@ -895,7 +928,8 @@ mod tests {
         // A record whose only field is this map attributes exactly
         // `map.heap_size()` to it, on top of the one-slot `Vec<Value>` backing
         // (`vec![_]` has capacity 1) — the same estimator gates both paths.
-        let schema = Arc::new(Schema::new(vec!["m".into()]));
+        let schema =
+            crate::owned_storage::SharedStorage::from_arc(Arc::new(Schema::new(vec!["m".into()])));
         let record = Record::new(schema, vec![map.clone()]);
         assert_eq!(
             record.estimated_heap_size(),
@@ -941,10 +975,14 @@ mod tests {
     #[test]
     fn test_map_set_field() {
         let mut m = Value::map([("a", Value::Integer(1))]);
-        m.set_field("c", Value::Integer(3));
+        m.as_map_mut()
+            .unwrap()
+            .legacy_mut()
+            .unwrap()
+            .insert("c".into(), Value::Integer(3));
         assert_eq!(m.get_field("c"), Some(&Value::Integer(3)));
         // Overwrite existing
-        m.set_field("a", Value::Integer(99));
+        *m.as_map_mut().unwrap().get_mut("a").unwrap() = Value::Integer(99);
         assert_eq!(m.get_field("a"), Some(&Value::Integer(99)));
     }
 
@@ -1004,17 +1042,17 @@ mod tests {
         let mut m2 = m1.clone();
         assert_eq!(m1, m2);
         // Modifying clone doesn't affect original
-        m2.set_field("a", Value::Integer(99));
+        *m2.as_map_mut().unwrap().get_mut("a").unwrap() = Value::Integer(99);
         assert_eq!(m1.get_field("a"), Some(&Value::Integer(1)));
         assert_eq!(m2.get_field("a"), Some(&Value::Integer(99)));
     }
 
     #[test]
     fn test_nested_map_in_array() {
-        let nested = Value::Array(vec![
+        let nested = Value::Array(OwnedValues::from_vec(vec![
             Value::map([("x", Value::Integer(10))]),
             Value::map([("y", Value::Integer(20))]),
-        ]);
+        ]));
         if let Value::Array(arr) = &nested {
             assert_eq!(arr[0].get_field("x"), Some(&Value::Integer(10)));
             assert_eq!(arr[1].get_field("y"), Some(&Value::Integer(20)));

@@ -1,7 +1,7 @@
 //! Executor-internal transform spec and the per-record transform
 //! evaluation helpers the dispatch arms drive.
 
-use std::sync::Arc;
+use clinker_record::owned_storage::SharedStorage;
 
 use clinker_record::{Record, Schema, Value};
 
@@ -44,7 +44,7 @@ pub(crate) fn evaluate_single_transform(
     transform_name: &str,
     evaluator: &mut ProgramEvaluator,
     ctx: &EvalContext,
-    _output_schema: &Arc<Schema>,
+    _output_schema: &SharedStorage<Schema>,
 ) -> Result<Vec<TransformOutput>, TransformEvalError> {
     let input = record;
     let result = evaluator

@@ -338,7 +338,7 @@ where
         let target_schema = output_schema
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| Arc::clone(record.schema()));
+            .unwrap_or_else(|| record.schema().clone());
         let eval_result = {
             let _guard = ctx.transform_timer.guard();
             if let Some(idx_num) = window_index {

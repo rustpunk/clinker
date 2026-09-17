@@ -5,6 +5,7 @@
 //! [`DlqEntry`] records into the on-disk CSV shape, which couples to the
 //! pipeline's config and executor types.
 
+use clinker_record::owned_storage::OwnedMap;
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -254,7 +255,7 @@ fn value_to_string(value: &Value) -> String {
         Value::String(s) => s.to_string(),
         Value::Date(d) => d.format("%Y-%m-%d").to_string(),
         Value::DateTime(dt) => dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
-        Value::Array(arr) => serde_json::to_string(arr).unwrap_or_default(),
+        Value::Array(arr) => serde_json::to_string(arr.as_slice()).unwrap_or_default(),
         // `Value::Map` only reaches the DLQ row builder if it lives at a
         // non-`$widened` column slot — i.e. the user explicitly emitted a
         // map at a regular column. The `dlq_user_columns` filter above
@@ -264,7 +265,16 @@ fn value_to_string(value: &Value) -> String {
         // `UnserializableMapValue` for the same situation; DLQ is
         // best-effort capture, not user-serializable output, so it
         // accepts the JSON-string degrade rather than failing).
-        Value::Map(m) => serde_json::to_string(m.as_ref()).unwrap_or_default(),
+        Value::Map(m) => serde_json::to_string(&BorrowedMap(m)).unwrap_or_default(),
+    }
+}
+
+// Serialize the borrowed map as the same JSON object without copying its entries.
+struct BorrowedMap<'a>(&'a OwnedMap);
+
+impl serde::Serialize for BorrowedMap<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().map(|(key, value)| (key.as_ref(), value)))
     }
 }
 
@@ -273,10 +283,28 @@ mod tests {
     use super::*;
     use clinker_core_types::dlq::DlqErrorCategory;
     use clinker_record::Record;
+    use clinker_record::owned_storage::{OwnedValues, SharedStorage};
     use std::sync::Arc;
 
-    fn make_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec!["name".into(), "value".into()]))
+    fn make_schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["name".into(), "value".into()])))
+    }
+
+    #[test]
+    fn nested_container_cells_preserve_json_shape_and_order() {
+        let value = Value::map([
+            ("z", Value::Integer(7)),
+            ("a", Value::map([("child", Value::Bool(true))])),
+        ]);
+        assert_eq!(
+            value_to_string(&value),
+            r#"{"z":{"Integer":7},"a":{"Map":[["child",{"Bool":true}]]}}"#
+        );
+        let array = Value::Array(OwnedValues::from_vec(vec![value, Value::Null]));
+        assert_eq!(
+            value_to_string(&array),
+            r#"[{"Map":[["z",{"Integer":7}],["a",{"Map":[["child",{"Bool":true}]]}]]},"Null"]"#
+        );
     }
 
     fn make_dlq_entry(
@@ -521,11 +549,11 @@ mod tests {
 
     #[test]
     fn test_dlq_source_fields_keep_shared_schema_order() {
-        let schema = Arc::new(Schema::new(vec![
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "zulu".into(),
             "alpha".into(),
             "mike".into(),
-        ]));
+        ])));
         let record = Record::new(
             schema.clone(),
             vec![
@@ -662,27 +690,25 @@ mod tests {
         use clinker_record::SchemaBuilder;
         // Schema mirrors what an `auto_widen` source produces:
         // user-declared columns + `$ck.<field>` shadow + `$widened`.
-        let schema = Arc::new(
-            SchemaBuilder::new()
-                .with_field("employee_id")
-                .with_field("salary")
-                .with_field_meta(
-                    "$ck.employee_id",
-                    FieldMetadata::source_correlation("employee_id"),
-                )
-                .with_field_meta("$widened", FieldMetadata::widened_sidecar())
-                .build(),
-        );
+        let schema = SchemaBuilder::new()
+            .with_field("employee_id")
+            .with_field("salary")
+            .with_field_meta(
+                "$ck.employee_id",
+                FieldMetadata::source_correlation("employee_id"),
+            )
+            .with_field_meta("$widened", FieldMetadata::widened_sidecar())
+            .build();
         let mut sidecar = indexmap::IndexMap::new();
         sidecar.insert("region".into(), Value::String("US".into()));
         sidecar.insert("dept".into(), Value::String("eng".into()));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("E001".into()),
                 Value::Integer(50000),
                 Value::String("E001".into()),
-                Value::Map(Box::new(sidecar)),
+                Value::Map(OwnedMap::from_map(sidecar)),
             ],
         );
         let entry = DlqEntry {
@@ -738,7 +764,7 @@ mod tests {
     fn test_dlq_triggering_field_and_value_columns() {
         let schema = make_schema();
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::String("Alice".into()), Value::String("oops".into())],
         );
         let entry = DlqEntry {
@@ -767,7 +793,7 @@ mod tests {
         let schema = make_schema();
         let mk = |src: &str| {
             let rec = Record::new(
-                Arc::clone(&schema),
+                schema.clone(),
                 vec![Value::String("n".into()), Value::String("v".into())],
             );
             DlqEntry {
@@ -828,7 +854,7 @@ mod tests {
         let schema = make_schema();
         let mk = |src: &str| {
             let rec = Record::new(
-                Arc::clone(&schema),
+                schema.clone(),
                 vec![Value::String("n".into()), Value::String("v".into())],
             );
             DlqEntry {

@@ -12,6 +12,7 @@ use super::spill::{
 use super::*;
 use crate::pipeline::grace_spill::GraceSpillReader;
 use clinker_record::SchemaBuilder;
+use clinker_record::owned_storage::SharedStorage;
 use cxl::ast::Statement;
 use cxl::lexer::Span as CxlSpan;
 use cxl::parser::Parser;
@@ -19,7 +20,7 @@ use cxl::resolve::pass::resolve_program;
 use cxl::typecheck::pass::type_check;
 use cxl::typecheck::row::{QualifiedField, Row};
 
-fn schema_with(cols: &[&str]) -> Arc<Schema> {
+fn schema_with(cols: &[&str]) -> SharedStorage<Schema> {
     let mut b = SchemaBuilder::with_capacity(cols.len());
     for c in cols {
         b = b.with_field(*c);
@@ -49,8 +50,8 @@ fn test_stats_sink<'a>(
     }
 }
 
-fn record_for(schema: &Arc<Schema>, values: Vec<Value>) -> Record {
-    Record::new(Arc::clone(schema), values)
+fn record_for(schema: &SharedStorage<Schema>, values: Vec<Value>) -> Record {
+    Record::new(schema.clone(), values)
 }
 
 /// Compile a single CXL key expression into the (typed_program,
@@ -380,7 +381,7 @@ fn combine_driver_identity_survives_grace_hash_partition_pair() {
         .map(|i| {
             (
                 Record::new(
-                    Arc::clone(&driver_schema),
+                    driver_schema.clone(),
                     vec![Value::Integer(i), Value::String(format!("d-{i}").into())],
                 ),
                 RecordOrder::new(PlanNodeId::new(21 + i as usize), 7),
@@ -390,7 +391,7 @@ fn combine_driver_identity_survives_grace_hash_partition_pair() {
     let builds: Vec<Record> = (0..10i64)
         .map(|i| {
             Record::new(
-                Arc::clone(&build_schema),
+                build_schema.clone(),
                 vec![Value::Integer(i), Value::String(format!("b-{i}").into())],
             )
         })
@@ -661,7 +662,7 @@ fn execute_grace_hash_spill_then_reload_correct() {
         .map(|i| {
             (
                 Record::new(
-                    Arc::clone(&driver_schema),
+                    driver_schema.clone(),
                     vec![Value::Integer(i), Value::String(format!("d-{i}").into())],
                 ),
                 (i as u64).into(),
@@ -671,7 +672,7 @@ fn execute_grace_hash_spill_then_reload_correct() {
     let builds: Vec<Record> = (0..32i64)
         .map(|i| {
             Record::new(
-                Arc::clone(&build_schema),
+                build_schema.clone(),
                 vec![Value::Integer(i), Value::String(format!("b-{i}").into())],
             )
         })
@@ -851,7 +852,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         .map(|i| {
             (
                 Record::new(
-                    Arc::clone(&driver_schema),
+                    driver_schema.clone(),
                     vec![Value::Integer(i), Value::String(format!("d-{i}").into())],
                 ),
                 (i as u64).into(),
@@ -861,7 +862,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
     let builds: Vec<Record> = (0..512i64)
         .map(|i| {
             Record::new(
-                Arc::clone(&build_schema),
+                build_schema.clone(),
                 vec![
                     Value::Integer(i % 16),
                     Value::String(format!("b-{i:08}-padding-padding-padding-padding").into()),
@@ -1439,7 +1440,7 @@ fn build_spill_reload_records_match() {
     let mut reloaded: Vec<Record> = Vec::new();
     for sp in spilled {
         for path in &sp.build_files {
-            let reader = GraceSpillReader::open(path, Arc::clone(&schema)).unwrap();
+            let reader = GraceSpillReader::open(path, schema.clone()).unwrap();
             for r in reader {
                 reloaded.push(r.unwrap());
             }
@@ -1486,8 +1487,8 @@ struct BnlHarness {
     build_extractor: KeyExtractor,
     driver_extractor: KeyExtractor,
     emit: EmitArgsOwned,
-    build_schema: Arc<Schema>,
-    driver_schema: Arc<Schema>,
+    build_schema: SharedStorage<Schema>,
+    driver_schema: SharedStorage<Schema>,
     stable: cxl::eval::StableEvalContext,
     source_file: Arc<str>,
     hash_state: ahash::RandomState,
@@ -1502,7 +1503,7 @@ struct EmitArgsOwned {
     match_mode: MatchMode,
     on_miss: OnMiss,
     build_qualifier: String,
-    output_schema: Arc<Schema>,
+    output_schema: SharedStorage<Schema>,
 }
 
 fn build_bnl_harness() -> BnlHarness {
@@ -1655,7 +1656,7 @@ fn with_reload_context<R>(h: &BnlHarness, f: impl FnOnce(&ReloadContext<'_>) -> 
         driver_extractor: &h.driver_extractor,
         emit: &emit,
         ctx: &eval_ctx,
-        build_schema: Arc::clone(&h.build_schema),
+        build_schema: h.build_schema.clone(),
         spill_dir: h.spill_dir.path(),
         spill_compress: true,
         hash_state: &h.hash_state,
@@ -1689,7 +1690,7 @@ fn spill_for_bnl(
     if !probe_records.is_empty() {
         let mut pw: crate::pipeline::spill::SpillWriter<RecordOrder> =
             crate::pipeline::spill::SpillWriter::new(
-                Arc::clone(&h.driver_schema),
+                h.driver_schema.clone(),
                 Some(h.spill_dir.path()),
                 true,
             )

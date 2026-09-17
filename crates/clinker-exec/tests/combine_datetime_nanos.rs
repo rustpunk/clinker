@@ -32,13 +32,25 @@ use clinker_plan::config::{CompileContext, PipelineConfig};
 /// Tight budget: small enough that the block-band external-sort threshold binds
 /// and the sides spill; the hash aggregate's group-count threshold also trips.
 const TIGHT_LIMIT: &str = "1M";
-/// The join's exact spill-backed output scan is just under 2 MiB. This limit
-/// admits that final materialization while keeping the much wider input axes
-/// over the block-band spill threshold.
-const JOIN_TIGHT_LIMIT: &str = "2M";
 /// Roomy budget: far above the working set, so nothing spills — the resident
 /// half of every across-budget pair.
 const ROOMY_LIMIT: &str = "512M";
+
+// Keep the fixed-width materialization at 90% of the hard limit: it fits the
+// scan while remaining above the 80% soft-spill threshold. Use the compiled
+// schema, including engine-stamped columns, and the live carrier layouts.
+fn tight_scan_limit(plan: &clinker_plan::plan::CompiledPlan, rows: usize) -> usize {
+    let dag = plan.dag();
+    let columns = dag
+        .graph
+        .node_weights()
+        .map(|node| node.output_schema_in(dag).column_count())
+        .max()
+        .unwrap();
+    let per_row = std::mem::size_of::<clinker_record::Value>() * columns
+        + std::mem::size_of::<(clinker_record::Record, clinker_exec::executor::SourceRowId)>();
+    (rows * per_row * 10).div_ceil(9)
+}
 
 /// Base instant all generated datetimes are offset from.
 fn base() -> NaiveDateTime {
@@ -278,13 +290,21 @@ fn datetime_single_inequality_matches_oracle_across_strategies_and_budgets() {
     let drv_sort = sort_order_block("ts");
     let bld_sort = sort_order_block("threshold");
 
+    let sizing_yaml = JOIN_YAML
+        .replace("__LIMIT__", ROOMY_LIMIT)
+        .replace("__SORT_DRV__", "")
+        .replace("__SORT_BLD__", "");
+    let sizing_config: PipelineConfig = clinker_plan::yaml::from_str(&sizing_yaml).unwrap();
+    let sizing_plan = sizing_config.compile(&CompileContext::default()).unwrap();
+    let join_tight_limit = tight_scan_limit(&sizing_plan, n_drivers as usize + 2).to_string();
+
     // IEJoin (no sort_order) at both budgets.
-    let iejoin_tight = run(JOIN_YAML, JOIN_TIGHT_LIMIT, "", "", &inputs, "out");
+    let iejoin_tight = run(JOIN_YAML, &join_tight_limit, "", "", &inputs, "out");
     let iejoin_roomy = run(JOIN_YAML, ROOMY_LIMIT, "", "", &inputs, "out");
     // SortMerge (both sources presorted on the range axis) at both budgets.
     let sortmerge_tight = run(
         JOIN_YAML,
-        JOIN_TIGHT_LIMIT,
+        &join_tight_limit,
         &drv_sort,
         &bld_sort,
         &inputs,

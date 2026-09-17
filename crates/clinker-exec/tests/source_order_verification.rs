@@ -301,7 +301,11 @@ fn compiled_source_order_worker_spill_parity() {
     let spilled_warn = run_csv_with_settings(&[("rows.csv", &unsorted)], "warn", "40K", 4);
 
     resident_warn.0.expect("resident repair");
-    spilled_warn.0.expect("spilled repair");
+    let spilled_report = spilled_warn.0.expect("spilled repair");
+    assert!(
+        spilled_report.cumulative_spill_bytes > 0,
+        "ordered repair must spill"
+    );
     assert_eq!(resident_warn.1, spilled_warn.1);
 
     let mut sorted = String::from("key,payload\n");

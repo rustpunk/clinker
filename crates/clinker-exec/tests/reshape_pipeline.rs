@@ -17,6 +17,76 @@ use clinker_plan::config::{CompileContext, parse_config};
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
 
+fn reshape_fixture_records(yaml: &str) -> (clinker_record::Record, clinker_record::Record) {
+    let config = parse_config(yaml).unwrap();
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    let dag = plan.dag();
+    let reshape = dag
+        .graph
+        .node_weights()
+        .find(|node| node.name() == "backfill")
+        .unwrap();
+    let record = |schema: &clinker_record::owned_storage::SharedStorage<clinker_record::Schema>| {
+        clinker_record::Record::new(
+            schema.clone(),
+            vec![clinker_record::Value::Null; schema.column_count()],
+        )
+    };
+    (
+        record(reshape.expected_input_schema_in(dag).unwrap()),
+        record(reshape.output_schema_in(dag)),
+    )
+}
+
+// The hard limit admits the actual input/output carriers.
+// A large group uses 90% of the limit: above the 80% spill threshold, below the
+// whole-group reload ceiling. No authored-width assumption omits hidden fields.
+fn reshape_fixture_limit(
+    yaml: &str,
+    input_rows: usize,
+    output_rows: usize,
+    group_rows: usize,
+    text_field: &str,
+    longest_text: &str,
+) -> String {
+    let (mut input, mut output) = reshape_fixture_records(yaml);
+    input.set(text_field, clinker_record::Value::from(longest_text));
+    output.set(text_field, clinker_record::Value::from(longest_text));
+    let scan_bytes = |record: &clinker_record::Record, rows: usize| {
+        rows * (std::mem::size_of::<(clinker_record::Record, clinker_exec::executor::SourceRowId)>(
+        ) + record.schema().column_count() * std::mem::size_of::<clinker_record::Value>())
+    };
+    let scan = scan_bytes(&input, input_rows).max(scan_bytes(&output, output_rows));
+    // BufferedRecord owns Record + admission sequence + source-row identity.
+    let group = group_rows
+        * (input.estimated_heap_size()
+            + std::mem::size_of::<(
+                clinker_record::Record,
+                u64,
+                clinker_exec::executor::SourceRowId,
+            )>());
+    scan.max((group * 10).div_ceil(9)).to_string()
+}
+
+fn pressure_padding(
+    yaml: &str,
+    input_rows: usize,
+    output_rows: usize,
+    group_rows: usize,
+) -> String {
+    let (input, output) = reshape_fixture_records(yaml);
+    let scan_bytes = |record: &clinker_record::Record, rows: usize| {
+        rows * (std::mem::size_of::<(clinker_record::Record, clinker_exec::executor::SourceRowId)>(
+        ) + record.schema().column_count() * std::mem::size_of::<clinker_record::Value>())
+    };
+    let scan = scan_bytes(&input, input_rows).max(scan_bytes(&output, output_rows));
+    // Retained group text must exceed the largest fixed scan reservation.
+    // One scan's worth of text alone establishes that boundary; the group's
+    // row carriers then add strict headroom. The limit helper admits the whole
+    // group at 90% of the hard ceiling, above the 80% spill threshold.
+    "x".repeat(scan.div_ceil(group_rows))
+}
+
 /// Run a single-source → reshape → single-output pipeline over `csv_input`,
 /// returning the run counters, DLQ entries, and the CSV output string.
 fn run_reshape(
@@ -611,17 +681,20 @@ fn scd_input(groups: usize, rows_per_group: usize) -> (String, usize) {
 
 #[test]
 fn reshape_spills_under_memory_pressure() {
-    // A 768 KiB budget admits the input's exact 499,200-byte scan and the
-    // 734,400-byte synthesized output, while the retained input charge leaves
-    // enough pressure that the heap-aware grouped buffer still crosses
-    // its spill threshold. The synthesized `copy_from: none` row makes the
-    // spill round-trip exercise the synthesized-row schema-width path. The
-    // output must be byte-identical to the same input run with an ample budget
-    // (spill is a memory strategy, never a data transform), and the run must
-    // report on-disk spill volume.
+    // Size the input and output scans from the compiled schema. The workload and
+    // synthesized-row count remain unchanged; real spill and exact resident
+    // parity below establish that the pressure fixture still exercises disk.
     let (csv, trigger_groups) = scd_input(200, 8);
 
-    let spilled = run_reshape_report(&scd_spill_pipeline("768K"), &csv).unwrap();
+    let limit = reshape_fixture_limit(
+        &scd_spill_pipeline("512M"),
+        1600,
+        1600 + trigger_groups,
+        8,
+        "status",
+        "baseline-7",
+    );
+    let spilled = run_reshape_report(&scd_spill_pipeline(&limit), &csv).unwrap();
     let in_memory = run_reshape_report(&scd_spill_pipeline("512M"), &csv).unwrap();
 
     assert!(
@@ -631,7 +704,7 @@ fn reshape_spills_under_memory_pressure() {
     );
     assert!(
         spilled.cumulative_spill_bytes > 0,
-        "the 768 KiB budget must force the disk spill path"
+        "the layout-sized budget must force the disk spill path"
     );
     assert_eq!(
         in_memory.cumulative_spill_bytes, 0,
@@ -674,10 +747,9 @@ fn reshape_spill_preserves_within_group_arrival_order() {
     // directly in the output (an `order_by` would stably re-sort and mask it).
     // One employee, 50 rows whose `status` carries the arrival index, none
     // triggering, so the output is the input rows in order. Padding the status
-    // keeps the grouped state above the soft threshold while the corrected
-    // fixed-width output admission fits under a 24K hard limit. A 512M budget
-    // keeps it resident for the baseline.
-    let padding = "x".repeat(128);
+    // keeps the group above the soft threshold while both fixed scans fit.
+    // A 512M budget keeps it resident for the baseline.
+    let padding = pressure_padding(&scd_spill_pipeline_no_order("512M"), 50, 50, 50);
     let mut csv = String::from("employee_id,plan_start,plan_end,status\n");
     for r in 0..50u32 {
         // Small gaps (plan_start == plan_end) so no row triggers; `status`
@@ -685,13 +757,21 @@ fn reshape_spill_preserves_within_group_arrival_order() {
         csv.push_str(&format!("E,{},{},{padding}seq-{r:04}\n", r * 10, r * 10));
     }
 
-    let spilled = run_reshape_report(&scd_spill_pipeline_no_order("24K"), &csv).unwrap();
+    let limit = reshape_fixture_limit(
+        &scd_spill_pipeline_no_order("512M"),
+        50,
+        50,
+        50,
+        "status",
+        &format!("{padding}seq-0049"),
+    );
+    let spilled = run_reshape_report(&scd_spill_pipeline_no_order(&limit), &csv).unwrap();
     let in_memory = run_reshape_report(&scd_spill_pipeline_no_order("512M"), &csv).unwrap();
 
     assert!(spilled.dlq_entries.is_empty(), "no DLQ entries under spill");
     assert!(
         spilled.cumulative_spill_bytes > 0,
-        "the single group must partition-spill under the 24K budget"
+        "the single group must partition-spill under the layout-sized budget"
     );
     assert_eq!(
         in_memory.cumulative_spill_bytes, 0,
@@ -839,17 +919,22 @@ fn reshape_spill_preserves_arrival_order_across_merge() {
     // row-for-row.
     let mut csv_a = String::from("account,tag\n");
     let mut csv_b = String::from("account,tag\n");
-    let padding = "x".repeat(128);
+    let padding = pressure_padding(&merge_reshape_pipeline("512M"), 120, 120, 120);
     for r in 0..60u32 {
         csv_a.push_str(&format!("X,{padding}a{r:03}\n"));
         csv_b.push_str(&format!("X,{padding}b{r:03}\n"));
     }
 
-    // 48K hard / ≈38K soft. The padded single merged group exceeds the soft
-    // threshold, so it partition-spills (the case that can reorder), while the
-    // corrected 41,280-byte output admission still fits the hard limit.
+    let limit = reshape_fixture_limit(
+        &merge_reshape_pipeline("512M"),
+        120,
+        120,
+        120,
+        "tag",
+        &format!("{padding}a059"),
+    );
     let (spilled_report, spilled) =
-        run_merge_reshape(&merge_reshape_pipeline("48K"), &csv_a, &csv_b);
+        run_merge_reshape(&merge_reshape_pipeline(&limit), &csv_a, &csv_b);
     let (memory_report, in_memory) =
         run_merge_reshape(&merge_reshape_pipeline("512M"), &csv_a, &csv_b);
 
@@ -860,7 +945,7 @@ fn reshape_spill_preserves_arrival_order_across_merge() {
     );
     assert!(
         spilled_report.cumulative_spill_bytes > 0,
-        "the 48K budget must force the merged group to spill"
+        "the layout-sized budget must force the merged group to spill"
     );
     assert_eq!(
         memory_report.cumulative_spill_bytes, 0,
@@ -888,7 +973,7 @@ fn reshape_skew_single_giant_group() {
     // is sized so the giant group still fits the finalize reload (it is not a
     // fail-loud case — see `reshape_giant_group_exceeds_budget_fails_loud`).
     let mut csv = String::from("employee_id,plan_start,plan_end,status\n");
-    let payload = "x".repeat(96);
+    let payload = pressure_padding(&scd_spill_pipeline("512M"), 700, 701, 600);
     for r in 0..599 {
         csv.push_str(&format!("employee-00000,{},{},{payload}\n", r * 10, r * 10));
     }
@@ -898,11 +983,15 @@ fn reshape_skew_single_giant_group() {
         csv.push_str(&format!("employee-{g:05},20,20,base\n"));
     }
 
-    // 300K hard / 240K soft. The padded giant group exceeds the soft threshold
-    // so it partition-spills incrementally, while the corrected 286,008-byte
-    // output admission and the finalize reload still fit the hard limit. This
-    // is the success path, not the fail-loud case.
-    let report = run_reshape_report(&scd_spill_pipeline("300K"), &csv).unwrap();
+    let limit = reshape_fixture_limit(
+        &scd_spill_pipeline("512M"),
+        700,
+        701,
+        600,
+        "status",
+        &payload,
+    );
+    let report = run_reshape_report(&scd_spill_pipeline(&limit), &csv).unwrap();
     assert!(report.dlq_entries.is_empty(), "no DLQ entries under skew");
 
     // The giant group went to disk: spill fired and evicted real volume. A
@@ -974,10 +1063,10 @@ fn reshape_giant_group_exceeds_budget_fails_loud() {
     }
     csv.push_str(&format!("employee-00000,1000,100,{payload}\n"));
 
-    // 128 KiB admits the input's exact 124,800-byte fixed-width scan, while
-    // the heap-aware group footprint includes the repeated 1 KiB payload and
-    // remains far above the hard limit.
-    let err = run_reshape_report(&scd_spill_pipeline("128K"), &csv)
+    // Admit the fixed-width input scan while keeping the complete 1 KiB-per-row
+    // group's heap far above the limit; the expected failure remains finalize.
+    let limit = reshape_fixture_limit(&scd_spill_pipeline("512M"), 400, 0, 0, "status", &payload);
+    let err = run_reshape_report(&scd_spill_pipeline(&limit), &csv)
         .expect_err("a single group larger than the budget must fail loud, not OOM");
 
     match &err {
@@ -1067,7 +1156,7 @@ fn examples_dir() -> PathBuf {
 #[test]
 fn scd_type2_e2e_with_spill() {
     // Run the runnable `examples/pipelines/scd_type2.yaml` end-to-end. Its
-    // pipeline-level `memory.limit: 16K` with the `spill` policy forces the
+    // pipeline-level `memory.limit: 128K` with the `spill` policy forces the
     // disk path on this small fixture, so the example doubles as the
     // bounded-memory smoke test: the mutate+synthesize output must be correct
     // AND the run must report on-disk spill volume.
@@ -1114,7 +1203,7 @@ fn scd_type2_e2e_with_spill() {
     );
     assert!(
         report.cumulative_spill_bytes > 0,
-        "the example's 16K budget forces the disk spill path"
+        "the example's 128K budget forces the disk spill path"
     );
 
     // Three employees have over-long windows (E001, E002, E004), so three

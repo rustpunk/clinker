@@ -13,6 +13,8 @@
 //! keyed by the full `(body_scope, window, input_root)` identity. No
 //! numeric slot fallback crosses a composition boundary.
 
+#[cfg(test)]
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -103,7 +105,9 @@ mod tests {
     use petgraph::graph::NodeIndex;
 
     fn empty_runtime() -> WindowRuntime {
-        let arena = Arc::new(Arena::empty(Arc::new(Schema::new(Vec::new()))));
+        let arena = Arc::new(Arena::empty(SharedStorage::from_arc(Arc::new(
+            Schema::new(Vec::new()),
+        ))));
         let index = Arc::new(SecondaryIndex {
             groups: HashMap::new(),
         });
@@ -112,7 +116,7 @@ mod tests {
 
     #[test]
     fn body_lookup_does_not_fall_back_to_same_numbered_top_slot() {
-        let schema = Arc::new(Schema::new(Vec::new()));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(Vec::new())));
         let spec = IndexSpec {
             root: PlanIndexRoot::Node {
                 upstream: NodeIndex::new(0),

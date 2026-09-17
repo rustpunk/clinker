@@ -88,6 +88,38 @@ use clinker_plan::config::PipelineConfig;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::ExecutionPlanDag;
 
+#[cfg(test)]
+type RunAllocationObserver = Box<
+    dyn FnMut(
+        &Arc<crate::pipeline::memory::MemoryArbitrator>,
+        &clinker_record::owned_storage::AllocationResources,
+    ),
+>;
+
+#[cfg(test)]
+thread_local! {
+    static RUN_ALLOCATION_OBSERVER: std::cell::RefCell<Option<RunAllocationObserver>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Scoped observation of the public entrypoint's actual run resources. This
+/// test-only seam neither supplies the run's arbitrator nor changes admission.
+#[cfg(test)]
+struct RunAllocationObserverGuard(Option<RunAllocationObserver>);
+
+#[cfg(test)]
+impl RunAllocationObserverGuard {
+    fn install(observer: RunAllocationObserver) -> Self {
+        Self(RUN_ALLOCATION_OBSERVER.with_borrow_mut(|slot| slot.replace(observer)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RunAllocationObserverGuard {
+    fn drop(&mut self) {
+        RUN_ALLOCATION_OBSERVER.with_borrow_mut(|slot| *slot = self.0.take());
+    }
+}
+
 /// Map from source-node name to the input feeding that source.
 ///
 /// The value is a [`crate::source::SourceInput`], generalized off the
@@ -211,6 +243,7 @@ struct RunExecutionContext<'a> {
 /// [`DagExecInputs`] because every field here transfers ownership into
 /// the walk rather than being borrowed for its duration.
 struct DagExecResources {
+    allocation_resources: clinker_record::owned_storage::AllocationResources,
     /// Executor-owned sealed Source capabilities for body activation.
     source_activation: Option<source_activation::SourceActivationController>,
     /// One live crossbeam `Receiver` per declared Source, drained by
@@ -717,6 +750,32 @@ impl PipelineExecutor {
 
         let source_configs: Vec<_> = config.source_configs().cloned().collect();
         let mut sink_configs: Vec<_> = config.sink_configs().cloned().collect();
+        // One stage per live Sink thread, plus the synchronous walk. Slots are
+        // admitted at startup and also bound unresolved cleanup ownership.
+        let descriptor_slots = std::num::NonZeroUsize::new(sink_configs.len().saturating_add(1))
+            .ok_or_else(|| PipelineError::Internal {
+                op: "writer-resources",
+                node: "pipeline".into(),
+                detail: "writer concurrency overflow".into(),
+            })?;
+        let writer_provider = preparation::ExecutorResources::with_spill_root(
+            memory_budget.clone(),
+            params
+                .shutdown_token
+                .clone()
+                .unwrap_or_else(crate::pipeline::shutdown::ShutdownToken::detached),
+            params.spill_root_dir.as_deref(),
+            descriptor_slots,
+            params.telemetry_producer.clone(),
+        )
+        .map_err(|error| PipelineError::Format(error.into()))?;
+        let allocation_resources = writer_provider.allocation();
+        #[cfg(test)]
+        RUN_ALLOCATION_OBSERVER.with_borrow_mut(|slot| {
+            if let Some(observer) = slot {
+                observer(&memory_budget, &allocation_resources);
+            }
+        });
         if !run_policy.preview().publishes_configured_outputs() {
             if auto_commit_staged || output_staging.has_run_attempt() {
                 return Err(PipelineError::Internal {
@@ -1044,12 +1103,14 @@ impl PipelineExecutor {
                         params
                             .spill_compress
                             .resolve_for_schema(source_column_count, source_batch_size as u64),
+                        allocation_resources.clone(),
                     )
                 }
                 None => crate::executor::source_stream::SourceIngestChannel::new(
                     crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
                     source_consumer_handle.clone(),
                     source_id,
+                    allocation_resources.clone(),
                 ),
             };
             let source_consumer_id = memory_budget.register_consumer(Arc::new(
@@ -1115,6 +1176,7 @@ impl PipelineExecutor {
                 run_policy,
             },
             DagExecResources {
+                allocation_resources,
                 source_activation,
                 source_records,
                 source_consumers,
@@ -1360,6 +1422,7 @@ impl PipelineExecutor {
             run_policy,
         } = inputs;
         let DagExecResources {
+            allocation_resources,
             source_activation,
             source_records,
             source_consumers,
@@ -1665,6 +1728,7 @@ impl PipelineExecutor {
             let writer_charge_handle = charge_handle.clone();
             let telemetry_producer = params.telemetry_producer.clone();
             let sink_shutdown_token = params.shutdown_token.clone();
+            let sink_allocation_resources = allocation_resources.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("clinker-output-{output_name}"))
                 .spawn(move || {
@@ -1675,6 +1739,7 @@ impl PipelineExecutor {
                         writer_charge_handle,
                         telemetry_producer,
                         sink_shutdown_token,
+                        sink_allocation_resources,
                     )
                 })
                 .map_err(|e| PipelineError::Internal {
@@ -1689,6 +1754,7 @@ impl PipelineExecutor {
         }
 
         let mut ctx = dispatch::ExecutorContext {
+            allocation_resources,
             config,
             composition_bodies,
             sink_configs: &sink_configs,
@@ -1936,9 +2002,29 @@ impl PipelineExecutor {
         // a failure, so swallow it here (the interruption is recorded in
         // `ctx.interrupted` and surfaced through the report) and let the
         // run finish draining. Every other walk error still propagates.
+        let writer_cancelled = |error: &PipelineError| {
+            matches!(
+                error,
+                PipelineError::Format(clinker_format::FormatError::Resource(
+                    clinker_format::preparation::ResourceError {
+                        kind: clinker_format::preparation::ResourceErrorKind::Cancelled,
+                        ..
+                    }
+                ))
+            )
+        };
+        let cancelled_output = ctx.output_errors.iter().any(writer_cancelled);
+        if cancelled_output {
+            ctx.interrupted = true;
+            ctx.output_errors.retain(|error| !writer_cancelled(error));
+        }
         let walk_completed = match walk_result {
-            Ok(()) => true,
+            Ok(()) => !cancelled_output,
             Err(PipelineError::Interrupted) => false,
+            Err(error) if writer_cancelled(&error) => {
+                ctx.interrupted = true;
+                false
+            }
             Err(other) => return Err(other),
         };
 
@@ -2324,6 +2410,7 @@ nodes:
     mod composition_port_admission_overshoot;
     mod deferred_dispatch;
     mod diamond_node_buffer_overshoot;
+    mod foreign_allocation_source;
     mod iejoin_pre_output_budget;
     mod multi_output;
     mod nested_composition_overshoot;

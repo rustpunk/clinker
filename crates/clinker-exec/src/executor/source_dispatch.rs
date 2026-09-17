@@ -16,9 +16,9 @@ use petgraph::graph::NodeIndex;
 use crate::executor::dispatch::{
     ExecutorContext, MERGED_SOURCE_FILE, NodeBufferKey, admit_node_buffer,
     admit_node_buffer_transferred, build_engine_stamped_tail, canonicalize_to_source_schema,
-    estimate_node_buffer_bytes, finalize_node_rooted_windows, node_buffer_spill_allowed,
-    require_node_buffer_input_transferred, seed_source_vars_for_record, source_file_arc_of,
-    tee_emit_to_region_input_buffers,
+    estimate_node_buffer_unaccounted_bytes, finalize_node_rooted_windows,
+    node_buffer_spill_allowed, require_node_buffer_input_transferred, seed_source_vars_for_record,
+    source_file_arc_of, tee_emit_to_region_input_buffers,
 };
 use crate::executor::node_buffer::TransientNodeBufferReservation;
 use clinker_plan::error::PipelineError;
@@ -126,6 +126,7 @@ where
             &ctx.memory_budget,
             ctx.shutdown_token.clone(),
             ctx.telemetry_producer.as_ref(),
+            &ctx.allocation_resources,
         );
         ctx.source_activation = Some(controller);
         if let Some(activated) = activated? {
@@ -283,7 +284,10 @@ where
                 }
             }
         }
-        reservation.set_bytes(estimate_node_buffer_bytes(&out_records));
+        reservation.set_bytes(estimate_node_buffer_unaccounted_bytes(
+            &out_records,
+            &ctx.allocation_resources,
+        ));
         (out_records, out_puncts, Some(reservation))
     } else if let Some(rx) = ctx.source_records.remove(name.as_str()) {
         // Live channel: consume per record so back-pressure

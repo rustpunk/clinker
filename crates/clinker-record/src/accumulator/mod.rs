@@ -597,7 +597,9 @@ impl CollectState {
     }
 
     fn finalize(&self) -> Value {
-        Value::Array(self.values.clone())
+        Value::Array(crate::owned_storage::OwnedValues::from_vec(
+            self.values.clone(),
+        ))
     }
 
     fn heap_size(&self) -> usize {

@@ -22,8 +22,8 @@
 //! (bundled-tuple sort), not on a parallel array, to avoid permutation-reindex
 //! bugs.
 
+use clinker_record::owned_storage::{AllocationResources, SharedStorage};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use rayon::slice::ParallelSliceMut;
 use serde::{Serialize, de::DeserializeOwned};
@@ -44,20 +44,58 @@ use clinker_plan::config::SortField;
 /// data-expanding equality key. A payload with no heap key uses the default `0`,
 /// so pure-range and every other sort stay byte-for-byte unchanged.
 pub trait HeapBytes {
+    /// Retained payload backing not already charged to the target allocation ledger.
+    fn unaccounted_heap_bytes(&self, resources: &AllocationResources) -> usize;
     fn heap_bytes(&self) -> usize {
         0
     }
 }
 
-impl HeapBytes for () {}
-impl HeapBytes for u64 {}
-impl HeapBytes for crate::executor::stream_event::SourceRowId {}
-impl HeapBytes for (u64, u64) {}
-impl HeapBytes for (u64, crate::executor::stream_event::SourceRowId) {}
-impl HeapBytes for (crate::executor::stream_event::SourceRowId, u64) {}
-impl HeapBytes for (u64, u64, u64) {}
-impl HeapBytes for (crate::executor::stream_event::SourceRowId, u64, u64) {}
-impl HeapBytes for (i64, i64, u64) {}
+impl HeapBytes for () {
+    fn unaccounted_heap_bytes(&self, _resources: &AllocationResources) -> usize {
+        0
+    }
+}
+impl HeapBytes for u64 {
+    fn unaccounted_heap_bytes(&self, _resources: &AllocationResources) -> usize {
+        0
+    }
+}
+impl HeapBytes for crate::executor::stream_event::SourceRowId {
+    fn unaccounted_heap_bytes(&self, _resources: &AllocationResources) -> usize {
+        0
+    }
+}
+impl HeapBytes for (u64, u64) {
+    fn unaccounted_heap_bytes(&self, _resources: &AllocationResources) -> usize {
+        0
+    }
+}
+impl HeapBytes for (u64, crate::executor::stream_event::SourceRowId) {
+    fn unaccounted_heap_bytes(&self, _resources: &AllocationResources) -> usize {
+        0
+    }
+}
+impl HeapBytes for (crate::executor::stream_event::SourceRowId, u64) {
+    fn unaccounted_heap_bytes(&self, _resources: &AllocationResources) -> usize {
+        0
+    }
+}
+impl HeapBytes for (u64, u64, u64) {
+    fn unaccounted_heap_bytes(&self, _resources: &AllocationResources) -> usize {
+        0
+    }
+}
+impl HeapBytes for (crate::executor::stream_event::SourceRowId, u64, u64) {
+    fn unaccounted_heap_bytes(&self, _resources: &AllocationResources) -> usize {
+        0
+    }
+}
+impl HeapBytes for (i64, i64, u64) {
+    fn unaccounted_heap_bytes(&self, _resources: &AllocationResources) -> usize {
+        0
+    }
+}
 
 /// Result of finishing a sort buffer: either all (record, payload) pairs
 /// fit in memory, or some were spilled to disk.
@@ -87,6 +125,8 @@ pub struct SortBuffer<P> {
     pairs: Vec<(Record, P)>,
     ordering: SortOrdering,
     bytes_used: usize,
+    unaccounted_bytes_used: usize,
+    allocation_resources: AllocationResources,
     /// Total pairs ever pushed, across every spilled run and the resident
     /// tail. Never decremented on spill — `sort_and_spill` and `finish` move
     /// pairs out but drop none, so this equals the exact count the finished
@@ -101,7 +141,7 @@ pub struct SortBuffer<P> {
     /// what `--explain` reports.
     spill_compress: bool,
     spill_files: Vec<SpillFile<P>>,
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
 }
 
 // `P: Ord` spans the whole impl, not just the payload-ordered constructor, so
@@ -117,12 +157,15 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
         spill_threshold: usize,
         spill_dir: Option<PathBuf>,
         spill_compress: bool,
-        schema: Arc<Schema>,
+        schema: SharedStorage<Schema>,
+        allocation_resources: AllocationResources,
     ) -> Self {
         Self {
             pairs: Vec::new(),
             ordering: SortOrdering::Fields(sort_by),
             bytes_used: 0,
+            unaccounted_bytes_used: 0,
+            allocation_resources,
             total_rows: 0,
             spill_threshold,
             spill_dir,
@@ -141,12 +184,15 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
         spill_threshold: usize,
         spill_dir: Option<PathBuf>,
         spill_compress: bool,
-        schema: Arc<Schema>,
+        schema: SharedStorage<Schema>,
+        allocation_resources: AllocationResources,
     ) -> Self {
         Self {
             pairs: Vec::new(),
             ordering: SortOrdering::Payload,
             bytes_used: 0,
+            unaccounted_bytes_used: 0,
+            allocation_resources,
             total_rows: 0,
             spill_threshold,
             spill_dir,
@@ -164,6 +210,10 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
             + record.estimated_heap_size()
             + std::mem::size_of::<P>()
             + payload.heap_bytes();
+        self.unaccounted_bytes_used += std::mem::size_of::<Record>()
+            + record.unaccounted_heap_size(&self.allocation_resources)
+            + std::mem::size_of::<P>()
+            + payload.unaccounted_heap_bytes(&self.allocation_resources);
         self.bytes_used += size;
         self.total_rows += 1;
         self.pairs.push((record, payload));
@@ -210,6 +260,10 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
             self.spill_dir.as_deref(),
             self.spill_compress,
         )?;
+        // Draining drops every pair even if writing fails. Reset both observations
+        // before that ownership transfer so a reusable buffer never reports lost rows.
+        self.bytes_used = 0;
+        self.unaccounted_bytes_used = 0;
         for (record, payload) in self.pairs.drain(..) {
             writer.write_pair(&record, &payload)?;
         }
@@ -244,6 +298,11 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
     /// Current estimated memory usage in bytes.
     pub fn bytes_used(&self) -> usize {
         self.bytes_used
+    }
+
+    /// Retained pair bytes not already accounted by this buffer's allocation ledger.
+    pub fn unaccounted_bytes_used(&self) -> usize {
+        self.unaccounted_bytes_used
     }
 
     /// Total pairs pushed over this buffer's life, across every spilled run and
@@ -309,14 +368,24 @@ impl crate::pipeline::memory::MemoryConsumer for SortConsumer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use clinker_record::Value;
-
-    fn test_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec!["name".into(), "value".into()]))
+    fn test_allocation_resources() -> clinker_record::owned_storage::AllocationResources {
+        clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024 * 1024).unwrap(),
+        )
+        .resources()
+        .allocation()
+        .clone()
     }
 
-    fn make_record(schema: &Arc<Schema>, name: &str, value: i64) -> Record {
+    use super::*;
+    use clinker_record::Value;
+    use std::sync::Arc;
+
+    fn test_schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["name".into(), "value".into()])))
+    }
+
+    fn make_record(schema: &SharedStorage<Schema>, name: &str, value: i64) -> Record {
         Record::new(
             schema.clone(),
             vec![Value::String(name.into()), Value::Integer(value)],
@@ -334,8 +403,14 @@ mod tests {
     #[test]
     fn test_sort_buffer_push_tracks_bytes() {
         let schema = test_schema();
-        let mut buf: SortBuffer<()> =
-            SortBuffer::new(sort_by_value_asc(), 1_000_000, None, true, schema.clone());
+        let mut buf: SortBuffer<()> = SortBuffer::new(
+            sort_by_value_asc(),
+            1_000_000,
+            None,
+            true,
+            schema.clone(),
+            test_allocation_resources(),
+        );
         assert_eq!(buf.bytes_used(), 0);
         buf.push(make_record(&schema, "Alice", 1), ());
         assert!(buf.bytes_used() > 0);
@@ -348,8 +423,14 @@ mod tests {
     fn test_sort_buffer_should_spill_at_threshold() {
         let schema = test_schema();
         // Very small threshold — should spill after a few records
-        let mut buf: SortBuffer<()> =
-            SortBuffer::new(sort_by_value_asc(), 100, None, true, schema.clone());
+        let mut buf: SortBuffer<()> = SortBuffer::new(
+            sort_by_value_asc(),
+            100,
+            None,
+            true,
+            schema.clone(),
+            test_allocation_resources(),
+        );
         assert!(!buf.should_spill());
         // Push records until we exceed 100 bytes
         for i in 0..10 {
@@ -364,8 +445,14 @@ mod tests {
     #[test]
     fn test_sort_buffer_in_memory_sort() {
         let schema = test_schema();
-        let mut buf: SortBuffer<()> =
-            SortBuffer::new(sort_by_value_asc(), 1_000_000, None, true, schema.clone());
+        let mut buf: SortBuffer<()> = SortBuffer::new(
+            sort_by_value_asc(),
+            1_000_000,
+            None,
+            true,
+            schema.clone(),
+            test_allocation_resources(),
+        );
         buf.push(make_record(&schema, "Charlie", 30), ());
         buf.push(make_record(&schema, "Alice", 10), ());
         buf.push(make_record(&schema, "Bob", 20), ());
@@ -384,8 +471,14 @@ mod tests {
     #[test]
     fn test_sort_buffer_spill_produces_spill_files() {
         let schema = test_schema();
-        let mut buf: SortBuffer<()> =
-            SortBuffer::new(sort_by_value_asc(), 1, None, true, schema.clone()); // threshold=1 → spill immediately
+        let mut buf: SortBuffer<()> = SortBuffer::new(
+            sort_by_value_asc(),
+            1,
+            None,
+            true,
+            schema.clone(),
+            test_allocation_resources(),
+        ); // threshold=1 → spill immediately
         buf.push(make_record(&schema, "Alice", 10), ());
         assert!(buf.should_spill());
         buf.sort_and_spill().unwrap();
@@ -396,8 +489,14 @@ mod tests {
     #[test]
     fn test_sort_buffer_finish_spilled_returns_files() {
         let schema = test_schema();
-        let mut buf: SortBuffer<()> =
-            SortBuffer::new(sort_by_value_asc(), 1, None, true, schema.clone());
+        let mut buf: SortBuffer<()> = SortBuffer::new(
+            sort_by_value_asc(),
+            1,
+            None,
+            true,
+            schema.clone(),
+            test_allocation_resources(),
+        );
 
         // Push and spill twice
         buf.push(make_record(&schema, "B", 20), ());
@@ -418,8 +517,14 @@ mod tests {
     #[test]
     fn test_sort_buffer_spill_files_are_sorted() {
         let schema = test_schema();
-        let mut buf: SortBuffer<()> =
-            SortBuffer::new(sort_by_value_asc(), 1, None, true, schema.clone());
+        let mut buf: SortBuffer<()> = SortBuffer::new(
+            sort_by_value_asc(),
+            1,
+            None,
+            true,
+            schema.clone(),
+            test_allocation_resources(),
+        );
         buf.push(make_record(&schema, "C", 30), ());
         buf.push(make_record(&schema, "A", 10), ());
         buf.push(make_record(&schema, "B", 20), ());
@@ -443,8 +548,14 @@ mod tests {
     fn test_sort_buffer_payload_survives_in_memory_sort() {
         // Pattern B gate: payload travels with the record through sort permutation.
         let schema = test_schema();
-        let mut buf: SortBuffer<u64> =
-            SortBuffer::new(sort_by_value_asc(), 1_000_000, None, true, schema.clone());
+        let mut buf: SortBuffer<u64> = SortBuffer::new(
+            sort_by_value_asc(),
+            1_000_000,
+            None,
+            true,
+            schema.clone(),
+            test_allocation_resources(),
+        );
         buf.push(make_record(&schema, "Charlie", 30), 100);
         buf.push(make_record(&schema, "Alice", 10), 200);
         buf.push(make_record(&schema, "Bob", 20), 300);
@@ -464,8 +575,14 @@ mod tests {
     fn test_sort_buffer_payload_survives_spill() {
         // Payload survives the postcard spill envelope through the round-trip.
         let schema = test_schema();
-        let mut buf: SortBuffer<u64> =
-            SortBuffer::new(sort_by_value_asc(), 1, None, true, schema.clone());
+        let mut buf: SortBuffer<u64> = SortBuffer::new(
+            sort_by_value_asc(),
+            1,
+            None,
+            true,
+            schema.clone(),
+            test_allocation_resources(),
+        );
         buf.push(make_record(&schema, "C", 30), 100);
         buf.push(make_record(&schema, "A", 10), 200);
         buf.push(make_record(&schema, "B", 20), 300);
@@ -493,8 +610,13 @@ mod tests {
         // carry an unrelated `value`; ordering must ignore it. Negative primary
         // keys must order correctly.
         let schema = test_schema();
-        let mut buf: SortBuffer<(i64, i64, u64)> =
-            SortBuffer::new_payload_ordered(1_000_000, None, true, schema.clone());
+        let mut buf: SortBuffer<(i64, i64, u64)> = SortBuffer::new_payload_ordered(
+            1_000_000,
+            None,
+            true,
+            schema.clone(),
+            test_allocation_resources(),
+        );
         buf.push(make_record(&schema, "a", 999), (5, 0, 0));
         buf.push(make_record(&schema, "b", 111), (-3, 2, 1));
         buf.push(make_record(&schema, "c", 555), (-3, 1, 2));
@@ -514,8 +636,13 @@ mod tests {
         // individually-sorted runs to disk; finish() flushes the residue as one
         // more. Payload-ordered spill uses the same envelope as field-ordered.
         let schema = test_schema();
-        let mut buf: SortBuffer<(i64, i64, u64)> =
-            SortBuffer::new_payload_ordered(1, None, true, schema.clone());
+        let mut buf: SortBuffer<(i64, i64, u64)> = SortBuffer::new_payload_ordered(
+            1,
+            None,
+            true,
+            schema.clone(),
+            test_allocation_resources(),
+        );
         for i in 0..3i64 {
             buf.push(make_record(&schema, "r", i), (i, 0, i as u64));
             assert!(buf.should_spill());
@@ -532,11 +659,146 @@ mod tests {
     #[test]
     fn test_sort_buffer_empty_returns_empty() {
         let schema = test_schema();
-        let buf: SortBuffer<()> =
-            SortBuffer::new(sort_by_value_asc(), 1_000_000, None, true, schema);
+        let buf: SortBuffer<()> = SortBuffer::new(
+            sort_by_value_asc(),
+            1_000_000,
+            None,
+            true,
+            schema,
+            test_allocation_resources(),
+        );
         match buf.finish().unwrap().0 {
             SortedOutput::InMemory(pairs) => assert!(pairs.is_empty()),
             SortedOutput::Spilled(_) => panic!("expected InMemory"),
         }
+    }
+    #[test]
+    fn sort_buffer_separates_physical_pressure_from_local_and_foreign_ownership() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        use clinker_record::{FieldStr, owned_storage::OwnedValues};
+        use std::num::NonZeroUsize;
+        let local = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+        let foreign = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+        let resources = local.resources().allocation().clone();
+        let scope = resources.scope().unwrap();
+        let foreign_resources = foreign.resources();
+        let foreign_scope = foreign_resources.allocation().scope().unwrap();
+        let local_text = FieldStr::try_new(&"local".repeat(64), &scope).unwrap();
+        let foreign_text = FieldStr::try_new(&"foreign".repeat(64), &foreign_scope).unwrap();
+        let alias = local_text.clone();
+        let mut values = OwnedValues::try_with_capacity(16, &scope).unwrap();
+        values.try_push(Value::String(local_text), &scope).unwrap();
+        values
+            .try_push(
+                Value::Array(OwnedValues::from_vec(vec![
+                    Value::String(foreign_text),
+                    Value::String("legacy".repeat(64).into()),
+                ])),
+                &scope,
+            )
+            .unwrap();
+        let record = Record::from_owned_values(test_schema(), values).unwrap();
+        let physical = std::mem::size_of::<Record>() + record.estimated_heap_size();
+        let relative = std::mem::size_of::<Record>() + record.unaccounted_heap_size(&resources);
+        assert!(physical > relative);
+        assert!(
+            relative > std::mem::size_of::<Record>(),
+            "foreign and legacy children remain attributed"
+        );
+        let cloned = record.clone();
+        assert!(
+            !cloned.values_are_accounted_by(&resources),
+            "cloning creates independent value slots"
+        );
+        assert!(
+            cloned.unaccounted_heap_size(&resources) > record.unaccounted_heap_size(&resources)
+        );
+        drop(cloned);
+        let charged = local.used();
+        let mut buf = SortBuffer::new_payload_ordered(
+            physical,
+            None,
+            false,
+            test_schema(),
+            resources.clone(),
+        );
+        buf.push(record, ());
+        assert!(
+            buf.should_spill(),
+            "pressure uses physical ownership even when admission is lower"
+        );
+        assert_eq!(buf.bytes_used(), physical);
+        assert_eq!(buf.unaccounted_bytes_used(), relative);
+        assert_eq!(local.used(), charged);
+        assert!(buf.sort_and_spill().unwrap() > 0);
+        assert_eq!(buf.bytes_used(), 0);
+        assert_eq!(buf.unaccounted_bytes_used(), 0);
+        assert!(
+            local.used() > 0,
+            "escaped text stays charged after original slots spill"
+        );
+        assert_eq!(foreign.used(), 0);
+        let (SortedOutput::Spilled(files), _) = buf.finish().unwrap() else {
+            panic!("spilled output");
+        };
+        let (decoded, ()) = files[0].reader().unwrap().next().unwrap().unwrap();
+        assert!(!decoded.values_are_accounted_by(&resources));
+        assert_eq!(
+            decoded.unaccounted_heap_size(&resources),
+            decoded.estimated_heap_size()
+        );
+        assert_eq!(decoded.get("name"), Some(&Value::String(alias.clone())));
+        drop(alias);
+        assert_eq!(local.used(), 0);
+    }
+
+    #[test]
+    fn sort_buffer_memory_finish_moves_governed_slots_and_failed_write_clears_counters() {
+        use clinker_record::owned_storage::OwnedValues;
+        #[derive(Eq, PartialEq, Ord, PartialOrd, serde::Deserialize)]
+        struct RefuseSerialization;
+        impl serde::Serialize for RefuseSerialization {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom(
+                    "deliberate spill payload failure",
+                ))
+            }
+        }
+        impl HeapBytes for RefuseSerialization {
+            fn unaccounted_heap_bytes(&self, _resources: &AllocationResources) -> usize {
+                0
+            }
+        }
+        let resources = test_allocation_resources();
+        let scope = resources.scope().unwrap();
+        let mut values = OwnedValues::try_with_capacity(8, &scope).unwrap();
+        values.try_push(Value::Null, &scope).unwrap();
+        values.try_push(Value::Integer(4), &scope).unwrap();
+        let record = Record::from_owned_values(test_schema(), values).unwrap();
+        let mut memory = SortBuffer::new_payload_ordered(
+            usize::MAX,
+            None,
+            false,
+            test_schema(),
+            resources.clone(),
+        );
+        assert_eq!(memory.sort_and_spill().unwrap(), 0);
+        memory.push(record, ());
+        assert_eq!(
+            memory.unaccounted_bytes_used(),
+            std::mem::size_of::<Record>()
+        );
+        let (SortedOutput::InMemory(mut rows), 0) = memory.finish().unwrap() else {
+            panic!("resident output");
+        };
+        let (moved, ()) = rows.pop().unwrap();
+        assert!(moved.values_are_accounted_by(&resources));
+        let mut failing = SortBuffer::new_payload_ordered(1, None, false, test_schema(), resources);
+        failing.push(moved, RefuseSerialization);
+        assert!(failing.sort_and_spill().is_err());
+        assert_eq!(failing.bytes_used(), 0);
+        assert_eq!(failing.unaccounted_bytes_used(), 0);
+        assert!(failing.pairs.is_empty());
+        assert_eq!(failing.sort_and_spill().unwrap(), 0);
     }
 }

@@ -268,7 +268,9 @@ mod tests {
 
     #[test]
     fn test_group_by_key_array_unsupported() {
-        let arr = Value::Array(vec![Value::Integer(1)]);
+        let arr = Value::Array(crate::owned_storage::OwnedValues::from_vec(vec![
+            Value::Integer(1),
+        ]));
         let result = value_to_group_key(&arr, "tags", 3);
         assert!(result.is_err());
         match result.unwrap_err() {

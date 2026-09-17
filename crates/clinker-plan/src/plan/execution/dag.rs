@@ -789,7 +789,9 @@ mod port_tag_guard_tests {
             id: PlanNodeId::new(id),
             span: Span::SYNTHETIC,
             body: CompositionBodyId::SENTINEL,
-            output_schema: Arc::new(clinker_record::Schema::new(Vec::new())),
+            output_schema: SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(
+                Vec::new(),
+            ))),
         }
     }
 

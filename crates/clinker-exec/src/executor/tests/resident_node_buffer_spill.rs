@@ -15,6 +15,7 @@
 //! `Memory → Spilled` with its charge discharged, its bytes recorded against
 //! the disk quota under its own stage name, and its rows intact on drain.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -27,18 +28,15 @@ use crate::executor::dispatch::{
 use crate::executor::node_buffer::{NodeBuffer, NodeBufferConsumer, record_byte_cost};
 use crate::pipeline::memory::{ConsumerHandle, ConsumerId, MemoryArbitrator, NoOpPolicy};
 
-fn schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec!["id".into(), "v".into()]))
+fn schema() -> SharedStorage<Schema> {
+    SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "v".into()])))
 }
 
-fn rec(s: &Arc<Schema>, id: i64, v: &str) -> Record {
-    Record::new(
-        Arc::clone(s),
-        vec![Value::Integer(id), Value::String(v.into())],
-    )
+fn rec(s: &SharedStorage<Schema>, id: i64, v: &str) -> Record {
+    Record::new(s.clone(), vec![Value::Integer(id), Value::String(v.into())])
 }
 
-fn memory_slot(s: &Arc<Schema>, rows: &[(i64, &str, u64)]) -> NodeBuffer {
+fn memory_slot(s: &SharedStorage<Schema>, rows: &[(i64, &str, u64)]) -> NodeBuffer {
     NodeBuffer::memory_from_records(
         rows.iter()
             .map(|(id, v, rn)| (rec(s, *id, v), *rn))

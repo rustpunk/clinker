@@ -25,6 +25,8 @@
 use std::io::{BufReader, Read};
 use std::sync::Arc;
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, SharedStorage};
+
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
@@ -71,7 +73,7 @@ impl Default for SwiftReaderConfig {
 /// streamed one record at a time.
 pub struct SwiftReader<R: Read> {
     tokenizer: BlockTokenizer<BufReader<R>>,
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     max_fields: usize,
     initialized: bool,
     /// Block 1 (basic header) body, captured in the pre-scan.
@@ -227,7 +229,7 @@ impl<R: Read> SwiftReader<R> {
             Value::String(line.tag.as_str().into()),
             string_or_null(&line.value),
         ];
-        Record::new(Arc::clone(&self.schema), values)
+        Record::new(self.schema.clone(), values)
     }
 
     /// Build the file-level `$doc` sections from the captured service blocks,
@@ -242,8 +244,8 @@ impl<R: Read> SwiftReader<R> {
     fn serve_sections(
         &self,
         config: &EnvelopeConfig,
-    ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
-        let mut out: IndexMap<Box<str>, Value> = IndexMap::with_capacity(config.sections.len());
+    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
+        let mut out: IndexMap<OwnedKey, Value> = IndexMap::with_capacity(config.sections.len());
         for (name, section) in &config.sections {
             let block_id = match &section.extract {
                 EnvelopeExtract::Segment(id) => id.as_str(),
@@ -264,7 +266,7 @@ impl<R: Read> SwiftReader<R> {
                      message-text body streamed as records."
                 ))
             })?;
-            out.insert(Box::from(name.as_str()), block_section_value(body));
+            out.insert(OwnedKey::from(name.as_str()), block_section_value(body));
         }
         Ok(out)
     }
@@ -284,8 +286,8 @@ impl<R: Read> SwiftReader<R> {
 }
 
 impl<R: Read + Send> FormatReader for SwiftReader<R> {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-        Ok(Arc::clone(&self.schema))
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+        Ok(self.schema.clone())
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
@@ -303,7 +305,7 @@ impl<R: Read + Send> FormatReader for SwiftReader<R> {
     fn prepare_document(
         &mut self,
         config: &EnvelopeConfig,
-    ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
+    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
         if config.is_empty() {
             return Ok(IndexMap::new());
         }
@@ -330,9 +332,9 @@ fn set_once(slot: &mut Option<String>, body: String, id: u8) -> Result<(), Forma
 /// (a header string, nested `{sub:tag}` blocks), so the whole body is one
 /// addressable field rather than positional elements.
 fn block_section_value(body: &str) -> Value {
-    let mut fields: IndexMap<Box<str>, Value> = IndexMap::with_capacity(1);
-    fields.insert(Box::from(BODY_FIELD), string_or_null(body));
-    Value::Map(Box::new(fields))
+    let mut fields: IndexMap<OwnedKey, Value> = IndexMap::with_capacity(1);
+    fields.insert(OwnedKey::from(BODY_FIELD), string_or_null(body));
+    Value::Map(OwnedMap::from_map(fields))
 }
 
 /// The engine-synthesized columns for a SWIFT `Generated` source: the fixed
@@ -354,12 +356,12 @@ pub fn generated_columns() -> Vec<Column> {
 /// Build the static `[block, tag, value]` schema. Column names come from
 /// [`generated_columns`]; tag and value text is stored verbatim so the
 /// round-trip is lossless.
-fn build_schema() -> Arc<Schema> {
+fn build_schema() -> SharedStorage<Schema> {
     let columns = generated_columns()
         .into_iter()
-        .map(|c| c.name.into_boxed_str())
+        .map(|c| c.name.into())
         .collect();
-    Arc::new(Schema::new(columns))
+    SharedStorage::from_arc(Arc::new(Schema::new(columns)))
 }
 
 /// Map a string to a `Value`: empty text becomes `Null` so an absent or blank

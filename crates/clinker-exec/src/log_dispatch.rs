@@ -678,6 +678,7 @@ fn bounded_correlation(value: &str) -> Box<str> {
 
 #[cfg(test)]
 mod tests {
+    use clinker_record::owned_storage::SharedStorage;
     use std::sync::Arc;
 
     use clinker_plan::config::{ClinkerToml, CompileContext, parse_config};
@@ -896,7 +897,7 @@ action = "allow"
         let (directives, conditions) = compiled_directives(condition);
         let policy = telemetry_policy();
         let (producer, receiver) = TelemetryArena::reserve(&policy).expect("arena reserves");
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount".into()])));
         let stable = StableEvalContext::test_default();
         let eval_ctx = EvalContext::test_default_borrowed(&stable);
 
@@ -913,7 +914,7 @@ action = "allow"
                 },
             );
             for amount in amounts {
-                let record = Record::new(Arc::clone(&schema), vec![Value::Integer(*amount)]);
+                let record = Record::new(schema.clone(), vec![Value::Integer(*amount)]);
                 dispatcher.fire_per_record(&record, &eval_ctx);
             }
         }
@@ -942,7 +943,7 @@ action = "allow"
         let (producer, receiver) =
             TelemetryArena::reserve(&sampling_policy(4)).expect("arena reserves");
         let observer = producer.clone();
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount".into()])));
         let stable = StableEvalContext::test_default();
         let eval_ctx = EvalContext::test_default_borrowed(&stable);
         FIELD_LOOKUPS.with(|count| count.set(0));
@@ -960,7 +961,7 @@ action = "allow"
                 },
             );
             for amount in 0..12_i64 {
-                let record = Record::new(Arc::clone(&schema), vec![Value::Integer(amount)]);
+                let record = Record::new(schema.clone(), vec![Value::Integer(amount)]);
                 dispatcher.fire_per_record(&record, &eval_ctx);
             }
             // Taken before the dispatcher closes its span, which is an
@@ -1001,7 +1002,7 @@ action = "allow"
         carry: Option<super::TransformSignalCarry>,
         amounts: &[i64],
     ) -> super::TransformSignalCarry {
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount".into()])));
         let stable = StableEvalContext::test_default();
         let eval_ctx = EvalContext::test_default_borrowed(&stable);
         let mut dispatcher = LogDispatcher::deferred(
@@ -1018,7 +1019,7 @@ action = "allow"
         );
         dispatcher.fire_before_transform();
         for amount in amounts {
-            let record = Record::new(Arc::clone(&schema), vec![Value::Integer(*amount)]);
+            let record = Record::new(schema.clone(), vec![Value::Integer(*amount)]);
             dispatcher.fire_per_record(&record, &eval_ctx);
         }
         dispatcher.finish();
@@ -1143,7 +1144,7 @@ action = "allow"
         carry: Option<super::TransformSignalCarry>,
         amounts: &[i64],
     ) {
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount".into()])));
         let stable = StableEvalContext::test_default();
         let eval_ctx = EvalContext::test_default_borrowed(&stable);
         let mut dispatcher = LogDispatcher::deferred(
@@ -1160,7 +1161,7 @@ action = "allow"
         );
         dispatcher.fire_before_transform();
         for amount in amounts {
-            let record = Record::new(Arc::clone(&schema), vec![Value::Integer(*amount)]);
+            let record = Record::new(schema.clone(), vec![Value::Integer(*amount)]);
             dispatcher.fire_per_record(&record, &eval_ctx);
         }
     }
@@ -1267,7 +1268,7 @@ action = "allow"
             TelemetryArena::reserve(&telemetry_policy()).expect("arena reserves");
         let observer = producer.clone();
         // The directive asks for `amount`; this row spells it `amount_total`.
-        let schema = Arc::new(Schema::new(vec!["amount_total".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount_total".into()])));
         let stable = StableEvalContext::test_default();
         let eval_ctx = EvalContext::test_default_borrowed(&stable);
 
@@ -1283,7 +1284,7 @@ action = "allow"
                     logical_node: "observe",
                 },
             );
-            let record = Record::new(Arc::clone(&schema), vec![Value::Integer(7)]);
+            let record = Record::new(schema.clone(), vec![Value::Integer(7)]);
             dispatcher.fire_per_record(&record, &eval_ctx);
         }
 
@@ -1311,7 +1312,7 @@ action = "allow"
         let (producer, _receiver) =
             TelemetryArena::reserve(&telemetry_policy()).expect("arena reserves");
         let observer = producer.clone();
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount".into()])));
         let stable = StableEvalContext::test_default();
         let eval_ctx = EvalContext::test_default_borrowed(&stable);
 
@@ -1327,7 +1328,7 @@ action = "allow"
                     logical_node: "observe",
                 },
             );
-            let record = Record::new(Arc::clone(&schema), vec![Value::Integer(7)]);
+            let record = Record::new(schema.clone(), vec![Value::Integer(7)]);
             dispatcher.fire_per_record(&record, &eval_ctx);
         }
 
@@ -1372,7 +1373,7 @@ action = "allow"
         directives[0].every = Some(2);
         let policy = telemetry_policy();
         let (producer, receiver) = TelemetryArena::reserve(&policy).expect("arena reserves");
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount".into()])));
         let stable = StableEvalContext::test_default();
         let eval_ctx = EvalContext::test_default_borrowed(&stable);
 
@@ -1391,7 +1392,7 @@ action = "allow"
             // Cadence admits positions 0 and 2 (values 5000 and 900); the gate
             // then rejects 900. Gate-first would have admitted 5000 and 2000.
             for amount in [5000_i64, 4000, 900, 2000] {
-                let record = Record::new(Arc::clone(&schema), vec![Value::Integer(amount)]);
+                let record = Record::new(schema.clone(), vec![Value::Integer(amount)]);
                 dispatcher.fire_per_record(&record, &eval_ctx);
             }
         }

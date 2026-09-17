@@ -1,5 +1,6 @@
 //! Differential contract tests for authored ordering promises.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
@@ -31,11 +32,11 @@ fn compile(yaml: &str) -> clinker_plan::plan::compiled::CompiledPlan {
 
 fn ordering_record(values: Vec<Value>) -> Record {
     Record::new(
-        Arc::new(Schema::new(vec![
+        SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "primary".into(),
             "secondary".into(),
             "identity".into(),
-        ])),
+        ]))),
         values,
     )
 }
@@ -509,8 +510,23 @@ nodes:
     )
 }
 
-fn run_correlation_writer(memory_limit: &str) -> String {
-    let plan = compile(&correlation_writer_pipeline(memory_limit));
+fn run_correlation_writer(require_spill: bool) -> String {
+    let mut plan = compile(&correlation_writer_pipeline("64M"));
+    if require_spill {
+        // Materialization must hold all four rows, including compiled hidden
+        // columns. The sort's lower spill threshold still forces disk use.
+        let columns = plan
+            .dag()
+            .graph
+            .node_weights()
+            .filter_map(|node| node.stored_output_schema())
+            .map(|schema| schema.column_count())
+            .max()
+            .expect("correlation fixture has a compiled schema");
+        let row_bytes = std::mem::size_of::<(Record, clinker_exec::executor::SourceRowId)>()
+            + columns * std::mem::size_of::<Value>();
+        plan = compile(&correlation_writer_pipeline(&(4 * row_bytes).to_string()));
+    }
     let readers: SourceReaders = HashMap::from([(
         "rows".to_string(),
         single_file_reader(
@@ -526,13 +542,19 @@ fn run_correlation_writer(memory_limit: &str) -> String {
         Box::new(output.clone()) as Box<dyn Write + Send>,
     )]);
 
-    PipelineExecutor::run_plan_with_readers_writers(
+    let report = PipelineExecutor::run_plan_with_readers_writers(
         &plan,
         readers,
         writers,
         &PipelineRunParams::default(),
     )
     .expect("correlation writer-boundary fixture must run");
+    if require_spill {
+        assert!(
+            report.cumulative_spill_bytes > 0,
+            "low-budget correlation must actually spill"
+        );
+    }
     output.as_string()
 }
 
@@ -630,7 +652,7 @@ fn writer_boundary_mode_matrix() {
     assert_eq!(fan_out["a"], "key,payload\n1,a1-first\n1,a1-second\n2,a2\n");
     assert_eq!(fan_out["b"], "key,payload\n0,b0\n3,b3\n");
 
-    let output = run_correlation_writer("64M");
+    let output = run_correlation_writer(false);
     assert_eq!(
         output, "key,group,payload\n0,b,b0\n1,b,b1\n2,a,a2\n3,a,a3\n",
         "correlation-deferred commit must enforce the complete physical writer boundary"
@@ -783,8 +805,8 @@ fn writer_boundary_resident_spill_parity() {
     assert_eq!(resident_fan_out, spilled_fan_out);
 
     assert_eq!(
-        run_correlation_writer("64M"),
-        run_correlation_writer("1200"),
+        run_correlation_writer(false),
+        run_correlation_writer(true),
         "correlation-deferred bytes must not depend on resident versus spill sorting"
     );
 }

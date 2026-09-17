@@ -15,6 +15,7 @@ use clinker_format::envelope::{
 use clinker_format::traits::FormatReader;
 use clinker_format::xml::reader::{XmlReader, XmlReaderConfig};
 use clinker_record::Value;
+use clinker_record::owned_storage::OwnedKey;
 use cxl::analyzer::doc_paths::DocPath;
 use indexmap::IndexMap;
 use std::io::Write;
@@ -95,7 +96,7 @@ fn doc_with_large_body_and_small_trailer(rows: usize) -> String {
     s
 }
 
-fn unwrap_map(value: &Value) -> &IndexMap<Box<str>, Value> {
+fn unwrap_map(value: &Value) -> &IndexMap<OwnedKey, Value> {
     match value {
         Value::Map(m) => m,
         other => panic!("expected map, got {other:?}"),

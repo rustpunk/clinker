@@ -4,7 +4,7 @@
 //! per-source synthetic identifier (`<source:NAME>`) because the row
 //! yielder exposes no per-record file identity.
 
-use std::sync::Arc;
+use clinker_record::owned_storage::{OwnedKey, SharedStorage};
 
 use clinker_format::{EnvelopeConfig, FormatError};
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
@@ -20,7 +20,7 @@ use std::io::Write;
 /// of rows; `current_source_file` stays `None` so the ingest loop falls
 /// back to the source's stable synthetic id.
 struct StubRecordSource {
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     rows: std::collections::VecDeque<Vec<Value>>,
 }
 
@@ -38,21 +38,21 @@ impl StubRecordSource {
 }
 
 impl RecordSource for StubRecordSource {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-        Ok(Arc::clone(&self.schema))
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+        Ok(self.schema.clone())
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
         Ok(self
             .rows
             .pop_front()
-            .map(|values| Record::new(Arc::clone(&self.schema), values)))
+            .map(|values| Record::new(self.schema.clone(), values)))
     }
 
     fn prepare_document(
         &mut self,
         _config: &EnvelopeConfig,
-    ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
+    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
         Ok(IndexMap::new())
     }
 }

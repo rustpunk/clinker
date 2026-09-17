@@ -815,7 +815,7 @@ pub fn build_policy(knob: clinker_plan::config::BackpressureKnob) -> Box<dyn Arb
 /// surfaces E310 with a partition + spill-bytes diagnostic instead
 /// of continuing to fill the disk.
 pub struct MemoryArbitrator {
-    admission: Mutex<reservation::ReservationLedger>,
+    admission: Arc<reservation::ReservationState>,
     writer_cleanup: Mutex<Option<Arc<dyn reservation::WriterCleanup>>>,
     /// Total memory limit in bytes (the hard limit). Default: 512MB.
     /// `AtomicU64` for `&self` access; production sets this once at
@@ -881,6 +881,15 @@ pub struct MemoryArbitrator {
     policy: Box<dyn ArbitrationPolicy>,
 }
 
+impl Drop for MemoryArbitrator {
+    fn drop(&mut self) {
+        // The run, not an escaped allocation authority, owns terminal closure.
+        // Cleanup can still release memory/disk/descriptors through shared state
+        // while a weak run link can no longer be upgraded.
+        self.close_writer_resources();
+    }
+}
+
 impl MemoryArbitrator {
     /// Build an arbitrator with `limit` bytes hard ceiling,
     /// `spill_threshold_pct` soft-limit fraction, and an explicit
@@ -907,10 +916,14 @@ impl MemoryArbitrator {
             "resume_threshold_pct ({resume_threshold_pct}) must sit in \
              (0, spill_threshold_pct={spill_threshold_pct})"
         );
+        let writer_cleanup = Mutex::new(None);
+        // Terminal close consults cleanup even for a memory-only run. Establish
+        // its platform mutex at startup instead of allocating during teardown.
+        drop(writer_cleanup.lock().unwrap_or_else(|e| e.into_inner()));
         Self {
             limit: AtomicU64::new(limit),
-            admission: Mutex::new(reservation::ReservationLedger::default()),
-            writer_cleanup: Mutex::new(None),
+            admission: Arc::new(reservation::ReservationState::new()),
+            writer_cleanup,
             spill_threshold_pct,
             resume_threshold_pct,
             peak_rss: AtomicU64::new(0),
@@ -1036,7 +1049,11 @@ impl MemoryArbitrator {
     /// overflow scenarios without spawning processes of the requested
     /// RSS size.
     pub fn set_limit(&self, n: u64) -> Result<(), ResourceError> {
-        let ledger = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        let ledger = self
+            .admission
+            .ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if n < ledger.usage.memory {
             return Err(ResourceError::new(
                 ResourceErrorKind::Budget,
@@ -1146,7 +1163,11 @@ impl MemoryArbitrator {
     /// construction; integration tests use it to drive E310
     /// overshoot scenarios.
     pub fn set_max_spill_bytes(&self, n: u64) -> Result<(), ResourceError> {
-        let ledger = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        let ledger = self
+            .admission
+            .ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let occupied = ledger
             .usage
             .disk
@@ -1203,7 +1224,11 @@ impl MemoryArbitrator {
     /// sorts release their surviving runs when the eager merger or lazy stream
     /// drops.
     pub fn record_spill_bytes(&self, node: &str, n: u64) -> bool {
-        let ledger = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        let ledger = self
+            .admission
+            .ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _ =
             self.cumulative_spill_bytes
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -1237,7 +1262,11 @@ impl MemoryArbitrator {
     /// never charged to this node) cannot wrap the counter below other stages'
     /// live charges.
     pub fn release_spill_bytes(&self, node: &str, n: u64) {
-        let _ledger = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        let _ledger = self
+            .admission
+            .ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if n == 0 {
             return;
         }
@@ -1864,79 +1893,8 @@ mod tests {
         v
     }
 
-    /// Env flag distinguishing the re-exec'd child from the harness-launched
-    /// parent: absent in the parent (which re-execs), set in the child
-    /// (which runs the probe body). Its presence also breaks the otherwise
-    /// infinite re-exec loop.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    const MEMPROBE_ISOLATED_ENV: &str = "CLINKER_MEMPROBE_ISOLATED";
-
-    /// Marker the child prints to stdout after the probe's assertions pass.
-    /// The parent requires it in the child's captured stdout, which is the
-    /// positive proof the probe actually ran: libtest exits 0 when its
-    /// filter matches no test, so `status.success()` alone would pass even
-    /// if `test_path` stopped matching the real test name (a future rename,
-    /// a filter quirk) and the probe never executed. A dedicated sentinel is
-    /// robust to libtest output-format drift in a way that scraping for
-    /// "1 passed" is not.
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    const MEMPROBE_RAN_SENTINEL: &str = "__clinker_memprobe_ran__";
-
-    /// Runs `probe` in a child process where it is the sole test, so its
-    /// memory samples bracket only its own allocation and the process-global
-    /// RSS readings cannot be moved by a sibling test thread.
-    ///
-    /// The probes read a process-global counter (Linux `/proc/self/statm`
-    /// RSS, Windows `PrivateUsage`, macOS `phys_footprint`) and assert a
-    /// relation between two or more samples. Under `cargo test`'s default
-    /// multi-threaded harness, sibling test threads in the same binary
-    /// commit and free large buffers between the samples, moving the global
-    /// figure independently of this probe's own allocation and tripping the
-    /// assertion at random (issue #394). `#[serial]` is insufficient: it
-    /// only orders `#[serial]`-tagged tests, leaving every other test in the
-    /// binary concurrent. The mechanism is platform-agnostic, so it runs on
-    /// every first-class target rather than only macOS/Windows.
-    ///
-    /// On first entry (parent, env flag absent) this re-execs the test
-    /// binary filtered to `test_path` alone, with the flag set, then
-    /// requires both that the child exited successfully and that it printed
-    /// [`MEMPROBE_RAN_SENTINEL`] — the latter is positive proof the probe
-    /// ran, since libtest exits 0 on a filter that matches no test. A
-    /// failure surfaces the child's stderr (the real assertion text). On the
-    /// recursive entry (child, env flag present) it runs `probe`, prints the
-    /// sentinel, and returns, letting libtest report the result.
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    fn run_isolated(test_path: &str, probe: impl FnOnce()) {
-        if std::env::var_os(MEMPROBE_ISOLATED_ENV).is_some() {
-            probe();
-            // Reached only when the probe's assertions all passed; a panic
-            // unwinds past this and the sentinel is absent from stdout.
-            println!("{MEMPROBE_RAN_SENTINEL}");
-            return;
-        }
-
-        let exe = std::env::current_exe().expect("test binary path must be readable");
-        let output = std::process::Command::new(exe)
-            .args(["--exact", test_path, "--test-threads=1", "--nocapture"])
-            .env(MEMPROBE_ISOLATED_ENV, "1")
-            .output()
-            .expect("re-exec of the isolated memory probe must spawn");
-
-        assert!(
-            output.status.success(),
-            "isolated memory probe {test_path} failed in child process:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains(MEMPROBE_RAN_SENTINEL),
-            "isolated memory probe {test_path} never ran: the child exited 0 \
-             but did not print its run sentinel, so the `--exact` filter \
-             matched no test (likely a stale test-path literal). \
-             child stdout:\n{stdout}"
-        );
-    }
+    use crate::test_support::run_isolated;
 
     /// On macOS, `rss_bytes()` reports `phys_footprint`, which rises when a
     /// large allocation is touched. A delta-threshold assertion would flake

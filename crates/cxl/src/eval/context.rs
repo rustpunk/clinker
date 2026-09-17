@@ -1,3 +1,4 @@
+use clinker_record::owned_storage::SharedStorage;
 use std::sync::{Arc, RwLock};
 
 use chrono::{NaiveDateTime, Utc};
@@ -226,12 +227,12 @@ pub struct EvalContext<'a> {
     /// Envelope context for the record currently under evaluation.
     /// `$doc.<section>.<field>` resolves through this Arc's sections
     /// map. Construction sites that evaluate against a real record
-    /// borrow the record's own `Arc<DocumentContext>`; sites that
+    /// borrow the record's own `SharedStorage<DocumentContext>`; sites that
     /// evaluate in a record-free context (init-phase state, certain
     /// finalize paths) borrow [`synthetic_document_context`]'s Arc,
     /// whose section map is empty so every `$doc.*` resolves to
     /// `Value::Null`.
-    pub doc_ctx: &'a Arc<DocumentContext>,
+    pub doc_ctx: &'a SharedStorage<DocumentContext>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -368,9 +369,9 @@ fn test_default_source_name() -> &'static Arc<str> {
 /// `$doc.*` evaluation against it returns `Value::Null` uniformly —
 /// the right default for test contexts and any record-free finalize
 /// path that doesn't have a real envelope.
-fn test_default_doc_ctx() -> &'static Arc<DocumentContext> {
+fn test_default_doc_ctx() -> &'static SharedStorage<DocumentContext> {
     use std::sync::OnceLock;
-    static CTX: OnceLock<Arc<DocumentContext>> = OnceLock::new();
+    static CTX: OnceLock<SharedStorage<DocumentContext>> = OnceLock::new();
     CTX.get_or_init(synthetic_document_context)
 }
 
@@ -504,19 +505,22 @@ mod tests {
 
     #[test]
     fn resolve_doc_returns_section_field_when_present() {
-        use clinker_record::DocumentId;
+        use clinker_record::{
+            DocumentId,
+            owned_storage::{OwnedKey, OwnedMap},
+        };
         let stable = StableEvalContext::test_default();
         let file: Arc<str> = Arc::from("payments.xml");
         let batch: Arc<str> = Arc::from("b");
         let mut sections = IndexMap::new();
         let mut head = IndexMap::new();
-        head.insert(Box::from("batch_id"), Value::String("RUN-001".into()));
-        sections.insert(Box::from("Head"), Value::Map(Box::new(head)));
-        let doc = Arc::new(DocumentContext::new(
+        head.insert(OwnedKey::from("batch_id"), Value::String("RUN-001".into()));
+        sections.insert(OwnedKey::from("Head"), Value::Map(OwnedMap::from_map(head)));
+        let doc = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::clone(&file),
             clinker_record::EnvelopeRecord::from_sections(sections),
-        ));
+        )));
         let mut ctx = make_ctx(&stable, &file, &batch, 1);
         ctx.doc_ctx = &doc;
         assert_eq!(

@@ -23,6 +23,7 @@
 //! per row. The `Arc` swap happens automatically as the wrapper advances
 //! across file boundaries.
 
+use clinker_record::owned_storage::{OwnedKey, SharedStorage};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -140,7 +141,7 @@ pub struct MultiFileFormatReader {
     current_file: Arc<str>,
     /// Cached schema from file 0. Compared against subsequent files'
     /// schemas; mismatch fails fast.
-    schema: Option<Arc<Schema>>,
+    schema: Option<SharedStorage<Schema>>,
     /// Per-file factory.
     factory: Box<FactoryFn>,
     /// Ordered structural events accumulated while the wrapper advances.
@@ -275,9 +276,9 @@ impl FormatReader for MultiFileFormatReader {
         Some(&self.current_file)
     }
 
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
         if let Some(ref s) = self.schema {
-            return Ok(Arc::clone(s));
+            return Ok(s.clone());
         }
         if self.active.is_none() && !self.advance()? {
             return Err(FormatError::SchemaInference(
@@ -289,14 +290,14 @@ impl FormatReader for MultiFileFormatReader {
             .as_mut()
             .expect("advance() set active or returned false")
             .schema()?;
-        self.schema = Some(Arc::clone(&schema));
+        self.schema = Some(schema.clone());
         Ok(schema)
     }
 
     fn prepare_document(
         &mut self,
         config: &clinker_format::EnvelopeConfig,
-    ) -> Result<indexmap::IndexMap<Box<str>, clinker_record::Value>, FormatError> {
+    ) -> Result<indexmap::IndexMap<OwnedKey, clinker_record::Value>, FormatError> {
         // Each file is its own document; forward the pre-scan to the
         // active per-file reader. The executor's ingest loop calls this
         // once per file (at each `current_source_file` transition), so
@@ -613,6 +614,9 @@ mod tests {
         let mut r = MultiFileFormatReader::new(files, csv_factory());
         let s1 = r.schema().unwrap();
         let s2 = r.schema().unwrap();
-        assert!(Arc::ptr_eq(&s1, &s2), "schema() should be idempotent");
+        assert!(
+            SharedStorage::ptr_eq(&s1, &s2),
+            "schema() should be idempotent"
+        );
     }
 }

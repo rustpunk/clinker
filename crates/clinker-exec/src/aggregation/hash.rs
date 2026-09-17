@@ -7,6 +7,9 @@
 //! [`empty_global_fold_row`], [`group_by_sort_fields`]) that the
 //! streaming path reuses to guarantee byte-identical output.
 
+#[cfg(test)]
+use clinker_record::owned_storage::OwnedKey;
+use clinker_record::owned_storage::SharedStorage;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -127,14 +130,14 @@ pub struct HashAggregator {
     value_heap_bytes: usize,
     memory_budget: usize,
     spill_files: Vec<AggSpillFile>,
-    spill_schema: Arc<Schema>,
+    spill_schema: SharedStorage<Schema>,
     spill_dir: Option<PathBuf>,
     /// Whether spill files are LZ4-compressed. Resolved by the dispatcher
     /// from the workspace `[storage.spill] compress` knob against this
     /// aggregate's output-schema width and the run's batch size, so the
     /// on-disk format matches what `--explain` reports for the operator.
     spill_compress: bool,
-    output_schema: Arc<Schema>,
+    output_schema: SharedStorage<Schema>,
     transform_name: String,
     /// Source-row counter — incremented after the pre-agg filter accepts
     /// a record. Used by the global-fold empty-input special case in
@@ -207,10 +210,10 @@ pub struct AggregatorConfig {
     /// Evaluator for pre-aggregation filters and expression bindings.
     pub evaluator: ProgramEvaluator,
     /// Schema of finalized output rows.
-    pub output_schema: Arc<Schema>,
+    pub output_schema: SharedStorage<Schema>,
     /// Schema of spilled partition rows (group-by columns ++
     /// `__acc_state`).
-    pub spill_schema: Arc<Schema>,
+    pub spill_schema: SharedStorage<Schema>,
     /// RSS budget in bytes that gates the spill trigger. Zero disables
     /// the group-count cap (`max_groups` becomes `usize::MAX`).
     pub memory_budget: usize,
@@ -1094,7 +1097,7 @@ impl HashAggregator {
             for _ in gb_count..schema_cols {
                 values.push(Value::Null);
             }
-            let synth = Record::new(Arc::clone(&self.spill_schema), values);
+            let synth = Record::new(self.spill_schema.clone(), values);
             let mut buf = Vec::new();
             encoder.encode_into(&synth, &mut buf);
             prepared.push((buf, idx));
@@ -1423,7 +1426,7 @@ impl crate::pipeline::memory::MemoryConsumer for AggregateConsumer {
 /// 3. Build the output `Record`.
 pub(crate) fn finalize_group_inner(
     factory: &AccumulatorFactory,
-    output_schema: &Arc<Schema>,
+    output_schema: &SharedStorage<Schema>,
     transform_name: &str,
     key: &[GroupByKey],
     state: &AggregatorGroupState,
@@ -1475,7 +1478,7 @@ pub(crate) fn finalize_group_inner(
         values[idx] = Value::Integer(state.group_index as i64);
     }
 
-    let record = Record::new(Arc::clone(output_schema), values);
+    let record = Record::new(output_schema.clone(), values);
     Ok(record)
 }
 
@@ -1507,7 +1510,7 @@ pub(crate) fn group_by_sort_fields(group_by_fields: &[String], _schema: &Schema)
 /// `AggregateStream` empty-input branch.
 pub(crate) fn empty_global_fold_row(
     factory: &AccumulatorFactory,
-    output_schema: &Arc<Schema>,
+    output_schema: &SharedStorage<Schema>,
     transform_name: &str,
 ) -> Result<Record, HashAggError> {
     let empty_key: Vec<GroupByKey> = Vec::new();
@@ -1527,12 +1530,14 @@ mod spill_trigger_tests {
     use cxl::typecheck::types::Type;
     use indexmap::IndexMap;
 
-    fn make_schema(cols: &[&str]) -> Arc<Schema> {
-        Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()))
+    fn make_schema(cols: &[&str]) -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(
+            cols.iter().map(|c| (*c).into()).collect(),
+        )))
     }
 
-    fn make_record(schema: &Arc<Schema>, vals: Vec<Value>) -> Record {
-        Record::new(Arc::clone(schema), vals)
+    fn make_record(schema: &SharedStorage<Schema>, vals: Vec<Value>) -> Record {
+        Record::new(schema.clone(), vals)
     }
 
     /// Compile a CXL aggregate snippet against input_fields, returning a
@@ -1612,19 +1617,19 @@ mod spill_trigger_tests {
         // constructor sees both flags as `false`.
         compiled.set_retraction_flags(is_relaxed);
 
-        let output_columns: Vec<Box<str>> = compiled
+        let output_columns: Vec<OwnedKey> = compiled
             .emits
             .iter()
-            .map(|e| e.output_name.clone())
+            .map(|e| OwnedKey::from_box(e.output_name.clone()))
             .collect();
-        let output_schema = Arc::new(Schema::new(output_columns));
+        let output_schema = SharedStorage::from_arc(Arc::new(Schema::new(output_columns)));
 
-        let mut spill_cols: Vec<Box<str>> = group_by_owned
+        let mut spill_cols: Vec<OwnedKey> = group_by_owned
             .iter()
-            .map(|s| Box::<str>::from(s.as_str()))
+            .map(|s| OwnedKey::from(s.as_str()))
             .collect();
         spill_cols.push("__acc_state".into());
-        let spill_schema = Arc::new(Schema::new(spill_cols));
+        let spill_schema = SharedStorage::from_arc(Arc::new(Schema::new(spill_cols)));
 
         let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
 
@@ -3025,12 +3030,12 @@ mod spill_trigger_tests {
         );
         let output_schema = builder.build();
 
-        let mut spill_cols: Vec<Box<str>> = group_by_owned
+        let mut spill_cols: Vec<OwnedKey> = group_by_owned
             .iter()
-            .map(|s| Box::<str>::from(s.as_str()))
+            .map(|s| OwnedKey::from(s.as_str()))
             .collect();
         spill_cols.push("__acc_state".into());
-        let spill_schema = Arc::new(Schema::new(spill_cols));
+        let spill_schema = SharedStorage::from_arc(Arc::new(Schema::new(spill_cols)));
 
         let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
 

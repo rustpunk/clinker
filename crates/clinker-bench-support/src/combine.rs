@@ -9,8 +9,8 @@
 //! tunable probe-side overlap ratio (default 90%), and string non-key
 //! columns of deterministic length.
 
+use clinker_record::owned_storage::SharedStorage;
 use clinker_record::{FieldStr, Record, Schema, SchemaBuilder, Value};
-use std::sync::Arc;
 
 /// Generates two correlated record sets for combine benchmarks.
 ///
@@ -62,7 +62,7 @@ impl CombineDataGen {
     ///
     /// Column layout: `key` (int), then `c0`, `c1`, ... `c{extra_columns-1}`
     /// (string).
-    fn schema(&self) -> Arc<Schema> {
+    fn schema(&self) -> SharedStorage<Schema> {
         SchemaBuilder::with_capacity(1 + self.extra_columns)
             .with_field("key")
             .extend((0..self.extra_columns).map(|i| format!("c{i}")))
@@ -90,13 +90,13 @@ impl CombineDataGen {
 
     /// Build a record with the given integer key and deterministic string
     /// non-key columns derived from `row`.
-    fn make_record(&self, schema: &Arc<Schema>, row: usize, key: i64) -> Record {
+    fn make_record(&self, schema: &SharedStorage<Schema>, row: usize, key: i64) -> Record {
         let mut values = Vec::with_capacity(1 + self.extra_columns);
         values.push(Value::Integer(key));
         for col in 0..self.extra_columns {
             values.push(Value::String(Self::det_string(row, col)));
         }
-        Record::new(Arc::clone(schema), values)
+        Record::new(schema.clone(), values)
     }
 
     /// Effective build-side cardinality: `min(key_cardinality, build_rows)`.

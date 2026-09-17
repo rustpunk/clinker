@@ -302,7 +302,8 @@ fn collect_port_records(
         // Composition port seeding takes records only; the body operates in
         // its own document-boundary scope and re-emits at the call site.
         let (input, reservation) = input.into_parts();
-        let materialized_bytes = input.estimated_materialized_bytes();
+        let materialized_bytes =
+            input.materialization_bytes_without_transfer(&ctx.allocation_resources);
         let transferred_overlap_bytes = input.transferred_materialization_overlap_bytes();
         let reservation = match reservation {
             Some(reservation) => {
@@ -316,9 +317,12 @@ fn collect_port_records(
             )?,
         };
         let (records, _puncts) = input.drain_split()?;
-        reservation.set_bytes(crate::executor::dispatch::estimate_node_buffer_bytes(
-            &records,
-        ));
+        reservation.set_bytes(
+            crate::executor::dispatch::estimate_node_buffer_unaccounted_bytes(
+                &records,
+                &ctx.allocation_resources,
+            ),
+        );
         // Two parallel edges to the same port (e.g. `inputs: { p: a,
         // p: a }` — currently rejected at parse, but the runtime is
         // defensive) would overwrite; the wiring pass guarantees

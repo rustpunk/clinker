@@ -771,12 +771,6 @@ fn fused_transform_charges_one_batch_not_full_stage() {
     // Large enough that the constant in-flight bound is a small fraction
     // of the full-stage estimate (which scales with ROWS).
     const ROWS: usize = 100_000;
-    // Conservative bytes-per-row lower bound for this 2-column schema; the
-    // real per-row cost (`record_byte_cost`) exceeds this, so the
-    // full-stage estimate computed from it is a safe lower bound.
-    const PER_ROW_LOWER: usize = 48;
-    // Generous bytes-per-row upper bound for the in-flight ceiling.
-    const PER_ROW_UPPER: usize = 256;
     // Bounded in-flight capacity, summed across the two registered memory
     // consumers whose live charge the arbitrator peaks over:
     //   - the source ingest channel, `crossbeam_channel::bounded(1024)` —
@@ -791,7 +785,9 @@ fn fused_transform_charges_one_batch_not_full_stage() {
     // 1024 + 256 + 64, independent of total input size. The last term is the
     // fixture's `batch_size` (64), not the output channel depth — the channel
     // depth is already the 256 term and must not be double-counted as a batch.
-    const IN_FLIGHT_RECORDS: usize = 1024 + 256 + 64;
+    const SOURCE_CAPACITY: usize = 1024;
+    const OUTPUT_CAPACITY: usize = 256;
+    const BATCH_SIZE: usize = 64;
 
     let yaml = r#"
 pipeline:
@@ -861,8 +857,28 @@ nodes:
     // set — the two bounded channels plus one batch — never the whole
     // stage. With ROWS far larger than the in-flight bound, the full-stage
     // estimate dwarfs the peak.
-    let full_stage_lower = (ROWS * PER_ROW_LOWER) as u64;
-    let in_flight_ceiling = (IN_FLIGHT_RECORDS * PER_ROW_UPPER) as u64;
+    let dag = plan.dag();
+    let schema_for = |name| {
+        dag.graph
+            .node_weights()
+            .find(|node| node.name() == name)
+            .unwrap()
+            .output_schema_in(dag)
+            .clone()
+    };
+    let source_schema = schema_for("src");
+    let output_schema = schema_for("rename");
+    // All fixture strings (including source metadata) fit inline. The source
+    // EWMA charges Record plus value backing; the streaming slot additionally
+    // charges its SourceRowId carrier. Compiled schemas include hidden fields.
+    let source_row_bytes = std::mem::size_of::<clinker_record::Record>()
+        + source_schema.column_count() * std::mem::size_of::<clinker_record::Value>();
+    let output_row_bytes =
+        std::mem::size_of::<(clinker_record::Record, clinker_exec::executor::SourceRowId)>()
+            + output_schema.column_count() * std::mem::size_of::<clinker_record::Value>();
+    let full_stage_lower = (ROWS * output_row_bytes) as u64;
+    let in_flight_ceiling = (SOURCE_CAPACITY * source_row_bytes
+        + (OUTPUT_CAPACITY + BATCH_SIZE) * output_row_bytes) as u64;
     assert!(
         report.peak_consumer_usage_bytes <= in_flight_ceiling,
         "fused Transform charged {} bytes at peak — expected <= {} \

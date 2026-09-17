@@ -125,8 +125,8 @@ Primary source evidence used:
 ### Record And Value Storage
 
 1. **Area/module:** `clinker-record::FieldStr`, `clinker-record::Value`, `Record` operations.
-2. **Why performance-sensitive:** `Value::String` is documented as the dominant ETL payload shape, and `FieldStr` width controls the per-`Value` byte cost that drives RSS/spill thresholds.
-3. **Existing optimization choices:** `FieldStr` uses a 24-byte union with inline strings up to 23 bytes, `Arc<str>` for shared long strings, and `Box<str>` for long unique strings. `Value` custom serialization keeps wire form as string bytes and does not serialize the storage arm. Size assertions pin `FieldStr` at 24 bytes and `Value` at the expected footprint.
+2. **Why performance-sensitive:** `FieldStr` width controls every `Value` slot's footprint, including non-string variants. Long strings and nested containers also add backing allocations; workload frequency cannot be inferred from fixtures.
+3. **Existing optimization choices:** `FieldStr` uses a 24-byte union with inline strings up to 23 bytes, legacy shared/unique backing, and governed shared/unique owners carrying allocation leases. Shared clones alias the original allocation; unique clones remain independent legacy copies. `Value` custom serialization keeps wire form as string bytes and does not serialize the storage arm. Size assertions pin `FieldStr` at 24 bytes and `Value` at the expected footprint. Governed container growth reserves old and new capacity together; actual allocator tests cover holder and backing layouts.
 4. **Avoid:** Do not widen `FieldStr`/`Value`, remove inline storage, make long shared clones deep-copy by default, or serialize the in-memory storage arm unless all memory/spill assumptions and record benchmarks are updated.
 5. **Benchmarks/tests available:** `cargo bench -p clinker-record --bench record_ops`; size/clone/serde tests in `clinker-record`.
 6. **Confidence:** High.
@@ -188,7 +188,7 @@ Primary source evidence used:
 
 1. **Area/module:** `clinker-record::Value`, `clinker-record::DocumentContext`, `clinker-exec::pipeline::spill`, metrics/reporting.
 2. **Why performance-sensitive:** Serialization is used for spill, metrics, DLQ, benchmark reports, and tests. Spill serialization sits on memory-pressure paths.
-3. **Existing optimization choices:** `Value` uses tagged serde compatible with postcard; production JSON output bypasses serde `Value` dispatch through format helpers. Spill record bodies use postcard, while the schema header stays JSON for inspectability. Document contexts are interned once per spill file and reloaded via `Arc<DocumentContext>`.
+3. **Existing optimization choices:** `Value` uses tagged serde compatible with postcard; production JSON output bypasses serde `Value` dispatch through format helpers. Spill record bodies use postcard, while the schema header stays JSON for inspectability. Document contexts are interned once per spill file and reloaded through shared storage handles; decoded copies have their own legacy allocations.
 4. **Avoid:** Do not replace postcard spill frames with verbose JSON rows, inline document context per record, or remove deserialize frame-size caps.
 5. **Benchmarks/tests available:** `spill_compression` bench, `record_ops` value heap-size/string benches, spill/storage tests.
 6. **Confidence:** High for spill serialization; medium for other reporting paths.

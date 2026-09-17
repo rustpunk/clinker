@@ -1,3 +1,4 @@
+use clinker_record::owned_storage::{OwnedKey, SharedStorage};
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -84,7 +85,7 @@ impl Default for CsvWriterConfig {
 /// CSV row after it — no document is buffered, so framing stays O(1-record).
 pub struct CsvWriter<W: Write> {
     inner: csv::Writer<W>,
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     config: CsvWriterConfig,
     header_written: bool,
     /// Indices into `schema.columns()` of the columns actually emitted (after
@@ -111,7 +112,7 @@ pub struct CsvWriter<W: Write> {
 }
 
 impl<W: Write> CsvWriter<W> {
-    pub fn new(writer: W, schema: Arc<Schema>, config: CsvWriterConfig) -> Self {
+    pub fn new(writer: W, schema: SharedStorage<Schema>, config: CsvWriterConfig) -> Self {
         let framer = config
             .envelope
             .clone()
@@ -160,7 +161,7 @@ impl<W: Write> CsvWriter<W> {
     /// row, optionally appending a trailing computed-count cell.
     fn write_section_row(
         inner: &mut csv::Writer<W>,
-        fields: &indexmap::IndexMap<Box<str>, Value>,
+        fields: &indexmap::IndexMap<OwnedKey, Value>,
         count: Option<(&str, i64)>,
     ) -> Result<(), FormatError> {
         let mut cells: Vec<String> = Vec::new();
@@ -313,7 +314,7 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
 /// Non-CSV formats do not need this — their factories are stateless.
 pub struct HeaderCapturingCsvWriter<W: Write> {
     inner: CsvWriter<W>,
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     shared_header: Arc<Mutex<Option<Vec<Box<str>>>>>,
     captured: bool,
 }
@@ -321,7 +322,7 @@ pub struct HeaderCapturingCsvWriter<W: Write> {
 impl<W: Write> HeaderCapturingCsvWriter<W> {
     pub fn new(
         inner: CsvWriter<W>,
-        schema: Arc<Schema>,
+        schema: SharedStorage<Schema>,
         shared_header: Arc<Mutex<Option<Vec<Box<str>>>>>,
     ) -> Self {
         Self {
@@ -352,7 +353,7 @@ impl<W: Write + Send> FormatWriter for HeaderCapturingCsvWriter<W> {
                             .field_metadata(*i)
                             .is_none_or(|m| !m.is_engine_stamped())
                 })
-                .map(|(_, name)| name.clone())
+                .map(|(_, name)| Box::<str>::from(name.as_ref()))
                 .collect();
             *self.shared_header.lock().unwrap() = Some(header);
             self.captured = true;
@@ -392,7 +393,10 @@ impl<W: Write + Send> FormatWriter for HeaderCapturingCsvWriter<W> {
 /// The indices into `schema.columns()` of the columns the CSV writer emits,
 /// after filtering engine-stamped columns unless opted in. Computed once and
 /// reused for both the header row and every body row.
-fn filtered_column_indices(schema: &Arc<Schema>, include_engine_stamped: bool) -> Vec<usize> {
+fn filtered_column_indices(
+    schema: &SharedStorage<Schema>,
+    include_engine_stamped: bool,
+) -> Vec<usize> {
     schema
         .columns()
         .iter()
@@ -592,23 +596,26 @@ mod tests {
     use super::*;
     use crate::csv::reader::{CsvReader, CsvReaderConfig};
     use crate::traits::FormatReader;
+    use clinker_record::owned_storage::{OwnedMap, OwnedValues};
 
-    fn make_schema(cols: &[&str]) -> Arc<Schema> {
-        Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()))
+    fn make_schema(cols: &[&str]) -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(
+            cols.iter().map(|c| (*c).into()).collect(),
+        )))
     }
 
-    fn make_record(schema: &Arc<Schema>, values: Vec<Value>) -> Record {
-        Record::new(Arc::clone(schema), values)
+    fn make_record(schema: &SharedStorage<Schema>, values: Vec<Value>) -> Record {
+        Record::new(schema.clone(), values)
     }
 
     fn write_to_string(
-        schema: &Arc<Schema>,
+        schema: &SharedStorage<Schema>,
         config: CsvWriterConfig,
         records: &[Record],
     ) -> String {
         let mut buf = Vec::new();
         {
-            let mut writer = CsvWriter::new(&mut buf, Arc::clone(schema), config);
+            let mut writer = CsvWriter::new(&mut buf, schema.clone(), config);
             for r in records {
                 writer.write_record(r).unwrap();
             }
@@ -743,7 +750,7 @@ mod tests {
         assert_eq!(parsed, dt);
     }
 
-    fn make_schema_with_engine_stamp(user_col: &str, stamp_col: &str) -> Arc<Schema> {
+    fn make_schema_with_engine_stamp(user_col: &str, stamp_col: &str) -> SharedStorage<Schema> {
         use clinker_record::FieldMetadata;
         use clinker_record::SchemaBuilder;
         SchemaBuilder::new()
@@ -937,15 +944,15 @@ mod tests {
     fn test_csv_writer_rejects_map_value() {
         use indexmap::IndexMap;
         let schema = make_schema(&["id", "payload"]);
-        let mut sidecar: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut sidecar: IndexMap<OwnedKey, Value> = IndexMap::new();
         sidecar.insert("a".into(), Value::Integer(1));
         sidecar.insert("b".into(), Value::String("two".into()));
         let record = make_record(
             &schema,
-            vec![Value::Integer(7), Value::Map(Box::new(sidecar))],
+            vec![Value::Integer(7), Value::Map(OwnedMap::from_map(sidecar))],
         );
         let mut buf = Vec::new();
-        let mut writer = CsvWriter::new(&mut buf, Arc::clone(&schema), CsvWriterConfig::default());
+        let mut writer = CsvWriter::new(&mut buf, schema.clone(), CsvWriterConfig::default());
         let err = writer.write_record(&record).unwrap_err();
         match err {
             FormatError::UnserializableMapValue { format, column } => {
@@ -984,11 +991,11 @@ mod tests {
             &schema,
             vec![
                 Value::Integer(7),
-                Value::Array(vec![
+                Value::Array(OwnedValues::from_vec(vec![
                     Value::String("a".into()),
                     Value::String("b".into()),
                     Value::String("c".into()),
-                ]),
+                ])),
             ],
         );
         let output = write_to_string(&schema, declared_config(&["tags"]), &[record]);
@@ -1001,12 +1008,18 @@ mod tests {
     #[test]
     fn join_values_empty_and_single() {
         let schema = make_schema(&["id", "tags"]);
-        let empty = make_record(&schema, vec![Value::Integer(1), Value::Array(Vec::new())]);
+        let empty = make_record(
+            &schema,
+            vec![
+                Value::Integer(1),
+                Value::Array(OwnedValues::from_vec(Vec::new())),
+            ],
+        );
         let single = make_record(
             &schema,
             vec![
                 Value::Integer(2),
-                Value::Array(vec![Value::String("solo".into())]),
+                Value::Array(OwnedValues::from_vec(vec![Value::String("solo".into())])),
             ],
         );
         let output = write_to_string(&schema, declared_config(&["tags"]), &[empty, single]);
@@ -1019,10 +1032,10 @@ mod tests {
         let schema = make_schema(&["codes"]);
         let record = make_record(
             &schema,
-            vec![Value::Array(vec![
+            vec![Value::Array(OwnedValues::from_vec(vec![
                 Value::String("x".into()),
                 Value::String("y".into()),
-            ])],
+            ]))],
         );
         let config = join_config(vec![JoinValues {
             field: "codes".into(),
@@ -1045,13 +1058,13 @@ mod tests {
         let schema = make_schema(&["tags"]);
         let record = make_record(
             &schema,
-            vec![Value::Array(vec![
+            vec![Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a;b".into()),
                 Value::String("c".into()),
-            ])],
+            ]))],
         );
         let mut buf = Vec::new();
-        let mut writer = CsvWriter::new(&mut buf, Arc::clone(&schema), declared_config(&["tags"]));
+        let mut writer = CsvWriter::new(&mut buf, schema.clone(), declared_config(&["tags"]));
         let err = writer.write_record(&record).unwrap_err();
         assert!(err.is_join_collision());
         match err {
@@ -1084,7 +1097,10 @@ mod tests {
             Value::String(r"c\d".into()),
             Value::String("e".into()),
         ];
-        let record = make_record(&schema, vec![Value::Array(original.clone())]);
+        let record = make_record(
+            &schema,
+            vec![Value::Array(OwnedValues::from_vec(original.clone()))],
+        );
         let config = join_config(vec![JoinValues {
             field: "tags".into(),
             delimiter: ";".into(),
@@ -1107,7 +1123,10 @@ mod tests {
         let mut reader = CsvReader::from_reader(output.as_bytes(), read_config);
         reader.schema().unwrap();
         let back = reader.next_record().unwrap().unwrap();
-        assert_eq!(back.get("tags"), Some(&Value::Array(original)));
+        assert_eq!(
+            back.get("tags"),
+            Some(&Value::Array(OwnedValues::from_vec(original)))
+        );
     }
 
     /// `on_conflict: encode_json` round-trips exactly, including values carrying
@@ -1120,7 +1139,10 @@ mod tests {
             Value::String("c\"d".into()),
             Value::String("e\nf".into()),
         ];
-        let record = make_record(&schema, vec![Value::Array(original.clone())]);
+        let record = make_record(
+            &schema,
+            vec![Value::Array(OwnedValues::from_vec(original.clone()))],
+        );
         let config = join_config(vec![JoinValues {
             field: "payload".into(),
             delimiter: ";".into(),
@@ -1143,7 +1165,10 @@ mod tests {
         let mut reader = CsvReader::from_reader(output.as_bytes(), read_config);
         reader.schema().unwrap();
         let back = reader.next_record().unwrap().unwrap();
-        assert_eq!(back.get("payload"), Some(&Value::Array(original)));
+        assert_eq!(
+            back.get("payload"),
+            Some(&Value::Array(OwnedValues::from_vec(original)))
+        );
     }
 
     /// AC#6 interaction: a value containing BOTH the intra-cell delimiter and the
@@ -1153,11 +1178,14 @@ mod tests {
     fn join_values_interaction_with_csv_field_delimiter() {
         let schema = make_schema(&["tags"]);
         let original = vec![Value::String("a,b;c".into()), Value::String("d".into())];
-        let record = make_record(&schema, vec![Value::Array(original.clone())]);
+        let record = make_record(
+            &schema,
+            vec![Value::Array(OwnedValues::from_vec(original.clone()))],
+        );
 
         // error: the ';' inside "a,b;c" collides.
         let mut buf = Vec::new();
-        let mut w = CsvWriter::new(&mut buf, Arc::clone(&schema), declared_config(&["tags"]));
+        let mut w = CsvWriter::new(&mut buf, schema.clone(), declared_config(&["tags"]));
         assert!(w.write_record(&record).unwrap_err().is_join_collision());
 
         // escape: round-trips through the reader despite the CSV comma-quoting.
@@ -1182,7 +1210,10 @@ mod tests {
         let mut reader = CsvReader::from_reader(out.as_bytes(), read_config);
         reader.schema().unwrap();
         let back = reader.next_record().unwrap().unwrap();
-        assert_eq!(back.get("tags"), Some(&Value::Array(original)));
+        assert_eq!(
+            back.get("tags"),
+            Some(&Value::Array(OwnedValues::from_vec(original)))
+        );
     }
 
     /// A single empty-string value `[""]` is indistinguishable from an empty
@@ -1196,7 +1227,7 @@ mod tests {
             &schema,
             vec![
                 Value::Integer(1),
-                Value::Array(vec![Value::String("".into())]),
+                Value::Array(OwnedValues::from_vec(vec![Value::String("".into())])),
             ],
         );
         // Delimited (default error): empty cell, reads back as [] (0 values).
@@ -1225,8 +1256,11 @@ mod tests {
     /// silently joined the way a record cell is.
     #[test]
     fn envelope_section_cell_rejects_an_array() {
-        let err = value_to_csv_cell("checksum", &Value::Array(vec![Value::String("a".into())]))
-            .unwrap_err();
+        let err = value_to_csv_cell(
+            "checksum",
+            &Value::Array(OwnedValues::from_vec(vec![Value::String("a".into())])),
+        )
+        .unwrap_err();
         match err {
             FormatError::UnserializableArrayValue { format, column } => {
                 assert_eq!(format, "CSV");
@@ -1244,13 +1278,13 @@ mod tests {
         let schema = make_schema(&["tags"]);
         let record = make_record(
             &schema,
-            vec![Value::Array(vec![
+            vec![Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
-                Value::Array(vec![Value::String("nested".into())]),
-            ])],
+                Value::Array(OwnedValues::from_vec(vec![Value::String("nested".into())])),
+            ]))],
         );
         let mut buf = Vec::new();
-        let mut writer = CsvWriter::new(&mut buf, Arc::clone(&schema), CsvWriterConfig::default());
+        let mut writer = CsvWriter::new(&mut buf, schema.clone(), CsvWriterConfig::default());
         match writer.write_record(&record).unwrap_err() {
             FormatError::UnserializableArrayValue { column, .. } => assert_eq!(column, "tags"),
             other => panic!("expected UnserializableArrayValue for nested element, got {other:?}"),
@@ -1277,7 +1311,7 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         {
-            let mut writer = CsvWriter::new(&mut buf, Arc::clone(&schema), config);
+            let mut writer = CsvWriter::new(&mut buf, schema.clone(), config);
             writer.begin_document(&doc).unwrap();
             writer
                 .write_record(&make_record(&schema, vec![Value::Integer(10)]))
@@ -1314,10 +1348,9 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         {
-            let inner = CsvWriter::new(&mut buf, Arc::clone(&schema), config);
+            let inner = CsvWriter::new(&mut buf, schema.clone(), config);
             let shared_header = Arc::new(Mutex::new(None));
-            let mut writer =
-                HeaderCapturingCsvWriter::new(inner, Arc::clone(&schema), shared_header);
+            let mut writer = HeaderCapturingCsvWriter::new(inner, schema.clone(), shared_header);
             writer.begin_document(&doc).unwrap();
             writer
                 .write_record(&make_record(&schema, vec![Value::Integer(10)]))
@@ -1341,7 +1374,7 @@ mod tests {
         {
             let mut writer = CsvWriter::new(
                 &mut buf,
-                Arc::clone(&schema),
+                schema.clone(),
                 CsvWriterConfig {
                     include_header: false,
                     ..Default::default()
@@ -1370,7 +1403,7 @@ mod tests {
             ..Default::default()
         };
         let mut buf = Vec::new();
-        let mut writer = CsvWriter::new(&mut buf, Arc::clone(&writer_schema), config);
+        let mut writer = CsvWriter::new(&mut buf, writer_schema.clone(), config);
         // Record carries a `region` column the pinned schema lacks.
         let drift_schema = make_schema(&["amount", "region"]);
         let record = make_record(
@@ -1404,7 +1437,7 @@ mod tests {
         };
         let doc = doc_with_sections(&[("Head", &[("batch_id", Value::String("A".into()))])]);
         let mut buf = Vec::new();
-        let mut writer = CsvWriter::new(&mut buf, Arc::clone(&writer_schema), config);
+        let mut writer = CsvWriter::new(&mut buf, writer_schema.clone(), config);
         writer.begin_document(&doc).unwrap();
         let drift_schema = make_schema(&["amount", "region"]);
         let record = make_record(

@@ -43,6 +43,7 @@
 //! rule A is not re-observed by rule B; conflicting writes are detected and
 //! the whole group is rolled back rather than silently order-dependent.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -317,7 +318,7 @@ fn run_reshape_grouped(
     node_idx: NodeIndex,
     name: &str,
     config: &ReshapeBody,
-    output_schema: &Arc<Schema>,
+    output_schema: &SharedStorage<Schema>,
     compiled_rules: &[CompiledReshapeRule],
     input: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     input_puncts: Vec<crate::executor::stream_event::Punctuation>,
@@ -353,7 +354,7 @@ fn run_reshape_grouped(
     let budget = Arc::clone(&ctx.memory_budget);
     let spill_root = Arc::clone(&ctx.spill_root_path);
 
-    let mut buffer = ReshapeGroupBuffer::new(Arc::clone(&input_schema), spill_compress);
+    let mut buffer = ReshapeGroupBuffer::new(input_schema.clone(), spill_compress);
     for (record, row_num) in input {
         let key = partition_key(&record, &config.partition_by);
         buffer.push(key, record, row_num);
@@ -476,7 +477,7 @@ impl ReshapeGroupState {
 /// arrival order — and the kernel runs unchanged.
 struct ReshapeGroupBuffer {
     /// Input schema every spill file stores and reloads against.
-    input_schema: Arc<Schema>,
+    input_schema: SharedStorage<Schema>,
     /// Whether spill files are LZ4-framed. Resolved once against the
     /// output-schema width so the on-disk format matches `--explain`.
     compress: bool,
@@ -494,7 +495,7 @@ struct ReshapeGroupBuffer {
 }
 
 impl ReshapeGroupBuffer {
-    fn new(input_schema: Arc<Schema>, compress: bool) -> Self {
+    fn new(input_schema: SharedStorage<Schema>, compress: bool) -> Self {
         Self {
             input_schema,
             compress,
@@ -819,12 +820,12 @@ fn write_spill_slice<'a>(
     node_name: &str,
     budget: &MemoryArbitrator,
     spill_root: &std::path::Path,
-    input_schema: &Arc<Schema>,
+    input_schema: &SharedStorage<Schema>,
     compress: bool,
     records: impl Iterator<Item = &'a BufferedRecord>,
 ) -> Result<SpillFile<ReshapeSpillPayload>, PipelineError> {
     let mut writer: SpillWriter<ReshapeSpillPayload> =
-        SpillWriter::new(Arc::clone(input_schema), Some(spill_root), compress)
+        SpillWriter::new(input_schema.clone(), Some(spill_root), compress)
             .map_err(|e| reshape_spill_error(node_name, e))?;
     for buffered in records {
         writer
@@ -883,7 +884,7 @@ fn process_group(
     ctx: &mut ExecutorContext<'_>,
     node_name: &str,
     rules: &mut [CompiledRule],
-    output_schema: &Arc<clinker_record::Schema>,
+    output_schema: &SharedStorage<clinker_record::Schema>,
     group: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     out: &mut Vec<(Record, crate::executor::stream_event::SourceRowId)>,
 ) -> Result<(), PipelineError> {
@@ -959,7 +960,7 @@ fn process_group(
                     // `copy_from: none` rule overrides every user column, so
                     // no `Null` survives below.
                     CopyFrom::None => Record::new(
-                        Arc::clone(output_schema),
+                        output_schema.clone(),
                         vec![Value::Null; output_schema.column_count()],
                     ),
                 };
@@ -1135,12 +1136,12 @@ fn sort_group(
 
 /// Re-key a record onto the (audit-widened) output schema, carrying every
 /// matching column value through and defaulting new columns to null.
-fn clone_into_schema(record: &Record, schema: &Arc<clinker_record::Schema>) -> Record {
+fn clone_into_schema(record: &Record, schema: &SharedStorage<clinker_record::Schema>) -> Record {
     let mut values = Vec::with_capacity(schema.column_count());
     for col in schema.columns() {
         values.push(record.get(col.as_ref()).cloned().unwrap_or(Value::Null));
     }
-    Record::new(Arc::clone(schema), values)
+    Record::new(schema.clone(), values)
 }
 
 /// Write the three `$meta.*` audit columns onto a row.
@@ -1184,15 +1185,15 @@ mod tests {
     use clinker_plan::BudgetCategory;
     use clinker_plan::plan::{EntityRef, PlanNodeId};
 
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec!["gid".into(), "payload".into()]))
+    fn schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["gid".into(), "payload".into()])))
     }
 
     /// One record carrying a `gid` group key and a fixed-width `payload`
     /// string, so each record has a predictable, non-trivial heap footprint.
-    fn rec(schema: &Arc<Schema>, gid: &str, payload: &str) -> Record {
+    fn rec(schema: &SharedStorage<Schema>, gid: &str, payload: &str) -> Record {
         Record::new(
-            Arc::clone(schema),
+            schema.clone(),
             vec![Value::String(gid.into()), Value::String(payload.into())],
         )
     }
@@ -1229,13 +1230,13 @@ mod tests {
     /// footprint exceeds the arbitrator's soft limit — the same admit-then-
     /// spill cadence the dispatch loop runs. Returns the populated buffer.
     fn fill_single_group(
-        schema: &Arc<Schema>,
+        schema: &SharedStorage<Schema>,
         arb: &MemoryArbitrator,
         spill_root: &std::path::Path,
         n: u64,
     ) -> ReshapeGroupBuffer {
         let handle = ConsumerHandle::new();
-        let mut buffer = ReshapeGroupBuffer::new(Arc::clone(schema), true);
+        let mut buffer = ReshapeGroupBuffer::new(schema.clone(), true);
         for row_num in 0..n {
             let payload = format!("{row_num:063}");
             buffer.push(
@@ -1290,7 +1291,7 @@ mod tests {
         let spill_root = tempfile::tempdir().unwrap();
         // 20 small groups, each one ~80-byte record. Soft limit sized to hold
         // roughly half of them resident.
-        let mut buffer = ReshapeGroupBuffer::new(Arc::clone(&schema), true);
+        let mut buffer = ReshapeGroupBuffer::new(schema.clone(), true);
         for g in 0..20u64 {
             let payload = format!("{g:063}");
             buffer.push(
@@ -1432,7 +1433,7 @@ mod tests {
     #[test]
     fn a_whole_input_group_names_itself_and_offers_no_key_to_narrow() {
         let schema = schema();
-        let mut buffer = ReshapeGroupBuffer::new(Arc::clone(&schema), true);
+        let mut buffer = ReshapeGroupBuffer::new(schema.clone(), true);
         // Every record keys to the empty tuple, so all 8 land in one group.
         for row_num in 0..8u64 {
             let payload = format!("{row_num:063}");
@@ -1502,7 +1503,7 @@ mod tests {
             "a blank partition value must key to the null group for this test to be meaningful"
         );
 
-        let mut buffer = ReshapeGroupBuffer::new(Arc::clone(&schema), true);
+        let mut buffer = ReshapeGroupBuffer::new(schema.clone(), true);
         for row_num in 0..64u64 {
             let payload = format!("{row_num:063}");
             buffer.push(key.clone(), rec(&schema, "", &payload), source_row(row_num));
@@ -1553,7 +1554,7 @@ mod tests {
         let arb = arbitrator(512);
         arb.set_max_spill_bytes(1).unwrap();
         let handle = ConsumerHandle::new();
-        let mut buffer = ReshapeGroupBuffer::new(Arc::clone(&schema), true);
+        let mut buffer = ReshapeGroupBuffer::new(schema.clone(), true);
         // One group, ~5 KiB resident against a 512 B soft limit, so the
         // spill loop must evict — and the first flush already exceeds the
         // one-byte disk cap.

@@ -1419,7 +1419,7 @@ impl ExecutionPlanDag {
     /// on-disk spill file agree on the column count the `auto` heuristic
     /// weighs. Hash Aggregate and grace-hash / sort-merge Combine carry a
     /// stored output schema, so `output_schema_in` returns it directly — the
-    /// same `Arc<Schema>` their runtime dispatch arms resolve compression
+    /// same `SharedStorage<Schema>` their runtime dispatch arms resolve compression
     /// against.
     fn spill_decision_column_count(&self, idx: NodeIndex) -> usize {
         self.graph[idx].output_schema_in(self).column_count()
@@ -2623,7 +2623,9 @@ mod spill_projection_tests {
             max_output_rows: None,
             propagate_ck: crate::config::pipeline_node::PropagateCkSpec::Driver,
             decomposed_from: None,
-            output_schema: Arc::new(clinker_record::Schema::new(Vec::new())),
+            output_schema: SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(
+                Vec::new(),
+            ))),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
             typed: None,
             combine_inputs: None,
@@ -2646,14 +2648,17 @@ mod spill_projection_tests {
     /// downstream node's runtime input-record width equals this column count.
     fn source_node(name: &str, id: usize, column_names: &[&str]) -> PlanNode {
         let schema = clinker_record::Schema::new(
-            column_names.iter().map(|c| Box::<str>::from(*c)).collect(),
+            column_names
+                .iter()
+                .map(|c| clinker_record::owned_storage::OwnedKey::from(*c))
+                .collect(),
         );
         PlanNode::Source {
             name: name.to_string(),
             id: PlanNodeId::new(id),
             span: Span::SYNTHETIC,
             resolved: None,
-            output_schema: Arc::new(schema),
+            output_schema: SharedStorage::from_arc(Arc::new(schema)),
         }
     }
 

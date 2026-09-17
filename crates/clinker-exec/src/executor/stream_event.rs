@@ -6,7 +6,7 @@
 //! - [`StreamEvent::Record`] — a record paired with its exact
 //!   [`SourceRowId`] for the current execution attempt.
 //! - [`StreamEvent::Punctuation`] — a document-boundary signal carrying
-//!   the `Arc<DocumentContext>` whose boundary is being marked.
+//!   the `SharedStorage<DocumentContext>` whose boundary is being marked.
 //!
 //! Source ingest emits one `DocumentOpen` punctuation before the first
 //! body record of each source file and one `DocumentClose` after the
@@ -22,6 +22,7 @@
 //! `SignalTo`, Logstash atomic boolean) are the FLINK-4329 failure
 //! mode and explicitly rejected.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -189,7 +190,7 @@ pub struct StructuralReject {
 
 /// Document-boundary punctuation on the executor's record stream.
 ///
-/// Carries an `Arc<DocumentContext>` so operators reading the event can
+/// Carries a `SharedStorage<DocumentContext>` so operators reading the event can
 /// (a) identify which document is opening/closing via `doc_ctx.id()`
 /// and (b) access the document's envelope sections at the boundary
 /// (e.g. trailer-validation operators reading `$doc.<section>.<field>`
@@ -206,14 +207,14 @@ pub struct StructuralReject {
 /// boundary).
 #[derive(Debug, Clone)]
 pub struct Punctuation {
-    doc_ctx: Arc<DocumentContext>,
+    doc_ctx: SharedStorage<DocumentContext>,
     kind: PunctuationKind,
     structural_reject: Option<Box<StructuralReject>>,
 }
 
 impl Punctuation {
     /// Construct a punctuation for a given document context and kind.
-    pub fn new(doc_ctx: Arc<DocumentContext>, kind: PunctuationKind) -> Self {
+    pub fn new(doc_ctx: SharedStorage<DocumentContext>, kind: PunctuationKind) -> Self {
         Self {
             doc_ctx,
             kind,
@@ -222,12 +223,12 @@ impl Punctuation {
     }
 
     /// Convenience: build a `DocumentOpen` punctuation.
-    pub fn document_open(doc_ctx: Arc<DocumentContext>) -> Self {
+    pub fn document_open(doc_ctx: SharedStorage<DocumentContext>) -> Self {
         Self::new(doc_ctx, PunctuationKind::DocumentOpen)
     }
 
     /// Convenience: build a `DocumentClose` punctuation.
-    pub fn document_close(doc_ctx: Arc<DocumentContext>) -> Self {
+    pub fn document_close(doc_ctx: SharedStorage<DocumentContext>) -> Self {
         Self::new(doc_ctx, PunctuationKind::DocumentClose)
     }
 
@@ -237,7 +238,7 @@ impl Punctuation {
     /// via the document-DLQ reject seam before forwarding the close
     /// downstream.
     pub fn structural_reject_close(
-        doc_ctx: Arc<DocumentContext>,
+        doc_ctx: SharedStorage<DocumentContext>,
         reject: StructuralReject,
     ) -> Self {
         Self {
@@ -277,7 +278,7 @@ impl Punctuation {
     /// The document context this punctuation marks. The Envelope node's
     /// header/footer synthesis reads it to match a boundary to the rebuilt
     /// per-grain context after stamping synthesized sections.
-    pub(crate) fn doc_ctx(&self) -> &Arc<DocumentContext> {
+    pub(crate) fn doc_ctx(&self) -> &SharedStorage<DocumentContext> {
         &self.doc_ctx
     }
 
@@ -286,7 +287,7 @@ impl Punctuation {
     /// synthesis step to re-stamp a boundary onto the context carrying the
     /// freshly synthesized header/footer sections, keeping the stream
     /// internally consistent for any non-Output downstream consumer.
-    pub(crate) fn with_doc_ctx(self, doc_ctx: Arc<DocumentContext>) -> Self {
+    pub(crate) fn with_doc_ctx(self, doc_ctx: SharedStorage<DocumentContext>) -> Self {
         Self { doc_ctx, ..self }
     }
 }
@@ -402,17 +403,17 @@ mod tests {
     use super::*;
     use clinker_record::{DocumentContext, Schema, Value, synthetic_document_context};
 
-    fn doc_ctx() -> Arc<DocumentContext> {
-        Arc::new(DocumentContext::new(
+    fn doc_ctx() -> SharedStorage<DocumentContext> {
+        SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("doc.x12"),
             clinker_record::EnvelopeRecord::empty(),
-        ))
+        )))
     }
 
     fn rec(id: i64) -> Record {
         Record::new(
-            Arc::new(Schema::new(vec!["id".into()])),
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into()]))),
             vec![Value::Integer(id)],
         )
     }
@@ -434,7 +435,7 @@ mod tests {
         // The dominant boundary path leaves the structural-reject payload
         // empty, so a structural-validation check on any close is a cheap None.
         let ctx = doc_ctx();
-        let close = Punctuation::document_close(Arc::clone(&ctx));
+        let close = Punctuation::document_close(ctx.clone());
         assert!(close.structural_reject().is_none());
         let open = Punctuation::document_open(ctx);
         assert!(open.structural_reject().is_none());
@@ -452,7 +453,7 @@ mod tests {
             row_num: SourceRowId::from(42),
             message: "SE segment count mismatch".to_string(),
         };
-        let close = Punctuation::structural_reject_close(Arc::clone(&ctx), reject);
+        let close = Punctuation::structural_reject_close(ctx.clone(), reject);
         assert_eq!(close.kind(), PunctuationKind::DocumentClose);
         let payload = close
             .structural_reject()
@@ -465,7 +466,7 @@ mod tests {
     #[test]
     fn punctuation_event_carries_doc_id_and_kind() {
         let ctx = synthetic_document_context();
-        let ev = StreamEvent::punctuation(Punctuation::document_open(Arc::clone(&ctx)));
+        let ev = StreamEvent::punctuation(Punctuation::document_open(ctx.clone()));
         assert!(!ev.is_record());
         let p = match ev {
             StreamEvent::Punctuation(p) => p,
@@ -491,10 +492,10 @@ mod tests {
         let ctx = doc_ctx();
         let id = ctx.id();
         let union = vec![
-            Punctuation::document_open(Arc::clone(&ctx)),
-            Punctuation::document_open(Arc::clone(&ctx)),
-            Punctuation::document_close(Arc::clone(&ctx)),
-            Punctuation::document_close(Arc::clone(&ctx)),
+            Punctuation::document_open(ctx.clone()),
+            Punctuation::document_open(ctx.clone()),
+            Punctuation::document_close(ctx.clone()),
+            Punctuation::document_close(ctx.clone()),
         ];
         let out = reconcile_document_boundaries(union);
         assert_eq!(
@@ -520,10 +521,10 @@ mod tests {
         let ctx = doc_ctx();
         let id = ctx.id();
         let union = vec![
-            Punctuation::document_open(Arc::clone(&ctx)),
-            Punctuation::document_close(Arc::clone(&ctx)),
-            Punctuation::document_open(Arc::clone(&ctx)),
-            Punctuation::document_close(Arc::clone(&ctx)),
+            Punctuation::document_open(ctx.clone()),
+            Punctuation::document_close(ctx.clone()),
+            Punctuation::document_open(ctx.clone()),
+            Punctuation::document_close(ctx.clone()),
         ];
         let out = reconcile_document_boundaries(union);
         assert_eq!(
@@ -546,8 +547,8 @@ mod tests {
         let ctx = doc_ctx();
         let id = ctx.id();
         let union = vec![
-            Punctuation::document_open(Arc::clone(&ctx)),
-            Punctuation::document_close(Arc::clone(&ctx)),
+            Punctuation::document_open(ctx.clone()),
+            Punctuation::document_close(ctx.clone()),
         ];
         let out = reconcile_document_boundaries(union);
         assert_eq!(
@@ -566,10 +567,10 @@ mod tests {
         let driver = doc_ctx();
         let build = doc_ctx();
         let union = vec![
-            Punctuation::document_open(Arc::clone(&driver)),
-            Punctuation::document_close(Arc::clone(&driver)),
-            Punctuation::document_open(Arc::clone(&build)),
-            Punctuation::document_close(Arc::clone(&build)),
+            Punctuation::document_open(driver.clone()),
+            Punctuation::document_close(driver.clone()),
+            Punctuation::document_open(build.clone()),
+            Punctuation::document_close(build.clone()),
         ];
         let out = reconcile_document_boundaries(union);
         assert_eq!(
@@ -597,9 +598,9 @@ mod tests {
         let ctx = doc_ctx();
         let id = ctx.id();
         let union = vec![
-            Punctuation::document_open(Arc::clone(&ctx)),
-            Punctuation::document_close(Arc::clone(&ctx)),
-            Punctuation::document_close(Arc::clone(&ctx)),
+            Punctuation::document_open(ctx.clone()),
+            Punctuation::document_close(ctx.clone()),
+            Punctuation::document_close(ctx.clone()),
         ];
         let out = reconcile_document_boundaries(union);
         assert_eq!(
@@ -620,11 +621,11 @@ mod tests {
         let spanning = doc_ctx();
         let unterminated = doc_ctx();
         let union = vec![
-            Punctuation::document_open(Arc::clone(&spanning)),
-            Punctuation::document_open(Arc::clone(&unterminated)),
-            Punctuation::document_open(Arc::clone(&spanning)),
-            Punctuation::document_close(Arc::clone(&spanning)),
-            Punctuation::document_close(Arc::clone(&spanning)),
+            Punctuation::document_open(spanning.clone()),
+            Punctuation::document_open(unterminated.clone()),
+            Punctuation::document_open(spanning.clone()),
+            Punctuation::document_close(spanning.clone()),
+            Punctuation::document_close(spanning.clone()),
         ];
         let out = reconcile_document_boundaries(union);
         assert_eq!(

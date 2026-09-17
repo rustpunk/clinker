@@ -21,6 +21,8 @@
 //! (fields exist but have no value, rather than the field being absent
 //! from the row).
 
+#[cfg(test)]
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -39,7 +41,7 @@ use clinker_plan::plan::types::JoinSide;
 /// - `qualified`: every `QualifiedField` the body reads maps to
 ///   `(side, column-index)` — the side tells the resolver which
 ///   record to reach into; the `u32` is the positional index on that
-///   side's `Arc<Schema>`. Probe-time resolution is therefore a
+///   side's `SharedStorage<Schema>`. Probe-time resolution is therefore a
 ///   direct `Vec<Value>` index read.
 /// - `bare_to_side`: unambiguous bare field name → `(side, index)`.
 ///   Bare CXL references (e.g. `product_id`) resolve through this
@@ -56,7 +58,7 @@ use clinker_plan::plan::types::JoinSide;
 /// silent side-preference choice.
 pub(crate) struct CombineResolverMapping {
     /// `(qualifier, name)` → `(side, column-index)` on that side's
-    /// `Arc<Schema>`.
+    /// `SharedStorage<Schema>`.
     qualified: HashMap<QualifiedField, (JoinSide, u32)>,
     /// Unambiguous bare name → `(side, column-index)`. Absent when the
     /// name appears on 2+ inputs.
@@ -229,16 +231,13 @@ mod tests {
     use cxl::typecheck::Type;
     use indexmap::IndexMap;
 
-    fn make_schema(fields: &[&str]) -> Arc<Schema> {
-        Arc::new(Schema::new(
-            fields
-                .iter()
-                .map(|f| (*f).to_string().into_boxed_str())
-                .collect(),
-        ))
+    fn make_schema(fields: &[&str]) -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(
+            fields.iter().map(|f| (*f).into()).collect(),
+        )))
     }
 
-    fn make_record(schema: &Arc<Schema>, values: Vec<Value>) -> Record {
+    fn make_record(schema: &SharedStorage<Schema>, values: Vec<Value>) -> Record {
         Record::new(schema.clone(), values)
     }
 

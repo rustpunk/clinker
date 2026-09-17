@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::process;
 
 use clap::{Parser, Subcommand};
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues};
 use clinker_record::{RecordStorage, Value};
 
 /// Dummy storage for no-window evaluation.
@@ -514,13 +515,15 @@ fn json_to_value(v: serde_json::Value) -> Value {
             }
         }
         serde_json::Value::String(s) => Value::String(s.into()),
-        serde_json::Value::Array(arr) => Value::Array(arr.into_iter().map(json_to_value).collect()),
+        serde_json::Value::Array(arr) => Value::Array(OwnedValues::from_vec(
+            arr.into_iter().map(json_to_value).collect(),
+        )),
         serde_json::Value::Object(map) => {
             let mut out = indexmap::IndexMap::with_capacity(map.len());
             for (key, value) in map {
-                out.insert(key.into_boxed_str(), json_to_value(value));
+                out.insert(OwnedKey::from(key), json_to_value(value));
             }
-            Value::Map(Box::new(out))
+            Value::Map(OwnedMap::from_map(out))
         }
     }
 }

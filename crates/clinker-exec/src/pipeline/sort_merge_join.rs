@@ -49,6 +49,7 @@ use std::sync::Arc;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use serde::{Serialize, de::DeserializeOwned};
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
 use clinker_record::{Record, Schema, Value};
 use cxl::ast::Expr;
 use cxl::eval::{EvalContext, EvalError, EvalResult, ProgramEvaluator, SkipReason};
@@ -109,6 +110,7 @@ type WindowEntry = (Record, Value, u64);
 /// sink. Bundled so the window methods stay under clippy's argument cap and
 /// every spill charges disk and memory identically.
 struct MergeSpill<'a> {
+    allocation_resources: &'a clinker_record::owned_storage::AllocationResources,
     name: &'a str,
     spill_dir: &'a Path,
     spill_compress: bool,
@@ -171,7 +173,8 @@ struct MatchWindow {
     /// Live in-memory bytes charged into the consumer handle: the resident
     /// segments' undropped entries plus the tail.
     charged: u64,
-    schema: Option<Arc<Schema>>,
+    physical_bytes: u64,
+    schema: Option<SharedStorage<Schema>>,
     /// Seal the tail into a segment once it reaches this many bytes.
     seg_target: usize,
     /// Spill sealed segments once resident content would exceed this.
@@ -192,6 +195,7 @@ impl MatchWindow {
             tail: Vec::new(),
             tail_bytes: 0,
             charged: 0,
+            physical_bytes: 0,
             schema: None,
             seg_target,
             byte_limit,
@@ -206,6 +210,16 @@ impl MatchWindow {
             + std::mem::size_of::<u64>()
     }
 
+    fn unaccounted_entry_bytes(
+        entry: &WindowEntry,
+        resources: &clinker_record::owned_storage::AllocationResources,
+    ) -> usize {
+        std::mem::size_of::<Record>()
+            + entry.0.unaccounted_heap_size(resources)
+            + std::mem::size_of::<Value>()
+            + std::mem::size_of::<u64>()
+    }
+
     /// Append one matching build row, charging its in-memory growth into the
     /// consumer handle. Seals the tail past `seg_target`; when resident content
     /// would exceed `byte_limit`, spills the most-recently-sealed resident
@@ -213,11 +227,13 @@ impl MatchWindow {
     /// aborting with `SpillCapExceeded` on overflow.
     fn push_back(&mut self, entry: WindowEntry, ctx: &MergeSpill<'_>) -> Result<(), PipelineError> {
         if self.schema.is_none() {
-            self.schema = Some(Arc::clone(entry.0.schema()));
+            self.schema = Some(entry.0.schema().clone());
         }
-        let bytes = Self::entry_bytes(&entry) as u64;
+        let physical = Self::entry_bytes(&entry) as u64;
+        let bytes = Self::unaccounted_entry_bytes(&entry, ctx.allocation_resources) as u64;
         self.tail.push(entry);
-        self.tail_bytes += bytes as usize;
+        self.tail_bytes += physical as usize;
+        self.physical_bytes += physical;
         self.charged += bytes;
         ctx.consumer.add_bytes(bytes);
 
@@ -226,7 +242,7 @@ impl MatchWindow {
             self.tail_bytes = 0;
             self.segments.push_back(WindowSegment::Resident(sealed));
         }
-        while self.charged > self.byte_limit as u64 {
+        while self.physical_bytes > self.byte_limit as u64 {
             if !self.spill_one_resident(ctx)? {
                 break;
             }
@@ -280,7 +296,12 @@ impl MatchWindow {
         let (file, written) = writer
             .finish_with_bytes()
             .map_err(|e| spill_io_error(ctx.name, "match-window spill finish failed", e))?;
-        let live_bytes: u64 = live.iter().map(|e| Self::entry_bytes(e) as u64).sum();
+        let physical: u64 = live.iter().map(|e| Self::entry_bytes(e) as u64).sum();
+        let live_bytes: u64 = live
+            .iter()
+            .map(|e| Self::unaccounted_entry_bytes(e, ctx.allocation_resources) as u64)
+            .sum();
+        self.physical_bytes -= physical;
         self.segments[idx] = WindowSegment::Spilled(file);
         if is_head {
             self.head_off = 0;
@@ -313,13 +334,16 @@ impl MatchWindow {
             .map_err(|e| spill_io_error(ctx.name, "match-window replay open failed", e))?;
         let mut v: Vec<WindowEntry> = Vec::new();
         let mut bytes: u64 = 0;
+        let mut physical: u64 = 0;
         for item in reader {
             let (record, (key, build_idx)) =
                 item.map_err(|e| spill_io_error(ctx.name, "match-window replay decode failed", e))?;
             let entry = (record, key, build_idx);
-            bytes += Self::entry_bytes(&entry) as u64;
+            physical += Self::entry_bytes(&entry) as u64;
+            bytes += Self::unaccounted_entry_bytes(&entry, ctx.allocation_resources) as u64;
             v.push(entry);
         }
+        self.physical_bytes += physical;
         self.charged += bytes;
         ctx.consumer.add_bytes(bytes);
         self.segments.push_front(WindowSegment::Resident(v));
@@ -350,6 +374,7 @@ impl MatchWindow {
             self.decode_head_to_resident(ctx)?;
             let mut head_off = self.head_off;
             let mut dropped_bytes: u64 = 0;
+            let mut dropped_physical: u64 = 0;
             let seg_len;
             {
                 let WindowSegment::Resident(v) = self.segments.front().unwrap() else {
@@ -357,11 +382,15 @@ impl MatchWindow {
                 };
                 seg_len = v.len();
                 while head_off < v.len() && should_drop(&v[head_off].1) {
-                    dropped_bytes += Self::entry_bytes(&v[head_off]) as u64;
+                    dropped_physical += Self::entry_bytes(&v[head_off]) as u64;
+                    dropped_bytes +=
+                        Self::unaccounted_entry_bytes(&v[head_off], ctx.allocation_resources)
+                            as u64;
                     head_off += 1;
                 }
             }
             self.head_off = head_off;
+            self.physical_bytes -= dropped_physical;
             self.charged -= dropped_bytes;
             ctx.consumer.sub_bytes(dropped_bytes);
             if head_off >= seg_len {
@@ -573,6 +602,7 @@ fn apply_op(left: &Value, op: RangeOp, right: &Value) -> bool {
 /// Inputs to [`execute_combine_sort_merge`]. Bundled so the function
 /// signature stays under clippy's `too_many_arguments` cap.
 pub(crate) struct SortMergeExec<'a> {
+    pub(crate) allocation_resources: &'a clinker_record::owned_storage::AllocationResources,
     pub name: &'a str,
     pub build_qualifier: &'a str,
     pub driver_records: Vec<(Record, RecordOrder)>,
@@ -580,7 +610,7 @@ pub(crate) struct SortMergeExec<'a> {
     pub decomposed: &'a DecomposedPredicate,
     pub body_program: Option<&'a Arc<TypedProgram>>,
     pub resolver_mapping: &'a CombineResolverMapping,
-    pub output_schema: Option<&'a Arc<Schema>>,
+    pub output_schema: Option<&'a SharedStorage<Schema>>,
     pub match_mode: MatchMode,
     pub on_miss: OnMiss,
     /// Opt-in per-combine output-row cap (E325); `None` is unlimited. Enforced at
@@ -707,7 +737,22 @@ pub(crate) struct SortMergeOutput {
 fn execute_combine_sort_merge_with_stats(
     args: SortMergeExec<'_>,
 ) -> Result<(SortMergeOutput, SortMergeStats), PipelineError> {
+    // This kernel is the sole byte writer for its operator-private handle.
+    // Restore only its prior attribution after error-owned locals have dropped.
+    let consumer = args.consumer_handle.clone();
+    let baseline = consumer.bytes();
+    let result = execute_combine_sort_merge_inner(args);
+    if result.is_err() {
+        consumer.set_bytes(baseline);
+    }
+    result
+}
+
+fn execute_combine_sort_merge_inner(
+    args: SortMergeExec<'_>,
+) -> Result<(SortMergeOutput, SortMergeStats), PipelineError> {
     let SortMergeExec {
+        allocation_resources,
         name,
         build_qualifier,
         driver_records,
@@ -842,8 +887,8 @@ fn execute_combine_sort_merge_with_stats(
     // `driver_records`; it backs the output sort's spill header. Spilling output
     // only happens on high-fan-out combines, which always carry an output
     // schema, so the fallback backs only the never-spilling small cases.
-    let driver_schema_hint: Option<Arc<Schema>> =
-        driver_records.first().map(|(r, _)| Arc::clone(r.schema()));
+    let driver_schema_hint: Option<SharedStorage<Schema>> =
+        driver_records.first().map(|(r, _)| r.schema().clone());
 
     // Range-key extraction runs the compiled CXL range closures per record — the
     // costly part of Phase A — in parallel across the shared kernel pool. Each
@@ -918,6 +963,7 @@ fn execute_combine_sort_merge_with_stats(
     //    `byte_limit`, and the output spills past its own threshold. The
     //    pre-sorted path only avoids the sort *work*.
     let (driver_stream, driver_charge) = sort_side_stream(SideStreamBuild {
+        allocation_resources,
         pairs: driver_pairs,
         name,
         range_field: &driver_field,
@@ -929,6 +975,7 @@ fn execute_combine_sort_merge_with_stats(
         side: "driver",
     })?;
     let (build_cursor, build_resident_charge) = sort_side_stream(SideStreamBuild {
+        allocation_resources,
         pairs: build_pairs,
         name,
         range_field: &build_field,
@@ -956,9 +1003,10 @@ fn execute_combine_sort_merge_with_stats(
     // for collect / on_miss rows — so the emitted order is the engine-canonical,
     // memory-limit-independent order regardless of the merge's emit sequence, and
     // the output axis spills rather than holding every matched row in RAM.
-    let output_row_schema: Arc<Schema> = match output_schema {
-        Some(s) => Arc::clone(s),
-        None => driver_schema_hint.unwrap_or_else(|| Arc::new(Schema::new(Vec::new()))),
+    let output_row_schema: SharedStorage<Schema> = match output_schema {
+        Some(s) => s.clone(),
+        None => driver_schema_hint
+            .unwrap_or_else(|| SharedStorage::from_arc(Arc::new(Schema::new(Vec::new())))),
     };
     let sort_threshold = spill_threshold_bytes(budget);
     let mut output_buf: SortBuffer<(RecordOrder, u64, u64)> = SortBuffer::new_payload_ordered(
@@ -966,6 +1014,7 @@ fn execute_combine_sort_merge_with_stats(
         Some(spill_dir.to_path_buf()),
         spill_compress,
         output_row_schema,
+        allocation_resources.clone(),
     );
     // Parallel `(order, driver_idx, build_idx)` sort key per deferred output-eval
     // failure, so the dead-letter rows re-order into the same layout-independent
@@ -983,6 +1032,7 @@ fn execute_combine_sort_merge_with_stats(
         strategy,
     };
     let mspill = MergeSpill {
+        allocation_resources,
         name,
         spill_dir,
         spill_compress,
@@ -1037,7 +1087,9 @@ fn execute_combine_sort_merge_with_stats(
                             // Ownership of this build's bytes moves from the
                             // resident cursor to the window (or is freed on a
                             // non-match); discharge the cursor's share here.
-                            let b_bytes = MatchWindow::entry_bytes(&b) as u64;
+                            let b_bytes =
+                                MatchWindow::unaccounted_entry_bytes(&b, allocation_resources)
+                                    as u64;
                             consumer_handle.sub_bytes(b_bytes);
                             build_charge = build_charge.saturating_sub(b_bytes);
                         }
@@ -1131,13 +1183,15 @@ fn execute_combine_sort_merge_with_stats(
     // the dispatcher; discharge them so the node-buffer admission never sums a
     // stale footprint. Charging the output sort during emit never aborts a
     // completing run — it self-bounds by spilling.
-    let output_sort_charged = output_buf.bytes_used() as u64;
-    let (sorted, residue) = output_buf.finish().map_err(|e| {
+    let output_sort_charged = output_buf.unaccounted_bytes_used() as u64;
+    let finish_result = output_buf.finish();
+    consumer_handle.sub_bytes(output_sort_charged);
+    let (sorted, residue) = finish_result.map_err(|e| {
         PipelineError::Io(std::io::Error::other(format!(
             "sort-merge output finish failed: {e}"
         )))
     })?;
-    consumer_handle.sub_bytes(output_sort_charged);
+
     if matches!(sorted, SortedOutput::Spilled(_)) {
         stats.output_spilled = 1;
     }
@@ -1178,6 +1232,7 @@ fn execute_combine_sort_merge_with_stats(
 /// `P` the side carries verbatim — `(RecordOrder, driver_idx)` for the driver
 /// side, `build_idx` for the build side.
 struct SideStreamBuild<'a, P> {
+    allocation_resources: &'a clinker_record::owned_storage::AllocationResources,
     /// `(record, key, payload)` tuples for the side.
     pairs: Vec<(Record, Value, P)>,
     name: &'a str,
@@ -1208,6 +1263,16 @@ fn side_entry_bytes<P>(record: &Record) -> u64 {
         + std::mem::size_of::<P>()) as u64
 }
 
+fn side_entry_unaccounted_bytes<P>(
+    record: &Record,
+    resources: &clinker_record::owned_storage::AllocationResources,
+) -> u64 {
+    (std::mem::size_of::<Record>()
+        + record.unaccounted_heap_size(resources)
+        + std::mem::size_of::<Value>()
+        + std::mem::size_of::<P>()) as u64
+}
+
 /// Sum the resident byte charge of pre-sorted `pairs` in the single pass that
 /// also verifies the caller's ascending-range-key certification. A pre-sorted
 /// walk-in-place trusts that order literally: a mis-certified (actually-
@@ -1222,8 +1287,10 @@ fn checked_presorted_charge<P>(
     pairs: &[(Record, Value, P)],
     name: &str,
     side: &'static str,
-) -> Result<u64, PipelineError> {
+    allocation_resources: &clinker_record::owned_storage::AllocationResources,
+) -> Result<(u64, u64), PipelineError> {
     let mut total: u64 = 0;
+    let mut unaccounted: u64 = 0;
     let mut prev: Option<&Value> = None;
     for (record, key, _payload) in pairs {
         if let Some(prev_key) = prev
@@ -1240,9 +1307,13 @@ fn checked_presorted_charge<P>(
             });
         }
         total = total.saturating_add(side_entry_bytes::<P>(record));
+        unaccounted = unaccounted.saturating_add(side_entry_unaccounted_bytes::<P>(
+            record,
+            allocation_resources,
+        ));
         prev = Some(key);
     }
-    Ok(total)
+    Ok((total, unaccounted))
 }
 
 /// Sort one side's `(record, key, payload)` tuples on the range key field
@@ -1276,7 +1347,23 @@ fn sort_side_stream<P>(args: SideStreamBuild<'_, P>) -> Result<(SideStream<P>, u
 where
     P: Serialize + DeserializeOwned + Send + Ord + crate::pipeline::sort_buffer::HeapBytes,
 {
+    let consumer = args.consumer_handle.clone();
+    let baseline = consumer.bytes();
+    let result = sort_side_stream_inner(args);
+    if result.is_err() {
+        consumer.set_bytes(baseline);
+    }
+    result
+}
+
+fn sort_side_stream_inner<P>(
+    args: SideStreamBuild<'_, P>,
+) -> Result<(SideStream<P>, u64), PipelineError>
+where
+    P: Serialize + DeserializeOwned + Send + Ord + crate::pipeline::sort_buffer::HeapBytes,
+{
     let SideStreamBuild {
+        allocation_resources,
         pairs,
         name,
         range_field,
@@ -1309,23 +1396,23 @@ where
                 ),
             });
         }
-        let charged = checked_presorted_charge(&pairs, name, side)?;
+        let (_, charged) = checked_presorted_charge(&pairs, name, side, allocation_resources)?;
         consumer_handle.add_bytes(charged);
         return Ok((SideStream::InMemory(pairs.into_iter()), charged));
     };
 
     if presorted {
-        let total = checked_presorted_charge(&pairs, name, side)?;
+        let (total, charged) = checked_presorted_charge(&pairs, name, side, allocation_resources)?;
         if total <= spill_threshold as u64 {
             // Fits budget: walk in place — no redundant stable sort + rebuild.
-            consumer_handle.add_bytes(total);
-            return Ok((SideStream::InMemory(pairs.into_iter()), total));
+            consumer_handle.add_bytes(charged);
+            return Ok((SideStream::InMemory(pairs.into_iter()), charged));
         }
         // Over budget: fall through to the spillable sort (stable no-op on
         // already-ascending input) so the side spills instead of holding whole.
     }
 
-    let schema = Arc::clone(pairs[0].0.schema());
+    let schema = pairs[0].0.schema().clone();
     let sort_field = clinker_plan::config::SortField {
         field: field.clone(),
         order: clinker_plan::config::SortOrder::Asc,
@@ -1339,21 +1426,24 @@ where
         Some(spill_dir.to_path_buf()),
         spill_compress,
         schema,
+        allocation_resources.clone(),
     );
 
     let mut local_charged: u64 = 0;
     for (record, _key, payload) in pairs {
-        let pre = buf.bytes_used();
+        let pre = buf.unaccounted_bytes_used();
         buf.push(record, payload);
-        let delta = (buf.bytes_used().saturating_sub(pre)) as u64;
+        let delta = (buf.unaccounted_bytes_used().saturating_sub(pre)) as u64;
         consumer_handle.add_bytes(delta);
         local_charged = local_charged.saturating_add(delta);
         if buf.should_spill() {
-            let pre_spill = buf.bytes_used() as u64;
-            let written = buf
-                .sort_and_spill()
+            let pre_spill = buf.unaccounted_bytes_used() as u64;
+            let spill_result = buf.sort_and_spill();
+            consumer_handle
+                .sub_bytes(pre_spill.saturating_sub(buf.unaccounted_bytes_used() as u64));
+            let written = spill_result
                 .map_err(|e| spill_io_error(name, &format!("{side} phase A spill failed"), e))?;
-            consumer_handle.sub_bytes(pre_spill);
+
             local_charged = local_charged.saturating_sub(pre_spill);
             if written > 0 && budget.record_spill_bytes(name, written) {
                 return Err(PipelineError::spill_cap_exceeded(
@@ -1366,8 +1456,9 @@ where
         }
     }
 
-    let (sorted, residue) = buf
-        .finish()
+    let finish_result = buf.finish();
+    consumer_handle.sub_bytes(local_charged);
+    let (sorted, residue) = finish_result
         .map_err(|e| spill_io_error(name, &format!("{side} phase A finish failed"), e))?;
     if residue > 0 && budget.record_spill_bytes(name, residue) {
         return Err(PipelineError::spill_cap_exceeded(
@@ -1380,7 +1471,7 @@ where
     // Net the transient sort-buffer charge to zero; each terminal branch below
     // then charges only what it actually holds resident (nothing, for a spilled
     // cursor whose records live on disk).
-    consumer_handle.sub_bytes(local_charged);
+
     match sorted {
         SortedOutput::InMemory(out) => {
             // Records stay resident in `v` until the walk consumes/pulls them; the
@@ -1394,7 +1485,10 @@ where
                 let key = record.get(field).cloned().unwrap_or(Value::Null);
                 v.push((record, key, payload));
             }
-            let charged: u64 = v.iter().map(|(r, _, _)| side_entry_bytes::<P>(r)).sum();
+            let charged: u64 = v
+                .iter()
+                .map(|(r, _, _)| side_entry_unaccounted_bytes::<P>(r, allocation_resources))
+                .sum();
             consumer_handle.add_bytes(charged);
             Ok((SideStream::InMemory(v.into_iter()), charged))
         }
@@ -1456,7 +1550,7 @@ fn field_name_of_range_expr(expr: &Expr) -> Option<String> {
 /// `$ck` identically.
 struct EmitCtx<'a> {
     name: &'a str,
-    output_schema: Option<&'a Arc<Schema>>,
+    output_schema: Option<&'a SharedStorage<Schema>>,
     build_qualifier: &'a str,
     propagate_ck: &'a clinker_plan::config::pipeline_node::PropagateCkSpec,
     resolver_mapping: &'a CombineResolverMapping,
@@ -1494,17 +1588,20 @@ fn push_output_row(
             cap,
         });
     }
-    let pre = output.bytes_used();
+    let pre = output.unaccounted_bytes_used();
     output.push(record, key);
     mspill
         .consumer
-        .add_bytes(output.bytes_used().saturating_sub(pre) as u64);
+        .add_bytes(output.unaccounted_bytes_used().saturating_sub(pre) as u64);
     if output.should_spill() {
-        let pre_spill = output.bytes_used() as u64;
-        let written = output
-            .sort_and_spill()
-            .map_err(|e| spill_io_error(mspill.name, "output sort spill failed", e))?;
-        mspill.consumer.sub_bytes(pre_spill);
+        let pre_spill = output.unaccounted_bytes_used() as u64;
+        let spill_result = output.sort_and_spill();
+        mspill
+            .consumer
+            .sub_bytes(pre_spill.saturating_sub(output.unaccounted_bytes_used() as u64));
+        let written =
+            spill_result.map_err(|e| spill_io_error(mspill.name, "output sort spill failed", e))?;
+
         if written > 0 && mspill.budget.record_spill_bytes(mspill.name, written) {
             return Err(PipelineError::spill_cap_exceeded(
                 mspill.name,
@@ -1576,7 +1673,10 @@ fn emit_collect_row(
     if let Some(b) = first_build {
         crate::executor::copy_build_ck_columns(&mut rec, b, ectx.propagate_ck);
     }
-    rec.set(ectx.build_qualifier, Value::Array(arr));
+    rec.set(
+        ectx.build_qualifier,
+        Value::Array(OwnedValues::from_vec(arr)),
+    );
     push_output_row(
         output,
         rec,
@@ -1815,11 +1915,11 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                 // nests inside the collect-mode `Value::Map` and reaches the
                 // writer as a nested Map, triggering
                 // `FormatError::UnserializableMapValue`.
-                let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
+                let mut m: IndexMap<OwnedKey, Value> = IndexMap::new();
                 for (fname, val) in inner.iter_user_fields() {
                     m.insert(fname.into(), val.clone());
                 }
-                arr.push(Value::Map(Box::new(m)));
+                arr.push(Value::Map(OwnedMap::from_map(m)));
             }
             if truncated {
                 eprintln!(
@@ -1965,7 +2065,7 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                             ),
                         });
                     }
-                    let rec = Record::new(Arc::clone(target_schema), values);
+                    let rec = Record::new(target_schema.clone(), values);
                     push_output_row(output, rec, out_key, mspill)?;
                     emitted_any = true;
                     if select_first {
@@ -2094,6 +2194,15 @@ impl crate::pipeline::memory::MemoryConsumer for SortMergeConsumer {
 
 #[cfg(test)]
 mod tests {
+    fn test_allocation_resources() -> clinker_record::owned_storage::AllocationResources {
+        clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024 * 1024).unwrap(),
+        )
+        .resources()
+        .allocation()
+        .clone()
+    }
+
     use super::*;
     use crate::executor::combine::CombineResolverMapping;
     use clinker_plan::plan::combine::{CombineInput, RangeConjunct, RangeKeyType};
@@ -2110,7 +2219,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    fn schema_with(cols: &[&str]) -> Arc<Schema> {
+    fn schema_with(cols: &[&str]) -> SharedStorage<Schema> {
         let mut b = SchemaBuilder::with_capacity(cols.len());
         for c in cols {
             b = b.with_field(*c);
@@ -2180,9 +2289,9 @@ mod tests {
 
     fn make_test_resolver_mapping(
         left_qual: &str,
-        left_schema: &Arc<Schema>,
+        left_schema: &SharedStorage<Schema>,
         right_qual: &str,
-        right_schema: &Arc<Schema>,
+        right_schema: &SharedStorage<Schema>,
     ) -> CombineResolverMapping {
         // Construct CombineInput entries for both sides; the resolver
         // mapping consumes `combine_inputs` plus a pre-resolved column
@@ -2247,8 +2356,8 @@ mod tests {
         CombineResolverMapping::from_pre_resolved(&pre_resolved, &combine_inputs)
     }
 
-    fn rec(schema: &Arc<Schema>, vals: Vec<Value>) -> Record {
-        Record::new(Arc::clone(schema), vals)
+    fn rec(schema: &SharedStorage<Schema>, vals: Vec<Value>) -> Record {
+        Record::new(schema.clone(), vals)
     }
 
     /// Build a DecomposedPredicate carrying one range conjunct, with
@@ -2277,8 +2386,8 @@ mod tests {
         decomposed: DecomposedPredicate,
         driver_qual: &'a str,
         build_qual: &'a str,
-        driver_schema: &'a Arc<Schema>,
-        build_schema: &'a Arc<Schema>,
+        driver_schema: &'a SharedStorage<Schema>,
+        build_schema: &'a SharedStorage<Schema>,
         match_mode: MatchMode,
         on_miss: OnMiss,
         presorted: bool,
@@ -2356,12 +2465,26 @@ mod tests {
     /// `should_abort` rather than the test process's real RSS.
     fn run_kernel_result_pinned<R>(
         rk: RunKernel<'_, R>,
-        output_schema: Option<&Arc<Schema>>,
+        output_schema: Option<&SharedStorage<Schema>>,
         pinned_consumer_bytes: Option<u64>,
     ) -> Result<(Vec<(Record, RecordOrder)>, SortMergeStats), PipelineError>
     where
         R: Into<RecordOrder>,
     {
+        run_kernel_with_resources(
+            rk,
+            output_schema,
+            pinned_consumer_bytes,
+            &test_allocation_resources(),
+        )
+    }
+
+    fn run_kernel_with_resources<R: Into<RecordOrder>>(
+        rk: RunKernel<'_, R>,
+        output_schema: Option<&SharedStorage<Schema>>,
+        pinned_consumer_bytes: Option<u64>,
+        resources: &clinker_record::owned_storage::AllocationResources,
+    ) -> Result<(Vec<(Record, RecordOrder)>, SortMergeStats), PipelineError> {
         let resolver_mapping = make_test_resolver_mapping(
             rk.driver_qual,
             rk.driver_schema,
@@ -2399,6 +2522,7 @@ mod tests {
             .map(|(record, order)| (record, order.into()))
             .collect();
         let args = SortMergeExec {
+            allocation_resources: resources,
             name: "sm_test",
             build_qualifier: rk.build_qual,
             driver_records,
@@ -3733,6 +3857,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let handle = crate::pipeline::memory::ConsumerHandle::new();
         let err = sort_side_stream(SideStreamBuild {
+            allocation_resources: &test_allocation_resources(),
             pairs,
             name: "sm",
             range_field: &Some("k".to_string()),
@@ -3782,6 +3907,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let handle = crate::pipeline::memory::ConsumerHandle::new();
         let err = sort_side_stream(SideStreamBuild {
+            allocation_resources: &test_allocation_resources(),
             pairs,
             name: "sm",
             range_field: &Some("k".to_string()),
@@ -3821,6 +3947,7 @@ mod tests {
         std::fs::remove_dir(&spill_root).unwrap();
         let handle = crate::pipeline::memory::ConsumerHandle::new();
         let err = sort_side_stream(SideStreamBuild {
+            allocation_resources: &test_allocation_resources(),
             pairs,
             name: "sm",
             range_field: &Some("k".to_string()),
@@ -4391,5 +4518,182 @@ mod tests {
                 prop_assert_eq!(actual, expected);
             }
         }
+    }
+    #[test]
+    fn match_window_keeps_physical_spill_pressure_and_attributes_decoded_rows() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        use clinker_record::{FieldStr, owned_storage::OwnedValues};
+        let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let resources = provider.resources().allocation().clone();
+        let scope = resources.scope().unwrap();
+        let text = FieldStr::try_new(&"x".repeat(8192), &scope).unwrap();
+        let alias = text.clone();
+        let schema = schema_with(&["k", "pad"]);
+        let mut values = OwnedValues::try_with_capacity(8, &scope).unwrap();
+        values.try_push(Value::Integer(1), &scope).unwrap();
+        values.try_push(Value::String(text), &scope).unwrap();
+        let record = Record::from_owned_values(schema, values).unwrap();
+        let entry = (record, Value::Integer(1), 0);
+        let physical = MatchWindow::entry_bytes(&entry) as u64;
+        let relative = MatchWindow::unaccounted_entry_bytes(&entry, &resources) as u64;
+        assert!(physical > relative);
+        let budget = crate::pipeline::memory::MemoryArbitrator::with_policy(
+            1024 * 1024,
+            0.8,
+            0.7,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        );
+        let handle = crate::pipeline::memory::ConsumerHandle::new();
+        let dir = tempfile::tempdir().unwrap();
+        let spill = MergeSpill {
+            allocation_resources: &resources,
+            name: "ownership",
+            spill_dir: dir.path(),
+            spill_compress: false,
+            budget: &budget,
+            consumer: &handle,
+            emitted_since_check: std::cell::Cell::new(0),
+            max_output_rows: None,
+        };
+        let mut window = MatchWindow::new(4096);
+        window.push_back(entry, &spill).unwrap();
+        assert!(
+            window.spilled,
+            "intrinsic ownership cannot relax the physical spill cap"
+        );
+        assert_eq!(window.charged_bytes(), 0);
+        assert_eq!(handle.bytes(), 0);
+        assert!(provider.used() > 0);
+        window.decode_head_to_resident(&spill).unwrap();
+        assert!(window.charged_bytes() > relative);
+        assert_eq!(window.charged_bytes(), window.physical_bytes);
+        assert_eq!(handle.bytes(), window.charged_bytes());
+        window.drop_front_while(|_| true, &spill).unwrap();
+        assert_eq!(window.charged_bytes(), 0);
+        assert_eq!(window.physical_bytes, 0);
+        assert_eq!(handle.bytes(), 0);
+        drop(alias);
+        assert_eq!(provider.used(), 0);
+    }
+    #[test]
+    fn governed_sort_merge_preserves_presorted_and_spilled_results_for_all_modes() {
+        use clinker_record::{FieldStr, owned_storage::OwnedValues};
+        let provider = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(4 * 1024 * 1024).unwrap(),
+        );
+        let resources = provider.resources().allocation().clone();
+        let scope = resources.scope().unwrap();
+        let driver_schema = schema_with(&["k", "pad", "b"]);
+        let build_schema = schema_with(&["k", "pad"]);
+        let typed = compile_pure_range(
+            "filter d.k >= b.k",
+            &[
+                ("d", "k", cxl::typecheck::Type::Int),
+                ("b", "k", cxl::typecheck::Type::Int),
+            ],
+        );
+        for match_mode in [MatchMode::All, MatchMode::First, MatchMode::Collect] {
+            for spilled in [false, true] {
+                let count = if spilled { 40 } else { 3 };
+                let run = |governed: bool| {
+                    let row = |schema: &SharedStorage<Schema>, k: i64| {
+                        let text = "x".repeat(1024);
+                        let text = if governed {
+                            FieldStr::try_new(&text, &scope).unwrap()
+                        } else {
+                            text.into()
+                        };
+                        let mut values = vec![Value::Integer(k), Value::String(text)];
+                        if schema.column_count() == 3 {
+                            values.push(Value::Null);
+                        }
+                        if governed {
+                            let mut owned =
+                                OwnedValues::try_with_capacity(values.len() + 8, &scope).unwrap();
+                            for value in values {
+                                owned.try_push(value, &scope).unwrap();
+                            }
+                            Record::from_owned_values(schema.clone(), owned).unwrap()
+                        } else {
+                            Record::new(schema.clone(), values)
+                        }
+                    };
+                    run_kernel_with_resources(
+                        RunKernel {
+                            driver_records: (0..count)
+                                .map(|k| (row(&driver_schema, k), k as u64))
+                                .collect(),
+                            build_records: (0..count).map(|k| row(&build_schema, k)).collect(),
+                            decomposed: decomposed_pure_range(
+                                extract_range_conjunct(&typed, "d", "b"),
+                                typed.clone(),
+                            ),
+                            driver_qual: "d",
+                            build_qual: "b",
+                            driver_schema: &driver_schema,
+                            build_schema: &build_schema,
+                            match_mode,
+                            on_miss: OnMiss::Skip,
+                            presorted: true,
+                            body_program: None,
+                            budget_bytes: Some(if spilled {
+                                64 * 1024
+                            } else {
+                                1024 * 1024 * 1024
+                            }),
+                        },
+                        None,
+                        None,
+                        &resources,
+                    )
+                    .unwrap()
+                };
+                let (expected, _) = run(false);
+                let (actual, stats) = run(true);
+                assert_eq!(
+                    actual
+                        .iter()
+                        .map(|(r, o)| (r.values(), o))
+                        .collect::<Vec<_>>(),
+                    expected
+                        .iter()
+                        .map(|(r, o)| (r.values(), o))
+                        .collect::<Vec<_>>()
+                );
+                if spilled {
+                    assert_eq!(stats.driver_stream_spilled, 1);
+                    assert_eq!(stats.build_stream_spilled, 1);
+                }
+                drop(actual);
+                drop(expected);
+                assert_eq!(provider.used(), 0);
+            }
+        }
+    }
+    #[test]
+    fn source_sort_open_failure_preserves_nonzero_consumer_baseline() {
+        let resources = test_allocation_resources();
+        let budget = MemoryArbitrator::with_policy(64 * 1024, 0.8, 0.7, Box::new(NoOpPolicy));
+        let consumer = crate::pipeline::memory::ConsumerHandle::new();
+        consumer.set_bytes(777);
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let error = sort_side_stream(SideStreamBuild {
+            allocation_resources: &resources,
+            pairs: phase_a_driver_pairs(30),
+            name: "open-failure",
+            range_field: &Some("k".into()),
+            budget: &budget,
+            spill_compress: false,
+            consumer_handle: &consumer,
+            spill_dir: &missing,
+            presorted: false,
+            side: "driver",
+        })
+        .err()
+        .expect("missing spill directory must fail");
+        assert!(matches!(error, PipelineError::Io(_)));
+        assert!(error.to_string().contains("phase A spill failed"));
+        assert_eq!(consumer.bytes(), 777);
     }
 }

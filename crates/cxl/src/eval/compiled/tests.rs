@@ -21,6 +21,7 @@
 //! against the expected literal. Float results are NaN-canonicalized
 //! first so an expected NaN compares equal rather than false-failing.
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -257,13 +258,15 @@ enum ResultProjection {
 fn canonicalize_nan(v: &Value) -> Value {
     match v {
         Value::Float(f) if f.is_nan() => Value::Float(f64::NAN),
-        Value::Array(items) => Value::Array(items.iter().map(canonicalize_nan).collect()),
+        Value::Array(items) => Value::Array(OwnedValues::from_vec(
+            items.iter().map(canonicalize_nan).collect(),
+        )),
         Value::Map(m) => {
-            let mut out: indexmap::IndexMap<Box<str>, Value> = indexmap::IndexMap::new();
+            let mut out: indexmap::IndexMap<OwnedKey, Value> = indexmap::IndexMap::new();
             for (k, mv) in m.iter() {
                 out.insert(k.clone(), canonicalize_nan(mv));
             }
-            Value::Map(Box::new(out))
+            Value::Map(OwnedMap::from_map(out))
         }
         other => other.clone(),
     }
@@ -394,7 +397,7 @@ fn eval_project_with_doc(
     src: &str,
     fields: &[&str],
     record: HashMap<String, Value>,
-    doc_ctx: &Arc<clinker_record::DocumentContext>,
+    doc_ctx: &SharedStorage<clinker_record::DocumentContext>,
 ) -> ResultProjection {
     let typed = type_program(src, fields);
     let has_distinct = program_has_distinct(&typed);
@@ -412,19 +415,25 @@ fn eval_project_with_doc(
 /// Build a `DocumentContext` whose single section `name` holds the given
 /// `(field, Value)` payload as a `Value::Map`. Field values may themselves
 /// be `Value::Array` / `Value::Map` to exercise indexed `$doc` chains.
-fn doc_with_section(name: &str, fields: &[(&str, Value)]) -> Arc<clinker_record::DocumentContext> {
+fn doc_with_section(
+    name: &str,
+    fields: &[(&str, Value)],
+) -> SharedStorage<clinker_record::DocumentContext> {
     use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
     let mut payload = indexmap::IndexMap::new();
     for (k, v) in fields {
-        payload.insert(Box::from(*k), v.clone());
+        payload.insert(OwnedKey::from(*k), v.clone());
     }
     let mut sections = indexmap::IndexMap::new();
-    sections.insert(Box::from(name), Value::Map(Box::new(payload)));
-    Arc::new(DocumentContext::new(
+    sections.insert(
+        OwnedKey::from(name),
+        Value::Map(OwnedMap::from_map(payload)),
+    );
+    SharedStorage::from_arc(Arc::new(DocumentContext::new(
         DocumentId::next(),
         Arc::from("proof.json"),
         EnvelopeRecord::from_sections(sections),
-    ))
+    )))
 }
 
 // ── Corpus: the scalar core ───────────────────────────────
@@ -1006,11 +1015,11 @@ fn system_access() {
 #[test]
 fn index_access() {
     let nums = || {
-        Value::Array(vec![
+        Value::Array(OwnedValues::from_vec(vec![
             Value::Integer(10),
             Value::Integer(20),
             Value::Integer(30),
-        ])
+        ]))
     };
     let emit = |v: Value| ResultProjection::Emit {
         fields: vec![("out".to_string(), v)],
@@ -1105,11 +1114,11 @@ fn doc_access_array_index_in_and_out_of_range() {
         "Head",
         &[(
             "items",
-            Value::Array(vec![
+            Value::Array(OwnedValues::from_vec(vec![
                 Value::Integer(10),
                 Value::Integer(20),
                 Value::Integer(30),
-            ]),
+            ])),
         )],
     );
     let emit = |v: Value| ResultProjection::Emit {
@@ -1134,8 +1143,8 @@ fn doc_access_array_index_in_and_out_of_range() {
 #[test]
 fn doc_access_map_key_present_and_missing() {
     let mut meta = indexmap::IndexMap::new();
-    meta.insert(Box::from("region"), Value::String("us-east".into()));
-    let doc = doc_with_section("Head", &[("meta", Value::Map(Box::new(meta)))]);
+    meta.insert(OwnedKey::from("region"), Value::String("us-east".into()));
+    let doc = doc_with_section("Head", &[("meta", Value::Map(OwnedMap::from_map(meta)))]);
     let emit = |v: Value| ResultProjection::Emit {
         fields: vec![("out".to_string(), v)],
         record_vars: vec![],
@@ -1169,14 +1178,17 @@ fn doc_access_map_key_present_and_missing() {
 #[test]
 fn doc_access_nested_chain_short_circuits_on_out_of_range() {
     let mut row0 = indexmap::IndexMap::new();
-    row0.insert(Box::from("k"), Value::String("v0".into()));
+    row0.insert(OwnedKey::from("k"), Value::String("v0".into()));
     let mut row1 = indexmap::IndexMap::new();
-    row1.insert(Box::from("k"), Value::String("v1".into()));
+    row1.insert(OwnedKey::from("k"), Value::String("v1".into()));
     let doc = doc_with_section(
         "Head",
         &[(
             "items",
-            Value::Array(vec![Value::Map(Box::new(row0)), Value::Map(Box::new(row1))]),
+            Value::Array(OwnedValues::from_vec(vec![
+                Value::Map(OwnedMap::from_map(row0)),
+                Value::Map(OwnedMap::from_map(row1)),
+            ])),
         )],
     );
     let emit = |v: Value| ResultProjection::Emit {
@@ -1464,7 +1476,7 @@ fn regex_methods() {
 /// Build an array `Value`, the receiver shape the closure builtins
 /// require.
 fn arr(items: Vec<Value>) -> Value {
-    Value::Array(items)
+    Value::Array(OwnedValues::from_vec(items))
 }
 
 /// Each closure builtin (`filter` / `map` / `find` / `any` / `flat_map`)
@@ -2037,13 +2049,13 @@ impl<'a> clinker_record::WindowContext<'a, VecStorage> for VecWindow<'a> {
         clinker_record::RecordView::new(self.storage, index as u64)
     }
     fn collect(&self, field: &str) -> Value {
-        Value::Array(
+        Value::Array(OwnedValues::from_vec(
             self.storage
                 .rows
                 .iter()
                 .filter_map(|r| r.get(field).cloned())
                 .collect(),
-        )
+        ))
     }
     fn distinct(&self, field: &str) -> Value {
         let mut seen = Vec::new();
@@ -2054,7 +2066,7 @@ impl<'a> clinker_record::WindowContext<'a, VecStorage> for VecWindow<'a> {
                 seen.push(v.clone());
             }
         }
-        Value::Array(seen)
+        Value::Array(OwnedValues::from_vec(seen))
     }
     fn row_number(&self) -> i64 {
         (self.current + 1) as i64
@@ -2184,11 +2196,11 @@ fn window_bare_calls() {
     case("emit out = $window.dense_rank()", Value::Integer(1));
     case(
         "emit out = $window.collect(amount)",
-        Value::Array(vec![
+        Value::Array(OwnedValues::from_vec(vec![
             Value::Integer(10),
             Value::Integer(20),
             Value::Integer(30),
-        ]),
+        ])),
     );
     case("emit out = $window.first_value(amount)", Value::Integer(10));
     case("emit out = $window.last_value(amount)", Value::Integer(30));
@@ -2540,11 +2552,11 @@ fn distinct_bare_all_fields() {
 /// the seeded `tag = "t"` (seed first, then the body's `val`).
 #[test]
 fn emit_each_fanout_and_seed() {
-    let nums = Value::Array(vec![
+    let nums = Value::Array(OwnedValues::from_vec(vec![
         Value::Integer(10),
         Value::Integer(20),
         Value::Integer(30),
-    ]);
+    ]));
     // `emit tag = "t"` before the block seeds every fanned record.
     let proj = eval_project(
         "emit tag = \"t\"\nemit each n in nums {\n  emit val = n + 1\n}",
@@ -2594,7 +2606,10 @@ fn emit_each_empty_array() {
     let proj = eval_project(
         "emit each n in nums {\n  emit val = n\n}",
         &["nums"],
-        HashMap::from([("nums".to_string(), Value::Array(vec![]))]),
+        HashMap::from([(
+            "nums".to_string(),
+            Value::Array(OwnedValues::from_vec(vec![])),
+        )]),
     );
     assert_eq!(
         proj,
@@ -2614,11 +2629,11 @@ fn emit_each_ceiling_boundary() {
     let src = "emit each n in nums {\n  emit val = n\n}";
     let typed = type_program(src, &["nums"]);
     let stable = StableEvalContext::test_default();
-    let nums = Value::Array(vec![
+    let nums = Value::Array(OwnedValues::from_vec(vec![
         Value::Integer(1),
         Value::Integer(2),
         Value::Integer(3),
-    ]);
+    ]));
     let resolver = HashMapResolver::new(HashMap::from([("nums".to_string(), nums)]));
 
     // Ceiling of 2 over a 3-element array → the third element trips it.
@@ -2644,7 +2659,10 @@ fn emit_each_ceiling_boundary() {
 /// the trace.
 #[test]
 fn emit_each_body_trace_is_noop() {
-    let nums = Value::Array(vec![Value::Integer(1), Value::Integer(2)]);
+    let nums = Value::Array(OwnedValues::from_vec(vec![
+        Value::Integer(1),
+        Value::Integer(2),
+    ]));
     let proj = eval_project(
         "emit each n in nums {\n  trace if (1 / z) == 0 \"would error: \" + (1 / z).to_string()\n  emit val = n\n}",
         &["nums", "z"],

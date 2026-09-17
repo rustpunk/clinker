@@ -12,10 +12,13 @@ storage/resolver traits.
 ## Responsibilities
 
 - Own shared row/value vocabulary used by CXL, format, plan, exec, CLI, channel, net, schema-adjacent code, and benchmarks.
-- Keep records schema-indexed: positional values interpreted through `Arc<Schema>`.
+- Keep records schema-indexed: owned positional values interpreted through a
+  shared schema handle.
 - Provide low-level resolver/storage traits without depending on `clinker-exec`.
 - Preserve spill-friendly wire payloads for values, records, accumulators, and document context.
 - Preserve memory-sensitive string/value layout assumptions.
+- Keep allocation leases attached to their real storage owners through aliases
+  and consuming iteration; physical destruction must precede release.
 - Keep grouping, distinct, aggregate, and counter vocabulary centralized here when downstream crates need it.
 
 ## Important public APIs
@@ -34,6 +37,8 @@ storage/resolver traits.
 
 - `value`: typed runtime values, custom serde wire form, map helpers, and heap-size accounting.
 - `field_str`: 24-byte inline/shared/unique string representation for `Value::String`.
+- `owned_storage`: finite allocation capability, unique leases and sealed
+  governed text/container/shared storage; no executor or format dependency.
 - `record`: schema-indexed records, record vars, document context attachment, and `RecordPayload`.
 - `schema`: column ordering, field metadata, name lookup, and `SchemaBuilder`.
 - `schema_def`: schema-file and inline schema structures.
@@ -46,7 +51,9 @@ storage/resolver traits.
 ### Allowed dependencies
 
 Current normal dependencies are intentional: `serde`, `serde_json`, `chrono`,
-`ahash`, `indexmap`, and `smol_str`.
+`ahash`, `indexmap`, `smol_str`, `rust_decimal`, and the exact reviewed
+`triomphe` pin. Only the sealed shared-allocation implementation may use
+`triomphe`; do not expose its raw owners or add other shared-owner operations.
 
 Current dev/bench dependencies are expected only for tests and benches:
 `criterion`, `clinker-bench-support`, and `postcard`.
@@ -65,7 +72,9 @@ Current dev/bench dependencies are expected only for tests and benches:
 - `RecordStorage` is `Send + Sync` and returns borrowed `&Value` to keep window/evaluator paths zero-copy.
 - `FieldStr` is a 24-byte storage optimization; storage arms must not affect equality, ordering, hashing, grouping, or serialized content.
 - `Value` postcard/tagged wire form and `DocumentContext` section ordering are spill-sensitive.
-- `DocumentContext` is shared per document through `Arc`; synthetic records use the process-wide synthetic context.
+- `DocumentContext` is shared per document through `SharedStorage`; synthetic
+  records use the process-wide legacy shared context. Physical source-file
+  identity remains its separate `Arc<str>`.
 - `DocumentGrain` is the output-envelope frame identity, not always the innermost document id.
 - `FieldMetadata` marks engine-stamped columns; default user-field iteration skips stamped columns.
 - Group keys canonicalize default integers/floats together, reject NaN, and treat null as caller-controlled.

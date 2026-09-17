@@ -22,6 +22,7 @@
 //! small buffered `ReopenableSource` — the honest one-shot fallback, bounded
 //! because such inputs are small by construction.
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
@@ -91,7 +92,7 @@ pub enum JsonMode {
 
 pub struct JsonReader {
     inner: InnerReader,
-    schema: Option<Arc<Schema>>,
+    schema: Option<SharedStorage<Schema>>,
     config: JsonReaderConfig,
     /// Suspended expansion of the current input record. It retains one map per
     /// declared fan-out depth and one current output map, never the cartesian
@@ -663,7 +664,7 @@ impl JsonReader {
     }
 
     /// Builds a Record carrying the JSON object's actual keys (per-record
-    /// schema). Each record's `Arc<Schema>` reflects exactly the keys
+    /// schema). Each record's `SharedStorage<Schema>` reflects exactly the keys
     /// present in that record — the per-Source `OnUnmapped` policy at
     /// the dispatch layer reconciles records against the user-declared
     /// schema (probing for `auto_widen`, rejecting on `reject`, or
@@ -673,8 +674,8 @@ impl JsonReader {
         mut flat: serde_json::Map<String, serde_json::Value>,
     ) -> Result<Record, FormatError> {
         self.apply_multi_value(&mut flat);
-        let columns: Vec<Box<str>> = flat.keys().map(|k| k.clone().into_boxed_str()).collect();
-        let schema = Arc::new(Schema::new(columns));
+        let columns: Vec<OwnedKey> = flat.keys().map(|k| k.clone().into()).collect();
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(columns)));
         let values: Vec<Value> = flat
             .iter()
             .map(|(field, value)| {
@@ -689,7 +690,7 @@ impl FormatReader for JsonReader {
     fn prepare_document(
         &mut self,
         config: &EnvelopeConfig,
-    ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
+    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
         if config.is_empty() {
             return Ok(IndexMap::new());
         }
@@ -799,15 +800,15 @@ impl FormatReader for JsonReader {
             let typed = coerce_json_section_fields(name, payload_obj, &section.fields, &index)?;
             let path = doc_path_for_section(name);
             index
-                .insert(&path, Value::Map(Box::new(typed)))
+                .insert(&path, Value::Map(OwnedMap::from_map(typed)))
                 .map_err(FormatError::Json)?;
         }
         Ok(index.into_sections())
     }
 
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
         if let Some(ref s) = self.schema {
-            return Ok(Arc::clone(s));
+            return Ok(s.clone());
         }
 
         // Read forward until a raw record actually expands to something. A
@@ -826,7 +827,7 @@ impl FormatReader for JsonReader {
         let (raw, first) = loop {
             let Some(raw) = self.next_raw()? else {
                 let s = SchemaBuilder::new().build();
-                self.schema = Some(Arc::clone(&s));
+                self.schema = Some(s.clone());
                 self.inner = InnerReader::Done;
                 return Ok(s);
             };
@@ -844,7 +845,7 @@ impl FormatReader for JsonReader {
             .collect::<SchemaBuilder>()
             .build();
         self.deferred_first = Some(raw);
-        self.schema = Some(Arc::clone(&schema));
+        self.schema = Some(schema.clone());
         Ok(schema)
     }
 
@@ -1061,22 +1062,22 @@ fn json_to_value_observing(
             value
         }
         serde_json::Value::String(s) => Value::String(s.clone().into()),
-        serde_json::Value::Array(arr) => Value::Array(
+        serde_json::Value::Array(arr) => Value::Array(OwnedValues::from_vec(
             arr.iter()
                 .map(|value| {
                     json_to_value_observing(value, field, observer, recover_streamed_number)
                 })
                 .collect(),
-        ),
+        )),
         serde_json::Value::Object(obj) => {
-            let mut map: IndexMap<Box<str>, Value> = IndexMap::with_capacity(obj.len());
+            let mut map: IndexMap<OwnedKey, Value> = IndexMap::with_capacity(obj.len());
             for (k, val) in obj {
                 map.insert(
                     k.as_str().into(),
                     json_to_value_observing(val, field, observer, recover_streamed_number),
                 );
             }
-            Value::Map(Box::new(map))
+            Value::Map(OwnedMap::from_map(map))
         }
     }
 }
@@ -1127,8 +1128,8 @@ fn coerce_json_section_fields(
     obj: &serde_json::Map<String, serde_json::Value>,
     schema: &IndexMap<String, EnvelopeFieldType>,
     index: &DocArenaIndex,
-) -> Result<IndexMap<Box<str>, Value>, FormatError> {
-    let mut out: IndexMap<Box<str>, Value> = IndexMap::with_capacity(schema.len());
+) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
+    let mut out: IndexMap<OwnedKey, Value> = IndexMap::with_capacity(schema.len());
     for (field, ty) in schema {
         if !index.wants_field(section_name, field) {
             continue;
@@ -1154,7 +1155,7 @@ fn coerce_json_section_fields(
                  cannot coerce JSON value {json_val}: {e}"
             ))
         })?;
-        out.insert(Box::from(field.as_str()), coerced);
+        out.insert(OwnedKey::from(field.as_str()), coerced);
     }
     Ok(out)
 }
@@ -1237,7 +1238,7 @@ mod tests {
         cfg
     }
 
-    fn unwrap_section_map(value: &Value) -> &IndexMap<Box<str>, Value> {
+    fn unwrap_section_map(value: &Value) -> &IndexMap<OwnedKey, Value> {
         match value {
             Value::Map(m) => m,
             other => panic!("expected Value::Map, got {other:?}"),
@@ -1704,15 +1705,17 @@ mod tests {
         let _s = r.schema().unwrap();
         assert_eq!(
             r.next_record().unwrap().unwrap().get("tags"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::String("b".into()),
                 Value::String("c".into()),
-            ]))
+            ])))
         );
         assert_eq!(
             r.next_record().unwrap().unwrap().get("tags"),
-            Some(&Value::Array(vec![Value::String("solo".into())]))
+            Some(&Value::Array(OwnedValues::from_vec(vec![Value::String(
+                "solo".into()
+            )])))
         );
     }
 
@@ -1757,7 +1760,10 @@ mod tests {
         let _s = r.schema().unwrap();
         assert_eq!(
             r.next_record().unwrap().unwrap().get("a.b"),
-            Some(&Value::Array(vec![Value::Integer(1), Value::Integer(2)]))
+            Some(&Value::Array(OwnedValues::from_vec(vec![
+                Value::Integer(1),
+                Value::Integer(2)
+            ])))
         );
     }
 
@@ -1776,10 +1782,13 @@ mod tests {
         let _s = r.schema().unwrap();
         assert_eq!(
             r.next_record().unwrap().unwrap().get("a.b"),
-            Some(&Value::Array(vec![
-                Value::Array(vec![Value::Integer(1), Value::Integer(2)]),
+            Some(&Value::Array(OwnedValues::from_vec(vec![
+                Value::Array(OwnedValues::from_vec(vec![
+                    Value::Integer(1),
+                    Value::Integer(2)
+                ])),
                 Value::Integer(3),
-            ]))
+            ])))
         );
     }
 
@@ -1795,11 +1804,11 @@ mod tests {
         let _s = r.schema().unwrap();
         assert_eq!(
             r.next_record().unwrap().unwrap().get("tags"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::String("b".into()),
                 Value::String("c".into()),
-            ]))
+            ])))
         );
     }
 
@@ -1817,7 +1826,10 @@ mod tests {
         let _s = r.schema().unwrap();
         let r1 = r.next_record().unwrap().unwrap();
         assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
-        assert_eq!(r1.get("tags"), Some(&Value::Array(vec![])));
+        assert_eq!(
+            r1.get("tags"),
+            Some(&Value::Array(OwnedValues::from_vec(vec![])))
+        );
         let r2 = r.next_record().unwrap().unwrap();
         assert_eq!(r2.get("id"), Some(&Value::Integer(2)));
         assert_eq!(r2.get("tags"), None);
@@ -2009,10 +2021,10 @@ mod tests {
         let _s = r.schema().unwrap();
         assert_eq!(
             r.next_record().unwrap().unwrap().get("tags"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::String("b".into()),
-            ]))
+            ])))
         );
     }
 
@@ -2043,7 +2055,7 @@ mod tests {
     #[test]
     fn test_json_emits_per_record_schema() {
         // Each emitted record carries the actual keys present in its
-        // JSON object — the per-record `Arc<Schema>` reflects exactly
+        // JSON object — the per-record `SharedStorage<Schema>` reflects exactly
         // what was parsed. The dispatch-layer `CoercingReader` then
         // applies the per-Source `OnUnmapped` policy (drop/reject)
         // against the user-declared schema.
@@ -2165,18 +2177,23 @@ mod tests {
         let tags = |r: &mut JsonReader| r.next_record().unwrap().unwrap().get("tags").cloned();
         assert_eq!(
             tags(&mut r),
-            Some(Value::Array(vec![
+            Some(Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::String("b".into())
-            ]))
+            ])))
         );
         assert_eq!(
             tags(&mut r),
-            Some(Value::Array(vec![Value::String("solo".into())]))
+            Some(Value::Array(OwnedValues::from_vec(vec![Value::String(
+                "solo".into()
+            )])))
         );
         assert_eq!(tags(&mut r), Some(Value::Null), "explicit null stays null");
         assert_eq!(tags(&mut r), None, "absent field contributes no column");
-        assert_eq!(tags(&mut r), Some(Value::Array(vec![])));
+        assert_eq!(
+            tags(&mut r),
+            Some(Value::Array(OwnedValues::from_vec(vec![])))
+        );
         assert!(r.next_record().unwrap().is_none());
     }
 

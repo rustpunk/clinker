@@ -9,6 +9,7 @@
 //! dispatcher's `Aggregation` arm is a single delegating call into
 //! [`dispatch_aggregation`].
 
+use clinker_record::owned_storage::{OwnedKey, SharedStorage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -36,14 +37,14 @@ use clinker_plan::plan::types::AggregateStrategy;
 /// trips through the same schema it was serialized against. Shared by every
 /// arm that builds an `AggregateStream` (the relaxed-CK and windowed
 /// preludes, and the per-document factory).
-fn aggregate_spill_schema(compiled: &cxl::plan::CompiledAggregate) -> Arc<Schema> {
+fn aggregate_spill_schema(compiled: &cxl::plan::CompiledAggregate) -> SharedStorage<Schema> {
     compiled
         .group_by_fields
         .iter()
-        .map(|s| Box::<str>::from(s.as_str()))
+        .map(|s| OwnedKey::from(s.as_str()))
         .chain([
-            Box::<str>::from("__acc_state"),
-            Box::<str>::from("__meta_tracker"),
+            OwnedKey::from("__acc_state"),
+            OwnedKey::from("__meta_tracker"),
         ])
         .collect::<SchemaBuilder>()
         .build()
@@ -60,7 +61,7 @@ struct AggregateSpec<'a> {
     name: &'a str,
     typed: &'a Arc<cxl::typecheck::TypedProgram>,
     compiled: &'a Arc<cxl::plan::CompiledAggregate>,
-    output_schema: &'a Arc<Schema>,
+    output_schema: &'a SharedStorage<Schema>,
     strategy: AggregateStrategy,
     has_distinct: bool,
 }
@@ -257,7 +258,7 @@ where
             name,
             compiled,
             strategy: agg_strategy,
-            output_schema: Arc::clone(output_schema),
+            output_schema: output_schema.clone(),
             spill_schema,
             mem_limit,
             typed: Arc::clone(typed),
@@ -322,7 +323,7 @@ where
             crate::aggregation::AggregatorConfig {
                 compiled: Arc::clone(compiled),
                 evaluator,
-                output_schema: Arc::clone(output_schema),
+                output_schema: output_schema.clone(),
                 spill_schema,
                 memory_budget: mem_limit,
                 spill_dir: Some(ctx.spill_root_path.to_path_buf()),
@@ -595,8 +596,8 @@ struct DocAggregatorFactory {
     typed: Arc<cxl::typecheck::TypedProgram>,
     has_distinct: bool,
     max_expansion: u64,
-    output_schema: Arc<Schema>,
-    spill_schema: Arc<Schema>,
+    output_schema: SharedStorage<Schema>,
+    spill_schema: SharedStorage<Schema>,
     mem_limit: usize,
     spill_dir: std::path::PathBuf,
     spill_compress: bool,
@@ -633,7 +634,7 @@ impl DocAggregatorFactory {
             typed: Arc::clone(spec.typed),
             has_distinct: spec.has_distinct,
             max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
-            output_schema: Arc::clone(spec.output_schema),
+            output_schema: spec.output_schema.clone(),
             spill_schema,
             mem_limit: parse_memory_limit(ctx.config),
             spill_dir: ctx.spill_root_path.to_path_buf(),
@@ -675,8 +676,8 @@ impl DocAggregatorFactory {
             crate::aggregation::AggregatorConfig {
                 compiled: Arc::clone(&self.compiled),
                 evaluator,
-                output_schema: Arc::clone(&self.output_schema),
-                spill_schema: Arc::clone(&self.spill_schema),
+                output_schema: self.output_schema.clone(),
+                spill_schema: self.spill_schema.clone(),
                 memory_budget: self.mem_limit,
                 // `AggregatorConfig` owns its `spill_dir: Option<PathBuf>`
                 // and `transform_name: String`, so each table takes an owned
@@ -891,7 +892,7 @@ fn run_strict_aggregate_per_document(
     ctx: &mut ExecutorContext<'_>,
     factory: DocAggregatorFactory,
     name: &str,
-    output_schema: &Arc<Schema>,
+    output_schema: &SharedStorage<Schema>,
     input: &[(Record, crate::executor::stream_event::SourceRowId)],
     input_puncts: &[crate::executor::stream_event::Punctuation],
 ) -> Result<Vec<crate::aggregation::SortRow>, PipelineError> {
@@ -1067,7 +1068,7 @@ fn route_document_flush_result(
     ctx: &mut ExecutorContext<'_>,
     name: &str,
     attribution: &[(Record, crate::executor::stream_event::SourceRowId)],
-    output_schema: &Arc<Schema>,
+    output_schema: &SharedStorage<Schema>,
     result: Result<(), crate::aggregation::HashAggError>,
 ) -> Result<(), PipelineError> {
     use crate::aggregation::HashAggError;
@@ -1197,6 +1198,7 @@ fn run_streaming_aggregate_ingest(
     // document flushes (on its `DocumentClose`, or at disconnect for the
     // document left open).
     let factory = DocAggregatorFactory::from_ctx(ctx, spec)?;
+    let allocation_resources = ctx.allocation_resources.clone();
 
     // Install the bounded streaming-ingest channel keyed by the producer's
     // index, so its dispatch arm streams into it with no producer-side
@@ -1284,9 +1286,12 @@ fn run_streaming_aggregate_ingest(
                     // of the producer's per-batch admit. The formula matches
                     // the producer's charge so a fully-drained stream nets to
                     // zero.
-                    charge_handle.sub_bytes(crate::executor::node_buffer::record_byte_cost(
-                        record.schema().column_count(),
-                    ));
+                    charge_handle.sub_bytes(
+                        crate::executor::node_buffer::unaccounted_record_byte_cost(
+                            &record,
+                            &allocation_resources,
+                        ),
+                    );
                     input_count += 1;
                     if let Some(exp) = expected_input.as_ref() {
                         check_input_schema(
@@ -1375,7 +1380,16 @@ fn run_streaming_aggregate_ingest(
                 // streaming-ingest arm aborts on any ingest error (schema
                 // mismatch, FailFast `add_record`, finalize failure) with no
                 // DLQ fallback, matching the prior single-stream behavior.
-                while rx.recv().is_ok() {}
+                while let Ok(event) = rx.recv() {
+                    if let StreamEvent::Record(record, _) = event {
+                        charge_handle.sub_bytes(
+                            crate::executor::node_buffer::unaccounted_record_byte_cost(
+                                &record,
+                                &allocation_resources,
+                            ),
+                        );
+                    }
+                }
             }
             result
         });
@@ -1403,16 +1417,13 @@ fn run_streaming_aggregate_ingest(
     });
 
     // Charge bookkeeping is complete: the producer charged each batch and
-    // the ingest thread discharged each record. Pin to zero defensively (a
-    // heuristic mismatch between batch charge and per-record discharge must
-    // not leave a stale positive for the arbitrator), then unregister the
-    // per-edge charge consumer. The per-document aggregate consumers are
+    // the ingest thread discharged each processed or discarded record. Remove
+    // the per-edge charge consumer without masking an accounting mismatch. The per-document aggregate consumers are
     // released separately: a flushed bucket unregisters its own via
     // `finalize_bucket`, and `RegisteredTables`' `Drop` releases any bucket
     // still open when `tables` falls out of scope below — including on the
     // error path, where `ingest_result?` returns before the success-path
     // replay. So no aggregate consumer survives this arm on any exit.
-    charge_handle.set_bytes(0);
     ctx.streaming_charge_consumers.remove(&producer_idx);
     ctx.memory_budget.unregister_consumer(charge_consumer_id);
 
@@ -1473,8 +1484,8 @@ struct WindowedAggContext<'a> {
     name: &'a str,
     compiled: &'a Arc<cxl::plan::CompiledAggregate>,
     strategy: AggregateStrategy,
-    output_schema: Arc<Schema>,
-    spill_schema: Arc<Schema>,
+    output_schema: SharedStorage<Schema>,
+    spill_schema: SharedStorage<Schema>,
     mem_limit: usize,
     /// Typed `aggregate:` program read off the `PlanNode::Aggregation`. Each
     /// per-window stream clones a fresh `ProgramEvaluator` from this Arc.
@@ -1524,8 +1535,8 @@ impl WindowedAggContext<'_> {
             crate::aggregation::AggregatorConfig {
                 compiled: Arc::clone(self.compiled),
                 evaluator,
-                output_schema: Arc::clone(&self.output_schema),
-                spill_schema: Arc::clone(&self.spill_schema),
+                output_schema: self.output_schema.clone(),
+                spill_schema: self.spill_schema.clone(),
                 memory_budget: self.mem_limit,
                 spill_dir: Some(ctx.spill_root_path.to_path_buf()),
                 spill_compress,
@@ -1565,7 +1576,7 @@ fn run_time_windowed_aggregate(
 ) -> Result<Vec<crate::aggregation::SortRow>, PipelineError> {
     let name = win_ctx.name;
     let compiled = win_ctx.compiled;
-    let output_schema = Arc::clone(&win_ctx.output_schema);
+    let output_schema = win_ctx.output_schema.clone();
     use crate::aggregation::{AggregateStream, HashAggError, SortRow as AggSortRow};
     use crate::executor::time_window::{
         WindowBounds, duration_to_nanos, hopping_windows, partition_into_sessions,
@@ -2074,7 +2085,7 @@ fn finalize_windows(
         ),
     >,
     out_rows: &mut Vec<crate::aggregation::SortRow>,
-    output_schema: &Arc<Schema>,
+    output_schema: &SharedStorage<Schema>,
     input: &[(Record, crate::executor::stream_event::SourceRowId)],
 ) -> Result<(), PipelineError> {
     use crate::aggregation::HashAggError;
@@ -2175,7 +2186,7 @@ fn emit_aggregate_finalize_dlq(
     ctx: &mut ExecutorContext<'_>,
     name: &str,
     records: &[(Record, crate::executor::stream_event::SourceRowId)],
-    output_schema: &Arc<Schema>,
+    output_schema: &SharedStorage<Schema>,
     transform: &str,
     binding: &str,
     source: &clinker_record::accumulator::AccumulatorError,
@@ -2185,7 +2196,7 @@ fn emit_aggregate_finalize_dlq(
         (rec.clone(), sn)
     } else {
         (
-            Record::new(Arc::clone(output_schema), Vec::new()),
+            Record::new(output_schema.clone(), Vec::new()),
             Arc::from(name),
         )
     };
@@ -2267,13 +2278,13 @@ mod tests {
         let compiled = Arc::new(
             extract_aggregates(&typed, &group_by_owned, &schema_names).expect("extract_aggregates"),
         );
-        let output_schema = Arc::new(Schema::new(
+        let output_schema = SharedStorage::from_arc(Arc::new(Schema::new(
             compiled
                 .emits
                 .iter()
-                .map(|e| e.output_name.clone())
-                .collect::<Vec<Box<str>>>(),
-        ));
+                .map(|e| OwnedKey::from_box(e.output_name.clone()))
+                .collect::<Vec<OwnedKey>>(),
+        )));
         let spill_schema = aggregate_spill_schema(&compiled);
         let is_global_fold = compiled.group_by_fields.is_empty();
         DocAggregatorFactory {
@@ -2294,13 +2305,13 @@ mod tests {
     }
 
     fn record_in_document(doc_id: DocumentId, tag: &str) -> Record {
-        let schema = Arc::new(Schema::new(vec!["tag".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["tag".into()])));
         let mut record = Record::new(schema, vec![Value::from(tag)]);
-        record.set_doc_ctx(Arc::new(DocumentContext::new(
+        record.set_doc_ctx(SharedStorage::from_arc(Arc::new(DocumentContext::new(
             doc_id,
             Arc::from("file.csv"),
             clinker_record::EnvelopeRecord::empty(),
-        )));
+        ))));
         record
     }
 

@@ -27,6 +27,8 @@
 
 use std::io::{BufRead, Read};
 
+use clinker_record::owned_storage::OwnedValues;
+
 use clinker_record::Value;
 
 use crate::charset::Charset;
@@ -82,11 +84,11 @@ impl Delimiters {
     /// terminator]`. Bytes, not characters — a delimiter byte (a `\n`
     /// terminator, say) need not be printable text.
     pub(crate) fn to_doc_value(self) -> Value {
-        Value::Array(vec![
+        Value::Array(OwnedValues::from_vec(vec![
             Value::Integer(i64::from(self.element)),
             Value::Integer(i64::from(self.subelement)),
             Value::Integer(i64::from(self.terminator)),
-        ])
+        ]))
     }
 
     /// Decode a delimiter set from its `$doc` carrier value. The key is
@@ -541,11 +543,11 @@ mod tests {
         };
         assert_eq!(
             d.to_doc_value(),
-            Value::Array(vec![
+            Value::Array(OwnedValues::from_vec(vec![
                 Value::Integer(124),
                 Value::Integer(94),
                 Value::Integer(10),
-            ])
+            ]))
         );
         assert_eq!(Delimiters::from_doc_value(&d.to_doc_value()).unwrap(), d);
     }
@@ -556,27 +558,28 @@ mod tests {
         assert!(Delimiters::from_doc_value(&Value::String("junk".into())).is_err());
         // Wrong arity.
         assert!(
-            Delimiters::from_doc_value(&Value::Array(
-                vec![Value::Integer(42), Value::Integer(58),]
-            ))
+            Delimiters::from_doc_value(&Value::Array(OwnedValues::from_vec(vec![
+                Value::Integer(42),
+                Value::Integer(58),
+            ])))
             .is_err()
         );
         // Out-of-byte-range integer.
         assert!(
-            Delimiters::from_doc_value(&Value::Array(vec![
+            Delimiters::from_doc_value(&Value::Array(OwnedValues::from_vec(vec![
                 Value::Integer(300),
                 Value::Integer(58),
                 Value::Integer(126),
-            ]))
+            ])))
             .is_err()
         );
         // Non-integer element.
         assert!(
-            Delimiters::from_doc_value(&Value::Array(vec![
+            Delimiters::from_doc_value(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("*".into()),
                 Value::Integer(58),
                 Value::Integer(126),
-            ]))
+            ])))
             .is_err()
         );
     }

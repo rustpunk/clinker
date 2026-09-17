@@ -7,6 +7,7 @@
 //! [`SortBuffer`]; forced spill drains through the shared
 //! [`SortedRunMerger`]. No source-local replay is involved.
 
+use clinker_record::owned_storage::{AllocationResources, SharedStorage};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -202,6 +203,18 @@ impl Ord for StagedSourceRejection {
 }
 
 impl HeapBytes for StagedSourceRejection {
+    fn unaccounted_heap_bytes(
+        &self,
+        resources: &clinker_record::owned_storage::AllocationResources,
+    ) -> usize {
+        self.source_name
+            .len()
+            .saturating_add(self.source_file.len())
+            .saturating_add(self.message.len())
+            .saturating_add(self.triggering_field.len())
+            .saturating_add(self.triggering_value.unaccounted_heap_size(resources))
+    }
+
     fn heap_bytes(&self) -> usize {
         self.source_name
             .len()
@@ -238,7 +251,7 @@ pub(crate) struct SourceFileEventSpool {
     errors: Option<SortBuffer<StagedSourceRejection>>,
     previous: Option<Record>,
     previous_row: Option<u64>,
-    original_doc_ctx: Option<Arc<DocumentContext>>,
+    original_doc_ctx: Option<SharedStorage<DocumentContext>>,
     verification: OrderVerificationState,
     row_count: u64,
     attempted_count: u64,
@@ -286,6 +299,7 @@ pub(crate) struct OrderRepairOutcome {
 /// synchronous `RecordSource`, while different sources own independent state.
 pub(crate) struct SourceFileOrderBarrier {
     config: SourceOrderConfig,
+    allocation_resources: clinker_record::owned_storage::AllocationResources,
     state: Option<SourceFileEventSpool>,
     tx: crossbeam_channel::Sender<SourceStreamEvent>,
     consumer_handle: Arc<ConsumerHandle>,
@@ -294,7 +308,9 @@ pub(crate) struct SourceFileOrderBarrier {
     spill_compress: bool,
     record_stage: String,
     error_stage: String,
-    record_bytes_ewma: u64,
+    queued_bytes_ewma: u64,
+    /// Full physical record/payload estimate for independent spill decoding.
+    reload_bytes_ewma: u64,
     /// Resident records being transferred from an in-memory sorted spool into
     /// the bounded channel. Decrements only after ownership moves to `tx`.
     releasing_memory_bytes: u64,
@@ -306,6 +322,11 @@ pub(crate) struct SourceFileOrderBarrier {
 }
 
 impl SourceFileOrderBarrier {
+    #[cfg(test)]
+    pub(crate) fn allocation_identity(&self) -> usize {
+        self.allocation_resources.identity()
+    }
+
     pub(crate) fn new(
         config: SourceOrderConfig,
         tx: crossbeam_channel::Sender<SourceStreamEvent>,
@@ -313,11 +334,13 @@ impl SourceFileOrderBarrier {
         memory: Arc<MemoryArbitrator>,
         spill_dir: PathBuf,
         spill_compress: bool,
+        allocation_resources: clinker_record::owned_storage::AllocationResources,
     ) -> Self {
         let record_stage = format!("source-order:{}:records", config.source_name);
         let error_stage = format!("source-order:{}:errors", config.source_name);
         Self {
             config,
+            allocation_resources,
             state: None,
             tx,
             consumer_handle,
@@ -326,7 +349,8 @@ impl SourceFileOrderBarrier {
             spill_compress,
             record_stage,
             error_stage,
-            record_bytes_ewma: 0,
+            queued_bytes_ewma: 0,
+            reload_bytes_ewma: 0,
             releasing_memory_bytes: 0,
             fixed_memory_bytes: 0,
             #[cfg(test)]
@@ -382,7 +406,11 @@ impl SourceFileOrderBarrier {
             )));
         }
         let record_bytes = record_pair_bytes(&record);
-        self.record_bytes_ewma = ewma_step(self.record_bytes_ewma, record_bytes);
+        self.reload_bytes_ewma = ewma_step(self.reload_bytes_ewma, record_bytes);
+        self.queued_bytes_ewma = ewma_step(
+            self.queued_bytes_ewma,
+            unaccounted_record_pair_bytes(&record, &self.allocation_resources),
+        );
         let Some(state) = self.state.as_mut() else {
             return Err(self.shape_error_for_file(
                 "<unknown>",
@@ -418,8 +446,8 @@ impl SourceFileOrderBarrier {
         }
 
         match state.original_doc_ctx.as_ref() {
-            None => state.original_doc_ctx = Some(Arc::clone(record.doc_ctx())),
-            Some(original) if !Arc::ptr_eq(original, record.doc_ctx()) => {
+            None => state.original_doc_ctx = Some(record.doc_ctx().clone()),
+            Some(original) if !SharedStorage::ptr_eq(original, record.doc_ctx()) => {
                 let file = Arc::clone(&state.file);
                 self.abort_file_barrier();
                 return Err(self.shape_error(
@@ -439,7 +467,8 @@ impl SourceFileOrderBarrier {
                 threshold,
                 Some(self.spill_dir.clone()),
                 self.spill_compress,
-                Arc::clone(record.schema()),
+                record.schema().clone(),
+                self.allocation_resources.clone(),
             ));
         }
         state.previous = Some(record.clone());
@@ -456,7 +485,7 @@ impl SourceFileOrderBarrier {
         self.update_staged_charge();
 
         let should_spill = buffer_should_spill
-            || self.staged_bytes() >= self.memory.spill_threshold_bytes()
+            || self.physical_staged_bytes() >= self.memory.spill_threshold_bytes()
             || self.memory.should_spill_self()
             || self.consumer_handle.take_spill_request();
         if should_spill {
@@ -484,7 +513,11 @@ impl SourceFileOrderBarrier {
         }
         let (record, payload) = StagedSourceRejection::from_event(event);
         let record_bytes = rejection_pair_bytes(&record, &payload);
-        self.record_bytes_ewma = ewma_step(self.record_bytes_ewma, record_bytes);
+        self.reload_bytes_ewma = ewma_step(self.reload_bytes_ewma, record_bytes);
+        self.queued_bytes_ewma = ewma_step(
+            self.queued_bytes_ewma,
+            unaccounted_rejection_pair_bytes(&record, &payload, &self.allocation_resources),
+        );
         let Some(state) = self.state.as_mut() else {
             return Err(self.shape_error_for_file(
                 "<unknown>",
@@ -499,8 +532,8 @@ impl SourceFileOrderBarrier {
             ));
         }
         match state.original_doc_ctx.as_ref() {
-            None => state.original_doc_ctx = Some(Arc::clone(record.doc_ctx())),
-            Some(original) if !Arc::ptr_eq(original, record.doc_ctx()) => {
+            None => state.original_doc_ctx = Some(record.doc_ctx().clone()),
+            Some(original) if !SharedStorage::ptr_eq(original, record.doc_ctx()) => {
                 let file = Arc::clone(&state.file);
                 self.abort_file_barrier();
                 return Err(self.shape_error(
@@ -518,7 +551,8 @@ impl SourceFileOrderBarrier {
                 threshold,
                 Some(self.spill_dir.clone()),
                 self.spill_compress,
-                Arc::clone(record.schema()),
+                record.schema().clone(),
+                self.allocation_resources.clone(),
             ));
         }
         state.attempted_count = state.attempted_count.saturating_add(1);
@@ -534,7 +568,7 @@ impl SourceFileOrderBarrier {
             || state.records.as_ref().is_some_and(SortBuffer::should_spill);
         self.update_staged_charge();
         if buffer_should_spill
-            || self.staged_bytes() >= self.memory.spill_threshold_bytes()
+            || self.physical_staged_bytes() >= self.memory.spill_threshold_bytes()
             || self.memory.should_spill_self()
             || self.consumer_handle.take_spill_request()
         {
@@ -634,12 +668,25 @@ impl SourceFileOrderBarrier {
         let rows = state.attempted_count;
         state.previous = None;
         state.previous_row = None;
+        // `state` is detached from `self`, but both sorters remain resident
+        // during preparation. Carry their contribution across fallible merges.
+        self.releasing_memory_bytes = state
+            .records
+            .as_ref()
+            .map_or(0, |buffer| buffer.unaccounted_bytes_used() as u64)
+            .saturating_add(
+                state
+                    .errors
+                    .as_ref()
+                    .map_or(0, |buffer| buffer.unaccounted_bytes_used() as u64),
+            );
+        self.update_runtime_charge();
         let records = self.prepare_records(state.records.take())?;
         let errors = self.prepare_errors(state.errors.take())?;
         let spilled = matches!(&records, PreparedOutput::Spilled { .. })
             || matches!(&errors, PreparedOutput::Spilled { .. });
-        self.releasing_memory_bytes =
-            resident_record_bytes(&records).saturating_add(resident_error_bytes(&errors));
+        self.releasing_memory_bytes = resident_record_bytes(&records, &self.allocation_resources)
+            .saturating_add(resident_error_bytes(&errors, &self.allocation_resources));
         self.update_runtime_charge();
 
         if let Some(inversion) = inversion.as_ref() {
@@ -678,6 +725,7 @@ impl SourceFileOrderBarrier {
             return Ok(PreparedOutput::Empty);
         };
         let expected = buffer.total_rows();
+        let resident_bytes = buffer.unaccounted_bytes_used() as u64;
         let (output, residue_bytes) = buffer.finish().map_err(|error| {
             SourceStreamError::OrderViolation(Box::new(PipelineError::from(error)))
         })?;
@@ -686,6 +734,9 @@ impl SourceFileOrderBarrier {
         match output {
             SortedOutput::InMemory(records) => Ok(PreparedOutput::InMemory(records)),
             SortedOutput::Spilled(files) => {
+                self.releasing_memory_bytes =
+                    self.releasing_memory_bytes.saturating_sub(resident_bytes);
+                self.update_runtime_charge();
                 let (file, bytes) = self.consolidate_runs(files, expected, &stage, false)?;
                 Ok(PreparedOutput::Spilled { file, bytes })
             }
@@ -700,6 +751,7 @@ impl SourceFileOrderBarrier {
             return Ok(PreparedOutput::Empty);
         };
         let expected = buffer.total_rows();
+        let resident_bytes = buffer.unaccounted_bytes_used() as u64;
         let (output, residue_bytes) = buffer.finish().map_err(|error| {
             SourceStreamError::OrderViolation(Box::new(PipelineError::from(error)))
         })?;
@@ -708,6 +760,9 @@ impl SourceFileOrderBarrier {
         match output {
             SortedOutput::InMemory(errors) => Ok(PreparedOutput::InMemory(errors)),
             SortedOutput::Spilled(files) => {
+                self.releasing_memory_bytes =
+                    self.releasing_memory_bytes.saturating_sub(resident_bytes);
+                self.update_runtime_charge();
                 let (file, bytes) = self.consolidate_runs(files, expected, &stage, true)?;
                 Ok(PreparedOutput::Spilled { file, bytes })
             }
@@ -728,10 +783,15 @@ impl SourceFileOrderBarrier {
     {
         let schema = files
             .first()
-            .map(|file| Arc::clone(file.schema()))
+            .map(|file| file.schema().clone())
             .ok_or_else(|| {
                 self.shape_error_for_file("<unknown>", "spill-backed attempt spool was empty")
             })?;
+        // Opening the merger materializes independent decoded cursors. Their
+        // forecast must remain physical even when the original rows were owned.
+        self.fixed_memory_bytes = merger_reader_bytes(files.len(), self.reload_bytes_ewma)
+            .saturating_add(SPILL_IO_BUFFER_BYTES);
+        self.update_runtime_charge();
         let budget = MergeBudget {
             budget: &self.memory,
             node: stage,
@@ -750,7 +810,7 @@ impl SourceFileOrderBarrier {
         }
         .map_err(|error| SourceStreamError::OrderViolation(Box::new(error)))?;
         self.fixed_memory_bytes =
-            merger_reader_bytes(merger.reader_count(), self.record_bytes_ewma)
+            merger_reader_bytes(merger.reader_count(), self.reload_bytes_ewma)
                 .saturating_add(SPILL_IO_BUFFER_BYTES);
         self.update_runtime_charge();
         let input_charge = self.stage_spill_charge(stage);
@@ -777,7 +837,7 @@ impl SourceFileOrderBarrier {
         self.charge_spill_for(stage, final_bytes)?;
         self.memory.release_spill_bytes(stage, input_charge);
 
-        self.fixed_memory_bytes = spill_reader_bytes(self.record_bytes_ewma);
+        self.fixed_memory_bytes = spill_reader_bytes(self.reload_bytes_ewma);
         self.update_runtime_charge();
         let mut validated_rows = 0usize;
         for item in final_file.reader().map_err(|error| {
@@ -814,6 +874,14 @@ impl SourceFileOrderBarrier {
     }
 
     fn spill_resident_attempts(&mut self) -> Result<(), SourceStreamError> {
+        let result = self.spill_resident_attempts_inner();
+        if result.is_err() {
+            self.abort_file_barrier();
+        }
+        result
+    }
+
+    fn spill_resident_attempts_inner(&mut self) -> Result<(), SourceStreamError> {
         let (record_bytes, error_bytes) = {
             let state = self
                 .state
@@ -880,19 +948,21 @@ impl SourceFileOrderBarrier {
         &mut self,
         output: PreparedOutput<SourceRowId>,
         population: AttemptPopulationId,
-        original_doc_ctx: Option<&Arc<DocumentContext>>,
+        original_doc_ctx: Option<&SharedStorage<DocumentContext>>,
     ) -> Result<(), SourceStreamError> {
         match output {
             PreparedOutput::Empty => Ok(()),
             PreparedOutput::InMemory(records) => {
                 for (mut record, row_id) in records {
                     reattach_original_doc_ctx(&mut record, original_doc_ctx)?;
-                    self.emit_record(record, row_id, population)?;
+                    let retained =
+                        unaccounted_record_pair_bytes(&record, &self.allocation_resources);
+                    self.emit_record(record, row_id, population, retained)?;
                 }
                 Ok(())
             }
             PreparedOutput::Spilled { file, bytes } => {
-                self.fixed_memory_bytes = spill_reader_bytes(self.record_bytes_ewma);
+                self.fixed_memory_bytes = spill_reader_bytes(self.reload_bytes_ewma);
                 self.update_runtime_charge();
                 let reader = file.reader().map_err(|error| {
                     SourceStreamError::OrderViolation(Box::new(PipelineError::from(error)))
@@ -902,7 +972,7 @@ impl SourceFileOrderBarrier {
                         SourceStreamError::OrderViolation(Box::new(PipelineError::from(error)))
                     })?;
                     reattach_original_doc_ctx(&mut record, original_doc_ctx)?;
-                    self.emit_record(record, row_id, population)?;
+                    self.emit_record(record, row_id, population, 0)?;
                 }
                 self.fixed_memory_bytes = 0;
                 self.update_runtime_charge();
@@ -917,19 +987,24 @@ impl SourceFileOrderBarrier {
         &mut self,
         output: PreparedOutput<StagedSourceRejection>,
         population: AttemptPopulationId,
-        original_doc_ctx: Option<&Arc<DocumentContext>>,
+        original_doc_ctx: Option<&SharedStorage<DocumentContext>>,
     ) -> Result<(), SourceStreamError> {
         match output {
             PreparedOutput::Empty => Ok(()),
             PreparedOutput::InMemory(errors) => {
                 for (mut record, payload) in errors {
                     reattach_original_doc_ctx(&mut record, original_doc_ctx)?;
-                    self.emit_rejection(payload.into_event(record), population)?;
+                    let retained = unaccounted_rejection_pair_bytes(
+                        &record,
+                        &payload,
+                        &self.allocation_resources,
+                    );
+                    self.emit_rejection(payload.into_event(record), population, retained)?;
                 }
                 Ok(())
             }
             PreparedOutput::Spilled { file, bytes } => {
-                self.fixed_memory_bytes = spill_reader_bytes(self.record_bytes_ewma);
+                self.fixed_memory_bytes = spill_reader_bytes(self.reload_bytes_ewma);
                 self.update_runtime_charge();
                 let reader = file.reader().map_err(|error| {
                     SourceStreamError::OrderViolation(Box::new(PipelineError::from(error)))
@@ -939,7 +1014,7 @@ impl SourceFileOrderBarrier {
                         SourceStreamError::OrderViolation(Box::new(PipelineError::from(error)))
                     })?;
                     reattach_original_doc_ctx(&mut record, original_doc_ctx)?;
-                    self.emit_rejection(payload.into_event(record), population)?;
+                    self.emit_rejection(payload.into_event(record), population, 0)?;
                 }
                 self.fixed_memory_bytes = 0;
                 self.update_runtime_charge();
@@ -955,16 +1030,18 @@ impl SourceFileOrderBarrier {
         record: Record,
         row_id: SourceRowId,
         population: AttemptPopulationId,
+        released_bytes: u64,
     ) -> Result<(), SourceStreamError> {
-        let sample = record_pair_bytes(&record);
-        self.record_bytes_ewma = ewma_step(self.record_bytes_ewma, sample);
+        let sample = unaccounted_record_pair_bytes(&record, &self.allocation_resources);
+        self.queued_bytes_ewma = ewma_step(self.queued_bytes_ewma, sample);
+        self.reload_bytes_ewma = ewma_step(self.reload_bytes_ewma, record_pair_bytes(&record));
         self.tx
             .send(SourceStreamEvent::Attempt {
                 event: SourceAttemptEvent::Record(record, row_id),
                 population: Some(population),
             })
             .map_err(|_| SourceStreamError::Closed)?;
-        self.releasing_memory_bytes = self.releasing_memory_bytes.saturating_sub(sample);
+        self.release_resident_bytes(released_bytes)?;
         self.update_runtime_charge();
         Ok(())
     }
@@ -973,17 +1050,36 @@ impl SourceFileOrderBarrier {
         &mut self,
         event: crate::executor::SourceRejectionEvent,
         population: AttemptPopulationId,
+        released_bytes: u64,
     ) -> Result<(), SourceStreamError> {
-        let sample = rejection_event_bytes(&event);
-        self.record_bytes_ewma = ewma_step(self.record_bytes_ewma, sample);
+        let sample = unaccounted_rejection_event_bytes(&event, &self.allocation_resources);
+        self.queued_bytes_ewma = ewma_step(self.queued_bytes_ewma, sample);
+        self.reload_bytes_ewma = ewma_step(self.reload_bytes_ewma, rejection_event_bytes(&event));
         self.tx
             .send(SourceStreamEvent::Attempt {
                 event: SourceAttemptEvent::Rejection(Box::new(event)),
                 population: Some(population),
             })
             .map_err(|_| SourceStreamError::Closed)?;
-        self.releasing_memory_bytes = self.releasing_memory_bytes.saturating_sub(sample);
+        self.release_resident_bytes(released_bytes)?;
         self.update_runtime_charge();
+        Ok(())
+    }
+
+    fn release_resident_bytes(&mut self, bytes: u64) -> Result<(), SourceStreamError> {
+        self.releasing_memory_bytes =
+            self.releasing_memory_bytes
+                .checked_sub(bytes)
+                .ok_or_else(|| {
+                    SourceStreamError::OrderViolation(Box::new(PipelineError::Internal {
+                        op: "source-order-retention",
+                        node: self.config.source_name.to_string(),
+                        detail: format!(
+                            "released {bytes} resident bytes with only {} retained",
+                            self.releasing_memory_bytes
+                        ),
+                    }))
+                })?;
         Ok(())
     }
 
@@ -995,8 +1091,14 @@ impl SourceFileOrderBarrier {
         self.update_accounted_charge();
     }
 
+    /// Refresh all ordered-source domains after a channel operation returns.
+    /// Reloaded rows use this barrier's queue sample, not the original input's.
+    pub(crate) fn refresh_accounted_charge(&self) {
+        self.update_accounted_charge();
+    }
+
     fn update_accounted_charge(&self) {
-        let queued = (self.tx.len() as u64).saturating_mul(self.record_bytes_ewma);
+        let queued = (self.tx.len() as u64).saturating_mul(self.queued_bytes_ewma);
         self.consumer_handle.set_bytes(
             self.staged_bytes()
                 .saturating_add(self.releasing_memory_bytes)
@@ -1013,6 +1115,28 @@ impl SourceFileOrderBarrier {
     }
 
     pub(crate) fn staged_bytes(&self) -> u64 {
+        self.state
+            .as_ref()
+            .map(|state| {
+                let sorter = state
+                    .records
+                    .as_ref()
+                    .map_or(0, |records| records.unaccounted_bytes_used() as u64);
+                let errors = state
+                    .errors
+                    .as_ref()
+                    .map_or(0, |errors| errors.unaccounted_bytes_used() as u64);
+                let adjacent = state.previous.as_ref().map_or(0, |record| {
+                    (std::mem::size_of::<Record>()
+                        + record.unaccounted_heap_size(&self.allocation_resources))
+                        as u64
+                });
+                sorter.saturating_add(errors).saturating_add(adjacent)
+            })
+            .unwrap_or(0)
+    }
+
+    fn physical_staged_bytes(&self) -> u64 {
         self.state
             .as_ref()
             .map(|state| {
@@ -1124,7 +1248,7 @@ fn validate_runtime_shape(
 
 fn reattach_original_doc_ctx(
     record: &mut Record,
-    original: Option<&Arc<DocumentContext>>,
+    original: Option<&SharedStorage<DocumentContext>>,
 ) -> Result<(), SourceStreamError> {
     let Some(original) = original else {
         return Err(SourceStreamError::OrderViolation(Box::new(
@@ -1135,7 +1259,7 @@ fn reattach_original_doc_ctx(
             },
         )));
     };
-    record.set_doc_ctx(Arc::clone(original));
+    record.set_doc_ctx(original.clone());
     Ok(())
 }
 
@@ -1237,6 +1361,12 @@ fn record_pair_bytes(record: &Record) -> u64 {
         + std::mem::size_of::<SourceRowId>()) as u64
 }
 
+fn unaccounted_record_pair_bytes(record: &Record, resources: &AllocationResources) -> u64 {
+    (std::mem::size_of::<Record>()
+        + record.unaccounted_heap_size(resources)
+        + std::mem::size_of::<SourceRowId>()) as u64
+}
+
 fn rejection_pair_bytes(record: &Record, payload: &StagedSourceRejection) -> u64 {
     (std::mem::size_of::<Record>()
         + record.estimated_heap_size()
@@ -1244,26 +1374,51 @@ fn rejection_pair_bytes(record: &Record, payload: &StagedSourceRejection) -> u64
         + payload.heap_bytes()) as u64
 }
 
+fn unaccounted_rejection_pair_bytes(
+    record: &Record,
+    payload: &StagedSourceRejection,
+    resources: &AllocationResources,
+) -> u64 {
+    (std::mem::size_of::<Record>()
+        + record.unaccounted_heap_size(resources)
+        + std::mem::size_of::<StagedSourceRejection>()
+        + payload.unaccounted_heap_bytes(resources)) as u64
+}
+
 fn rejection_event_bytes(event: &crate::executor::SourceRejectionEvent) -> u64 {
     (std::mem::size_of::<crate::executor::SourceRejectionEvent>() + event.estimated_heap_size())
         as u64
 }
 
-fn resident_record_bytes(output: &PreparedOutput<SourceRowId>) -> u64 {
+fn unaccounted_rejection_event_bytes(
+    event: &crate::executor::SourceRejectionEvent,
+    resources: &AllocationResources,
+) -> u64 {
+    (std::mem::size_of::<crate::executor::SourceRejectionEvent>()
+        + event.unaccounted_heap_size(resources)) as u64
+}
+
+fn resident_record_bytes(
+    output: &PreparedOutput<SourceRowId>,
+    resources: &AllocationResources,
+) -> u64 {
     match output {
         PreparedOutput::InMemory(records) => records
             .iter()
-            .map(|(record, _)| record_pair_bytes(record))
+            .map(|(record, _)| unaccounted_record_pair_bytes(record, resources))
             .fold(0, u64::saturating_add),
         PreparedOutput::Empty | PreparedOutput::Spilled { .. } => 0,
     }
 }
 
-fn resident_error_bytes(output: &PreparedOutput<StagedSourceRejection>) -> u64 {
+fn resident_error_bytes(
+    output: &PreparedOutput<StagedSourceRejection>,
+    resources: &AllocationResources,
+) -> u64 {
     match output {
         PreparedOutput::InMemory(errors) => errors
             .iter()
-            .map(|(record, payload)| rejection_pair_bytes(record, payload))
+            .map(|(record, payload)| unaccounted_rejection_pair_bytes(record, payload, resources))
             .fold(0, u64::saturating_add),
         PreparedOutput::Empty | PreparedOutput::Spilled { .. } => 0,
     }
@@ -1289,18 +1444,558 @@ const fn ewma_step(previous: u64, sample: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::pipeline::memory::NoOpPolicy;
+    use clinker_format::preparation::MemoryOnlyResources;
     use clinker_plan::config::{CompileContext, NullOrder, PipelineConfig, SortOrder};
     use clinker_plan::plan::{EntityRef, PlanNodeId};
     use clinker_record::{DocumentId, EnvelopeRecord, Schema, Value};
+    use clinker_record::{FieldStr, owned_storage::OwnedValues};
+    use std::num::NonZeroUsize;
 
-    fn document(file: &str) -> Arc<DocumentContext> {
-        Arc::new(DocumentContext::new(
+    fn governed_schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "key".into(),
+            "payload".into(),
+            "mixed".into(),
+            "$source.file".into(),
+            "$source.name".into(),
+        ])))
+    }
+
+    fn governed_record(
+        resources: &AllocationResources,
+        schema: &SharedStorage<Schema>,
+        doc: &SharedStorage<DocumentContext>,
+        key: i64,
+        leaf: &FieldStr,
+    ) -> Record {
+        let scope = resources.scope().unwrap();
+        let mut values = OwnedValues::try_with_capacity(16, &scope).unwrap();
+        for value in [
+            Value::Integer(key),
+            Value::String(leaf.clone()),
+            Value::Array(OwnedValues::from_vec(vec![Value::String(
+                "legacy".repeat(32).into(),
+            )])),
+            Value::String("frame.swift".into()),
+            Value::String("rows".into()),
+        ] {
+            values.try_push(value, &scope).unwrap();
+        }
+        let mut record = Record::from_owned_values(schema.clone(), values).unwrap();
+        record.set_doc_ctx(doc.clone());
+        record
+    }
+
+    fn rejection(
+        record: Record,
+        ordinal: u64,
+        leaf: &FieldStr,
+    ) -> crate::executor::SourceRejectionEvent {
+        crate::executor::SourceRejectionEvent {
+            source_row: SourceRowId::new(PlanNodeId::new(7), ordinal),
+            source_name: Arc::from("rows"),
+            source_file: Arc::from("frame.swift"),
+            row: ordinal + 10,
+            kind: crate::executor::SourceRejectionKind::DeclaredType,
+            message: "E126 preserved diagnostic".into(),
+            original_record: record,
+            triggering_field: "payload".into(),
+            triggering_value: Value::String(leaf.clone()),
+        }
+    }
+
+    #[test]
+    fn governed_staging_counts_clone_slots_and_preserves_physical_reload_forecast() {
+        let (mut barrier, rx, _dir, _) = framed_barrier();
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+        let resources = provider.resources().allocation().clone();
+        barrier.allocation_resources = resources.clone();
+        let leaf = FieldStr::try_new(&"owned".repeat(500), &resources.scope().unwrap()).unwrap();
+        let schema = governed_schema();
+        let doc = document("frame.swift");
+        barrier
+            .begin_physical_file(Punctuation::document_open(doc.clone()))
+            .unwrap();
+        let record = governed_record(&resources, &schema, &doc, 1, &leaf);
+        let physical = record_pair_bytes(&record);
+        let relative = unaccounted_record_pair_bytes(&record, &resources);
+        assert!(physical > relative);
+        barrier
+            .observe_typed_event(record, SourceRowId::new(PlanNodeId::new(7), 1))
+            .unwrap();
+        let previous = barrier.state.as_ref().unwrap().previous.as_ref().unwrap();
+        assert!(!previous.values_are_accounted_by(&resources));
+        let previous_relative =
+            (std::mem::size_of::<Record>() + previous.unaccounted_heap_size(&resources)) as u64;
+        assert_eq!(barrier.staged_bytes(), relative + previous_relative);
+        assert_eq!(barrier.consumer_handle.bytes(), barrier.staged_bytes());
+        assert_eq!(barrier.reload_bytes_ewma, physical);
+        assert_eq!(barrier.queued_bytes_ewma, relative);
+        assert!(barrier.physical_staged_bytes() > barrier.staged_bytes());
+        assert_eq!(
+            spill_reader_bytes(barrier.reload_bytes_ewma),
+            SPILL_IO_BUFFER_BYTES + physical
+        );
+        barrier.abort_file_barrier();
+        assert_eq!(barrier.consumer_handle.bytes(), 0);
+        assert!(
+            provider.used() > 0,
+            "escaped leaf remains intrinsically charged"
+        );
+        drop(rx);
+        drop(leaf);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn governed_ordered_spill_matches_resident_records_rejections_and_punctuation() {
+        fn run(limit: u64) -> Vec<String> {
+            let (mut barrier, rx, _dir, memory) = framed_barrier_with_limit(limit);
+            let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+            let resources = provider.resources().allocation().clone();
+            barrier.allocation_resources = resources.clone();
+            let leaf =
+                FieldStr::try_new(&"owned".repeat(600), &resources.scope().unwrap()).unwrap();
+            let schema = governed_schema();
+            let outer = document("frame.swift");
+            let inner = document("frame.swift");
+            barrier
+                .observe_punctuation(Punctuation::document_open(outer.clone()))
+                .unwrap();
+            barrier
+                .observe_punctuation(Punctuation::document_open(inner.clone()))
+                .unwrap();
+            for ordinal in 1..=12 {
+                let record = governed_record(
+                    &resources,
+                    &schema,
+                    &inner,
+                    (12 - ordinal) as i64 / 2,
+                    &leaf,
+                );
+                if ordinal % 4 == 0 {
+                    barrier
+                        .observe_attempt(SourceAttemptEvent::Rejection(Box::new(rejection(
+                            record, ordinal, &leaf,
+                        ))))
+                        .unwrap();
+                } else {
+                    barrier
+                        .observe_typed_event(record, SourceRowId::new(PlanNodeId::new(7), ordinal))
+                        .unwrap();
+                }
+            }
+            assert!(barrier.reload_bytes_ewma > barrier.queued_bytes_ewma);
+            assert_eq!(barrier.consumer_handle.bytes(), barrier.staged_bytes());
+            let forced = limit < 1024 * 1024;
+            if forced {
+                assert!(memory.cumulative_spill_bytes() > 0);
+                assert!(
+                    barrier.staged_bytes() > 0,
+                    "previous comparison clone remains live"
+                );
+            }
+            barrier
+                .observe_punctuation(Punctuation::document_close(inner.clone()))
+                .unwrap();
+            let outcome = barrier
+                .observe_punctuation(Punctuation::document_close(outer.clone()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(outcome.spilled, forced);
+            assert_eq!(barrier.releasing_memory_bytes, 0);
+            assert_eq!(barrier.fixed_memory_bytes, 0);
+            assert_eq!(
+                barrier.consumer_handle.bytes(),
+                rx.len() as u64 * barrier.queued_bytes_ewma
+            );
+            assert_eq!(memory.cumulative_spill_bytes(), 0);
+            let mut result = Vec::new();
+            for event in rx.try_iter() {
+                match event {
+                    SourceStreamEvent::Attempt { event, .. } => {
+                        let (record, row, prefix) = match event {
+                            SourceAttemptEvent::Record(record, row) => {
+                                (record, row, "row".to_owned())
+                            }
+                            SourceAttemptEvent::Rejection(event) => {
+                                assert_eq!(event.message, "E126 preserved diagnostic");
+                                assert_eq!(event.row, event.source_row.ordinal() + 10);
+                                assert_eq!(event.triggering_value, Value::String(leaf.clone()));
+                                let prefix =
+                                    format!("rejection:{}:{}", event.row, event.triggering_field);
+                                (event.original_record, event.source_row, prefix)
+                            }
+                        };
+                        assert!(SharedStorage::ptr_eq(record.doc_ctx(), &inner));
+                        assert!(SharedStorage::ptr_eq(record.schema(), &schema));
+                        assert_eq!(record.values_are_accounted_by(&resources), !forced);
+                        if forced {
+                            assert_eq!(
+                                record.unaccounted_heap_size(&resources),
+                                record.estimated_heap_size()
+                            );
+                        }
+                        result.push(format!("{prefix}:{}:{:?}", row.ordinal(), record.values()));
+                    }
+                    SourceStreamEvent::Punctuation(p) => {
+                        assert!(
+                            SharedStorage::ptr_eq(p.doc_ctx(), &inner)
+                                || SharedStorage::ptr_eq(p.doc_ctx(), &outer)
+                        );
+                        result.push(format!("punct:{:?}:{}", p.kind(), p.source_file()));
+                    }
+                    SourceStreamEvent::Population(p) => {
+                        assert_eq!((p.attempted, p.rejected), (12, 3));
+                        result.push(format!("population:{}:{}", p.attempted, p.rejected));
+                    }
+                }
+            }
+            barrier.abort_file_barrier();
+            assert_eq!(barrier.consumer_handle.bytes(), 0);
+            assert!(provider.used() > 0);
+            drop(leaf);
+            assert_eq!(provider.used(), 0);
+            result
+        }
+        assert_eq!(run(8 * 1024), run(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn rejection_handoff_preserves_other_retained_rows_and_samples_queued_representation() {
+        let (mut barrier, rx, _dir, _) = framed_barrier();
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+        let resources = provider.resources().allocation().clone();
+        barrier.allocation_resources = resources.clone();
+        let leaf = FieldStr::try_new(&"owned".repeat(100), &resources.scope().unwrap()).unwrap();
+        let doc = document("frame.swift");
+        let event = rejection(
+            governed_record(&resources, &governed_schema(), &doc, 1, &leaf),
+            2,
+            &leaf,
+        );
+        let (record, payload) = StagedSourceRejection::from_event(event);
+        let retained = unaccounted_rejection_pair_bytes(&record, &payload, &resources);
+        let event = payload.into_event(record);
+        let queued = unaccounted_rejection_event_bytes(&event, &resources);
+        barrier.releasing_memory_bytes = 777 + retained;
+        barrier
+            .emit_rejection(
+                event,
+                AttemptPopulationId {
+                    source: PlanNodeId::new(7),
+                    document: doc.id(),
+                },
+                retained,
+            )
+            .unwrap();
+        assert_eq!(barrier.releasing_memory_bytes, 777);
+        assert_eq!(barrier.queued_bytes_ewma, queued);
+        assert_eq!(barrier.consumer_handle.bytes(), 777 + queued);
+        drop(rx.recv().unwrap());
+        barrier.abort_file_barrier();
+        drop(leaf);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn detached_spool_preparation_keeps_the_other_resident_side_charged() {
+        let (mut barrier, _rx, _dir, memory) = framed_barrier();
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+        let resources = provider.resources().allocation().clone();
+        barrier.allocation_resources = resources.clone();
+        let leaf = FieldStr::try_new(&"owned".repeat(100), &resources.scope().unwrap()).unwrap();
+        let doc = document("frame.swift");
+        let schema = governed_schema();
+        barrier
+            .begin_physical_file(Punctuation::document_open(doc.clone()))
+            .unwrap();
+        barrier
+            .observe_typed_event(
+                governed_record(&resources, &schema, &doc, 2, &leaf),
+                SourceRowId::new(PlanNodeId::new(7), 1),
+            )
+            .unwrap();
+        let spilled = barrier
+            .state
+            .as_mut()
+            .unwrap()
+            .records
+            .as_mut()
+            .unwrap()
+            .sort_and_spill()
+            .unwrap();
+        barrier
+            .charge_spill_for(&barrier.record_stage.clone(), spilled)
+            .unwrap();
+        barrier
+            .observe_typed_event(
+                governed_record(&resources, &schema, &doc, 1, &leaf),
+                SourceRowId::new(PlanNodeId::new(7), 2),
+            )
+            .unwrap();
+        barrier
+            .observe_rejection(rejection(
+                governed_record(&resources, &schema, &doc, 3, &leaf),
+                3,
+                &leaf,
+            ))
+            .unwrap();
+        let mut state = barrier.state.take().unwrap();
+        state.previous = None;
+        let error_bytes = state.errors.as_ref().unwrap().unaccounted_bytes_used() as u64;
+        barrier.releasing_memory_bytes =
+            error_bytes + state.records.as_ref().unwrap().unaccounted_bytes_used() as u64;
+        barrier.update_runtime_charge();
+        assert!(barrier.consumer_handle.bytes() > error_bytes);
+        let records = barrier.prepare_records(state.records.take()).unwrap();
+        assert!(matches!(records, PreparedOutput::Spilled { .. }));
+        assert_eq!(barrier.releasing_memory_bytes, error_bytes);
+        assert_eq!(barrier.consumer_handle.bytes(), error_bytes);
+        let errors = barrier.prepare_errors(state.errors.take()).unwrap();
+        assert_eq!(resident_error_bytes(&errors, &resources), error_bytes);
+        assert_eq!(barrier.consumer_handle.bytes(), error_bytes);
+        assert!(memory.cumulative_spill_bytes() > 0);
+        drop((records, errors, state));
+        barrier.cleanup_after_failure();
+        assert_eq!(barrier.consumer_handle.bytes(), 0);
+        assert_eq!(memory.cumulative_spill_bytes(), 0);
+        drop(leaf);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn governed_spill_open_and_corruption_failures_release_retained_domains() {
+        for corrupt_after_spill in [false, true] {
+            let (mut barrier, rx, dir, memory) = framed_barrier_with_limit(1024);
+            let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+            let resources = provider.resources().allocation().clone();
+            barrier.allocation_resources = resources.clone();
+            let leaf =
+                FieldStr::try_new(&"owned".repeat(100), &resources.scope().unwrap()).unwrap();
+            let schema = governed_schema();
+            let outer = document("frame.swift");
+            let inner = document("frame.swift");
+            if !corrupt_after_spill {
+                barrier.spill_dir = dir.path().join("missing");
+            }
+            barrier
+                .observe_punctuation(Punctuation::document_open(outer.clone()))
+                .unwrap();
+            barrier
+                .observe_punctuation(Punctuation::document_open(inner.clone()))
+                .unwrap();
+            let first = barrier.observe_typed_event(
+                governed_record(&resources, &schema, &inner, 2, &leaf),
+                SourceRowId::new(PlanNodeId::new(7), 1),
+            );
+            let error = if corrupt_after_spill {
+                first.unwrap();
+                barrier
+                    .observe_typed_event(
+                        governed_record(&resources, &schema, &inner, 1, &leaf),
+                        SourceRowId::new(PlanNodeId::new(7), 2),
+                    )
+                    .unwrap();
+                assert!(barrier.consumer_handle.bytes() > 0);
+                assert!(memory.cumulative_spill_bytes() > 0);
+                let paths = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                assert!(paths.len() >= 2, "exercise merging multiple real runs");
+                std::fs::write(&paths[0], b"corrupt spill").unwrap();
+                barrier
+                    .observe_punctuation(Punctuation::document_close(inner))
+                    .unwrap();
+                barrier
+                    .observe_punctuation(Punctuation::document_close(outer))
+                    .unwrap_err()
+            } else {
+                first.unwrap_err()
+            };
+            assert!(matches!(error, SourceStreamError::OrderViolation(_)));
+            assert!(barrier.state.is_none());
+            assert_eq!(barrier.staged_bytes(), 0);
+            assert_eq!(barrier.releasing_memory_bytes, 0);
+            assert_eq!(barrier.fixed_memory_bytes, 0);
+            assert_eq!(barrier.consumer_handle.bytes(), 0);
+            assert_eq!(memory.cumulative_spill_bytes(), 0);
+            assert!(rx.is_empty(), "failed verification releases no evidence");
+            assert!(provider.used() > 0);
+            drop(leaf);
+            assert_eq!(provider.used(), 0);
+        }
+    }
+
+    #[test]
+    fn governed_spilled_release_failure_after_prefix_keeps_escaped_leaf_alive() {
+        let (mut barrier, old_rx, _dir, memory) = framed_barrier_with_limit(1024);
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+        let resources = provider.resources().allocation().clone();
+        barrier.allocation_resources = resources.clone();
+        let leaf = FieldStr::try_new(&"owned".repeat(100), &resources.scope().unwrap()).unwrap();
+        let schema = governed_schema();
+        let outer = document("frame.swift");
+        let inner = document("frame.swift");
+        barrier
+            .observe_punctuation(Punctuation::document_open(outer.clone()))
+            .unwrap();
+        barrier
+            .observe_punctuation(Punctuation::document_open(inner.clone()))
+            .unwrap();
+        for ordinal in 1..=3 {
+            barrier
+                .observe_typed_event(
+                    governed_record(&resources, &schema, &inner, 4 - ordinal as i64, &leaf),
+                    SourceRowId::new(PlanNodeId::new(7), ordinal),
+                )
+                .unwrap();
+        }
+        assert!(memory.cumulative_spill_bytes() > 0);
+        let (tx, rx) = crossbeam_channel::bounded(0);
+        barrier.tx = tx;
+        drop(old_rx);
+        barrier
+            .observe_punctuation(Punctuation::document_close(inner.clone()))
+            .unwrap();
+        std::thread::scope(|scope| {
+            let receiver = scope.spawn(move || {
+                assert!(matches!(
+                    rx.recv().unwrap(),
+                    SourceStreamEvent::Population(_)
+                ));
+                assert!(matches!(
+                    rx.recv().unwrap(),
+                    SourceStreamEvent::Punctuation(_)
+                ));
+                assert!(matches!(
+                    rx.recv().unwrap(),
+                    SourceStreamEvent::Punctuation(_)
+                ));
+                let SourceStreamEvent::Attempt {
+                    event: SourceAttemptEvent::Record(record, row),
+                    ..
+                } = rx.recv().unwrap()
+                else {
+                    panic!("first sorted record");
+                };
+                assert_eq!(record.get("key"), Some(&Value::Integer(1)));
+                assert_eq!(row.ordinal(), 3);
+                assert!(!record.values_are_accounted_by(&resources));
+                assert!(SharedStorage::ptr_eq(record.doc_ctx(), &inner));
+                // Receiver drop deterministically interrupts the next send.
+            });
+            let error = barrier
+                .observe_punctuation(Punctuation::document_close(outer))
+                .unwrap_err();
+            assert!(matches!(error, SourceStreamError::Closed));
+            receiver.join().unwrap();
+        });
+        assert_eq!(barrier.consumer_handle.bytes(), 0);
+        assert_eq!(barrier.fixed_memory_bytes, 0);
+        assert_eq!(barrier.releasing_memory_bytes, 0);
+        assert_eq!(memory.cumulative_spill_bytes(), 0);
+        assert!(provider.used() > 0);
+        drop(leaf);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn completed_spill_quota_failure_and_early_shutdown_release_governed_owners() {
+        for exceed_quota in [false, true] {
+            let (mut barrier, rx, _dir, memory) = framed_barrier();
+            let handle = barrier.consumer_handle.clone();
+            let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+            let resources = provider.resources().allocation().clone();
+            barrier.allocation_resources = resources.clone();
+            let leaf =
+                FieldStr::try_new(&"owned".repeat(100), &resources.scope().unwrap()).unwrap();
+            let doc = document("frame.swift");
+            barrier
+                .begin_physical_file(Punctuation::document_open(doc.clone()))
+                .unwrap();
+            barrier
+                .observe_typed_event(
+                    governed_record(&resources, &governed_schema(), &doc, 1, &leaf),
+                    SourceRowId::new(PlanNodeId::new(7), 1),
+                )
+                .unwrap();
+            assert!(handle.bytes() > 0);
+            let before = provider.used();
+            if exceed_quota {
+                memory.set_max_spill_bytes(1).unwrap();
+                let error = barrier.spill_resident_attempts().unwrap_err();
+                assert!(matches!(error, SourceStreamError::OrderViolation(_)));
+                assert!(barrier.state.is_none());
+                assert_eq!(barrier.releasing_memory_bytes, 0);
+                assert_eq!(barrier.fixed_memory_bytes, 0);
+            }
+            drop(barrier);
+            assert_eq!(handle.bytes(), 0);
+            assert_eq!(memory.cumulative_spill_bytes(), 0);
+            assert!(rx.is_empty());
+            assert!(provider.used() > 0 && provider.used() < before);
+            drop(leaf);
+            assert_eq!(provider.used(), 0);
+        }
+    }
+
+    #[test]
+    fn failed_consolidation_write_retains_original_error_and_balances_reader_forecast() {
+        #[derive(Eq, PartialEq, Ord, PartialOrd)]
+        struct RefuseRewrite(bool);
+        impl Serialize for RefuseRewrite {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                if self.0 {
+                    return Err(serde::ser::Error::custom(
+                        "deliberate rewritten payload failure",
+                    ));
+                }
+                0u8.serialize(serializer)
+            }
+        }
+        impl<'de> Deserialize<'de> for RefuseRewrite {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let _ = u8::deserialize(deserializer)?;
+                Ok(Self(true))
+            }
+        }
+        let (mut barrier, rx, dir, memory) = framed_barrier();
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["key".into()])));
+        let record = Record::new(schema.clone(), vec![Value::Integer(1)]);
+        barrier.reload_bytes_ewma = record_pair_bytes(&record);
+        barrier.releasing_memory_bytes = 777;
+        let mut writer = SpillWriter::new(schema, Some(dir.path()), false).unwrap();
+        writer.write_pair(&record, &RefuseRewrite(false)).unwrap();
+        let (file, bytes) = writer.finish_with_bytes().unwrap();
+        let stage = barrier.record_stage.clone();
+        barrier.charge_spill_for(&stage, bytes).unwrap();
+        let error = barrier
+            .consolidate_runs(vec![file], 1, &stage, true)
+            .err()
+            .expect("rewrite must fail");
+        assert!(matches!(error, SourceStreamError::OrderViolation(_)));
+        assert_eq!(barrier.releasing_memory_bytes, 777);
+        assert!(barrier.fixed_memory_bytes >= SPILL_IO_BUFFER_BYTES);
+        assert!(barrier.consumer_handle.bytes() >= 777 + SPILL_IO_BUFFER_BYTES);
+        assert!(memory.cumulative_spill_bytes() > 0);
+        barrier.cleanup_after_failure();
+        assert_eq!(barrier.consumer_handle.bytes(), 0);
+        assert_eq!(barrier.fixed_memory_bytes, 0);
+        assert_eq!(memory.cumulative_spill_bytes(), 0);
+        assert!(rx.is_empty());
+    }
+
+    fn document(file: &str) -> SharedStorage<DocumentContext> {
+        SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from(file),
             EnvelopeRecord::empty(),
-        ))
+        )))
     }
 
     fn compiled_source_order_fixture() -> (
@@ -1444,6 +2139,12 @@ nodes:
             Arc::clone(&memory),
             dir.path().to_path_buf(),
             false,
+            clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(limit as usize).unwrap(),
+            )
+            .resources()
+            .allocation()
+            .clone(),
         );
         (barrier, rx, dir, memory)
     }
@@ -1457,16 +2158,20 @@ nodes:
         framed_barrier_with_limit(1024 * 1024 * 1024)
     }
 
-    fn record(schema: &Arc<Schema>, doc: &Arc<DocumentContext>, key: i64) -> Record {
+    fn record(
+        schema: &SharedStorage<Schema>,
+        doc: &SharedStorage<DocumentContext>,
+        key: i64,
+    ) -> Record {
         let mut record = Record::new(
-            Arc::clone(schema),
+            schema.clone(),
             vec![
                 Value::Integer(key),
                 Value::String("frame.swift".into()),
                 Value::String("rows".into()),
             ],
         );
-        record.set_doc_ctx(Arc::clone(doc));
+        record.set_doc_ctx(doc.clone());
         record
     }
 
@@ -1474,7 +2179,7 @@ nodes:
     fn staged_rejection_preserves_physical_line_distinct_from_attempt_ordinal() {
         let source_row = SourceRowId::new(PlanNodeId::new(7), 2);
         let record = Record::new(
-            Arc::new(Schema::new(vec!["record_type".into()])),
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["record_type".into()]))),
             vec![Value::from("X")],
         );
         let event = crate::executor::SourceRejectionEvent::unknown_record_type(
@@ -1500,16 +2205,16 @@ nodes:
         let (mut barrier, rx, _dir, _memory) = framed_barrier();
         let outer = document("frame.swift");
         let inner = document("frame.swift");
-        let schema = Arc::new(Schema::new(vec![
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "key".into(),
             "$source.file".into(),
             "$source.name".into(),
-        ]));
+        ])));
         barrier
-            .observe_punctuation(Punctuation::document_open(Arc::clone(&outer)))
+            .observe_punctuation(Punctuation::document_open(outer.clone()))
             .unwrap();
         barrier
-            .observe_punctuation(Punctuation::document_open(Arc::clone(&inner)))
+            .observe_punctuation(Punctuation::document_open(inner.clone()))
             .unwrap();
         let source = PlanNodeId::new(7);
         barrier
@@ -1519,10 +2224,10 @@ nodes:
             .observe_typed_event(record(&schema, &inner, 1), SourceRowId::new(source, 2))
             .unwrap();
         barrier
-            .observe_punctuation(Punctuation::document_close(Arc::clone(&inner)))
+            .observe_punctuation(Punctuation::document_close(inner.clone()))
             .unwrap();
         barrier
-            .observe_punctuation(Punctuation::document_close(Arc::clone(&outer)))
+            .observe_punctuation(Punctuation::document_close(outer.clone()))
             .unwrap();
 
         assert!(
@@ -1554,7 +2259,7 @@ nodes:
         assert_eq!(records[0].1, SourceRowId::new(source, 2));
         assert_eq!(records[1].1, SourceRowId::new(source, 1));
         for (record, _) in records {
-            assert!(Arc::ptr_eq(record.doc_ctx(), &inner));
+            assert!(SharedStorage::ptr_eq(record.doc_ctx(), &inner));
             assert_eq!(
                 record.get("$source.file"),
                 Some(&Value::String("frame.swift".into()))
@@ -1574,16 +2279,16 @@ nodes:
         let outer = document("empty.swift");
         let inner = document("empty.swift");
         barrier
-            .observe_punctuation(Punctuation::document_open(Arc::clone(&outer)))
+            .observe_punctuation(Punctuation::document_open(outer.clone()))
             .unwrap();
         barrier
-            .observe_punctuation(Punctuation::document_open(Arc::clone(&inner)))
+            .observe_punctuation(Punctuation::document_open(inner.clone()))
             .unwrap();
         barrier
-            .observe_punctuation(Punctuation::document_close(Arc::clone(&inner)))
+            .observe_punctuation(Punctuation::document_close(inner.clone()))
             .unwrap();
         barrier
-            .observe_punctuation(Punctuation::document_close(Arc::clone(&outer)))
+            .observe_punctuation(Punctuation::document_close(outer.clone()))
             .unwrap();
 
         let events = rx.try_iter().collect::<Vec<_>>();
@@ -1602,13 +2307,13 @@ nodes:
             .collect::<Vec<_>>();
         assert_eq!(punctuations.len(), 4);
         assert_eq!(punctuations[0].kind(), PunctuationKind::DocumentOpen);
-        assert!(Arc::ptr_eq(punctuations[0].doc_ctx(), &outer));
+        assert!(SharedStorage::ptr_eq(punctuations[0].doc_ctx(), &outer));
         assert_eq!(punctuations[1].kind(), PunctuationKind::DocumentOpen);
-        assert!(Arc::ptr_eq(punctuations[1].doc_ctx(), &inner));
+        assert!(SharedStorage::ptr_eq(punctuations[1].doc_ctx(), &inner));
         assert_eq!(punctuations[2].kind(), PunctuationKind::DocumentClose);
-        assert!(Arc::ptr_eq(punctuations[2].doc_ctx(), &inner));
+        assert!(SharedStorage::ptr_eq(punctuations[2].doc_ctx(), &inner));
         assert_eq!(punctuations[3].kind(), PunctuationKind::DocumentClose);
-        assert!(Arc::ptr_eq(punctuations[3].doc_ctx(), &outer));
+        assert!(SharedStorage::ptr_eq(punctuations[3].doc_ctx(), &outer));
     }
 
     #[test]
@@ -1623,16 +2328,16 @@ nodes:
             let (mut barrier, _rx, _dir, _memory) = framed_barrier();
             let outer = document("warning.swift");
             let inner = document("warning.swift");
-            let schema = Arc::new(Schema::new(vec![
+            let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
                 "key".into(),
                 "$source.file".into(),
                 "$source.name".into(),
-            ]));
+            ])));
             barrier
-                .observe_punctuation(Punctuation::document_open(Arc::clone(&outer)))
+                .observe_punctuation(Punctuation::document_open(outer.clone()))
                 .unwrap();
             barrier
-                .observe_punctuation(Punctuation::document_open(Arc::clone(&inner)))
+                .observe_punctuation(Punctuation::document_open(inner.clone()))
                 .unwrap();
             for (offset, key) in keys.into_iter().enumerate() {
                 barrier
@@ -1643,7 +2348,7 @@ nodes:
                     .unwrap();
             }
             barrier
-                .observe_punctuation(Punctuation::document_close(Arc::clone(&inner)))
+                .observe_punctuation(Punctuation::document_close(inner.clone()))
                 .unwrap();
             barrier
                 .observe_punctuation(Punctuation::document_close(outer))
@@ -1654,20 +2359,27 @@ nodes:
 
     #[test]
     fn forced_spill_matches_resident_order_and_restores_exact_document_arc() {
-        fn run(limit: u64) -> (Vec<(i64, SourceRowId)>, bool, Arc<DocumentContext>, u64) {
+        fn run(
+            limit: u64,
+        ) -> (
+            Vec<(i64, SourceRowId)>,
+            bool,
+            SharedStorage<DocumentContext>,
+            u64,
+        ) {
             let (mut barrier, rx, _dir, memory) = framed_barrier_with_limit(limit);
             let outer = document("many.swift");
             let inner = document("many.swift");
-            let schema = Arc::new(Schema::new(vec![
+            let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
                 "key".into(),
                 "$source.file".into(),
                 "$source.name".into(),
-            ]));
+            ])));
             barrier
-                .observe_punctuation(Punctuation::document_open(Arc::clone(&outer)))
+                .observe_punctuation(Punctuation::document_open(outer.clone()))
                 .unwrap();
             barrier
-                .observe_punctuation(Punctuation::document_open(Arc::clone(&inner)))
+                .observe_punctuation(Punctuation::document_open(inner.clone()))
                 .unwrap();
             let source = PlanNodeId::new(7);
             for ordinal in 1..=130u64 {
@@ -1682,7 +2394,7 @@ nodes:
                     .unwrap();
             }
             barrier
-                .observe_punctuation(Punctuation::document_close(Arc::clone(&inner)))
+                .observe_punctuation(Punctuation::document_close(inner.clone()))
                 .unwrap();
             let outcome = barrier
                 .observe_punctuation(Punctuation::document_close(outer))
@@ -1695,7 +2407,7 @@ nodes:
                         event: SourceAttemptEvent::Record(record, row_id),
                         ..
                     } => {
-                        assert!(Arc::ptr_eq(record.doc_ctx(), &inner));
+                        assert!(SharedStorage::ptr_eq(record.doc_ctx(), &inner));
                         assert_eq!(
                             record.get("$source.file"),
                             Some(&Value::String("frame.swift".into()))
@@ -1734,16 +2446,16 @@ nodes:
         let (mut barrier, rx, _dir, memory) = framed_barrier_with_limit(1024);
         let outer = document("interrupted.swift");
         let inner = document("interrupted.swift");
-        let schema = Arc::new(Schema::new(vec![
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "key".into(),
             "$source.file".into(),
             "$source.name".into(),
-        ]));
+        ])));
         barrier
-            .observe_punctuation(Punctuation::document_open(Arc::clone(&outer)))
+            .observe_punctuation(Punctuation::document_open(outer.clone()))
             .unwrap();
         barrier
-            .observe_punctuation(Punctuation::document_open(Arc::clone(&inner)))
+            .observe_punctuation(Punctuation::document_open(inner.clone()))
             .unwrap();
         let source = PlanNodeId::new(7);
         for ordinal in 1..=130u64 {

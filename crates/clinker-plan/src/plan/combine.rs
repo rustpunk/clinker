@@ -20,6 +20,7 @@
 //!     keyed by input-port name. See `CombineInput` for why each input
 //!     still refers to its upstream node by name rather than `NodeIndex`.)
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -2191,7 +2192,7 @@ pub(crate) fn decompose_nary_combines(
             plan.graph.remove_edge(eid);
         }
 
-        // Compute each non-final step's encoded output `Arc<Schema>`.
+        // Compute each non-final step's encoded output `SharedStorage<Schema>`.
         // Column order matches `intermediate_row.fields()` iteration
         // order; the i-th encoded column corresponds to the i-th
         // qualified field in the running merged-row prefix. This
@@ -2200,11 +2201,11 @@ pub(crate) fn decompose_nary_combines(
         // holds the value for the i-th joined `(qualifier, field)`,
         // and `j == position_in_intermediate_row.fields()`.
         let last_step_idx = steps.len() - 1;
-        let mut step_output_schemas: Vec<Arc<clinker_record::Schema>> =
+        let mut step_output_schemas: Vec<SharedStorage<clinker_record::Schema>> =
             Vec::with_capacity(steps.len());
         for (i, step) in steps.iter().enumerate() {
             let schema = if i == last_step_idx {
-                Arc::clone(&original_output_schema)
+                original_output_schema.clone()
             } else {
                 let mut builder = clinker_record::SchemaBuilder::new();
                 for (qf, _ty) in step.intermediate_row.fields() {
@@ -2280,7 +2281,7 @@ pub(crate) fn decompose_nary_combines(
         let mut step_indices: Vec<NodeIndex> = Vec::with_capacity(steps.len());
         for (i, step) in steps.iter().enumerate() {
             let predicate_summary = CombinePredicateSummary::from_decomposed(&step.predicate_slice);
-            let step_output_schema = Arc::clone(&step_output_schemas[i]);
+            let step_output_schema = step_output_schemas[i].clone();
             let step_resolved_map: crate::plan::execution::ResolvedColumnMap =
                 Arc::new(step_resolved_maps[i].clone());
             let (match_mode, on_miss, output_schema, idx) = if i == last_step_idx {
@@ -2316,7 +2317,7 @@ pub(crate) fn decompose_nary_combines(
                         max_output_rows: None,
                         propagate_ck: original_propagate_ck.clone(),
                         decomposed_from: Some(original_name.clone()),
-                        output_schema: Arc::clone(&step_output_schema),
+                        output_schema: step_output_schema.clone(),
                         resolved_column_map: Arc::clone(&step_resolved_map),
                         // Non-final chain steps are body-less `match: All`
                         // joins; the body program lives only on the final

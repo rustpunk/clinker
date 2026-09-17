@@ -6,7 +6,6 @@
 use std::alloc::Layout;
 use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::{FormatError, reserved::ReservedBuffer};
@@ -17,200 +16,72 @@ pub const PROGRESS_BYTES: usize = 16 * 1024;
 /// Independently admitted stage chunk size.
 pub const STAGE_CHUNK_BYTES: usize = 16 * 1024;
 
-/// Fixed-cardinality resource failure, without record values or copied strings.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResourceErrorKind {
-    Budget,
-    Allocation,
-    Layout,
-    DiskQuota,
-    DescriptorQuota,
-    Cancelled,
-    Storage,
-    Readback,
-    DeliveryPoisoned,
-    Finalized,
-    Authority,
-}
+pub use clinker_record::owned_storage::{
+    AllocationAuthority, AllocationLease, AllocationResources, AllocationScope, OwnerId,
+    ResourceError, ResourceErrorKind,
+};
 
-/// Bounded evidence for admission and delivery errors. Field is a schema index;
-/// offset identifies a byte without copying any author-provided value.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResourceError {
-    pub kind: ResourceErrorKind,
-    pub requested: usize,
-    pub available: usize,
-    pub field: Option<usize>,
-    pub offset: Option<u64>,
-}
-impl ResourceError {
-    /// Construct allocation-free diagnostic evidence.
-    pub const fn new(kind: ResourceErrorKind, requested: usize, available: usize) -> Self {
-        Self {
-            kind,
-            requested,
-            available,
-            field: None,
-            offset: None,
-        }
-    }
-}
-impl std::fmt::Display for ResourceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "writer resource {:?}: requested {} bytes, available {} bytes",
-            self.kind, self.requested, self.available
-        )
-    }
-}
-impl std::error::Error for ResourceError {}
 impl From<ResourceError> for FormatError {
     fn from(value: ResourceError) -> Self {
         Self::Resource(value)
     }
 }
 
-/// Stable, allocation-free identity within a resource authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OwnerId(pub u64);
-
-/// Provider boundary. Reserve/release must be synchronized and account the
-/// entire requested layout before allocation. No callback sees a destination.
+/// Format-only stage capability. Allocation admission belongs to the core
+/// authority; a stage receives the matching writer's explicit finite scope.
 pub trait ResourceAuthority: Send + Sync {
-    /// Identity of the aggregate ledger. Adapters sharing a ledger return the
-    /// same identity; owner identifiers travel with tokens, not a second tally.
-    fn identity(&self) -> usize {
-        std::ptr::from_ref(self).cast::<()>() as usize
-    }
-    fn try_reserve(
-        self: Arc<Self>,
-        owner: OwnerId,
-        layout: Layout,
-    ) -> Result<AllocationGrant, ResourceError>;
-    fn release(&self, owner: OwnerId, bytes: usize);
-    fn check_cancelled(&self) -> Result<(), ResourceError>;
-    fn create_stage(
-        self: Arc<Self>,
-        scope: WriterScope,
-    ) -> Result<Box<dyn OperationStage>, FormatError>;
+    fn create_stage(self: Arc<Self>, scope: WriterScope) -> Result<OperationStage, FormatError>;
 }
 
-/// Unique reservation. Moving a value moves this token; copying needs another.
-pub struct AllocationGrant {
-    authority: Arc<dyn ResourceAuthority>,
-    owner: OwnerId,
-    bytes: usize,
-}
-impl AllocationGrant {
-    /// Provider-only accounting boundary: caller must have admitted these bytes
-    /// before constructing the token. No allocation occurs here.
-    pub fn admitted(authority: Arc<dyn ResourceAuthority>, owner: OwnerId, bytes: usize) -> Self {
-        Self {
-            authority,
-            owner,
-            bytes,
-        }
-    }
-    pub fn requested_bytes(&self) -> usize {
-        self.bytes
-    }
-    pub fn owner(&self) -> OwnerId {
-        self.owner
-    }
-    /// Move the charge to another scope of this same authority, without a
-    /// release/reacquire window or a second allocation.
-    pub fn transfer(&mut self, scope: &WriterScope) -> Result<(), ResourceError> {
-        if self.authority.identity() != scope.resources.authority.identity() {
-            return Err(ResourceError::new(
-                ResourceErrorKind::Authority,
-                self.bytes,
-                0,
-            ));
-        }
-        self.owner = scope.owner;
-        Ok(())
-    }
-    /// Partition ownership without changing total usage.
-    pub fn split(&mut self, bytes: usize) -> Result<Self, ResourceError> {
-        if bytes > self.bytes {
-            return Err(ResourceError::new(
-                ResourceErrorKind::Authority,
-                bytes,
-                self.bytes,
-            ));
-        }
-        self.bytes -= bytes;
-        Ok(Self::admitted(self.authority.clone(), self.owner, bytes))
-    }
-    /// Combine ownership only when authority and owner are identical.
-    pub fn merge(&mut self, mut other: Self) -> Result<(), ResourceError> {
-        if self.authority.identity() != other.authority.identity() || self.owner != other.owner {
-            return Err(ResourceError::new(
-                ResourceErrorKind::Authority,
-                other.bytes,
-                0,
-            ));
-        }
-        self.bytes = self
-            .bytes
-            .checked_add(other.bytes)
-            .ok_or_else(|| ResourceError::new(ResourceErrorKind::Layout, other.bytes, 0))?;
-        other.bytes = 0;
-        Ok(())
-    }
-}
-impl Drop for AllocationGrant {
-    fn drop(&mut self) {
-        self.authority.release(self.owner, self.bytes);
-    }
-}
-
-/// Cloneable handle to an explicitly finite authority; never defaults to unlimited.
+/// Explicit allocation and staging capabilities from one provider.
 #[derive(Clone)]
 pub struct WriterResources {
-    authority: Arc<dyn ResourceAuthority>,
+    allocation: AllocationResources,
+    stage: Arc<dyn ResourceAuthority>,
 }
 impl WriterResources {
-    pub fn new(authority: Arc<dyn ResourceAuthority>) -> Self {
-        Self { authority }
+    /// Both capabilities originate from the same provider; allocation-only
+    /// callers can borrow the finite core resources without stage access.
+    pub fn new<T: AllocationAuthority + ResourceAuthority + 'static>(authority: Arc<T>) -> Self {
+        Self {
+            allocation: AllocationResources::new(authority.clone()),
+            stage: authority,
+        }
     }
-    /// Scope is inline, including identity and authority handle, with no heap
-    /// allocation per writer. Its containing owner must account retained storage.
+    pub fn allocation(&self) -> &AllocationResources {
+        &self.allocation
+    }
     pub fn scope(&self) -> Result<WriterScope, ResourceError> {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        self.authority.check_cancelled()?;
-        let owner = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| ResourceError::new(ResourceErrorKind::Authority, 1, 0))?;
         Ok(WriterScope {
-            resources: self.clone(),
-            owner: OwnerId(owner),
+            allocation: self.allocation.scope()?,
+            stage: self.stage.clone(),
         })
     }
 }
 
-/// Inline allocation identity. Cloning grants no bytes and allocates nothing.
+/// Inline scope: ownership stays in the core allocation capability, while stage
+/// creation remains confined to the format layer. Cloning allocates no bytes.
 #[derive(Clone)]
 pub struct WriterScope {
-    resources: WriterResources,
-    owner: OwnerId,
+    allocation: AllocationScope,
+    stage: Arc<dyn ResourceAuthority>,
 }
 impl WriterScope {
-    pub fn owner(&self) -> OwnerId {
-        self.owner
+    pub fn allocation(&self) -> &AllocationScope {
+        &self.allocation
     }
-    pub fn reserve(&self, layout: Layout) -> Result<AllocationGrant, ResourceError> {
-        self.resources
-            .authority
-            .clone()
-            .try_reserve(self.owner, layout)
+    pub fn owner(&self) -> OwnerId {
+        self.allocation.owner()
+    }
+    pub fn reserve(&self, layout: Layout) -> Result<AllocationLease, ResourceError> {
+        self.allocation.reserve(layout)
     }
     pub fn check_cancelled(&self) -> Result<(), ResourceError> {
-        self.resources.authority.check_cancelled()
+        self.allocation.check_cancelled()
     }
-    pub fn stage(&self) -> Result<Box<dyn OperationStage>, FormatError> {
-        self.resources.authority.clone().create_stage(self.clone())
+    pub fn stage(&self) -> Result<OperationStage, FormatError> {
+        self.check_cancelled()?;
+        self.stage.clone().create_stage(self.clone())
     }
 }
 
@@ -245,12 +116,12 @@ impl MemoryOnlyResources {
             .unwrap_or_else(|e| e.into_inner())
     }
 }
-impl ResourceAuthority for MemoryAuthority {
+impl AllocationAuthority for MemoryAuthority {
     fn try_reserve(
         self: Arc<Self>,
         owner: OwnerId,
         layout: Layout,
-    ) -> Result<AllocationGrant, ResourceError> {
+    ) -> Result<AllocationLease, ResourceError> {
         let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
         let available = self.limit.saturating_sub(*used);
         if layout.size() > available {
@@ -262,7 +133,7 @@ impl ResourceAuthority for MemoryAuthority {
         }
         *used += layout.size();
         drop(used);
-        Ok(AllocationGrant::admitted(self, owner, layout.size()))
+        AllocationLease::admitted(self, owner, layout.size())
     }
     fn release(&self, _: OwnerId, bytes: usize) {
         *self.used.lock().unwrap_or_else(|e| e.into_inner()) -= bytes;
@@ -270,19 +141,50 @@ impl ResourceAuthority for MemoryAuthority {
     fn check_cancelled(&self) -> Result<(), ResourceError> {
         Ok(())
     }
-    fn create_stage(
-        self: Arc<Self>,
-        scope: WriterScope,
-    ) -> Result<Box<dyn OperationStage>, FormatError> {
+}
+impl ResourceAuthority for MemoryAuthority {
+    fn create_stage(self: Arc<Self>, scope: WriterScope) -> Result<OperationStage, FormatError> {
         StorageStage::create(scope.clone(), MemoryStorage::new(scope))
     }
 }
 
-/// Private encoding destination. An error permanently prevents sealing.
-pub trait OperationStage: Write + Send {
+/// Private encoding destination with admitted backing retained through deallocation.
+///
+/// The inline owner drops its boxed backend before releasing the metadata grant.
+/// Finishing consumes the writable capability and moves this same owner into
+/// sealed bytes; no raw backend or independently detachable grant is exposed.
+pub struct OperationStage {
+    backend: Box<dyn StageBackend>,
+    _metadata: AllocationLease,
+}
+
+impl OperationStage {
     /// Bounded failure evidence, retained without copying provider diagnostics.
+    pub fn failure(&self) -> Option<ResourceError> {
+        self.backend.failure()
+    }
+
+    /// Seal without reallocating the backend, retaining its grant through readback.
+    pub fn finish(mut self) -> Result<PreparedBytes, FormatError> {
+        let len = self.backend.seal()?;
+        Ok(PreparedBytes { len, stage: self })
+    }
+}
+
+impl Write for OperationStage {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.backend.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.backend.flush()
+    }
+}
+
+trait StageBackend: Write + Send {
     fn failure(&self) -> Option<ResourceError>;
-    fn finish(self: Box<Self>) -> Result<PreparedBytes, FormatError>;
+    fn seal(&mut self) -> Result<u64, FormatError>;
+    fn deliver(&mut self, destination: &mut dyn Write, len: u64) -> Result<(), FormatError>;
 }
 
 /// Storage implementations own their memory/files and support bounded readback.
@@ -314,34 +216,33 @@ pub struct StorageStage<S: StageStorage> {
     progress: ReservedBuffer,
     scope: WriterScope,
     failed: Option<ResourceError>,
-    _metadata: AllocationGrant,
 }
 impl<S: StageStorage + 'static> StorageStage<S> {
     /// Reserve metadata and progress before any storage writes or destination effects.
-    pub fn create(
-        scope: WriterScope,
-        mut storage: S,
-    ) -> Result<Box<dyn OperationStage>, FormatError> {
+    pub fn create(scope: WriterScope, mut storage: S) -> Result<OperationStage, FormatError> {
         let metadata = scope.reserve(Layout::new::<Self>()).inspect_err(|&error| {
             storage.resource_failed(error);
         })?;
-        let mut progress = ReservedBuffer::new(scope.clone());
+        let mut progress = ReservedBuffer::new(scope.allocation().clone());
         progress
             .extend_from_slice(&[0; PROGRESS_BYTES])
             .inspect_err(|&error| {
                 storage.resource_failed(error);
             })?;
-        Ok(crate::reserved::try_box(Self {
+        let backend = crate::reserved::try_box(Self {
             storage,
             progress,
             scope,
             failed: None,
-            _metadata: metadata,
         })
         .map_err(|(error, mut stage)| {
             stage.record_failure(error);
             error
-        })?)
+        })?;
+        Ok(OperationStage {
+            backend,
+            _metadata: metadata,
+        })
     }
 }
 impl<S: StageStorage> StorageStage<S> {
@@ -390,11 +291,11 @@ impl<S: StageStorage> Write for StorageStage<S> {
         })
     }
 }
-impl<S: StageStorage + 'static> OperationStage for StorageStage<S> {
+impl<S: StageStorage> StageBackend for StorageStage<S> {
     fn failure(&self) -> Option<ResourceError> {
         self.failed
     }
-    fn finish(mut self: Box<Self>) -> Result<PreparedBytes, FormatError> {
+    fn seal(&mut self) -> Result<u64, FormatError> {
         if let Some(error) = self.failed {
             return Err(error.into());
         }
@@ -404,17 +305,9 @@ impl<S: StageStorage + 'static> OperationStage for StorageStage<S> {
         let len = self.storage.seal().inspect_err(|&error| {
             self.record_failure(error);
         })?;
-        // Reuse the existing admitted box as readback; no second allocation.
-        Ok(PreparedBytes {
-            len,
-            readback: self,
-        })
+        Ok(len)
     }
-}
-trait Readback: Send {
-    fn deliver(&mut self, destination: &mut dyn Write, len: u64) -> Result<(), FormatError>;
-}
-impl<S: StageStorage> Readback for StorageStage<S> {
+
     fn deliver(
         &mut self,
         destination: &mut dyn Write,
@@ -461,7 +354,7 @@ impl<S: StageStorage> Readback for StorageStage<S> {
 /// grants exactly once. Generic I/O may partially accept bytes before failing.
 pub struct PreparedBytes {
     len: u64,
-    readback: Box<dyn Readback>,
+    stage: OperationStage,
 }
 impl PreparedBytes {
     pub fn len(&self) -> u64 {
@@ -471,7 +364,7 @@ impl PreparedBytes {
         self.len == 0
     }
     pub fn deliver(mut self, destination: &mut dyn Write) -> Result<(), FormatError> {
-        self.readback.deliver(destination, self.len)
+        self.stage.backend.deliver(destination, self.len)
     }
 }
 
@@ -487,7 +380,7 @@ pub struct MemoryStorage {
 impl MemoryStorage {
     pub fn new(scope: WriterScope) -> Self {
         Self {
-            chunks: crate::reserved::ReservedVec::new(scope.clone()),
+            chunks: crate::reserved::ReservedVec::new(scope.allocation().clone()),
             scope,
             len: 0,
             read: 0,
@@ -511,7 +404,7 @@ impl MemoryStorage {
         }
         let index = self.len / STAGE_CHUNK_BYTES;
         if index == self.chunks.len() {
-            let mut chunk = ReservedBuffer::new(self.scope.clone());
+            let mut chunk = ReservedBuffer::new(self.scope.allocation().clone());
             chunk.reserve_exact(STAGE_CHUNK_BYTES)?;
             self.chunks.push(chunk)?;
         }

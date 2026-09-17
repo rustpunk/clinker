@@ -9,6 +9,7 @@
 // ===========================================================================
 
 mod dispatch {
+    use clinker_record::owned_storage::{OwnedKey, SharedStorage};
     use std::sync::Arc;
 
     use clinker_record::{GroupByKey, Record, Schema, Value};
@@ -26,12 +27,14 @@ mod dispatch {
     use clinker_plan::config::ErrorStrategy;
     use clinker_plan::error::PipelineError;
 
-    fn make_schema(cols: &[&str]) -> Arc<Schema> {
-        Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()))
+    fn make_schema(cols: &[&str]) -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(
+            cols.iter().map(|c| (*c).into()).collect(),
+        )))
     }
 
-    fn make_record(s: &Arc<Schema>, vals: Vec<Value>) -> Record {
-        Record::new(Arc::clone(s), vals)
+    fn make_record(s: &SharedStorage<Schema>, vals: Vec<Value>) -> Record {
+        Record::new(s.clone(), vals)
     }
 
     /// Compile a CXL aggregate snippet against `input_fields` (typed
@@ -72,20 +75,20 @@ mod dispatch {
 
         // Output schema = non-meta emit names in declaration order
         // (mirrors `ExecutionPlanDag::compile`).
-        let output_columns: Vec<Box<str>> = compiled
+        let output_columns: Vec<OwnedKey> = compiled
             .emits
             .iter()
-            .map(|e| e.output_name.clone())
+            .map(|e| OwnedKey::from(e.output_name.as_ref()))
             .collect();
-        let output_schema = Arc::new(Schema::new(output_columns));
+        let output_schema = SharedStorage::from_arc(Arc::new(Schema::new(output_columns)));
 
         // Spill schema: group-by columns ++ __acc_state.
-        let mut spill_cols: Vec<Box<str>> = group_by_owned
+        let mut spill_cols: Vec<OwnedKey> = group_by_owned
             .iter()
-            .map(|s| Box::<str>::from(s.as_str()))
+            .map(|s| OwnedKey::from(s.as_str()))
             .collect();
         spill_cols.push("__acc_state".into());
-        let spill_schema = Arc::new(Schema::new(spill_cols));
+        let spill_schema = SharedStorage::from_arc(Arc::new(Schema::new(spill_cols)));
 
         let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
 
@@ -377,12 +380,12 @@ nodes:
         let group_by_owned: Vec<String> = group_by.iter().map(|s| (*s).to_string()).collect();
         let compiled = extract_aggregates(&typed, &group_by_owned, &schema_names).expect("extract");
 
-        let output_columns: Vec<Box<str>> = compiled
+        let output_columns: Vec<OwnedKey> = compiled
             .emits
             .iter()
-            .map(|e| e.output_name.clone())
+            .map(|e| OwnedKey::from(e.output_name.as_ref()))
             .collect();
-        let output_schema = Arc::new(Schema::new(output_columns));
+        let output_schema = SharedStorage::from_arc(Arc::new(Schema::new(output_columns)));
         let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
         crate::aggregation::StreamingAggregator::new_for_raw(
             Arc::new(compiled),
@@ -1262,6 +1265,7 @@ nodes:
 // ----- Single-Encoder Two-Phase Bytes tests -----
 
 mod two_phase_bytes_encoder {
+    use clinker_record::owned_storage::{OwnedKey, SharedStorage};
     use std::sync::Arc;
 
     use clinker_record::{Record, Schema, Value};
@@ -1271,12 +1275,14 @@ mod two_phase_bytes_encoder {
     use crate::pipeline::streaming_merge::{GroupBoundary, StreamingErrorMode};
     use clinker_plan::error::PipelineError;
 
-    fn schema(cols: &[&str]) -> Arc<Schema> {
-        Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()))
+    fn schema(cols: &[&str]) -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(
+            cols.iter().map(|c| (*c).into()).collect(),
+        )))
     }
 
-    fn rec(s: &Arc<Schema>, vals: Vec<Value>) -> Record {
-        Record::new(Arc::clone(s), vals)
+    fn rec(s: &SharedStorage<Schema>, vals: Vec<Value>) -> Record {
+        Record::new(s.clone(), vals)
     }
 
     fn dummy_state() -> AggregatorGroupState {
@@ -1566,10 +1572,10 @@ mod two_phase_bytes_encoder {
         let mut rng = Rng::new(0xC0FFEE);
 
         for schema_types in &schemas {
-            let col_names: Vec<Box<str>> = (0..schema_types.len())
+            let col_names: Vec<OwnedKey> = (0..schema_types.len())
                 .map(|i| col_name(i).into())
                 .collect();
-            let s = Arc::new(Schema::new(col_names));
+            let s = SharedStorage::from_arc(Arc::new(Schema::new(col_names)));
             let group_by: Vec<String> = (0..schema_types.len()).map(col_name).collect();
             let fields = group_by_sort_fields(&group_by, &s);
             let encoder = SortKeyEncoder::new(fields);
@@ -1594,7 +1600,7 @@ mod two_phase_bytes_encoder {
             let encoded: Vec<Vec<u8>> = rows
                 .iter()
                 .map(|(v, _)| {
-                    let r = Record::new(Arc::clone(&s), v.clone());
+                    let r = Record::new(s.clone(), v.clone());
                     let mut buf = Vec::new();
                     encoder.encode_into(&r, &mut buf);
                     buf
@@ -1623,6 +1629,7 @@ mod two_phase_bytes_encoder {
 // ===========================================================================
 
 mod two_phase_bytes_spill {
+    use clinker_record::owned_storage::{OwnedKey, SharedStorage};
     use std::sync::Arc;
 
     use clinker_record::{Record, Schema, Value};
@@ -1672,19 +1679,19 @@ mod two_phase_bytes_spill {
         let compiled =
             extract_aggregates(&typed, &group_by_owned, &schema_names).expect("extract_aggregates");
 
-        let output_columns: Vec<Box<str>> = compiled
+        let output_columns: Vec<OwnedKey> = compiled
             .emits
             .iter()
-            .map(|e| e.output_name.clone())
+            .map(|e| OwnedKey::from(e.output_name.as_ref()))
             .collect();
-        let output_schema = Arc::new(Schema::new(output_columns));
+        let output_schema = SharedStorage::from_arc(Arc::new(Schema::new(output_columns)));
 
-        let mut spill_cols: Vec<Box<str>> = group_by_owned
+        let mut spill_cols: Vec<OwnedKey> = group_by_owned
             .iter()
-            .map(|s| Box::<str>::from(s.as_str()))
+            .map(|s| OwnedKey::from(s.as_str()))
             .collect();
         spill_cols.push("__acc_state".into());
-        let spill_schema = Arc::new(Schema::new(spill_cols));
+        let spill_schema = SharedStorage::from_arc(Arc::new(Schema::new(spill_cols)));
 
         let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
 
@@ -1712,8 +1719,8 @@ mod two_phase_bytes_spill {
         })
     }
 
-    fn make_input_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec!["k".into()]))
+    fn make_input_schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["k".into()])))
     }
 
     fn ctx_for<'a>(stable: &'a StableEvalContext, file: &'a Arc<str>, row: u64) -> EvalContext<'a> {
@@ -1782,7 +1789,7 @@ mod two_phase_bytes_spill {
         let stable = StableEvalContext::test_default();
         let file: Arc<str> = Arc::from("test.csv");
         for (i, k) in dataset().into_iter().enumerate() {
-            let r = Record::new(Arc::clone(&s), vec![Value::String(k.into())]);
+            let r = Record::new(s.clone(), vec![Value::String(k.into())]);
             agg.add_record(&r, i as u64, &ctx_for(&stable, &file, i as u64))
                 .unwrap();
         }
@@ -1875,6 +1882,7 @@ mod group_boundary_sort_order {
     //! unconditional, not gated on `debug_assertions`. This test gates
     //! the always-on contract so a future refactor can't quietly demote
     //! it to `debug_assert!` without turning red.
+    use clinker_record::owned_storage::SharedStorage;
     use std::sync::Arc;
 
     use clinker_record::{Record, Schema, Value};
@@ -1883,12 +1891,14 @@ mod group_boundary_sort_order {
     use crate::pipeline::sort_key::SortKeyEncoder;
     use crate::pipeline::streaming_merge::{GroupBoundary, StreamingErrorMode};
 
-    fn schema(cols: &[&str]) -> Arc<Schema> {
-        Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()))
+    fn schema(cols: &[&str]) -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(
+            cols.iter().map(|c| (*c).into()).collect(),
+        )))
     }
 
-    fn rec(s: &Arc<Schema>, vals: Vec<Value>) -> Record {
-        Record::new(Arc::clone(s), vals)
+    fn rec(s: &SharedStorage<Schema>, vals: Vec<Value>) -> Record {
+        Record::new(s.clone(), vals)
     }
 
     fn finalize_noop(_r: &Record, _s: &AggregatorGroupState) -> Result<Record, HashAggError> {

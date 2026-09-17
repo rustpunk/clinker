@@ -34,6 +34,7 @@ pub use streaming_class::{
     compute_streaming_combine_probe_edges, compute_transform_fused_sources,
 };
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::{BTreeSet, HashMap};
 
 use indexmap::IndexMap;
@@ -121,7 +122,7 @@ pub enum PlanNode {
         /// by this source carries this exact `Arc` so downstream
         /// `Arc::ptr_eq` schema checks hit the fast path.
         #[serde(skip)]
-        output_schema: Arc<Schema>,
+        output_schema: SharedStorage<Schema>,
     },
     Transform {
         name: String,
@@ -159,7 +160,7 @@ pub enum PlanNode {
         /// on top of the upstream's schema so `Record::set` at emit sites
         /// always hits a known slot.
         #[serde(skip)]
-        output_schema: Arc<Schema>,
+        output_schema: SharedStorage<Schema>,
     },
     Route {
         name: String,
@@ -206,11 +207,11 @@ pub enum PlanNode {
         /// Canonical output schema adopted from `input[0]`. All Merge inputs
         /// are structurally equal per the Merge contract (validated in
         /// `bind_schema`); picking one canonical `Arc` lets Merge emit every
-        /// record via `Arc::clone(&output_schema)` so downstream operators
+        /// record via `output_schema.clone()` so downstream operators
         /// always hit the `Arc::ptr_eq` fast path instead of structural
         /// fallback on input-switches.
         #[serde(skip)]
-        output_schema: Arc<Schema>,
+        output_schema: SharedStorage<Schema>,
     },
     Sink {
         name: String,
@@ -246,7 +247,7 @@ pub enum PlanNode {
         /// `$meta.*` audit columns Reshape stamps. Populated by
         /// `bind_schema`.
         #[serde(skip)]
-        output_schema: Arc<Schema>,
+        output_schema: SharedStorage<Schema>,
         /// Per-rule typechecked CXL programs (`when` / `set` / `overrides`),
         /// one [`CompiledReshapeRule`] per entry in `config.rules` and in
         /// the same declaration order. Built at lowering from
@@ -284,7 +285,7 @@ pub enum PlanNode {
         /// widen). Both the main and `removed_to` ports carry it.
         /// Populated by `bind_schema`.
         #[serde(skip)]
-        output_schema: Arc<Schema>,
+        output_schema: SharedStorage<Schema>,
         /// Extracted aggregate plan for the OR-combined `drop_group_when`
         /// decision program (emit target
         /// [`CULL_DROP_DECISION_COLUMN`](crate::config::pipeline_node::CULL_DROP_DECISION_COLUMN)).
@@ -343,7 +344,7 @@ pub enum PlanNode {
         /// Output schema, adopted verbatim from the body input (Envelope does
         /// not widen). Populated by `bind_schema`.
         #[serde(skip)]
-        output_schema: Arc<Schema>,
+        output_schema: SharedStorage<Schema>,
         /// Compiled declarative header/footer synthesis. `Some` iff the node
         /// declared a `config.header:` or `config.footer:` map; the executor
         /// then stamps the synthesized sections into each output document's
@@ -403,7 +404,7 @@ pub enum PlanNode {
         has_distinct: bool,
         strategy: AggregateStrategy,
         #[serde(skip)]
-        output_schema: Arc<Schema>,
+        output_schema: SharedStorage<Schema>,
         /// Reason streaming was not selected. Populated by the
         /// `select_aggregation_strategies` post-pass when
         /// `config.strategy == Auto` and eligibility was `HashFallback`.
@@ -436,7 +437,7 @@ pub enum PlanNode {
         /// Lowered output schema of the composition body. Populated by
         /// `bind_composition` from the body's terminal-node output row.
         #[serde(skip)]
-        output_schema: Arc<Schema>,
+        output_schema: SharedStorage<Schema>,
     },
     /// Planner-synthesized terminal commit node for `correlation_key` pipelines.
     ///
@@ -540,7 +541,7 @@ pub enum PlanNode {
         /// collected array; for `match: first | all` it is the body-emit
         /// widened schema. Populated by `bind_schema::bind_combine`.
         #[serde(skip)]
-        output_schema: Arc<Schema>,
+        output_schema: SharedStorage<Schema>,
         /// Pre-resolved `(side, column-index)` for every qualified field
         /// reference in the combine body. Populated by the CXL typechecker
         /// walk over the body against the per-input schemas; consumed
@@ -782,7 +783,7 @@ impl PlanNode {
         }
     }
 
-    /// The stored `Arc<Schema>` for this node. For variants whose output
+    /// The stored `SharedStorage<Schema>` for this node. For variants whose output
     /// row shape matches the upstream (Route/Output/Sort), callers must
     /// resolve via the graph (see [`PlanNode::output_schema_in`]).
     /// Names of CXL-emitted columns this node produces, for downstream
@@ -843,7 +844,7 @@ impl PlanNode {
         }
     }
 
-    pub fn stored_output_schema(&self) -> Option<&Arc<Schema>> {
+    pub fn stored_output_schema(&self) -> Option<&SharedStorage<Schema>> {
         match self {
             PlanNode::Source { output_schema, .. }
             | PlanNode::Transform { output_schema, .. }
@@ -861,17 +862,17 @@ impl PlanNode {
         }
     }
 
-    /// The `Arc<Schema>` this node emits. For row-preserving variants
+    /// The `SharedStorage<Schema>` this node emits. For row-preserving variants
     /// (Route/Output/Sort) this walks the graph to the sole upstream and
     /// returns its schema. At the top level the DAG invariant is that
     /// these variants always have exactly one incoming data edge; in
     /// composition-body context a Route at the body root may consume
     /// an input port that doesn't appear as a graph edge — for that
-    /// case we fall back to a leaked empty `Arc<Schema>` so downstream
+    /// case we fall back to a leaked empty `SharedStorage<Schema>` so downstream
     /// schema checks see "no expected schema" (paired with the body
     /// arm that already handles this gracefully via the
     /// `expected_input_schema_in() -> Option<&Arc>` shape).
-    pub fn output_schema_in<'a>(&'a self, dag: &'a ExecutionPlanDag) -> &'a Arc<Schema> {
+    pub fn output_schema_in<'a>(&'a self, dag: &'a ExecutionPlanDag) -> &'a SharedStorage<Schema> {
         if let Some(s) = self.stored_output_schema() {
             return s;
         }
@@ -890,14 +891,15 @@ impl PlanNode {
         // structural check will fail unless the consumer also short-
         // circuits on `expected.column_count() == 0` — which the
         // current dispatcher arms do via the `Option<&Arc<_>>` peek.
-        // The Arc is leaked because `&'a Arc<Schema>` requires a
+        // The Arc is leaked because `&'a SharedStorage<Schema>` requires a
         // borrow that outlives this call; the leak is one-shot per
         // body Route at compile time.
-        static EMPTY_SCHEMA: std::sync::OnceLock<Arc<Schema>> = std::sync::OnceLock::new();
-        EMPTY_SCHEMA.get_or_init(|| Arc::new(Schema::new(Vec::new())))
+        static EMPTY_SCHEMA: std::sync::OnceLock<SharedStorage<Schema>> =
+            std::sync::OnceLock::new();
+        EMPTY_SCHEMA.get_or_init(|| SharedStorage::from_arc(Arc::new(Schema::new(Vec::new()))))
     }
 
-    /// The `Arc<Schema>` this node expects to see on incoming records.
+    /// The `SharedStorage<Schema>` this node expects to see on incoming records.
     /// Equal to the sole upstream's `output_schema_in` for every variant
     /// with exactly one incoming edge (Transform/Aggregate/Route/Output/
     /// Sort/Composition). Returns `None` for Sources (no upstream) and
@@ -905,7 +907,7 @@ impl PlanNode {
     pub fn expected_input_schema_in<'a>(
         &'a self,
         dag: &'a ExecutionPlanDag,
-    ) -> Option<&'a Arc<Schema>> {
+    ) -> Option<&'a SharedStorage<Schema>> {
         if matches!(self, PlanNode::Source { .. }) {
             return None;
         }

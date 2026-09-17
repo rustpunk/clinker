@@ -29,6 +29,13 @@ readback storage, and the retained progress buffer streams bytes to the
 destination without a second operation-sized allocation. A truncated readback
 fails instead of delivering an apparently complete operation.
 
+`OperationStage` is a sealed owner, returned directly by
+`ResourceAuthority::create_stage`. Storage extensions implement `StageStorage`
+and construct it with `StorageStage::create`; they cannot extract the boxed
+backend or release its metadata grant before deallocation. The grant stays
+with both writable and sealed storage through successful delivery, failure,
+cancellation, early drop and unwinding.
+
 Admission, allocation, quota and cancellation failures retain a typed inline
 `ResourceError`. `StageStorage::failure` and `resource_error` recover that
 evidence from the nonallocating standard-I/O sentinel at write, flush and

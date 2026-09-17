@@ -107,7 +107,7 @@ pub fn validate_nested_depth(value: &Value) -> Result<(), NestedDepthError> {
                         limit: MAX_NESTED_VALUE_DEPTH,
                     });
                 }
-                for value in values {
+                for value in values.as_slice() {
                     visit(value, next)?;
                 }
             }
@@ -119,7 +119,7 @@ pub fn validate_nested_depth(value: &Value) -> Result<(), NestedDepthError> {
                         limit: MAX_NESTED_VALUE_DEPTH,
                     });
                 }
-                for value in values.values() {
+                for value in values.as_map().values() {
                     visit(value, next)?;
                 }
             }
@@ -143,7 +143,7 @@ pub fn validate_nested_keys(value: &Value) -> Result<(), NestedKeyError> {
                         limit: MAX_NESTED_VALUE_DEPTH,
                     });
                 }
-                for value in values {
+                for value in values.as_slice() {
                     visit(value, next)?;
                 }
             }
@@ -155,9 +155,9 @@ pub fn validate_nested_keys(value: &Value) -> Result<(), NestedKeyError> {
                         limit: MAX_NESTED_VALUE_DEPTH,
                     });
                 }
-                for (position, (key, value)) in values.iter().enumerate() {
+                for (position, (key, value)) in values.as_map().iter().enumerate() {
                     let decoded = NestedKey::decode(key)?;
-                    for prior in values.keys().take(position) {
+                    for prior in values.as_map().keys().take(position) {
                         if NestedKey::decode(prior)?.text == decoded.text {
                             return Err(NestedKeyError::DuplicateLogicalKey {
                                 key: decoded.text.into_owned(),
@@ -200,7 +200,7 @@ mod tests {
         let mut values = indexmap::IndexMap::new();
         values.insert("@id".into(), Value::Integer(1));
         values.insert("\\@id".into(), Value::Integer(2));
-        let value = Value::Map(Box::new(values));
+        let value = Value::Map(crate::owned_storage::OwnedMap::from_map(values));
         assert_eq!(
             validate_nested_keys(&value),
             Err(NestedKeyError::DuplicateLogicalKey { key: "@id".into() })
@@ -212,7 +212,7 @@ mod tests {
         fn nested(depth: usize) -> Value {
             let mut value = Value::Null;
             for _ in 0..depth {
-                value = Value::Array(vec![value]);
+                value = Value::Array(crate::owned_storage::OwnedValues::from_vec(vec![value]));
             }
             value
         }

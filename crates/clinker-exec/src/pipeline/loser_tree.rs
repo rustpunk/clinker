@@ -6,6 +6,8 @@
 //!
 //! Reference: DataFusion PR #4301 (50-72% faster than BinaryHeap).
 
+#[cfg(test)]
+use clinker_record::owned_storage::SharedStorage;
 use std::cmp::Ordering;
 
 use clinker_record::Record;
@@ -52,6 +54,13 @@ pub struct LoserTree<T: Ord> {
 }
 
 impl<T: Ord> LoserTree<T> {
+    /// Retained vector capacities plus caller-described cursor payload heaps.
+    /// Shared state referenced by cursors belongs to their enclosing owner.
+    pub(crate) fn retained_heap_bytes(&self, heap: impl Fn(&T) -> usize) -> usize {
+        self.tree.capacity() * std::mem::size_of::<usize>()
+            + self.cursors.capacity() * std::mem::size_of::<Option<T>>()
+            + self.cursors.iter().flatten().map(heap).sum::<usize>()
+    }
     /// Create a new loser tree from initial entries (one per stream).
     pub fn new(initial_entries: Vec<Option<T>>) -> Self {
         let k = initial_entries.len();
@@ -163,7 +172,7 @@ mod tests {
             record: {
                 use clinker_record::{Record, Schema, Value};
                 use std::sync::Arc;
-                let schema = Arc::new(Schema::new(vec!["v".into()]));
+                let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["v".into()])));
                 Record::new(schema, vec![Value::Integer(key as i64)])
             },
         })
@@ -237,7 +246,7 @@ mod tests {
             record: {
                 use clinker_record::{Record, Schema, Value};
                 use std::sync::Arc;
-                let s = Arc::new(Schema::new(vec!["x".into()]));
+                let s = SharedStorage::from_arc(Arc::new(Schema::new(vec!["x".into()])));
                 Record::new(s, vec![Value::Integer(999)]) // record content irrelevant
             },
         };
@@ -246,7 +255,7 @@ mod tests {
             record: {
                 use clinker_record::{Record, Schema, Value};
                 use std::sync::Arc;
-                let s = Arc::new(Schema::new(vec!["x".into()]));
+                let s = SharedStorage::from_arc(Arc::new(Schema::new(vec!["x".into()])));
                 Record::new(s, vec![Value::Integer(1)]) // different record, but key matters
             },
         };
@@ -294,7 +303,7 @@ mod tests {
                 record: {
                     use clinker_record::{Record, Schema, Value};
                     use std::sync::Arc;
-                    let s = Arc::new(Schema::new(vec!["v".into()]));
+                    let s = SharedStorage::from_arc(Arc::new(Schema::new(vec!["v".into()])));
                     Record::new(s, vec![Value::Integer(k as i64)])
                 },
             });
@@ -321,7 +330,7 @@ mod tests {
                 record: {
                     use clinker_record::{Record, Schema, Value};
                     use std::sync::Arc;
-                    let s = Arc::new(Schema::new(vec!["v".into()]));
+                    let s = SharedStorage::from_arc(Arc::new(Schema::new(vec!["v".into()])));
                     Record::new(s, vec![Value::Integer(k as i64)])
                 },
             });

@@ -46,8 +46,9 @@ use super::detect::RetractScope;
 use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, admit_node_buffer_transferred,
     admit_node_buffer_with_readers, dispatch_plan_node, drain_node_buffer_slot,
-    estimate_node_buffer_bytes, node_buffer_spill_allowed, planned_materialized_reader_counts,
-    require_node_buffer_input, validate_completed_node_buffer_scope,
+    estimate_node_buffer_unaccounted_bytes, node_buffer_spill_allowed,
+    planned_materialized_reader_counts, require_node_buffer_input,
+    validate_completed_node_buffer_scope,
 };
 use crate::executor::node_buffer::NodeBuffer;
 use clinker_plan::error::PipelineError;
@@ -545,7 +546,10 @@ fn recurse_into_body(
             // re-emit at the parent's call site; here we take records only.
             let (records, _puncts) = input.drain_split()?;
             if let Some(reservation) = reservation.as_ref() {
-                reservation.set_bytes(estimate_node_buffer_bytes(&records));
+                reservation.set_bytes(estimate_node_buffer_unaccounted_bytes(
+                    &records,
+                    &ctx.allocation_resources,
+                ));
             }
             harvested.extend(records);
             if let Some(reservation) = reservation {
@@ -602,12 +606,17 @@ fn recurse_into_body(
             Some(slot) => {
                 let reservation =
                     crate::executor::node_buffer::reserve_node_buffer_materialization(
-                        slot.replacement_materialization_bytes_after_unregister(),
+                        slot.replacement_materialization_bytes_after_unregister(
+                            &ctx.allocation_resources,
+                        ),
                         &ctx.memory_budget,
                         parent_dag.graph[composition_idx].name(),
                     )?;
                 let rows = slot.drain_split()?.0;
-                reservation.set_bytes(estimate_node_buffer_bytes(&rows));
+                reservation.set_bytes(estimate_node_buffer_unaccounted_bytes(
+                    &rows,
+                    &ctx.allocation_resources,
+                ));
                 harvest_reservations.push(reservation);
                 rows
             }

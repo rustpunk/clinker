@@ -11,6 +11,7 @@
 pub mod multi_file;
 pub(crate) mod order_barrier;
 
+use clinker_record::owned_storage::{OwnedKey, SharedStorage};
 use std::sync::Arc;
 
 use clinker_format::traits::FormatReader;
@@ -39,7 +40,7 @@ pub trait RecordSource: Send {
     /// Resolve the record schema. `&mut self` because some sources discover
     /// their columns only by reading — a CSV reader has to consume the header
     /// row before it can answer.
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError>;
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError>;
 
     /// Yield the next record, or `None` at end of input. Finite by
     /// contract — every transport EOFs after exhausting its cursor.
@@ -62,7 +63,7 @@ pub trait RecordSource: Send {
     fn prepare_document(
         &mut self,
         _config: &EnvelopeConfig,
-    ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
+    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
         Ok(IndexMap::new())
     }
 
@@ -119,7 +120,7 @@ pub trait RecordSource: Send {
 /// wraps it for schema coercion, then hands the `Box<dyn FormatReader>` to
 /// the shared ingest loop as a `RecordSource`.
 impl RecordSource for Box<dyn FormatReader> {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
         (**self).schema()
     }
 
@@ -134,7 +135,7 @@ impl RecordSource for Box<dyn FormatReader> {
     fn prepare_document(
         &mut self,
         config: &EnvelopeConfig,
-    ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
+    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
         (**self).prepare_document(config)
     }
 

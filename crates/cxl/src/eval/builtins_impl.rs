@@ -3,12 +3,13 @@ use std::path::Path;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 use clinker_record::Value;
 use clinker_record::coercion::{DECIMAL_ROUNDING, coerce_to_decimal};
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues};
 use regex::Regex;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
 use super::context::{EvalContext, MAX_STRING_OUTPUT};
-use super::error::EvalError;
+use super::error::{EvalError, EvalErrorKind};
 use crate::lexer::Span;
 
 /// Dispatch a method call on a receiver value.
@@ -108,7 +109,7 @@ pub fn dispatch_method(
             if let (Value::String(s), Some(Value::String(delim))) = (receiver, args.first()) {
                 let parts: Vec<Value> =
                     s.split(&**delim).map(|p| Value::String(p.into())).collect();
-                Ok(Some(Value::Array(parts)))
+                Ok(Some(Value::Array(OwnedValues::from_vec(parts))))
             } else {
                 Ok(Some(Value::Null))
             }
@@ -679,13 +680,13 @@ pub fn dispatch_method(
 
         // ── Map ─────────────────────────────────────────────────
         "keys" => Ok(Some(match receiver {
-            Value::Map(m) => {
-                Value::Array(m.keys().map(|k| Value::String(k.as_ref().into())).collect())
-            }
+            Value::Map(m) => Value::Array(OwnedValues::from_vec(
+                m.keys().map(|k| Value::String(k.as_ref().into())).collect(),
+            )),
             _ => Value::Null,
         })),
         "values" => Ok(Some(match receiver {
-            Value::Map(m) => Value::Array(m.values().cloned().collect()),
+            Value::Map(m) => Value::Array(OwnedValues::from_vec(m.values().cloned().collect())),
             _ => Value::Null,
         })),
         "merge" => Ok(Some(match (receiver, args.first()) {
@@ -694,7 +695,7 @@ pub fn dispatch_method(
                 for (k, v) in b.iter() {
                     out.insert(k.clone(), v.clone());
                 }
-                Value::Map(Box::new(out))
+                Value::Map(OwnedMap::from_map(out))
             }
             _ => Value::Null,
         })),
@@ -703,7 +704,7 @@ pub fn dispatch_method(
                 // A bare key (no `.` / `[n]`) inserts at the top level. A
                 // dotted/indexed path descends, auto-creating missing
                 // intermediate Maps; see `map_set_path` for the conflict rules.
-                map_set_path(m, key.as_str(), val)
+                map_set_path(m, key.as_str(), val, span)?
             }
             _ => Value::Null,
         })),
@@ -711,7 +712,7 @@ pub fn dispatch_method(
             (Value::Map(m), Some(Value::String(key))) => {
                 let mut out = (**m).clone();
                 out.shift_remove(key.as_str());
-                Value::Map(Box::new(out))
+                Value::Map(OwnedMap::from_map(out))
             }
             _ => Value::Null,
         })),
@@ -814,48 +815,58 @@ fn parse_set_path(key: &str) -> Option<Vec<PathSeg<'_>>> {
 /// next segment (e.g. indexing a map, or fielding an array) — and on an array
 /// index past the end (no silent auto-grow). A malformed path string is also
 /// `Null`.
-fn map_set_path(m: &indexmap::IndexMap<Box<str>, Value>, key: &str, val: &Value) -> Value {
+fn map_set_path(
+    m: &indexmap::IndexMap<OwnedKey, Value>,
+    key: &str,
+    val: &Value,
+    span: Span,
+) -> Result<Value, EvalError> {
     let Some(segs) = parse_set_path(key) else {
-        return Value::Null;
+        return Ok(Value::Null);
     };
-    let mut root = Value::Map(Box::new(m.clone()));
-    if set_in(&mut root, &segs, val) {
+    let mut root = Value::Map(OwnedMap::from_map(m.clone()));
+    Ok(if set_in(&mut root, &segs, val, span)? {
         root
     } else {
         Value::Null
-    }
+    })
 }
 
-/// Writes `val` at the path `segs` inside `target`, descending in place into
-/// the caller's already-cloned copy. Returns `false` on any conflict so the
-/// caller can discard the partial copy and yield `Null` for the whole `.set`.
-fn set_in(target: &mut Value, segs: &[PathSeg<'_>], val: &Value) -> bool {
+/// Mutate the already distinct container copy, propagating invariant failures
+/// separately from authored path conflicts (which return false).
+fn set_in(
+    target: &mut Value,
+    segs: &[PathSeg<'_>],
+    val: &Value,
+    span: Span,
+) -> Result<bool, EvalError> {
     let Some((head, rest)) = segs.split_first() else {
         *target = val.clone();
-        return true;
+        return Ok(true);
     };
     match (head, target) {
         (PathSeg::Field(name), Value::Map(map)) => {
+            let mut map = map.legacy_mut().ok_or_else(|| {
+                EvalError::new(
+                    EvalErrorKind::InvariantViolation {
+                        message: "nested mutation requires a distinct legacy container copy".into(),
+                    },
+                    span,
+                )
+            })?;
             if rest.is_empty() {
-                map.insert(Box::from(*name), val.clone());
-                true
+                map.insert(OwnedKey::from(*name), val.clone());
+                Ok(true)
             } else {
-                // Auto-create a missing intermediate as an empty map so the
-                // path can build structure; an existing wrong-kind child trips
-                // the conflict check one level down.
-                let child = map
-                    .entry(Box::from(*name))
-                    .or_insert_with(|| Value::Map(Box::new(indexmap::IndexMap::new())));
-                set_in(child, rest, val)
+                let child = map.get_or_insert_with(OwnedKey::from(*name), Value::empty_map);
+                set_in(child, rest, val, span)
             }
         }
         (PathSeg::Index(idx), Value::Array(items)) => match items.get_mut(*idx) {
-            Some(child) => set_in(child, rest, val),
-            None => false, // index past the end → Null, no auto-grow
+            Some(child) => set_in(child, rest, val, span),
+            None => Ok(false),
         },
-        // Field-into-array, index-into-map, or any scalar where a container is
-        // required: a hard type conflict.
-        _ => false,
+        _ => Ok(false),
     }
 }
 
@@ -883,11 +894,11 @@ fn set_in(target: &mut Value, segs: &[PathSeg<'_>], val: &Value) -> bool {
 /// which yields `Null` on a conflicting path). Array elements are removed with a
 /// down-shift so the array shrinks by one. The receiver is cloned before any
 /// edit, so the caller's binding is untouched.
-fn map_unset_path(m: &indexmap::IndexMap<Box<str>, Value>, key: &str) -> Value {
+fn map_unset_path(m: &indexmap::IndexMap<OwnedKey, Value>, key: &str) -> Value {
     let Some(segs) = parse_set_path(key) else {
-        return Value::Map(Box::new(m.clone()));
+        return Value::Map(OwnedMap::from_map(m.clone()));
     };
-    let mut root = Value::Map(Box::new(m.clone()));
+    let mut root = Value::Map(OwnedMap::from_map(m.clone()));
     // The cloned `root` is the unchanged receiver whether or not `unset_in`
     // deletes anything, so a no-op simply returns it as-is.
     unset_in(&mut root, &segs);
@@ -914,9 +925,9 @@ fn unset_in(target: &mut Value, segs: &[PathSeg<'_>]) -> bool {
             if rest.is_empty() {
                 // `shift_remove` deletes the entry and preserves the order of the
                 // surviving keys; absence is a no-op.
-                map.shift_remove(*name).is_some()
+                map.shift_remove(name).is_some()
             } else {
-                match map.get_mut(*name) {
+                match map.get_mut(name) {
                     Some(child) => unset_in(child, rest),
                     None => false, // missing intermediate → no-op
                 }

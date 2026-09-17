@@ -6,6 +6,7 @@
 //! concrete document grain: that would silently merge multiple documents into
 //! one interchange/message envelope.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::sync::Arc;
 
 use clinker_format::error::FormatError;
@@ -78,7 +79,7 @@ impl StructuredOutputDocumentGuard {
     pub(crate) fn observe(
         &mut self,
         output_name: &str,
-        doc_ctx: &Arc<DocumentContext>,
+        doc_ctx: &SharedStorage<DocumentContext>,
     ) -> Result<(), PipelineError> {
         let Some(format) = self.format else {
             return Ok(());
@@ -111,12 +112,12 @@ mod tests {
     use super::*;
     use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
 
-    fn doc(file: &str) -> Arc<DocumentContext> {
-        Arc::new(DocumentContext::new(
+    fn doc(file: &str) -> SharedStorage<DocumentContext> {
+        SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from(file),
             EnvelopeRecord::empty(),
-        ))
+        )))
     }
 
     #[test]

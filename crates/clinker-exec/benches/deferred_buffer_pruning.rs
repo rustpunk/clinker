@@ -19,15 +19,15 @@
 
 use clinker_exec::pipeline::arena::Arena;
 use clinker_exec::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+use clinker_record::owned_storage::SharedStorage;
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use std::sync::Arc;
 
 const ROW_COUNT: usize = 10_000;
 const WIDE_COLUMN_COUNT: usize = 50;
 const NARROW_COLUMN_COUNT: usize = 5;
 
-fn build_wide_schema() -> Arc<Schema> {
+fn build_wide_schema() -> SharedStorage<Schema> {
     let mut builder = SchemaBuilder::with_capacity(WIDE_COLUMN_COUNT);
     for i in 0..WIDE_COLUMN_COUNT {
         builder = builder.with_field(format!("col_{i}"));
@@ -42,7 +42,7 @@ fn build_wide_rows() -> Vec<(Record, u64)> {
             let values: Vec<Value> = (0..WIDE_COLUMN_COUNT)
                 .map(|c| Value::String(format!("row{i}_col{c}").into()))
                 .collect();
-            (Record::new(Arc::clone(&schema), values), i as u64)
+            (Record::new(schema.clone(), values), i as u64)
         })
         .collect()
 }

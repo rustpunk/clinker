@@ -17,8 +17,8 @@
 //! switch to `on_unmapped: drop` / `reject` for explicit scalar
 //! semantics.
 
+use clinker_record::owned_storage::{OwnedMap, OwnedValues, SharedStorage};
 use std::io::{BufReader, Read};
-use std::sync::Arc;
 
 use crate::bom::SkipBom;
 use crate::fixed_width::field::{self, ResolvedField, ResolvedRepeatingGroup};
@@ -61,7 +61,7 @@ pub struct FixedWidthReader<R: Read> {
     /// a field a `split_values` entry covers, `None` otherwise. Built once at
     /// construction so per-record extraction is a positional lookup.
     split_delims: Vec<Option<String>>,
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     config: FixedWidthReaderConfig,
     record_length: usize,
     line_buf: Vec<u8>,
@@ -209,8 +209,8 @@ impl<R: Read> FixedWidthReader<R> {
 }
 
 impl<R: Read + Send> FormatReader for FixedWidthReader<R> {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-        Ok(Arc::clone(&self.schema))
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+        Ok(self.schema.clone())
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
@@ -272,7 +272,7 @@ impl<R: Read + Send> FormatReader for FixedWidthReader<R> {
             .map(|value| value.expect("every resolved layout is visited once"))
             .collect();
 
-        Ok(Some(Record::new(Arc::clone(&self.schema), values)))
+        Ok(Some(Record::new(self.schema.clone(), values)))
     }
 }
 
@@ -372,10 +372,13 @@ fn read_group(
             let value = field::extract_value(&positioned, line, row)?;
             map.insert(child.name.clone().into(), value);
         }
-        occurrences.push(clinker_record::Value::Map(Box::new(map)));
+        occurrences.push(clinker_record::Value::Map(OwnedMap::from_map(map)));
     }
     let width = group.encoded_width(count);
-    Ok((clinker_record::Value::Array(occurrences), width))
+    Ok((
+        clinker_record::Value::Array(OwnedValues::from_vec(occurrences)),
+        width,
+    ))
 }
 
 fn inferred_padded_count(
@@ -475,11 +478,11 @@ mod tests {
         assert_eq!(record.get("id"), Some(&Value::Integer(1)));
         assert_eq!(
             record.get("tags"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::String("b".into()),
                 Value::String("c".into()),
-            ]))
+            ])))
         );
     }
 
@@ -501,11 +504,11 @@ mod tests {
         let record = reader.next_record().unwrap().unwrap();
         assert_eq!(
             record.get("codes"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::Integer(1),
                 Value::Integer(2),
                 Value::Integer(3),
-            ]))
+            ])))
         );
     }
 
@@ -533,7 +536,10 @@ mod tests {
         let mut reader =
             FixedWidthReader::new(&data[..], fields, split_config("tags", ";")).unwrap();
         let record = reader.next_record().unwrap().unwrap();
-        assert_eq!(record.get("tags"), Some(&Value::Array(Vec::new())));
+        assert_eq!(
+            record.get("tags"),
+            Some(&Value::Array(OwnedValues::from_vec(Vec::new())))
+        );
     }
 
     #[test]

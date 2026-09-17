@@ -36,6 +36,8 @@
 use std::io::{BufReader, Read};
 use std::sync::Arc;
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
+
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
@@ -111,7 +113,7 @@ impl Default for Hl7ReaderConfig {
 /// envelope section without re-reading the source.
 pub struct Hl7Reader<R: Read> {
     tokenizer: SegmentTokenizer<BufReader<R>>,
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     max_fields: usize,
     /// The ordered field-column layout: each positional field is either kept
     /// verbatim as one `fNN` column or exploded into its split-leaf columns.
@@ -296,7 +298,7 @@ impl<R: Read> Hl7Reader<R> {
                 "BHS" => self.open_batch(&segment)?,
                 "BTS" => self.close_batch(&segment)?,
                 "MSH" => {
-                    self.open_message(&segment);
+                    self.open_message(&segment)?;
                     let record = self.body_record(&raw, &segment)?;
                     return Ok(Some(record));
                 }
@@ -405,7 +407,7 @@ impl<R: Read> Hl7Reader<R> {
     /// tallying it against the open batch. The previous message (if any) is
     /// closed first — HL7 has no per-message trailer, so the next `MSH` is
     /// the boundary.
-    fn open_message(&mut self, msh: &ParsedSegment) {
+    fn open_message(&mut self, msh: &ParsedSegment) -> Result<(), FormatError> {
         self.close_message_if_open();
         let message_type = msh
             .fields
@@ -426,13 +428,14 @@ impl<R: Read> Hl7Reader<R> {
         // one frame.
         let delims = self.tokenizer.delimiters();
         self.pending_events.push(EnvelopeEvent::OpenLevel {
-            sections: message_section(msh, &delims),
+            sections: message_section(msh, &delims)?,
             frame: FrameRole::NewFrame,
         });
         self.open_message = Some(OpenMessage {
             control_id,
             message_type,
         });
+        Ok(())
     }
 
     /// Close the open message (if any), queuing its `CloseLevel`. A no-op
@@ -486,7 +489,7 @@ impl<R: Read> Hl7Reader<R> {
         for group in &self.field_layout {
             self.push_field_group(raw, segment, group, &delims, &mut values)?;
         }
-        Ok(Record::new(Arc::clone(&self.schema), values))
+        Ok(Record::new(self.schema.clone(), values))
     }
 
     /// Append a field group's values to a record's value list: one cell for a
@@ -527,8 +530,8 @@ impl<R: Read> Hl7Reader<R> {
 }
 
 impl<R: Read + Send> FormatReader for Hl7Reader<R> {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-        Ok(Arc::clone(&self.schema))
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+        Ok(self.schema.clone())
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
@@ -546,7 +549,7 @@ impl<R: Read + Send> FormatReader for Hl7Reader<R> {
     fn prepare_document(
         &mut self,
         config: &EnvelopeConfig,
-    ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
+    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
         if config.is_empty() {
             return Ok(IndexMap::new());
         }
@@ -565,7 +568,7 @@ impl<R: Read + Send> FormatReader for Hl7Reader<R> {
             }
         }
 
-        let mut out: IndexMap<Box<str>, Value> = IndexMap::with_capacity(config.sections.len());
+        let mut out: IndexMap<OwnedKey, Value> = IndexMap::with_capacity(config.sections.len());
         for (name, section) in &config.sections {
             let segment_tag = match &section.extract {
                 EnvelopeExtract::Segment(tag) => tag.as_str(),
@@ -602,7 +605,10 @@ impl<R: Read + Send> FormatReader for Hl7Reader<R> {
                 .map(|(i, f)| (positional_key(i), f.clone()))
                 .collect();
             let typed = coerce_section_fields(raw, &section.fields).map_err(FormatError::Hl7)?;
-            out.insert(Box::from(name.as_str()), Value::Map(Box::new(typed)));
+            out.insert(
+                OwnedKey::from(name.as_str()),
+                Value::Map(OwnedMap::from_map(typed)),
+            );
         }
         Ok(out)
     }
@@ -614,36 +620,51 @@ impl<R: Read + Send> FormatReader for Hl7Reader<R> {
 /// reconstruction of an echoed `MSH` header, and the message's delimiter
 /// declaration so the writer re-emits the message with the delimiter set
 /// its header declared.
-fn message_section(msh: &ParsedSegment, delims: &Delimiters) -> IndexMap<Box<str>, Value> {
+fn message_section(
+    msh: &ParsedSegment,
+    delims: &Delimiters,
+) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
     let mut sections = positional_section(MESSAGE_SECTION, &msh.fields);
     if let Some(Value::Map(fields)) = sections.get_mut(MESSAGE_SECTION) {
+        let mut fields = fields.legacy_mut().ok_or_else(|| {
+            FormatError::Hl7("internal invariant: freshly constructed message section must have legacy map storage".into())
+        })?;
         let raw: Vec<Value> = msh
             .fields
             .iter()
             .map(|f| Value::String(f.as_str().into()))
             .collect();
-        fields.insert(Box::from(RAW_FIELDS_KEY), Value::Array(raw));
+        fields.insert(
+            OwnedKey::from(RAW_FIELDS_KEY),
+            Value::Array(OwnedValues::from_vec(raw)),
+        );
         // HL7 delimiters are printable ASCII in practice; a pathological
         // non-UTF-8 byte degrades through the lossy conversion and is then
         // rejected by the writer's declaration parse rather than silently
         // corrupting the output.
         let declaration = String::from_utf8_lossy(&delims.declaration()).into_owned();
-        fields.insert(Box::from(DELIMITERS_KEY), Value::String(declaration.into()));
+        fields.insert(
+            OwnedKey::from(DELIMITERS_KEY),
+            Value::String(declaration.into()),
+        );
     }
-    sections
+    Ok(sections)
 }
 
 /// Build a single-named `$doc` section whose fields are the segment's
 /// positional fields (`f01`, `f02`, …). Used for the nested `BHS`/`MSH`
 /// levels, which carry their whole header verbatim rather than a
 /// user-declared field schema.
-fn positional_section(name: &str, fields: &[String]) -> IndexMap<Box<str>, Value> {
-    let mut payload: IndexMap<Box<str>, Value> = IndexMap::with_capacity(fields.len());
+fn positional_section(name: &str, fields: &[String]) -> IndexMap<OwnedKey, Value> {
+    let mut payload: IndexMap<OwnedKey, Value> = IndexMap::with_capacity(fields.len());
     for (i, f) in fields.iter().enumerate() {
-        payload.insert(positional_key(i).into_boxed_str(), string_or_null(f));
+        payload.insert(positional_key(i).into(), string_or_null(f));
     }
-    let mut sections: IndexMap<Box<str>, Value> = IndexMap::with_capacity(1);
-    sections.insert(Box::from(name), Value::Map(Box::new(payload)));
+    let mut sections: IndexMap<OwnedKey, Value> = IndexMap::with_capacity(1);
+    sections.insert(
+        OwnedKey::from(name),
+        Value::Map(OwnedMap::from_map(payload)),
+    );
     sections
 }
 
@@ -694,17 +715,17 @@ pub fn generated_columns(max_fields: usize, splits: &[Hl7FieldSplit]) -> Vec<Col
 /// `fNN`. All columns are string-typed; field text is stored verbatim
 /// (escapes decoded) so the round-trip is lossless. Shares its column identity
 /// with [`generated_columns`].
-fn build_schema(layout: &[FieldGroup]) -> Arc<Schema> {
-    let mut columns: Vec<Box<str>> = Vec::with_capacity(3 + layout.len());
-    columns.push(Box::from("seg_id"));
-    columns.push(Box::from("set_ref"));
-    columns.push(Box::from("set_type"));
+fn build_schema(layout: &[FieldGroup]) -> SharedStorage<Schema> {
+    let mut columns: Vec<OwnedKey> = Vec::with_capacity(3 + layout.len());
+    columns.push(OwnedKey::from("seg_id"));
+    columns.push(OwnedKey::from("set_ref"));
+    columns.push(OwnedKey::from("set_type"));
     for group in layout {
         for name in group.column_names() {
-            columns.push(name.into_boxed_str());
+            columns.push(name.into());
         }
     }
-    Arc::new(Schema::new(columns))
+    SharedStorage::from_arc(Arc::new(Schema::new(columns)))
 }
 
 /// Positional field column name for field index `i`: `f01`, `f02`, …
@@ -1292,22 +1313,22 @@ mod tests {
 
         // Attach a document context (no FHS section; the message-level MSH
         // is rebuilt from the record stream) and re-emit through the writer.
-        let ctx = Arc::new(DocumentContext::new(
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("adt.hl7"),
             EnvelopeRecord::empty(),
-        ));
+        )));
         let schema = r.schema().unwrap();
         let out = {
             let mut buf = Vec::new();
             let mut w = Hl7Writer::new(
                 std::io::Cursor::new(&mut buf),
-                Arc::clone(&schema),
+                schema.clone(),
                 Hl7WriterConfig::default(),
             );
             for rec in &body_recs {
                 let mut rec = rec.clone();
-                rec.set_doc_ctx(Arc::clone(&ctx));
+                rec.set_doc_ctx(ctx.clone());
                 w.write_record(&rec).unwrap();
             }
             w.flush().unwrap();
@@ -1366,22 +1387,22 @@ mod tests {
         // Attach the message-level document the reader produced — the same
         // sections the executor's ingest driver would layer onto every body
         // record — and re-emit through the writer.
-        let ctx = Arc::new(DocumentContext::new(
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("custom.hl7"),
             EnvelopeRecord::from_sections(msg_sections.expect("MSH opens a message level")),
-        ));
+        )));
         let schema = r.schema().unwrap();
         let out = {
             let mut buf = Vec::new();
             let mut w = Hl7Writer::new(
                 std::io::Cursor::new(&mut buf),
-                Arc::clone(&schema),
+                schema.clone(),
                 Hl7WriterConfig::default(),
             );
             for rec in &body_recs {
                 let mut rec = rec.clone();
-                rec.set_doc_ctx(Arc::clone(&ctx));
+                rec.set_doc_ctx(ctx.clone());
                 w.write_record(&rec).unwrap();
             }
             w.flush().unwrap();
@@ -1442,7 +1463,7 @@ mod tests {
             let mut buf = Vec::new();
             let mut w = Hl7Writer::new(
                 std::io::Cursor::new(&mut buf),
-                Arc::clone(&schema),
+                schema.clone(),
                 Hl7WriterConfig::default(),
             );
             for rec in &body_recs {

@@ -19,6 +19,7 @@
 //! accepted forms.
 
 use clinker_record::Value;
+use clinker_record::owned_storage::OwnedValues;
 use serde::de::{self};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -297,8 +298,10 @@ pub(crate) fn split_text_value_escaped(value: &Value, delimiter: &str, escape: &
         out
     }
     match value {
-        Value::String(s) => Value::Array(parts(s.as_str(), delimiter, escape)),
-        Value::Array(items) => Value::Array(
+        Value::String(s) => {
+            Value::Array(OwnedValues::from_vec(parts(s.as_str(), delimiter, escape)))
+        }
+        Value::Array(items) => Value::Array(OwnedValues::from_vec(
             items
                 .iter()
                 .flat_map(|item| match item {
@@ -306,8 +309,8 @@ pub(crate) fn split_text_value_escaped(value: &Value, delimiter: &str, escape: &
                     other => vec![other.clone()],
                 })
                 .collect(),
-        ),
-        other => Value::Array(vec![other.clone()]),
+        )),
+        other => Value::Array(OwnedValues::from_vec(vec![other.clone()])),
     }
 }
 

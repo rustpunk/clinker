@@ -8,8 +8,6 @@
 //! dispatcher's `Merge` arm is a single delegating call into
 //! [`dispatch_merge`].
 
-use std::sync::Arc;
-
 use clinker_record::Record;
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
@@ -274,9 +272,9 @@ where
                 // per-record envelope context across the
                 // rebuild — each merged row keeps the document
                 // it came from.
-                let doc_ctx = Arc::clone(record.doc_ctx());
+                let doc_ctx = record.doc_ctx().clone();
                 let values = record.values().to_vec();
-                record = Record::new(Arc::clone(canonical), values);
+                record = Record::new(canonical.clone(), values);
                 record.set_doc_ctx(doc_ctx);
             }
             merged.push((record, rn));

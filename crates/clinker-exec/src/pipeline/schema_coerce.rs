@@ -1,6 +1,6 @@
 //! Schema-based type coercion + declared-schema reprojection for source records.
 //!
-//! Wraps a `FormatReader` and returns records whose `Arc<Schema>` is the
+//! Wraps a `FormatReader` and returns records whose `SharedStorage<Schema>` is the
 //! source's user-declared schema (extended with the `$widened` engine-
 //! stamped sidecar column for `OnUnmapped::AutoWiden`), with the
 //! per-Source `OnUnmapped` policy applied to undeclared input fields:
@@ -43,6 +43,7 @@
 //! Those readers keep every other reprojection service (the
 //! `OnUnmapped` policy, the `$widened` sidecar, the `long_unique` storage hint).
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -164,7 +165,7 @@ impl MultiRecordProofs {
 }
 
 /// Wraps a `FormatReader` and reprojects every record onto the
-/// user-declared `Arc<Schema>` (plus the `$widened` engine-stamped
+/// user-declared `SharedStorage<Schema>` (plus the `$widened` engine-stamped
 /// sidecar slot for `AutoWiden`), applying the per-Source
 /// `OnUnmapped` policy to undeclared input fields.
 pub struct CoercingReader {
@@ -187,7 +188,7 @@ pub struct CoercingReader {
     aliased_exposed: HashMap<Box<str>, Box<str>>,
     /// Output schema — declared columns (keyed by exposed name) followed
     /// (under `AutoWiden`) by the `$widened` engine-stamped sidecar column.
-    output_schema: Arc<Schema>,
+    output_schema: SharedStorage<Schema>,
     /// Per-output-column admission target, indexed by position in
     /// `output_schema`. Every slot has one explicit disposition, including
     /// authored `Any`, reader-proven positional values, and the engine-owned
@@ -421,7 +422,7 @@ impl CoercingReader {
         } else {
             None
         };
-        let output_schema: Arc<Schema> = builder.build();
+        let output_schema: SharedStorage<Schema> = builder.build();
 
         Ok(CoercingReader {
             inner,
@@ -450,7 +451,7 @@ impl CoercingReader {
     /// plus the `$widened` sidecar for `AutoWiden`).
     fn reproject(&self, record: &Record) -> Result<Record, FormatError> {
         // Collect undeclared keys for the policy decision.
-        let mut sidecar: Option<IndexMap<Box<str>, Value>> = None;
+        let mut sidecar: Option<IndexMap<OwnedKey, Value>> = None;
         for (k, v) in record.iter_all_fields() {
             if !self.declared_names.contains(k) {
                 // Guard the alias collision before any policy branch: an input
@@ -493,7 +494,7 @@ impl CoercingReader {
             // non-declared keys were observed); otherwise Null.
             if Some(i) == self.widened_idx {
                 values.push(match sidecar.take() {
-                    Some(map) if !map.is_empty() => Value::Map(Box::new(map)),
+                    Some(map) if !map.is_empty() => Value::Map(OwnedMap::from_map(map)),
                     _ => Value::Null,
                 });
                 continue;
@@ -578,7 +579,7 @@ impl CoercingReader {
                                 .map_err(|message| format!("element {}: {message}", index + 1))
                         })
                         .collect::<Result<Vec<_>, _>>()
-                        .map(Value::Array),
+                        .map(|values| Value::Array(OwnedValues::from_vec(values))),
                     // Defensive. E361 owns the invariant that a declared-
                     // multiple column comes from a format whose reader
                     // produces an array, so this arm is unreachable for a
@@ -591,8 +592,11 @@ impl CoercingReader {
                     // array and have every downstream array expression read it
                     // as the wrong shape.
                     Value::Null => validate_declared_value(&raw, target, &rules),
-                    scalar => validate_declared_value(scalar, target, &rules)
-                        .map(|value| Value::Array(vec![value])),
+                    scalar => validate_declared_value(scalar, target, &rules).map(|value| {
+                        Value::Array(clinker_record::owned_storage::OwnedValues::from_vec(vec![
+                            value,
+                        ]))
+                    }),
                 }
             } else {
                 validate_declared_value(&raw, target, &rules)
@@ -625,13 +629,13 @@ impl CoercingReader {
             };
             values.push(stored);
         }
-        Ok(Record::new(Arc::clone(&self.output_schema), values))
+        Ok(Record::new(self.output_schema.clone(), values))
     }
 }
 
 impl FormatReader for CoercingReader {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-        Ok(Arc::clone(&self.output_schema))
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+        Ok(self.output_schema.clone())
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
@@ -648,7 +652,7 @@ impl FormatReader for CoercingReader {
     fn prepare_document(
         &mut self,
         config: &clinker_format::EnvelopeConfig,
-    ) -> Result<indexmap::IndexMap<Box<str>, clinker_record::Value>, clinker_format::FormatError>
+    ) -> Result<indexmap::IndexMap<OwnedKey, clinker_record::Value>, clinker_format::FormatError>
     {
         // Envelope sections are extracted from the raw source by the
         // underlying format reader; schema coercion applies to body
@@ -1089,7 +1093,9 @@ mod tests {
         let rec = coercing.next_record().unwrap().unwrap();
         assert_eq!(
             rec.get("codes"),
-            Some(&Value::Array(vec![Value::Integer(7)]))
+            Some(&Value::Array(
+                clinker_record::owned_storage::OwnedValues::from_vec(vec![Value::Integer(7)])
+            ))
         );
         assert_eq!(rec.get("absent"), Some(&Value::Null));
     }
@@ -1200,26 +1206,26 @@ mod tests {
         use std::sync::Arc as StdArc;
 
         struct StubReader {
-            schema: StdArc<RecordSchema>,
+            schema: SharedStorage<RecordSchema>,
             rows: std::vec::IntoIter<Vec<Value>>,
         }
         impl FRTrait for StubReader {
-            fn schema(&mut self) -> Result<StdArc<RecordSchema>, FormatError> {
-                Ok(StdArc::clone(&self.schema))
+            fn schema(&mut self) -> Result<SharedStorage<RecordSchema>, FormatError> {
+                Ok(self.schema.clone())
             }
             fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
                 Ok(self
                     .rows
                     .next()
-                    .map(|v| Record::new(StdArc::clone(&self.schema), v)))
+                    .map(|v| Record::new(self.schema.clone(), v)))
             }
         }
 
-        let schema_arc = StdArc::new(RecordSchema::new(vec!["n".into()]));
+        let schema_arc = SharedStorage::from_arc(StdArc::new(RecordSchema::new(vec!["n".into()])));
         let decl = vec![col("n", Type::Int)];
         for value in [Value::String("42".into()), Value::Null] {
             let reader = Box::new(StubReader {
-                schema: StdArc::clone(&schema_arc),
+                schema: schema_arc.clone(),
                 rows: vec![vec![value]].into_iter(),
             });
             let mut coercing =
@@ -1239,22 +1245,22 @@ mod tests {
         use std::sync::Arc as StdArc;
 
         struct StubReader {
-            schema: StdArc<RecordSchema>,
+            schema: SharedStorage<RecordSchema>,
             value: Option<Value>,
         }
         impl FRTrait for StubReader {
-            fn schema(&mut self) -> Result<StdArc<RecordSchema>, FormatError> {
-                Ok(StdArc::clone(&self.schema))
+            fn schema(&mut self) -> Result<SharedStorage<RecordSchema>, FormatError> {
+                Ok(self.schema.clone())
             }
             fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
                 Ok(self
                     .value
                     .take()
-                    .map(|value| Record::new(StdArc::clone(&self.schema), vec![value])))
+                    .map(|value| Record::new(self.schema.clone(), vec![value])))
             }
         }
 
-        let schema = StdArc::new(RecordSchema::new(vec!["v".into()]));
+        let schema = SharedStorage::from_arc(StdArc::new(RecordSchema::new(vec!["v".into()])));
         let cases = [
             (
                 Value::Decimal(Decimal::new(12_345, 3)),
@@ -1276,7 +1282,7 @@ mod tests {
         ];
         for (value, declaration) in cases {
             let reader = Box::new(StubReader {
-                schema: StdArc::clone(&schema),
+                schema: schema.clone(),
                 value: Some(value),
             });
             let mut coercing =
@@ -1581,24 +1587,27 @@ mod tests {
         use std::sync::Arc as StdArc;
 
         struct PositionalReader {
-            schema: StdArc<RecordSchema>,
+            schema: SharedStorage<RecordSchema>,
             rows: std::vec::IntoIter<Vec<Value>>,
         }
         impl FRTrait for PositionalReader {
-            fn schema(&mut self) -> Result<StdArc<RecordSchema>, FormatError> {
-                Ok(StdArc::clone(&self.schema))
+            fn schema(&mut self) -> Result<SharedStorage<RecordSchema>, FormatError> {
+                Ok(self.schema.clone())
             }
             fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
                 Ok(self
                     .rows
                     .next()
-                    .map(|values| Record::new(StdArc::clone(&self.schema), values)))
+                    .map(|values| Record::new(self.schema.clone(), values)))
             }
         }
 
-        let declared_schema = StdArc::new(RecordSchema::new(vec!["id".into(), "name".into()]));
+        let declared_schema = SharedStorage::from_arc(StdArc::new(RecordSchema::new(vec![
+            "id".into(),
+            "name".into(),
+        ])));
         let reader = Box::new(PositionalReader {
-            schema: StdArc::clone(&declared_schema),
+            schema: declared_schema.clone(),
             rows: vec![
                 vec![Value::String("1".into()), Value::String("Alice".into())],
                 vec![Value::String("2".into()), Value::String("Bob".into())],

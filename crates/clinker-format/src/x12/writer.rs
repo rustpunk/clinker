@@ -32,7 +32,8 @@
 //! therefore only ever flushed at true end of stream.
 
 use std::io::Write;
-use std::sync::Arc;
+
+use clinker_record::owned_storage::SharedStorage;
 
 use clinker_record::{Record, Schema, Value};
 
@@ -154,7 +155,7 @@ impl<W: Write> X12Writer<W> {
     /// Build a writer over a sink with the given schema and config. The
     /// schema's `seg_id` / `set_ref` / `set_type` / `group_ref` / `eNN`
     /// columns are resolved to positional indices once.
-    pub fn new(writer: W, schema: Arc<Schema>, config: X12WriterConfig) -> Self {
+    pub fn new(writer: W, schema: SharedStorage<Schema>, config: X12WriterConfig) -> Self {
         let mut element_columns = Vec::new();
         let mut seg_id_idx = None;
         let mut set_ref_idx = None;
@@ -670,7 +671,9 @@ fn value_to_element(value: &Value, column: &str) -> Result<String, FormatError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues};
     use std::io::Cursor;
+    use std::sync::Arc;
 
     const ISA_ELEMENTS: &[&str] = &[
         "00",
@@ -695,16 +698,16 @@ mod tests {
         "PO", "SENDER", "RECEIVER", "20240101", "1200", "1", "X", "004010",
     ];
 
-    fn schema() -> Arc<Schema> {
-        let mut cols: Vec<Box<str>> = vec!["seg_id".into(), "set_ref".into(), "set_type".into()];
+    fn schema() -> SharedStorage<Schema> {
+        let mut cols: Vec<OwnedKey> = vec!["seg_id".into(), "set_ref".into(), "set_type".into()];
         for i in 1..=4 {
-            cols.push(format!("e{i:02}").into_boxed_str());
+            cols.push(format!("e{i:02}").into());
         }
-        Arc::new(Schema::new(cols))
+        SharedStorage::from_arc(Arc::new(Schema::new(cols)))
     }
 
     fn body(
-        schema: &Arc<Schema>,
+        schema: &SharedStorage<Schema>,
         seg: &str,
         set_ref: &str,
         set_type: &str,
@@ -729,7 +732,7 @@ mod tests {
                 None => values.push(Value::Null),
             }
         }
-        Record::new(Arc::clone(schema), values)
+        Record::new(schema.clone(), values)
     }
 
     fn literal_config() -> X12WriterConfig {
@@ -741,9 +744,13 @@ mod tests {
         }
     }
 
-    fn write_all(config: X12WriterConfig, records: &[Record], schema: &Arc<Schema>) -> String {
+    fn write_all(
+        config: X12WriterConfig,
+        records: &[Record],
+        schema: &SharedStorage<Schema>,
+    ) -> String {
         let mut buf = Vec::new();
-        let mut w = X12Writer::new(Cursor::new(&mut buf), Arc::clone(schema), config);
+        let mut w = X12Writer::new(Cursor::new(&mut buf), schema.clone(), config);
         for r in records {
             w.write_record(r).unwrap();
         }
@@ -797,28 +804,28 @@ mod tests {
     fn doc_ctx_with_isa(
         elements: &[&str],
         stamp: Option<Value>,
-    ) -> Arc<clinker_record::DocumentContext> {
+    ) -> SharedStorage<clinker_record::DocumentContext> {
         use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
         use indexmap::IndexMap;
 
-        let raw = Value::Array(
+        let raw = Value::Array(OwnedValues::from_vec(
             elements
                 .iter()
                 .map(|e| Value::String((*e).into()))
                 .collect(),
-        );
-        let mut isa: IndexMap<Box<str>, Value> = IndexMap::new();
+        ));
+        let mut isa: IndexMap<OwnedKey, Value> = IndexMap::new();
         isa.insert(super::RAW_ELEMENTS_KEY.into(), raw);
         if let Some(v) = stamp {
             isa.insert(super::DELIMITERS_KEY.into(), v);
         }
-        let mut sections: IndexMap<Box<str>, Value> = IndexMap::new();
-        sections.insert("interchange".into(), Value::Map(Box::new(isa)));
-        Arc::new(DocumentContext::new(
+        let mut sections: IndexMap<OwnedKey, Value> = IndexMap::new();
+        sections.insert("interchange".into(), Value::Map(OwnedMap::from_map(isa)));
+        SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.x12"),
             EnvelopeRecord::from_sections(sections),
-        ))
+        )))
     }
 
     fn from_doc_config() -> X12WriterConfig {
@@ -933,7 +940,7 @@ mod tests {
         assert!(out.contains("BEG|A*B!"), "{out}");
 
         let mut buf = Vec::new();
-        let mut w = X12Writer::new(Cursor::new(&mut buf), Arc::clone(&s), from_doc_config());
+        let mut w = X12Writer::new(Cursor::new(&mut buf), s.clone(), from_doc_config());
         let err = w.write_record(&stamped_body("A|B")).unwrap_err();
         assert!(
             matches!(&err, FormatError::X12(m) if m.contains("element") && m.contains("no escape")),
@@ -954,7 +961,7 @@ mod tests {
         ));
 
         let mut buf = Vec::new();
-        let mut w = X12Writer::new(Cursor::new(&mut buf), Arc::clone(&s), from_doc_config());
+        let mut w = X12Writer::new(Cursor::new(&mut buf), s.clone(), from_doc_config());
         let err = w.write_record(&record).unwrap_err();
         assert!(
             matches!(&err, FormatError::X12(m) if m.contains("malformed delimiter stamp")),
@@ -1010,10 +1017,10 @@ mod tests {
 
     #[test]
     fn gapped_element_columns_map_by_position() {
-        let cols: Vec<Box<str>> = vec!["seg_id".into(), "e01".into(), "e03".into()];
-        let schema = Arc::new(Schema::new(cols));
+        let cols: Vec<OwnedKey> = vec!["seg_id".into(), "e01".into(), "e03".into()];
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("PO1".into()),
                 Value::String("a".into()),
@@ -1028,10 +1035,10 @@ mod tests {
 
     #[test]
     fn reordered_element_columns_emit_in_position_order() {
-        let cols: Vec<Box<str>> = vec!["seg_id".into(), "e02".into(), "e01".into()];
-        let schema = Arc::new(Schema::new(cols));
+        let cols: Vec<OwnedKey> = vec!["seg_id".into(), "e02".into(), "e01".into()];
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("PO1".into()),
                 Value::String("second".into()),
@@ -1053,7 +1060,7 @@ mod tests {
         // separator must be rejected, not silently corrupt the segment.
         let s = schema();
         let mut buf = Vec::new();
-        let mut w = X12Writer::new(Cursor::new(&mut buf), Arc::clone(&s), literal_config());
+        let mut w = X12Writer::new(Cursor::new(&mut buf), s.clone(), literal_config());
         let err = w
             .write_record(&body(&s, "BEG", "0001", "850", &["A*B"]))
             .unwrap_err();
@@ -1067,7 +1074,7 @@ mod tests {
     fn terminator_byte_in_data_is_rejected() {
         let s = schema();
         let mut buf = Vec::new();
-        let mut w = X12Writer::new(Cursor::new(&mut buf), Arc::clone(&s), literal_config());
+        let mut w = X12Writer::new(Cursor::new(&mut buf), s.clone(), literal_config());
         let err = w
             .write_record(&body(&s, "BEG", "0001", "850", &["A~B"]))
             .unwrap_err();
@@ -1086,7 +1093,7 @@ mod tests {
             ..Default::default()
         };
         let mut buf = Vec::new();
-        let mut w = X12Writer::new(Cursor::new(&mut buf), Arc::clone(&s), cfg);
+        let mut w = X12Writer::new(Cursor::new(&mut buf), s.clone(), cfg);
         let err = w
             .write_record(&body(&s, "BEG", "0001", "850", &["00"]))
             .unwrap_err();
@@ -1102,7 +1109,7 @@ mod tests {
             ..Default::default()
         };
         let mut buf = Vec::new();
-        let mut w = X12Writer::new(Cursor::new(&mut buf), Arc::clone(&s), cfg);
+        let mut w = X12Writer::new(Cursor::new(&mut buf), s.clone(), cfg);
         let err = w
             .write_record(&body(&s, "BEG", "0001", "850", &["00"]))
             .unwrap_err();
@@ -1111,14 +1118,14 @@ mod tests {
 
     #[test]
     fn engine_stamped_columns_excluded() {
-        let cols: Vec<Box<str>> = vec![
+        let cols: Vec<OwnedKey> = vec![
             "seg_id".into(),
             "set_ref".into(),
             "set_type".into(),
             "e01".into(),
             "$source.file".into(),
         ];
-        let schema = Arc::new(Schema::new(cols));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let values = vec![
             Value::String("BEG".into()),
             Value::String("0001".into()),
@@ -1126,7 +1133,7 @@ mod tests {
             Value::String("00".into()),
             Value::String("/tmp/x.x12".into()),
         ];
-        let record = Record::new(Arc::clone(&schema), values);
+        let record = Record::new(schema.clone(), values);
         let out = write_all(literal_config(), &[record], &schema);
         assert!(out.contains("BEG*00~"));
         assert!(!out.contains("/tmp/x.x12"));
@@ -1134,15 +1141,15 @@ mod tests {
 
     #[test]
     fn unrecognized_column_errors_by_name() {
-        let cols: Vec<Box<str>> = vec![
+        let cols: Vec<OwnedKey> = vec![
             "seg_id".into(),
             "set_ref".into(),
             "set_type".into(),
             "amount".into(),
         ];
-        let schema = Arc::new(Schema::new(cols));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("BEG".into()),
                 Value::String("0001".into()),
@@ -1151,7 +1158,7 @@ mod tests {
             ],
         );
         let mut buf = Vec::new();
-        let mut w = X12Writer::new(Cursor::new(&mut buf), Arc::clone(&schema), literal_config());
+        let mut w = X12Writer::new(Cursor::new(&mut buf), schema.clone(), literal_config());
         let err = w.write_record(&record).unwrap_err();
         assert!(matches!(err, FormatError::X12(m) if m.contains("amount")));
     }
@@ -1160,7 +1167,7 @@ mod tests {
     fn flush_finalize_idempotent() {
         let s = schema();
         let mut buf = Vec::new();
-        let mut w = X12Writer::new(Cursor::new(&mut buf), Arc::clone(&s), literal_config());
+        let mut w = X12Writer::new(Cursor::new(&mut buf), s.clone(), literal_config());
         w.write_record(&body(&s, "BEG", "0001", "850", &["00"]))
             .unwrap();
         w.flush().unwrap();
@@ -1178,23 +1185,23 @@ mod tests {
 
     /// Schema with a `group_ref` discriminator column ahead of `set_ref`,
     /// for the multi-functional-group output tests.
-    fn grouped_schema() -> Arc<Schema> {
-        let mut cols: Vec<Box<str>> = vec![
+    fn grouped_schema() -> SharedStorage<Schema> {
+        let mut cols: Vec<OwnedKey> = vec![
             "seg_id".into(),
             "group_ref".into(),
             "set_ref".into(),
             "set_type".into(),
         ];
         for i in 1..=4 {
-            cols.push(format!("e{i:02}").into_boxed_str());
+            cols.push(format!("e{i:02}").into());
         }
-        Arc::new(Schema::new(cols))
+        SharedStorage::from_arc(Arc::new(Schema::new(cols)))
     }
 
     /// Body record carrying a `group_ref` value alongside `set_ref` /
     /// `set_type`, mirroring [`body`] but with the group discriminator.
     fn grouped_body(
-        schema: &Arc<Schema>,
+        schema: &SharedStorage<Schema>,
         seg: &str,
         group_ref: &str,
         set_ref: &str,
@@ -1220,7 +1227,7 @@ mod tests {
                 None => values.push(Value::Null),
             }
         }
-        Record::new(Arc::clone(schema), values)
+        Record::new(schema.clone(), values)
     }
 
     #[test]
@@ -1314,11 +1321,11 @@ mod tests {
     fn anonymous_set_numbers_restart_per_group() {
         // With no set_ref but distinct group_ref values, each group's
         // generated ST02 control number restarts at 0001 within its group.
-        let cols: Vec<Box<str>> = vec!["seg_id".into(), "group_ref".into()];
-        let schema = Arc::new(Schema::new(cols));
+        let cols: Vec<OwnedKey> = vec!["seg_id".into(), "group_ref".into()];
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let rec = |seg: &str, group: &str| {
             Record::new(
-                Arc::clone(&schema),
+                schema.clone(),
                 vec![Value::String(seg.into()), Value::String(group.into())],
             )
         };
@@ -1352,18 +1359,21 @@ mod tests {
     #[test]
     fn map_value_in_element_column_errors_by_name() {
         use indexmap::IndexMap;
-        let cols: Vec<Box<str>> = vec!["seg_id".into(), "e01".into()];
-        let schema = Arc::new(Schema::new(cols));
-        let mut nested: IndexMap<Box<str>, Value> = IndexMap::new();
+        let cols: Vec<OwnedKey> = vec!["seg_id".into(), "e01".into()];
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
+        let mut nested: IndexMap<OwnedKey, Value> = IndexMap::new();
         nested.insert("k".into(), Value::String("v".into()));
         let record = Record::new(
-            Arc::clone(&schema),
-            vec![Value::String("PO1".into()), Value::Map(Box::new(nested))],
+            schema.clone(),
+            vec![
+                Value::String("PO1".into()),
+                Value::Map(OwnedMap::from_map(nested)),
+            ],
         );
         let mut cfg = literal_config();
         cfg.set_type = Some("850".into());
         let mut buf = Vec::new();
-        let mut w = X12Writer::new(Cursor::new(&mut buf), Arc::clone(&schema), cfg);
+        let mut w = X12Writer::new(Cursor::new(&mut buf), schema.clone(), cfg);
         let err = w.write_record(&record).unwrap_err();
         assert!(
             matches!(&err, FormatError::UnserializableMapValue { format: "x12", column } if column == "e01"),

@@ -6,6 +6,7 @@
 //! Transform so the assertions can observe the exact [`SourceRowId`] that
 //! arrived at the end of each path without adding a test-only runtime hook.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 use std::io::Cursor;
 
@@ -303,7 +304,8 @@ fn fanout_dispatch_has_no_scalar_cull_reconstruction_and_charges_typed_carriers(
         "Cull production admission must require SourceRowId directly"
     );
     assert!(route.contains("size_of::<(Record,crate::executor::stream_event::SourceRowId)>"));
-    assert!(dispatch.contains("record_byte_cost(first.schema().column_count())"));
+    assert!(dispatch.contains("fnestimate_node_buffer_unaccounted_bytes("));
+    assert!(dispatch.contains("unaccounted_record_byte_cost(record,resources,)"));
     assert!(node_buffer.contains("size_of::<(Record,SourceRowId)>()"));
     assert!(
         std::mem::size_of::<SourceRowId>() > std::mem::size_of::<u64>(),
@@ -412,15 +414,18 @@ fn fanout_resident_and_node_buffer_spill_keep_identical_typed_membership() {
     );
 }
 
-fn ordering_record(schema: &std::sync::Arc<Schema>, key: i64, label: &str) -> Record {
+fn ordering_record(schema: &SharedStorage<Schema>, key: i64, label: &str) -> Record {
     Record::new(
-        std::sync::Arc::clone(schema),
+        schema.clone(),
         vec![Value::Integer(key), Value::from(label)],
     )
 }
 
 fn ordering_sort_rows(force_spill: bool) -> Vec<(Record, SourceRowId)> {
-    let schema = std::sync::Arc::new(Schema::new(vec!["key".into(), "label".into()]));
+    let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec![
+        "key".into(),
+        "label".into(),
+    ])));
     let source_a = PlanNodeId::new(40);
     let source_b = PlanNodeId::new(41);
     let input = [
@@ -451,7 +456,8 @@ fn ordering_sort_rows(force_spill: bool) -> Vec<(Record, SourceRowId)> {
         usize::MAX,
         Some(spill_dir.path().to_path_buf()),
         true,
-        std::sync::Arc::clone(&schema),
+        schema.clone(),
+        test_allocation_resources(),
     );
     for (record, identity) in input {
         buffer.push(record, identity);
@@ -589,4 +595,13 @@ fn ordering_dispatch_has_no_scalar_sort_reconstruction() {
     assert!(!sort.contains("(iasu64).into()"));
     assert!(sort.contains("SortBuffer<crate::executor::stream_event::SourceRowId>"));
     assert!(merge.contains("VecDeque<(Record,crate::executor::stream_event::SourceRowId)>"));
+}
+
+fn test_allocation_resources() -> clinker_record::owned_storage::AllocationResources {
+    clinker_format::preparation::MemoryOnlyResources::new(
+        std::num::NonZeroUsize::new(1024 * 1024 * 1024).unwrap(),
+    )
+    .resources()
+    .allocation()
+    .clone()
 }

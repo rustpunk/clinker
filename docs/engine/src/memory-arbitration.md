@@ -16,7 +16,13 @@ explicit nonzero memory budget. `ExecutorResources` shares the run's
 telemetry changes no resource limit. Neither provider offers an unlimited
 memory path.
 
-`AllocationGrant` reserves the complete requested `Layout` before allocation.
+The allocation vocabulary lives in `clinker_record::owned_storage`:
+`AllocationAuthority`, `AllocationResources`, `AllocationScope` and the
+non-cloneable `AllocationLease`. Format preparation separately supplies the
+temporary-storage capability. Both use the same executor admission ledger;
+record storage does not depend on the format or executor crates.
+
+`AllocationLease` reserves the complete requested `Layout` before allocation.
 `ReservedBuffer` and `ReservedVec` retain that grant until the allocation is
 freed. Growth reserves the replacement while the old block remains charged;
 allocation failure leaves the old contents and charge intact. Moving a grant
@@ -24,6 +30,11 @@ or transferring it within one authority moves ownership without a release and
 reacquire gap. Splitting or merging grants preserves the total; cross-authority
 transfers are refused. Requested layouts include stage metadata, chunk
 inventories, and retained progress space, rather than just encoded lengths.
+
+`OperationStage` retains its metadata lease outside the boxed storage backend.
+The backend and its allocation are destroyed before that lease is released,
+including on error and unwinding. Sealing moves this same owner into
+`PreparedBytes`; it neither reallocates the backend nor detaches its grant.
 
 The executor admission ledger serializes reservations and limit changes. It
 subtracts sampled legacy consumer usage and outstanding writer grants before
@@ -39,7 +50,13 @@ the synchronous writer would prevent its own release progress. Spill requests
 are consumed at chunk boundaries, and cancellation is checked before consulting
 pause state. Grants and cleanup debt keep the admission owner registered after
 the provider handle drops; the final owner unregisters it on success, error or
-cancellation. [Prepared storage](storage-internals.md#prepared-output-storage)
+cancellation while the run remains open. Closing the run closes admission and
+unregisters the consumer even if an allocation escapes the run. Such an
+allocation retains only the synchronized release state and a weak arbitrator
+reference, so its eventual drop still settles the ledger without retaining the
+run or its telemetry producer. Cleanup debt remains visible until the resource
+is actually released; closing a run does not manufacture a zero balance.
+[Prepared storage](storage-internals.md#prepared-output-storage)
 describes the separate disk and descriptor ownership.
 
 These are requested-allocation bounds, not whole-process RSS bounds. Allocator
@@ -51,6 +68,72 @@ retained authored paths, path-construction envelopes and descriptor inventories
 are admitted separately. Existing parser buffers, input records and legacy
 operators remain with their existing owners; this API does not retroactively
 admit them.
+
+### Allocation-owned record storage
+
+Governed text, positional values, ordered maps and map keys attach their lease
+to the allocation's owner. A record or queue entry is not the lifetime boundary:
+a detached string or key can remain live after its original container drops.
+Shared text clones retain one allocation and one charge. A consuming container
+iterator retains the container charge until its backing is destroyed; yielded
+children keep their own independent owners.
+
+Complete requested layouts are admitted before allocation, including text
+bytes, vector capacity, map entries and hash-table backing, and their owner
+holders. Map bounds follow the pinned container implementation and are checked
+against actual allocator requests. Growth admits old and replacement backing
+simultaneously. Budget refusal or allocation failure preserves the original
+container and returns an unconsumed insertion value.
+
+Shared storage uses a sealed final-owner protocol: the last owner frees the
+shared allocation before destroying its payload, which in turn releases its
+lease after its children. Unique holders follow the same destruction order.
+The public APIs cannot extract an ungoverned backing allocation or grow a
+governed container without admission.
+
+Physical heap estimates and admission contributions answer different questions.
+Physical estimates include governed storage for pressure decisions. Runtime
+admission uses `unaccounted_heap_size` with the executing run's live allocation
+resources. It excludes a backing allocation only when its lease belongs to that
+same ledger, then classifies each child independently. A custom library source
+can supply governed storage from a different provider; that foreign allocation
+still contributes its physical estimate to this run. The comparison reuses the
+existing authority identity and never transfers or releases a grant.
+
+The separate legacy-only traversal describes storage representation and does
+not establish which run owns a charge. Neither traversal subtracts a global
+managed-byte total from a sampled consumer estimate. An ordinary deep copy or
+spill reload creates new legacy storage; it cannot reuse the original
+allocation's charge. These primitives alone do not establish complete reader
+admission or replace existing parser-buffer allowances.
+
+Fixed-row node-buffer and streaming estimates still count the record/identity
+pair and logical value slots; they do not add nested heap to that heuristic.
+Actual rows omit their value slots only when the vector itself belongs to the
+executing ledger. Each row is classified independently, including mixed-width
+batches. Producers and consumers use the same capability and calculate the cost
+before moving the row. A successful send transfers the producer reservation;
+the consumer may already have discharged its share before that send returns.
+Error drains subtract discarded rows individually instead of resetting the
+shared counter.
+
+A consuming memory scan moves its original storage. A shared scan needs new
+value slots while retaining the original backing, and disk rows need their full
+reload forecast. Sort pressure thresholds therefore keep physical size distinct
+from resident attribution. During a streaming spill, the original run remains
+charged through serialization and destruction; each decoded row then receives
+its own charge before publication. Original shared leaves can outlive either
+representation under their intrinsic allocation grants.
+
+Range-join output checks its initial spill-merge frontier before returning any
+row to a consumer. The physical footprint includes the open readers, their
+decoder workspace, merge entries, file inventory and retained metadata. If
+that frontier alone exceeds the run's hard limit, execution returns a structured
+arena memory-budget error and releases its files and charges. The check applies
+to streaming, materialized, delayed and shared output drains, independently of
+the sink format. It does not claim pre-allocation admission or a bound on later
+decoder-table growth; resident attribution still uses the ownership-relative
+queries above.
 
 ### Prepared-output telemetry
 
@@ -154,7 +237,7 @@ stage disk charge on cancellation or read/write/merge failure.
 
 Records spilled through this path keep their typed `SourceRowId` as the stable
 tie-break payload. Spill serialization reconstructs record-owned context, so the
-barrier carries the physical file's original document-context `Arc` once outside
+barrier carries the physical file's original shared document-context handle once outside
 the row spool and reattaches that exact allocation to every repaired record on
 release. This preserves pointer identity without retaining one extra context per
 row and without replaying the source.

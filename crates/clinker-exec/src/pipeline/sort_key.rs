@@ -1098,9 +1098,9 @@ mod tests {
     }
 
     fn make_record(fields: &[(&str, Value)]) -> Record {
-        let schema = Arc::new(Schema::new(
+        let schema = clinker_record::owned_storage::SharedStorage::from_arc(Arc::new(Schema::new(
             fields.iter().map(|(k, _)| (*k).into()).collect(),
-        ));
+        )));
         let values = fields.iter().map(|(_, v)| v.clone()).collect();
         Record::new(schema, values)
     }

@@ -1,3 +1,4 @@
+use clinker_record::owned_storage::{OwnedMap, OwnedValues};
 use std::collections::HashMap;
 
 use chrono::Datelike;
@@ -127,7 +128,10 @@ fn nested_literals_evaluate_in_author_order() {
     );
     assert_eq!(
         map["first"],
-        Value::Array(vec![Value::Integer(1), Value::Integer(2)])
+        Value::Array(OwnedValues::from_vec(vec![
+            Value::Integer(1),
+            Value::Integer(2)
+        ]))
     );
     assert!(matches!(map["computed"], Value::Map(_)));
     assert_eq!(map["last"], Value::Null);
@@ -140,16 +144,19 @@ fn array_comprehension_filters_and_preserves_order() {
         &["values"],
         HashMap::from([(
             "values".into(),
-            Value::Array(vec![
+            Value::Array(OwnedValues::from_vec(vec![
                 Value::Integer(3),
                 Value::Integer(-1),
                 Value::Integer(2),
-            ]),
+            ])),
         )]),
     );
     assert_eq!(
         value,
-        Value::Array(vec![Value::Integer(6), Value::Integer(4)])
+        Value::Array(OwnedValues::from_vec(vec![
+            Value::Integer(6),
+            Value::Integer(4)
+        ]))
     );
 }
 
@@ -1000,13 +1007,16 @@ fn compiled_scalar_evaluates_windowless_surface() {
             &["items"],
             vec![(
                 "items",
-                Value::Array(vec![
+                Value::Array(OwnedValues::from_vec(vec![
                     Value::Integer(1),
                     Value::Integer(2),
                     Value::Integer(3),
-                ]),
+                ])),
             )],
-            Expected::Yields(Value::Array(vec![Value::Integer(2), Value::Integer(3)])),
+            Expected::Yields(Value::Array(OwnedValues::from_vec(vec![
+                Value::Integer(2),
+                Value::Integer(3),
+            ]))),
         ),
         // Division by zero surfaces a runtime error.
         (
@@ -1717,7 +1727,7 @@ mod intra_record {
     }
 
     fn arr(values: Vec<Value>) -> Value {
-        Value::Array(values)
+        Value::Array(OwnedValues::from_vec(values))
     }
 
     fn map(entries: Vec<(&str, Value)>) -> Value {
@@ -1725,7 +1735,7 @@ mod intra_record {
         for (k, v) in entries {
             m.insert(k.into(), v);
         }
-        Value::Map(Box::new(m))
+        Value::Map(OwnedMap::from_map(m))
     }
 
     #[test]

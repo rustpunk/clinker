@@ -51,6 +51,15 @@ Semantic plan identity remains in `clinker-plan`; dataset identity remains in
 `clinker-lineage`. The shared vocabulary therefore owns neither identity nor
 wire-format serialization policy.
 
+### Allocation capability boundary
+
+`clinker-record::owned_storage` owns finite allocation authorities, scopes,
+unique leases and storage owners. `clinker-format::preparation` adds temporary
+storage without moving the allocation vocabulary into the codec layer.
+`clinker-exec` implements both capabilities against its run ledger. The record
+crate has no dependency on executor state, telemetry delivery or format staging;
+an escaped storage owner retains release capability without retaining the run.
+
 ## Current Layering Rules Inferred From Source
 
 - `clinker-core-types` appears intended as a leaf crate: its crate docs say it holds spans, diagnostics, graph, and DLQ vocabulary and "deliberately holds no executor, config, or schema types" (`crates/clinker-core-types/src/lib.rs`).

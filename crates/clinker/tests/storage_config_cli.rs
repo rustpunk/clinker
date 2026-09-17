@@ -488,9 +488,10 @@ fn real_run_logs_per_stage_actual_spill() {
     // (#176 AC#3).
     let tmp = tempdir_path();
     let pipeline = tmp.join("pipeline.yaml");
-    // Inline an 8 MiB memory budget: it admits the exact 7.6 MB terminal
-    // materialization while the aggregate's 50,000-group table still spills.
-    // `backpressure: spill` is required: 8 MiB is below the binary's
+    // Derive terminal materialization from the compiled schema and current
+    // Record layout, then round up to leave room for the writer. The same
+    // 50,000-group workload must still spill, as asserted below.
+    // `backpressure: spill` is required: this budget is below the binary's
     // baseline RSS, which the default `pause` policy rejects at startup
     // (E312); the spill policy never pauses a producer and so spills as
     // this test intends rather than being rejected.
@@ -504,16 +505,32 @@ fn real_run_logs_per_stage_actual_spill() {
     // so the only spill is the group-table spill this test targets.
     let yaml = AGG_PIPELINE_YAML
         .replace(
-            "pipeline:\n  name: storage_obs\n",
-            "pipeline:\n  name: storage_obs\n  memory: { limit: \"8M\", backpressure: spill }\n",
-        )
-        .replace(
             "  - type: aggregate\n    name: dept_totals\n    input: orders\n",
             "  - type: transform\n    name: norm\n    input: orders\n    config:\n      cxl: |\n        emit department = department\n        emit amount = amount\n  - type: aggregate\n    name: dept_totals\n    input: norm\n",
         );
+    let plan = clinker_plan::config::parse_config(&yaml)
+        .expect("parse aggregate fixture")
+        .compile(&clinker_plan::config::CompileContext::default())
+        .expect("compile aggregate fixture");
+    let columns = plan
+        .dag()
+        .graph
+        .node_weights()
+        .filter_map(|node| node.stored_output_schema())
+        .map(|schema| schema.column_count())
+        .max()
+        .expect("fixture has a compiled schema");
+    let row_bytes =
+        std::mem::size_of::<(clinker_record::Record, clinker_exec::executor::SourceRowId)>()
+            + columns * std::mem::size_of::<clinker_record::Value>();
+    let memory_limit = (50_000 * row_bytes).next_power_of_two();
+    let yaml = yaml.replace(
+        "pipeline:\n  name: storage_obs\n",
+        &format!("pipeline:\n  name: storage_obs\n  memory: {{ limit: \"{memory_limit}\", backpressure: spill }}\n"),
+    );
     std::fs::write(&pipeline, &yaml).expect("write pipeline yaml");
     // Every row a distinct department: 50_000 groups dwarf the budget-derived
-    // group-count cap (max_groups = 60% of the 8 MiB budget / est-bytes-per-group
+    // group-count cap (max_groups = 60% of the finite budget / est-bytes-per-group
     // ≈ a few thousand), so the group table crosses the cap and spills before
     // EOF. That cap is derived from the configured budget, not process RSS, so
     // the spill fires deterministically on every host — unlike the prior
@@ -543,7 +560,7 @@ fn real_run_logs_per_stage_actual_spill() {
     // per-stage actuals section must be present on every host.
     assert!(
         stdout.contains("=== Spill Volume (actual, per stage) ==="),
-        "the high-cardinality aggregate must spill its group table under the 8 MiB \
+        "the high-cardinality aggregate must spill its group table under the finite \
          budget, so the per-stage actual-spill section must be printed; got:\n{stdout}"
     );
     assert!(

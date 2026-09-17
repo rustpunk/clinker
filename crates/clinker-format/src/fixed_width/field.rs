@@ -8,6 +8,7 @@
 //! `bool`) parses the same way regardless of whether the file is single- or
 //! multi-record — instead of two forks that drift apart.
 
+use clinker_record::owned_storage::OwnedValues;
 use std::io::{BufRead, BufReader, Read};
 
 use chrono::NaiveDate;
@@ -555,7 +556,7 @@ pub fn extract_split_value(
 ) -> Result<Value, FormatError> {
     let raw = field_text(field, line, row)?;
     if raw.is_empty() {
-        return Ok(Value::Array(Vec::new()));
+        return Ok(Value::Array(OwnedValues::from_vec(Vec::new())));
     }
     let parts = raw
         .split(delimiter)
@@ -573,7 +574,7 @@ pub fn extract_split_value(
             })
         })
         .collect::<Result<Vec<Value>, _>>()?;
-    Ok(Value::Array(parts))
+    Ok(Value::Array(OwnedValues::from_vec(parts)))
 }
 
 /// Borrow a field's raw (un-coerced) text from a record line, stripped of

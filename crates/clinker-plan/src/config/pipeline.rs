@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::yaml::Spanned;
+use clinker_record::owned_storage::SharedStorage;
 // Default `fNN`/`eNN` ceilings each reader enforces, referenced by the HL7
 // split-field reachability check and the `$doc` positional-bound validation
 // so the planner's bounds cannot drift from the reader's own constants.
@@ -3841,7 +3842,7 @@ pub(crate) fn lower_node_to_plan_node(
     use clinker_record::{FieldMetadata, SchemaBuilder};
     use std::sync::Arc;
 
-    // Build an `Arc<Schema>` from the bound output row for this node.
+    // Build an `SharedStorage<Schema>` from the bound output row for this node.
     // Returns an empty sentinel if bind_schema didn't record one — the
     // caller skips lowering in every such case, so the sentinel never
     // reaches the executor.
@@ -3859,9 +3860,9 @@ pub(crate) fn lower_node_to_plan_node(
     // classify aggregate columns as source-CK shadows. The marker
     // travels with the column through the DAG: when a Transform /
     // Aggregate / Combine output row inherits a `$ck.*` column, its
-    // own `Arc<Schema>` recovers the same metadata here. The reserved
+    // own `SharedStorage<Schema>` recovers the same metadata here. The reserved
     // `$` prefix guarantees no user-declared column collides.
-    let schema_from_bound = || -> Arc<clinker_record::Schema> {
+    let schema_from_bound = || -> SharedStorage<clinker_record::Schema> {
         match artifacts.typed_get(id) {
             Some(tp) => {
                 let mut builder = SchemaBuilder::with_capacity(tp.output_row.field_count());
@@ -5576,11 +5577,11 @@ fn extend_aggregate_group_by_with_shadow_for_graph(
             crate::plan::execution::PlanEdge,
         >,
         mut idx: NodeIndex,
-    ) -> Option<Arc<Schema>> {
+    ) -> Option<SharedStorage<Schema>> {
         loop {
             let upstream = graph.neighbors_directed(idx, Direction::Incoming).next()?;
             if let Some(s) = graph[upstream].stored_output_schema() {
-                return Some(Arc::clone(s));
+                return Some(s.clone());
             }
             idx = upstream;
         }

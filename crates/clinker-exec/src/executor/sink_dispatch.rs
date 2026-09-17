@@ -7,6 +7,7 @@
 //! the streaming-fused output short-circuit. The dispatcher's `Sink` arm
 //! is a single delegating call into [`dispatch_sink`].
 
+use clinker_record::owned_storage::{OwnedKey, SharedStorage};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
@@ -247,7 +248,7 @@ fn resolve_out_cfg<'a>(
 /// emit names (for `include_unmapped: false` projection). Owned so the caller
 /// can hold them across the `&mut ctx` write phase.
 struct SinkInputs {
-    expected_input_schema: Option<Arc<clinker_record::Schema>>,
+    expected_input_schema: Option<SharedStorage<clinker_record::Schema>>,
     upstream_name: String,
     cxl_emit_names: Vec<String>,
 }
@@ -677,7 +678,7 @@ fn dispatch_sink_work(
             let _guard = ctx.projection_timer.guard();
             project_output_from_record(&unbuffered[0].0, out_cfg, cxl_emit_names_opt)
         };
-        Arc::clone(projected.schema())
+        projected.schema().clone()
     };
 
     // Find and take the writer for this output. Errors from
@@ -817,8 +818,8 @@ fn build_csv_union_schema(
     unbuffered: &[(Record, crate::executor::stream_event::SourceRowId)],
     out_cfg: &clinker_plan::config::SinkConfig,
     cxl_emit_names_opt: Option<&[String]>,
-) -> Arc<Schema> {
-    let mut union: IndexSet<Box<str>> = IndexSet::new();
+) -> SharedStorage<Schema> {
+    let mut union: IndexSet<OwnedKey> = IndexSet::new();
     let first = project_output_from_record(&unbuffered[0].0, out_cfg, cxl_emit_names_opt);
     for col in first.schema().columns() {
         union.insert(col.clone());
@@ -832,7 +833,7 @@ fn build_csv_union_schema(
             union.insert(col.clone());
         }
     }
-    Arc::new(Schema::new(union.into_iter().collect()))
+    SharedStorage::from_arc(Arc::new(Schema::new(union.into_iter().collect())))
 }
 
 /// Execute the `Output` arm under document-level DLQ. Drains this Output's
@@ -916,7 +917,7 @@ fn drain_sink_input_events(
 /// through `write_record`, and `end_document` fires when the document ends.
 ///
 /// Boundary detection is RECORD-driven, not punctuation-driven: every
-/// `Record` carries its `Arc<DocumentContext>`, and a document boundary is a
+/// `Record` carries its `SharedStorage<DocumentContext>`, and a document boundary is a
 /// change in the record's `doc_ctx().grain()` between consecutive records.
 /// Punctuations cannot drive this — the executor's buffers tail-clump all
 /// `DocumentClose` events after all records, so an interleaved boundary stream
@@ -1119,7 +1120,7 @@ fn next_envelope_record(
 /// closure so the driver stays free of [`ExecutorContext`] — production
 /// builds it from `ctx.writers`, the unit test from a probe writer.
 type WriterFactory<'a> = dyn FnMut(
-        Arc<clinker_record::Schema>,
+        SharedStorage<clinker_record::Schema>,
     ) -> Option<Result<Box<dyn clinker_format::FormatWriter>, PipelineError>>
     + 'a;
 
@@ -1139,7 +1140,7 @@ struct EnvelopeWriterDriver {
     /// first concrete-file record and between documents. Held so the
     /// matching `end_document` (at the next boundary or at `finish`) carries
     /// the same context `begin_document` opened with.
-    open_doc: Option<Arc<clinker_record::DocumentContext>>,
+    open_doc: Option<SharedStorage<clinker_record::DocumentContext>>,
     /// Writer-construction / framing / write / flush errors, appended to the
     /// run's error sink by the caller rather than short-circuiting, matching
     /// the records-only Output path.
@@ -1166,12 +1167,12 @@ impl EnvelopeWriterDriver {
     /// is what keeps flag-on invariant against flag-off.
     fn on_record(
         &mut self,
-        doc_ctx: &Arc<clinker_record::DocumentContext>,
+        doc_ctx: &SharedStorage<clinker_record::DocumentContext>,
         projected: &Record,
         open_writer: &mut WriterFactory<'_>,
     ) {
         if self.writer.is_none() {
-            match open_writer(Arc::clone(projected.schema())) {
+            match open_writer(projected.schema().clone()) {
                 Some(Ok(w)) => self.writer = Some(w),
                 Some(Err(e)) => {
                     self.errors.push(e);
@@ -1209,7 +1210,7 @@ impl EnvelopeWriterDriver {
     /// is what makes a multi-message HL7 file frame once per message (each
     /// `MSH` is its own grain) while a nested X12 interchange still frames once
     /// (its `GS`/`ST` levels inherit the interchange grain).
-    fn maybe_cross_boundary(&mut self, doc_ctx: &Arc<clinker_record::DocumentContext>) {
+    fn maybe_cross_boundary(&mut self, doc_ctx: &SharedStorage<clinker_record::DocumentContext>) {
         if !crate::executor::document_dlq::is_concrete_file(doc_ctx.source_file()) {
             return;
         }
@@ -1223,7 +1224,7 @@ impl EnvelopeWriterDriver {
         }
         self.fire_end();
         self.fire_begin(doc_ctx);
-        self.open_doc = Some(Arc::clone(doc_ctx));
+        self.open_doc = Some(doc_ctx.clone());
     }
 
     /// Emit the open document's closing framing, if a document is open.
@@ -1361,7 +1362,7 @@ struct FanOutContext<'a> {
     name: &'a str,
     out_cfg: &'a clinker_plan::config::SinkConfig,
     cxl_emit_names_opt: Option<&'a [String]>,
-    output_schema: &'a Arc<clinker_record::Schema>,
+    output_schema: &'a SharedStorage<clinker_record::Schema>,
     output_errors: &'a mut Vec<PipelineError>,
     write_timer: &'a mut crate::executor::stage_metrics::CumulativeTimer,
     projection_timer: &'a mut crate::executor::stage_metrics::CumulativeTimer,
@@ -1404,7 +1405,7 @@ fn emit_single_writer(
     match build_format_writer(
         fan_ctx.out_cfg,
         raw_writer,
-        Arc::clone(fan_ctx.output_schema),
+        fan_ctx.output_schema.clone(),
         fan_ctx.output_staging.clone(),
         fan_ctx.sink_byte_counter.clone(),
     ) {
@@ -1510,7 +1511,7 @@ fn emit_fan_out(
         match build_format_writer(
             &resolved_config,
             raw,
-            Arc::clone(fan_ctx.output_schema),
+            fan_ctx.output_schema.clone(),
             fan_ctx.output_staging.clone(),
             fan_ctx.sink_byte_counter.clone(),
         ) {
@@ -1639,7 +1640,7 @@ mod tests {
     }
 
     fn sink_input_clone_fixture() -> NodeBuffer {
-        let schema = Arc::new(Schema::new(vec!["id".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into()])));
         NodeBuffer::memory_from_records(vec![(Record::new(schema, vec![Value::Integer(1)]), 1)])
     }
 
@@ -1745,18 +1746,18 @@ mod tests {
         }
     }
 
-    fn doc(file: &str) -> Arc<DocumentContext> {
-        Arc::new(DocumentContext::new(
+    fn doc(file: &str) -> SharedStorage<DocumentContext> {
+        SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from(file),
             clinker_record::EnvelopeRecord::empty(),
-        ))
+        )))
     }
 
-    fn record(id: i64, doc_ctx: &Arc<DocumentContext>) -> Record {
-        let schema = Arc::new(Schema::new(vec!["id".into()]));
+    fn record(id: i64, doc_ctx: &SharedStorage<DocumentContext>) -> Record {
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into()])));
         let mut rec = Record::new(schema, vec![Value::Integer(id)]);
-        rec.set_doc_ctx(Arc::clone(doc_ctx));
+        rec.set_doc_ctx(doc_ctx.clone());
         rec
     }
 
@@ -1822,8 +1823,9 @@ mod tests {
         // interchange document — begin/end fire exactly once for the whole
         // `ISA..IEA`, not once per transaction set.
         let outer = doc("multi.x12");
-        let inner =
-            Arc::new(outer.child(DocumentId::next(), clinker_record::EnvelopeRecord::empty()));
+        let inner = SharedStorage::from_arc(Arc::new(
+            outer.child(DocumentId::next(), clinker_record::EnvelopeRecord::empty()),
+        ));
         let records = vec![record(1, &outer), record(2, &inner), record(3, &outer)];
         let (log, written) = run_log(&records);
         assert_eq!(
@@ -1850,17 +1852,17 @@ mod tests {
         // even though both messages live in one file. (Keying on `source_file`
         // would collapse them into a single frame, the bug this fixes.)
         let file: Arc<str> = Arc::from("messages.hl7");
-        let file_doc = Arc::new(DocumentContext::new(
+        let file_doc = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::clone(&file),
             clinker_record::EnvelopeRecord::empty(),
+        )));
+        let msg1 = SharedStorage::from_arc(Arc::new(
+            file_doc.child_frame(DocumentId::next(), clinker_record::EnvelopeRecord::empty()),
         ));
-        let msg1 = Arc::new(
+        let msg2 = SharedStorage::from_arc(Arc::new(
             file_doc.child_frame(DocumentId::next(), clinker_record::EnvelopeRecord::empty()),
-        );
-        let msg2 = Arc::new(
-            file_doc.child_frame(DocumentId::next(), clinker_record::EnvelopeRecord::empty()),
-        );
+        ));
         let records = vec![record(1, &msg1), record(2, &msg1), record(3, &msg2)];
         let (log, written) = run_log(&records);
         assert_eq!(
@@ -1910,9 +1912,9 @@ mod tests {
         // `Arc::ptr_eq` on `source_file` would spuriously split it. The
         // postcard round-trip is exactly what the spill path does.
         let chunk1 = doc("split.csv");
-        let bytes = postcard::to_stdvec(chunk1.as_ref()).unwrap();
+        let bytes = postcard::to_stdvec(&*chunk1).unwrap();
         let rebuilt: DocumentContext = postcard::from_bytes(&bytes).unwrap();
-        let chunk2 = Arc::new(rebuilt);
+        let chunk2 = SharedStorage::from_arc(Arc::new(rebuilt));
         assert!(
             !Arc::ptr_eq(chunk1.source_file(), chunk2.source_file()),
             "the rebuilt context must hold a distinct `source_file` Arc to model the spill",

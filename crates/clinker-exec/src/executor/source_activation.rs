@@ -71,6 +71,8 @@ impl SourceActivationController {
     /// The pre-admitted group lease transfers before any opener runs. Every
     /// opener completes before a Source channel is registered or a worker is
     /// spawned, so partial open failure cannot start downstream work.
+    // The run capabilities remain explicit at this activation boundary.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn activate(
         &mut self,
         instance: CompiledSourceInstanceId,
@@ -79,6 +81,7 @@ impl SourceActivationController {
         memory: &Arc<MemoryArbitrator>,
         shutdown: Option<crate::pipeline::shutdown::ShutdownToken>,
         telemetry: Option<&TelemetryProducer>,
+        allocation_resources: &clinker_record::owned_storage::AllocationResources,
     ) -> Result<Option<ActivatedSourceGroup>, PipelineError> {
         let CompiledSourceScope::CompositionBody(scope) = instance.scope else {
             return Ok(None);
@@ -137,7 +140,10 @@ impl SourceActivationController {
                 SourceIngestChannel::DEFAULT_CAPACITY,
                 Arc::clone(&handle),
                 member.source_node,
+                allocation_resources.clone(),
             );
+            #[cfg(test)]
+            stream.assert_allocation_domain(allocation_resources);
             let consumer_id =
                 memory.register_consumer(Arc::new(SourceConsumer::new(Arc::clone(&handle))));
             activated.receivers.push((source_name.clone(), receiver));

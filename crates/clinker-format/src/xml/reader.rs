@@ -25,6 +25,7 @@
 //! whole-file byte buffer is retained for a file-backed input. See
 //! [`crate::xml::streaming`] for the event-driven pruned-extraction pass.
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
 use std::io::{BufRead, BufReader, Read};
 use std::ops::Range;
 use std::sync::Arc;
@@ -141,17 +142,17 @@ impl RawRecord {
 /// collapsing repeated field names. Each array item records one flattened
 /// field occurrence in document order.
 fn raw_xml_record_value(raw: &RawRecord) -> Value {
-    Value::Array(
+    Value::Array(OwnedValues::from_vec(
         raw.fields
             .iter()
             .map(|(field, value)| {
                 let mut occurrence = IndexMap::with_capacity(2);
                 occurrence.insert("field".into(), Value::String(field.clone().into()));
                 occurrence.insert("value".into(), Value::String(value.clone().into()));
-                Value::Map(Box::new(occurrence))
+                Value::Map(OwnedMap::from_map(occurrence))
             })
             .collect(),
-    )
+    ))
 }
 
 /// A flattened field tagged with its index in the original extraction, so
@@ -428,7 +429,7 @@ pub struct XmlReader {
     body_identity: SourceIdentity,
     parser: BodyParser,
     config: XmlReaderConfig,
-    schema: Option<Arc<Schema>>,
+    schema: Option<SharedStorage<Schema>>,
     buf: Vec<u8>,
     /// Path segments from record_path, e.g., ["Orders", "Order"].
     path_segments: Vec<String>,
@@ -941,7 +942,7 @@ impl XmlReader {
 
     /// Converts raw field pairs to a Record carrying the element's
     /// actual key set (per-record schema). Each emitted record's
-    /// `Arc<Schema>` reflects exactly the keys present in that XML
+    /// `SharedStorage<Schema>` reflects exactly the keys present in that XML
     /// element — the per-Source `OnUnmapped` policy at the dispatch
     /// layer reconciles records against the user-declared schema.
     ///
@@ -956,7 +957,7 @@ impl XmlReader {
         // pipeline, including the majority that declare no multi-value column.
         let mut slot: std::collections::HashMap<Box<str>, usize> =
             std::collections::HashMap::with_capacity(fields.len());
-        let mut columns: Vec<Box<str>> = Vec::with_capacity(fields.len());
+        let mut columns: Vec<OwnedKey> = Vec::with_capacity(fields.len());
         let mut values: Vec<Value> = Vec::with_capacity(fields.len());
         for (key, val) in fields {
             let observation = observe_xml_scalar(&val);
@@ -968,7 +969,14 @@ impl XmlReader {
                 Some(&i) => match &mut values[i] {
                     // A repeated key on a `multiple:` column accumulates in
                     // document order.
-                    Value::Array(items) => items.push(value),
+                    Value::Array(items) => items
+                        .legacy_mut()
+                        .ok_or_else(|| {
+                            FormatError::Xml(
+                                "internal invariant: repeated-field storage must be legacy".into(),
+                            )
+                        })?
+                        .push(value),
                     // A repeated key on any other column would keep the first
                     // value and silently drop this one. Refuse loudly instead:
                     // an undeclared repeat is a data-loss hazard, not a
@@ -984,9 +992,9 @@ impl XmlReader {
                     let multiple = self.is_multi_value(&key);
                     let name = key.into_boxed_str();
                     slot.insert(name.clone(), columns.len());
-                    columns.push(name);
+                    columns.push(name.into());
                     values.push(if multiple {
-                        Value::Array(vec![value])
+                        Value::Array(OwnedValues::from_vec(vec![value]))
                     } else {
                         value
                     });
@@ -998,7 +1006,7 @@ impl XmlReader {
                 values[i] = split_text_value(&values[i], &entry.delimiter);
             }
         }
-        let schema = Arc::new(Schema::new(columns));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(columns)));
         Ok(Record::new(schema, values))
     }
 
@@ -1067,9 +1075,9 @@ impl XmlReader {
 }
 
 impl FormatReader for XmlReader {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
         if let Some(ref s) = self.schema {
-            return Ok(Arc::clone(s));
+            return Ok(s.clone());
         }
 
         // Infer the schema from the first expanded record's field NAMES
@@ -1091,7 +1099,7 @@ impl FormatReader for XmlReader {
         let (raw, first, presence) = loop {
             let Some(raw) = self.read_next_record_raw()? else {
                 let s = SchemaBuilder::new().build();
-                self.schema = Some(Arc::clone(&s));
+                self.schema = Some(s.clone());
                 self.done = true;
                 return Ok(s);
             };
@@ -1127,7 +1135,7 @@ impl FormatReader for XmlReader {
         // record loop. Schema inference must not consume an uncounted output
         // or retain a cursor with the runtime ceiling disabled.
         self.deferred_first = Some(raw);
-        self.schema = Some(Arc::clone(&schema));
+        self.schema = Some(schema.clone());
 
         Ok(schema)
     }
@@ -1170,7 +1178,7 @@ impl FormatReader for XmlReader {
     fn prepare_document(
         &mut self,
         config: &EnvelopeConfig,
-    ) -> Result<IndexMap<Box<str>, Value>, FormatError> {
+    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
         if config.is_empty() {
             return Ok(IndexMap::new());
         }
@@ -1258,7 +1266,7 @@ impl FormatReader for XmlReader {
                 coerce_section_fields(payload, &section.fields).map_err(FormatError::Xml)?;
             let path = doc_path_for_section(&name);
             index
-                .insert(&path, Value::Map(Box::new(typed)))
+                .insert(&path, Value::Map(OwnedMap::from_map(typed)))
                 .map_err(FormatError::Xml)?;
         }
         Ok(index.into_sections())
@@ -1578,7 +1586,7 @@ mod tests {
         cfg
     }
 
-    fn unwrap_section_map(value: &Value) -> &IndexMap<Box<str>, Value> {
+    fn unwrap_section_map(value: &Value) -> &IndexMap<OwnedKey, Value> {
         match value {
             Value::Map(m) => m,
             other => panic!("expected Value::Map, got {other:?}"),
@@ -2106,7 +2114,8 @@ mod tests {
     fn multiple_collects_repeated_scalar_children_into_one_array() {
         // A `multiple: true` column collects every occurrence in document
         // order, rather than keeping only the first.
-        let xml = r#"<Root><Row><id>7</id><Tag>a</Tag><Tag>b</Tag><Tag>c</Tag></Row></Root>"#;
+        let xml =
+            r#"<Root><Row><id>7</id><Tag>a</Tag><Tag>b</Tag><Tag>c</Tag><Tag>d</Tag></Row></Root>"#;
         let config = multi_value_config("Root/Row", &["Tag"]);
         let mut r = reader_from_str(xml, config);
         let s = r.schema().unwrap();
@@ -2116,11 +2125,12 @@ mod tests {
         assert_eq!(r1.get("id"), Some(&Value::Integer(7)));
         assert_eq!(
             r1.get("Tag"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::String("b".into()),
                 Value::String("c".into()),
-            ]))
+                Value::String("d".into()),
+            ])))
         );
         assert!(r.next_record().unwrap().is_none());
     }
@@ -2138,14 +2148,17 @@ mod tests {
         assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
         assert_eq!(
             r1.get("Item.name"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("A".into()),
                 Value::String("B".into()),
-            ]))
+            ])))
         );
         assert_eq!(
             r1.get("Item.qty"),
-            Some(&Value::Array(vec![Value::Integer(2), Value::Integer(3)]))
+            Some(&Value::Array(OwnedValues::from_vec(vec![
+                Value::Integer(2),
+                Value::Integer(3)
+            ])))
         );
         assert!(r.next_record().unwrap().is_none());
     }
@@ -2163,7 +2176,9 @@ mod tests {
         let r1 = r.next_record().unwrap().unwrap();
         assert_eq!(
             r1.get("Tag"),
-            Some(&Value::Array(vec![Value::String("only".into())]))
+            Some(&Value::Array(OwnedValues::from_vec(vec![Value::String(
+                "only".into()
+            )])))
         );
     }
 
@@ -2197,7 +2212,10 @@ mod tests {
 
         let r1 = r.next_record().unwrap().unwrap();
         assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
-        assert_eq!(r1.get("Tag"), Some(&Value::Array(vec![Value::Null])));
+        assert_eq!(
+            r1.get("Tag"),
+            Some(&Value::Array(OwnedValues::from_vec(vec![Value::Null])))
+        );
     }
 
     #[test]
@@ -2214,11 +2232,11 @@ mod tests {
         let r1 = r.next_record().unwrap().unwrap();
         assert_eq!(
             r1.get("Tag"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::Null,
                 Value::String("b".into()),
-            ]))
+            ])))
         );
     }
 
@@ -2236,11 +2254,11 @@ mod tests {
         let r1 = r.next_record().unwrap().unwrap();
         assert_eq!(
             r1.get("Tag"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::Null,
                 Value::String("b".into()),
-            ]))
+            ])))
         );
     }
 
@@ -2260,11 +2278,11 @@ mod tests {
             let r1 = r.next_record().unwrap().unwrap();
             assert_eq!(
                 r1.get("Tag"),
-                Some(&Value::Array(vec![
+                Some(&Value::Array(OwnedValues::from_vec(vec![
                     Value::String("a".into()),
                     Value::Null,
                     Value::String("b".into()),
-                ])),
+                ]))),
                 "middle form {middle:?}"
             );
             // The attribute still lands on its own (non-`multiple:`) column.
@@ -2427,11 +2445,11 @@ mod tests {
         let r1 = r.next_record().unwrap().unwrap();
         assert_eq!(
             r1.get("Tag"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::String("b".into()),
                 Value::String("c".into()),
-            ]))
+            ])))
         );
     }
 
@@ -2662,10 +2680,10 @@ mod tests {
         let rec = r.next_record().unwrap().unwrap();
         assert_eq!(
             rec.get("Dup"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("x".into()),
                 Value::String("y".into()),
-            ]))
+            ])))
         );
         assert!(r.next_record().unwrap().is_none());
     }
@@ -2681,7 +2699,10 @@ mod tests {
         let mut r = reader_from_str(xml, config);
         let _s = r.schema().unwrap();
 
-        let tags = Value::Array(vec![Value::String("x".into()), Value::String("y".into())]);
+        let tags = Value::Array(OwnedValues::from_vec(vec![
+            Value::String("x".into()),
+            Value::String("y".into()),
+        ]));
         let r1 = r.next_record().unwrap().unwrap();
         assert_eq!(r1.get("Item.name"), Some(&Value::String("A".into())));
         assert_eq!(r1.get("Tag"), Some(&tags));
@@ -2710,11 +2731,11 @@ mod tests {
         let r1 = r.next_record().unwrap().unwrap();
         assert_eq!(
             r1.get("tag"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::Null,
                 Value::String("b".into()),
-            ])),
+            ]))),
             "empty middle occurrence keeps its positional null inside the fan-out"
         );
         assert!(r.next_record().unwrap().is_none());
@@ -2736,11 +2757,11 @@ mod tests {
         let r1 = r.next_record().unwrap().unwrap();
         assert_eq!(
             r1.get("Item.tag"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::Null,
                 Value::String("b".into()),
-            ])),
+            ]))),
             "split mode keeps the dotted name and the positional null"
         );
         assert!(r.next_record().unwrap().is_none());
@@ -2759,11 +2780,11 @@ mod tests {
         let r1 = r.next_record().unwrap().unwrap();
         assert_eq!(
             r1.get("tag"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::Null,
                 Value::String("b".into()),
-            ]))
+            ])))
         );
         assert!(r.next_record().unwrap().is_none());
     }

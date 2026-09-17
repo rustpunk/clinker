@@ -36,7 +36,8 @@
 //! therefore only ever flushed at true end of stream.
 
 use std::io::Write;
-use std::sync::Arc;
+
+use clinker_record::owned_storage::SharedStorage;
 
 use clinker_record::{Record, Schema, Value};
 
@@ -128,7 +129,7 @@ impl<W: Write> Hl7Writer<W> {
     /// schema's `seg_id` and `fNN` columns are resolved to positional
     /// indices once. The `set_ref` / `set_type` columns are read from the
     /// `MSH` record itself, so they need no separate index.
-    pub fn new(writer: W, schema: Arc<Schema>, config: Hl7WriterConfig) -> Self {
+    pub fn new(writer: W, schema: SharedStorage<Schema>, config: Hl7WriterConfig) -> Self {
         let mut field_columns = Vec::new();
         let mut split_columns = Vec::new();
         let mut seg_id_idx = None;
@@ -564,18 +565,20 @@ fn value_to_field(value: &Value, column: &str) -> Result<String, FormatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues};
     use std::io::Cursor;
+    use std::sync::Arc;
 
     /// A schema with `seg_id`, `set_ref`, `set_type`, and `f01..f10`.
-    fn schema() -> Arc<Schema> {
-        let mut cols: Vec<Box<str>> = vec!["seg_id".into(), "set_ref".into(), "set_type".into()];
+    fn schema() -> SharedStorage<Schema> {
+        let mut cols: Vec<OwnedKey> = vec!["seg_id".into(), "set_ref".into(), "set_type".into()];
         for i in 1..=10 {
-            cols.push(format!("f{i:02}").into_boxed_str());
+            cols.push(format!("f{i:02}").into());
         }
-        Arc::new(Schema::new(cols))
+        SharedStorage::from_arc(Arc::new(Schema::new(cols)))
     }
 
-    fn record(schema: &Arc<Schema>, seg: &str, fields: &[&str]) -> Record {
+    fn record(schema: &SharedStorage<Schema>, seg: &str, fields: &[&str]) -> Record {
         let mut values = vec![Value::String(seg.into()), Value::Null, Value::Null];
         for i in 0..10 {
             match fields.get(i) {
@@ -583,12 +586,16 @@ mod tests {
                 _ => values.push(Value::Null),
             }
         }
-        Record::new(Arc::clone(schema), values)
+        Record::new(schema.clone(), values)
     }
 
-    fn write_all(config: Hl7WriterConfig, records: &[Record], schema: &Arc<Schema>) -> String {
+    fn write_all(
+        config: Hl7WriterConfig,
+        records: &[Record],
+        schema: &SharedStorage<Schema>,
+    ) -> String {
         let mut buf = Vec::new();
-        let mut w = Hl7Writer::new(Cursor::new(&mut buf), Arc::clone(schema), config);
+        let mut w = Hl7Writer::new(Cursor::new(&mut buf), schema.clone(), config);
         for r in records {
             w.write_record(r).unwrap();
         }
@@ -707,20 +714,20 @@ mod tests {
         use indexmap::IndexMap;
 
         let s = schema();
-        let raw = RecVal::Array(vec![
+        let raw = RecVal::Array(OwnedValues::from_vec(vec![
             RecVal::String("^~\\&".into()),
             RecVal::String("SENDAPP".into()),
             RecVal::String("FILE9".into()),
-        ]);
-        let mut file_doc: IndexMap<Box<str>, RecVal> = IndexMap::new();
+        ]));
+        let mut file_doc: IndexMap<OwnedKey, RecVal> = IndexMap::new();
         file_doc.insert(super::RAW_FIELDS_KEY.into(), raw);
-        let mut sections: IndexMap<Box<str>, RecVal> = IndexMap::new();
-        sections.insert("file".into(), RecVal::Map(Box::new(file_doc)));
-        let ctx = Arc::new(DocumentContext::new(
+        let mut sections: IndexMap<OwnedKey, RecVal> = IndexMap::new();
+        sections.insert("file".into(), RecVal::Map(OwnedMap::from_map(file_doc)));
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("a.hl7"),
             EnvelopeRecord::from_sections(sections),
-        ));
+        )));
 
         let mut msh = record(
             &s,
@@ -750,17 +757,17 @@ mod tests {
         use indexmap::IndexMap;
 
         let s = schema();
-        let mut file_doc: IndexMap<Box<str>, RecVal> = IndexMap::new();
+        let mut file_doc: IndexMap<OwnedKey, RecVal> = IndexMap::new();
         file_doc.insert("f01".into(), RecVal::String("^~\\&".into()));
         // f02 deliberately absent — the gap.
         file_doc.insert("f03".into(), RecVal::String("FILE9".into()));
-        let mut sections: IndexMap<Box<str>, RecVal> = IndexMap::new();
-        sections.insert("file".into(), RecVal::Map(Box::new(file_doc)));
-        let ctx = Arc::new(DocumentContext::new(
+        let mut sections: IndexMap<OwnedKey, RecVal> = IndexMap::new();
+        sections.insert("file".into(), RecVal::Map(OwnedMap::from_map(file_doc)));
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("a.hl7"),
             EnvelopeRecord::from_sections(sections),
-        ));
+        )));
 
         let mut msh = record(&s, "MSH", &["^~\\&", "S"]);
         msh.set_doc_ctx(ctx);
@@ -778,19 +785,22 @@ mod tests {
 
     /// Build a document context whose message section carries the given
     /// delimiter stamp, as the HL7 reader produces for every message.
-    fn stamped_ctx(stamp: Value) -> Arc<clinker_record::DocumentContext> {
+    fn stamped_ctx(stamp: Value) -> SharedStorage<clinker_record::DocumentContext> {
         use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
         use indexmap::IndexMap;
 
-        let mut msg_doc: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut msg_doc: IndexMap<OwnedKey, Value> = IndexMap::new();
         msg_doc.insert(super::DELIMITERS_KEY.into(), stamp);
-        let mut sections: IndexMap<Box<str>, Value> = IndexMap::new();
-        sections.insert(super::MESSAGE_SECTION.into(), Value::Map(Box::new(msg_doc)));
-        Arc::new(DocumentContext::new(
+        let mut sections: IndexMap<OwnedKey, Value> = IndexMap::new();
+        sections.insert(
+            super::MESSAGE_SECTION.into(),
+            Value::Map(OwnedMap::from_map(msg_doc)),
+        );
+        SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("stamped.hl7"),
             EnvelopeRecord::from_sections(sections),
-        ))
+        )))
     }
 
     #[test]
@@ -803,7 +813,7 @@ mod tests {
         let ctx = stamped_ctx(Value::String("#@*/$".into()));
         let s = schema();
         let mut msh = record(&s, "MSH", &["@*/$", "SENDAPP"]);
-        msh.set_doc_ctx(Arc::clone(&ctx));
+        msh.set_doc_ctx(ctx.clone());
         let mut obx = record(&s, "OBX", &["1", "TX", "note", "", "a#b/c|d"]);
         obx.set_doc_ctx(ctx);
         let out = write_all(Hl7WriterConfig::default(), &[msh, obx], &s);
@@ -819,7 +829,7 @@ mod tests {
         let ctx = stamped_ctx(Value::String("#@*/$".into()));
         let s = schema();
         let mut msh1 = record(&s, "MSH", &["@*/$", "S1"]);
-        msh1.set_doc_ctx(Arc::clone(&ctx));
+        msh1.set_doc_ctx(ctx.clone());
         let mut pid1 = record(&s, "PID", &["1"]);
         pid1.set_doc_ctx(ctx);
         let msh2 = record(&s, "MSH", &["^~\\&", "S2"]);
@@ -860,11 +870,8 @@ mod tests {
             let mut msh = record(&s, "MSH", &["^~\\&", "S"]);
             msh.set_doc_ctx(stamped_ctx(stamp));
             let mut buf = Vec::new();
-            let mut w = Hl7Writer::new(
-                Cursor::new(&mut buf),
-                Arc::clone(&s),
-                Hl7WriterConfig::default(),
-            );
+            let mut w =
+                Hl7Writer::new(Cursor::new(&mut buf), s.clone(), Hl7WriterConfig::default());
             w.write_record(&msh)
         };
         // Colliding bytes ('#' twice) would corrupt every segment.
@@ -889,16 +896,16 @@ mod tests {
 
     #[test]
     fn unrecognized_column_errors_by_name() {
-        let cols: Vec<Box<str>> = vec!["seg_id".into(), "amount".into()];
-        let schema = Arc::new(Schema::new(cols));
+        let cols: Vec<OwnedKey> = vec!["seg_id".into(), "amount".into()];
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::String("PID".into()), Value::String("99".into())],
         );
         let mut buf = Vec::new();
         let mut w = Hl7Writer::new(
             Cursor::new(&mut buf),
-            Arc::clone(&schema),
+            schema.clone(),
             Hl7WriterConfig::default(),
         );
         let err = w.write_record(&record).unwrap_err();
@@ -907,14 +914,14 @@ mod tests {
 
     #[test]
     fn engine_stamped_columns_excluded() {
-        let cols: Vec<Box<str>> = vec!["seg_id".into(), "f01".into(), "$source.file".into()];
-        let schema = Arc::new(Schema::new(cols));
+        let cols: Vec<OwnedKey> = vec!["seg_id".into(), "f01".into(), "$source.file".into()];
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let values = vec![
             Value::String("PID".into()),
             Value::String("1".into()),
             Value::String("/tmp/a.hl7".into()),
         ];
-        let record = Record::new(Arc::clone(&schema), values);
+        let record = Record::new(schema.clone(), values);
         let out = write_all(Hl7WriterConfig::default(), &[record], &schema);
         assert!(out.contains("PID|1\r"), "{out}");
         assert!(!out.contains("/tmp/a.hl7"), "{out}");
@@ -923,18 +930,21 @@ mod tests {
     #[test]
     fn map_value_in_field_column_errors_by_name() {
         use indexmap::IndexMap;
-        let cols: Vec<Box<str>> = vec!["seg_id".into(), "f01".into()];
-        let schema = Arc::new(Schema::new(cols));
-        let mut nested: IndexMap<Box<str>, Value> = IndexMap::new();
+        let cols: Vec<OwnedKey> = vec!["seg_id".into(), "f01".into()];
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
+        let mut nested: IndexMap<OwnedKey, Value> = IndexMap::new();
         nested.insert("k".into(), Value::String("v".into()));
         let record = Record::new(
-            Arc::clone(&schema),
-            vec![Value::String("PID".into()), Value::Map(Box::new(nested))],
+            schema.clone(),
+            vec![
+                Value::String("PID".into()),
+                Value::Map(OwnedMap::from_map(nested)),
+            ],
         );
         let mut buf = Vec::new();
         let mut w = Hl7Writer::new(
             Cursor::new(&mut buf),
-            Arc::clone(&schema),
+            schema.clone(),
             Hl7WriterConfig::default(),
         );
         let err = w.write_record(&record).unwrap_err();
@@ -954,7 +964,7 @@ mod tests {
             segment_newline: false,
             ..Default::default()
         };
-        let mut w = Hl7Writer::new(Cursor::new(&mut buf), Arc::clone(&s), cfg);
+        let mut w = Hl7Writer::new(Cursor::new(&mut buf), s.clone(), cfg);
         w.write_record(&msh).unwrap();
         w.flush().unwrap();
         w.flush().unwrap();
@@ -971,10 +981,10 @@ mod tests {
 
     #[test]
     fn gapped_field_columns_map_by_position() {
-        let cols: Vec<Box<str>> = vec!["seg_id".into(), "f01".into(), "f03".into()];
-        let schema = Arc::new(Schema::new(cols));
+        let cols: Vec<OwnedKey> = vec!["seg_id".into(), "f01".into(), "f03".into()];
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("PID".into()),
                 Value::String("a".into()),
@@ -989,15 +999,15 @@ mod tests {
     fn split_columns_reassemble_into_wire_field() {
         // Component leaf columns re-join on the component separator at their
         // shared wire position; the separator is verbatim, not escaped.
-        let cols: Vec<Box<str>> = vec![
+        let cols: Vec<OwnedKey> = vec![
             "seg_id".into(),
             "f01".into(),
             "f03_c1".into(),
             "f03_c2".into(),
         ];
-        let schema = Arc::new(Schema::new(cols));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("PID".into()),
                 Value::String("1".into()),
@@ -1018,10 +1028,10 @@ mod tests {
         // A trailing-empty component must not fabricate a `^` inside the
         // re-assembled field. The split sits at wire field 3, so fields 1
         // and 2 are empty (`PID|||…`), exactly as a verbatim `f03` would be.
-        let cols: Vec<Box<str>> = vec!["seg_id".into(), "f03_c1".into(), "f03_c2".into()];
-        let schema = Arc::new(Schema::new(cols));
+        let cols: Vec<OwnedKey> = vec!["seg_id".into(), "f03_c1".into(), "f03_c2".into()];
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("PID".into()),
                 Value::String("PATID".into()),
@@ -1035,15 +1045,15 @@ mod tests {
 
     #[test]
     fn split_columns_reassemble_repetitions_and_subcomponents() {
-        let cols: Vec<Box<str>> = vec![
+        let cols: Vec<OwnedKey> = vec![
             "seg_id".into(),
             "f03_r1_c1_s1".into(),
             "f03_r1_c1_s2".into(),
             "f03_r2_c1_s1".into(),
         ];
-        let schema = Arc::new(Schema::new(cols));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("PID".into()),
                 Value::String("A".into()),
@@ -1060,10 +1070,10 @@ mod tests {
     fn split_leaf_value_escapes_embedded_field_separator() {
         // A literal field separator inside a split leaf is still escaped on
         // output; only the structural component separator is verbatim.
-        let cols: Vec<Box<str>> = vec!["seg_id".into(), "f03_c1".into(), "f03_c2".into()];
-        let schema = Arc::new(Schema::new(cols));
+        let cols: Vec<OwnedKey> = vec!["seg_id".into(), "f03_c1".into(), "f03_c2".into()];
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![
                 Value::String("PID".into()),
                 Value::String("a|b".into()),

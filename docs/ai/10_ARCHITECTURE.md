@@ -39,7 +39,7 @@ Current description:
 
 Verified facts:
 
-- **Record model:** `clinker-record` owns `Value`, `Record`, `Schema`, `RecordStorage`, `RecordView`, provenance, document context, grouping keys, counters, and accumulator state. `Record` stores positional `Vec<Value>` data behind an `Arc<Schema>`.
+- **Record model:** `clinker-record` owns `Value`, `Record`, `Schema`, `RecordStorage`, `RecordView`, provenance, document context, grouping keys, counters, and accumulator state. `Record` stores positional `OwnedValues` with a `SharedStorage<Schema>` handle.
 - **Expression engine:** `cxl` owns AST, lexing/parsing, module evaluation, resolution, typechecking, static analysis, aggregate planning, and runtime evaluation. Public symbols used downstream include `Parser`, `resolve_program`, `type_check`, `ProgramEvaluator`, and aggregate extraction/planning APIs.
 - **Format layer:** `clinker-format` owns streaming `FormatReader` / `FormatWriter` traits plus CSV, JSON/NDJSON, XML, fixed-width, HL7, X12, EDIFACT, SWIFT, multi-record, envelope, document index, source reopening, writer counting, and splitting modules.
 - **Planning layer:** `clinker-plan` parses YAML, validates topology and paths, resolves schemas and the workspace catalog, enumerates every CXL-bearing field through `PipelineNode::visit_cxl_fields`, admits and typechecks the bounded transitive module/declaration closure, lowers unified nodes into `ExecutionPlanDag`, and returns `CompiledPlan`. After all structural rewrites, the finalized DAG retains a `CompiledConsumerRegistry` keyed by `ProducerPortKey` and an immutable `ExecutionOrderContract` containing typed source orders, edge/consumer requirements, terminal promises, and physical-writer boundaries. Each compiled Sink also retains the exact output-facing names derived from reachable `multiple: true` schema columns after Sink mapping and exclusion; CSV/XML writers reject arrays outside that set. `CompiledPlan::cxl_modules()` retains the parsed registry needed by execution. Its workspace observability config owns only strict secret-free raw endpoint/auth intent and numeric telemetry/lineage bounds; it does not parse a URI or hold network-auth state.
@@ -89,6 +89,18 @@ These enforcement paths remain under the one run-scoped `MemoryArbitrator`.
 Source repair, shared-port replay, and writer sorting can spill and merge, but do
 not create private memory budgets, native helpers, async runtimes, or a second
 ordering implementation.
+
+Allocation ownership is core vocabulary in
+`clinker_record::owned_storage`. Its finite allocation capability is separate
+from format preparation's temporary-storage capability; executor providers
+admit both through the existing run ledger. Governed text and containers carry
+their own leases through aliases, detached values and consuming iteration.
+They reserve complete backing layouts before allocation and release only after
+physical destruction. Legacy copies retain their existing allocation policy.
+Release state can outlive a closed run without retaining its admission or
+telemetry capability. See [allocation-owned record storage](../engine/src/memory-arbitration.md#allocation-owned-record-storage)
+for ownership and accounting boundaries; the production-contract register
+tracks the remaining decoder integration.
 
 ### Current execution path and locked target
 
@@ -234,7 +246,7 @@ making a compatibility claim or changing a re-export:
 
 Verified patterns:
 
-- Records own their values but share schema and document context: `Record { schema: Arc<Schema>, values: Vec<Value>, doc_ctx: Arc<DocumentContext> }`.
+- Records own their values but share schema and document context: `Record { schema: SharedStorage<Schema>, values: OwnedValues, doc_ctx: SharedStorage<DocumentContext> }`. Shared handles preserve backing identity; their storage representation does not enter serialized data.
 - `SourceRowId` lives in executor stream vocabulary because it combines a planning-owned `PlanNodeId` with an attempt-local source ordinal. It is minted once at ingest and preserved through resident/spilled handoffs, fan-out, structural carriers, DLQ/commit state, and terminal accounting; `clinker-record` does not acquire a planner dependency.
 - `RecordStorage` returns borrowed `&Value` and requires `Send + Sync`, allowing zero-copy field resolution in window/evaluator paths.
 - `Value::String(FieldStr)` optimizes short strings inline and longer strings through shared or unique storage hints; serialization intentionally loses the storage hint and preserves content.

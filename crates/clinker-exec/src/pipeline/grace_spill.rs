@@ -17,9 +17,9 @@
 //! [`SpillWriter`](crate::pipeline::spill::SpillWriter): the first record
 //! carrying a non-synthetic [`DocumentId`] is preceded by a one-time context
 //! frame, and every record frame carries only its `doc_id`. On read a
-//! `HashMap<DocumentId, Arc<DocumentContext>>` is built incrementally and each
-//! record clones the shared `Arc` — `O(distinct documents)` context frames and
-//! one `Arc` per document on reload, never per record. The synthetic document
+//! `HashMap<DocumentId, SharedStorage<DocumentContext>>` is built incrementally and each
+//! record clones the shared handle — `O(distinct documents)` context frames and
+//! one shared handle per document on reload, never per record. The synthetic document
 //! is never interned; a synthetic `doc_id` resolves to the process-wide
 //! synthetic singleton, and a non-synthetic `doc_id` with no interned context
 //! is a corrupt-file error. `record_count` in the footer counts record frames
@@ -46,6 +46,7 @@
 //! shared with the inter-stage spill reader) bounds reader allocations
 //! against a malformed length prefix on either frame kind.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -411,7 +412,7 @@ impl GraceSpillWriter {
         let doc_ctx = record.doc_ctx();
         let doc_id = doc_ctx.id();
         if doc_id != DocumentId::SYNTHETIC && self.seen_docs.insert(doc_id) {
-            let ctx_bytes = postcard::to_stdvec(doc_ctx.as_ref())
+            let ctx_bytes = postcard::to_stdvec(&**doc_ctx)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             self.write_frame(FRAME_CONTEXT_INTERN, &ctx_bytes)?;
         }
@@ -483,18 +484,18 @@ impl GraceSpillWriter {
 /// consumed in between to populate the per-document interning table.
 ///
 /// Memory model: streaming — one frame is decoded per `next` call. The only
-/// retained state is `doc_table`, the per-file `DocumentId → Arc` table built
+/// retained state is `doc_table`, the per-file `DocumentId → SharedStorage` table built
 /// from context frames (`O(distinct documents)`); each record clones its
-/// document's shared `Arc`.
+/// document's shared handle.
 pub(crate) struct GraceSpillReader {
     source: GraceSpillSource,
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     header: SpillHeader,
     records_read: u64,
     /// Per-file envelope-context interning table, populated by context
     /// frames and read by record frames so every record of a document
-    /// shares one `Arc`.
-    doc_table: HashMap<DocumentId, Arc<DocumentContext>>,
+    /// shares one shared handle.
+    doc_table: HashMap<DocumentId, SharedStorage<DocumentContext>>,
     len_buf: [u8; 4],
 }
 
@@ -502,7 +503,7 @@ impl GraceSpillReader {
     /// Open a spill file, validate its footer, and select the body source
     /// from the leading format tag. The schema is supplied by the caller and
     /// reattached to each record on read; the file does not embed schema.
-    pub(crate) fn open(path: &Path, schema: Arc<Schema>) -> std::io::Result<Self> {
+    pub(crate) fn open(path: &Path, schema: SharedStorage<Schema>) -> std::io::Result<Self> {
         let mut file = File::open(path)?;
         let total_len = file.metadata()?.len();
         // The on-disk layout is `tag (1) ++ body ++ footer`; a file shorter
@@ -576,12 +577,13 @@ impl GraceSpillReader {
         &self.header
     }
 
-    /// Decode a context-intern frame into one shared `Arc<DocumentContext>`
+    /// Decode a context-intern frame into one legacy shared context
     /// and key it into the per-file table by the document's id.
     fn intern_context(&mut self, body: &[u8]) -> std::io::Result<()> {
         let ctx: DocumentContext =
             postcard::from_bytes(body).map_err(|e| std::io::Error::other(e.to_string()))?;
-        self.doc_table.insert(ctx.id(), Arc::new(ctx));
+        self.doc_table
+            .insert(ctx.id(), SharedStorage::from_arc(Arc::new(ctx)));
         Ok(())
     }
 
@@ -589,11 +591,11 @@ impl GraceSpillReader {
     /// `doc_id` resolves to the process-wide singleton; a non-synthetic
     /// `doc_id` absent from the interning table is a corrupt-file error,
     /// never a silent synthetic fallback.
-    fn doc_ctx_for(&self, doc_id: DocumentId) -> std::io::Result<Arc<DocumentContext>> {
+    fn doc_ctx_for(&self, doc_id: DocumentId) -> std::io::Result<SharedStorage<DocumentContext>> {
         if doc_id == DocumentId::SYNTHETIC {
             Ok(synthetic_document_context())
         } else {
-            self.doc_table.get(&doc_id).map(Arc::clone).ok_or_else(|| {
+            self.doc_table.get(&doc_id).cloned().ok_or_else(|| {
                 std::io::Error::other(format!(
                     "grace spill: record references document {doc_id:?} with no interned \
                      context frame; file is corrupt"
@@ -660,7 +662,7 @@ impl Iterator for GraceSpillReader {
                         Err(e) => return Some(Err(e)),
                     };
                     self.records_read += 1;
-                    return Some(Ok(payload.into_record(Arc::clone(&self.schema), doc_ctx)));
+                    return Some(Ok(payload.into_record(self.schema.clone(), doc_ctx)));
                 }
                 other => {
                     return Some(Err(std::io::Error::other(format!(
@@ -705,36 +707,34 @@ impl Read for BoundedRead {
 mod tests {
     use super::*;
     use clinker_record::Value;
+    use clinker_record::owned_storage::{OwnedKey, OwnedMap};
     use indexmap::IndexMap;
     use tempfile::TempDir;
 
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec!["id".into(), "v".into()]))
+    fn schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "v".into()])))
     }
 
-    fn record(s: &Arc<Schema>, id: i64, v: &str) -> Record {
-        Record::new(
-            Arc::clone(s),
-            vec![Value::Integer(id), Value::String(v.into())],
-        )
+    fn record(s: &SharedStorage<Schema>, id: i64, v: &str) -> Record {
+        Record::new(s.clone(), vec![Value::Integer(id), Value::String(v.into())])
     }
 
     /// Build a `DocumentContext` with a single `Head` section carrying a
     /// nested `Value::Map`, exercising the recursive `Value` path through
     /// the interned context frame.
-    fn doc_ctx(seed: i64, file: &str) -> Arc<DocumentContext> {
+    fn doc_ctx(seed: i64, file: &str) -> SharedStorage<DocumentContext> {
         let mut head = IndexMap::new();
         head.insert(
-            Box::from("batch_id"),
+            OwnedKey::from("batch_id"),
             Value::String(format!("RUN-{seed:03}").into()),
         );
         let mut sections = IndexMap::new();
-        sections.insert(Box::from("Head"), Value::Map(Box::new(head)));
-        Arc::new(DocumentContext::new(
+        sections.insert(OwnedKey::from("Head"), Value::Map(OwnedMap::from_map(head)));
+        SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from(file),
             clinker_record::EnvelopeRecord::from_sections(sections),
-        ))
+        )))
     }
 
     /// LZ4 frame magic number, little-endian `0x184D2204` — the four bytes a
@@ -759,7 +759,7 @@ mod tests {
                 "reported byte count must match file size (compress={compress})"
             );
 
-            let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
+            let reader = GraceSpillReader::open(&path, s.clone()).unwrap();
             assert_eq!(reader.header().record_count, 50);
             assert_eq!(reader.header().hash_bits, 4);
             assert_eq!(reader.header().partition_id, 7);
@@ -836,7 +836,7 @@ mod tests {
             let s = schema();
             let w = GraceSpillWriter::new(dir.path(), 4, 0, compress).unwrap();
             let (path, _bytes) = w.finish().unwrap();
-            let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
+            let reader = GraceSpillReader::open(&path, s.clone()).unwrap();
             assert_eq!(reader.header().record_count, 0);
             let recs: Vec<_> = reader.collect();
             assert!(recs.is_empty(), "compress={compress}");
@@ -964,11 +964,11 @@ mod tests {
             let doc = doc_ctx(1, "claims/run-001.xml");
             let mut w = GraceSpillWriter::new(dir.path(), 4, 0, compress).unwrap();
             let mut rec = record(&s, 1, "a");
-            rec.set_doc_ctx(Arc::clone(&doc));
+            rec.set_doc_ctx(doc.clone());
             w.write_record(&rec).unwrap();
             let (path, _) = w.finish().unwrap();
 
-            let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
+            let reader = GraceSpillReader::open(&path, s.clone()).unwrap();
             assert_eq!(
                 reader.header().record_count,
                 1,
@@ -987,7 +987,7 @@ mod tests {
         }
     }
 
-    // Every record of one document re-hydrates the SAME shared Arc — one
+    // Every record of one document re-hydrates the SAME shared context — one
     // allocation per document on reload.
     #[test]
     fn grace_shares_one_arc_per_document() {
@@ -997,18 +997,18 @@ mod tests {
         let mut w = GraceSpillWriter::new(dir.path(), 4, 0, true).unwrap();
         for i in 0..3 {
             let mut rec = record(&s, i, "x");
-            rec.set_doc_ctx(Arc::clone(&doc));
+            rec.set_doc_ctx(doc.clone());
             w.write_record(&rec).unwrap();
         }
         let (path, _) = w.finish().unwrap();
-        let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
+        let reader = GraceSpillReader::open(&path, s.clone()).unwrap();
         let recs: Vec<Record> = reader.map(|r| r.unwrap()).collect();
         assert_eq!(recs.len(), 3);
         let first = recs[0].doc_ctx();
         for r in &recs[1..] {
             assert!(
-                Arc::ptr_eq(first, r.doc_ctx()),
-                "all records of one document must share one re-hydrated Arc",
+                SharedStorage::ptr_eq(first, r.doc_ctx()),
+                "all records of one document must share one re-hydrated context",
             );
         }
     }
@@ -1023,11 +1023,11 @@ mod tests {
         // record() leaves the default synthetic context attached.
         w.write_record(&record(&s, 1, "syn")).unwrap();
         let (path, _) = w.finish().unwrap();
-        let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
+        let reader = GraceSpillReader::open(&path, s.clone()).unwrap();
         let recs: Vec<Record> = reader.map(|r| r.unwrap()).collect();
         assert_eq!(recs.len(), 1);
         assert!(
-            Arc::ptr_eq(recs[0].doc_ctx(), &synthetic_document_context()),
+            SharedStorage::ptr_eq(recs[0].doc_ctx(), &synthetic_document_context()),
             "synthetic doc_id must re-hydrate to the shared singleton",
         );
         assert_eq!(recs[0].doc_ctx().id(), DocumentId::SYNTHETIC);
@@ -1035,26 +1035,26 @@ mod tests {
 
     // The interning table is O(distinct documents): K documents over N
     // records emit exactly K context frames, and each document's records
-    // share one Arc while distinct documents get distinct Arcs.
+    // share one context while distinct documents get distinct contexts.
     #[test]
     fn grace_interning_table_is_o_distinct_docs() {
         let dir = TempDir::new().unwrap();
         let s = schema();
         const DOCS: i64 = 3;
         const RECS_PER_DOC: usize = 10;
-        let docs: Vec<Arc<DocumentContext>> = (0..DOCS)
+        let docs: Vec<SharedStorage<DocumentContext>> = (0..DOCS)
             .map(|d| doc_ctx(d + 1, &format!("doc-{d}.xml")))
             .collect();
         let mut w = GraceSpillWriter::new(dir.path(), 4, 0, false).unwrap();
         for doc in &docs {
             for i in 0..RECS_PER_DOC {
                 let mut rec = record(&s, i as i64, "r");
-                rec.set_doc_ctx(Arc::clone(doc));
+                rec.set_doc_ctx(doc.clone());
                 w.write_record(&rec).unwrap();
             }
         }
         let (path, _) = w.finish().unwrap();
-        let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
+        let reader = GraceSpillReader::open(&path, s.clone()).unwrap();
         // Footer counts record frames only — context frames excluded.
         assert_eq!(
             reader.header().record_count as usize,
@@ -1065,9 +1065,12 @@ mod tests {
         let doc_a = recs[0].doc_ctx();
         let doc_b = recs[RECS_PER_DOC].doc_ctx();
         assert!(
-            !Arc::ptr_eq(doc_a, doc_b),
-            "distinct docs get distinct Arcs"
+            !SharedStorage::ptr_eq(doc_a, doc_b),
+            "distinct docs get distinct contexts"
         );
-        assert!(Arc::ptr_eq(doc_a, recs[RECS_PER_DOC - 1].doc_ctx()));
+        assert!(SharedStorage::ptr_eq(
+            doc_a,
+            recs[RECS_PER_DOC - 1].doc_ctx()
+        ));
     }
 }

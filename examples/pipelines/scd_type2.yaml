@@ -13,10 +13,9 @@
 # input records to disk under pressure and re-running synthesis on reload.
 pipeline:
   name: scd_type2_backfill
-  # A small budget here forces the spill path even on this tiny fixture, so
-  # the example doubles as a demonstration of bounded-memory Reshape. Raise or
-  # remove it for production volumes.
-  memory: { limit: "16K", backpressure: spill }
+  # Include headroom for complete row groups and their retained storage.
+  # The spill policy permits disk-backed execution when memory is pressured.
+  memory: { limit: "128K", backpressure: spill }
 
 nodes:
   - type: source

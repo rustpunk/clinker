@@ -1,3 +1,4 @@
+use clinker_record::owned_storage::OwnedValues;
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
@@ -521,7 +522,9 @@ fn telemetry_arena_bounds_typed_record_values_before_serialization() {
     let policy = policy_with_lanes("3KB", "1KB", "4KB");
     let (producer, receiver) =
         TelemetryArena::reserve(&policy).expect("enabled policy creates arena");
-    let value = Value::Array((0..1_000).map(Value::Integer).collect());
+    let value = Value::Array(OwnedValues::from_vec(
+        (0..1_000).map(Value::Integer).collect(),
+    ));
 
     assert!(
         producer

@@ -5,6 +5,336 @@ use clinker_exec::{
         shutdown::ShutdownToken,
     },
 };
+use clinker_record::owned_storage::ResourceErrorKind;
+
+#[test]
+fn allocation_capability_clone_and_query_do_not_allocate() {
+    let arb = Arc::new(MemoryArbitrator::with_policy(
+        4096,
+        0.8,
+        0.7,
+        Box::new(NoOpPolicy),
+    ));
+    let weak = Arc::downgrade(&arb);
+    let observer = arb.writer_resource_observer();
+    let provider = ExecutorResources::new(
+        arb.clone(),
+        ShutdownToken::detached(),
+        None,
+        NonZeroUsize::MIN,
+        None,
+    )
+    .unwrap();
+    let allocation = provider.allocation();
+    let writers = provider.resources();
+    let scope = allocation.scope().unwrap();
+    let value = clinker_record::FieldStr::try_new(
+        "a governed string long enough to require shared heap backing",
+        &scope,
+    )
+    .unwrap();
+    let lease = scope.reserve(Layout::new::<[u8; 64]>()).unwrap();
+    let foreign =
+        clinker_format::preparation::MemoryOnlyResources::new(NonZeroUsize::new(4096).unwrap());
+    let foreign_resources = foreign.resources();
+    let foreign_lease = foreign_resources
+        .allocation()
+        .reserve(scope.owner(), Layout::new::<[u8; 64]>())
+        .unwrap();
+    assert_eq!(lease.owner(), foreign_lease.owner());
+    let charged = observer.usage().memory;
+    assert!(charged > 64);
+
+    ALLOCATIONS.with(|count| count.set(Some(0)));
+    let cloned = allocation.clone();
+    let same_adapter = cloned.identity() == writers.allocation().identity();
+    let local_bytes = value.unaccounted_heap_size(&cloned);
+    let foreign_bytes = value.unaccounted_heap_size(foreign_resources.allocation());
+    let local_lease = lease.is_accounted_by(writers.allocation());
+    let unrelated_lease = foreign_lease.is_accounted_by(&cloned);
+    let allocations = ALLOCATIONS.with(|count| count.replace(None).unwrap());
+    assert_eq!(
+        allocations, 0,
+        "cloning capabilities and borrowed queries allocate nothing"
+    );
+    assert!(same_adapter);
+    assert_eq!(local_bytes, 0);
+    assert!(foreign_bytes > 0);
+    assert!(local_lease);
+    assert!(!unrelated_lease);
+    assert_eq!(observer.usage().memory, charged);
+
+    drop(writers);
+    drop(provider);
+    drop(arb);
+    assert!(
+        weak.upgrade().is_none(),
+        "allocation capabilities must not retain the run"
+    );
+    assert!(observer.is_closed());
+    assert!(!observer.has_managed_handle());
+    assert_eq!(observer.usage().memory, charged);
+    assert_eq!(
+        cloned.scope().err().unwrap().kind,
+        ResourceErrorKind::Finalized
+    );
+    drop(value);
+    assert_eq!(observer.usage().memory, 64);
+    drop(lease);
+    assert_eq!(observer.usage().memory, 0);
+}
+
+#[test]
+fn allocation_release_after_run_retains_only_live_charge() {
+    let arb = Arc::new(MemoryArbitrator::with_policy(
+        1024,
+        0.8,
+        0.7,
+        Box::new(NoOpPolicy),
+    ));
+    let weak = Arc::downgrade(&arb);
+    let observer = arb.writer_resource_observer();
+    let provider = ExecutorResources::new(
+        arb.clone(),
+        ShutdownToken::detached(),
+        None,
+        NonZeroUsize::new(1).unwrap(),
+        None,
+    )
+    .unwrap();
+    let allocation = provider.allocation();
+    let scope = allocation.scope().unwrap();
+    let lease = scope.reserve(Layout::new::<[u8; 64]>()).unwrap();
+    assert_eq!(arb.consumer_count(), 1);
+    assert!(observer.has_managed_handle());
+    drop(provider);
+    arb.close_writer_resources();
+    assert_eq!(
+        arb.consumer_count(),
+        0,
+        "escaped authority is not a registered run consumer"
+    );
+    assert!(!observer.has_managed_handle());
+    assert_eq!(observer.usage().memory, 64);
+    assert_eq!(
+        scope.reserve(Layout::new::<u8>()).err().unwrap().kind,
+        ResourceErrorKind::Finalized
+    );
+    drop(arb);
+    assert!(
+        weak.upgrade().is_none(),
+        "the release observer and scope must not retain the run"
+    );
+    assert!(observer.is_closed());
+    assert_eq!(observer.usage().memory, 64);
+    assert_eq!(
+        allocation.scope().err().unwrap().kind,
+        ResourceErrorKind::Finalized
+    );
+    ALLOCATIONS.with(|count| count.set(Some(0)));
+    drop(lease);
+    let allocations = ALLOCATIONS.with(|count| count.replace(None).unwrap());
+    assert_eq!(allocations, 0, "release after teardown needs no allocation");
+    assert_eq!(observer.usage().memory, 0);
+    assert_eq!(observer.usage().peak_memory, 64);
+}
+
+#[test]
+fn allocation_release_after_run_drop_closes_without_explicit_shutdown() {
+    let arb = Arc::new(MemoryArbitrator::with_policy(
+        1024,
+        0.8,
+        0.7,
+        Box::new(NoOpPolicy),
+    ));
+    let observer = arb.writer_resource_observer();
+    let provider = ExecutorResources::new(
+        arb.clone(),
+        ShutdownToken::detached(),
+        None,
+        NonZeroUsize::new(1).unwrap(),
+        None,
+    )
+    .unwrap();
+    let scope = provider.allocation().scope().unwrap();
+    let lease = scope.reserve(Layout::new::<u64>()).unwrap();
+    drop(provider);
+    drop(arb);
+    assert!(observer.is_closed());
+    assert!(!observer.has_managed_handle());
+    assert_eq!(observer.usage().memory, 8);
+    drop(lease);
+    assert_eq!(observer.usage().memory, 0);
+}
+
+#[test]
+fn allocation_release_after_run_preserves_actual_disk_cleanup_result() {
+    for restore_before_drop in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            128 * 1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let weak = Arc::downgrade(&arb);
+        let observer = arb.writer_resource_observer();
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            ShutdownToken::detached(),
+            Some(&configured(root.path())),
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        )
+        .unwrap();
+        let lease = provider
+            .allocation()
+            .scope()
+            .unwrap()
+            .reserve(Layout::new::<[u8; 64]>())
+            .unwrap();
+        let mut stage = provider.resources().scope().unwrap().stage().unwrap();
+        stage.write_all(&vec![1; 100 * 1024]).unwrap();
+        let prepared = stage.finish().unwrap();
+        assert_eq!(observer.usage().disk, 100 * 1024);
+        assert_eq!(observer.usage().descriptors, 1);
+        let path = std::fs::read_dir(root.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let saved = root.path().join("retained");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        drop(prepared);
+        assert_eq!(provider.cleanup_debt_count(), 1);
+        drop(provider);
+        assert_eq!(arb.retry_writer_cleanup(), 1);
+        assert_eq!(arb.consumer_count(), 1);
+        if restore_before_drop {
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::rename(&saved, &path).unwrap();
+        }
+        drop(arb);
+        assert!(weak.upgrade().is_none());
+        assert!(observer.is_closed());
+        assert!(!observer.has_managed_handle());
+        assert_eq!(
+            observer.usage().memory,
+            64,
+            "cleanup metadata has actually been dropped"
+        );
+        assert_eq!(
+            observer.usage().descriptors,
+            0,
+            "the owned file was closed before debt retention"
+        );
+        assert_eq!(
+            observer.usage().disk,
+            if restore_before_drop { 0 } else { 100 * 1024 }
+        );
+        if restore_before_drop {
+            assert!(!path.exists());
+        } else {
+            assert_eq!(std::fs::metadata(&saved).unwrap().len(), 100 * 1024);
+        }
+        drop(lease);
+        assert_eq!(observer.usage().memory, 0);
+    }
+}
+
+#[test]
+fn allocation_close_release_and_admission_are_serialized() {
+    for _ in 0..16 {
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            64,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            ShutdownToken::detached(),
+            None,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        )
+        .unwrap();
+        let scope = provider.allocation().scope().unwrap();
+        let lease = scope.reserve(Layout::new::<[u8; 64]>()).unwrap();
+        let barrier = std::sync::Barrier::new(3);
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                barrier.wait();
+                drop(lease);
+            });
+            threads.spawn(|| {
+                barrier.wait();
+                match scope.reserve(Layout::new::<[u8; 64]>()) {
+                    Ok(lease) => drop(lease),
+                    Err(error) => assert!(matches!(
+                        error.kind,
+                        ResourceErrorKind::Budget | ResourceErrorKind::Finalized
+                    )),
+                }
+            });
+            barrier.wait();
+            arb.close_writer_resources();
+        });
+        assert_eq!(arb.writer_resource_usage().memory, 0);
+        assert!(arb.writer_resource_usage().peak_memory <= 64);
+        assert_eq!(arb.consumer_count(), 0);
+        assert_eq!(
+            scope.reserve(Layout::new::<u8>()).err().unwrap().kind,
+            ResourceErrorKind::Finalized
+        );
+    }
+}
+
+#[test]
+fn allocation_shutdown_before_or_after_reservation_preserves_release() {
+    for cancel_first in [true, false] {
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            64,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let token = ShutdownToken::detached();
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            token.clone(),
+            None,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        )
+        .unwrap();
+        let scope = provider.allocation().scope().unwrap();
+        let observer = arb.writer_resource_observer();
+        if cancel_first {
+            token.request();
+        }
+        let lease = scope.reserve(Layout::new::<[u8; 64]>());
+        if cancel_first {
+            assert_eq!(lease.err().unwrap().kind, ResourceErrorKind::Cancelled);
+            assert_eq!(observer.usage().memory, 0);
+        } else {
+            let lease = lease.unwrap();
+            token.request();
+            assert_eq!(
+                scope.reserve(Layout::new::<u8>()).err().unwrap().kind,
+                ResourceErrorKind::Cancelled
+            );
+            assert_eq!(observer.usage().memory, 64);
+            drop(provider);
+            drop(arb);
+            assert!(observer.is_closed());
+            drop(lease);
+            assert_eq!(observer.usage().memory, 0);
+        }
+    }
+}
 
 struct CountingAllocator;
 thread_local! {

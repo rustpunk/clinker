@@ -1,4 +1,8 @@
+use clinker_record::owned_storage::{OwnedKey, OwnedValues};
+#[cfg(test)]
+use clinker_record::owned_storage::{OwnedMap, SharedStorage};
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::Arc;
 
 use clinker_record::{Record, SchemaBuilder, Value, round_decimal_to_scale};
@@ -145,7 +149,7 @@ pub fn project_output_probed(
         // document envelope on output (e.g. EDIFACT `interchange_from_doc`
         // echoing the source `UNB` header) can still resolve
         // `$doc.<section>.<field>` after projection drops engine columns.
-        out.set_doc_ctx(Arc::clone(input_record.doc_ctx()));
+        out.set_doc_ctx(input_record.doc_ctx().clone());
         round_declared_output_decimals(&mut out, config);
         return out;
     }
@@ -233,9 +237,9 @@ pub fn project_output_probed(
     // The placeholder trick is what keeps the append order intact:
     // removing the slot outright would need `swap_remove` (which reorders
     // the passthrough columns) or a shift per listed column.
-    let (names, values): (Vec<Box<str>>, Vec<Value>) = match config.mapping.as_ref() {
+    let (names, values): (Vec<OwnedKey>, Vec<Value>) = match config.mapping.as_ref() {
         Some(mapping) => {
-            let mut names: Vec<Box<str>> = Vec::with_capacity(mapping.entries().len());
+            let mut names: Vec<OwnedKey> = Vec::with_capacity(mapping.entries().len());
             let mut values: Vec<Value> = Vec::with_capacity(mapping.entries().len());
             for (index, entry) in mapping.entries().iter().enumerate() {
                 let value = match fields.get_mut(entry.source.as_str()) {
@@ -255,7 +259,7 @@ pub fn project_output_probed(
                     // column, and the probe's end-of-stream report says so.
                     None => Value::Null,
                 };
-                names.push(Box::<str>::from(entry.output.as_str()));
+                names.push(OwnedKey::from(entry.output.as_str()));
                 values.push(value);
             }
             if config.include_unmapped {
@@ -281,7 +285,7 @@ pub fn project_output_probed(
                         }
                         continue;
                     }
-                    names.push(Box::<str>::from(name.as_str()));
+                    names.push(OwnedKey::from(name.as_str()));
                     values.push(value);
                 }
             } else {
@@ -317,17 +321,17 @@ pub fn project_output_probed(
                     let Some(value) = fields.swap_remove(name) else {
                         continue;
                     };
-                    names.push(Box::<str>::from(name));
+                    names.push(OwnedKey::from(name));
                     values.push(value);
                 }
             }
             (names, values)
         }
         None => {
-            let mut names: Vec<Box<str>> = Vec::with_capacity(fields.len());
+            let mut names: Vec<OwnedKey> = Vec::with_capacity(fields.len());
             let mut values: Vec<Value> = Vec::with_capacity(fields.len());
             for (name, value) in fields {
-                names.push(Box::<str>::from(name.as_str()));
+                names.push(OwnedKey::from(name.as_str()));
                 values.push(value);
             }
             (names, values)
@@ -339,7 +343,7 @@ pub fn project_output_probed(
     // Same document's row after the rename/exclude rewrite — carry the
     // envelope context forward so document-reconstructing writers still
     // resolve `$doc.<section>.<field>` on the projected record.
-    out.set_doc_ctx(Arc::clone(input_record.doc_ctx()));
+    out.set_doc_ctx(input_record.doc_ctx().clone());
     round_declared_output_decimals(&mut out, config);
     out
 }
@@ -708,7 +712,7 @@ fn round_declared_output_decimals(record: &mut Record, config: &SinkConfig) {
         // pass through, matching the scalar arm.
         let rounded = match record.get(&col.name) {
             Some(&Value::Decimal(d)) => Value::Decimal(round_decimal_to_scale(d, Some(scale))),
-            Some(Value::Array(items)) => Value::Array(
+            Some(Value::Array(items)) => Value::Array(OwnedValues::from_vec(
                 items
                     .iter()
                     .map(|item| match item {
@@ -718,7 +722,7 @@ fn round_declared_output_decimals(record: &mut Record, config: &SinkConfig) {
                         other => other.clone(),
                     })
                     .collect(),
-            ),
+            )),
             _ => continue,
         };
         record.set(&col.name, rounded);
@@ -735,12 +739,12 @@ mod tests {
         // Schema is pre-widened to include every field the post-transform
         // Record would carry — `full_name` is declared up front so
         // `Record::set` hits a known slot.
-        let schema = Arc::new(Schema::new(vec![
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "first_name".into(),
             "last_name".into(),
             "secret".into(),
             "full_name".into(),
-        ]));
+        ])));
         Record::new(
             schema,
             vec![
@@ -967,7 +971,7 @@ mod tests {
                 Value::Integer(1),
                 Value::String("Alice".into()),
                 Value::Integer(1),
-                Value::Map(Box::new(sidecar)),
+                Value::Map(OwnedMap::from_map(sidecar)),
             ],
         );
 
@@ -1377,7 +1381,7 @@ mod tests {
             vec![
                 Value::Integer(7),
                 Value::Integer(7),
-                Value::Map(Box::new(sidecar)),
+                Value::Map(OwnedMap::from_map(sidecar)),
             ],
         );
         let config = SinkConfig {
@@ -1435,21 +1439,22 @@ mod tests {
         // `interchange_from_doc` echoing the source `UNB` — must still
         // resolve `$doc.<section>.<field>` on the projected record, so the
         // fast path has to carry the envelope context forward.
-        let schema = Arc::new(Schema::new(vec!["seg_id".into(), "e01".into()]));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["seg_id".into(), "e01".into()])));
         let mut input = Record::new(
             schema,
             vec![Value::String("BGM".into()), Value::String("220".into())],
         );
-        let mut unb: RecIndexMap<Box<str>, Value> = RecIndexMap::new();
+        let mut unb: RecIndexMap<OwnedKey, Value> = RecIndexMap::new();
         unb.insert("e01".into(), Value::String("UNOA:1".into()));
-        let mut sections: RecIndexMap<Box<str>, Value> = RecIndexMap::new();
-        sections.insert("unb".into(), Value::Map(Box::new(unb)));
-        let ctx = Arc::new(DocumentContext::new(
+        let mut sections: RecIndexMap<OwnedKey, Value> = RecIndexMap::new();
+        sections.insert("unb".into(), Value::Map(OwnedMap::from_map(unb)));
+        let ctx = SharedStorage::from_arc(Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.edi"),
             clinker_record::EnvelopeRecord::from_sections(sections),
-        ));
-        input.set_doc_ctx(Arc::clone(&ctx));
+        )));
+        input.set_doc_ctx(ctx.clone());
 
         let config = SinkConfig {
             name: "out".into(),
@@ -1528,7 +1533,7 @@ mod tests {
     }
 
     fn one_field_record(name: &str, value: Value) -> Record {
-        let schema = Arc::new(Schema::new(vec![name.into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![name.into()])));
         Record::new(schema, vec![value])
     }
 
@@ -1560,11 +1565,11 @@ mod tests {
             .expect("4 / 3");
         let input = one_field_record(
             "amounts",
-            Value::Array(vec![
+            Value::Array(OwnedValues::from_vec(vec![
                 Value::Decimal(quotient),
                 Value::Decimal(Decimal::new(2125, 3)),
                 Value::String("n/a".into()),
-            ]),
+            ])),
         );
         let schema = SourceSchema::Columns(vec![Column {
             multiple: Some(true),
@@ -1573,11 +1578,11 @@ mod tests {
         let out = project_output_from_record(&input, &scale_config(Some(schema)), None);
         assert_eq!(
             out.get("amounts"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::Decimal(Decimal::new(133, 2)),
                 Value::Decimal(Decimal::new(212, 2)),
                 Value::String("n/a".into()),
-            ]))
+            ])))
         );
     }
 

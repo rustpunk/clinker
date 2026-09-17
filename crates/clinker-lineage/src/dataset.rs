@@ -318,6 +318,7 @@ fn longest_common_dir(dirs: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_record::owned_storage::SharedStorage;
     use std::sync::Arc;
 
     use clinker_core_types::span::Span;
@@ -355,7 +356,7 @@ mod tests {
             id: PlanNodeId::new(0),
             span: Span::SYNTHETIC,
             resolved: resolved.map(Box::new),
-            output_schema: Arc::new(Schema::new(vec![])),
+            output_schema: SharedStorage::from_arc(Arc::new(Schema::new(vec![]))),
         }
     }
 
@@ -376,7 +377,7 @@ mod tests {
             mode: clinker_plan::config::MergeMode::Concat,
             interleave_seed: None,
             input_order: Vec::new(),
-            output_schema: Arc::new(Schema::new(vec![])),
+            output_schema: SharedStorage::from_arc(Arc::new(Schema::new(vec![]))),
         }
     }
 

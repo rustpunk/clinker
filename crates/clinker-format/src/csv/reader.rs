@@ -1,5 +1,5 @@
+use clinker_record::owned_storage::{OwnedKey, OwnedValues, SharedStorage};
 use std::io::Read;
-use std::sync::Arc;
 
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
 
@@ -55,7 +55,7 @@ impl Default for CsvReaderConfig {
 /// `has_header: false` — never carries the `U+FEFF` marker.
 pub struct CsvReader<R: Read> {
     inner: csv::Reader<SkipBom<R>>,
-    schema: Option<Arc<Schema>>,
+    schema: Option<SharedStorage<Schema>>,
     config: CsvReaderConfig,
     /// Per-column split declaration, index-aligned to the schema columns:
     /// `Some(entry)` for a column a `split_values` entry covers, `None`
@@ -86,9 +86,9 @@ impl<R: Read> CsvReader<R> {
         }
     }
 
-    fn ensure_schema(&mut self) -> Result<Arc<Schema>, FormatError> {
+    fn ensure_schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
         if let Some(ref schema) = self.schema {
-            return Ok(Arc::clone(schema));
+            return Ok(schema.clone());
         }
 
         let schema = if self.config.has_header {
@@ -99,9 +99,9 @@ impl<R: Read> CsvReader<R> {
             }
             // Decode each header cell through the configured charset so a
             // non-UTF-8 column name resolves identically to its body fields.
-            let columns: Vec<Box<str>> = headers
+            let columns: Vec<OwnedKey> = headers
                 .iter()
-                .map(|f| charset.decode(f.to_vec()).map(Box::<str>::from))
+                .map(|f| charset.decode(f.to_vec()).map(OwnedKey::from))
                 .collect::<Result<_, _>>()?;
             columns.into_iter().collect::<SchemaBuilder>().build()
         } else if !self.inner.read_byte_record(&mut self.record_buf)? {
@@ -136,13 +136,13 @@ impl<R: Read> CsvReader<R> {
                 .collect();
         }
 
-        self.schema = Some(Arc::clone(&schema));
+        self.schema = Some(schema.clone());
         Ok(schema)
     }
 }
 
 impl<R: Read + Send> FormatReader for CsvReader<R> {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
         self.ensure_schema()
     }
 
@@ -199,7 +199,7 @@ fn decode_record(
                 return Ok(Value::String(s.into()));
             };
             if s.is_empty() {
-                return Ok(Value::Array(Vec::new()));
+                return Ok(Value::Array(OwnedValues::from_vec(Vec::new())));
             }
             if entry.json {
                 let parsed: serde_json::Value = serde_json::from_str(&s).map_err(|e| {
@@ -311,11 +311,11 @@ mod tests {
         assert_eq!(record.get("order_id"), Some(&Value::String("1".into())));
         assert_eq!(
             record.get("tags"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::String("b".into()),
                 Value::String("c".into()),
-            ]))
+            ])))
         );
     }
 
@@ -325,7 +325,10 @@ mod tests {
         let mut reader = CsvReader::from_reader(csv.as_bytes(), split_config("tags", ";"));
         reader.schema().unwrap();
         let record = reader.next_record().unwrap().unwrap();
-        assert_eq!(record.get("tags"), Some(&Value::Array(Vec::new())));
+        assert_eq!(
+            record.get("tags"),
+            Some(&Value::Array(OwnedValues::from_vec(Vec::new())))
+        );
     }
 
     #[test]
@@ -336,7 +339,9 @@ mod tests {
         let record = reader.next_record().unwrap().unwrap();
         assert_eq!(
             record.get("tags"),
-            Some(&Value::Array(vec![Value::String("solo".into())]))
+            Some(&Value::Array(OwnedValues::from_vec(vec![Value::String(
+                "solo".into()
+            )])))
         );
     }
 
@@ -350,11 +355,11 @@ mod tests {
         let record = reader.next_record().unwrap().unwrap();
         assert_eq!(
             record.get("tags"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::String("".into()),
                 Value::String("c".into()),
-            ]))
+            ])))
         );
     }
 
@@ -368,10 +373,10 @@ mod tests {
         let record = reader.next_record().unwrap().unwrap();
         assert_eq!(
             record.get("tags"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a".into()),
                 Value::String("b".into()),
-            ]))
+            ])))
         );
         assert_eq!(record.get("notes"), Some(&Value::String("x;y".into())));
     }
@@ -387,10 +392,10 @@ mod tests {
         let record = reader.next_record().unwrap().unwrap();
         assert_eq!(
             record.get("tags"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a,b".into()),
                 Value::String("c".into()),
-            ]))
+            ])))
         );
     }
 
@@ -413,10 +418,10 @@ mod tests {
         let record = reader.next_record().unwrap().unwrap();
         assert_eq!(
             record.get("tags"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a;b".into()),
                 Value::String("c".into()),
-            ]))
+            ])))
         );
     }
 
@@ -438,10 +443,10 @@ mod tests {
         let record = reader.next_record().unwrap().unwrap();
         assert_eq!(
             record.get("tags"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a\\b".into()),
                 Value::String("c".into()),
-            ]))
+            ])))
         );
     }
 
@@ -464,10 +469,10 @@ mod tests {
         let record = reader.next_record().unwrap().unwrap();
         assert_eq!(
             record.get("tags"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::String("a;b".into()),
                 Value::String("c".into()),
-            ]))
+            ])))
         );
     }
 
@@ -486,7 +491,10 @@ mod tests {
         let mut reader = CsvReader::from_reader(csv.as_bytes(), config);
         reader.schema().unwrap();
         let record = reader.next_record().unwrap().unwrap();
-        assert_eq!(record.get("tags"), Some(&Value::Array(Vec::new())));
+        assert_eq!(
+            record.get("tags"),
+            Some(&Value::Array(OwnedValues::from_vec(Vec::new())))
+        );
     }
 
     #[test]
@@ -576,11 +584,11 @@ mod tests {
         let record = reader.next_record().unwrap().unwrap();
         assert_eq!(
             record.get("ids"),
-            Some(&Value::Array(vec![
+            Some(&Value::Array(OwnedValues::from_vec(vec![
                 Value::Integer(1),
                 Value::Integer(2),
                 Value::Integer(9007199254740993),
-            ]))
+            ])))
         );
     }
 

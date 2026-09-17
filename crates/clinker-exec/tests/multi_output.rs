@@ -10,6 +10,7 @@ mod common;
 #[path = "common/multi_output_fixtures.rs"]
 mod multi_output_fixtures;
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 
 use clinker_bench_support::io::SharedBuffer;
@@ -491,7 +492,7 @@ fn shared_port_resident_spill_parity() {
         assert_shared_port_run("spilled merge", &spilled.0, &spilled.1, "merged", 48);
         assert!(
             spilled.0.cumulative_spill_bytes > 0,
-            "the 64K run must exercise spill-backed shared-port replay"
+            "the bounded run must exercise spill-backed shared-port replay"
         );
         assert_eq!(
             csv_data_rows(&resident.1["direct"]),
@@ -1570,7 +1571,9 @@ fn test_multi_output_multiple_errors_collected() {
 fn test_dlq_stage_source() {
     // Unit test: verify DlqEntry::stage_source() produces "source"
     // and a DlqEntry with stage "source" has route: None.
-    let schema = std::sync::Arc::new(clinker_record::Schema::new(vec!["id".into()]));
+    let schema = SharedStorage::from_arc(std::sync::Arc::new(clinker_record::Schema::new(vec![
+        "id".into(),
+    ])));
     let record = clinker_record::Record::new(schema, vec![Value::String("1".into())]);
     let entry = DlqEntry {
         source_row: source_row(1),
@@ -1731,7 +1734,9 @@ nodes:
 fn test_dlq_stage_output() {
     // Unit test: verify DlqEntry::stage_output() produces "output:{name}"
     // and that a DlqEntry can carry both stage and route.
-    let schema = std::sync::Arc::new(clinker_record::Schema::new(vec!["id".into()]));
+    let schema = SharedStorage::from_arc(std::sync::Arc::new(clinker_record::Schema::new(vec![
+        "id".into(),
+    ])));
     let record = clinker_record::Record::new(schema, vec![Value::String("1".into())]);
     let entry = DlqEntry {
         source_row: source_row(1),
@@ -1819,7 +1824,9 @@ fn test_dlq_columns_in_csv() {
     // Verify that DLQ CSV output includes _cxl_dlq_stage and _cxl_dlq_route columns.
     use clinker_exec::dlq::write_dlq;
 
-    let schema = std::sync::Arc::new(clinker_record::Schema::new(vec!["name".into()]));
+    let schema = SharedStorage::from_arc(std::sync::Arc::new(clinker_record::Schema::new(vec![
+        "name".into(),
+    ])));
     let record = clinker_record::Record::new(schema.clone(), vec![Value::String("Alice".into())]);
     let entries = vec![DlqEntry {
         source_row: source_row(1),

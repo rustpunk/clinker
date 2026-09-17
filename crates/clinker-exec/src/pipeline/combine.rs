@@ -28,6 +28,7 @@
 
 use ahash::RandomState;
 use chrono::{Datelike, Timelike};
+use clinker_record::owned_storage::OwnedKey;
 use clinker_record::{Record, Value};
 use cxl::ast::Expr;
 use cxl::eval::{CompiledScalar, EvalContext, EvalError, compile_scalar};
@@ -201,7 +202,7 @@ fn hash_value_into<H: Hasher>(v: &Value, h: &mut H) {
             // hash identically regardless of insertion order. IndexMap
             // preserves insertion order, which is useful for display but
             // undesired for hash determinism.
-            let mut keys: Vec<&Box<str>> = m.keys().collect();
+            let mut keys: Vec<&OwnedKey> = m.keys().collect();
             keys.sort_unstable();
             for k in keys {
                 h.write_usize(k.len());
@@ -302,7 +303,7 @@ fn encode_canonical(v: &Value, out: &mut Vec<u8>) -> bool {
             // Sorted-key order so two Maps with the same entries encode
             // identically regardless of insertion order — the order-independent
             // Map equality `value_equal_canonicalized` gives.
-            let mut keys: Vec<&Box<str>> = m.keys().collect();
+            let mut keys: Vec<&OwnedKey> = m.keys().collect();
             keys.sort_unstable();
             for k in keys {
                 out.extend_from_slice(&(k.len() as u64).to_le_bytes());
@@ -984,6 +985,7 @@ impl crate::pipeline::memory::MemoryConsumer for CombineHashConsumer {
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+    use clinker_record::owned_storage::{OwnedMap, OwnedValues, SharedStorage};
     use indexmap::IndexMap;
 
     // Deterministic RandomState across tests so hashes are stable within a
@@ -1110,11 +1112,17 @@ mod tests {
         // must hash differently.
         let s = deterministic_state();
         let a = hash_composite_key(
-            &[Value::Array(vec![Value::Integer(1), Value::Integer(2)])],
+            &[Value::Array(OwnedValues::from_vec(vec![
+                Value::Integer(1),
+                Value::Integer(2),
+            ]))],
             &s,
         );
         let b = hash_composite_key(
-            &[Value::Array(vec![Value::Integer(2), Value::Integer(1)])],
+            &[Value::Array(OwnedValues::from_vec(vec![
+                Value::Integer(2),
+                Value::Integer(1),
+            ]))],
             &s,
         );
         assert_ne!(a, b);
@@ -1125,14 +1133,14 @@ mod tests {
         // Maps with the same (k, v) pairs must hash identically regardless
         // of insertion order.
         let s = deterministic_state();
-        let mut m1: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut m1: IndexMap<OwnedKey, Value> = IndexMap::new();
         m1.insert("a".into(), Value::Integer(1));
         m1.insert("b".into(), Value::Integer(2));
-        let mut m2: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut m2: IndexMap<OwnedKey, Value> = IndexMap::new();
         m2.insert("b".into(), Value::Integer(2));
         m2.insert("a".into(), Value::Integer(1));
-        let h1 = hash_composite_key(&[Value::Map(Box::new(m1))], &s);
-        let h2 = hash_composite_key(&[Value::Map(Box::new(m2))], &s);
+        let h1 = hash_composite_key(&[Value::Map(OwnedMap::from_map(m1))], &s);
+        let h2 = hash_composite_key(&[Value::Map(OwnedMap::from_map(m2))], &s);
         assert_eq!(h1, h2);
     }
 
@@ -1222,15 +1230,15 @@ mod tests {
 
     #[test]
     fn keys_equal_canonicalized_map_order_independent() {
-        let mut m1: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut m1: IndexMap<OwnedKey, Value> = IndexMap::new();
         m1.insert("k1".into(), Value::Integer(1));
         m1.insert("k2".into(), Value::Integer(2));
-        let mut m2: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut m2: IndexMap<OwnedKey, Value> = IndexMap::new();
         m2.insert("k2".into(), Value::Integer(2));
         m2.insert("k1".into(), Value::Integer(1));
         assert!(keys_equal_canonicalized(
-            &[Value::Map(Box::new(m1))],
-            &[Value::Map(Box::new(m2))]
+            &[Value::Map(OwnedMap::from_map(m1))],
+            &[Value::Map(OwnedMap::from_map(m2))]
         ));
     }
 
@@ -1242,20 +1250,29 @@ mod tests {
         assert_eq!(canonical_key_bytes(&[Value::Null]), None);
         assert_eq!(canonical_key_bytes(&[Value::Integer(1), Value::Null]), None);
         assert_eq!(
-            canonical_key_bytes(&[Value::Array(vec![Value::Integer(1), Value::Null])]),
+            canonical_key_bytes(&[Value::Array(OwnedValues::from_vec(vec![
+                Value::Integer(1),
+                Value::Null
+            ]))]),
             None
         );
-        let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut m: IndexMap<OwnedKey, Value> = IndexMap::new();
         m.insert("k".into(), Value::Null);
-        assert_eq!(canonical_key_bytes(&[Value::Map(Box::new(m))]), None);
+        assert_eq!(
+            canonical_key_bytes(&[Value::Map(OwnedMap::from_map(m))]),
+            None
+        );
         // Cross-type nesting: a null buried under a Map -> Array still poisons the
         // key, matching `value_equal_canonicalized` recursing to false.
-        let mut nested: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut nested: IndexMap<OwnedKey, Value> = IndexMap::new();
         nested.insert(
             "arr".into(),
-            Value::Array(vec![Value::Integer(1), Value::Null]),
+            Value::Array(OwnedValues::from_vec(vec![Value::Integer(1), Value::Null])),
         );
-        assert_eq!(canonical_key_bytes(&[Value::Map(Box::new(nested))]), None);
+        assert_eq!(
+            canonical_key_bytes(&[Value::Map(OwnedMap::from_map(nested))]),
+            None
+        );
     }
 
     #[test]
@@ -1266,10 +1283,10 @@ mod tests {
         // hash-partition prune rely on. Cover the canonicalization corners:
         // ±0.0 / NaN floats, Decimal scale, cross-type disjointness, string
         // length-prefixing, map key-order independence, and nesting.
-        let mut m_ab: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut m_ab: IndexMap<OwnedKey, Value> = IndexMap::new();
         m_ab.insert("a".into(), Value::Integer(1));
         m_ab.insert("b".into(), Value::Integer(2));
-        let mut m_ba: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut m_ba: IndexMap<OwnedKey, Value> = IndexMap::new();
         m_ba.insert("b".into(), Value::Integer(2));
         m_ba.insert("a".into(), Value::Integer(1));
 
@@ -1307,9 +1324,12 @@ mod tests {
             vec![dt_normal],
             vec![dt_leap],
             vec![Value::Integer(1), Value::Integer(2)],
-            vec![Value::Array(vec![Value::Integer(1), Value::Integer(2)])],
-            vec![Value::Map(Box::new(m_ab))],
-            vec![Value::Map(Box::new(m_ba))],
+            vec![Value::Array(OwnedValues::from_vec(vec![
+                Value::Integer(1),
+                Value::Integer(2),
+            ]))],
+            vec![Value::Map(OwnedMap::from_map(m_ab))],
+            vec![Value::Map(OwnedMap::from_map(m_ba))],
         ];
 
         let state = deterministic_state();
@@ -1350,8 +1370,11 @@ mod tests {
             Value::String("ab".into()),
             Value::Decimal("2.5".parse().unwrap()),
             Value::Decimal("2.50".parse().unwrap()),
-            Value::Array(vec![Value::Integer(1), Value::Integer(2)]),
-            Value::Array(vec![Value::Integer(1), Value::Null]),
+            Value::Array(OwnedValues::from_vec(vec![
+                Value::Integer(1),
+                Value::Integer(2),
+            ])),
+            Value::Array(OwnedValues::from_vec(vec![Value::Integer(1), Value::Null])),
         ])
     }
 
@@ -1599,13 +1622,13 @@ mod tests {
 
     use clinker_record::{Record, Schema};
 
-    fn test_schema(cols: &[&str]) -> Arc<Schema> {
-        let boxed: Vec<Box<str>> = cols.iter().map(|c| (*c).into()).collect();
-        Arc::new(Schema::new(boxed))
+    fn test_schema(cols: &[&str]) -> SharedStorage<Schema> {
+        let names: Vec<OwnedKey> = cols.iter().map(|c| (*c).into()).collect();
+        SharedStorage::from_arc(Arc::new(Schema::new(names)))
     }
 
-    fn mk_record(schema: &Arc<Schema>, values: Vec<Value>) -> Record {
-        Record::new(Arc::clone(schema), values)
+    fn mk_record(schema: &SharedStorage<Schema>, values: Vec<Value>) -> Record {
+        Record::new(schema.clone(), values)
     }
 
     fn test_budget(limit_bytes: u64) -> MemoryArbitrator {
@@ -1642,6 +1665,13 @@ mod tests {
 
     #[test]
     fn test_combine_hash_table_build_probe_exact() {
+        crate::test_support::run_isolated(
+            "pipeline::combine::tests::test_combine_hash_table_build_probe_exact",
+            test_combine_hash_table_build_probe_exact_probe,
+        );
+    }
+
+    fn test_combine_hash_table_build_probe_exact_probe() {
         let schema = test_schema(&["id", "name"]);
         let records: Vec<Record> = (0..1000)
             .map(|i| {
@@ -1672,6 +1702,13 @@ mod tests {
 
     #[test]
     fn test_combine_hash_table_duplicate_keys() {
+        crate::test_support::run_isolated(
+            "pipeline::combine::tests::test_combine_hash_table_duplicate_keys",
+            test_combine_hash_table_duplicate_keys_probe,
+        );
+    }
+
+    fn test_combine_hash_table_duplicate_keys_probe() {
         // Three records with the same key → all yielded by probe.
         let schema = test_schema(&["k", "val"]);
         let records = vec![
@@ -1701,6 +1738,13 @@ mod tests {
 
     #[test]
     fn test_combine_hash_table_no_match_returns_empty() {
+        crate::test_support::run_isolated(
+            "pipeline::combine::tests::test_combine_hash_table_no_match_returns_empty",
+            test_combine_hash_table_no_match_returns_empty_probe,
+        );
+    }
+
+    fn test_combine_hash_table_no_match_returns_empty_probe() {
         let schema = test_schema(&["k"]);
         let records = vec![mk_record(&schema, vec![Value::Integer(1)])];
         let extractor = single_int_key("k");
@@ -1717,6 +1761,13 @@ mod tests {
 
     #[test]
     fn test_combine_hash_table_null_probe_short_circuits() {
+        crate::test_support::run_isolated(
+            "pipeline::combine::tests::test_combine_hash_table_null_probe_short_circuits",
+            test_combine_hash_table_null_probe_short_circuits_probe,
+        );
+    }
+
+    fn test_combine_hash_table_null_probe_short_circuits_probe() {
         // Probe with NULL key → empty iter (SQL 3VL), even though a build
         // record with the same-hash NULL key exists in the table.
         let schema = test_schema(&["k", "tag"]);
@@ -1756,6 +1807,13 @@ mod tests {
 
     #[test]
     fn test_combine_hash_table_null_build_indexed_never_matches() {
+        crate::test_support::run_isolated(
+            "pipeline::combine::tests::test_combine_hash_table_null_build_indexed_never_matches",
+            test_combine_hash_table_null_build_indexed_never_matches_probe,
+        );
+    }
+
+    fn test_combine_hash_table_null_build_indexed_never_matches_probe() {
         // SQL three-value-logic: a build record stored under a NULL key
         // must never match any probe — including a probe whose extracted
         // key happens to share the NULL sentinel's hash bucket. The
@@ -1832,6 +1890,13 @@ mod tests {
 
     #[test]
     fn test_combine_hash_table_hash_collision_equality_reject() {
+        crate::test_support::run_isolated(
+            "pipeline::combine::tests::test_combine_hash_table_hash_collision_equality_reject",
+            test_combine_hash_table_hash_collision_equality_reject_probe,
+        );
+    }
+
+    fn test_combine_hash_table_hash_collision_equality_reject_probe() {
         // Force multiple records into the same bucket by using extreme
         // cardinality. hashbrown's AHasher is keyed by a process-random
         // RandomState, so we can't guarantee a collision between two
@@ -1875,6 +1940,13 @@ mod tests {
 
     #[test]
     fn test_combine_hash_table_memory_tracking_all_sources() {
+        crate::test_support::run_isolated(
+            "pipeline::combine::tests::test_combine_hash_table_memory_tracking_all_sources",
+            test_combine_hash_table_memory_tracking_all_sources_probe,
+        );
+    }
+
+    fn test_combine_hash_table_memory_tracking_all_sources_probe() {
         let schema = test_schema(&["k", "val"]);
         let records: Vec<Record> = (0..100)
             .map(|i| {
@@ -1917,6 +1989,13 @@ mod tests {
 
     #[test]
     fn test_combine_hash_table_memory_overhead_ratio() {
+        crate::test_support::run_isolated(
+            "pipeline::combine::tests::test_combine_hash_table_memory_overhead_ratio",
+            test_combine_hash_table_memory_overhead_ratio_probe,
+        );
+    }
+
+    fn test_combine_hash_table_memory_overhead_ratio_probe() {
         // Target: <1.1× overhead for records with 10+ fields (realistic
         // ETL size — ~1-2 KB per record). The "raw" baseline here is
         // what ANY in-memory record store would occupy: per-Record struct
@@ -1987,6 +2066,13 @@ mod tests {
 
     #[test]
     fn test_combine_hash_table_memory_overhead_bench() {
+        crate::test_support::run_isolated(
+            "pipeline::combine::tests::test_combine_hash_table_memory_overhead_bench",
+            test_combine_hash_table_memory_overhead_bench_probe,
+        );
+    }
+
+    fn test_combine_hash_table_memory_overhead_bench_probe() {
         // Bench-scale companion to the _ratio test: holds the < 1.1×
         // overhead target steady when both record count and record width
         // grow an order of magnitude. The smaller test runs at 1 K rows
@@ -2050,6 +2136,13 @@ mod tests {
 
     #[test]
     fn test_combine_hash_table_oom_aborts_during_build() {
+        crate::test_support::run_isolated(
+            "pipeline::combine::tests::test_combine_hash_table_oom_aborts_during_build",
+            test_combine_hash_table_oom_aborts_during_build_probe,
+        );
+    }
+
+    fn test_combine_hash_table_oom_aborts_during_build_probe() {
         // With a 1-byte budget the 10-record table's own footprint trivially
         // exceeds the hard limit, so the final-check safety net's
         // `should_abort_local(table.memory_bytes())` fires regardless of
@@ -2086,6 +2179,13 @@ mod tests {
 
     #[test]
     fn test_combine_build_aborts_under_tiny_budget_without_seeding_rss() {
+        crate::test_support::run_isolated(
+            "pipeline::combine::tests::test_combine_build_aborts_under_tiny_budget_without_seeding_rss",
+            test_combine_build_aborts_under_tiny_budget_without_seeding_rss_probe,
+        );
+    }
+
+    fn test_combine_build_aborts_under_tiny_budget_without_seeding_rss_probe() {
         // RSS-independent backstop: a build over input larger than the
         // budget must abort even with NO seeded peak_rss. `test_budget`
         // never seeds `peak_rss`, so on a target where `rss_bytes()`
@@ -2115,6 +2215,13 @@ mod tests {
 
     #[test]
     fn test_combine_hash_table_empty_input() {
+        crate::test_support::run_isolated(
+            "pipeline::combine::tests::test_combine_hash_table_empty_input",
+            test_combine_hash_table_empty_input_probe,
+        );
+    }
+
+    fn test_combine_hash_table_empty_input_probe() {
         // EC-1: zero build records. build() succeeds with len()==0; probe
         // returns empty iter for any driver.
         let schema = test_schema(&["k"]);
@@ -2134,6 +2241,13 @@ mod tests {
 
     #[test]
     fn test_combine_hash_table_probe_iter_advances_across_chain() {
+        crate::test_support::run_isolated(
+            "pipeline::combine::tests::test_combine_hash_table_probe_iter_advances_across_chain",
+            test_combine_hash_table_probe_iter_advances_across_chain_probe,
+        );
+    }
+
+    fn test_combine_hash_table_probe_iter_advances_across_chain_probe() {
         // Anti-regression for a subtle ProbeIter bug: if `self.current` is
         // advanced AFTER yielding (instead of before), a hash collision
         // with non-match followed by a true match would yield only the
@@ -2167,6 +2281,13 @@ mod tests {
 
     #[test]
     fn test_combine_hash_table_randomized_roundtrip() {
+        crate::test_support::run_isolated(
+            "pipeline::combine::tests::test_combine_hash_table_randomized_roundtrip",
+            test_combine_hash_table_randomized_roundtrip_probe,
+        );
+    }
+
+    fn test_combine_hash_table_randomized_roundtrip_probe() {
         // C.2.1.5: randomized round-trip. Builds random (key, payload)
         // records into the hash table, then verifies that for every key
         // (whether or not present in the build set) the probe yields

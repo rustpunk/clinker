@@ -4,9 +4,9 @@
 //! the deduplication step that produces `Vec<IndexSpec>`, combined with
 //! `AnalysisReport` field sets harvested from each transform's CXL.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 use clinker_record::Schema;
 use petgraph::graph::NodeIndex;
@@ -22,18 +22,18 @@ use crate::config::SortField;
 /// `NodeIndex`; the arena builds at the upstream operator's
 /// dispatch-arm exit through `finalize_node_rooted_windows`.
 ///
-/// The `Arc<Schema>` carried by the root is the upstream
+/// The `SharedStorage<Schema>` carried by the root is the upstream
 /// operator's `output_schema` at lowering time. It is **not** part of
 /// equality / hashing — only `upstream: NodeIndex` is. Two
 /// `IndexSpec`s with the same `upstream` always carry the same
-/// `Arc<Schema>` instance from that upstream node, so dedup keyed on
+/// `SharedStorage<Schema>` instance from that upstream node, so dedup keyed on
 /// `upstream` alone is correct.
 pub enum PlanIndexRoot {
     /// Node-rooted in the current DAG: arena built at the upstream
     /// operator's dispatch-arm exit from `node_buffers[upstream]`.
     Node {
         upstream: NodeIndex,
-        anchor_schema: Arc<Schema>,
+        anchor_schema: SharedStorage<Schema>,
     },
 }
 
@@ -45,7 +45,7 @@ impl Clone for PlanIndexRoot {
                 anchor_schema,
             } => Self::Node {
                 upstream: *upstream,
-                anchor_schema: Arc::clone(anchor_schema),
+                anchor_schema: anchor_schema.clone(),
             },
         }
     }
@@ -74,7 +74,7 @@ impl Eq for PlanIndexRoot {}
 impl Hash for PlanIndexRoot {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Discriminant + payload: Node by upstream NodeIndex. The
-        // Arc<Schema> is a side-channel — every
+        // SharedStorage<Schema> is a side-channel — every
         // IndexSpec sharing an `upstream` carries the same Arc
         // instance (it's the upstream operator's output_schema), so
         // excluding it from the hash key keeps dedup correct.

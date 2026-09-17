@@ -24,6 +24,7 @@
 //! yields the document count; the per-footer count validates the body→grain
 //! partitioning.
 
+use clinker_record::owned_storage::{OwnedKey, OwnedMap, SharedStorage};
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
@@ -81,7 +82,7 @@ enum Step {
 }
 
 struct ScriptedReader {
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     steps: std::collections::VecDeque<Step>,
     pending_events: Vec<EnvelopeEvent>,
     current_file: Option<Arc<str>>,
@@ -108,30 +109,30 @@ impl ScriptedReader {
         )
     }
 
-    fn section(name: &str, tag_val: &str) -> IndexMap<Box<str>, Value> {
+    fn section(name: &str, tag_val: &str) -> IndexMap<OwnedKey, Value> {
         let mut field = IndexMap::new();
-        field.insert(Box::from("tag"), Value::String(tag_val.into()));
+        field.insert(OwnedKey::from("tag"), Value::String(tag_val.into()));
         let mut sections = IndexMap::new();
-        sections.insert(Box::from(name), Value::Map(Box::new(field)));
+        sections.insert(OwnedKey::from(name), Value::Map(OwnedMap::from_map(field)));
         sections
     }
 
     /// Like [`Self::section`], but the section payload also carries an engine-
     /// injected `$raw` key (the `$`-sigil convention the X12/EDIFACT/HL7 readers
     /// use to stash lossless raw bytes alongside the user fields).
-    fn section_with_raw(name: &str, tag_val: &str, raw: &str) -> IndexMap<Box<str>, Value> {
+    fn section_with_raw(name: &str, tag_val: &str, raw: &str) -> IndexMap<OwnedKey, Value> {
         let mut field = IndexMap::new();
-        field.insert(Box::from("tag"), Value::String(tag_val.into()));
-        field.insert(Box::from("$raw"), Value::String(raw.into()));
+        field.insert(OwnedKey::from("tag"), Value::String(tag_val.into()));
+        field.insert(OwnedKey::from("$raw"), Value::String(raw.into()));
         let mut sections = IndexMap::new();
-        sections.insert(Box::from(name), Value::Map(Box::new(field)));
+        sections.insert(OwnedKey::from(name), Value::Map(OwnedMap::from_map(field)));
         sections
     }
 }
 
 impl RecordSource for ScriptedReader {
-    fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-        Ok(Arc::clone(&self.schema))
+    fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+        Ok(self.schema.clone())
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
@@ -176,7 +177,7 @@ impl RecordSource for ScriptedReader {
                 Step::Record { file, id } => {
                     self.current_file = Some(self.file_arc(file));
                     return Ok(Some(Record::new(
-                        Arc::clone(&self.schema),
+                        self.schema.clone(),
                         vec![Value::Integer(id)],
                     )));
                 }

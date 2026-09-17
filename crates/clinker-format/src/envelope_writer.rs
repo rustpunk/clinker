@@ -14,6 +14,7 @@
 //! [`DocumentContext`]. Each writer renders those fields in its own native
 //! shape (a CSV row, a JSON object, an XML element, a fixed-width line).
 
+use clinker_record::owned_storage::OwnedKey;
 use clinker_record::{DocumentContext, Value};
 use indexmap::IndexMap;
 
@@ -105,7 +106,7 @@ impl EnvelopeFramer {
     pub fn header_fields<'a>(
         &self,
         doc: &'a DocumentContext,
-    ) -> Option<&'a IndexMap<Box<str>, Value>> {
+    ) -> Option<&'a IndexMap<OwnedKey, Value>> {
         self.spec
             .header_from_doc
             .as_deref()
@@ -125,7 +126,7 @@ impl EnvelopeFramer {
     pub fn footer_fields<'a>(
         &self,
         doc: &'a DocumentContext,
-    ) -> Option<&'a IndexMap<Box<str>, Value>> {
+    ) -> Option<&'a IndexMap<OwnedKey, Value>> {
         self.spec
             .footer_from_doc
             .as_deref()
@@ -151,19 +152,24 @@ impl EnvelopeFramer {
 #[cfg(test)]
 pub(crate) fn test_doc_with_sections(
     sections: &[(&str, &[(&str, Value)])],
-) -> std::sync::Arc<DocumentContext> {
-    let mut map: IndexMap<Box<str>, Value> = IndexMap::new();
+) -> clinker_record::owned_storage::SharedStorage<DocumentContext> {
+    let mut map: IndexMap<OwnedKey, Value> = IndexMap::new();
     for (name, fields) in sections {
-        let mut inner: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut inner: IndexMap<OwnedKey, Value> = IndexMap::new();
         for (k, v) in *fields {
-            inner.insert(Box::from(*k), v.clone());
+            inner.insert(OwnedKey::from(*k), v.clone());
         }
-        map.insert(Box::from(*name), Value::Map(Box::new(inner)));
+        map.insert(
+            OwnedKey::from(*name),
+            Value::Map(clinker_record::owned_storage::OwnedMap::from_map(inner)),
+        );
     }
-    std::sync::Arc::new(DocumentContext::new(
-        clinker_record::DocumentId::next(),
-        std::sync::Arc::from("test.doc"),
-        clinker_record::EnvelopeRecord::from_sections(map),
+    clinker_record::owned_storage::SharedStorage::from_arc(std::sync::Arc::new(
+        DocumentContext::new(
+            clinker_record::DocumentId::next(),
+            std::sync::Arc::from("test.doc"),
+            clinker_record::EnvelopeRecord::from_sections(map),
+        ),
     ))
 }
 
@@ -174,16 +180,16 @@ mod tests {
     use std::sync::Arc;
 
     fn section(fields: &[(&str, Value)]) -> Value {
-        let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut m: IndexMap<OwnedKey, Value> = IndexMap::new();
         for (k, v) in fields {
-            m.insert(Box::from(*k), v.clone());
+            m.insert(OwnedKey::from(*k), v.clone());
         }
-        Value::Map(Box::new(m))
+        Value::Map(clinker_record::owned_storage::OwnedMap::from_map(m))
     }
 
     fn doc_with(section_name: &str, fields: &[(&str, Value)]) -> DocumentContext {
         let mut sections = IndexMap::new();
-        sections.insert(Box::from(section_name), section(fields));
+        sections.insert(OwnedKey::from(section_name), section(fields));
         DocumentContext::new(
             DocumentId::next(),
             Arc::from("f.csv"),

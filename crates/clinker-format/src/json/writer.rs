@@ -17,8 +17,8 @@
 //! mode, or one object per line in `ndjson` mode. The body array streams one
 //! record at a time, so no document is ever buffered.
 
+use clinker_record::owned_storage::{OwnedKey, SharedStorage};
 use std::io::Write;
-use std::sync::Arc;
 
 use clinker_record::field_path::{self, FieldPathError};
 use clinker_record::{DocumentContext, Record, Schema, Value};
@@ -71,7 +71,7 @@ pub struct JsonWriter<W: Write> {
     /// the plan built from `Record::schema`, so the field is not read
     /// per-record, but keeping the `Arc` pins the schema against unintended
     /// drop by factory callers.
-    _schema: Arc<Schema>,
+    _schema: SharedStorage<Schema>,
     config: JsonWriterConfig,
     records_written: u64,
     /// Per-document envelope framer + state machine, present only when
@@ -105,7 +105,7 @@ struct EnvelopeState {
 }
 
 impl<W: Write> JsonWriter<W> {
-    pub fn new(writer: W, schema: Arc<Schema>, config: JsonWriterConfig) -> Self {
+    pub fn new(writer: W, schema: SharedStorage<Schema>, config: JsonWriterConfig) -> Self {
         let envelope = config
             .envelope
             .clone()
@@ -127,7 +127,7 @@ impl<W: Write> JsonWriter<W> {
     }
 
     /// Ensure `plan_cache` holds an expansion plan for this record's schema,
-    /// rebuilding only when the schema identity changes (`Arc::ptr_eq`), so a
+    /// rebuilding only when the schema identity changes (`SharedStorage::ptr_eq`), so a
     /// single-schema stream builds it once. Name decoding and collision
     /// detection happen here, before any byte of the record is written, so an
     /// unexpandable column set fails `write_record` cleanly.
@@ -135,7 +135,7 @@ impl<W: Write> JsonWriter<W> {
         let current = self
             .plan_cache
             .as_ref()
-            .is_some_and(|c| Arc::ptr_eq(&c.schema, record.schema()));
+            .is_some_and(|c| SharedStorage::ptr_eq(&c.schema, record.schema()));
         if !current {
             self.plan_cache = Some(build_plan_cache(
                 record.schema(),
@@ -227,7 +227,7 @@ impl<W: Write> JsonWriter<W> {
     /// be expanded, and [`FormatError::Json`] when a section field holds a
     /// non-finite float (NaN or an infinity), which JSON cannot represent.
     fn section_object(
-        fields: &indexmap::IndexMap<Box<str>, Value>,
+        fields: &indexmap::IndexMap<OwnedKey, Value>,
         count: Option<(&str, i64)>,
     ) -> Result<serde_json::Value, FormatError> {
         use serde_json::{Map, Value as Jv};
@@ -518,7 +518,7 @@ fn field_path_error(source: FieldPathError) -> FormatError {
 
 /// The expansion plan plus the schema identity it was built for.
 struct PlanCache {
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     root: PlanBody,
 }
 
@@ -546,7 +546,7 @@ enum PlanNode {
 /// Returns [`FormatError::FieldPath`] for a malformed escape, a name past the
 /// depth cap, or two columns that would occupy the same place in the tree.
 fn build_plan_cache(
-    schema: &Arc<Schema>,
+    schema: &SharedStorage<Schema>,
     include_engine_stamped: bool,
 ) -> Result<PlanCache, FormatError> {
     let emitted: Vec<(usize, &str)> = (0..schema.column_count())
@@ -589,7 +589,7 @@ fn build_plan_cache(
         });
     }
     Ok(PlanCache {
-        schema: Arc::clone(schema),
+        schema: schema.clone(),
         root,
     })
 }
@@ -737,19 +737,21 @@ mod tests {
     use super::*;
     use crate::json::reader::{JsonReader, JsonReaderConfig};
     use crate::traits::FormatReader;
+    use clinker_record::owned_storage::{OwnedMap, OwnedValues};
     use clinker_record::schema::{FieldMetadata, SchemaBuilder};
+    use std::sync::Arc;
 
-    fn test_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
+    fn test_schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "name".into(),
             "age".into(),
             "active".into(),
-        ]))
+        ])))
     }
 
-    fn make_record(schema: &Arc<Schema>, name: &str, age: i64, active: bool) -> Record {
+    fn make_record(schema: &SharedStorage<Schema>, name: &str, age: i64, active: bool) -> Record {
         Record::new(
-            Arc::clone(schema),
+            schema.clone(),
             vec![
                 Value::String(name.into()),
                 Value::Integer(age),
@@ -758,9 +760,13 @@ mod tests {
         )
     }
 
-    fn write_records(config: JsonWriterConfig, records: &[Record], schema: &Arc<Schema>) -> String {
+    fn write_records(
+        config: JsonWriterConfig,
+        records: &[Record],
+        schema: &SharedStorage<Schema>,
+    ) -> String {
         let mut buf = Vec::new();
-        let mut w = JsonWriter::new(&mut buf, Arc::clone(schema), config);
+        let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
         for r in records {
             w.write_record(r).unwrap();
         }
@@ -769,11 +775,11 @@ mod tests {
     }
 
     /// Build a record over a schema of plain columns, one value per column.
-    fn record_of(schema: &Arc<Schema>, values: Vec<Value>) -> Record {
-        Record::new(Arc::clone(schema), values)
+    fn record_of(schema: &SharedStorage<Schema>, values: Vec<Value>) -> Record {
+        Record::new(schema.clone(), values)
     }
 
-    fn schema_of(columns: &[&str]) -> Arc<Schema> {
+    fn schema_of(columns: &[&str]) -> SharedStorage<Schema> {
         columns.iter().copied().collect::<SchemaBuilder>().build()
     }
 
@@ -781,7 +787,7 @@ mod tests {
     /// exact bytes rather than a reparsed tree.
     fn write_one_line(
         config: JsonWriterConfig,
-        schema: &Arc<Schema>,
+        schema: &SharedStorage<Schema>,
         values: Vec<Value>,
     ) -> String {
         let config = JsonWriterConfig {
@@ -797,11 +803,11 @@ mod tests {
     /// reached the sink, so a rejection can be checked to have emitted nothing.
     fn write_one_expecting_error(
         config: JsonWriterConfig,
-        schema: &Arc<Schema>,
+        schema: &SharedStorage<Schema>,
         values: Vec<Value>,
     ) -> (FormatError, Vec<u8>) {
         let mut buf = Vec::new();
-        let mut w = JsonWriter::new(&mut buf, Arc::clone(schema), config);
+        let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
         let err = w
             .write_record(&record_of(schema, values))
             .expect_err("expected the record to be refused");
@@ -868,9 +874,9 @@ mod tests {
 
     #[test]
     fn test_json_write_omit_nulls() {
-        let schema = Arc::new(Schema::new(vec!["a".into(), "b".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["a".into(), "b".into()])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::String("hello".into()), Value::Null],
         );
         let config = JsonWriterConfig {
@@ -887,9 +893,9 @@ mod tests {
 
     #[test]
     fn test_json_write_preserve_nulls() {
-        let schema = Arc::new(Schema::new(vec!["a".into(), "b".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["a".into(), "b".into()])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::String("hello".into()), Value::Null],
         );
         let config = JsonWriterConfig {
@@ -907,13 +913,13 @@ mod tests {
     fn test_json_write_field_ordering() {
         // Schema fields emit in schema order — the widened schema is
         // authoritative; there is no overflow ordering to reason about.
-        let schema = Arc::new(Schema::new(vec![
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
             "z_field".into(),
             "a_field".into(),
             "m_field".into(),
-        ]));
+        ])));
         let record = Record::new(
-            Arc::clone(&schema),
+            schema.clone(),
             vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
         );
 
@@ -969,14 +975,14 @@ mod tests {
         // a wide schema and a long string value, then reads back to confirm the
         // scratch buffer is fully rewritten per record (no stale-byte bleed) and
         // the round-trip is faithful.
-        let cols: Vec<Box<str>> = (0..40).map(|i| format!("c{i}").into()).collect();
-        let schema = Arc::new(Schema::new(cols));
+        let cols: Vec<OwnedKey> = (0..40).map(|i| format!("c{i}").into()).collect();
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
         let long = "x".repeat(500);
         let mk = |seed: i64, tail: &str| {
             let mut vals: Vec<Value> = (0..40).map(|i| Value::Integer(seed + i as i64)).collect();
             // Overwrite one column with a long string to stress the value path.
             vals[17] = Value::String(format!("{long}-{tail}").into());
-            Record::new(Arc::clone(&schema), vals)
+            Record::new(schema.clone(), vals)
         };
         let records = vec![mk(0, "first"), mk(100, "second")];
         let config = JsonWriterConfig {
@@ -1010,8 +1016,8 @@ mod tests {
 
     #[test]
     fn test_json_write_finite_float_roundtrips_exactly() {
-        let schema = Arc::new(Schema::new(vec!["reading".into()]));
-        let record = Record::new(Arc::clone(&schema), vec![Value::Float(2.5)]);
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["reading".into()])));
+        let record = Record::new(schema.clone(), vec![Value::Float(2.5)]);
         let config = JsonWriterConfig {
             format: JsonOutputMode::Ndjson,
             ..Default::default()
@@ -1023,15 +1029,15 @@ mod tests {
 
     #[test]
     fn test_json_write_rejects_non_finite_floats() {
-        let schema = Arc::new(Schema::new(vec!["reading".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["reading".into()])));
         for (val, rendered) in [
             (f64::NAN, "NaN"),
             (f64::INFINITY, "inf"),
             (f64::NEG_INFINITY, "-inf"),
         ] {
-            let record = Record::new(Arc::clone(&schema), vec![Value::Float(val)]);
+            let record = Record::new(schema.clone(), vec![Value::Float(val)]);
             let mut buf = Vec::new();
-            let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), JsonWriterConfig::default());
+            let mut w = JsonWriter::new(&mut buf, schema.clone(), JsonWriterConfig::default());
             let err = w.write_record(&record).unwrap_err();
             match err {
                 FormatError::Json(msg) => assert!(
@@ -1051,16 +1057,16 @@ mod tests {
 
     #[test]
     fn test_json_write_rejects_non_finite_float_nested_in_array() {
-        let schema = Arc::new(Schema::new(vec!["readings".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["readings".into()])));
         let record = Record::new(
-            Arc::clone(&schema),
-            vec![Value::Array(vec![
+            schema.clone(),
+            vec![Value::Array(OwnedValues::from_vec(vec![
                 Value::Float(1.0),
                 Value::Float(f64::INFINITY),
-            ])],
+            ]))],
         );
         let mut buf = Vec::new();
-        let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), JsonWriterConfig::default());
+        let mut w = JsonWriter::new(&mut buf, schema.clone(), JsonWriterConfig::default());
         let err = w.write_record(&record).unwrap_err();
         match err {
             FormatError::Json(msg) => assert!(
@@ -1073,8 +1079,8 @@ mod tests {
 
     use crate::envelope_writer::test_doc_with_sections as doc_with_sections;
 
-    fn amount_record(schema: &Arc<Schema>, n: i64) -> Record {
-        Record::new(Arc::clone(schema), vec![Value::Integer(n)])
+    fn amount_record(schema: &SharedStorage<Schema>, n: i64) -> Record {
+        Record::new(schema.clone(), vec![Value::Integer(n)])
     }
 
     #[test]
@@ -1085,7 +1091,7 @@ mod tests {
         // ever reached here without an open document, the writer must raise a
         // clean error rather than emit record bytes outside any `body` array
         // (which would be malformed JSON).
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount".into()])));
         let config = JsonWriterConfig {
             format: JsonOutputMode::Array,
             envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
@@ -1095,7 +1101,7 @@ mod tests {
             ..Default::default()
         };
         let mut buf = Vec::new();
-        let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), config);
+        let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
         // No begin_document — write straight into the envelope writer.
         let err = w.write_record(&amount_record(&schema, 1)).unwrap_err();
         match err {
@@ -1109,7 +1115,7 @@ mod tests {
 
     #[test]
     fn json_envelope_array_mode_frames_each_document_as_an_object() {
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount".into()])));
         let config = JsonWriterConfig {
             format: JsonOutputMode::Array,
             envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
@@ -1129,7 +1135,7 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         {
-            let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), config);
+            let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
             w.begin_document(&doc_a).unwrap();
             w.write_record(&amount_record(&schema, 10)).unwrap();
             w.write_record(&amount_record(&schema, 20)).unwrap();
@@ -1157,7 +1163,7 @@ mod tests {
 
     #[test]
     fn json_envelope_ndjson_mode_one_document_object_per_line() {
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount".into()])));
         let config = JsonWriterConfig {
             format: JsonOutputMode::Ndjson,
             envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
@@ -1170,7 +1176,7 @@ mod tests {
         let doc_b = doc_with_sections(&[("Head", &[("batch_id", Value::String("B".into()))])]);
         let mut buf = Vec::new();
         {
-            let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), config);
+            let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
             w.begin_document(&doc_a).unwrap();
             w.write_record(&amount_record(&schema, 10)).unwrap();
             w.end_document(&doc_a).unwrap();
@@ -1189,7 +1195,7 @@ mod tests {
 
     #[test]
     fn json_envelope_rejects_non_finite_float_in_section() {
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount".into()])));
         let config = JsonWriterConfig {
             format: JsonOutputMode::Array,
             envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
@@ -1200,7 +1206,7 @@ mod tests {
         };
         let doc = doc_with_sections(&[("Head", &[("ratio", Value::Float(f64::NAN))])]);
         let mut buf = Vec::new();
-        let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), config);
+        let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
         let err = w.begin_document(&doc).unwrap_err();
         match err {
             FormatError::Json(msg) => assert!(
@@ -1213,7 +1219,7 @@ mod tests {
 
     #[test]
     fn json_envelope_rejects_non_finite_float_in_body_record() {
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["amount".into()])));
         let config = JsonWriterConfig {
             format: JsonOutputMode::Array,
             envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
@@ -1224,9 +1230,9 @@ mod tests {
         };
         let doc = doc_with_sections(&[("Head", &[("batch_id", Value::String("A".into()))])]);
         let mut buf = Vec::new();
-        let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), config);
+        let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
         w.begin_document(&doc).unwrap();
-        let record = Record::new(Arc::clone(&schema), vec![Value::Float(f64::NEG_INFINITY)]);
+        let record = Record::new(schema.clone(), vec![Value::Float(f64::NEG_INFINITY)]);
         let err = w.write_record(&record).unwrap_err();
         match err {
             FormatError::Json(msg) => assert!(
@@ -1345,8 +1351,11 @@ mod tests {
             JsonWriterConfig::default(),
             &schema,
             vec![
-                Value::Array(vec![Value::Integer(1), Value::Integer(2)]),
-                Value::Map(Box::new(
+                Value::Array(OwnedValues::from_vec(vec![
+                    Value::Integer(1),
+                    Value::Integer(2),
+                ])),
+                Value::Map(OwnedMap::from_map(
                     [("k".into(), Value::String("v".into()))]
                         .into_iter()
                         .collect(),
@@ -1470,7 +1479,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         {
-            let mut w = JsonWriter::new(&mut buf, Arc::clone(&flat), config);
+            let mut w = JsonWriter::new(&mut buf, flat.clone(), config);
             w.write_record(&record_of(&flat, vec![Value::Integer(1)]))
                 .unwrap();
             w.write_record(&record_of(&nested, vec![Value::Integer(2)]))
@@ -1534,7 +1543,7 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         {
-            let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), config);
+            let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
             w.begin_document(&doc).unwrap();
             w.write_record(&record_of(&schema, vec![Value::Integer(1)]))
                 .unwrap();

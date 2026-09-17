@@ -7,7 +7,9 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
-use crate::preparation::{AllocationGrant, ResourceError, ResourceErrorKind, WriterScope};
+use clinker_record::owned_storage::{
+    AllocationLease, AllocationScope, ResourceError, ResourceErrorKind,
+};
 
 #[cfg(test)]
 thread_local! { static FAIL_ALLOCATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
@@ -24,22 +26,14 @@ fn allocate(layout: Layout) -> *mut u8 {
 /// Allocate an already-admitted box. Failure returns the intact owner so its
 /// caller can observe the error while all grants are still live, before drop.
 pub(crate) fn try_box<T>(value: T) -> Result<Box<T>, (ResourceError, T)> {
-    let layout = Layout::new::<T>();
-    if layout.size() == 0 {
-        return Ok(Box::new(value));
-    }
-    let Some(ptr) = NonNull::new(allocate(layout).cast::<T>()) else {
+    #[cfg(test)]
+    if std::mem::size_of::<T>() != 0 && FAIL_ALLOCATION.with(|fail| fail.replace(false)) {
         return Err((
-            ResourceError::new(ResourceErrorKind::Allocation, layout.size(), 0),
+            ResourceError::new(ResourceErrorKind::Allocation, std::mem::size_of::<T>(), 0),
             value,
         ));
-    };
-    // SAFETY: ptr owns exactly Layout::new::<T>(); initialize before constructing
-    // the Box, whose destructor uses the identical global allocator/layout.
-    unsafe {
-        ptr.as_ptr().write(value);
-        Ok(Box::from_raw(ptr.as_ptr()))
     }
+    clinker_record::owned_storage::try_box(value)
 }
 
 /// A fallibly growing vector whose allocation is admitted before it occurs.
@@ -48,8 +42,8 @@ pub struct ReservedVec<T> {
     ptr: NonNull<T>,
     len: usize,
     capacity: usize,
-    grant: Option<AllocationGrant>,
-    scope: WriterScope,
+    grant: Option<AllocationLease>,
+    scope: AllocationScope,
     marker: PhantomData<T>,
 }
 
@@ -61,7 +55,7 @@ unsafe impl<T: Sync> Sync for ReservedVec<T> {}
 
 impl<T> ReservedVec<T> {
     /// Construct empty storage without allocating.
-    pub fn new(scope: WriterScope) -> Self {
+    pub fn new(scope: AllocationScope) -> Self {
         Self {
             ptr: NonNull::dangling(),
             len: 0,
@@ -171,7 +165,7 @@ impl<T> Drop for ReservedVec<T> {
         struct Block<T> {
             ptr: NonNull<T>,
             capacity: usize,
-            _grant: Option<AllocationGrant>,
+            _grant: Option<AllocationLease>,
         }
         impl<T> Drop for Block<T> {
             fn drop(&mut self) {
@@ -230,7 +224,7 @@ impl ReservedBuffer {
 pub struct ReservedText(ReservedBuffer);
 impl ReservedText {
     /// Construct empty text without allocating.
-    pub fn new(scope: WriterScope) -> Self {
+    pub fn new(scope: AllocationScope) -> Self {
         Self(ReservedBuffer::new(scope))
     }
     /// Append valid UTF-8 after admission.
@@ -257,7 +251,7 @@ mod tests {
     #[test]
     fn memory_allocator_failure_releases_new_grant_preserves_old() {
         let provider = MemoryOnlyResources::new(NonZeroUsize::new(4096).unwrap());
-        let mut bytes = ReservedBuffer::new(provider.resources().scope().unwrap());
+        let mut bytes = ReservedBuffer::new(provider.resources().allocation().scope().unwrap());
         bytes.extend_from_slice(b"old").unwrap();
         FAIL_ALLOCATION.with(|fail| fail.set(true));
         assert_eq!(

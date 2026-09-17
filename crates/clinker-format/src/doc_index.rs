@@ -18,6 +18,7 @@
 //! materialization — the bounded-memory posture the engine commits to.
 
 use clinker_record::Value;
+use clinker_record::owned_storage::OwnedKey;
 use cxl::analyzer::doc_paths::DocPath;
 use indexmap::IndexMap;
 
@@ -46,7 +47,7 @@ pub struct DocArenaIndex {
     wanted_fields: IndexMap<Box<str>, Option<Vec<Box<str>>>>,
     /// Retained section subtrees, keyed by section name in insertion
     /// order. One entry per inserted section.
-    sections: IndexMap<Box<str>, Value>,
+    sections: IndexMap<OwnedKey, Value>,
     /// Running sum of the heap-size estimate of every retained subtree.
     retained_bytes: usize,
     /// Hard cap on `retained_bytes`. `None` disables the cap (the reader's
@@ -167,7 +168,7 @@ impl DocArenaIndex {
             ));
         }
         self.retained_bytes = projected;
-        self.sections.insert(path.section.clone(), value);
+        self.sections.insert(path.section.clone().into(), value);
         Ok(())
     }
 
@@ -181,7 +182,7 @@ impl DocArenaIndex {
     /// Lower the retained subtrees to the envelope-section map a reader's
     /// `prepare_document` returns: section name → its retained [`Value`],
     /// in insertion order.
-    pub fn into_sections(self) -> IndexMap<Box<str>, Value> {
+    pub fn into_sections(self) -> IndexMap<OwnedKey, Value> {
         self.sections
     }
 }
@@ -208,11 +209,11 @@ mod tests {
     }
 
     fn map(pairs: &[(&str, Value)]) -> Value {
-        let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
+        let mut m: IndexMap<OwnedKey, Value> = IndexMap::new();
         for (k, v) in pairs {
             m.insert((*k).into(), v.clone());
         }
-        Value::Map(Box::new(m))
+        Value::Map(clinker_record::owned_storage::OwnedMap::from_map(m))
     }
 
     #[test]
@@ -400,17 +401,20 @@ mod tests {
     fn insert_accumulates_until_cap_then_errors() {
         // First insert fits, second tips over the cap — proving the cap is
         // checked against the running total, not per-insert.
-        let mut idx = DocArenaIndex::new(&[path("A", "x"), path("B", "y")], Some(300));
-        idx.insert(
-            &path("A", "x"),
-            map(&[("x", Value::String("a".repeat(100).into()))]),
-        )
-        .expect("first insert fits under the running cap");
+        let first = map(&[("x", Value::String("a".repeat(100).into()))]);
+        let second = map(&[("y", Value::String("b".repeat(100).into()))]);
+        // Fit either subtree in isolation, including its one-byte section key.
+        // Derive the fixture cap from the compiled storage layout.
+        let cap = 1 + first.heap_size().max(second.heap_size());
+        let mut standalone = DocArenaIndex::new(&[path("B", "y")], Some(cap));
+        standalone
+            .insert(&path("B", "y"), second.clone())
+            .expect("second subtree alone fits under the same cap");
+        let mut idx = DocArenaIndex::new(&[path("A", "x"), path("B", "y")], Some(cap));
+        idx.insert(&path("A", "x"), first)
+            .expect("first insert fits under the running cap");
         let err = idx
-            .insert(
-                &path("B", "y"),
-                map(&[("y", Value::String("b".repeat(400).into()))]),
-            )
+            .insert(&path("B", "y"), second)
             .expect_err("second insert tips the running total over the cap");
         assert!(
             err.contains("B"),

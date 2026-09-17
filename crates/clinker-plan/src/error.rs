@@ -6,6 +6,7 @@
 //! runtime error enum that aggregates every subsystem failure with the
 //! `From` conversions that thread them together.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::fmt;
 
 /// Maximum UTF-8 bytes retained from a logical node name in a dispatch
@@ -119,8 +120,8 @@ pub enum PipelineError {
     /// so the diagnostic can be rendered lazily without lifetime
     /// gymnastics.
     SchemaMismatch {
-        expected: std::sync::Arc<clinker_record::Schema>,
-        actual: std::sync::Arc<clinker_record::Schema>,
+        expected: SharedStorage<clinker_record::Schema>,
+        actual: SharedStorage<clinker_record::Schema>,
         operator_name: String,
         operator_kind: &'static str,
         upstream_name: String,

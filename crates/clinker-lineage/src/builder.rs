@@ -86,10 +86,10 @@
 //! - Engine-stamped columns (`$ck.*` / `$meta.*` / `$source.*` / `$widened`) are
 //!   skipped, mirroring the default-writer strip.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
 
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
@@ -507,7 +507,7 @@ fn walk_scope(
 
             PlanNode::Aggregation { compiled, .. } => {
                 let up = single_upstream(dag, idx);
-                let input_schema = node.expected_input_schema_in(dag).map(|s| s.as_ref());
+                let input_schema = node.expected_input_schema_in(dag).map(|s| &**s);
                 let mut cols = ColumnTerminals::new();
                 for emit in &compiled.emits {
                     if emit.output_name.starts_with('$') {
@@ -2455,8 +2455,8 @@ fn resolve_side(
 struct CombineSides<'a> {
     map: &'a HashMap<QualifiedField, (JoinSide, u32)>,
     bare: HashMap<String, (JoinSide, u32)>,
-    probe: Option<(PlanNodeId, &'a Arc<Schema>)>,
-    build: Option<(PlanNodeId, &'a Arc<Schema>)>,
+    probe: Option<(PlanNodeId, &'a SharedStorage<Schema>)>,
+    build: Option<(PlanNodeId, &'a SharedStorage<Schema>)>,
 }
 
 /// Resolve a Combine's probe / build sides. The build side is the incoming

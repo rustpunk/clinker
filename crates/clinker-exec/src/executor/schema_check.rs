@@ -1,9 +1,9 @@
 //! Per-record input-schema check for executor arms.
 //!
-//! Every operator enters the executor arm with an `expected: Arc<Schema>`
+//! Every operator enters the executor arm with an `expected: SharedStorage<Schema>`
 //! stamped at plan-compile time on the `PlanNode`. Records arriving from
-//! upstream carry their own `Arc<Schema>` — in the steady state (same
-//! upstream handing identical Arcs) the fast path is an `Arc::ptr_eq`
+//! upstream carry their own `SharedStorage<Schema>` — in the steady state (same
+//! upstream handing identical handles) the fast path is a `SharedStorage::ptr_eq`
 //! pointer compare (sub-nanosecond under branch prediction). On
 //! ptr-mismatch we fall back to structural equality over the column
 //! lists; any divergence surfaces as `E314` (`PipelineError::SchemaMismatch`).
@@ -13,23 +13,25 @@
 //! can smuggle an arity shift after the first record, and the branch
 //! predictor collapses the happy path cost to effectively zero.
 
+use clinker_record::owned_storage::SharedStorage;
+#[cfg(test)]
 use std::sync::Arc;
 
 use clinker_record::Schema;
 
 use clinker_plan::error::PipelineError;
 
-/// Validate that `actual` matches `expected`. Fast-path is `Arc::ptr_eq`;
+/// Validate that `actual` matches `expected`. Fast-path is `SharedStorage::ptr_eq`;
 /// structural fallback compares the column-name lists. Any divergence
 /// raises `E314`.
 pub fn check_input_schema(
-    expected: &Arc<Schema>,
-    actual: &Arc<Schema>,
+    expected: &SharedStorage<Schema>,
+    actual: &SharedStorage<Schema>,
     operator_name: &str,
     operator_kind: &'static str,
     upstream_name: &str,
 ) -> Result<(), PipelineError> {
-    if Arc::ptr_eq(expected, actual) {
+    if SharedStorage::ptr_eq(expected, actual) {
         return Ok(());
     }
     // Empty expected acts as "no expected schema" — produced by
@@ -45,8 +47,8 @@ pub fn check_input_schema(
         return Ok(());
     }
     Err(PipelineError::SchemaMismatch {
-        expected: Arc::clone(expected),
-        actual: Arc::clone(actual),
+        expected: expected.clone(),
+        actual: actual.clone(),
         operator_name: operator_name.to_string(),
         operator_kind,
         upstream_name: upstream_name.to_string(),
@@ -58,8 +60,10 @@ mod tests {
     use super::*;
     use clinker_record::Schema;
 
-    fn s(cols: &[&str]) -> Arc<Schema> {
-        Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()))
+    fn s(cols: &[&str]) -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(
+            cols.iter().map(|c| (*c).into()).collect(),
+        )))
     }
 
     #[test]
@@ -72,7 +76,7 @@ mod tests {
     fn structural_eq_fallback_passes() {
         let a = s(&["a", "b"]);
         let b = s(&["a", "b"]);
-        assert!(!Arc::ptr_eq(&a, &b));
+        assert!(!SharedStorage::ptr_eq(&a, &b));
         assert!(check_input_schema(&a, &b, "op", "transform", "src").is_ok());
     }
 

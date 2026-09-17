@@ -1,5 +1,6 @@
 //! Output writer registry and the format-writer builders that back it.
 
+use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::sync::atomic::AtomicU32;
@@ -449,7 +450,7 @@ fn build_writer_factory(
 pub(crate) fn build_format_writer(
     output: &SinkConfig,
     raw_writer: Box<dyn Write + Send>,
-    schema: Arc<Schema>,
+    schema: SharedStorage<Schema>,
     output_staging: crate::output::staging::OutputStagingRegistry,
     sink_byte_counter: Option<SharedByteCounter>,
 ) -> Result<Box<dyn FormatWriter>, PipelineError> {
@@ -605,13 +606,15 @@ nodes:
                     .join(format!("out.{format}"))
                     .display()
                     .to_string();
-                let schema = Arc::new(Schema::new(vec!["tags".into()]));
+                let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["tags".into()])));
                 let record = Record::new(
-                    Arc::clone(&schema),
-                    vec![Value::Array(vec![
-                        Value::String("a".into()),
-                        Value::String("b".into()),
-                    ])],
+                    schema.clone(),
+                    vec![Value::Array(
+                        clinker_record::owned_storage::OwnedValues::from_vec(vec![
+                            Value::String("a".into()),
+                            Value::String("b".into()),
+                        ]),
+                    )],
                 );
                 let raw = Box::new(std::io::Cursor::new(Vec::<u8>::new())) as Box<dyn Write + Send>;
                 let mut writer = build_format_writer(
