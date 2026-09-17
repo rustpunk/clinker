@@ -12,6 +12,12 @@ pub enum OutputEncodingKind {
     JoinCollision,
     SchemaDrift,
     Json,
+    JsonPath,
+    JsonDocumentClosed,
+    JsonDocumentOpen,
+    XmlName,
+    XmlValue,
+    XmlPath,
 }
 
 /// Inline diagnostic excerpt; the numeric field identity remains authoritative.
@@ -382,6 +388,18 @@ impl fmt::Display for FormatError {
                         "value contains the join delimiter; set on_conflict: escape or encode_json",
                     OutputEncodingKind::SchemaDrift =>
                         "output schema does not declare this column; declare the column",
+                    OutputEncodingKind::JsonDocumentClosed =>
+                        "no open document; call begin_document before writing an enveloped record",
+                    OutputEncodingKind::JsonDocumentOpen =>
+                        "document is still open; call end_document before beginning another document or finalizing output",
+                    OutputEncodingKind::JsonPath =>
+                        r"invalid or colliding JSON field path; use distinct leaf paths such as item.id and item.name; escape a literal dot as \. or a backslash as \\",
+                    OutputEncodingKind::XmlName =>
+                        "invalid XML name; use an element or attribute name such as item or item_id",
+                    OutputEncodingKind::XmlValue =>
+                        "invalid XML value; use valid XML characters, scalar attributes/text and nesting within 64 containers",
+                    OutputEncodingKind::XmlPath =>
+                        r"invalid or colliding XML field path; use distinct leaf paths such as item.id and item.name; escape a literal dot as \. or a backslash as \\",
                     OutputEncodingKind::Json =>
                         "value has no valid JSON representation; check finite numbers, nested keys and depth",
                 }

@@ -15,9 +15,9 @@ use std::sync::Arc;
 use clinker_format::csv::writer::{CsvEncoder, CsvWriterConfig};
 use clinker_format::error::OutputEncodingKind;
 use clinker_format::fixed_width::{FixedWidthWriter, FixedWidthWriterConfig};
-use clinker_format::json::writer::{JsonWriter, JsonWriterConfig};
+use clinker_format::json::writer::{JsonEncoder, JsonWriterConfig};
 use clinker_format::preparation::{MemoryOnlyResources, PreparedWriter};
-use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
+use clinker_format::xml::writer::{XmlEncoder, XmlWriterConfig};
 use clinker_format::{Column, FormatError, FormatWriter};
 use clinker_record::{Record, Schema, Value};
 use cxl::typecheck::Type;
@@ -110,7 +110,9 @@ fn xml_writer_emits_repeated_elements_for_array() {
             declared_multiple: BTreeSet::from(["tags".to_string()]),
             ..XmlWriterConfig::default()
         };
-        let mut writer = XmlWriter::new(&mut buf, schema.clone(), config);
+        let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let encoder = XmlEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+        let mut writer = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         writer
             .write_record(&record)
             .expect("XML writer emits repeated elements for a scalar array");
@@ -126,11 +128,14 @@ fn xml_writer_emits_repeated_elements_for_array() {
 #[test]
 fn xml_writer_rejects_array_in_undeclared_column() {
     let (schema, record) = record_with_array();
-    let mut writer = XmlWriter::new(Vec::new(), schema, XmlWriterConfig::default());
+    let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+    let encoder =
+        XmlEncoder::new(schema, &XmlWriterConfig::default(), provider.resources()).unwrap();
+    let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
     let err = writer.write_record(&record).unwrap_err();
     assert!(
-        matches!(&err, FormatError::UnserializableArrayValue { format, column }
-            if *format == "XML" && column == "tags"),
+        matches!(&err, FormatError::OutputEncoding { format: "XML", field: 2, offset: 0, kind: OutputEncodingKind::Array, field_name, element: None }
+            if field_name.to_string() == "tags"),
         "expected undeclared XML array rejection, got {err:?}"
     );
     assert_lists_remedies(&err);
@@ -165,15 +170,40 @@ fn json_writer_serializes_array_natively() {
     let (schema, record) = record_with_array();
     let mut buf = Vec::new();
     {
-        let mut writer = JsonWriter::new(&mut buf, schema.clone(), JsonWriterConfig::default());
+        let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let encoder = JsonEncoder::new(
+            schema.clone(),
+            &JsonWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         writer
             .write_record(&record)
             .expect("JSON writer serializes an array natively");
         writer.flush().expect("flush succeeds");
     }
     let out = String::from_utf8(buf).expect("JSON output is UTF-8");
-    assert!(
-        out.contains('[') && out.contains("\"a\"") && out.contains("\"b\""),
-        "the array serializes as a native JSON array: {out}"
+    assert_eq!(out, "[\n{\"id\":7,\"tags\":[\"a\",\"b\"]}\n]\n");
+}
+
+#[test]
+fn native_writer_construction_refuses_insufficient_finite_resources() {
+    use clinker_format::preparation::ResourceErrorKind;
+    let (schema, _) = record_with_array();
+    let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1).unwrap());
+    let json = JsonEncoder::new(
+        schema.clone(),
+        &JsonWriterConfig::default(),
+        provider.resources(),
     );
+    assert!(
+        matches!(json, Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Budget)
+    );
+    assert_eq!(provider.used(), 0);
+    let xml = XmlEncoder::new(schema, &XmlWriterConfig::default(), provider.resources());
+    assert!(
+        matches!(xml, Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Budget)
+    );
+    assert_eq!(provider.used(), 0);
 }

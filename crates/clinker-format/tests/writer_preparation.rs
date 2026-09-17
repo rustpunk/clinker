@@ -61,6 +61,236 @@ fn csv_schema() -> SharedStorage<clinker_record::Schema> {
 }
 
 #[test]
+fn xml_native_complete_operations_keep_literal_bytes() {
+    use clinker_format::FormatWriter;
+    use clinker_format::xml::writer::{XmlEncoder, XmlWriterConfig};
+    use clinker_record::{Record, Schema, Value};
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+    let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec!["payload".into()])));
+    let record = Record::new(
+        schema.clone(),
+        vec![Value::Map(OwnedMap::from_map(
+            [
+                (OwnedKey::from("@id"), Value::Integer(7)),
+                (OwnedKey::from("#text"), Value::String("A&B".into())),
+                (
+                    OwnedKey::from("item"),
+                    Value::Array(OwnedValues::from_vec(vec![
+                        Value::Bool(true),
+                        Value::Integer(2),
+                    ])),
+                ),
+            ]
+            .into(),
+        ))],
+    );
+    let encoder =
+        XmlEncoder::new(schema, &XmlWriterConfig::default(), provider.resources()).unwrap();
+    let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+    writer.write_record(&record).unwrap();
+    writer.flush_bytes().unwrap();
+    assert_eq!(writer.destination(), b"<Root><Record><payload id=\"7\">A&amp;B<item>true</item><item>2</item></payload></Record>");
+    writer.write_record(&record).unwrap();
+    writer.flush().unwrap();
+    writer.flush().unwrap();
+    assert_eq!(writer.destination(), b"<Root><Record><payload id=\"7\">A&amp;B<item>true</item><item>2</item></payload></Record><Record><payload id=\"7\">A&amp;B<item>true</item><item>2</item></payload></Record></Root>");
+    drop(writer);
+    assert_eq!(provider.used(), 0);
+}
+
+#[test]
+fn json_identity_tracer_borrowed_nested_exact_bytes() {
+    use clinker_format::FormatWriter;
+    use clinker_format::json::writer::{JsonEncoder, JsonWriterConfig};
+    use clinker_record::{Record, Schema, Value};
+
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+    let resources = provider.resources();
+    let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec![
+        "address.city".into(),
+        "items".into(),
+    ])));
+    let record = Record::new(
+        schema.clone(),
+        vec![
+            Value::String("Montréal".into()),
+            Value::Array(OwnedValues::from_vec(vec![
+                Value::Integer(7),
+                Value::Bool(true),
+                Value::Null,
+            ])),
+        ],
+    );
+    let encoder =
+        JsonEncoder::new(schema, &JsonWriterConfig::default(), resources.clone()).unwrap();
+    let mut output = Vec::new();
+    let mut writer = PreparedWriter::new(&mut output, encoder, resources).unwrap();
+    writer.write_record(&record).unwrap();
+    drop(record);
+    writer.flush().unwrap();
+    drop(writer);
+    assert_eq!(
+        output,
+        "[\n{\"address\":{\"city\":\"Montréal\"},\"items\":[7,true,null]}\n]\n".as_bytes()
+    );
+    assert_eq!(provider.used(), 0);
+}
+
+#[test]
+fn json_identity_tracer_refusal_preserves_cache_framing_and_destination() {
+    use clinker_format::FormatWriter;
+    use clinker_format::json::writer::{JsonEncoder, JsonWriterConfig};
+    use clinker_record::{Record, Schema, Value};
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+    let resources = provider.resources();
+    let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec!["a.b".into()])));
+    let record = Record::new(schema.clone(), vec![Value::Integer(7)]);
+    let encoder =
+        JsonEncoder::new(schema, &JsonWriterConfig::default(), resources.clone()).unwrap();
+    let mut writer = PreparedWriter::new(Vec::new(), encoder, resources.clone()).unwrap();
+    writer.write_record(&record).unwrap();
+    let committed = provider.used();
+    let other = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec![
+        "changed.path".into(),
+    ])));
+    let changed = Record::new(other, vec![Value::Integer(9)]);
+    let scope = resources.scope().unwrap();
+    let pending = writer
+        .encoder()
+        .prepare(
+            OutputOperation::Record(&changed),
+            &mut std::io::sink(),
+            &scope,
+        )
+        .unwrap();
+    assert!(
+        provider.used() > committed,
+        "old and replacement caches overlap until delivery"
+    );
+    drop(pending);
+    assert_eq!(provider.used(), committed);
+    let pressure = scope
+        .reserve(std::alloc::Layout::array::<u8>(128 * 1024 - committed).unwrap())
+        .unwrap();
+    let mut private = Vec::new();
+    assert!(matches!(
+        writer
+            .encoder()
+            .prepare(OutputOperation::Record(&changed), &mut private, &scope),
+        Err(FormatError::Resource(ResourceError {
+            kind: ResourceErrorKind::Budget,
+            ..
+        }))
+    ));
+    assert!(
+        private.is_empty(),
+        "cache refusal precedes even private framing"
+    );
+    assert!(matches!(
+        writer.write_record(&changed),
+        Err(FormatError::Resource(ResourceError {
+            kind: ResourceErrorKind::Budget,
+            ..
+        }))
+    ));
+    assert_eq!(writer.destination(), b"[\n{\"a\":{\"b\":7}}");
+    drop(pressure);
+    assert_eq!(provider.used(), committed);
+    let (failure, _) = allocation_probe(true, || writer.write_record(&changed));
+    assert!(matches!(
+        failure,
+        Err(FormatError::Resource(ResourceError {
+            kind: ResourceErrorKind::Allocation,
+            ..
+        }))
+    ));
+    assert_eq!(provider.used(), committed);
+    assert_eq!(writer.destination(), b"[\n{\"a\":{\"b\":7}}");
+    writer.write_record(&record).unwrap();
+    writer.write_record(&changed).unwrap();
+    writer.flush().unwrap();
+    assert_eq!(
+        writer.destination(),
+        b"[\n{\"a\":{\"b\":7}},\n{\"a\":{\"b\":7}},\n{\"changed\":{\"path\":9}}\n]\n"
+    );
+    drop(writer);
+    assert_eq!(provider.used(), 0);
+}
+
+#[test]
+fn json_identity_tracer_late_validation_keeps_initial_framing_private() {
+    use clinker_format::FormatWriter;
+    use clinker_format::json::writer::{JsonEncoder, JsonWriterConfig};
+    use clinker_record::{Record, Schema, Value};
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+    let resources = provider.resources();
+    let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec!["a.b".into()])));
+    let encoder = JsonEncoder::new(
+        schema.clone(),
+        &JsonWriterConfig::default(),
+        resources.clone(),
+    )
+    .unwrap();
+    let baseline = provider.used();
+    let mut writer = PreparedWriter::new(Vec::new(), encoder, resources).unwrap();
+    let record = Record::new(
+        schema.clone(),
+        vec![Value::Array(OwnedValues::from_vec(vec![
+            Value::Integer(1),
+            Value::Float(f64::NAN),
+        ]))],
+    );
+    assert!(matches!(
+        writer.write_record(&record),
+        Err(FormatError::OutputEncoding {
+            format: "JSON",
+            field: 1,
+            ..
+        })
+    ));
+    assert!(writer.destination().is_empty());
+    assert_eq!(provider.used(), baseline);
+    writer
+        .write_record(&Record::new(schema, vec![Value::Integer(2)]))
+        .unwrap();
+    writer.flush().unwrap();
+    assert_eq!(writer.destination(), b"[\n{\"a\":{\"b\":2}}\n]\n");
+    drop(writer);
+    assert_eq!(provider.used(), 0);
+}
+
+#[test]
+fn json_identity_tracer_config_alias_keeps_actual_backing_charged() {
+    use clinker_format::json::writer::{JsonEncoderConfig, JsonWriterConfig};
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+    BACKING_WATCH.with(|watch| {
+        watch.set(Some(BackingWatch {
+            provider: &provider,
+            pointer: std::ptr::null_mut(),
+            bytes: 0,
+            live_at_deallocation: None,
+            live_at_allocation: None,
+            layout: None,
+            deallocations: 0,
+        }))
+    });
+    let config =
+        JsonEncoderConfig::new(&JsonWriterConfig::default(), &provider.resources()).unwrap();
+    let charge = provider.used();
+    let (alias, allocations) = allocation_probe(false, || config.clone());
+    assert_eq!(allocations, 0);
+    drop(config);
+    assert_eq!(provider.used(), charge);
+    drop(alias);
+    let watched = BACKING_WATCH.with(|watch| watch.replace(None).unwrap());
+    assert_eq!(watched.bytes, charge);
+    assert_eq!(watched.live_at_allocation, Some(charge));
+    assert_eq!(watched.live_at_deallocation, Some(charge));
+    assert_eq!(watched.deallocations, 1);
+    assert_eq!(provider.used(), 0);
+}
+
+#[test]
 fn header_capture_replay_tracer() {
     use clinker_format::FormatWriter;
     use clinker_format::csv::writer::{
@@ -2919,6 +3149,1354 @@ mod boxed_owner_lifetimes {
                 assert_eq!(drops.load(Ordering::SeqCst), 1);
                 assert_eq!(provider.used(), 0);
             }
+        }
+    }
+}
+
+#[test]
+fn xml_rejected_operations_preserve_root_counts_and_cache() {
+    use clinker_format::xml::writer::{XmlEncoder, XmlWriterConfig};
+    use clinker_format::{FormatWriter, OutputEnvelopeSpec};
+    use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Record, Schema, Value};
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(256 * 1024).unwrap());
+    let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec!["value".into()])));
+    let config = XmlWriterConfig {
+        envelope: Some(OutputEnvelopeSpec {
+            header_from_doc: Some("opening".into()),
+            footer_from_doc: Some("closing".into()),
+            footer_record_count_field: Some("rows".into()),
+        }),
+        ..Default::default()
+    };
+    let document = |bad| {
+        DocumentContext::new(
+            DocumentId::next(),
+            std::sync::Arc::from("input.xml"),
+            EnvelopeRecord::from_sections([
+                (
+                    "opening".into(),
+                    Value::Map(OwnedMap::from_map(
+                        [
+                            ("@id".into(), Value::Integer(7)),
+                            (
+                                "text".into(),
+                                Value::String(if bad { "bad\u{1}" } else { "begin" }.into()),
+                            ),
+                        ]
+                        .into(),
+                    )),
+                ),
+                (
+                    "closing".into(),
+                    Value::Map(OwnedMap::from_map(
+                        [(
+                            "text".into(),
+                            Value::String(if bad { "bad\u{1}" } else { "end" }.into()),
+                        )]
+                        .into(),
+                    )),
+                ),
+            ]),
+        )
+    };
+    let good = document(false);
+    let bad = document(true);
+    let encoder = XmlEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+    let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+    let baseline = provider.used();
+    assert!(writer.begin_document(&bad).is_err());
+    assert!(writer.destination().is_empty());
+    assert_eq!(provider.used(), baseline);
+    for _ in 0..2 {
+        writer.begin_document(&good).unwrap();
+        let before = writer.destination().clone();
+        assert!(
+            writer
+                .write_record(&Record::new(
+                    schema.clone(),
+                    vec![Value::Array(OwnedValues::from_vec(vec![]))]
+                ))
+                .is_err()
+        );
+        assert_eq!(writer.destination(), &before);
+        writer
+            .write_record(&Record::new(schema.clone(), vec![Value::Integer(1)]))
+            .unwrap();
+        writer.flush_bytes().unwrap();
+        let before = writer.destination().clone();
+        assert!(writer.end_document(&bad).is_err());
+        assert_eq!(writer.destination(), &before);
+        writer.end_document(&good).unwrap();
+    }
+    writer.flush().unwrap();
+    let expected = "<Document><header id=\"7\"><text>begin</text></header><Record><value>1</value></Record><footer><text>end</text><rows>1</rows></footer></Document>";
+    assert_eq!(
+        writer.destination(),
+        format!("<Root>{expected}{expected}</Root>").as_bytes()
+    );
+    assert_eq!(provider.used(), baseline);
+    drop(writer);
+    assert_eq!(provider.used(), 0);
+}
+
+#[test]
+fn xml_late_shape_errors_preserve_destination_and_admission() {
+    use clinker_format::xml::writer::{XmlEncoder, XmlWriterConfig};
+    use clinker_record::{Record, Schema, Value};
+    let nested = |key: &str, value| {
+        Value::Map(OwnedMap::from_map(
+            [("good".into(), Value::Integer(1)), (key.into(), value)].into(),
+        ))
+    };
+    let deep = (0..65).fold(Value::Null, |value, _| nested("next", value));
+    let cases = vec![
+        (vec!["value"], nested("bad name", Value::Integer(2))),
+        (
+            vec!["value"],
+            nested("last", Value::String("bad\u{1}".into())),
+        ),
+        (
+            vec!["value"],
+            nested("@attr", Value::Array(OwnedValues::from_vec(vec![]))),
+        ),
+        (
+            vec!["value"],
+            nested("#text", Value::Map(OwnedMap::from_map(Default::default()))),
+        ),
+        (
+            vec!["value"],
+            Value::Map(OwnedMap::from_map(
+                [
+                    ("@id".into(), Value::Integer(1)),
+                    (r"\@id".into(), Value::Integer(2)),
+                ]
+                .into(),
+            )),
+        ),
+        (vec!["value"], nested(r"\invalid", Value::Null)),
+        (vec!["value"], deep),
+        (vec!["a", "a.b"], Value::Null),
+        (vec!["a.b", "a"], Value::Null),
+        (vec![r"bad\q"], Value::Null),
+        (vec!["a."], Value::Null),
+    ];
+    for (columns, value) in cases {
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(256 * 1024).unwrap());
+        let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(
+            columns.iter().map(|s| (*s).into()).collect(),
+        )));
+        let encoder = XmlEncoder::new(
+            schema.clone(),
+            &XmlWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        let retained = provider.used();
+        let error = writer
+            .write_operation(OutputOperation::Record(&Record::new(
+                schema,
+                vec![value; columns.len()],
+            )))
+            .unwrap_err();
+        assert!(
+            matches!(error, FormatError::OutputEncoding { .. }),
+            "{columns:?}: {error}"
+        );
+        assert!(writer.destination().is_empty());
+        assert_eq!(provider.used(), retained);
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+    }
+}
+
+#[test]
+fn xml_cache_replacement_overlap_refusal_and_finalize_release() {
+    use clinker_format::xml::writer::{XmlEncoder, XmlWriterConfig};
+    use clinker_record::{Record, Schema, Value};
+    let limit = 128 * 1024;
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(limit).unwrap());
+    let scope = provider.resources().scope().unwrap();
+    let schema =
+        |name: &str| SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec![name.into()])));
+    let first = Record::new(schema("old.value"), vec![Value::Integer(1)]);
+    let next = Record::new(schema("new.value"), vec![Value::Integer(2)]);
+    let mut encoder = XmlEncoder::new(
+        first.schema().clone(),
+        &XmlWriterConfig::default(),
+        provider.resources(),
+    )
+    .unwrap();
+    let base = provider.used();
+    let pending = encoder
+        .prepare(OutputOperation::Record(&first), &mut Vec::new(), &scope)
+        .unwrap();
+    encoder.commit(pending);
+    let committed = provider.used();
+    assert!(committed > base);
+    let pending = encoder
+        .prepare(OutputOperation::Record(&next), &mut Vec::new(), &scope)
+        .unwrap();
+    assert_eq!(provider.used(), committed + (committed - base));
+    drop(pending);
+    assert_eq!(provider.used(), committed);
+    let denied = scope
+        .reserve(std::alloc::Layout::array::<u8>(limit - committed).unwrap())
+        .unwrap();
+    assert!(matches!(
+        encoder.prepare(OutputOperation::Record(&next), &mut Vec::new(), &scope),
+        Err(FormatError::Resource(_))
+    ));
+    assert_eq!(provider.used(), limit);
+    drop(denied);
+    let mut bytes = Vec::new();
+    let pending = encoder
+        .prepare(OutputOperation::Record(&first), &mut bytes, &scope)
+        .unwrap();
+    encoder.commit(pending);
+    assert_eq!(provider.used(), committed);
+    assert_eq!(bytes, b"<Record><old><value>1</value></old></Record>");
+    let pending = encoder
+        .prepare(OutputOperation::Record(&next), &mut Vec::new(), &scope)
+        .unwrap();
+    encoder.commit(pending);
+    assert_eq!(provider.used(), committed);
+    let pending = encoder
+        .prepare(OutputOperation::Finalize, &mut Vec::new(), &scope)
+        .unwrap();
+    encoder.commit(pending);
+    assert_eq!(provider.used(), base);
+    drop(encoder);
+    assert_eq!(provider.used(), 0);
+}
+
+#[test]
+fn xml_empty_finalize_is_idempotent_and_drop_does_not_finalize() {
+    use clinker_format::xml::writer::{XmlEncoder, XmlWriterConfig};
+    use clinker_record::Schema;
+    for finalize in [false, true] {
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+        let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec![])));
+        let encoder =
+            XmlEncoder::new(schema, &XmlWriterConfig::default(), provider.resources()).unwrap();
+        let mut bytes = Vec::new();
+        let mut writer = PreparedWriter::new(&mut bytes, encoder, provider.resources()).unwrap();
+        writer.flush_bytes().unwrap();
+        assert!(writer.destination().is_empty());
+        if finalize {
+            writer.flush().unwrap();
+            writer.flush().unwrap();
+        }
+        drop(writer);
+        assert_eq!(
+            bytes,
+            if finalize {
+                b"<Root></Root>".as_slice()
+            } else {
+                b""
+            }
+        );
+        assert_eq!(provider.used(), 0);
+    }
+}
+
+#[test]
+fn xml_repeats_wrappers_nulls_and_configured_prefix_keep_exact_bytes() {
+    use clinker_format::xml::writer::{XmlEncoder, XmlWriterConfig};
+    use clinker_format::{
+        FormatWriter,
+        multi_value::{JoinValues, OnConflict},
+    };
+    use clinker_record::{Record, Schema, Value};
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(256 * 1024).unwrap());
+    let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec![
+        "_id".into(),
+        "A.x".into(),
+        "A.y".into(),
+        "tags".into(),
+        r"literal\.dot".into(),
+    ])));
+    let config = XmlWriterConfig {
+        root_element: "Batch".into(),
+        record_element: "Row".into(),
+        attribute_prefix: "_".into(),
+        preserve_nulls: true,
+        declared_multiple: ["tags".to_owned()].into(),
+        join_values: vec![JoinValues {
+            field: "tags".into(),
+            delimiter: ",".into(),
+            escape: "\\".into(),
+            on_conflict: OnConflict::Error,
+            repeat_as: Some("tag".into()),
+            wrap_in: Some("list".into()),
+        }],
+        ..Default::default()
+    };
+    let nested = Value::Map(OwnedMap::from_map(
+        [
+            ("_code".into(), Value::String("a\t\n\r".into())),
+            ("#text".into(), Value::String("text<&>".into())),
+            (
+                "item".into(),
+                Value::Array(OwnedValues::from_vec(vec![
+                    Value::Integer(1),
+                    Value::Integer(2),
+                ])),
+            ),
+        ]
+        .into(),
+    ));
+    let record = Record::new(
+        schema.clone(),
+        vec![
+            Value::Integer(7),
+            nested,
+            Value::Null,
+            Value::Array(OwnedValues::from_vec(vec![
+                Value::String("one".into()),
+                Value::String("two".into()),
+            ])),
+            Value::Bool(true),
+        ],
+    );
+    let encoder = XmlEncoder::new(schema, &config, provider.resources()).unwrap();
+    let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+    writer.write_record(&record).unwrap();
+    writer.flush().unwrap();
+    assert_eq!(writer.destination(), b"<Batch><Row id=\"7\"><A><x code=\"a&#9;&#10;&#13;\">text&lt;&amp;&gt;<item>1</item><item>2</item></x><y/></A><list><tag>one</tag><tag>two</tag></list><literal.dot>true</literal.dot></Row></Batch>");
+    drop(writer);
+    assert_eq!(provider.used(), 0);
+}
+
+#[test]
+fn xml_schema_identity_releases_dynamic_columns_and_depth_boundary_is_exact() {
+    use clinker_format::{
+        FormatWriter,
+        xml::writer::{XmlEncoder, XmlWriterConfig},
+    };
+    use clinker_record::{Record, Schema, Value};
+    for depth in [64, 65] {
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(256 * 1024).unwrap());
+        let schema = std::sync::Arc::new(Schema::new(vec!["value".into()]));
+        let identity = std::sync::Arc::downgrade(&schema);
+        let schema = SharedStorage::from_arc(schema);
+        let encoder = XmlEncoder::new(
+            schema.clone(),
+            &XmlWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        let value = (0..depth).fold(Value::Integer(7), |value, _| {
+            Value::Map(OwnedMap::from_map([("x".into(), value)].into()))
+        });
+        let record = Record::new(schema, vec![value]);
+        let result = writer.write_record(&record);
+        drop(record);
+        assert!(
+            identity.upgrade().is_none(),
+            "cache must not retain schema columns"
+        );
+        if depth == 64 {
+            result.unwrap();
+            writer.flush().unwrap();
+            assert_eq!(
+                writer.destination(),
+                format!(
+                    "<Root><Record><value>{}7{}</value></Record></Root>",
+                    "<x>".repeat(64),
+                    "</x>".repeat(64)
+                )
+                .as_bytes()
+            );
+        } else {
+            assert!(matches!(result, Err(FormatError::OutputEncoding { .. })));
+            assert!(writer.destination().is_empty());
+        }
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+    }
+}
+
+#[test]
+fn json_complete_framing_matrix_has_literal_byte_oracles() {
+    use clinker_format::json::writer::{JsonEncoder, JsonOutputMode, JsonWriterConfig};
+    use clinker_format::{FormatWriter, OutputEnvelopeSpec};
+    use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Record, Schema, Value};
+    let compact_records = ["", "{\"v\":1}", "{\"v\":1},{\"v\":2}"];
+    let pretty_records = ["", "{\n  \"v\": 1\n}", "{\n  \"v\": 1\n},{\n  \"v\": 2\n}"];
+    let compact_documents = [
+        "{\"header\":{\"tag\":7},\"body\":[],\"footer\":{\"rows\":0}}",
+        "{\"header\":{\"tag\":7},\"body\":[{\"v\":1}],\"footer\":{\"rows\":1}}",
+        "{\"header\":{\"tag\":7},\"body\":[{\"v\":1},{\"v\":2}],\"footer\":{\"rows\":2}}",
+    ];
+    let pretty_documents = [
+        "{\"header\":{\n  \"tag\": 7\n},\"body\":[],\"footer\":{\n  \"rows\": 0\n}}",
+        "{\"header\":{\n  \"tag\": 7\n},\"body\":[{\n  \"v\": 1\n}],\"footer\":{\n  \"rows\": 1\n}}",
+        "{\"header\":{\n  \"tag\": 7\n},\"body\":[{\n  \"v\": 1\n},{\n  \"v\": 2\n}],\"footer\":{\n  \"rows\": 2\n}}",
+    ];
+    let plain_arrays = ["[]\n", "[\n{\"v\":1}\n]\n", "[\n{\"v\":1},\n{\"v\":2}\n]\n"];
+    let pretty_arrays = [
+        "[]\n",
+        "[\n{\n  \"v\": 1\n}\n]\n",
+        "[\n{\n  \"v\": 1\n},\n{\n  \"v\": 2\n}\n]\n",
+    ];
+    let lines = ["", "{\"v\":1}\n", "{\"v\":1}\n{\"v\":2}\n"];
+    let doc = DocumentContext::new(
+        DocumentId::next(),
+        std::sync::Arc::from("source.json"),
+        EnvelopeRecord::from_sections([
+            (
+                "opening".into(),
+                Value::Map(OwnedMap::from_map(
+                    [("tag".into(), Value::Integer(7))].into(),
+                )),
+            ),
+            (
+                "closing".into(),
+                Value::Map(OwnedMap::from_map(Default::default())),
+            ),
+        ]),
+    );
+    let mut cases = 0;
+    for mode in [JsonOutputMode::Array, JsonOutputMode::Ndjson] {
+        for pretty in [false, true] {
+            for envelope in [false, true] {
+                for count in 0..=2 {
+                    for documents in 1..=if envelope { 2 } else { 1 } {
+                        let provider =
+                            MemoryOnlyResources::new(NonZeroUsize::new(256 * 1024).unwrap());
+                        let schema =
+                            SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec![
+                                "v".into(),
+                            ])));
+                        let config = JsonWriterConfig {
+                            format: mode,
+                            pretty,
+                            envelope: envelope.then(|| OutputEnvelopeSpec {
+                                header_from_doc: Some("opening".into()),
+                                footer_from_doc: Some("closing".into()),
+                                footer_record_count_field: Some("rows".into()),
+                            }),
+                            ..Default::default()
+                        };
+                        let encoder =
+                            JsonEncoder::new(schema.clone(), &config, provider.resources())
+                                .unwrap();
+                        let mut writer =
+                            PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+                        for _ in 0..documents {
+                            writer.begin_document(&doc).unwrap();
+                            for value in 1..=count {
+                                writer
+                                    .write_record(&Record::new(
+                                        schema.clone(),
+                                        vec![Value::Integer(value as i64)],
+                                    ))
+                                    .unwrap();
+                                let before = writer.destination().clone();
+                                writer.flush_bytes().unwrap();
+                                assert_eq!(writer.destination(), &before, "drain changed syntax");
+                            }
+                            writer.end_document(&doc).unwrap();
+                        }
+                        writer.flush().unwrap();
+                        writer.flush().unwrap();
+                        let expected = if envelope {
+                            let document = if pretty {
+                                pretty_documents[count]
+                            } else {
+                                compact_documents[count]
+                            };
+                            match (mode, documents) {
+                                (JsonOutputMode::Array, 1) => format!("[\n{document}\n]\n"),
+                                (JsonOutputMode::Array, 2) => {
+                                    format!("[\n{document},\n{document}\n]\n")
+                                }
+                                (JsonOutputMode::Ndjson, 1) => document.to_owned(),
+                                (JsonOutputMode::Ndjson, 2) => format!("{document}\n{document}"),
+                                _ => unreachable!(),
+                            }
+                        } else {
+                            match mode {
+                                JsonOutputMode::Array if pretty => pretty_arrays[count],
+                                JsonOutputMode::Array => plain_arrays[count],
+                                JsonOutputMode::Ndjson => lines[count],
+                            }
+                            .to_owned()
+                        };
+                        assert_eq!(
+                            writer.destination(),
+                            expected.as_bytes(),
+                            "{mode:?} pretty={pretty} envelope={envelope} count={count} documents={documents}"
+                        );
+                        // A separate literal grammar check keeps the compact and
+                        // pretty body examples tied to the envelope byte table.
+                        if envelope {
+                            let body = if pretty {
+                                pretty_records[count]
+                            } else {
+                                compact_records[count]
+                            };
+                            assert!(expected.contains(&format!("\"body\":[{body}]")));
+                        }
+                        drop(writer);
+                        assert_eq!(provider.used(), 0);
+                        cases += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 36);
+}
+
+#[test]
+fn json_late_failure_does_not_commit_separator_or_document_count() {
+    use clinker_format::json::writer::{JsonEncoder, JsonOutputMode, JsonWriterConfig};
+    use clinker_format::{FormatWriter, OutputEnvelopeSpec};
+    use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Record, Schema, Value};
+    let doc = DocumentContext::new(
+        DocumentId::next(),
+        std::sync::Arc::from("in.json"),
+        EnvelopeRecord::from_sections([(
+            "closing".into(),
+            Value::Map(OwnedMap::from_map(Default::default())),
+        )]),
+    );
+    for envelope in [false, true] {
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(256 * 1024).unwrap());
+        let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec!["v".into()])));
+        let config = JsonWriterConfig {
+            format: JsonOutputMode::Array,
+            envelope: envelope.then(|| OutputEnvelopeSpec {
+                header_from_doc: None,
+                footer_from_doc: Some("closing".into()),
+                footer_record_count_field: Some("rows".into()),
+            }),
+            ..Default::default()
+        };
+        let encoder = JsonEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        writer.begin_document(&doc).unwrap();
+        writer
+            .write_record(&Record::new(schema.clone(), vec![Value::Integer(1)]))
+            .unwrap();
+        let before = writer.destination().clone();
+        let committed = provider.used();
+        let invalid = [
+            Value::Array(OwnedValues::from_vec(vec![
+                Value::Integer(7),
+                Value::Float(f64::INFINITY),
+            ])),
+            Value::Map(OwnedMap::from_map(
+                [
+                    ("good".into(), Value::Bool(true)),
+                    (r"\bad".into(), Value::Null),
+                ]
+                .into(),
+            )),
+            Value::Map(OwnedMap::from_map(
+                [
+                    ("@id".into(), Value::Integer(1)),
+                    (r"\@id".into(), Value::Integer(2)),
+                ]
+                .into(),
+            )),
+            (0..65).fold(Value::Null, |value, _| {
+                Value::Array(OwnedValues::from_vec(vec![value]))
+            }),
+        ];
+        for value in invalid {
+            assert!(matches!(
+                writer.write_record(&Record::new(schema.clone(), vec![value])),
+                Err(FormatError::OutputEncoding { .. })
+            ));
+            assert_eq!(writer.destination(), &before);
+            assert_eq!(provider.used(), committed);
+        }
+        writer
+            .write_record(&Record::new(schema, vec![Value::Integer(2)]))
+            .unwrap();
+        writer.end_document(&doc).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(
+            writer.destination(),
+            if envelope {
+                b"[\n{\"body\":[{\"v\":1},{\"v\":2}],\"footer\":{\"rows\":2}}\n]\n".as_slice()
+            } else {
+                b"[\n{\"v\":1},\n{\"v\":2}\n]\n".as_slice()
+            }
+        );
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+    }
+}
+
+#[test]
+fn json_empty_envelope_stream_without_a_document_finalizes_exactly() {
+    use clinker_format::{
+        OutputEnvelopeSpec,
+        json::writer::{JsonEncoder, JsonOutputMode, JsonWriterConfig},
+    };
+    use clinker_record::Schema;
+    for mode in [JsonOutputMode::Array, JsonOutputMode::Ndjson] {
+        for pretty in [false, true] {
+            let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+            let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec![])));
+            let config = JsonWriterConfig {
+                format: mode,
+                pretty,
+                envelope: Some(OutputEnvelopeSpec {
+                    header_from_doc: Some("opening".into()),
+                    footer_from_doc: None,
+                    footer_record_count_field: None,
+                }),
+                ..Default::default()
+            };
+            let encoder = JsonEncoder::new(schema, &config, provider.resources()).unwrap();
+            let mut writer =
+                PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+            writer.flush_bytes().unwrap();
+            assert!(writer.destination().is_empty());
+            writer.flush().unwrap();
+            writer.flush().unwrap();
+            assert_eq!(
+                writer.destination(),
+                match mode {
+                    JsonOutputMode::Array => b"[]\n".as_slice(),
+                    JsonOutputMode::Ndjson => b"",
+                }
+            );
+            drop(writer);
+            assert_eq!(provider.used(), 0);
+        }
+    }
+}
+
+mod nested_public_boundary {
+    use super::*;
+    use clinker_format::{FormatWriter, FormatWriterHandle};
+    use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Record, Value};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Destination(Arc<Mutex<Vec<u8>>>);
+    impl Write for Destination {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn probe<E: FormatEncoder>(
+        encoder: E,
+        mut owned: FormatWriterHandle,
+        destination: Destination,
+        provider: &MemoryOnlyResources,
+        expected: &[u8],
+    ) {
+        let record = Record::new(csv_schema(), vec![Value::Integer(1), Value::Integer(2)]);
+        let doc = DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("input"),
+            EnvelopeRecord::from_sections([]),
+        );
+        let mut borrowed = Vec::new();
+        let mut writer = PreparedWriter::new(&mut borrowed, encoder, provider.resources()).unwrap();
+        // Exhaust the remaining allowance after construction. A first record
+        // cannot fall back to an unadmitted buffer.
+        let scope = provider.resources().scope().unwrap();
+        let held = scope
+            .reserve(std::alloc::Layout::array::<u8>(128 * 1024 - provider.used()).unwrap())
+            .unwrap();
+        assert!(
+            matches!(writer.write_operation(OutputOperation::Record(&record)),
+            Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Budget)
+        );
+        assert!(writer.destination().is_empty());
+        drop(held);
+        writer
+            .write_operation(OutputOperation::BeginDocument(&doc))
+            .unwrap();
+        writer
+            .write_operation(OutputOperation::Record(&record))
+            .unwrap();
+        writer.flush_bytes().unwrap();
+        writer
+            .write_operation(OutputOperation::EndDocument(&doc))
+            .unwrap();
+        writer.flush().unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.destination().as_slice(), expected);
+        assert!(
+            matches!(writer.write_operation(OutputOperation::Record(&record)),
+            Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Finalized)
+        );
+        drop(writer);
+        assert_eq!(borrowed, expected);
+
+        owned.begin_document(&doc).unwrap();
+        owned.write_record(&record).unwrap();
+        owned.flush_bytes().unwrap();
+        owned.end_document(&doc).unwrap();
+        owned.flush().unwrap();
+        owned.flush().unwrap();
+        assert_eq!(*destination.0.lock().unwrap(), expected);
+        assert!(matches!(owned.write_record(&record),
+            Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Finalized));
+        drop(owned);
+    }
+
+    #[test]
+    fn nested_public_json_entrypoints_require_finite_resources() {
+        use clinker_format::json::writer::{JsonEncoder, JsonEncoderConfig, JsonWriterConfig};
+        let config = JsonWriterConfig::default();
+        let denied = MemoryOnlyResources::new(NonZeroUsize::new(1).unwrap());
+        assert!(
+            matches!(JsonEncoder::new(csv_schema(), &config, denied.resources()),
+            Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Budget)
+        );
+        assert_eq!(denied.used(), 0);
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+        let policy = JsonEncoderConfig::new(&config, &provider.resources()).unwrap();
+        let retained = provider.used();
+        let alias = policy.clone();
+        assert_eq!(provider.used(), retained);
+        let encoder = JsonEncoder::from_config(csv_schema(), policy).unwrap();
+        let destination = Destination::default();
+        let owned = JsonEncoder::from_config(csv_schema(), alias.clone())
+            .unwrap()
+            .into_boxed_writer(destination.clone(), provider.resources())
+            .unwrap();
+        probe(
+            encoder,
+            owned,
+            destination,
+            &provider,
+            b"[\n{\"first\":1,\"last\":2}\n]\n",
+        );
+        assert_eq!(
+            provider.used(),
+            retained,
+            "last config alias retains exactly its backing"
+        );
+        let encoder = JsonEncoder::from_config(csv_schema(), alias.clone()).unwrap();
+        assert!(
+            matches!(encoder.into_boxed_writer(Destination::default(), denied.resources()),
+            Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Budget)
+        );
+        drop(alias);
+        assert_eq!(provider.used(), 0);
+        assert_eq!(denied.used(), 0);
+    }
+
+    #[test]
+    fn nested_public_xml_entrypoints_require_finite_resources() {
+        use clinker_format::xml::writer::{XmlEncoder, XmlEncoderConfig, XmlWriterConfig};
+        let config = XmlWriterConfig::default();
+        let denied = MemoryOnlyResources::new(NonZeroUsize::new(1).unwrap());
+        assert!(
+            matches!(XmlEncoder::new(csv_schema(), &config, denied.resources()),
+            Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Budget)
+        );
+        assert_eq!(denied.used(), 0);
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+        let policy = XmlEncoderConfig::new((&config).into(), &provider.resources()).unwrap();
+        let retained = provider.used();
+        let alias = policy.clone();
+        assert_eq!(provider.used(), retained);
+        let encoder = XmlEncoder::from_config(csv_schema(), policy).unwrap();
+        let destination = Destination::default();
+        let owned = XmlEncoder::from_config(csv_schema(), alias.clone())
+            .unwrap()
+            .into_boxed_writer(destination.clone(), provider.resources())
+            .unwrap();
+        probe(
+            encoder,
+            owned,
+            destination,
+            &provider,
+            b"<Root><Record><first>1</first><last>2</last></Record></Root>",
+        );
+        assert_eq!(
+            provider.used(),
+            retained,
+            "last config alias retains exactly its backing"
+        );
+        let encoder = XmlEncoder::from_config(csv_schema(), alias.clone()).unwrap();
+        assert!(
+            matches!(encoder.into_boxed_writer(Destination::default(), denied.resources()),
+            Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Budget)
+        );
+        drop(alias);
+        assert_eq!(provider.used(), 0);
+        assert_eq!(denied.used(), 0);
+    }
+}
+
+mod nested_fault_boundaries {
+    use super::*;
+    use clinker_format::preparation::{
+        AllocationAuthority, AllocationLease, MemoryStorage, OperationStage, OwnerId,
+        ResourceAuthority, WriterResources,
+    };
+    use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Record, Value};
+    use std::io::Read;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(usize)]
+    enum Fault {
+        None,
+        Budget,
+        Layout,
+        Allocation,
+        Write,
+        Flush,
+        Seal,
+        BeforeSeal,
+        AfterSeal,
+        Read,
+        ShortRead,
+        Destination,
+        AfterWrite,
+        Complete,
+    }
+    const FAULTS: [Fault; 13] = [
+        Fault::Budget,
+        Fault::Layout,
+        Fault::Allocation,
+        Fault::Write,
+        Fault::Flush,
+        Fault::Seal,
+        Fault::BeforeSeal,
+        Fault::AfterSeal,
+        Fault::Read,
+        Fault::ShortRead,
+        Fault::Destination,
+        Fault::AfterWrite,
+        Fault::Complete,
+    ];
+    struct Authority {
+        memory: MemoryOnlyResources,
+        fault: AtomicUsize,
+        cancelled: AtomicBool,
+        stages: AtomicUsize,
+    }
+    impl Authority {
+        fn is(&self, fault: Fault) -> bool {
+            self.fault.load(Ordering::SeqCst) == fault as usize
+        }
+        fn evidence(&self, kind: ResourceErrorKind) -> ResourceError {
+            ResourceError {
+                kind,
+                requested: 91,
+                available: 17,
+                field: Some(3),
+                offset: Some(41),
+            }
+        }
+        fn reset(&self) {
+            self.fault.store(Fault::None as usize, Ordering::SeqCst);
+            self.cancelled.store(false, Ordering::SeqCst);
+        }
+    }
+    impl AllocationAuthority for Authority {
+        fn identity(&self) -> usize {
+            self.memory.resources().allocation().identity()
+        }
+        fn try_reserve(
+            self: Arc<Self>,
+            owner: OwnerId,
+            layout: std::alloc::Layout,
+        ) -> Result<AllocationLease, ResourceError> {
+            self.check_cancelled()?;
+            for (fault, kind) in [
+                (Fault::Budget, ResourceErrorKind::Budget),
+                (Fault::Layout, ResourceErrorKind::Layout),
+                (Fault::Allocation, ResourceErrorKind::Allocation),
+            ] {
+                if self.is(fault) {
+                    return Err(self.evidence(kind));
+                }
+            }
+            self.memory.resources().allocation().reserve(owner, layout)
+        }
+        fn release(&self, _: OwnerId, _: usize) {
+            unreachable!("delegated memory owns grants")
+        }
+        fn check_cancelled(&self) -> Result<(), ResourceError> {
+            if self.cancelled.load(Ordering::SeqCst) {
+                Err(self.evidence(ResourceErrorKind::Cancelled))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    struct Storage {
+        memory: MemoryStorage,
+        authority: Arc<Authority>,
+        failure: Option<ResourceError>,
+    }
+    impl Storage {
+        fn fail(&mut self, kind: ResourceErrorKind) -> std::io::Error {
+            self.failure = Some(self.authority.evidence(kind));
+            std::io::ErrorKind::Other.into()
+        }
+    }
+    impl Drop for Storage {
+        fn drop(&mut self) {
+            self.authority.stages.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    impl Write for Storage {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.authority.is(Fault::Write) {
+                return Err(self.fail(ResourceErrorKind::Storage));
+            }
+            let n = self.memory.write(bytes)?;
+            if self.authority.is(Fault::BeforeSeal) {
+                self.authority.cancelled.store(true, Ordering::SeqCst);
+            }
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.authority.is(Fault::Flush) {
+                return Err(self.fail(ResourceErrorKind::Storage));
+            }
+            self.memory.flush()
+        }
+    }
+    impl Read for Storage {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            if self.authority.is(Fault::Read) {
+                return Err(self.fail(ResourceErrorKind::Readback));
+            }
+            if self.authority.is(Fault::ShortRead) {
+                return Ok(0);
+            }
+            self.memory.read(bytes)
+        }
+    }
+    impl StageStorage for Storage {
+        fn resource_failed(&mut self, error: ResourceError) {
+            self.failure.get_or_insert(error);
+            self.memory.resource_failed(error);
+        }
+        fn failure(&self) -> Option<ResourceError> {
+            self.failure.or(self.memory.failure())
+        }
+        fn seal(&mut self) -> Result<u64, ResourceError> {
+            if self.authority.is(Fault::Seal) {
+                return Err(self.authority.evidence(ResourceErrorKind::Storage));
+            }
+            self.flush().map_err(|_| self.failure.unwrap())?;
+            let len = self.memory.seal()?;
+            if self.authority.is(Fault::AfterSeal) {
+                self.authority.cancelled.store(true, Ordering::SeqCst);
+            }
+            Ok(len)
+        }
+        fn complete(&mut self) -> Result<(), ResourceError> {
+            if self.authority.is(Fault::Complete) {
+                return Err(self.authority.evidence(ResourceErrorKind::Storage));
+            }
+            self.memory.complete()
+        }
+    }
+    impl ResourceAuthority for Authority {
+        fn create_stage(
+            self: Arc<Self>,
+            scope: WriterScope,
+        ) -> Result<OperationStage, FormatError> {
+            self.stages.fetch_add(1, Ordering::SeqCst);
+            StorageStage::create(
+                scope.clone(),
+                Storage {
+                    memory: MemoryStorage::new(scope),
+                    authority: self,
+                    failure: None,
+                },
+            )
+        }
+    }
+    struct Destination {
+        bytes: Vec<u8>,
+        authority: Arc<Authority>,
+        remaining: std::cell::Cell<usize>,
+        calls: usize,
+    }
+    impl Write for Destination {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if self.authority.is(Fault::Destination) && self.remaining.get() == 0 {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let n = if self.authority.is(Fault::Destination) {
+                bytes.len().min(self.remaining.get())
+            } else {
+                bytes.len()
+            };
+            self.bytes.extend_from_slice(&bytes[..n]);
+            self.remaining.set(self.remaining.get().saturating_sub(n));
+            if self.authority.is(Fault::AfterWrite) {
+                self.authority.cancelled.store(true, Ordering::SeqCst);
+            }
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn operation<'a>(
+        index: usize,
+        record: &'a Record,
+        doc: &'a DocumentContext,
+    ) -> OutputOperation<'a> {
+        match index {
+            0 | 1 => OutputOperation::BeginDocument(doc),
+            2 | 3 => OutputOperation::Record(record),
+            4 | 5 => OutputOperation::EndDocument(doc),
+            6 | 7 => OutputOperation::Finalize,
+            _ => unreachable!(),
+        }
+    }
+    fn literal(xml: bool, index: usize) -> &'static [u8] {
+        if xml {
+            match index {
+                0 => b"<Root><Document><header><v>start</v></header>",
+                1 => b"<Document><header><v>start</v></header>",
+                2 | 3 => b"<Record><first>1</first><last>2</last></Record>",
+                4 => b"<footer><v>end</v><rows>0</rows></footer></Document>",
+                5 => b"<footer><v>end</v><rows>1</rows></footer></Document>",
+                6 => b"<Root></Root>",
+                7 => b"</Root>",
+                _ => unreachable!(),
+            }
+        } else {
+            match index {
+                0 => b"[\n{\"header\":{\"v\":\"start\"},\"body\":[",
+                1 => b",\n{\"header\":{\"v\":\"start\"},\"body\":[",
+                2 => b"{\"first\":1,\"last\":2}",
+                3 => b",{\"first\":1,\"last\":2}",
+                4 => b"],\"footer\":{\"v\":\"end\",\"rows\":0}}",
+                5 => b"],\"footer\":{\"v\":\"end\",\"rows\":1}}",
+                6 => b"[]\n",
+                7 => b"\n]\n",
+                _ => unreachable!(),
+            }
+        }
+    }
+    fn snapshot<E: FormatEncoder>(
+        encoder: &E,
+        resources: &WriterResources,
+        record: &Record,
+        doc: &DocumentContext,
+    ) -> Vec<Result<Vec<u8>, String>> {
+        (0..4)
+            .map(|i| {
+                let scope = resources.scope().unwrap();
+                let mut stage = scope.stage().unwrap();
+                let op = match i {
+                    0 => OutputOperation::BeginDocument(doc),
+                    1 => OutputOperation::Record(record),
+                    2 => OutputOperation::EndDocument(doc),
+                    _ => OutputOperation::Finalize,
+                };
+                match encoder.prepare(op, &mut stage, &scope) {
+                    Ok(pending) => {
+                        drop(pending);
+                        let mut bytes = Vec::new();
+                        stage.finish().unwrap().deliver(&mut bytes).unwrap();
+                        Ok(bytes)
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            })
+            .collect()
+    }
+    fn run<E: FormatEncoder>(xml: bool, build: impl Fn(WriterResources) -> E) {
+        let record = Record::new(csv_schema(), vec![Value::Integer(1), Value::Integer(2)]);
+        let doc = DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("input"),
+            EnvelopeRecord::from_sections([
+                (
+                    "opening".into(),
+                    Value::Map(OwnedMap::from_map(
+                        [("v".into(), Value::String("start".into()))].into(),
+                    )),
+                ),
+                (
+                    "closing".into(),
+                    Value::Map(OwnedMap::from_map(
+                        [("v".into(), Value::String("end".into()))].into(),
+                    )),
+                ),
+            ]),
+        );
+        for index in 0..8 {
+            for fault in FAULTS {
+                let authority = Arc::new(Authority {
+                    memory: MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap()),
+                    fault: AtomicUsize::new(0),
+                    cancelled: AtomicBool::new(false),
+                    stages: AtomicUsize::new(0),
+                });
+                let resources = WriterResources::new(authority.clone());
+                let encoder = build(resources.clone());
+                let destination = Destination {
+                    bytes: Vec::new(),
+                    authority: authority.clone(),
+                    remaining: std::cell::Cell::new(usize::MAX),
+                    calls: 0,
+                };
+                let mut writer =
+                    PreparedWriter::new(destination, encoder, resources.clone()).unwrap();
+                let prior: &[usize] = match index {
+                    0 | 6 => &[],
+                    1 | 7 => &[0, 2, 5],
+                    2 | 4 => &[0],
+                    3 | 5 => &[0, 2],
+                    _ => unreachable!(),
+                };
+                let mut expected = Vec::new();
+                for &step in prior {
+                    writer
+                        .write_operation(operation(step, &record, &doc))
+                        .unwrap();
+                    expected.extend_from_slice(literal(xml, step));
+                }
+                assert_eq!(writer.destination().bytes, expected);
+                let before = snapshot(writer.encoder(), &resources, &record, &doc);
+                let retained = authority.memory.used();
+                // This target accepts only a two-byte irreversible prefix.
+                writer.destination().remaining.set(2);
+                authority.fault.store(fault as usize, Ordering::SeqCst);
+                let error = writer
+                    .write_operation(operation(index, &record, &doc))
+                    .unwrap_err();
+                let kind = match fault {
+                    Fault::Budget => ResourceErrorKind::Budget,
+                    Fault::Layout => ResourceErrorKind::Layout,
+                    Fault::Allocation => ResourceErrorKind::Allocation,
+                    Fault::BeforeSeal | Fault::AfterSeal | Fault::AfterWrite => {
+                        ResourceErrorKind::Cancelled
+                    }
+                    Fault::Read | Fault::ShortRead => ResourceErrorKind::Readback,
+                    _ => ResourceErrorKind::Storage,
+                };
+                match (&error, fault) {
+                    (FormatError::Io(error), Fault::Destination) => {
+                        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe)
+                    }
+                    (FormatError::Resource(error), Fault::ShortRead) => {
+                        assert_eq!(error.kind, kind);
+                        assert_eq!(error.available, 0);
+                        assert_eq!(error.requested, literal(xml, index).len());
+                    }
+                    (FormatError::Resource(error), _) => {
+                        assert_eq!(*error, authority.evidence(kind), "{xml}/{index}/{fault:?}")
+                    }
+                    _ => panic!("{xml}/{index}/{fault:?}: {error:?}"),
+                }
+                let poisoned = matches!(
+                    fault,
+                    Fault::AfterSeal
+                        | Fault::Read
+                        | Fault::ShortRead
+                        | Fault::Destination
+                        | Fault::AfterWrite
+                        | Fault::Complete
+                );
+                match fault {
+                    Fault::Destination => expected.extend_from_slice(&literal(xml, index)[..2]),
+                    Fault::AfterWrite | Fault::Complete => {
+                        expected.extend_from_slice(literal(xml, index))
+                    }
+                    _ => {}
+                }
+                assert_eq!(
+                    writer.destination().bytes,
+                    expected,
+                    "{xml}/{index}/{fault:?}"
+                );
+                authority.reset();
+                assert_eq!(
+                    snapshot(writer.encoder(), &resources, &record, &doc),
+                    before,
+                    "committed state changed: {xml}/{index}/{fault:?}"
+                );
+                assert_eq!(
+                    authority.memory.used(),
+                    retained,
+                    "pending state leaked: {xml}/{index}/{fault:?}"
+                );
+                assert_eq!(authority.stages.load(Ordering::SeqCst), 0);
+                if poisoned {
+                    let calls = writer.destination().calls;
+                    for op in [operation(index, &record, &doc), OutputOperation::Finalize] {
+                        assert!(
+                            matches!(writer.write_operation(op), Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::DeliveryPoisoned)
+                        );
+                    }
+                    assert!(
+                        matches!(writer.flush_bytes(), Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::DeliveryPoisoned)
+                    );
+                    assert_eq!(writer.destination().calls, calls);
+                } else {
+                    writer
+                        .write_operation(operation(index, &record, &doc))
+                        .unwrap();
+                    expected.extend_from_slice(literal(xml, index));
+                    assert_eq!(
+                        writer.destination().bytes,
+                        expected,
+                        "retry bytes: {xml}/{index}/{fault:?}"
+                    );
+                }
+                drop(writer);
+                assert_eq!(authority.memory.used(), 0);
+                assert_eq!(authority.stages.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+    fn envelope() -> clinker_format::OutputEnvelopeSpec {
+        clinker_format::OutputEnvelopeSpec {
+            header_from_doc: Some("opening".into()),
+            footer_from_doc: Some("closing".into()),
+            footer_record_count_field: Some("rows".into()),
+        }
+    }
+    #[test]
+    fn nested_fault_json_operations_preserve_state_or_poison_delivery() {
+        use clinker_format::json::writer::{JsonEncoder, JsonWriterConfig};
+        run(false, |resources| {
+            JsonEncoder::new(
+                csv_schema(),
+                &JsonWriterConfig {
+                    envelope: Some(envelope()),
+                    ..Default::default()
+                },
+                resources,
+            )
+            .unwrap()
+        });
+    }
+    #[test]
+    fn nested_fault_xml_operations_preserve_state_or_poison_delivery() {
+        use clinker_format::xml::writer::{XmlEncoder, XmlWriterConfig};
+        run(true, |resources| {
+            XmlEncoder::new(
+                csv_schema(),
+                &XmlWriterConfig {
+                    envelope: Some(envelope()),
+                    ..Default::default()
+                },
+                resources,
+            )
+            .unwrap()
+        });
+    }
+}
+
+#[test]
+fn nested_fault_wide_schema_and_huge_keys_keep_cache_and_bounded_errors() {
+    use clinker_format::{
+        json::writer::{JsonEncoder, JsonWriterConfig},
+        xml::writer::{XmlEncoder, XmlWriterConfig},
+    };
+    use clinker_record::{Record, Schema, Value};
+    fn probe<E: FormatEncoder>(
+        encoder: E,
+        provider: &MemoryOnlyResources,
+        original: &Record,
+        xml: bool,
+    ) {
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        writer
+            .write_operation(OutputOperation::Record(original))
+            .unwrap();
+        let before = writer.destination().clone();
+        let retained = provider.used();
+        for columns in [
+            vec!["x".repeat(256 * 1024)],
+            (0..2048).map(|i| format!("field_{i}")).collect(),
+        ] {
+            let values = vec![Value::Integer(1); columns.len()];
+            let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(
+                columns.into_iter().map(Into::into).collect(),
+            )));
+            let record = Record::new(schema, values);
+            let error = writer
+                .write_operation(OutputOperation::Record(&record))
+                .unwrap_err();
+            assert!(
+                matches!(error, FormatError::Resource(error) if error.kind == ResourceErrorKind::Budget)
+            );
+            assert!(error.to_string().len() < 200);
+            assert_eq!(writer.destination(), &before);
+            assert_eq!(provider.used(), retained);
+        }
+        let (result, attempts) = allocation_probe(true, || {
+            writer.write_operation(OutputOperation::Record(original))
+        });
+        assert!(
+            matches!(result, Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Allocation)
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(writer.destination(), &before);
+        assert_eq!(provider.used(), retained);
+        writer
+            .write_operation(OutputOperation::Record(original))
+            .unwrap();
+        writer.flush().unwrap();
+        assert_eq!(
+            writer.destination(),
+            if xml {
+                b"<Root><Record><value>1</value></Record><Record><value>1</value></Record></Root>"
+                    .as_slice()
+            } else {
+                b"[\n{\"value\":1},\n{\"value\":1}\n]\n".as_slice()
+            }
+        );
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+    }
+    for xml in [false, true] {
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+        let schema =
+            SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec!["value".into()])));
+        let record = Record::new(schema.clone(), vec![Value::Integer(1)]);
+        if xml {
+            let config = XmlWriterConfig::default();
+            let (result, _) = allocation_probe(true, || {
+                XmlEncoder::new(schema.clone(), &config, provider.resources())
+            });
+            assert!(
+                matches!(result, Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Allocation)
+            );
+            assert_eq!(provider.used(), 0);
+            let encoder = XmlEncoder::new(schema, &config, provider.resources()).unwrap();
+            probe(encoder, &provider, &record, xml);
+        } else {
+            let config = JsonWriterConfig::default();
+            let (result, _) = allocation_probe(true, || {
+                JsonEncoder::new(schema.clone(), &config, provider.resources())
+            });
+            assert!(
+                matches!(result, Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Allocation)
+            );
+            assert_eq!(provider.used(), 0);
+            let encoder = JsonEncoder::new(schema, &config, provider.resources()).unwrap();
+            probe(encoder, &provider, &record, xml);
         }
     }
 }

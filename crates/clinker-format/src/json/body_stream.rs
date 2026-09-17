@@ -219,7 +219,7 @@ impl ByteReader {
         match self.inner.read(&mut one) {
             Ok(0) => Ok(None),
             Ok(_) => Ok(Some(one[0])),
-            Err(e) => Err(FormatError::Io(e)),
+            Err(e) => Err(crate::bom::utf8_input_error(e)),
         }
     }
 

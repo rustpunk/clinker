@@ -437,12 +437,19 @@ fn wrap_reader_with_schema_coercion(
                 clinker_format::FormatError::Interrupted => PipelineError::Interrupted,
                 clinker_format::FormatError::Charset(_)
                 | clinker_format::FormatError::Csv(_)
+                | clinker_format::FormatError::Json(_)
+                | clinker_format::FormatError::Xml(_)
                 | clinker_format::FormatError::Io(_)
-                    if matches!(format, clinker_plan::config::InputFormat::Csv(_)) =>
+                    if matches!(
+                        format,
+                        clinker_plan::config::InputFormat::Csv(_)
+                            | clinker_plan::config::InputFormat::Json(_)
+                            | clinker_plan::config::InputFormat::Xml(_)
+                    ) =>
                 {
-                    // Discovering CSV columns reads source bytes. Malformed
-                    // input and read failures remain data/I/O errors even when
-                    // observed before the first record reaches the pipeline.
+                    // Discovering columns can read source bytes. Keep malformed
+                    // input and transport failures distinct from configuration,
+                    // even before the first record reaches the pipeline.
                     PipelineError::Format(error)
                 }
                 other => PipelineError::Compilation {
@@ -1759,7 +1766,8 @@ fn emit_structural_reject_close(
 /// # Errors
 ///
 /// Preserves typed resource refusal and cancellation from pre-scan or context
-/// admission. Other pre-scan failures retain their existing internal diagnostic.
+/// admission. Native JSON/XML input failures remain format errors; other
+/// pre-scan failures retain their existing internal diagnostic.
 fn open_file_level_doc(
     src_cfg: &clinker_plan::config::SourceConfig,
     stream: &mut crate::executor::source_stream::SourceIngestChannel,
@@ -1777,6 +1785,14 @@ fn open_file_level_doc(
         Some(cfg) => src_reader.prepare_document(cfg).map_err(|e| match e {
             clinker_format::FormatError::Resource(_) => PipelineError::Format(e),
             clinker_format::FormatError::Interrupted => PipelineError::Interrupted,
+            _ if matches!(
+                src_cfg.format,
+                clinker_plan::config::InputFormat::Json(_)
+                    | clinker_plan::config::InputFormat::Xml(_)
+            ) =>
+            {
+                PipelineError::Format(e)
+            }
             _ => PipelineError::Internal {
                 op: "envelope-pre-scan",
                 node: src_cfg.name.clone(),

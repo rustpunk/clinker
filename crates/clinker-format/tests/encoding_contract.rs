@@ -1798,3 +1798,454 @@ fn multi_record_pending_cancel_precedes_late_malformed_utf8() {
     drop(first);
     assert_eq!(authority.used.load(SeqCst), 0);
 }
+
+fn xml_values(bytes: Vec<u8>) -> Result<Vec<Record>, clinker_format::FormatError> {
+    use clinker_format::xml::reader::{XmlReader, XmlReaderConfig};
+    let mut reader = XmlReader::from_reader(
+        std::io::Cursor::new(bytes),
+        XmlReaderConfig {
+            record_path: Some("root/row".into()),
+            ..Default::default()
+        },
+    )?;
+    let mut rows = Vec::new();
+    while let Some(row) = reader.next_record()? {
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+#[test]
+fn xml_non_utf8_conflicting_and_malformed_declarations_fail() {
+    for declaration in [
+        "<?xml version='1.0' encoding='ISO-8859-1'?>",
+        "<?xml version='1.0' encoding='UTF-16'?>",
+        "<?xml version='1.0' encoding='UTF-32'?>",
+        "<?xml version='1.0' encoding='UTF-8' encoding='UTF-16'?>",
+        "<?xml version='1.0' encoding='UTF-8' encoding='UTF-8'?>",
+        "<?xml encoding='UTF-8'?>",
+        "<?xml version='1.0' encoding=UTF-8?>",
+        "<?xml version='1.0'?><?xml version='1.0'?>",
+    ] {
+        let bytes =
+            format!("{declaration}<root><row><value>café</value></row></root>").into_bytes();
+        assert!(xml_values(bytes).is_err(), "accepted {declaration}");
+    }
+}
+
+#[test]
+fn xml_invalid_utf8_never_becomes_replacement_text() {
+    for (before, after) in [
+        (
+            b"<root><row><value>".as_slice(),
+            b"</value></row></root>".as_slice(),
+        ),
+        (
+            b"<root><row><value><![CDATA[".as_slice(),
+            b"]]></value></row></root>".as_slice(),
+        ),
+        (b"<root><row bad".as_slice(), b"='x'/></root>".as_slice()),
+        (b"<root><row><bad".as_slice(), b"/></row></root>".as_slice()),
+        (b"<root><!--".as_slice(), b"--><row/></root>".as_slice()),
+    ] {
+        let mut bytes = before.to_vec();
+        bytes.push(0xff);
+        bytes.extend_from_slice(after);
+        assert!(
+            xml_values(bytes).is_err(),
+            "invalid bytes accepted after {before:?}"
+        );
+    }
+}
+
+fn json_values(
+    bytes: Vec<u8>,
+    mode: Option<clinker_format::json::reader::JsonMode>,
+    path: Option<&str>,
+) -> Result<Vec<Record>, clinker_format::FormatError> {
+    use clinker_format::json::reader::{JsonReader, JsonReaderConfig};
+    let mut reader = JsonReader::from_reader(
+        std::io::Cursor::new(bytes),
+        JsonReaderConfig {
+            format: mode,
+            record_path: path.map(Into::into),
+            ..Default::default()
+        },
+    )?;
+    let mut rows = Vec::new();
+    while let Some(row) = reader.next_record()? {
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+#[test]
+fn json_all_shapes_share_bom_and_malformed_byte_policy() {
+    use clinker_format::json::reader::JsonMode;
+    for (input, mode, path) in [
+        (
+            "[{\"value\":\"é\"},{\"value\":\"€\"}]",
+            Some(JsonMode::Array),
+            None,
+        ),
+        (
+            "{\"value\":\"é\"}\n{\"value\":\"€\"}\n",
+            Some(JsonMode::Ndjson),
+            None,
+        ),
+        (
+            "{\"rows\":[{\"value\":\"é\"},{\"value\":\"€\"}]}",
+            Some(JsonMode::Object),
+            Some("rows"),
+        ),
+        ("[{\"value\":\"é\"},{\"value\":\"€\"}]", None, None),
+    ] {
+        for prefix in [vec![], vec![0xef, 0xbb, 0xbf]] {
+            let mut bytes = prefix;
+            bytes.extend_from_slice(input.as_bytes());
+            let rows = json_values(bytes, mode, path).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values(), &[Value::String("é".into())]);
+            assert_eq!(rows[1].values(), &[Value::String("€".into())]);
+        }
+        for prefix in [
+            vec![0xff, 0xfe],
+            vec![0xfe, 0xff],
+            vec![0xff, 0xfe, 0, 0],
+            vec![0, 0, 0xfe, 0xff],
+        ] {
+            let mut bytes = prefix;
+            bytes.extend_from_slice(input.as_bytes());
+            assert!(json_values(bytes, mode, path).is_err());
+        }
+        let mut bytes = input.as_bytes().to_vec();
+        let pos = bytes.iter().position(|&b| b == 0xc3).unwrap();
+        bytes[pos] = 0xff;
+        assert!(json_values(bytes, mode, path).is_err());
+    }
+    // Ignored wrapper fields must not bypass UTF-8 validation.
+    assert!(
+        json_values(
+            b"{\"ignored\":\"\xff\",\"rows\":[{\"value\":1}]}".to_vec(),
+            None,
+            Some("rows")
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn xml_utf8_declarations_boms_and_record_adjacency_are_exact() {
+    for declaration in [
+        "",
+        "<?xml version='1.0'?>",
+        "<?xml version='1.1' encoding='uTf-8' standalone='yes'?>",
+    ] {
+        let body = format!(
+            "{declaration}<root><row><value>é</value></row><row><value><![CDATA[€]]></value></row></root>"
+        );
+        for prefix in [vec![], vec![0xef, 0xbb, 0xbf]] {
+            let mut bytes = prefix;
+            bytes.extend_from_slice(body.as_bytes());
+            let rows = xml_values(bytes).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values(), &[Value::String("é".into())]);
+            assert_eq!(rows[1].values(), &[Value::String("€".into())]);
+        }
+        for prefix in [
+            vec![0xff, 0xfe],
+            vec![0xfe, 0xff],
+            vec![0xff, 0xfe, 0, 0],
+            vec![0, 0, 0xfe, 0xff],
+        ] {
+            let mut bytes = prefix;
+            bytes.extend_from_slice(body.as_bytes());
+            assert!(xml_values(bytes).is_err());
+        }
+    }
+}
+
+fn envelope_probe(
+    xml: bool,
+    bytes: &[u8],
+    file_backed: bool,
+) -> Result<(usize, Value), clinker_format::FormatError> {
+    use clinker_format::{
+        FormatError, ReopenableSource,
+        envelope::{EnvelopeConfig, EnvelopeExtract, EnvelopeFieldType, EnvelopeSection},
+    };
+    use cxl::analyzer::doc_paths::DocPath;
+    let path = std::env::temp_dir().join(format!(
+        "encoding-reopen-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let source = if file_backed {
+        std::fs::write(&path, bytes)?;
+        ReopenableSource::path(&path)
+    } else {
+        ReopenableSource::buffer(std::io::Cursor::new(bytes.to_vec()))?
+    };
+    let result = (|| {
+        let paths = vec![DocPath {
+            section: "summary".into(),
+            field: "value".into(),
+            indices: vec![],
+        }];
+        let mut reader: Box<dyn FormatReader> = if xml {
+            Box::new(clinker_format::xml::reader::XmlReader::from_source(
+                source,
+                clinker_format::xml::reader::XmlReaderConfig {
+                    record_path: Some("root/row".into()),
+                    declared_doc_paths: paths,
+                    max_index_bytes: Some(1024),
+                    ..Default::default()
+                },
+            )?)
+        } else {
+            Box::new(clinker_format::json::reader::JsonReader::from_source(
+                source,
+                clinker_format::json::reader::JsonReaderConfig {
+                    record_path: Some("rows".into()),
+                    declared_doc_paths: paths,
+                    max_index_bytes: Some(1024),
+                    ..Default::default()
+                },
+            )?)
+        };
+        let mut config = EnvelopeConfig::default();
+        config.sections.insert(
+            "summary".into(),
+            EnvelopeSection {
+                extract: if xml {
+                    EnvelopeExtract::XmlPath("root/closing".into())
+                } else {
+                    EnvelopeExtract::JsonPointer("/closing".into())
+                },
+                fields: [("value".into(), EnvelopeFieldType::String)].into(),
+            },
+        );
+        let sections = reader.prepare_document(&config)?;
+        let value = sections
+            .get("summary")
+            .cloned()
+            .ok_or_else(|| FormatError::Io(std::io::ErrorKind::InvalidData.into()))?;
+        let mut count = 0;
+        while reader.next_record()?.is_some() {
+            count += 1;
+        }
+        Ok((count, value))
+    })();
+    if file_backed {
+        std::fs::remove_file(path)?;
+    }
+    result
+}
+
+#[test]
+fn json_envelope_prescan_and_reopens_share_strict_utf8_policy() {
+    let document = b"{\"rows\":[{\"value\":1},{\"value\":2}],\"closing\":{\"value\":\"ok\"}}";
+    for file_backed in [false, true] {
+        for prefix in [vec![], vec![0xef, 0xbb, 0xbf]] {
+            let mut bytes = prefix;
+            bytes.extend_from_slice(document);
+            let (count, section) = envelope_probe(false, &bytes, file_backed).unwrap();
+            assert_eq!(count, 2);
+            assert_eq!(
+                section,
+                Value::Map(clinker_record::owned_storage::OwnedMap::from_map(
+                    [("value".into(), Value::String("ok".into()))].into()
+                ))
+            );
+        }
+        for prefix in [
+            vec![0xff, 0xfe],
+            vec![0xfe, 0xff],
+            vec![0xff, 0xfe, 0, 0],
+            vec![0, 0, 0xfe, 0xff],
+        ] {
+            let mut bytes = prefix;
+            bytes.extend_from_slice(document);
+            assert!(envelope_probe(false, &bytes, file_backed).is_err());
+        }
+        for field in ["closing", "ignored"] {
+            let mut bytes =
+                format!("{{\"rows\":[{{\"value\":1}}],\"{field}\":{{\"value\":\"").into_bytes();
+            bytes.push(0xff);
+            bytes.extend_from_slice(b"\"},\"tail\":0}");
+            assert!(envelope_probe(false, &bytes, file_backed).is_err());
+        }
+    }
+}
+
+#[test]
+fn xml_envelope_prescan_and_reopens_share_declaration_and_utf8_policy() {
+    let document = b"<root><row><value>1</value></row><row><value>2</value></row><closing><value>ok</value></closing></root>";
+    for file_backed in [false, true] {
+        for prefix in [vec![], vec![0xef, 0xbb, 0xbf]] {
+            let mut bytes = prefix;
+            bytes.extend_from_slice(b"<?xml version='1.0' encoding='UTF-8'?>");
+            bytes.extend_from_slice(document);
+            let (count, section) = envelope_probe(true, &bytes, file_backed).unwrap();
+            assert_eq!(count, 2);
+            assert_eq!(
+                section,
+                Value::Map(clinker_record::owned_storage::OwnedMap::from_map(
+                    [("value".into(), Value::String("ok".into()))].into()
+                ))
+            );
+        }
+        for prefix in [
+            vec![0xff, 0xfe],
+            vec![0xfe, 0xff],
+            vec![0xff, 0xfe, 0, 0],
+            vec![0, 0, 0xfe, 0xff],
+            b"<?xml version='1.0' encoding='ISO-8859-1'?>".to_vec(),
+        ] {
+            let mut bytes = prefix;
+            bytes.extend_from_slice(document);
+            assert!(envelope_probe(true, &bytes, file_backed).is_err());
+        }
+        for section in ["closing", "ignored"] {
+            let mut bytes = format!("<root><row><value>1</value></row><{section}><value><![CDATA[")
+                .into_bytes();
+            bytes.push(0xff);
+            bytes.extend_from_slice(format!("]]></value></{section}></root>").as_bytes());
+            assert!(envelope_probe(true, &bytes, file_backed).is_err());
+        }
+        let bytes = b"<root><row/><closing><value>ok</value></closing><?xml version='1.0' encoding='UTF-8'?></root>";
+        assert!(envelope_probe(true, bytes, file_backed).is_err());
+    }
+}
+
+#[test]
+fn xml_record_path_selects_only_matching_siblings_across_containers() {
+    use clinker_format::xml::reader::{XmlReader, XmlReaderConfig};
+    for (path, input) in [
+        (
+            "root/row",
+            "<root><before/><row id='1'></row><between/><row id='2'/><other><row id='99'/></other><row id='3'></row><after/></root>",
+        ),
+        (
+            "root/group/row",
+            "<root><before/><group><meta/><row id='1'></row><after/></group><group/><between/><group><row id='2'/><meta/><row id='3'></row></group><after/></root>",
+        ),
+    ] {
+        let mut reader = XmlReader::from_reader(
+            std::io::Cursor::new(input.as_bytes().to_vec()),
+            XmlReaderConfig {
+                record_path: Some(path.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        while let Some(row) = reader.next_record().unwrap() {
+            rows.push(row);
+        }
+        assert_eq!(rows.len(), 3, "{path}");
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row.values(), &[Value::Integer(index as i64 + 1)]);
+        }
+    }
+    for path in [None, Some("root")] {
+        let mut reader = XmlReader::from_reader(
+            std::io::Cursor::new(b"<root><value>7</value></root>".to_vec()),
+            XmlReaderConfig {
+                record_path: path.map(Into::into),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reader.next_record().unwrap().unwrap().values(),
+            &[Value::Integer(7)]
+        );
+        assert!(reader.next_record().unwrap().is_none());
+    }
+}
+
+#[test]
+fn json_xml_bom_classifier_and_utf8_chunks_are_lossless() {
+    use clinker_format::bom::{UnicodeBom, Utf8Input, classify_unicode_bom};
+    use std::io::Read;
+    struct Chunks {
+        bytes: std::io::Cursor<Vec<u8>>,
+        chunk: usize,
+        interrupted: bool,
+    }
+    impl Read for Chunks {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if out.is_empty() {
+                return Ok(0);
+            }
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let n = out.len().min(self.chunk);
+            self.bytes.read(&mut out[..n])
+        }
+    }
+    assert_eq!(
+        classify_unicode_bom(&[0xff, 0xfe, 0, 0]),
+        Some(UnicodeBom::Utf32Le)
+    );
+    assert_eq!(
+        classify_unicode_bom(&[0, 0, 0xfe, 0xff]),
+        Some(UnicodeBom::Utf32Be)
+    );
+    assert_eq!(
+        classify_unicode_bom(&[0xff, 0xfe, b'a', b'b']),
+        Some(UnicodeBom::Utf16Le)
+    );
+    assert_eq!(
+        classify_unicode_bom(&[0xfe, 0xff, b'a', b'b']),
+        Some(UnicodeBom::Utf16Be)
+    );
+    for chunk in 1..=9 {
+        for output_chunk in 1..=9 {
+            for bom in [false, true] {
+                let expected = "Aé€𐀀\u{feff}Z".as_bytes();
+                let mut bytes = if bom { vec![0xef, 0xbb, 0xbf] } else { vec![] };
+                bytes.extend_from_slice(expected);
+                let source = Chunks {
+                    bytes: std::io::Cursor::new(bytes),
+                    chunk,
+                    interrupted: false,
+                };
+                let mut reader = Utf8Input::new(source).unwrap();
+                assert_eq!(reader.read(&mut []).unwrap(), 0);
+                let mut actual = Vec::new();
+                let mut out = [0; 9];
+                loop {
+                    let n = reader.read(&mut out[..output_chunk]).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    actual.extend_from_slice(&out[..n]);
+                }
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+    for bad in [
+        vec![0xef],
+        vec![0xef, 0xbb],
+        vec![0xc0, 0xaf],
+        vec![0xed, 0xa0, 0x80],
+        vec![0xf4, 0x90, 0x80, 0x80],
+        vec![0xf0, 0x9f, 0x92],
+    ] {
+        for chunk in 1..=4 {
+            let source = Chunks {
+                bytes: std::io::Cursor::new(bad.clone()),
+                chunk,
+                interrupted: false,
+            };
+            let mut reader = Utf8Input::new(source).unwrap();
+            assert!(reader.read_to_end(&mut Vec::new()).is_err());
+            assert!(reader.read(&mut [0]).is_err());
+        }
+    }
+}

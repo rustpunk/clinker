@@ -25,6 +25,25 @@ rules.
       max_index_bytes: 64MB             # cap on retained envelope sections (optional)
 ```
 
+## Text encoding
+
+XML input must contain valid UTF-8. One leading UTF-8 BOM is removed on every
+physical file open, including the envelope pre-scan. UTF-16/32 BOMs are rejected.
+An XML declaration may omit `encoding` or declare UTF-8; other encodings and
+conflicting declarations are rejected. Convert such input to UTF-8 rather than
+adding an `encoding` option. Names, attributes, text and CDATA are never decoded
+with replacement characters.
+
+Validation applies to bytes the reader consumes. A pre-scan may find a late
+error before any body record is delivered; a streaming body can have already
+delivered earlier records. Each subsequent file establishes its own BOM and
+declaration policy. Metadata adjacent to a selected record does not become an
+extra row, and repeated matching containers preserve body order and empty rows.
+
+Output is UTF-8 without a BOM or XML declaration. See
+[native document boundaries](../pipelines/envelope-and-doc-context.md#native-json-and-xml-output-boundaries)
+for envelope and empty-output behavior.
+
 ## Options
 
 | Option | Default | Description |
@@ -213,12 +232,15 @@ attributes are always omitted.
 
 The XML writer is deliberately two-pass per record. Its first borrowed pass
 validates the complete schema/value shape, XML names, and scalar roles before
-writing any bytes for that record. Its second pass streams directly from the
-original record. Authored strings remain borrowed; other scalars are formatted
+writing any bytes for that record. Its second pass encodes from the borrowed
+original record into a private prepared operation. Delivery begins only when
+the complete operation is ready. Authored strings remain borrowed; other scalars
+are formatted
 in a fixed 128-byte stack scratch buffer. The writer does not clone or
 materialize a second nested tree, and it retains no record values or rendered
 scalar capacity between calls. Its only memoized preparation heap state is the
-schema-derived element plan, whose size is independent of record value widths;
+admitted schema-derived element plan, whose size is independent of record value
+widths;
 recursive calls are capped at 64 containers. This is separate from the XML
 reader's optional envelope pre-scan described below.
 
@@ -449,3 +471,21 @@ memory is the bounded section index plus a single live record, not the input
 size. See
 [Document Envelope Context](../pipelines/envelope-and-doc-context.md) for
 the full model.
+
+## Preparation and delivery failures
+
+Invalid XML names, illegal XML characters, unsupported nested shapes and
+resource refusal during preparation leave that operation's destination bytes
+unchanged. Diagnostics identify a bounded offending field and the rule to
+correct. No replacement character or JSON-string fallback is written.
+
+A destination may accept a prefix before failing. After that failure the writer
+refuses further work, including finalization, and dropping it never retries the
+prefix. Earlier delivered records remain delivered. The CLI publishes staged
+files only after successful execution; this is a separate boundary from writer
+delivery. See [output preparation](../ops/storage.md#output-preparation).
+
+A CLI source with no body records produces an empty file because no writer is
+opened. Explicitly finalizing an unused library writer instead produces
+`<Root></Root>` with default names. An explicitly opened empty envelope retains
+its declared framing with a body count of zero.

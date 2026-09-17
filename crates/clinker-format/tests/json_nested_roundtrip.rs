@@ -6,7 +6,8 @@
 //! scalars, and nulls.
 
 use clinker_format::json::reader::{JsonReader, JsonReaderConfig};
-use clinker_format::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
+use clinker_format::json::writer::{JsonEncoder, JsonOutputMode, JsonWriterConfig};
+use clinker_format::preparation::{MemoryOnlyResources, PreparedWriter};
 use clinker_format::{FormatReader, FormatWriter};
 
 /// Read `input` as a single-record NDJSON document and write it straight back,
@@ -28,14 +29,18 @@ fn read_then_write(input: &str) -> serde_json::Value {
             preserve_nulls: true,
             ..Default::default()
         };
-        let mut writer = JsonWriter::new(&mut buf, schema, config);
+        let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let encoder = JsonEncoder::new(schema, &config, provider.resources()).unwrap();
+        let mut writer = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         while let Some(record) = reader.next_record().expect("record reads") {
             writer.write_record(&record).expect("record writes");
         }
         writer.flush().expect("writer flushes");
     }
     let out = String::from_utf8(buf).expect("utf-8 output");
-    serde_json::from_str(out.trim_end()).expect("valid JSON output")
+    assert!(out.ends_with('\n'), "NDJSON terminates the record");
+    assert_eq!(out.bytes().filter(|byte| *byte == b'\n').count(), 1);
+    serde_json::from_str(&out).expect("valid JSON output")
 }
 
 fn assert_round_trips(input: &str) {

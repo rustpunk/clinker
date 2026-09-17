@@ -68,9 +68,32 @@ Split construction uses `WriterFactory::try_new(closure, &scope)` and calls
 `create(destination, schema)` to obtain a `FormatWriterHandle` for each file.
 The factory admits the concrete closure layout before type erasure; captured
 allocations need separate owners. `WriterFactory::from_legacy` leaves an
-unchanged non-CSV factory ungoverned. `CountedFormatWriter` and
+unchanged codec factory outside CSV/JSON/XML ungoverned. `CountedFormatWriter` and
 `SplittingWriter` retain writer handles, so wrapping and rotating a CSV writer
 preserve its backing charge. See [memory ownership](memory-arbitration.md#exact-allocation-admission-for-prepared-output).
+
+### Finite native writer construction
+
+JSON and XML expose `JsonEncoder`/`XmlEncoder`, admitted shared
+`JsonEncoderConfig`/`XmlEncoderConfig`, and borrowed options. Construct an
+encoder with finite `WriterResources`, then wrap it in `PreparedWriter<W, E>` for a
+borrowed or owned destination. For type erasure, `into_boxed_writer` admits the
+concrete allocation and returns `FormatWriterHandle`. Pass explicit finite
+`MemoryOnlyResources` for direct use or executor `WriterResources` at runtime;
+there is no unlimited constructor and no raw `JsonWriter`/`XmlWriter` fallback.
+
+`FormatEncoder::prepare` must leave committed state unchanged. Return pending
+cache/framing/count state and commit it only after complete stage delivery.
+Every wrapper forwards document hooks, `flush_bytes`, finalization, byte counts
+and failures. Never add buffering outside the prepared writer that can retry
+bytes from `Drop` or obscure accepted destination counts. `WriterFactory`
+retains the admitted config owner across split rotations.
+
+Schema cache identity is `SharedStorageIdentity<Schema>`, never a raw address
+or an owned schema clone. The old cache and its prospective replacement remain
+charged together until the operation commits or aborts. Preserve the legacy
+weak-backing reservation and final deallocation order. See
+[native ownership](memory-arbitration.md#native-jsonxml-configuration-and-schema-caches).
 
 ### Prepared storage extensions
 

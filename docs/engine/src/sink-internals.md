@@ -265,7 +265,7 @@ header bytes are merely prepared.
 splitting wrappers. `WriterFactory` owns the concrete split-construction
 closure. Their external leases outlive box deallocation; internal buffers and
 captured state retain independent allocation owners. Explicit legacy handles
-preserve unchanged non-CSV implementations without claiming admission. The
+preserve unchanged codecs outside CSV/JSON/XML without claiming admission. The
 [extension seam](extension-seams.md#allocation-aware-csv-construction) describes
 the constructor contracts, and [prepared storage](storage-internals.md#prepared-output-storage)
 describes spill and cleanup debt.
@@ -285,6 +285,50 @@ and `sink_surface` tests. The runtime tests observe actual spill completion and
 bytes; the CLI checks exact output, summary counters and diagnostic categories.
 Destination-prefix and cancellation fault guarantees come from the injected
 integration tests, not from successful CLI fixtures.
+
+## Native JSON/XML prepared output
+
+`JsonEncoder` and `XmlEncoder` implement the same `FormatEncoder` transaction:
+prepare borrowed input into an `OperationStage`, seal, deliver completely, then
+commit pending framing/count/cache state. Begin-document, record, end-document
+and finalization each have their own operation. Memory, allocation and storage
+refusal before delivery leave committed state and destination unchanged.
+Readback, destination or cancellation failure after delivery begins can leave a
+prefix and poisons continuation. Drop never finalizes or retries. Draining
+bytes through `flush_bytes` never closes syntax.
+
+The registry uses admitted immutable configs, `FormatWriterHandle` and
+`WriterFactory` for ordinary, split and per-source destinations. CSV/JSON/XML
+prepared writers directly wrap the destination, without an extra `BufWriter`:
+a buffered outer writer could count undelivered bytes or retry them on drop
+after poisoning. Other codecs retain their existing wrapper behavior. Sink
+byte metrics count actual accepted destination bytes; records count only
+complete delivered record operations. Cancellation is interruption, with zero
+Sink errors unless a real failure also occurred.
+
+Ordinary NDJSON always emits one compact record and LF, regardless of `pretty`.
+Reconstructed JSON keeps its existing document grammar and pretty behavior;
+XML keeps native attributes, text, repeated elements and configured wrappers.
+No XML declaration is emitted. Empty library finalization and explicitly opened
+empty envelopes are supported, but a CLI run with no native body rows never
+opens a writer and publishes an empty staged file. Unsupported envelope/routing
+combinations fail configuration validation before execution.
+
+Native source schema discovery and envelope pre-scan preserve input errors as
+format failures. The UTF-8 adapter marks its own encoding failures structurally
+across `std::io::Error`; unrelated transport errors are not relabeled by that
+adapter. Each physical open revalidates BOM/declaration policy. XML selection
+resets matched depth at the selected record's closing event, so metadata and
+repeated containers do not inflate body cardinality. File dataset identity and
+declared-column DIRECT lineage remain unchanged; structural element names do
+not invent data-column influence edges.
+
+Fault tests in `writer_preparation` and `writer_resources` cover all native
+operation boundaries, storage failures, exact destination prefixes, cancellation,
+cache rollback and telemetry admission loss. `encoding_cli` and
+`encoding_runtime_contract` cover literal files, publication, exit codes and
+source/sink count prefixes. See [native ownership](memory-arbitration.md#native-jsonxml-configuration-and-schema-caches)
+for configuration, schema lifetime and the remaining reader allowance.
 
 ## Streaming vs. buffered
 
@@ -367,7 +411,8 @@ and correlation-deferred modes apply that boundary at their actual population
 grain; they do not create a second memory budget.
 
 CSV adds admitted per-cell workspace, retained policy/header state and prepared
-operation storage under that same authority. Raw parser buffers, JSON parser
+operation storage under that same authority. JSON/XML add admitted immutable
+configuration, schema caches and prepared operation storage. Raw parser buffers, JSON parser
 intermediates and unchanged downstream copies remain outside this allocation
 guarantee. An explicit spill root permits prepared output to spill, but does not
 remove the finite memory needed for cell rendering and metadata. See

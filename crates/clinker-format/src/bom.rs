@@ -13,6 +13,178 @@ use std::io::Read;
 /// The UTF-8 encoding of `U+FEFF`, the byte-order mark.
 pub const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
+/// Unicode BOMs recognized from at most four leading bytes, longest first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnicodeBom {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+    Utf32Le,
+    Utf32Be,
+}
+
+/// Classifies a prefix without reading or allocating. UTF-32LE must precede
+/// UTF-16LE because the first two bytes are identical.
+pub fn classify_unicode_bom(prefix: &[u8]) -> Option<UnicodeBom> {
+    if prefix.starts_with(&[0xff, 0xfe, 0, 0]) {
+        Some(UnicodeBom::Utf32Le)
+    } else if prefix.starts_with(&[0, 0, 0xfe, 0xff]) {
+        Some(UnicodeBom::Utf32Be)
+    } else if prefix.starts_with(&UTF8_BOM) {
+        Some(UnicodeBom::Utf8)
+    } else if prefix.starts_with(&[0xff, 0xfe]) {
+        Some(UnicodeBom::Utf16Le)
+    } else if prefix.starts_with(&[0xfe, 0xff]) {
+        Some(UnicodeBom::Utf16Be)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug)]
+enum Utf8InputError {
+    UnsupportedBom,
+    InvalidBytes,
+}
+impl std::fmt::Display for Utf8InputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedBom => "unsupported UTF-16/UTF-32 input; save the input as UTF-8",
+            Self::InvalidBytes => "invalid UTF-8 input; save the input as valid UTF-8",
+        })
+    }
+}
+impl std::error::Error for Utf8InputError {}
+
+/// Preserve adapter-created data failures without relabeling transport errors.
+pub(crate) fn utf8_input_error(error: std::io::Error) -> crate::FormatError {
+    if error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<Utf8InputError>())
+    {
+        crate::FormatError::Charset(error.to_string())
+    } else {
+        crate::FormatError::Io(error)
+    }
+}
+
+/// Strict UTF-8 byte boundary for JSON/XML opens. Removes one leading UTF-8
+/// BOM and refuses UTF-16/32; all other bytes pass unchanged after validation.
+/// The only retained byte storage is four bytes, shared by the initial probe
+/// and an incomplete UTF-8 scalar. It never buffers a record or document.
+pub struct Utf8Input<R> {
+    inner: R,
+    carry: [u8; 4],
+    filled: usize,
+    valid: usize,
+    head: usize,
+    failed: bool,
+}
+impl<R: Read> Utf8Input<R> {
+    /// Probes at most four bytes before the parser can emit a record.
+    pub fn new(mut inner: R) -> std::io::Result<Self> {
+        let mut carry = [0; 4];
+        let mut filled = 0;
+        while filled < carry.len() {
+            match inner.read(&mut carry[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        let head = match classify_unicode_bom(&carry[..filled]) {
+            Some(UnicodeBom::Utf8) => 3,
+            Some(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    Utf8InputError::UnsupportedBom,
+                ));
+            }
+            None => 0,
+        };
+        carry.copy_within(head..filled, 0);
+        filled -= head;
+        Ok(Self {
+            inner,
+            carry,
+            filled,
+            valid: 0,
+            head: 0,
+            failed: false,
+        })
+    }
+    fn invalid(&mut self) -> std::io::Error {
+        self.failed = true;
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            Utf8InputError::InvalidBytes,
+        )
+    }
+}
+impl<R: Read> Read for Utf8Input<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if self.failed {
+            return Err(self.invalid());
+        }
+        loop {
+            if self.head < self.valid {
+                let n = (self.valid - self.head).min(out.len());
+                out[..n].copy_from_slice(&self.carry[self.head..self.head + n]);
+                self.head += n;
+                return Ok(n);
+            }
+            if self.head > 0 {
+                self.carry.copy_within(self.head..self.filled, 0);
+                self.filled -= self.head;
+                self.valid = 0;
+                self.head = 0;
+            }
+            if self.filled > 0 {
+                match std::str::from_utf8(&self.carry[..self.filled]) {
+                    Ok(_) => {
+                        self.valid = self.filled;
+                        continue;
+                    }
+                    Err(error) if error.error_len().is_some() => return Err(self.invalid()),
+                    Err(error) if error.valid_up_to() > 0 => {
+                        self.valid = error.valid_up_to();
+                        continue;
+                    }
+                    Err(_) => {
+                        // std's incomplete-scalar result guarantees fewer than
+                        // four bytes; no handwritten UTF-8 decoding is used.
+                        let n = self
+                            .inner
+                            .read(&mut self.carry[self.filled..self.filled + 1])?;
+                        if n == 0 {
+                            return Err(self.invalid());
+                        }
+                        self.filled += n;
+                        continue;
+                    }
+                }
+            }
+            let n = self.inner.read(out)?;
+            match std::str::from_utf8(&out[..n]) {
+                Ok(_) => return Ok(n),
+                Err(error) if error.error_len().is_some() => return Err(self.invalid()),
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    self.filled = n - valid;
+                    self.carry[..self.filled].copy_from_slice(&out[valid..n]);
+                    if valid > 0 {
+                        return Ok(valid);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A `Read` adapter that transparently drops a single leading UTF-8 BOM
 /// from the wrapped stream, then yields the remaining bytes verbatim.
 ///
@@ -294,5 +466,60 @@ mod tests {
         let calls = reader.inner.calls;
         assert_eq!(reader.read(&mut []).unwrap(), 0);
         assert_eq!(reader.inner.calls, calls);
+    }
+
+    #[test]
+    fn utf8_bom_input_retries_interruptions_at_every_byte_boundary() {
+        let input = "abcdé€𐀀Z".as_bytes();
+        for position in 0..=input.len() {
+            let source = FaultReader::new(input, Some((position, std::io::ErrorKind::Interrupted)));
+            assert_eq!(
+                read_all(Utf8Input::new(source).unwrap()),
+                input,
+                "{position}"
+            );
+        }
+    }
+
+    #[test]
+    fn utf8_bom_input_retains_split_scalars_after_recoverable_body_errors() {
+        let input = "abcdé€𐀀Z".as_bytes();
+        // Construction establishes the initial four-byte boundary. Later
+        // I/O errors must preserve both emitted bytes and incomplete scalars.
+        for position in 4..=input.len() {
+            let source =
+                FaultReader::new(input, Some((position, std::io::ErrorKind::ConnectionReset)));
+            let mut reader = Utf8Input::new(source).unwrap();
+            let mut actual = Vec::new();
+            assert_eq!(
+                reader.read_to_end(&mut actual).unwrap_err().kind(),
+                std::io::ErrorKind::ConnectionReset
+            );
+            reader.read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, input, "{position}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod utf8_error_tests {
+    use super::*;
+
+    #[test]
+    fn only_adapter_errors_are_encoding_failures() {
+        for kind in [
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            assert!(
+                matches!(utf8_input_error(std::io::Error::new(kind, "transport failure")), crate::FormatError::Io(error) if error.kind() == kind)
+            );
+        }
+        for kind in [Utf8InputError::UnsupportedBom, Utf8InputError::InvalidBytes] {
+            assert!(matches!(
+                utf8_input_error(std::io::Error::new(std::io::ErrorKind::InvalidData, kind)),
+                crate::FormatError::Charset(_)
+            ));
+        }
     }
 }

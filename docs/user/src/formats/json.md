@@ -25,6 +25,21 @@ rules.
       max_index_bytes: 64MB   # cap on retained envelope sections (optional)
 ```
 
+## Text encoding
+
+Input is strict UTF-8. One leading UTF-8 BOM is accepted and removed at each
+physical file open, including an envelope pre-scan. UTF-16 and UTF-32 BOMs and
+malformed UTF-8 are rejected; convert the file to UTF-8 before running it.
+There is no JSON `encoding` option or lossy fallback. A later invalid file does
+not erase records already delivered from earlier files. Validation follows the
+reader: it does not promise to discover malformed bytes beyond what it reads.
+
+Output is UTF-8 without a BOM. Ordinary `format: ndjson` always writes one
+compact object followed by exactly one LF, including the last record;
+`pretty: true` does not expand ordinary NDJSON across lines. `pretty` still
+controls array output and reconstructed envelope documents. Envelope framing
+is documented [separately](../pipelines/envelope-and-doc-context.md#native-json-and-xml-output-boundaries).
+
 ## Physical shapes
 
 | `format` | Layout |
@@ -176,7 +191,7 @@ the full model.
 
 JSON numbers cannot represent `NaN`, `+infinity`, or `-infinity`. Writing a
 record (or an envelope section field) that holds a non-finite float to a
-JSON output fails with a JSON error naming the value, rather than silently
+JSON output fails with a bounded field diagnostic, rather than silently
 substituting `null` — a substituted `null` would be indistinguishable from
 a genuine source null on read-back. Filter such records or replace the
 value in a transform before the JSON output.
@@ -198,7 +213,7 @@ single array (`format: array`, the default) or one object per line
     preserve_nulls: false  # omit null columns; native map/array nulls remain values
     options:
       format: ndjson     # array | ndjson
-      pretty: false      # indent the emitted objects
+      pretty: false      # indentation for arrays or reconstructed envelopes
 ```
 
 ### Dotted column names become nested objects
@@ -297,10 +312,25 @@ what the reader does), so `{"a.b": 1}` read and written back comes out as
 Two columns can describe places that cannot both exist in one object — a column
 `a` holding a value alongside a column `a.b` that needs `a` to be an object.
 Rather than keep one and drop the other, the writer refuses the whole column set
-before emitting a byte, naming both columns and, where escaping would resolve
-it, the escaped spelling to use. [Field Paths](../cxl/field-paths.md#when-two-names-clash)
+before emitting that record, identifying the offending column and the path
+rule to correct. [Field Paths](../cxl/field-paths.md#when-two-names-clash)
 lists every clashing shape.
 
 A column name carrying a malformed escape — a `\` that is not part of `\.`,
 `\[`, or `\\`, as in a column literally named `C:\temp` — is refused the same
-way, with the corrected spelling (`C:\\temp`) in the message.
+way, with escape guidance; write `C:\\temp` for a literal backslash.
+
+### Preparation and empty output
+
+Each complete output operation is prepared within the run's finite resources
+before delivery. An invalid value or resource refusal during preparation writes
+none of that operation. A destination failure during delivery can leave a
+prefix; the writer then stops and never retries or finalizes on teardown.
+Earlier delivered records remain delivered. See [output preparation](../ops/storage.md#output-preparation)
+for spill, cancellation and the separate file-publication boundary.
+
+A CLI source with no body records never opens its native writer and produces an
+empty file, including when envelope reconstruction is selected. This differs
+from explicitly finalizing a library array writer, which emits `[]` and an LF.
+An explicitly opened empty envelope document retains its declared framing and
+has a body count of zero.

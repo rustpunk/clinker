@@ -30,12 +30,19 @@ The safest strategy. Any record-level error (type coercion failure, validation e
 
 Some failures abort the run under **either** strategy, because they are not record-scoped: an unwritable output path, a config or CXL compile error, and the DLQ-rate ceiling ([`dlq.max_rate`](#dlq-configuration), E315/E316) all end the run regardless of the strategy.
 
-CSV resource failures are also fatal under either strategy. Memory or disk
+CSV, JSON and XML resource failures are also fatal under either strategy. Memory or disk
 admission refusal, allocation failure, descriptor exhaustion and temporary-storage
 failure are not bad-record errors, so `continue` cannot turn them into successful
 output. A typed resource diagnostic preserves the kind of failure rather than
 reporting every case as a memory shortage. A failed destination can already have
 accepted a prefix; see [output preparation](../ops/storage.md#output-preparation).
+
+Malformed JSON/XML input encoding is a data failure, including when discovered
+during schema discovery or envelope pre-scan. Under `fail_fast`, the CLI returns
+exit `4` and machine code `source.data.invalid`. It does not report a compilation
+error merely because no record has reached the pipeline. A late error can leave
+an already delivered prefix; an envelope pre-scan may discover it before any
+body records. Failed runs do not publish their staged normal output files.
 
 Explicit cancellation ends an interrupted run with exit `130`; it does not add a
 Sink error. If a real I/O or resource failure occurs alongside a shutdown request,

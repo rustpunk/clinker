@@ -115,7 +115,66 @@ enum SharedStorageKind<T> {
     Governed(SharedAllocation<Governed<T>>),
 }
 
+/// Sealed backing identity without access to or ownership of the payload.
+/// Governed identities retain only a non-reusable allocation ID. Legacy
+/// identities retain the weak backing with an additional conservative lease;
+/// they never retain the payload's children after the final strong owner drops.
+pub struct SharedStorageIdentity<T> {
+    identity: SharedStorageIdentityKind<T>,
+}
+
+enum SharedStorageIdentityKind<T> {
+    Governed(u64),
+    Legacy {
+        // Declaration order frees a final weak backing before releasing charge.
+        weak: std::sync::Weak<T>,
+        _lease: AllocationLease,
+    },
+}
+
+impl<T> SharedStorageIdentity<T> {
+    /// Compare the original backing with a live candidate without allocating.
+    pub fn matches(&self, candidate: &SharedStorage<T>) -> bool {
+        match (&self.identity, &candidate.storage) {
+            (SharedStorageIdentityKind::Governed(id), SharedStorageKind::Governed(value)) => {
+                *id == value.lease.allocation_id()
+            }
+            (SharedStorageIdentityKind::Legacy { weak, .. }, SharedStorageKind::Legacy(value)) => {
+                std::sync::Weak::ptr_eq(weak, &Arc::downgrade(value))
+            }
+            _ => false,
+        }
+    }
+}
+
 impl<T> SharedStorage<T> {
+    /// Obtain a payload-free identity under the caller's finite cache scope.
+    /// Legacy backing retention is admitted before downgrade, in addition to
+    /// any upstream accounting. Governed IDs require no retained allocation.
+    pub fn try_identity(
+        &self,
+        scope: &AllocationScope,
+    ) -> Result<SharedStorageIdentity<T>, ResourceError> {
+        scope.check_cancelled()?;
+        let identity = match &self.storage {
+            SharedStorageKind::Governed(value) => {
+                SharedStorageIdentityKind::Governed(value.lease.allocation_id())
+            }
+            SharedStorageKind::Legacy(value) => {
+                let layout = Layout::new::<[AtomicUsize; 2]>()
+                    .extend(Layout::new::<T>())
+                    .map_err(|_| ResourceError::new(ResourceErrorKind::Layout, usize::MAX, 0))?
+                    .0
+                    .pad_to_align();
+                let lease = scope.reserve(layout)?;
+                SharedStorageIdentityKind::Legacy {
+                    weak: Arc::downgrade(value),
+                    _lease: lease,
+                }
+            }
+        };
+        Ok(SharedStorageIdentity { identity })
+    }
     /// Own outer backing not already charged to this live aggregate ledger.
     pub fn unaccounted_outer_heap_size(&self, resources: &AllocationResources) -> usize {
         match &self.storage {
@@ -1356,6 +1415,133 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 
     #[test]
+    fn shared_storage_identity_matches_only_original_backing_without_allocating() {
+        use super::SharedStorage;
+        let authority = std::sync::Arc::new(FiniteAuthority {
+            used: AtomicUsize::new(0),
+            cancelled: AtomicBool::new(false),
+            limit: 4096,
+        });
+        let scope = AllocationResources::new(authority.clone()).scope().unwrap();
+        let governed = SharedStorage::try_new(17_u64, &scope).unwrap();
+        let legacy = SharedStorage::from_arc(std::sync::Arc::new(17_u64));
+        let observation = Observation::default();
+        let guard = Observe::start(&observation);
+        observation.deny_allocations.store(true, SeqCst);
+        let governed_id = governed.try_identity(&scope).unwrap();
+        let legacy_id = legacy.try_identity(&scope).unwrap();
+        assert!(governed_id.matches(&governed.clone()));
+        assert!(legacy_id.matches(&legacy.clone()));
+        assert!(!governed_id.matches(&legacy));
+        assert!(!legacy_id.matches(&governed));
+        observation.deny_allocations.store(false, SeqCst);
+        drop(guard);
+        assert_eq!(observation.allocations.load(SeqCst), 0);
+        let other = SharedStorage::try_new(17_u64, &scope).unwrap();
+        assert!(!governed_id.matches(&other));
+        drop(governed);
+        drop(legacy);
+        let fresh = SharedStorage::from_arc(std::sync::Arc::new(17_u64));
+        assert!(!legacy_id.matches(&fresh));
+        let fresh_governed = SharedStorage::try_new(17_u64, &scope).unwrap();
+        assert!(!governed_id.matches(&fresh_governed));
+        drop((other, fresh_governed, governed_id, legacy_id));
+        assert_eq!(authority.used.load(SeqCst), 0);
+    }
+
+    #[test]
+    fn shared_storage_identity_legacy_denial_precedes_retention() {
+        let original = std::sync::Arc::new(crate::Schema::new(vec![]));
+        let storage = super::SharedStorage::from_arc(original.clone());
+        let required = storage.estimated_outer_heap_size();
+        assert!(required > 0);
+        let authority = std::sync::Arc::new(FiniteAuthority {
+            used: AtomicUsize::new(0),
+            cancelled: AtomicBool::new(false),
+            limit: required - 1,
+        });
+        let scope = AllocationResources::new(authority.clone()).scope().unwrap();
+        let observation = Observation::default();
+        let guard = Observe::start(&observation);
+        let error = storage.try_identity(&scope).err().unwrap();
+        drop(guard);
+        assert_eq!(error.kind, ResourceErrorKind::Budget);
+        assert_eq!(error.requested, required);
+        assert_eq!(error.available, required - 1);
+        assert_eq!(std::sync::Arc::weak_count(&original), 0);
+        assert_eq!(observation.allocations.load(SeqCst), 0);
+        assert_eq!(authority.used.load(SeqCst), 0);
+    }
+
+    #[test]
+    fn shared_storage_identity_children_drop_and_final_weak_deallocates_before_release() {
+        struct WatchedAuthority(std::sync::Arc<Observation>);
+        impl AllocationAuthority for WatchedAuthority {
+            fn try_reserve(
+                self: std::sync::Arc<Self>,
+                owner: OwnerId,
+                layout: Layout,
+            ) -> Result<AllocationLease, ResourceError> {
+                self.0.used.fetch_add(layout.size(), SeqCst);
+                AllocationLease::admitted(self, owner, layout.size())
+            }
+            fn release(&self, _: OwnerId, bytes: usize) {
+                self.0.used.fetch_sub(bytes, SeqCst);
+                self.0.released.store(self.0.tick(), SeqCst);
+            }
+            fn check_cancelled(&self) -> Result<(), ResourceError> {
+                Ok(())
+            }
+        }
+        for (governed, metadata) in [(false, false), (false, true), (true, false), (true, true)] {
+            let observation = std::sync::Arc::new(Observation::new());
+            let authority = std::sync::Arc::new(WatchedAuthority(observation.clone()));
+            let scope = AllocationResources::new(authority).scope().unwrap();
+            let schema = crate::Schema::with_metadata(
+                vec!["long-column-name-retained-by-schema-only".into()],
+                vec![Some(crate::FieldMetadata::SourceCorrelation {
+                    source_field: "long-metadata-name-retained-by-schema-only".into(),
+                })],
+            );
+            let guard = Observe::start(&observation);
+            let storage = if governed {
+                super::SharedStorage::try_new(schema, &scope).unwrap()
+            } else {
+                super::SharedStorage::from_arc(std::sync::Arc::new(schema))
+            };
+            // Watch the column vector separately from the outer backing.
+            let child = if metadata {
+                let Some(crate::FieldMetadata::SourceCorrelation { source_field }) =
+                    storage.field_metadata(0)
+                else {
+                    panic!("metadata")
+                };
+                source_field.as_ptr() as usize
+            } else {
+                storage.columns().as_ptr() as usize
+            };
+            observation.payload_storage.store(child, SeqCst);
+            let identity = storage.try_identity(&scope).unwrap();
+            let charge = observation.used.load(SeqCst);
+            assert_eq!(charge, observation.backing_size.load(SeqCst));
+            drop(storage);
+            assert!(observation.payload_deallocated.load(SeqCst) > 0);
+            if governed {
+                assert!(observation.deallocated.load(SeqCst) > 0);
+                assert_eq!(observation.used.load(SeqCst), 0);
+            } else {
+                assert_eq!(observation.deallocated.load(SeqCst), 0);
+                assert_eq!(observation.used.load(SeqCst), charge);
+            }
+            drop(identity);
+            assert_eq!(observation.used_on_backing_dealloc.load(SeqCst), charge);
+            assert!(observation.deallocated.load(SeqCst) < observation.released.load(SeqCst));
+            assert_eq!(observation.used.load(SeqCst), 0);
+            drop(guard);
+        }
+    }
+
+    #[test]
     fn resource_diagnostic_is_neutral_and_keeps_bounded_evidence() {
         for (kind, requested, available, expected) in [
             (
@@ -1595,7 +1781,7 @@ mod tests {
     }
 
     #[test]
-    fn allocation_identity_exhaustion_releases_admitted_bytes() {
+    fn shared_storage_identity_exhaustion_releases_admitted_bytes() {
         let authority = std::sync::Arc::new(FiniteAuthority {
             used: AtomicUsize::new(8),
             cancelled: AtomicBool::new(false),

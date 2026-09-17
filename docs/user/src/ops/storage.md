@@ -8,17 +8,18 @@ directory. The `[storage]` block in `clinker.toml` lets you redirect them.
 
 ## Output preparation
 
-CSV output in the CLI and executor prepares each complete output operation
-before delivering its bytes. The first body row and its automatic header share
-one operation; explicit document start and end are separate operations. The
+CSV, JSON and XML output in the CLI and executor prepares each complete
+output operation before delivering its bytes. For CSV, the first body row and
+its automatic header share one operation; explicit document start and end are separate operations. The
 same finite-resource preparation API is available to library integrations.
 
-Prepared CSV bytes stay in memory unless `storage.spill.dir` supplies an explicit
+Prepared output bytes stay in memory unless `storage.spill.dir` supplies an explicit
 spill location. This differs from the operator spill default described below:
 output preparation does not silently use the operating system's temporary
 directory. Configured spill uses the run's disk budget and a finite descriptor
-allowance. It does not remove the memory required for a rendered cell or retained
-header. See [Memory Tuning](memory.md#what-the-budget-measures).
+allowance. It does not remove the memory required for a rendered CSV cell,
+retained header, or native format configuration and schema plans. See
+[Memory Tuning](memory.md#what-the-budget-measures).
 
 Failure before delivery writes none of that operation's bytes. Once delivery
 starts, ordinary I/O can accept a prefix before failing. The writer then refuses
@@ -35,7 +36,7 @@ those signals being retained.
 These rules add no storage setting and make no atomic-publication promise for
 an arbitrary destination. [Output publication](#output-publication-and-retained-attempts)
 governs the separate file-publication boundary. Other format writers retain their
-existing behavior; CSV preparation does not establish all-format migration.
+existing behavior; these three codecs do not establish all-format migration.
 
 ## The `[storage]` block
 

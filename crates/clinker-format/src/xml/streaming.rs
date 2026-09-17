@@ -23,7 +23,6 @@
 
 use std::io::{BufReader, Read};
 
-use quick_xml::Reader as XmlParser;
 use quick_xml::events::Event;
 
 use crate::error::FormatError;
@@ -90,7 +89,7 @@ pub(crate) fn extract_sections(
     // Text nodes are trimmed when a run is finalized in `read_section_payload`,
     // not per parser event, so reference-adjacent whitespace survives the
     // `Text`/`GeneralRef` fragment split (see `finalize_text_run`).
-    let mut parser = XmlParser::from_reader(reader);
+    let mut parser = BodyParser::from_reader(reader);
 
     let parse_ctx = SectionParseCtx { ns, attr_prefix };
     let mut path_stack: Vec<String> = Vec::new();
@@ -103,12 +102,10 @@ pub(crate) fn extract_sections(
 
     loop {
         buf.clear();
-        let event = parser
-            .read_event_into(&mut buf)
-            .map_err(|e| FormatError::Xml(e.to_string()))?;
+        let event = parser.read_event_into(&mut buf)?;
         match event {
             Event::Start(ref e) => {
-                let name = elem_name_static(ns, &e.name());
+                let name = elem_name_static(ns, &e.name())?;
                 path_stack.push(name);
                 // Several sections may alias one path (distinct names
                 // projecting different `fields` from a single header), so
@@ -154,7 +151,7 @@ pub(crate) fn extract_sections(
                 }
             }
             Event::Empty(ref e) => {
-                let name = elem_name_static(ns, &e.name());
+                let name = elem_name_static(ns, &e.name())?;
                 path_stack.push(name);
                 // An empty element carries only its attributes; several
                 // sections may still alias its path, so record the attribute
@@ -287,9 +284,7 @@ fn read_section_payload(
     let mut text_run = String::new();
     loop {
         buf.clear();
-        let event = parser
-            .read_event_into(buf)
-            .map_err(|e| FormatError::Xml(e.to_string()))?;
+        let event = parser.read_event_into(buf)?;
 
         // Any event other than a text fragment ends the current text node;
         // resolve, charge, and retain it before handling the structural event.
@@ -308,7 +303,7 @@ fn read_section_payload(
         match event {
             Event::Start(ref e) => {
                 depth_here += 1;
-                let name = elem_name_static(ctx.ns, &e.name());
+                let name = elem_name_static(ctx.ns, &e.name())?;
                 element_stack.push(name);
                 let attrs = extract_attributes_static(ctx.attr_prefix, e)?;
                 let prefix = element_stack.join(".");
@@ -326,7 +321,7 @@ fn read_section_payload(
                 element_stack.pop();
             }
             Event::Empty(ref e) => {
-                let name = elem_name_static(ctx.ns, &e.name());
+                let name = elem_name_static(ctx.ns, &e.name())?;
                 let prefix = if element_stack.is_empty() {
                     name.clone()
                 } else {
@@ -348,7 +343,9 @@ fn read_section_payload(
                 append_general_ref(&mut text_run, r)?;
             }
             Event::CData(ref cd) => {
-                let text = String::from_utf8_lossy(cd.as_ref()).into_owned();
+                let text = std::str::from_utf8(cd.as_ref())
+                    .map_err(|_| FormatError::Io(std::io::ErrorKind::InvalidData.into()))?
+                    .to_owned();
                 if !text.is_empty() {
                     let field_name = element_stack.join(".");
                     if !field_name.is_empty() {

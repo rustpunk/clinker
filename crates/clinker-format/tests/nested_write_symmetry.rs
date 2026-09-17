@@ -7,8 +7,10 @@
 
 use clinker_record::owned_storage::{OwnedMap, OwnedValues, SharedStorage};
 
-use clinker_format::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
-use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
+use clinker_format::error::OutputEncodingKind;
+use clinker_format::json::writer::{JsonEncoder, JsonOutputMode, JsonWriterConfig};
+use clinker_format::preparation::{MemoryOnlyResources, PreparedWriter};
+use clinker_format::xml::writer::{XmlEncoder, XmlWriterConfig};
 use clinker_format::{FormatError, FormatWriter};
 use clinker_record::schema::FieldMetadata;
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
@@ -26,15 +28,14 @@ fn write_json(schema: &SharedStorage<Schema>, values: Vec<Value>, preserve_nulls
     };
     let mut buf = Vec::new();
     {
-        let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
+        let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let encoder = JsonEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+        let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         w.write_record(&Record::new(schema.clone(), values))
             .expect("json record writes");
         w.flush().expect("json writer flushes");
     }
-    String::from_utf8(buf)
-        .expect("utf-8")
-        .trim_end()
-        .to_string()
+    String::from_utf8(buf).expect("utf-8")
 }
 
 fn write_xml(schema: &SharedStorage<Schema>, values: Vec<Value>, preserve_nulls: bool) -> String {
@@ -44,7 +45,9 @@ fn write_xml(schema: &SharedStorage<Schema>, values: Vec<Value>, preserve_nulls:
     };
     let mut buf = Vec::new();
     {
-        let mut w = XmlWriter::new(&mut buf, schema.clone(), config);
+        let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let encoder = XmlEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+        let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         w.write_record(&Record::new(schema.clone(), values))
             .expect("xml record writes");
         w.flush().expect("xml writer flushes");
@@ -60,15 +63,31 @@ fn refusal(
 ) -> (Option<FormatError>, Option<FormatError>) {
     let mut json_buf = Vec::new();
     let json = {
-        let mut w = JsonWriter::new(&mut json_buf, schema.clone(), JsonWriterConfig::default());
+        let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let encoder = JsonEncoder::new(
+            schema.clone(),
+            &JsonWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut w = PreparedWriter::new(&mut json_buf, encoder, provider.resources()).unwrap();
         w.write_record(&Record::new(schema.clone(), values.clone()))
             .err()
     };
     let mut xml_buf = Vec::new();
     let xml = {
-        let mut w = XmlWriter::new(&mut xml_buf, schema.clone(), XmlWriterConfig::default());
+        let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let encoder = XmlEncoder::new(
+            schema.clone(),
+            &XmlWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut w = PreparedWriter::new(&mut xml_buf, encoder, provider.resources()).unwrap();
         w.write_record(&Record::new(schema.clone(), values)).err()
     };
+    assert!(json_buf.is_empty(), "refused JSON cannot publish framing");
+    assert!(xml_buf.is_empty(), "refused XML cannot publish framing");
     (json, xml)
 }
 
@@ -78,7 +97,7 @@ fn both_writers_group_a_shared_prefix_at_its_first_occurrence() {
     let values = vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)];
     assert_eq!(
         write_json(&schema, values.clone(), false),
-        r#"{"A":{"x":1,"y":3},"n":2}"#
+        concat!(r#"{"A":{"x":1,"y":3},"n":2}"#, "\n")
     );
     assert!(
         write_xml(&schema, values, false).contains("<A><x>1</x><y>3</y></A><n>2</n>"),
@@ -92,7 +111,7 @@ fn both_writers_nest_to_the_same_depth() {
     let values = vec![Value::Integer(1), Value::Integer(2)];
     assert_eq!(
         write_json(&schema, values.clone(), false),
-        r#"{"a":{"b":{"c":1,"d":2}}}"#
+        concat!(r#"{"a":{"b":{"c":1,"d":2}}}"#, "\n")
     );
     assert!(write_xml(&schema, values, false).contains("<a><b><c>1</c><d>2</d></b></a>"));
 }
@@ -101,7 +120,10 @@ fn both_writers_nest_to_the_same_depth() {
 fn both_writers_omit_a_container_whose_children_are_all_absent() {
     let schema = schema_of(&["a.b", "a.c", "d"]);
     let values = vec![Value::Null, Value::Null, Value::Integer(9)];
-    assert_eq!(write_json(&schema, values.clone(), false), r#"{"d":9}"#);
+    assert_eq!(
+        write_json(&schema, values.clone(), false),
+        concat!(r#"{"d":9}"#, "\n")
+    );
     let xml = write_xml(&schema, values, false);
     assert!(
         !xml.contains("<a"),
@@ -116,7 +138,10 @@ fn both_writers_keep_an_escaped_separator_in_the_name() {
     // named `a.b` — the same single key JSON emits.
     let schema = schema_of(&["a\\.b"]);
     let values = vec![Value::Integer(1)];
-    assert_eq!(write_json(&schema, values.clone(), false), r#"{"a.b":1}"#);
+    assert_eq!(
+        write_json(&schema, values.clone(), false),
+        concat!(r#"{"a.b":1}"#, "\n")
+    );
     assert!(write_xml(&schema, values, false).contains("<a.b>1</a.b>"));
 }
 
@@ -124,7 +149,7 @@ fn both_writers_keep_an_escaped_separator_in_the_name() {
 fn both_writers_refuse_a_column_set_that_cannot_be_expanded() {
     // Before the shared grammar the XML writer silently emitted two sibling
     // `<a>` elements for this set, which its own reader then refused on the way
-    // back in. Both writers now refuse it up front, with the same error.
+    // back in. Both writers now refuse it up front, with bounded format-local reasons.
     for columns in [["a", "a.b"], ["a.b", "a"], ["a.b", "a.b.c"]] {
         let schema = schema_of(&columns);
         let values = vec![Value::Integer(1); columns.len()];
@@ -133,19 +158,15 @@ fn both_writers_refuse_a_column_set_that_cannot_be_expanded() {
             panic!("both writers must refuse {columns:?}");
         };
         assert!(
-            matches!(json, FormatError::FieldPath { format: "JSON", .. }),
+            matches!(&json, FormatError::OutputEncoding { format: "JSON", field: 2, kind: OutputEncodingKind::JsonPath, field_name, .. } if field_name.to_string() == columns[1]),
             "JSON: {json:?}"
         );
         assert!(
-            matches!(xml, FormatError::FieldPath { format: "XML", .. }),
+            matches!(&xml, FormatError::OutputEncoding { format: "XML", field: 2, kind: OutputEncodingKind::XmlPath, field_name, .. } if field_name.to_string() == columns[1]),
             "XML: {xml:?}"
         );
-        // Only the format label differs — the diagnostic itself is the
-        // grammar's, so both name the same two columns and the same remedy.
-        assert_eq!(
-            json.to_string().replace("JSON", ""),
-            xml.to_string().replace("XML", "")
-        );
+        assert!(json.to_string().contains("use distinct leaf paths"));
+        assert!(xml.to_string().contains("use distinct leaf paths"));
     }
 }
 
@@ -178,13 +199,15 @@ fn an_engine_stamped_column_expands_by_the_same_rule() {
             include_engine_stamped: true,
             ..Default::default()
         };
-        let mut w = JsonWriter::new(&mut json_buf, schema.clone(), config);
+        let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let encoder = JsonEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+        let mut w = PreparedWriter::new(&mut json_buf, encoder, provider.resources()).unwrap();
         w.write_record(&record()).expect("json accepts `$ck`");
         w.flush().expect("json flushes");
     }
     assert_eq!(
-        String::from_utf8(json_buf).expect("utf-8").trim_end(),
-        r#"{"amount":5,"$ck":{"customer_id":"C-1"}}"#
+        String::from_utf8(json_buf).expect("utf-8"),
+        concat!(r#"{"amount":5,"$ck":{"customer_id":"C-1"}}"#, "\n")
     );
 
     let mut xml_buf = Vec::new();
@@ -192,12 +215,14 @@ fn an_engine_stamped_column_expands_by_the_same_rule() {
         include_engine_stamped: true,
         ..Default::default()
     };
-    let mut w = XmlWriter::new(&mut xml_buf, schema.clone(), config);
+    let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+    let encoder = XmlEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+    let mut w = PreparedWriter::new(&mut xml_buf, encoder, provider.resources()).unwrap();
     let err = w
         .write_record(&record())
         .expect_err("XML has no well-formed name for `$ck`");
     assert!(
-        matches!(err, FormatError::Xml(ref m) if m.contains("not a well-formed XML name")),
+        matches!(&err, FormatError::OutputEncoding { format: "XML", field: 2, kind: OutputEncodingKind::XmlName, field_name, .. } if field_name.to_string() == "$ck"),
         "{err:?}"
     );
 }
@@ -206,9 +231,16 @@ fn an_engine_stamped_column_expands_by_the_same_rule() {
 fn both_writers_refuse_a_malformed_escape() {
     let schema = schema_of(&["C:\\temp"]);
     let (json, xml) = refusal(&schema, vec![Value::Integer(1)]);
-    for err in [json, xml] {
-        let err = err.expect("a malformed escape is refused by both writers");
-        assert!(matches!(err, FormatError::FieldPath { .. }), "{err:?}");
+    for (error, expected_format, expected_kind) in [
+        (json, "JSON", OutputEncodingKind::JsonPath),
+        (xml, "XML", OutputEncodingKind::XmlPath),
+    ] {
+        let error = error.expect("a malformed escape is refused by both writers");
+        assert!(
+            matches!(&error, FormatError::OutputEncoding { format, field: 1, kind, field_name, .. } if *format == expected_format && *kind == expected_kind && field_name.to_string() == "C:\\temp"),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains(r"backslash as \\"));
     }
 }
 
@@ -236,7 +268,10 @@ fn native_nested_values_keep_order_and_format_specific_xml_roles() {
 
     assert_eq!(
         write_json(&schema, vec![value.clone()], false),
-        r##"{"payload":{"@kind":"event","#text":"before","item":[{"@id":1,"#text":"alpha"},{"@id":2,"#text":"beta"}],"tail":"after"}}"##
+        concat!(
+            r##"{"payload":{"@kind":"event","#text":"before","item":[{"@id":1,"#text":"alpha"},{"@id":2,"#text":"beta"}],"tail":"after"}}"##,
+            "\n"
+        )
     );
     assert_eq!(
         write_xml(&schema, vec![value], false),
@@ -255,7 +290,7 @@ fn escaped_nested_keys_decode_for_json_and_are_validated_before_output() {
             vec![Value::Map(OwnedMap::from_map(payload))],
             false
         ),
-        r#"{"payload":{"@literal":1}}"#
+        concat!(r#"{"payload":{"@literal":1}}"#, "\n")
     );
 
     let mut duplicate = IndexMap::new();
@@ -266,13 +301,27 @@ fn escaped_nested_keys_decode_for_json_and_are_validated_before_output() {
         vec![Value::Map(OwnedMap::from_map(duplicate))],
     );
     let mut json_buf = Vec::new();
-    let mut json = JsonWriter::new(&mut json_buf, schema.clone(), JsonWriterConfig::default());
+    let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+    let encoder = JsonEncoder::new(
+        schema.clone(),
+        &JsonWriterConfig::default(),
+        provider.resources(),
+    )
+    .unwrap();
+    let mut json = PreparedWriter::new(&mut json_buf, encoder, provider.resources()).unwrap();
     assert!(json.write_record(&record).is_err());
     drop(json);
     assert!(json_buf.is_empty());
 
     let mut xml_buf = Vec::new();
-    let mut xml = XmlWriter::new(&mut xml_buf, schema.clone(), XmlWriterConfig::default());
+    let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+    let encoder = XmlEncoder::new(
+        schema.clone(),
+        &XmlWriterConfig::default(),
+        provider.resources(),
+    )
+    .unwrap();
+    let mut xml = PreparedWriter::new(&mut xml_buf, encoder, provider.resources()).unwrap();
     assert!(xml.write_record(&record).is_err());
     drop(xml);
     assert!(xml_buf.is_empty());
@@ -288,13 +337,27 @@ fn both_recursive_writers_reject_depth_cap_plus_one_before_output() {
     let record = Record::new(schema.clone(), vec![value]);
 
     let mut json_buf = Vec::new();
-    let mut json = JsonWriter::new(&mut json_buf, schema.clone(), JsonWriterConfig::default());
+    let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+    let encoder = JsonEncoder::new(
+        schema.clone(),
+        &JsonWriterConfig::default(),
+        provider.resources(),
+    )
+    .unwrap();
+    let mut json = PreparedWriter::new(&mut json_buf, encoder, provider.resources()).unwrap();
     assert!(json.write_record(&record).is_err());
     drop(json);
     assert!(json_buf.is_empty());
 
     let mut xml_buf = Vec::new();
-    let mut xml = XmlWriter::new(&mut xml_buf, schema.clone(), XmlWriterConfig::default());
+    let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+    let encoder = XmlEncoder::new(
+        schema.clone(),
+        &XmlWriterConfig::default(),
+        provider.resources(),
+    )
+    .unwrap();
+    let mut xml = PreparedWriter::new(&mut xml_buf, encoder, provider.resources()).unwrap();
     assert!(xml.write_record(&record).is_err());
     drop(xml);
     assert!(xml_buf.is_empty());

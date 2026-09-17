@@ -739,7 +739,7 @@ fn test_split_single_record_one_file() {
 /// Each file should be independently valid NDJSON (one JSON object per line).
 #[test]
 fn test_splitting_writer_json_produces_valid_files() {
-    use crate::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
+    use crate::json::writer::{JsonEncoder, JsonEncoderConfig, JsonOutputMode, JsonWriterConfig};
 
     let schema = make_schema(&["id", "name"]);
     let registry = FileRegistry::new();
@@ -758,15 +758,20 @@ fn test_splitting_writer_json_produces_valid_files() {
         envelope: None,
     };
 
-    let json_factory = WriterFactory::from_legacy(
-        move |counting: CountingWriter<Box<dyn Write + Send>>, schema: SharedStorage<Schema>| {
-            Ok(FormatWriterHandle::from_legacy(Box::new(JsonWriter::new(
-                counting,
-                schema,
-                json_config.clone(),
-            ))))
-        },
+    let provider = crate::preparation::MemoryOnlyResources::new(
+        std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
     );
+    let resources = provider.resources();
+    let scope = resources.scope().unwrap();
+    let config = JsonEncoderConfig::new(&json_config, &resources).unwrap();
+    let json_factory = WriterFactory::try_new(
+        move |counting: CountingWriter<Box<dyn Write + Send>>, schema: SharedStorage<Schema>| {
+            JsonEncoder::from_config(schema, config.clone())?
+                .into_boxed_writer(counting, resources.clone())
+        },
+        scope.allocation(),
+    )
+    .unwrap();
 
     let mut writer = SplittingWriter::new(
         registry.file_factory(),
@@ -787,6 +792,14 @@ fn test_splitting_writer_json_produces_valid_files() {
 
     assert_eq!(registry.file_count(), 3, "expected 3 split files");
     let contents = registry.file_contents();
+    assert_eq!(
+        contents,
+        vec![
+            "{\"id\":0,\"name\":\"name_0\"}\n{\"id\":1,\"name\":\"name_1\"}\n{\"id\":2,\"name\":\"name_2\"}\n",
+            "{\"id\":3,\"name\":\"name_3\"}\n{\"id\":4,\"name\":\"name_4\"}\n{\"id\":5,\"name\":\"name_5\"}\n",
+            "{\"id\":6,\"name\":\"name_6\"}\n"
+        ]
+    );
 
     // Each file should contain valid NDJSON lines
     let mut total_lines = 0;
@@ -804,13 +817,15 @@ fn test_splitting_writer_json_produces_valid_files() {
         total_lines += lines.len();
     }
     assert_eq!(total_lines, 7, "total records across all files");
+    drop(writer);
+    assert_eq!(provider.used(), 0);
 }
 
 /// SplittingWriter with XML format produces valid XML files on rotation.
 /// Each split file must have proper root element open/close tags.
 #[test]
 fn test_splitting_writer_xml_produces_valid_files() {
-    use crate::xml::writer::{XmlWriter, XmlWriterConfig};
+    use crate::xml::writer::{XmlEncoder, XmlEncoderConfig, XmlWriterConfig};
 
     let schema = make_schema(&["id", "val"]);
     let registry = FileRegistry::new();
@@ -827,15 +842,20 @@ fn test_splitting_writer_xml_produces_valid_files() {
         ..Default::default()
     };
 
-    let xml_factory = WriterFactory::from_legacy(
-        move |counting: CountingWriter<Box<dyn Write + Send>>, schema: SharedStorage<Schema>| {
-            Ok(FormatWriterHandle::from_legacy(Box::new(XmlWriter::new(
-                counting,
-                schema,
-                xml_config.clone(),
-            ))))
-        },
+    let provider = crate::preparation::MemoryOnlyResources::new(
+        std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
     );
+    let resources = provider.resources();
+    let scope = resources.scope().unwrap();
+    let config = XmlEncoderConfig::new((&xml_config).into(), &resources).unwrap();
+    let xml_factory = WriterFactory::try_new(
+        move |counting: CountingWriter<Box<dyn Write + Send>>, schema: SharedStorage<Schema>| {
+            XmlEncoder::from_config(schema, config.clone())?
+                .into_boxed_writer(counting, resources.clone())
+        },
+        scope.allocation(),
+    )
+    .unwrap();
 
     let mut writer =
         SplittingWriter::new(registry.file_factory(), xml_factory, schema.clone(), policy);
@@ -852,6 +872,14 @@ fn test_splitting_writer_xml_produces_valid_files() {
 
     assert_eq!(registry.file_count(), 3, "expected 3 split files");
     let contents = registry.file_contents();
+    assert_eq!(
+        contents,
+        vec![
+            "<items><item><id>0</id><val>v0</val></item><item><id>1</id><val>v1</val></item><item><id>2</id><val>v2</val></item></items>",
+            "<items><item><id>3</id><val>v3</val></item><item><id>4</id><val>v4</val></item><item><id>5</id><val>v5</val></item></items>",
+            "<items><item><id>6</id><val>v6</val></item></items>"
+        ]
+    );
 
     for (idx, content) in contents.iter().enumerate() {
         assert!(
@@ -873,6 +901,8 @@ fn test_splitting_writer_xml_produces_valid_files() {
     assert_eq!(count_items(&contents[0]), 3);
     assert_eq!(count_items(&contents[1]), 3);
     assert_eq!(count_items(&contents[2]), 1);
+    drop(writer);
+    assert_eq!(provider.used(), 0);
 }
 
 /// Byte-limited splitting of JSON *array* output: each rotated file must be a
@@ -881,7 +911,7 @@ fn test_splitting_writer_xml_produces_valid_files() {
 /// which stranded later records after the closing `]`.
 #[test]
 fn test_splitting_writer_json_array_byte_split_valid_files() {
-    use crate::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
+    use crate::json::writer::{JsonEncoder, JsonEncoderConfig, JsonOutputMode, JsonWriterConfig};
 
     let schema = make_schema(&["id", "name"]);
     let registry = FileRegistry::new();
@@ -900,15 +930,20 @@ fn test_splitting_writer_json_array_byte_split_valid_files() {
         envelope: None,
     };
 
-    let json_factory = WriterFactory::from_legacy(
-        move |counting: CountingWriter<Box<dyn Write + Send>>, schema: SharedStorage<Schema>| {
-            Ok(FormatWriterHandle::from_legacy(Box::new(JsonWriter::new(
-                counting,
-                schema,
-                json_config.clone(),
-            ))))
-        },
+    let provider = crate::preparation::MemoryOnlyResources::new(
+        std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
     );
+    let resources = provider.resources();
+    let scope = resources.scope().unwrap();
+    let config = JsonEncoderConfig::new(&json_config, &resources).unwrap();
+    let json_factory = WriterFactory::try_new(
+        move |counting: CountingWriter<Box<dyn Write + Send>>, schema: SharedStorage<Schema>| {
+            JsonEncoder::from_config(schema, config.clone())?
+                .into_boxed_writer(counting, resources.clone())
+        },
+        scope.allocation(),
+    )
+    .unwrap();
 
     let mut writer = SplittingWriter::new(
         registry.file_factory(),
@@ -931,6 +966,15 @@ fn test_splitting_writer_json_array_byte_split_valid_files() {
         "byte limit should have split into multiple files"
     );
     let contents = registry.file_contents();
+    assert_eq!(
+        contents,
+        vec![
+            "[\n{\"id\":0,\"name\":\"nm0\"},\n{\"id\":1,\"name\":\"nm1\"},\n{\"id\":2,\"name\":\"nm2\"}\n]\n",
+            "[\n{\"id\":3,\"name\":\"nm3\"},\n{\"id\":4,\"name\":\"nm4\"},\n{\"id\":5,\"name\":\"nm5\"}\n]\n",
+            "[\n{\"id\":6,\"name\":\"nm6\"},\n{\"id\":7,\"name\":\"nm7\"},\n{\"id\":8,\"name\":\"nm8\"}\n]\n",
+            "[\n{\"id\":9,\"name\":\"nm9\"}\n]\n"
+        ]
+    );
 
     let mut total_records = 0;
     let mut multi_record_file_seen = false;
@@ -972,6 +1016,8 @@ fn test_splitting_writer_json_array_byte_split_valid_files() {
         multi_record_file_seen,
         "at least one file must hold multiple records to exercise the mid-document corruption path",
     );
+    drop(writer);
+    assert_eq!(provider.used(), 0);
 }
 
 /// Byte-limited splitting of XML output: each rotated file must be a single
@@ -980,7 +1026,7 @@ fn test_splitting_writer_json_array_byte_split_valid_files() {
 /// accounting, which stranded later records outside the root.
 #[test]
 fn test_splitting_writer_xml_byte_split_valid_files() {
-    use crate::xml::writer::{XmlWriter, XmlWriterConfig};
+    use crate::xml::writer::{XmlEncoder, XmlEncoderConfig, XmlWriterConfig};
 
     let schema = make_schema(&["id", "val"]);
     let registry = FileRegistry::new();
@@ -997,15 +1043,20 @@ fn test_splitting_writer_xml_byte_split_valid_files() {
         ..Default::default()
     };
 
-    let xml_factory = WriterFactory::from_legacy(
-        move |counting: CountingWriter<Box<dyn Write + Send>>, schema: SharedStorage<Schema>| {
-            Ok(FormatWriterHandle::from_legacy(Box::new(XmlWriter::new(
-                counting,
-                schema,
-                xml_config.clone(),
-            ))))
-        },
+    let provider = crate::preparation::MemoryOnlyResources::new(
+        std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
     );
+    let resources = provider.resources();
+    let scope = resources.scope().unwrap();
+    let config = XmlEncoderConfig::new((&xml_config).into(), &resources).unwrap();
+    let xml_factory = WriterFactory::try_new(
+        move |counting: CountingWriter<Box<dyn Write + Send>>, schema: SharedStorage<Schema>| {
+            XmlEncoder::from_config(schema, config.clone())?
+                .into_boxed_writer(counting, resources.clone())
+        },
+        scope.allocation(),
+    )
+    .unwrap();
 
     let mut writer =
         SplittingWriter::new(registry.file_factory(), xml_factory, schema.clone(), policy);
@@ -1024,6 +1075,14 @@ fn test_splitting_writer_xml_byte_split_valid_files() {
         "byte limit should have split into multiple files"
     );
     let contents = registry.file_contents();
+    assert_eq!(
+        contents,
+        vec![
+            "<items><item><id>0</id><val>v0</val></item><item><id>1</id><val>v1</val></item><item><id>2</id><val>v2</val></item><item><id>3</id><val>v3</val></item></items>",
+            "<items><item><id>4</id><val>v4</val></item><item><id>5</id><val>v5</val></item><item><id>6</id><val>v6</val></item><item><id>7</id><val>v7</val></item></items>",
+            "<items><item><id>8</id><val>v8</val></item><item><id>9</id><val>v9</val></item></items>"
+        ]
+    );
 
     let mut total_items = 0;
     let mut multi_record_file_seen = false;
@@ -1061,6 +1120,8 @@ fn test_splitting_writer_xml_byte_split_valid_files() {
         multi_record_file_seen,
         "at least one file must hold multiple records to exercise the mid-document corruption path",
     );
+    drop(writer);
+    assert_eq!(provider.used(), 0);
 }
 
 use crate::traits::test_support::HookProbe;

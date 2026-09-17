@@ -550,3 +550,33 @@ records between — and for an inner envelope that opens or closes after the
 file's last body record. Every envelope boundary a reader signals is
 applied, whether or not a record follows it, so the document frame stays
 balanced end to end.
+
+## Native JSON and XML output boundaries
+
+JSON/XML reconstructed envelopes prepare document start, each body record,
+document end and finalization as separate complete operations. A document's
+body count advances only when a record is delivered. Ending one document and
+opening the next resets that count and restores the next document's own
+sections. Section names remain the names declared in your pipeline.
+
+Reconstructed JSON envelopes retain their document grammar: array mode wraps
+the envelope documents in an array; NDJSON mode separates complete envelope
+documents with LF. Unlike ordinary compact NDJSON records, reconstructed
+`pretty: true` documents can span lines. XML places each `Document` wrapper inside one configured root, retaining
+header/footer section wrappers and emitting no XML declaration.
+
+Explicitly opened empty documents still carry framing and a zero body count.
+In the CLI, a native source with no body records does not open a writer, so its
+output is an empty file even with reconstruction enabled. Do not infer this
+behavior from header-only message interchanges, whose readers emit explicit
+boundaries even without a body.
+
+Ordinary native output supports correlation, splitting and per-file fan-out.
+Reconstructed envelopes combined with splitting, per-file fan-out, correlation
+or document-grain DLQ are rejected before execution (E347). These combinations
+cannot establish the required single document boundary.
+
+Library writers distinguish draining already delivered bytes from finalizing
+a document. A byte drain adds no closing syntax. Once delivery fails, neither a
+drain, finalization nor teardown resumes the failed operation. See
+[output preparation](../ops/storage.md#output-preparation) for failure effects.

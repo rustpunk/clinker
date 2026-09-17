@@ -20,12 +20,562 @@
 use clinker_record::owned_storage::{OwnedKey, SharedStorage};
 use std::io::Write;
 
-use clinker_record::field_path::{self, FieldPathError};
+use clinker_record::field_path;
 use clinker_record::{DocumentContext, Record, Schema, Value};
 
-use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
-use crate::error::FormatError;
+use crate::envelope_writer::OutputEnvelopeSpec;
+use crate::error::{FormatError, OutputEncodingKind};
+use crate::preparation::{
+    FormatEncoder, OutputOperation, PreparedWriter, WriterResources, WriterScope,
+};
+use crate::reserved::{ReservedText, ReservedVec};
 use crate::traits::FormatWriter;
+
+fn json_output_error(field: usize, name: &str) -> FormatError {
+    json_encoding_error(field, name, OutputEncodingKind::Json)
+}
+
+fn json_encoding_error(field: usize, name: &str, kind: OutputEncodingKind) -> FormatError {
+    FormatError::OutputEncoding {
+        format: "JSON",
+        field: field + 1,
+        offset: 0,
+        kind,
+        field_name: crate::error::OutputFieldName::new(name),
+        element: None,
+    }
+}
+
+struct PreparedJsonConfig {
+    mode: JsonOutputMode,
+    pretty: bool,
+    preserve_nulls: bool,
+    include_engine_stamped: bool,
+    envelope: Option<crate::envelope_writer::PreparedEnvelope>,
+}
+
+/// Admitted immutable JSON policy shared across a factory's physical writers.
+#[derive(Clone)]
+pub struct JsonEncoderConfig(SharedStorage<PreparedJsonConfig>);
+impl JsonEncoderConfig {
+    /// Copies only envelope names, after admission; the caller owns its options.
+    pub fn new(
+        config: &JsonWriterConfig,
+        resources: &WriterResources,
+    ) -> Result<Self, FormatError> {
+        let envelope = config.envelope.as_ref();
+        Self::from_names(
+            config,
+            envelope.and_then(|e| e.header_from_doc.as_deref()),
+            envelope.and_then(|e| e.footer_from_doc.as_deref()),
+            envelope.and_then(|e| e.footer_record_count_field.as_deref()),
+            resources,
+        )
+    }
+    /// Admits borrowed compiled envelope names before retaining any copies.
+    pub fn from_names(
+        config: &JsonWriterConfig,
+        header: Option<&str>,
+        footer: Option<&str>,
+        count: Option<&str>,
+        resources: &WriterResources,
+    ) -> Result<Self, FormatError> {
+        let scope = resources.scope()?;
+        Ok(Self(SharedStorage::try_new(
+            PreparedJsonConfig {
+                mode: config.format,
+                pretty: config.pretty,
+                preserve_nulls: config.preserve_nulls,
+                include_engine_stamped: config.include_engine_stamped,
+                envelope: crate::envelope_writer::PreparedEnvelope::from_names(
+                    header, footer, count, &scope,
+                )?,
+            },
+            scope.allocation(),
+        )?))
+    }
+}
+
+struct JsonTreeNode {
+    name: ReservedText,
+    field: Option<usize>,
+    children: ReservedVec<JsonTreeNode>,
+}
+struct JsonCache {
+    schema: clinker_record::owned_storage::SharedStorageIdentity<Schema>,
+    tree: ReservedVec<JsonTreeNode>,
+}
+#[derive(Clone, Copy, Default)]
+struct JsonState {
+    records: u64,
+    any_document: bool,
+    document_open: bool,
+}
+
+/// Prepares complete operations from borrowed values into the governed stage.
+/// Only admitted schema paths and payload-free identity survive each operation.
+/// Raw construction without a finite resource provider is unavailable.
+///
+/// ```compile_fail
+/// use clinker_format::json::writer::JsonWriter;
+/// ```
+///
+/// ```
+/// use std::num::NonZeroUsize;
+/// use std::sync::Arc;
+/// use clinker_format::{FormatWriter, json::writer::{JsonEncoder, JsonWriterConfig}};
+/// use clinker_format::preparation::{MemoryOnlyResources, PreparedWriter};
+/// use clinker_record::{Record, Schema, Value, owned_storage::SharedStorage};
+/// let resources = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+/// let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into()])));
+/// let record = Record::new(schema.clone(), vec![Value::Integer(1)]);
+/// let encoder = JsonEncoder::new(schema, &JsonWriterConfig::default(), resources.resources())?;
+/// let mut bytes = Vec::new();
+/// let mut writer = PreparedWriter::new(&mut bytes, encoder, resources.resources())?;
+/// writer.write_record(&record)?;
+/// writer.flush()?;
+/// drop(writer);
+/// assert_eq!(bytes, b"[\n{\"id\":1}\n]\n");
+/// assert_eq!(resources.used(), 0);
+/// # Ok::<(), clinker_format::FormatError>(())
+/// ```
+pub struct JsonEncoder {
+    config: JsonEncoderConfig,
+    cache: Option<JsonCache>,
+    state: JsonState,
+}
+/// A replacement cache overlaps the committed cache until delivery succeeds.
+pub struct JsonPending {
+    replacement: Option<JsonCache>,
+    state: JsonState,
+    finalized: bool,
+}
+impl JsonEncoder {
+    /// Admits retained policy; schema values remain owned by the caller.
+    pub fn new(
+        schema: SharedStorage<Schema>,
+        config: &JsonWriterConfig,
+        resources: WriterResources,
+    ) -> Result<Self, FormatError> {
+        Self::from_config(schema, JsonEncoderConfig::new(config, &resources)?)
+    }
+    /// Shares admitted policy without retaining the caller's schema columns.
+    pub fn from_config(
+        _schema: SharedStorage<Schema>,
+        config: JsonEncoderConfig,
+    ) -> Result<Self, FormatError> {
+        Ok(Self {
+            config,
+            cache: None,
+            state: JsonState::default(),
+        })
+    }
+    /// Admit the concrete wrapper until its actual backing is deallocated.
+    pub fn into_boxed_writer<W: Write + Send + 'static>(
+        self,
+        destination: W,
+        resources: WriterResources,
+    ) -> Result<crate::traits::FormatWriterHandle, FormatError> {
+        let scope = resources.scope()?;
+        let writer = PreparedWriter::new(destination, self, resources)?;
+        Ok(crate::traits::FormatWriterHandle::try_new(
+            writer,
+            scope.allocation(),
+        )?)
+    }
+}
+impl<W: Write + Send> FormatWriter for PreparedWriter<W, JsonEncoder> {
+    fn write_record(&mut self, r: &Record) -> Result<(), FormatError> {
+        self.write_operation(OutputOperation::Record(r))
+    }
+    fn begin_document(&mut self, d: &DocumentContext) -> Result<(), FormatError> {
+        self.write_operation(OutputOperation::BeginDocument(d))
+    }
+    fn end_document(&mut self, d: &DocumentContext) -> Result<(), FormatError> {
+        self.write_operation(OutputOperation::EndDocument(d))
+    }
+    fn flush(&mut self) -> Result<(), FormatError> {
+        PreparedWriter::flush(self)
+    }
+    fn flush_bytes(&mut self) -> Result<(), FormatError> {
+        PreparedWriter::flush_bytes(self)
+    }
+}
+
+fn json_tree<'a>(
+    fields: impl Iterator<Item = (usize, &'a str)>,
+    scope: &WriterScope,
+) -> Result<ReservedVec<JsonTreeNode>, FormatError> {
+    let mut root: ReservedVec<JsonTreeNode> = ReservedVec::new(scope.allocation().clone());
+    for (field, full_name) in fields {
+        let mut body = &mut root;
+        let mut segments = field_path::segments(full_name).peekable();
+        while let Some(segment) = segments.next() {
+            scope.check_cancelled()?;
+            let segment = segment
+                .map_err(|_| json_encoding_error(field, full_name, OutputEncodingKind::JsonPath))?;
+            let mut name = ReservedText::new(scope.allocation().clone());
+            segment.write_to(|chunk| name.push_str(chunk))?;
+            let leaf = segments.peek().is_none();
+            let position = body
+                .as_slice()
+                .iter()
+                .position(|n| n.name.as_str() == name.as_str());
+            let at = match position {
+                Some(at) => {
+                    if leaf || body.as_slice()[at].field.is_some() {
+                        return Err(json_encoding_error(
+                            field,
+                            full_name,
+                            OutputEncodingKind::JsonPath,
+                        ));
+                    }
+                    at
+                }
+                None => {
+                    let at = body.len();
+                    body.push(JsonTreeNode {
+                        name,
+                        field: leaf.then_some(field),
+                        children: ReservedVec::new(scope.allocation().clone()),
+                    })?;
+                    at
+                }
+            };
+            body = &mut body.as_mut_slice()[at].children;
+        }
+    }
+    Ok(root)
+}
+
+fn validate_json_value(
+    value: &Value,
+    field: usize,
+    name: &str,
+    scope: &WriterScope,
+    depth: usize,
+) -> Result<(), FormatError> {
+    use clinker_record::nested_key::{MAX_NESTED_VALUE_DEPTH, NestedKey};
+    scope.check_cancelled()?;
+    match value {
+        Value::Float(n) if !n.is_finite() => return Err(json_output_error(field, name)),
+        Value::Array(values) => {
+            if depth >= MAX_NESTED_VALUE_DEPTH {
+                return Err(json_output_error(field, name));
+            }
+            for value in values {
+                validate_json_value(value, field, name, scope, depth + 1)?;
+            }
+        }
+        Value::Map(values) => {
+            if depth >= MAX_NESTED_VALUE_DEPTH {
+                return Err(json_output_error(field, name));
+            }
+            for (position, (key, value)) in values.iter().enumerate() {
+                // The existing key decoder borrows valid keys; only its error
+                // owns a copy. Hold the exact possible copy through conversion.
+                let diagnostic = scope.reserve(
+                    std::alloc::Layout::array::<u8>(key.len())
+                        .map_err(|_| json_output_error(field, name))?,
+                )?;
+                let decoded = NestedKey::decode(key).map_err(|_| json_output_error(field, name))?;
+                for prior in values.keys().take(position) {
+                    scope.check_cancelled()?;
+                    let prior =
+                        NestedKey::decode(prior).map_err(|_| json_output_error(field, name))?;
+                    if prior.text == decoded.text {
+                        return Err(json_output_error(field, name));
+                    }
+                }
+                drop(diagnostic);
+                validate_json_value(value, field, name, scope, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// Both records and sections borrow their original values. The count is the
+// sole new scalar and lives on the operation's stack.
+enum JsonValues<'a> {
+    Record(&'a [Value]),
+    Section(&'a indexmap::IndexMap<OwnedKey, Value>, &'a Value),
+}
+impl JsonValues<'_> {
+    fn get(&self, field: usize) -> &Value {
+        match self {
+            Self::Record(values) => &values[field],
+            Self::Section(fields, count) => fields.get_index(field).map_or(count, |(_, v)| v),
+        }
+    }
+}
+struct PreparedBodySer<'a> {
+    body: &'a [JsonTreeNode],
+    values: &'a JsonValues<'a>,
+    preserve_nulls: bool,
+}
+fn json_present(body: &[JsonTreeNode], values: &JsonValues<'_>) -> bool {
+    body.iter().any(|n| {
+        n.field.map_or_else(
+            || json_present(n.children.as_slice(), values),
+            |i| !values.get(i).is_null(),
+        )
+    })
+}
+impl serde::Serialize for PreparedBodySer<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        for node in self.body {
+            if let Some(field) = node.field {
+                let value = self.values.get(field);
+                if self.preserve_nulls || !value.is_null() {
+                    map.serialize_entry(node.name.as_str(), &ValueSer(value))?;
+                }
+            } else if self.preserve_nulls || json_present(node.children.as_slice(), self.values) {
+                map.serialize_entry(
+                    node.name.as_str(),
+                    &Self {
+                        body: node.children.as_slice(),
+                        values: self.values,
+                        preserve_nulls: self.preserve_nulls,
+                    },
+                )?;
+            }
+        }
+        map.end()
+    }
+}
+fn json_serialize(
+    stage: &mut dyn Write,
+    tree: &[JsonTreeNode],
+    values: &JsonValues<'_>,
+    preserve_nulls: bool,
+    pretty: bool,
+    scope: &WriterScope,
+) -> Result<(), FormatError> {
+    use serde::Serialize;
+    // Pinned serde_json ErrorImpl: ErrorCode (unit, Box<str>, or io::Error)
+    // plus line/column. Prevalidation eliminates custom-message allocations.
+    // The formatter owns only scalar state and borrowed indentation bytes.
+    let _error = scope.reserve(std::alloc::Layout::new::<(
+        usize,
+        Box<str>,
+        std::io::Error,
+        usize,
+        usize,
+    )>())?;
+    let value = PreparedBodySer {
+        body: tree,
+        values,
+        preserve_nulls,
+    };
+    let result = if pretty {
+        value.serialize(&mut serde_json::Serializer::pretty(stage))
+    } else {
+        value.serialize(&mut serde_json::Serializer::new(stage))
+    };
+    result.map_err(|error| {
+        if error.is_io() {
+            FormatError::Io(error.into())
+        } else {
+            json_output_error(0, "")
+        }
+    })
+}
+fn json_section(
+    stage: &mut dyn Write,
+    fields: &indexmap::IndexMap<OwnedKey, Value>,
+    count: Option<(&str, i64)>,
+    pretty: bool,
+    scope: &WriterScope,
+) -> Result<(), FormatError> {
+    let tree = json_tree(
+        fields
+            .keys()
+            .enumerate()
+            .map(|(i, name)| (i, name.as_ref()))
+            .chain(count.map(|(name, _)| (fields.len(), name))),
+        scope,
+    )?;
+    for (i, (name, value)) in fields.iter().enumerate() {
+        validate_json_value(value, i, name, scope, 0)?;
+    }
+    let count = Value::Integer(count.map_or(0, |(_, count)| count));
+    json_serialize(
+        stage,
+        tree.as_slice(),
+        &JsonValues::Section(fields, &count),
+        true,
+        pretty,
+        scope,
+    )
+}
+
+impl FormatEncoder for JsonEncoder {
+    type Pending = JsonPending;
+    fn prepare(
+        &self,
+        operation: OutputOperation<'_>,
+        stage: &mut dyn Write,
+        workspace: &WriterScope,
+    ) -> Result<JsonPending, FormatError> {
+        workspace.check_cancelled()?;
+        let config = &self.config.0;
+        let mut pending = JsonPending {
+            replacement: None,
+            state: self.state,
+            finalized: false,
+        };
+        let state = &mut pending.state;
+        match operation {
+            OutputOperation::Record(record) => {
+                if config.envelope.is_some() && !state.document_open {
+                    return Err(json_encoding_error(
+                        0,
+                        "document",
+                        OutputEncodingKind::JsonDocumentClosed,
+                    ));
+                }
+                if self
+                    .cache
+                    .as_ref()
+                    .is_none_or(|c| !c.schema.matches(record.schema()))
+                {
+                    let identity = record.schema().try_identity(workspace.allocation())?;
+                    let tree = json_tree(
+                        record
+                            .schema()
+                            .columns()
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| {
+                                config.include_engine_stamped
+                                    || !record.schema().is_engine_stamped(*i)
+                            })
+                            .map(|(i, name)| (i, name.as_ref())),
+                        workspace,
+                    )?;
+                    pending.replacement = Some(JsonCache {
+                        schema: identity,
+                        tree,
+                    });
+                }
+                let cache = pending
+                    .replacement
+                    .as_ref()
+                    .or(self.cache.as_ref())
+                    .ok_or_else(|| json_output_error(0, "schema"))?;
+                for (i, value) in record.values().iter().enumerate() {
+                    if config.include_engine_stamped || !record.schema().is_engine_stamped(i) {
+                        validate_json_value(value, i, &record.schema().columns()[i], workspace, 0)?;
+                    }
+                }
+                if config.envelope.is_some() {
+                    if state.records > 0 {
+                        stage.write_all(b",")?;
+                    }
+                } else if matches!(config.mode, JsonOutputMode::Array) {
+                    stage.write_all(if state.records == 0 { b"[\n" } else { b",\n" })?;
+                }
+                json_serialize(
+                    stage,
+                    cache.tree.as_slice(),
+                    &JsonValues::Record(record.values()),
+                    config.preserve_nulls,
+                    config.pretty
+                        && (config.envelope.is_some()
+                            || matches!(config.mode, JsonOutputMode::Array)),
+                    workspace,
+                )?;
+                if config.envelope.is_none() && matches!(config.mode, JsonOutputMode::Ndjson) {
+                    stage.write_all(b"\n")?;
+                }
+                state.records = state
+                    .records
+                    .checked_add(1)
+                    .ok_or_else(|| json_output_error(0, "record count"))?;
+            }
+            OutputOperation::BeginDocument(doc) => {
+                if let Some(envelope) = &config.envelope {
+                    if state.document_open {
+                        return Err(json_encoding_error(
+                            0,
+                            "document",
+                            OutputEncodingKind::JsonDocumentOpen,
+                        ));
+                    }
+                    match config.mode {
+                        JsonOutputMode::Array => {
+                            stage.write_all(if state.any_document { b",\n" } else { b"[\n" })?
+                        }
+                        JsonOutputMode::Ndjson if state.any_document => stage.write_all(b"\n")?,
+                        JsonOutputMode::Ndjson => {}
+                    }
+                    stage.write_all(b"{")?;
+                    if let Some(fields) = envelope.header_fields(doc) {
+                        stage.write_all(b"\"header\":")?;
+                        json_section(stage, fields, None, config.pretty, workspace)?;
+                        stage.write_all(b",")?;
+                    }
+                    stage.write_all(b"\"body\":[")?;
+                    state.document_open = true;
+                    state.records = 0;
+                }
+            }
+            OutputOperation::EndDocument(doc) => {
+                if let Some(envelope) = &config.envelope
+                    && state.document_open
+                {
+                    stage.write_all(b"]")?;
+                    if let Some(fields) = envelope.footer_fields(doc) {
+                        stage.write_all(b",\"footer\":")?;
+                        let count = i64::try_from(state.records)
+                            .map_err(|_| json_output_error(0, "record count"))?;
+                        json_section(
+                            stage,
+                            fields,
+                            envelope.count_name().map(|name| (name, count)),
+                            config.pretty,
+                            workspace,
+                        )?;
+                    }
+                    stage.write_all(b"}")?;
+                    state.document_open = false;
+                    state.any_document = true;
+                }
+            }
+            OutputOperation::Finalize => {
+                if state.document_open {
+                    return Err(json_encoding_error(
+                        0,
+                        "document",
+                        OutputEncodingKind::JsonDocumentOpen,
+                    ));
+                }
+                if matches!(config.mode, JsonOutputMode::Array) {
+                    let nonempty = if config.envelope.is_some() {
+                        state.any_document
+                    } else {
+                        state.records > 0
+                    };
+                    stage.write_all(if nonempty { b"\n]\n" } else { b"[]\n" })?;
+                }
+                pending.finalized = true;
+            }
+        }
+        Ok(pending)
+    }
+    fn commit(&mut self, pending: JsonPending) {
+        self.state = pending.state;
+        if pending.finalized {
+            self.cache = None;
+        } else if let Some(cache) = pending.replacement {
+            self.cache = Some(cache);
+        }
+    }
+}
 
 /// JSON output format mode.
 #[derive(Debug, Clone, Copy, Default)]
@@ -65,626 +615,8 @@ impl Default for JsonWriterConfig {
     }
 }
 
-pub struct JsonWriter<W: Write> {
-    writer: W,
-    /// Schema held for the writer's lifetime. The writer emits records against
-    /// the plan built from `Record::schema`, so the field is not read
-    /// per-record, but keeping the `Arc` pins the schema against unintended
-    /// drop by factory callers.
-    _schema: SharedStorage<Schema>,
-    config: JsonWriterConfig,
-    records_written: u64,
-    /// Per-document envelope framer + state machine, present only when
-    /// `config.envelope` is. Drives the per-document-object reframe.
-    envelope: Option<EnvelopeState>,
-    /// Precompiled name→object-tree expansion, rebuilt only when the schema
-    /// identity changes. Holds one `String` per distinct path segment plus one
-    /// column index per leaf — bounded by the schema's column names, never by
-    /// record count.
-    plan_cache: Option<PlanCache>,
-    /// Reusable serialization buffer. Each record is serialized straight into
-    /// this `Vec` (via a borrowing `serde::Serialize` impl, no intermediate
-    /// `serde_json::Value` tree) and then written to the sink; the allocation
-    /// is retained across records so per-record cost is amortized. Bounded by
-    /// the widest single record, never the whole stream.
-    scratch: Vec<u8>,
-}
-
-/// Per-document-object framing state for the envelope reframe. Tracks the
-/// running framer (header/footer sections + the body record count, which also
-/// drives the body-array comma), whether ANY document object has been emitted
-/// (for the outer-array comma in `array` mode), and whether a document object
-/// is currently open. Holds no body record — bounded memory.
-struct EnvelopeState {
-    framer: EnvelopeFramer,
-    /// Whether at least one document object has been emitted this stream —
-    /// drives the outer-array `[\n` vs `,\n` separator in `array` mode.
-    any_doc_written: bool,
-    /// Whether a document object is currently open (between begin/end).
-    doc_open: bool,
-}
-
-impl<W: Write> JsonWriter<W> {
-    pub fn new(writer: W, schema: SharedStorage<Schema>, config: JsonWriterConfig) -> Self {
-        let envelope = config
-            .envelope
-            .clone()
-            .and_then(OutputEnvelopeSpec::into_framer)
-            .map(|framer| EnvelopeState {
-                framer,
-                any_doc_written: false,
-                doc_open: false,
-            });
-        Self {
-            writer,
-            _schema: schema,
-            config,
-            records_written: 0,
-            envelope,
-            plan_cache: None,
-            scratch: Vec::new(),
-        }
-    }
-
-    /// Ensure `plan_cache` holds an expansion plan for this record's schema,
-    /// rebuilding only when the schema identity changes (`SharedStorage::ptr_eq`), so a
-    /// single-schema stream builds it once. Name decoding and collision
-    /// detection happen here, before any byte of the record is written, so an
-    /// unexpandable column set fails `write_record` cleanly.
-    fn ensure_plan(&mut self, record: &Record) -> Result<(), FormatError> {
-        let current = self
-            .plan_cache
-            .as_ref()
-            .is_some_and(|c| SharedStorage::ptr_eq(&c.schema, record.schema()));
-        if !current {
-            self.plan_cache = Some(build_plan_cache(
-                record.schema(),
-                self.config.include_engine_stamped,
-            )?);
-        }
-        Ok(())
-    }
-
-    /// Serialize a record as a JSON object into the reusable `scratch` buffer,
-    /// walking the expansion plan so dotted column names emit as nested
-    /// objects. `preserve_nulls: false` omits null leaves, and an object whose
-    /// every descendant is omitted emits no key at all. Engine-stamped columns
-    /// are stripped from the default output; callers opt in via
-    /// `include_engine_stamped`. Keys borrow the plan's segment names and
-    /// values borrow the record's [`Value`]s, so no intermediate
-    /// `serde_json::Value` tree is built.
-    ///
-    /// The buffer is cleared first, and the sink is written only by the caller
-    /// on success, so a mid-record error (non-finite float) leaves no partial
-    /// bytes downstream.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FormatError::FieldPath`] when the schema's column names cannot
-    /// be expanded, and [`FormatError::Json`] when a field holds a non-finite
-    /// float (NaN or an infinity), which JSON cannot represent.
-    fn serialize_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        use serde::Serialize as _;
-        self.ensure_plan(record)?;
-        for (index, value) in record.values().iter().enumerate() {
-            if !self.config.include_engine_stamped && record.schema().is_engine_stamped(index) {
-                continue;
-            }
-            clinker_record::nested_key::validate_nested_depth(value)
-                .map_err(|error| FormatError::Json(error.to_string()))?;
-            clinker_record::nested_key::validate_nested_keys(value)
-                .map_err(|error| FormatError::Json(error.to_string()))?;
-        }
-        // Disjoint field borrows: serializing reads the plan (`plan_cache`)
-        // while writing into `scratch`.
-        let Self {
-            plan_cache,
-            scratch,
-            config,
-            ..
-        } = self;
-        scratch.clear();
-        let obj = PlanBodySer {
-            body: &plan_cache.as_ref().expect("plan built above").root,
-            values: record.values(),
-            preserve_nulls: config.preserve_nulls,
-        };
-        let result = if config.pretty {
-            obj.serialize(&mut serde_json::Serializer::pretty(&mut *scratch))
-        } else {
-            obj.serialize(&mut serde_json::Serializer::new(&mut *scratch))
-        };
-        result.map_err(|e| FormatError::Json(e.to_string()))
-    }
-
-    /// Serialize a JSON value with the configured pretty/compact mode.
-    fn serialize_value(&self, value: &serde_json::Value) -> Result<String, FormatError> {
-        let s = if self.config.pretty {
-            serde_json::to_string_pretty(value)
-        } else {
-            serde_json::to_string(value)
-        }
-        .map_err(|e| FormatError::Json(e.to_string()))?;
-        Ok(s)
-    }
-
-    /// Build a JSON object from an envelope section's ordered fields, plus an
-    /// optional trailing computed-count entry. Section field names expand into
-    /// nested objects by the same rule body records use, and the count entry
-    /// rides that expansion too — matching the XML writer, which passes the
-    /// count through the same field tree its section fields go through.
-    /// `null` is always emitted for a section (envelope sections are small
-    /// typed metadata, not body records), so the round-trip stays faithful
-    /// regardless of `preserve_nulls`.
-    ///
-    /// Unlike the body path this materializes an owned `serde_json::Map`: a
-    /// section is bounded `$doc` metadata already held in memory under
-    /// `max_index_bytes`, not a streamed record.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FormatError::FieldPath`] when the section's field names cannot
-    /// be expanded, and [`FormatError::Json`] when a section field holds a
-    /// non-finite float (NaN or an infinity), which JSON cannot represent.
-    fn section_object(
-        fields: &indexmap::IndexMap<OwnedKey, Value>,
-        count: Option<(&str, i64)>,
-    ) -> Result<serde_json::Value, FormatError> {
-        use serde_json::{Map, Value as Jv};
-        let names = fields
-            .keys()
-            .map(|k| k.as_ref())
-            .chain(count.map(|(field, _)| field));
-        field_path::check_expandable(names).map_err(field_path_error)?;
-        let mut root = Map::new();
-        for (name, value) in fields {
-            insert_section_field(&mut root, name, clinker_to_json(value)?)?;
-        }
-        if let Some((field, n)) = count {
-            insert_section_field(&mut root, field, Jv::Number(n.into()))?;
-        }
-        Ok(Jv::Object(root))
-    }
-
-    /// Append one body record to the currently-open document object's `body`
-    /// array, comma-separating from prior body records (off the framer's
-    /// running record count, so there is no duplicate counter).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FormatError::Json`] when NO document object is open — a record
-    /// reached an enveloped JSON writer without a `begin_document` (a record
-    /// with no originating document, e.g. a `<merged>` fan-in / aggregate row).
-    /// The plan-time guard (E347) rejects the pipeline shapes that produce
-    /// such records upstream of an enveloped Output, so this is a defense-in-
-    /// depth safety net: it raises a clean error rather than writing record
-    /// bytes outside any `{...,"body":[` object (which would be malformed JSON).
-    fn write_enveloped_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        self.serialize_record(record)?;
-        // Read the framer state through a shared borrow that ends before the
-        // sink writes, so the `envelope`, `writer`, and `scratch` field borrows
-        // stay disjoint.
-        let env = self
-            .envelope
-            .as_ref()
-            .expect("write_enveloped_record only called with an envelope state");
-        if !env.doc_open {
-            return Err(FormatError::Json(
-                "enveloped JSON output received a record with no open document — a record \
-                 with no originating document (a fan-in / aggregate row) cannot be framed"
-                    .to_string(),
-            ));
-        }
-        let need_comma = env.framer.record_count() > 0;
-        if need_comma {
-            self.writer.write_all(b",").map_err(FormatError::Io)?;
-        }
-        self.writer
-            .write_all(&self.scratch)
-            .map_err(FormatError::Io)?;
-        self.envelope
-            .as_mut()
-            .expect("envelope state present after doc-open guard")
-            .framer
-            .count_record();
-        Ok(())
-    }
-}
-
-impl<W: Write + Send> FormatWriter for JsonWriter<W> {
-    fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        // Envelope mode: append to the open document object's `body` array.
-        // A document is always open here (the dispatch arm fires
-        // `begin_document` before the first record), so this never writes a
-        // stray top-level record.
-        if self.envelope.is_some() {
-            return self.write_enveloped_record(record);
-        }
-
-        self.serialize_record(record)?;
-
-        match self.config.format {
-            JsonOutputMode::Array => {
-                if self.records_written == 0 {
-                    self.writer.write_all(b"[\n").map_err(FormatError::Io)?;
-                } else {
-                    self.writer.write_all(b",\n").map_err(FormatError::Io)?;
-                }
-                self.writer
-                    .write_all(&self.scratch)
-                    .map_err(FormatError::Io)?;
-            }
-            JsonOutputMode::Ndjson => {
-                if self.records_written > 0 {
-                    self.writer.write_all(b"\n").map_err(FormatError::Io)?;
-                }
-                self.writer
-                    .write_all(&self.scratch)
-                    .map_err(FormatError::Io)?;
-            }
-        }
-
-        self.records_written += 1;
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<(), FormatError> {
-        match self.envelope.as_ref() {
-            // Envelope mode: in `array` mode the per-document objects are
-            // wrapped in an outer array, closed here; `ndjson` mode needs no
-            // wrapper. An empty stream emits `[]` (array) / nothing (ndjson),
-            // matching the non-enveloped empty shape.
-            Some(env) => {
-                if let JsonOutputMode::Array = self.config.format {
-                    if env.any_doc_written {
-                        self.writer.write_all(b"\n]\n").map_err(FormatError::Io)?;
-                    } else {
-                        self.writer.write_all(b"[]\n").map_err(FormatError::Io)?;
-                    }
-                }
-            }
-            None => {
-                if let JsonOutputMode::Array = self.config.format {
-                    if self.records_written > 0 {
-                        self.writer.write_all(b"\n]\n").map_err(FormatError::Io)?;
-                    } else {
-                        self.writer.write_all(b"[]\n").map_err(FormatError::Io)?;
-                    }
-                }
-            }
-        }
-        self.writer.flush().map_err(FormatError::Io)?;
-        Ok(())
-    }
-
-    /// Drain the underlying sink without writing the closing array bytes, so
-    /// byte-limit split accounting can observe the size mid-document. The
-    /// finalizing `]` (or `[]` for an empty file) is emitted only by
-    /// [`Self::flush`] at end of file / rotation.
-    fn flush_bytes(&mut self) -> Result<(), FormatError> {
-        self.writer.flush().map_err(FormatError::Io)
-    }
-
-    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
-        let Some(env) = self.envelope.as_mut() else {
-            return Ok(());
-        };
-        env.framer.begin();
-        // Build the optional header object only when the document carries the
-        // configured section (a missing section emits no `"header"` key).
-        let header = env
-            .framer
-            .header_fields(doc)
-            .map(|fields| Self::section_object(fields, None))
-            .transpose()?;
-        let any_doc_written = env.any_doc_written;
-        // Outer framing between document objects: `[\n` / `,\n` (array) or a
-        // newline separator (ndjson).
-        match self.config.format {
-            JsonOutputMode::Array => {
-                if any_doc_written {
-                    self.writer.write_all(b",\n").map_err(FormatError::Io)?;
-                } else {
-                    self.writer.write_all(b"[\n").map_err(FormatError::Io)?;
-                }
-            }
-            JsonOutputMode::Ndjson => {
-                if any_doc_written {
-                    self.writer.write_all(b"\n").map_err(FormatError::Io)?;
-                }
-            }
-        }
-        // Open the document object, emit the optional header, open the body
-        // array. The body's records stream in via `write_record`.
-        self.writer.write_all(b"{").map_err(FormatError::Io)?;
-        if let Some(header) = header {
-            let s = self.serialize_value(&header)?;
-            self.writer
-                .write_all(b"\"header\":")
-                .map_err(FormatError::Io)?;
-            self.writer
-                .write_all(s.as_bytes())
-                .map_err(FormatError::Io)?;
-            self.writer.write_all(b",").map_err(FormatError::Io)?;
-        }
-        self.writer
-            .write_all(b"\"body\":[")
-            .map_err(FormatError::Io)?;
-        if let Some(env) = self.envelope.as_mut() {
-            env.doc_open = true;
-        }
-        Ok(())
-    }
-
-    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
-        if self.envelope.as_ref().is_none_or(|e| !e.doc_open) {
-            return Ok(());
-        }
-        // Close the body array.
-        self.writer.write_all(b"]").map_err(FormatError::Io)?;
-        // Emit the optional footer only when the document carries the
-        // configured footer section (the computed count rides it).
-        let footer = {
-            let env = self
-                .envelope
-                .as_ref()
-                .expect("doc_open implies an envelope state");
-            env.framer
-                .footer_fields(doc)
-                .map(|fields| Self::section_object(fields, env.framer.footer_count()))
-                .transpose()?
-        };
-        if let Some(footer) = footer {
-            let s = self.serialize_value(&footer)?;
-            self.writer
-                .write_all(b",\"footer\":")
-                .map_err(FormatError::Io)?;
-            self.writer
-                .write_all(s.as_bytes())
-                .map_err(FormatError::Io)?;
-        }
-        // Close the document object.
-        self.writer.write_all(b"}").map_err(FormatError::Io)?;
-        if let Some(env) = self.envelope.as_mut() {
-            env.any_doc_written = true;
-            env.doc_open = false;
-        }
-        Ok(())
-    }
-}
-
-/// Converts a clinker [`Value`] to a `serde_json::Value`.
-///
-/// `pub(crate)` because the CSV writer's `join_values` `on_conflict: encode_json`
-/// policy reuses this exact conversion to embed a multi-value field as a JSON
-/// array in a CSV cell — never the `Value` serde impl, which is externally
-/// tagged (`{"Integer":42}`) for postcard round-trip, not clean JSON.
-///
-/// # Errors
-///
-/// Returns [`FormatError::Json`] for a non-finite float (NaN or an infinity):
-/// JSON numbers cannot represent them, and mapping to `null` would be
-/// indistinguishable from a source null on read-back.
-pub(crate) fn clinker_to_json(val: &Value) -> Result<serde_json::Value, FormatError> {
-    use serde_json::Value as Jv;
-    Ok(match val {
-        Value::Null => Jv::Null,
-        Value::Bool(b) => Jv::Bool(*b),
-        Value::Integer(i) => Jv::Number((*i).into()),
-        Value::Float(f) => serde_json::Number::from_f64(*f)
-            .map(Jv::Number)
-            .ok_or_else(|| {
-                FormatError::Json(format!(
-                    "non-finite float {f} has no JSON representation; \
-                     filter or replace the value before the JSON output"
-                ))
-            })?,
-        // JSON has no exact-decimal type, and a JSON number would collapse the
-        // scale (2.50 -> 2.5) and risk binary-float reinterpretation by
-        // consumers. Emit the scale-preserving string form to keep the value
-        // exact end-to-end.
-        Value::Decimal(d) => Jv::String(d.to_string()),
-        Value::String(s) => Jv::String(s.to_string()),
-        Value::Date(d) => Jv::String(d.to_string()),
-        Value::DateTime(dt) => Jv::String(dt.to_string()),
-        Value::Array(arr) => Jv::Array(arr.iter().map(clinker_to_json).collect::<Result<_, _>>()?),
-        Value::Map(m) => {
-            let mut obj = serde_json::Map::with_capacity(m.len());
-            for (raw_key, value) in m.iter() {
-                let key = clinker_record::nested_key::NestedKey::decode(raw_key)
-                    .map_err(|error| FormatError::Json(error.to_string()))?;
-                let logical_key = key.text.into_owned();
-                if obj
-                    .insert(logical_key.clone(), clinker_to_json(value)?)
-                    .is_some()
-                {
-                    return Err(FormatError::Json(format!(
-                        "duplicate logical nested key {:?}",
-                        logical_key
-                    )));
-                }
-            }
-            Jv::Object(obj)
-        }
-    })
-}
-
-/// Wrap a field-name grammar failure as this writer's error.
-fn field_path_error(source: FieldPathError) -> FormatError {
-    FormatError::field_path("JSON", source)
-}
-
-// ── Column name → nested object expansion ────────────────────────────
-
-/// The expansion plan plus the schema identity it was built for.
-struct PlanCache {
-    schema: SharedStorage<Schema>,
-    root: PlanBody,
-}
-
-/// One object's contents: the ordered keys it emits. Key order is
-/// first-insertion order, so columns sharing a prefix group at the position
-/// where that prefix first appeared even when the schema interleaves them.
-type PlanBody = Vec<PlanNode>;
-
-enum PlanNode {
-    /// A key holding a column's value, addressed by its schema position.
-    Leaf { name: String, field: usize },
-    /// A key holding a nested object.
-    Branch { name: String, body: PlanBody },
-}
-
-/// Build the expansion plan for a schema: decode every emitted column name and
-/// place its index at the leaf its path addresses.
-///
-/// The whole column set is checked before the first placement, so a set that
-/// cannot be expanded is refused as a set rather than discovered halfway
-/// through building a tree.
-///
-/// # Errors
-///
-/// Returns [`FormatError::FieldPath`] for a malformed escape, a name past the
-/// depth cap, or two columns that would occupy the same place in the tree.
-fn build_plan_cache(
-    schema: &SharedStorage<Schema>,
-    include_engine_stamped: bool,
-) -> Result<PlanCache, FormatError> {
-    let emitted: Vec<(usize, &str)> = (0..schema.column_count())
-        .filter(|&i| include_engine_stamped || !schema.is_engine_stamped(i))
-        .map(|i| (i, schema.columns()[i].as_ref()))
-        .collect();
-    field_path::check_expandable(emitted.iter().map(|&(_, name)| name))
-        .map_err(field_path_error)?;
-
-    let mut root = PlanBody::default();
-    for &(field, name) in &emitted {
-        let path = field_path::decode(name).map_err(field_path_error)?;
-        let (leaf, branches) = path
-            .split_last()
-            .expect("decoding yields at least one segment");
-        let mut body = &mut root;
-        for segment in branches {
-            // Descend into the branch this segment already opened, so a shared
-            // prefix groups at the position where it first appeared.
-            let at = body
-                .iter()
-                .position(|n| matches!(n, PlanNode::Branch { name, .. } if *name == **segment))
-                .unwrap_or_else(|| {
-                    body.push(PlanNode::Branch {
-                        name: segment.to_string(),
-                        body: PlanBody::default(),
-                    });
-                    body.len() - 1
-                });
-            body = match &mut body[at] {
-                PlanNode::Branch { body, .. } => body,
-                PlanNode::Leaf { .. } => {
-                    unreachable!("check_expandable rejects a column nesting under a value column")
-                }
-            };
-        }
-        body.push(PlanNode::Leaf {
-            name: leaf.to_string(),
-            field,
-        });
-    }
-    Ok(PlanCache {
-        schema: schema.clone(),
-        root,
-    })
-}
-
-/// Place one already-materialized section value at the path its field name
-/// addresses, creating intermediate objects as it descends.
-fn insert_section_field(
-    root: &mut serde_json::Map<String, serde_json::Value>,
-    name: &str,
-    value: serde_json::Value,
-) -> Result<(), FormatError> {
-    let path = field_path::decode(name).map_err(field_path_error)?;
-    let (leaf, branches) = path
-        .split_last()
-        .expect("decoding yields at least one segment");
-    let mut object = root;
-    for segment in branches {
-        object = object
-            .entry(segment.as_ref())
-            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-            .as_object_mut()
-            .expect("check_expandable rejects a field nesting under a value field");
-    }
-    object.insert(leaf.to_string(), value);
-    Ok(())
-}
-
-/// Borrows one object's plan and the record's values, serializing the object
-/// directly to the target serializer with no intermediate `serde_json::Value`
-/// tree. Keys borrow the plan's segment names; values borrow the record's
-/// [`Value`]s via [`ValueSer`]. Nested objects recurse through this same impl,
-/// bounded by [`clinker_record::field_path::MAX_FIELD_PATH_DEPTH`].
-struct PlanBodySer<'a> {
-    body: &'a PlanBody,
-    values: &'a [Value],
-    preserve_nulls: bool,
-}
-
-impl serde::Serialize for PlanBodySer<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        // `None` length hint: serde_json ignores it, and the exact post-null-
-        // skip entry count would need a second pass over the plan.
-        let mut map = serializer.serialize_map(None)?;
-        for node in self.body {
-            match node {
-                PlanNode::Leaf { name, field } => {
-                    let value = &self.values[*field];
-                    if !self.preserve_nulls && value.is_null() {
-                        continue;
-                    }
-                    map.serialize_entry(name.as_str(), &ValueSer(value))?;
-                }
-                PlanNode::Branch { name, body } => {
-                    // An object whose every descendant is omitted emits no key
-                    // at all rather than an empty object, so it reads back as
-                    // the absent column it stands for. Under `preserve_nulls`
-                    // every leaf emits, so no subtree can be empty.
-                    if !self.preserve_nulls && !has_present_leaf(body, self.values) {
-                        continue;
-                    }
-                    map.serialize_entry(
-                        name.as_str(),
-                        &PlanBodySer {
-                            body,
-                            values: self.values,
-                            preserve_nulls: self.preserve_nulls,
-                        },
-                    )?;
-                }
-            }
-        }
-        map.end()
-    }
-}
-
-/// Whether any leaf under `body` holds a non-null value. Only meaningful under
-/// `preserve_nulls: false`, the one mode in which a subtree can go unemitted.
-///
-/// Re-walks the subtree rather than caching per-record presence flags: the walk
-/// is bounded by the plan, which is already retained, while a presence buffer
-/// would be per-record state proportional to record width. It short-circuits on
-/// the first present leaf, so the cost is paid only by sparse records.
-fn has_present_leaf(body: &PlanBody, values: &[Value]) -> bool {
-    body.iter().any(|node| match node {
-        PlanNode::Leaf { field, .. } => !values[*field].is_null(),
-        PlanNode::Branch { body, .. } => has_present_leaf(body, values),
-    })
-}
-
-/// Borrows a clinker [`Value`] and serializes it directly, mirroring
-/// [`clinker_to_json`] variant-for-variant without allocating an intermediate
-/// `serde_json::Value`. A non-finite float is rejected with the same message
-/// `clinker_to_json` raises, surfaced through the serializer's error type so it
-/// arrives at the caller as [`FormatError::Json`] with identical text.
+/// Serializes a borrowed neutral value without an intermediate JSON tree.
+/// Callers prevalidate keys, depth and finite numbers before publication.
 pub(crate) struct ValueSer<'a>(pub(crate) &'a Value);
 
 impl serde::Serialize for ValueSer<'_> {
@@ -697,7 +629,7 @@ impl serde::Serialize for ValueSer<'_> {
             Value::Float(f) => {
                 // serde_json's default would silently coerce a non-finite float
                 // to `null`, indistinguishable from a source null on read-back;
-                // reject with the same text `clinker_to_json` uses.
+                // reject rather than losing the original scalar distinction.
                 if !f.is_finite() {
                     return Err(S::Error::custom(format!(
                         "non-finite float {f} has no JSON representation; \
@@ -707,7 +639,7 @@ impl serde::Serialize for ValueSer<'_> {
                 serializer.serialize_f64(*f)
             }
             // JSON has no exact-decimal type; emit the scale-preserving string
-            // form (matches `clinker_to_json`).
+            // form used by the native format contract.
             Value::Decimal(d) => serializer.collect_str(d),
             Value::String(s) => serializer.serialize_str(s.as_str()),
             Value::Date(d) => serializer.collect_str(d),
@@ -736,10 +668,36 @@ impl serde::Serialize for ValueSer<'_> {
 mod tests {
     use super::*;
     use crate::json::reader::{JsonReader, JsonReaderConfig};
+    use crate::preparation::MemoryOnlyResources;
     use crate::traits::FormatReader;
     use clinker_record::owned_storage::{OwnedMap, OwnedValues};
     use clinker_record::schema::{FieldMetadata, SchemaBuilder};
     use std::sync::Arc;
+
+    fn assert_encoding_error(
+        err: &FormatError,
+        kind: OutputEncodingKind,
+        field: usize,
+        name: &str,
+    ) {
+        let FormatError::OutputEncoding {
+            format,
+            kind: actual,
+            field: actual_field,
+            field_name,
+            ..
+        } = err
+        else {
+            panic!("expected a bounded output error, got {err:?}");
+        };
+        assert_eq!(*format, "JSON");
+        assert_eq!(*actual, kind);
+        assert_eq!(*actual_field, field);
+        assert_eq!(
+            field_name.to_string(),
+            crate::error::OutputFieldName::new(name).to_string()
+        );
+    }
 
     fn test_schema() -> SharedStorage<Schema> {
         SharedStorage::from_arc(Arc::new(Schema::new(vec![
@@ -766,11 +724,15 @@ mod tests {
         schema: &SharedStorage<Schema>,
     ) -> String {
         let mut buf = Vec::new();
-        let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = JsonEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+        let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         for r in records {
             w.write_record(r).unwrap();
         }
         w.flush().unwrap();
+        drop(w);
         String::from_utf8(buf).unwrap()
     }
 
@@ -795,7 +757,8 @@ mod tests {
             ..config
         };
         write_records(config, &[record_of(schema, values)], schema)
-            .trim_end()
+            .strip_suffix('\n')
+            .expect("NDJSON record ends in one LF")
             .to_string()
     }
 
@@ -807,7 +770,10 @@ mod tests {
         values: Vec<Value>,
     ) -> (FormatError, Vec<u8>) {
         let mut buf = Vec::new();
-        let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = JsonEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+        let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         let err = w
             .write_record(&record_of(schema, values))
             .expect_err("expected the record to be refused");
@@ -973,7 +939,7 @@ mod tests {
     fn test_json_write_wide_and_long_value_roundtrip() {
         // Exercises the buffer-reuse serialize path across a reused writer with
         // a wide schema and a long string value, then reads back to confirm the
-        // scratch buffer is fully rewritten per record (no stale-byte bleed) and
+        // operation stage is fresh per record (no stale-byte bleed) and
         // the round-trip is faithful.
         let cols: Vec<OwnedKey> = (0..40).map(|i| format!("c{i}").into()).collect();
         let schema = SharedStorage::from_arc(Arc::new(Schema::new(cols)));
@@ -1030,22 +996,20 @@ mod tests {
     #[test]
     fn test_json_write_rejects_non_finite_floats() {
         let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["reading".into()])));
-        for (val, rendered) in [
-            (f64::NAN, "NaN"),
-            (f64::INFINITY, "inf"),
-            (f64::NEG_INFINITY, "-inf"),
-        ] {
+        for val in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let record = Record::new(schema.clone(), vec![Value::Float(val)]);
             let mut buf = Vec::new();
-            let mut w = JsonWriter::new(&mut buf, schema.clone(), JsonWriterConfig::default());
+            let provider =
+                MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+            let encoder = JsonEncoder::new(
+                schema.clone(),
+                &JsonWriterConfig::default(),
+                provider.resources(),
+            )
+            .unwrap();
+            let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
             let err = w.write_record(&record).unwrap_err();
-            match err {
-                FormatError::Json(msg) => assert!(
-                    msg.contains(&format!("non-finite float {rendered}")),
-                    "expected the non-finite message for {rendered}, got: {msg}"
-                ),
-                other => panic!("expected FormatError::Json for {rendered}, got {other:?}"),
-            }
+            assert_encoding_error(&err, OutputEncodingKind::Json, 1, "reading");
             drop(w);
             assert!(
                 buf.is_empty(),
@@ -1066,15 +1030,17 @@ mod tests {
             ]))],
         );
         let mut buf = Vec::new();
-        let mut w = JsonWriter::new(&mut buf, schema.clone(), JsonWriterConfig::default());
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = JsonEncoder::new(
+            schema.clone(),
+            &JsonWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         let err = w.write_record(&record).unwrap_err();
-        match err {
-            FormatError::Json(msg) => assert!(
-                msg.contains("non-finite float inf"),
-                "expected the non-finite message, got: {msg}"
-            ),
-            other => panic!("expected FormatError::Json, got {other:?}"),
-        }
+        assert_encoding_error(&err, OutputEncodingKind::Json, 1, "readings");
     }
 
     use crate::envelope_writer::test_doc_with_sections as doc_with_sections;
@@ -1101,16 +1067,15 @@ mod tests {
             ..Default::default()
         };
         let mut buf = Vec::new();
-        let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = JsonEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+        let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         // No begin_document — write straight into the envelope writer.
         let err = w.write_record(&amount_record(&schema, 1)).unwrap_err();
-        match err {
-            FormatError::Json(msg) => assert!(
-                msg.contains("no open document"),
-                "expected the no-open-document message, got: {msg}"
-            ),
-            other => panic!("expected FormatError::Json, got {other:?}"),
-        }
+        assert_encoding_error(&err, OutputEncodingKind::JsonDocumentClosed, 1, "document");
+        assert!(err.to_string().contains("no open document"));
+        assert!(err.to_string().contains("begin_document"));
     }
 
     #[test]
@@ -1135,7 +1100,10 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         {
-            let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
+            let provider =
+                MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+            let encoder = JsonEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+            let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
             w.begin_document(&doc_a).unwrap();
             w.write_record(&amount_record(&schema, 10)).unwrap();
             w.write_record(&amount_record(&schema, 20)).unwrap();
@@ -1176,7 +1144,10 @@ mod tests {
         let doc_b = doc_with_sections(&[("Head", &[("batch_id", Value::String("B".into()))])]);
         let mut buf = Vec::new();
         {
-            let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
+            let provider =
+                MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+            let encoder = JsonEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+            let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
             w.begin_document(&doc_a).unwrap();
             w.write_record(&amount_record(&schema, 10)).unwrap();
             w.end_document(&doc_a).unwrap();
@@ -1206,15 +1177,12 @@ mod tests {
         };
         let doc = doc_with_sections(&[("Head", &[("ratio", Value::Float(f64::NAN))])]);
         let mut buf = Vec::new();
-        let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = JsonEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+        let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         let err = w.begin_document(&doc).unwrap_err();
-        match err {
-            FormatError::Json(msg) => assert!(
-                msg.contains("non-finite float NaN"),
-                "expected the non-finite message, got: {msg}"
-            ),
-            other => panic!("expected FormatError::Json, got {other:?}"),
-        }
+        assert_encoding_error(&err, OutputEncodingKind::Json, 1, "ratio");
     }
 
     #[test]
@@ -1230,17 +1198,14 @@ mod tests {
         };
         let doc = doc_with_sections(&[("Head", &[("batch_id", Value::String("A".into()))])]);
         let mut buf = Vec::new();
-        let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = JsonEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+        let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         w.begin_document(&doc).unwrap();
         let record = Record::new(schema.clone(), vec![Value::Float(f64::NEG_INFINITY)]);
         let err = w.write_record(&record).unwrap_err();
-        match err {
-            FormatError::Json(msg) => assert!(
-                msg.contains("non-finite float -inf"),
-                "expected the non-finite message, got: {msg}"
-            ),
-            other => panic!("expected FormatError::Json, got {other:?}"),
-        }
+        assert_encoding_error(&err, OutputEncodingKind::Json, 1, "amount");
     }
 
     // ── Dotted column name → nested object expansion ─────────────────
@@ -1325,7 +1290,7 @@ mod tests {
     }
 
     #[test]
-    fn pretty_mode_indents_the_nested_object() {
+    fn pretty_mode_keeps_ndjson_compact() {
         let schema = schema_of(&["Address.City", "name"]);
         let config = JsonWriterConfig {
             pretty: true,
@@ -1336,10 +1301,7 @@ mod tests {
             &schema,
             vec![Value::String("Boston".into()), Value::String("Ada".into())],
         );
-        assert_eq!(
-            out,
-            "{\n  \"Address\": {\n    \"City\": \"Boston\"\n  },\n  \"name\": \"Ada\"\n}"
-        );
+        assert_eq!(out, r#"{"Address":{"City":"Boston"},"name":"Ada"}"#);
     }
 
     #[test]
@@ -1383,14 +1345,7 @@ mod tests {
                 &schema,
                 vec![Value::Integer(1); columns.len()],
             );
-            let FormatError::FieldPath { format, .. } = &err else {
-                panic!("expected a field-path error for {columns:?}, got {err:?}");
-            };
-            assert_eq!(*format, "JSON");
-            let msg = err.to_string();
-            for column in columns {
-                assert!(msg.contains(column), "{msg} should name {column}");
-            }
+            assert_encoding_error(&err, OutputEncodingKind::JsonPath, 2, columns[1]);
             assert!(
                 buf.is_empty(),
                 "a refused column set must emit no bytes, got: {:?}",
@@ -1430,18 +1385,8 @@ mod tests {
             &schema,
             vec![Value::Integer(1)],
         );
-        assert!(
-            matches!(
-                err,
-                FormatError::FieldPath {
-                    source: clinker_record::field_path::FieldPathError::UnknownEscape { .. },
-                    ..
-                }
-            ),
-            "got {err:?}"
-        );
-        // The message must carry the spelling that fixes it.
-        assert!(err.to_string().contains("C:\\\\temp"), "{err}");
+        assert_encoding_error(&err, OutputEncodingKind::JsonPath, 1, r"C:\temp");
+        assert!(err.to_string().contains(r"backslash as \\"), "{err}");
         assert!(buf.is_empty());
     }
 
@@ -1479,7 +1424,10 @@ mod tests {
         };
         let mut buf = Vec::new();
         {
-            let mut w = JsonWriter::new(&mut buf, flat.clone(), config);
+            let provider =
+                MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+            let encoder = JsonEncoder::new(flat.clone(), &config, provider.resources()).unwrap();
+            let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
             w.write_record(&record_of(&flat, vec![Value::Integer(1)]))
                 .unwrap();
             w.write_record(&record_of(&nested, vec![Value::Integer(2)]))
@@ -1493,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn a_nested_schema_reuses_the_scratch_buffer_without_bleed() {
+    fn a_nested_schema_stages_each_record_without_bleed() {
         // The nested walk writes into the same retained buffer every record;
         // a wide schema with a long value would surface any stale tail.
         let columns: Vec<String> = (0..40).map(|i| format!("g{}.c{i}", i % 4)).collect();
@@ -1543,7 +1491,10 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         {
-            let mut w = JsonWriter::new(&mut buf, schema.clone(), config);
+            let provider =
+                MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+            let encoder = JsonEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+            let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
             w.begin_document(&doc).unwrap();
             w.write_record(&record_of(&schema, vec![Value::Integer(1)]))
                 .unwrap();

@@ -916,3 +916,933 @@ fn csv_cli_continue_reports_exact_rejected_population_and_category() {
     );
     assert_eq!(executed.len(), 4);
 }
+
+const EXPECTED_NESTED_OUTPUT_ROWS: &[&str] = &[
+    "json-array/compact/0",
+    "json-array/compact/1",
+    "json-array/compact/2",
+    "json-array/pretty/0",
+    "json-array/pretty/1",
+    "json-array/pretty/2",
+    "ndjson/compact/0",
+    "ndjson/compact/1",
+    "ndjson/compact/2",
+    "ndjson/pretty/0",
+    "ndjson/pretty/1",
+    "ndjson/pretty/2",
+    "json-envelope-array/compact/0",
+    "json-envelope-array/compact/1",
+    "json-envelope-array/compact/2",
+    "json-envelope-array/compact/two-documents",
+    "json-envelope-array/pretty/0",
+    "json-envelope-array/pretty/1",
+    "json-envelope-array/pretty/2",
+    "json-envelope-array/pretty/two-documents",
+    "json-envelope-ndjson/compact/0",
+    "json-envelope-ndjson/compact/1",
+    "json-envelope-ndjson/compact/2",
+    "json-envelope-ndjson/compact/two-documents",
+    "json-envelope-ndjson/pretty/0",
+    "json-envelope-ndjson/pretty/1",
+    "json-envelope-ndjson/pretty/2",
+    "json-envelope-ndjson/pretty/two-documents",
+    "xml/compact/0",
+    "xml/compact/1",
+    "xml/compact/2",
+    "xml-envelope/compact/0",
+    "xml-envelope/compact/1",
+    "xml-envelope/compact/2",
+    "xml-envelope/compact/two-documents",
+];
+
+#[test]
+fn nested_output_framing_rows_equal_literal_files_and_process_counts() {
+    use std::collections::BTreeSet;
+    let mut executed = BTreeSet::new();
+    for codec in [
+        "json-array",
+        "ndjson",
+        "json-envelope-array",
+        "json-envelope-ndjson",
+        "xml",
+        "xml-envelope",
+    ] {
+        let xml = codec.starts_with("xml");
+        let envelope = codec.contains("envelope");
+        for pretty in [false, true] {
+            if xml && pretty {
+                continue;
+            }
+            for population in ["0", "1", "2", "two-documents"] {
+                let documents = if population == "two-documents" { 2 } else { 1 };
+                if documents == 2 && !envelope {
+                    continue;
+                }
+                let rows = if documents == 2 {
+                    1
+                } else {
+                    population.parse::<usize>().unwrap()
+                };
+                let id = format!(
+                    "{codec}/{}/{population}",
+                    if pretty { "pretty" } else { "compact" }
+                );
+                let root = tempfile::tempdir().unwrap();
+                let source_path = if documents == 2 {
+                    "glob: input-*.json"
+                } else {
+                    "path: input-1.json"
+                };
+                let source_envelope = if envelope {
+                    r#"      options: { record_path: items }
+      envelope:
+        sections:
+          opening:
+            extract: { json_pointer: "/opening" }
+            fields: { tag: int }
+          closing:
+            extract: { json_pointer: "/closing" }
+            fields: { status: string }
+"#
+                } else {
+                    ""
+                };
+                let sink_options = if xml {
+                    if envelope {
+                        r#"      options:
+        envelope:
+          header_from_doc: opening
+          footer_from_doc: closing
+          footer_record_count_field: rows
+"#
+                        .to_owned()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    let mode = if codec.contains("ndjson") {
+                        "ndjson"
+                    } else {
+                        "array"
+                    };
+                    format!(
+                        "      options:\n        format: {mode}\n        pretty: {pretty}\n{}",
+                        if envelope {
+                            "        envelope:\n          header_from_doc: opening\n          footer_from_doc: closing\n          footer_record_count_field: rows\n"
+                        } else {
+                            ""
+                        }
+                    )
+                };
+                let format = if xml { "xml" } else { "json" };
+                let yaml = format!(
+                    r#"
+pipeline:
+  name: native_framing
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: json
+      {source_path}
+{source_envelope}      schema: [{{ name: v, type: int }}]
+  - type: sink
+    name: out
+    input: rows
+    config:
+      name: out
+      type: {format}
+      path: output.{format}
+      reconstruct_envelope: {envelope}
+{sink_options}"#
+                );
+                std::fs::write(root.path().join("pipeline.yaml"), yaml).unwrap();
+                for document in 1..=documents {
+                    let body = match (rows, document) {
+                        (0, _) => "",
+                        (1, 1) => r#"{"v":1}"#,
+                        (1, 2) => r#"{"v":2}"#,
+                        (2, _) => r#"{"v":1},{"v":2}"#,
+                        _ => unreachable!(),
+                    };
+                    let input = if envelope {
+                        format!(
+                            r#"{{"opening":{{"tag":7}},"items":[{body}],"closing":{{"status":"done"}}}}"#
+                        )
+                    } else {
+                        format!("[{body}]")
+                    };
+                    std::fs::write(root.path().join(format!("input-{document}.json")), input)
+                        .unwrap();
+                }
+                let result = run(root.path());
+                assert_completed(
+                    &result,
+                    (rows * documents) as u64,
+                    (rows * documents) as u64,
+                    0,
+                );
+                // Runtime writers open on the first body row. An empty run
+                // publishes the existing empty file; it never constructs an
+                // encoder whose explicit Finalize would emit empty framing.
+                let expected = if rows == 0 {
+                    String::new()
+                } else if xml {
+                    let body = match rows {
+                        0 => "",
+                        1 => "<Record><v>1</v></Record>",
+                        2 => "<Record><v>1</v></Record><Record><v>2</v></Record>",
+                        _ => unreachable!(),
+                    };
+                    if envelope {
+                        let doc = format!(
+                            "<Document><header><tag>7</tag></header>{body}<footer><status>done</status><rows>{rows}</rows></footer></Document>"
+                        );
+                        if documents == 2 {
+                            format!(
+                                "<Root>{doc}<Document><header><tag>7</tag></header><Record><v>2</v></Record><footer><status>done</status><rows>1</rows></footer></Document></Root>"
+                            )
+                        } else {
+                            format!("<Root>{doc}</Root>")
+                        }
+                    } else {
+                        format!("<Root>{body}</Root>")
+                    }
+                } else if envelope {
+                    let header = if pretty {
+                        "{\n  \"tag\": 7\n}"
+                    } else {
+                        r#"{"tag":7}"#
+                    };
+                    let body = match (rows, pretty) {
+                        (0, _) => "",
+                        (1, false) => r#"{"v":1}"#,
+                        (1, true) => "{\n  \"v\": 1\n}",
+                        (2, false) => r#"{"v":1},{"v":2}"#,
+                        (2, true) => "{\n  \"v\": 1\n},{\n  \"v\": 2\n}",
+                        _ => unreachable!(),
+                    };
+                    let footer = if pretty {
+                        format!("{{\n  \"status\": \"done\",\n  \"rows\": {rows}\n}}")
+                    } else {
+                        format!(r#"{{"status":"done","rows":{rows}}}"#)
+                    };
+                    let first =
+                        format!("{{\"header\":{header},\"body\":[{body}],\"footer\":{footer}}}");
+                    let doc = if documents == 2 {
+                        let body = if pretty {
+                            "{\n  \"v\": 2\n}"
+                        } else {
+                            r#"{"v":2}"#
+                        };
+                        format!(
+                            "{first}{}{{\"header\":{header},\"body\":[{body}],\"footer\":{footer}}}",
+                            if codec.ends_with("ndjson") {
+                                "\n"
+                            } else {
+                                ",\n"
+                            }
+                        )
+                    } else {
+                        first
+                    };
+                    if codec.ends_with("ndjson") {
+                        doc
+                    } else {
+                        format!("[\n{doc}\n]\n")
+                    }
+                } else if codec == "ndjson" {
+                    match rows {
+                        0 => "",
+                        1 => "{\"v\":1}\n",
+                        2 => "{\"v\":1}\n{\"v\":2}\n",
+                        _ => unreachable!(),
+                    }
+                    .to_owned()
+                } else {
+                    match (rows, pretty) {
+                        (0, _) => "[]\n",
+                        (1, false) => "[\n{\"v\":1}\n]\n",
+                        (1, true) => "[\n{\n  \"v\": 1\n}\n]\n",
+                        (2, false) => "[\n{\"v\":1},\n{\"v\":2}\n]\n",
+                        (2, true) => "[\n{\n  \"v\": 1\n},\n{\n  \"v\": 2\n}\n]\n",
+                        _ => unreachable!(),
+                    }
+                    .to_owned()
+                };
+                assert_eq!(
+                    std::fs::read(root.path().join(format!("output.{format}"))).unwrap(),
+                    expected.as_bytes(),
+                    "{id}"
+                );
+                assert!(executed.insert(id));
+            }
+        }
+    }
+    assert_eq!(
+        executed.iter().map(String::as_str).collect::<BTreeSet<_>>(),
+        EXPECTED_NESTED_OUTPUT_ROWS.iter().copied().collect()
+    );
+    assert_eq!(executed.len(), 35);
+}
+
+const EXPECTED_NESTED_INPUT_ROWS: &[&str] = &[
+    "json-array/utf8",
+    "json-array/bom8",
+    "json-array/bom16le",
+    "json-array/bom16be",
+    "json-array/bom32le",
+    "json-array/bom32be",
+    "json-array/malformed-first",
+    "json-array/malformed-late",
+    "json-array/two-files",
+    "json-array/invalid-second",
+    "json-ndjson/utf8",
+    "json-ndjson/bom8",
+    "json-ndjson/bom16le",
+    "json-ndjson/bom16be",
+    "json-ndjson/bom32le",
+    "json-ndjson/bom32be",
+    "json-ndjson/malformed-first",
+    "json-ndjson/malformed-late",
+    "json-ndjson/two-files",
+    "json-ndjson/invalid-second",
+    "json-body/utf8",
+    "json-body/bom8",
+    "json-body/bom16le",
+    "json-body/bom16be",
+    "json-body/bom32le",
+    "json-body/bom32be",
+    "json-body/malformed-first",
+    "json-body/malformed-late",
+    "json-body/two-files",
+    "json-body/invalid-second",
+    "xml-ordinary/utf8",
+    "xml-ordinary/bom8",
+    "xml-ordinary/bom16le",
+    "xml-ordinary/bom16be",
+    "xml-ordinary/bom32le",
+    "xml-ordinary/bom32be",
+    "xml-ordinary/malformed-first",
+    "xml-ordinary/malformed-late",
+    "xml-ordinary/two-files",
+    "xml-ordinary/invalid-second",
+    "xml-ordinary/declaration8",
+    "xml-ordinary/declaration16",
+    "xml-ordinary/conflicting-declaration",
+    "xml-body/utf8",
+    "xml-body/bom8",
+    "xml-body/bom16le",
+    "xml-body/bom16be",
+    "xml-body/bom32le",
+    "xml-body/bom32be",
+    "xml-body/malformed-first",
+    "xml-body/malformed-late",
+    "xml-body/two-files",
+    "xml-body/invalid-second",
+    "xml-body/declaration8",
+    "xml-body/declaration16",
+    "xml-body/conflicting-declaration",
+    "xml-envelope/utf8",
+    "xml-envelope/bom8",
+    "xml-envelope/bom16le",
+    "xml-envelope/bom16be",
+    "xml-envelope/bom32le",
+    "xml-envelope/bom32be",
+    "xml-envelope/malformed-first",
+    "xml-envelope/malformed-late",
+    "xml-envelope/two-files",
+    "xml-envelope/invalid-second",
+    "xml-envelope/declaration8",
+    "xml-envelope/declaration16",
+    "xml-envelope/conflicting-declaration",
+    "xml-prescan/utf8",
+    "xml-prescan/bom8",
+    "xml-prescan/bom16le",
+    "xml-prescan/bom16be",
+    "xml-prescan/bom32le",
+    "xml-prescan/bom32be",
+    "xml-prescan/malformed-first",
+    "xml-prescan/malformed-late",
+    "xml-prescan/two-files",
+    "xml-prescan/invalid-second",
+    "xml-prescan/declaration8",
+    "xml-prescan/declaration16",
+    "xml-prescan/conflicting-declaration",
+];
+
+fn nested_input_yaml(mode: &str, multiple: bool) -> String {
+    let xml = mode.starts_with("xml");
+    let format = if xml { "xml" } else { "json" };
+    let path = if multiple {
+        format!("glob: input-*.{format}")
+    } else {
+        format!("path: input-1.{format}")
+    };
+    let options = match mode {
+        "json-ndjson" => "      options: { format: ndjson }\n",
+        "json-body" => "      options: { record_path: items }\n",
+        "xml-body" | "xml-envelope" | "xml-prescan" => {
+            "      options: { record_path: Root/items/row }\n"
+        }
+        _ => "",
+    };
+    let envelope = if matches!(mode, "xml-envelope" | "xml-prescan") {
+        r#"      envelope:
+        sections:
+          manifest:
+            extract: { xml_path: "/Root/manifest" }
+            fields: { batch: int }
+"#
+    } else {
+        ""
+    };
+    let transform = if mode == "xml-prescan" {
+        r#"  - type: transform
+    name: attach
+    input: rows
+    config:
+      cxl: |
+        emit id = id
+        emit batch = $doc.manifest.batch
+"#
+    } else {
+        ""
+    };
+    let upstream = if mode == "xml-prescan" {
+        "attach"
+    } else {
+        "rows"
+    };
+    format!(
+        r#"
+pipeline:
+  name: native_input
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: {format}
+      {path}
+{options}{envelope}      schema: [{{ name: id, type: int }}]
+{transform}  - type: sink
+    name: out
+    input: {upstream}
+    config:
+      name: out
+      type: json
+      path: output.json
+      options: {{ format: ndjson }}
+"#
+    )
+}
+
+fn nested_input_bytes(mode: &str, id: u8, malformed: bool) -> Vec<u8> {
+    let text = match mode {
+        "json-array" => format!(r#"[{{"id":{id}}}]"#),
+        "json-ndjson" => format!("{{\"id\":{id}}}\n"),
+        "json-body" => {
+            format!(r#"{{"metadata":{{"id":99}},"items":[{{"id":{id}}}],"after":{{"id":98}}}}"#)
+        }
+        "xml-ordinary" => format!("<row><id>{id}</id></row>"),
+        "xml-prescan" => format!(
+            "<Root><items><row><id>{id}</id></row></items><manifest><batch>7</batch></manifest></Root>"
+        ),
+        _ => format!(
+            "<Root><manifest><batch>7</batch></manifest><items><row><id>{id}</id></row></items><metadata><id>99</id></metadata></Root>"
+        ),
+    };
+    if !malformed {
+        return text.into_bytes();
+    }
+    let marker = if mode.starts_with("json") {
+        format!("\"id\":{id}")
+    } else {
+        format!("<id>{id}</id>")
+    };
+    let mut bytes = text.into_bytes();
+    let start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker.as_bytes())
+        .unwrap();
+    let offset = start + if mode.starts_with("json") { 5 } else { 4 };
+    bytes[offset] = 0xff;
+    bytes
+}
+
+fn nested_partial_outputs(root: &Path) -> Vec<Vec<u8>> {
+    let mut outputs = Vec::new();
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            outputs.extend(nested_partial_outputs(&entry.path()));
+        } else if entry.file_name().to_string_lossy().starts_with("artifact-")
+            || entry.file_name().to_string_lossy().ends_with(".partial")
+        {
+            outputs.push(std::fs::read(entry.path()).unwrap());
+        }
+    }
+    outputs
+}
+
+#[test]
+fn nested_input_rows_enforce_utf8_and_independent_physical_file_policy() {
+    use std::collections::BTreeSet;
+    let mut executed = BTreeSet::new();
+    for mode in [
+        "json-array",
+        "json-ndjson",
+        "json-body",
+        "xml-ordinary",
+        "xml-body",
+        "xml-envelope",
+        "xml-prescan",
+    ] {
+        for variant in [
+            "utf8",
+            "bom8",
+            "bom16le",
+            "bom16be",
+            "bom32le",
+            "bom32be",
+            "malformed-first",
+            "malformed-late",
+            "two-files",
+            "invalid-second",
+            "declaration8",
+            "declaration16",
+            "conflicting-declaration",
+        ] {
+            let xml = mode.starts_with("xml");
+            if !xml && variant.contains("declaration") {
+                continue;
+            }
+            let id = format!("{mode}/{variant}");
+            let root = tempfile::tempdir().unwrap();
+            let multiple = matches!(variant, "two-files" | "invalid-second");
+            std::fs::write(
+                root.path().join("pipeline.yaml"),
+                nested_input_yaml(mode, multiple),
+            )
+            .unwrap();
+            let mut bytes = nested_input_bytes(mode, 1, variant == "malformed-first");
+            if variant == "malformed-late" {
+                // Separate the complete first body record from corruption by
+                // more than the reader buffer. This tests streaming progress,
+                // without depending on where a short read happens to stop.
+                let padding = " ".repeat(32 * 1024);
+                bytes = match mode {
+                    "json-array" => format!("[{{\"id\":1}},{padding}{{\"id\":2}}]").into_bytes(),
+                    "json-ndjson" => format!("{{\"id\":1}}\n{padding}{{\"id\":2}}\n").into_bytes(),
+                    "json-body" => format!("{{\"items\":[{{\"id\":1}},{padding}{{\"id\":2}}]}}").into_bytes(),
+                    "xml-ordinary" => format!("<row><id>1</id>{padding}<tail>2</tail></row>").into_bytes(),
+                    _ => format!("<Root><manifest><batch>7</batch></manifest><items><row><id>1</id></row>{padding}<row><id>2</id></row></items></Root>").into_bytes(),
+                };
+                let offset = bytes.iter().rposition(|byte| *byte == b'2').unwrap();
+                bytes[offset] = 0xff;
+            }
+            let prefix: &[u8] = match variant {
+                "bom8" | "two-files" | "invalid-second" => b"\xef\xbb\xbf",
+                "bom16le" => b"\xff\xfe",
+                "bom16be" => b"\xfe\xff",
+                "bom32le" => b"\xff\xfe\0\0",
+                "bom32be" => b"\0\0\xfe\xff",
+                "declaration8" => b"<?xml version='1.0' encoding='UTF-8'?>",
+                "declaration16" => b"<?xml version='1.0' encoding='UTF-16'?>",
+                "conflicting-declaration" => {
+                    b"<?xml version='1.0' encoding='UTF-8' encoding='UTF-16'?>"
+                }
+                _ => b"",
+            };
+            bytes.splice(..0, prefix.iter().copied());
+            let format = if xml { "xml" } else { "json" };
+            std::fs::write(root.path().join(format!("input-1.{format}")), bytes).unwrap();
+            if multiple {
+                let second = nested_input_bytes(mode, 2, variant == "invalid-second");
+                std::fs::write(
+                    root.path().join(format!("input-2.{format}")),
+                    [b"\xef\xbb\xbf".as_slice(), &second].concat(),
+                )
+                .unwrap();
+            }
+            let result = run(root.path());
+            let success = matches!(variant, "utf8" | "bom8" | "two-files" | "declaration8");
+            let first = if mode == "xml-prescan" {
+                b"{\"id\":1,\"batch\":7}\n".as_slice()
+            } else {
+                b"{\"id\":1}\n".as_slice()
+            };
+            if success {
+                let rows = if multiple { 2 } else { 1 };
+                assert_completed(&result, rows, rows, 0);
+                let second = if mode == "xml-prescan" {
+                    b"{\"id\":2,\"batch\":7}\n".as_slice()
+                } else {
+                    b"{\"id\":2}\n".as_slice()
+                };
+                let expected = [first, if multiple { second } else { b"" }].concat();
+                assert_eq!(
+                    std::fs::read(root.path().join("output.json")).unwrap(),
+                    expected,
+                    "{id}"
+                );
+            } else {
+                let outcome = terminal(&result, 4, "failed");
+                assert_eq!(
+                    outcome["failure"]["code"], "source.data.invalid",
+                    "{id}: {outcome}"
+                );
+                assert!(
+                    !root.path().join("output.json").exists(),
+                    "{id}: failed run must not publish"
+                );
+                let partials = nested_partial_outputs(root.path());
+                let expected = if variant == "invalid-second"
+                    || (variant == "malformed-late"
+                        && !matches!(mode, "xml-ordinary" | "xml-prescan"))
+                {
+                    first
+                } else {
+                    b""
+                };
+                assert!(
+                    partials.iter().any(|bytes| bytes == expected),
+                    "{id}: retained prefix {partials:?}"
+                );
+                assert!(
+                    partials
+                        .iter()
+                        .all(|bytes| bytes == expected || bytes.is_empty()),
+                    "{id}: unexpected retained bytes"
+                );
+            }
+            assert!(executed.insert(id));
+        }
+    }
+    assert_eq!(
+        executed.iter().map(String::as_str).collect::<BTreeSet<_>>(),
+        EXPECTED_NESTED_INPUT_ROWS.iter().copied().collect()
+    );
+    assert_eq!(executed.len(), 82);
+}
+
+const EXPECTED_NESTED_OUTPUT_EDGE_ROWS: &[&str] = &[
+    "json/native/omit",
+    "json/native/preserve",
+    "xml/native/omit",
+    "xml/native/preserve",
+    "json/depth",
+    "xml/depth",
+    "json/collision",
+    "xml/collision",
+    "xml/name",
+    "xml/character",
+    "json/correlation",
+    "xml/correlation",
+    "json/split",
+    "xml/split",
+    "json/fanout",
+    "xml/fanout",
+    "json/reject-split",
+    "xml/reject-split",
+    "json/reject-fanout",
+    "xml/reject-fanout",
+    "json/reject-correlation",
+    "xml/reject-correlation",
+    "json/reject-document-dlq",
+    "xml/reject-document-dlq",
+];
+
+fn nested_transform_yaml(format: &str, expression: &str, preserve: bool) -> String {
+    let options = if format == "json" {
+        "      options: { format: ndjson }\n"
+    } else {
+        ""
+    };
+    let cxl = expression
+        .lines()
+        .map(|line| format!("        {line}\n"))
+        .collect::<String>();
+    format!(
+        r#"
+pipeline:
+  name: native_values
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: input.csv
+      schema: [{{ name: key, type: string }}]
+  - type: transform
+    name: construct
+    input: rows
+    config:
+      cxl: |
+{cxl}  - type: sink
+    name: out
+    input: construct
+    config:
+      name: out
+      type: {format}
+      path: output.{format}
+      include_unmapped: false
+      preserve_nulls: {preserve}
+{options}"#
+    )
+}
+
+#[test]
+fn nested_output_edges_have_exact_bytes_rejections_and_publication() {
+    use std::collections::BTreeSet;
+    let mut executed = BTreeSet::new();
+    for format in ["json", "xml"] {
+        for preserve in [false, true] {
+            let id = format!(
+                "{format}/native/{}",
+                if preserve { "preserve" } else { "omit" }
+            );
+            let expression = r##"emit payload = {"@kind": "event", "#text": "before", item: [{"@id": 2, "#text": "two"}], tail: "after"}
+emit enabled = true
+emit count = 2
+emit amount = 1.5
+emit absent = null"##;
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(
+                root.path().join("pipeline.yaml"),
+                nested_transform_yaml(format, expression, preserve),
+            )
+            .unwrap();
+            std::fs::write(root.path().join("input.csv"), b"key\n@id\n").unwrap();
+            assert_completed(&run(root.path()), 1, 1, 0);
+            let expected: &[u8] = match (format, preserve) {
+                ("json", false) => b"{\"payload\":{\"@kind\":\"event\",\"#text\":\"before\",\"item\":[{\"@id\":2,\"#text\":\"two\"}],\"tail\":\"after\"},\"enabled\":true,\"count\":2,\"amount\":1.5}\n",
+                ("json", true) => b"{\"payload\":{\"@kind\":\"event\",\"#text\":\"before\",\"item\":[{\"@id\":2,\"#text\":\"two\"}],\"tail\":\"after\"},\"enabled\":true,\"count\":2,\"amount\":1.5,\"absent\":null}\n",
+                (_, false) => b"<Root><Record><payload kind=\"event\">before<item id=\"2\">two</item><tail>after</tail></payload><enabled>true</enabled><count>2</count><amount>1.5</amount></Record></Root>",
+                (_, true) => b"<Root><Record><payload kind=\"event\">before<item id=\"2\">two</item><tail>after</tail></payload><enabled>true</enabled><count>2</count><amount>1.5</amount><absent/></Record></Root>",
+            };
+            assert_eq!(
+                std::fs::read(root.path().join(format!("output.{format}"))).unwrap(),
+                expected,
+                "{id}"
+            );
+            assert!(executed.insert(id));
+        }
+        for (kind, expression, exit, diagnostic) in [
+            (
+                "depth",
+                format!("emit payload = {}null{}", "{n: ".repeat(65), "}".repeat(65)),
+                3,
+                "depth",
+            ),
+            (
+                "collision",
+                r#"emit payload = {"@id": 1, [key]: 2}"#.into(),
+                3,
+                "duplicate map key",
+            ),
+            (
+                "name",
+                r#"emit payload = {"1bad": 2}"#.into(),
+                4,
+                "XML name",
+            ),
+            ("character", "emit payload = key".into(), 4, "XML"),
+        ] {
+            if format == "json" && matches!(kind, "name" | "character") {
+                continue;
+            }
+            let id = format!("{format}/{kind}");
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(
+                root.path().join("pipeline.yaml"),
+                nested_transform_yaml(format, &expression, false),
+            )
+            .unwrap();
+            std::fs::write(
+                root.path().join("input.csv"),
+                if kind == "character" {
+                    b"key\n\x01\n".as_slice()
+                } else {
+                    b"key\n@id\n".as_slice()
+                },
+            )
+            .unwrap();
+            let result = run(root.path());
+            assert_eq!(
+                terminal(&result, exit, "failed")["failure"]["code"],
+                "source.data.invalid",
+                "{id}"
+            );
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(stderr.contains(diagnostic), "{id}: {stderr}");
+            assert!(stderr.len() < 4096, "{id}: bounded diagnostic");
+            assert!(!root.path().join(format!("output.{format}")).exists());
+            assert!(
+                nested_partial_outputs(root.path())
+                    .iter()
+                    .all(Vec::is_empty),
+                "{id}"
+            );
+            assert!(executed.insert(id));
+        }
+        for mode in [
+            "correlation",
+            "split",
+            "fanout",
+            "reject-split",
+            "reject-fanout",
+            "reject-correlation",
+            "reject-document-dlq",
+        ] {
+            let id = format!("{format}/{mode}");
+            let root = tempfile::tempdir().unwrap();
+            let source = match mode {
+                "correlation" | "reject-correlation" => "      correlation_key: id\n",
+                "reject-document-dlq" => "      dlq_granularity: document\n",
+                _ => "",
+            };
+            let path = if mode.ends_with("fanout") {
+                format!("output_{{source_file}}.{format}")
+            } else {
+                format!("output.{format}")
+            };
+            let split = if mode.ends_with("split") {
+                "      split: { max_records: 1 }\n"
+            } else {
+                ""
+            };
+            let envelope = if mode.starts_with("reject-") {
+                "      reconstruct_envelope: true\n      options:\n        envelope:\n          footer_record_count_field: rows\n"
+            } else {
+                ""
+            };
+            let yaml = format!(
+                r#"
+pipeline:
+  name: native_routing
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      glob: input-*.csv
+{source}      schema: [{{ name: id, type: int }}]
+  - type: sink
+    name: out
+    input: rows
+    config:
+      name: out
+      type: {format}
+      path: {path}
+{split}{envelope}"#
+            );
+            std::fs::write(root.path().join("pipeline.yaml"), yaml).unwrap();
+            std::fs::write(root.path().join("input-a.csv"), b"id\n1\n").unwrap();
+            std::fs::write(root.path().join("input-b.csv"), b"id\n2\n").unwrap();
+            let result = run(root.path());
+            if mode.starts_with("reject-") {
+                assert_eq!(
+                    terminal(&result, 1, "failed")["failure"]["code"],
+                    "admission.configuration.invalid",
+                    "{id}"
+                );
+                assert!(
+                    String::from_utf8_lossy(&result.stderr).contains("E347"),
+                    "{id}"
+                );
+                assert!(nested_partial_outputs(root.path()).is_empty());
+                assert!(!std::fs::read_dir(root.path()).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("output")
+                }));
+            } else {
+                assert_completed(&result, 2, 2, 0);
+                let expected: Vec<(&str, &[u8])> = match (format, mode) {
+                    ("json", "correlation") => {
+                        vec![("output.json", b"[\n{\"id\":1},\n{\"id\":2}\n]\n")]
+                    }
+                    ("xml", "correlation") => vec![(
+                        "output.xml",
+                        b"<Root><Record><id>1</id></Record><Record><id>2</id></Record></Root>",
+                    )],
+                    ("json", "split") => vec![
+                        ("output_0001.json", b"[\n{\"id\":1}\n]\n"),
+                        ("output_0002.json", b"[\n{\"id\":2}\n]\n"),
+                    ],
+                    ("xml", "split") => vec![
+                        (
+                            "output_0001.xml",
+                            b"<Root><Record><id>1</id></Record></Root>",
+                        ),
+                        (
+                            "output_0002.xml",
+                            b"<Root><Record><id>2</id></Record></Root>",
+                        ),
+                    ],
+                    ("json", _) => vec![
+                        ("output_input-a.json", b"[\n{\"id\":1}\n]\n"),
+                        ("output_input-b.json", b"[\n{\"id\":2}\n]\n"),
+                    ],
+                    (_, _) => vec![
+                        (
+                            "output_input-a.xml",
+                            b"<Root><Record><id>1</id></Record></Root>",
+                        ),
+                        (
+                            "output_input-b.xml",
+                            b"<Root><Record><id>2</id></Record></Root>",
+                        ),
+                    ],
+                };
+                for (name, bytes) in expected {
+                    assert_eq!(
+                        std::fs::read(root.path().join(name)).unwrap(),
+                        bytes,
+                        "{id}/{name}"
+                    );
+                }
+            }
+            assert!(executed.insert(id));
+        }
+    }
+    assert_eq!(
+        executed.iter().map(String::as_str).collect::<BTreeSet<_>>(),
+        EXPECTED_NESTED_OUTPUT_EDGE_ROWS.iter().copied().collect()
+    );
+    assert_eq!(executed.len(), 24);
+}
+
+#[test]
+fn nested_input_xml_metadata_never_inflates_selected_body_count() {
+    for mode in ["xml-body", "xml-envelope", "xml-prescan"] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("pipeline.yaml"),
+            nested_input_yaml(mode, false)
+                .replace("name: id, type: int", "name: id, type: { nullable: int }"),
+        )
+        .unwrap();
+        std::fs::write(root.path().join("input-1.xml"), b"<Root><metadata><id>99</id></metadata><items><row><id>1</id></row><row/></items><manifest><batch>7</batch></manifest><items/><items><row><id>2</id></row></items><metadata><id>98</id></metadata></Root>").unwrap();
+        assert_completed(&run(root.path()), 3, 3, 0);
+        let expected: &[u8] = if mode == "xml-prescan" {
+            b"{\"id\":1,\"batch\":7}\n{\"batch\":7}\n{\"id\":2,\"batch\":7}\n"
+        } else {
+            b"{\"id\":1}\n{}\n{\"id\":2}\n"
+        };
+        assert_eq!(
+            std::fs::read(root.path().join("output.json")).unwrap(),
+            expected,
+            "{mode}"
+        );
+    }
+}

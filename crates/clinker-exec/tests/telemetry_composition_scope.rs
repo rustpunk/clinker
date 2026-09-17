@@ -139,8 +139,8 @@ nodes:
 
 /// Run `TWO_CALL_SITES` with telemetry enabled and return every transform span
 /// name the receiver saw, sorted, paired with the two output documents.
-/// JSON keeps this identity test independent of CSV allocation-span pressure;
-/// the fixed arena size and the three exact scope-name assertions are unchanged.
+/// Literal NDJSON bytes prove both bodies ran; the fixed arena size and the
+/// three exact scope-name assertions also exercise normal resource signals.
 fn transform_span_names() -> (Vec<String>, HashMap<String, String>) {
     let config = parse_config(TWO_CALL_SITES).expect("pipeline fixture parses");
     let root = fixture_workspace_root();
@@ -224,6 +224,6 @@ fn body_transform_spans_name_the_call_site_that_ran_them() {
 
     // The run has to be a real one: identical span names would also be produced
     // by a pipeline that never executed either body.
-    assert_eq!(outputs["eu_out"], "{\"a\":5,\"computed\":10}");
-    assert_eq!(outputs["us_out"], "{\"a\":7,\"computed\":14}");
+    assert_eq!(outputs["eu_out"], "{\"a\":5,\"computed\":10}\n");
+    assert_eq!(outputs["us_out"], "{\"a\":7,\"computed\":14}\n");
 }
