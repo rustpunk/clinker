@@ -26,6 +26,9 @@
 //!    by running a windowed transform against a slow source and
 //!    asserting the windowed output is still well-formed.
 
+#[path = "common/resource_fixtures.rs"]
+mod resource_fixtures;
+
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
@@ -876,13 +879,19 @@ nodes:
     let output_row_bytes =
         std::mem::size_of::<(clinker_record::Record, clinker_exec::executor::SourceRowId)>()
             + output_schema.column_count() * std::mem::size_of::<clinker_record::Value>();
+    let sample = clinker_record::Record::new(
+        output_schema.clone(),
+        vec![clinker_record::Value::Null; output_schema.column_count()],
+    );
+    let writer_workspace = resource_fixtures::csv_workspace_headroom(&sample);
     let full_stage_lower = (ROWS * output_row_bytes) as u64;
     let in_flight_ceiling = (SOURCE_CAPACITY * source_row_bytes
-        + (OUTPUT_CAPACITY + BATCH_SIZE) * output_row_bytes) as u64;
+        + (OUTPUT_CAPACITY + BATCH_SIZE) * output_row_bytes) as u64
+        + writer_workspace;
     assert!(
         report.peak_consumer_usage_bytes <= in_flight_ceiling,
         "fused Transform charged {} bytes at peak — expected <= {} \
-         (source channel + output channel + one batch); per-batch \
+         (source channel + output channel + one batch + writer workspace); per-batch \
          admit/discharge is not bounding the charge to the in-flight set",
         report.peak_consumer_usage_bytes,
         in_flight_ceiling,

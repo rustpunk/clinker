@@ -1,16 +1,904 @@
 use clinker_record::owned_storage::{OwnedKey, SharedStorage};
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use clinker_record::{DocumentContext, Record, Schema, Value};
 
-use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
+use crate::charset::Charset;
+
+use crate::envelope_writer::OutputEnvelopeSpec;
 use crate::error::FormatError;
-use crate::json::writer::clinker_to_json;
+use crate::error::OutputEncodingKind;
 use crate::multi_value::{JoinValues, OnConflict};
+use crate::preparation::{FormatEncoder, OutputOperation, WriterResources, WriterScope};
+use crate::reserved::{ReservedBuffer, ReservedText, ReservedVec};
 use crate::schema::DEFAULT_VALUE_DELIMITER;
-use crate::traits::FormatWriter;
+use crate::traits::{FormatWriter, FormatWriterHandle};
+
+struct PreparedColumn {
+    index: usize,
+    multiple: bool,
+    join: Option<usize>,
+}
+
+fn csv_charset_error(mut error: FormatError) -> FormatError {
+    if let FormatError::OutputEncoding { format, .. } = &mut error {
+        *format = "CSV";
+    }
+    error
+}
+struct PreparedJoin {
+    field: ReservedText,
+    delimiter: ReservedText,
+    escape: ReservedText,
+    policy: OnConflict,
+}
+
+/// Borrowed constructor input. Runtime factories can borrow their validated
+/// policy directly rather than cloning a tree of config strings first.
+pub struct CsvEncoderOptions<'a> {
+    /// Closed byte repertoire for every header, scalar and composite cell.
+    pub charset: Charset,
+    pub delimiter: u8,
+    pub include_header: bool,
+    pub include_engine_stamped: bool,
+    pub lossless: bool,
+    pub join_values: &'a [JoinValues],
+    pub declared_multiple: &'a BTreeSet<String>,
+    pub envelope_header: Option<&'a str>,
+    pub envelope_footer: Option<&'a str>,
+    pub envelope_count: Option<&'a str>,
+}
+impl<'a> From<&'a CsvWriterConfig> for CsvEncoderOptions<'a> {
+    fn from(config: &'a CsvWriterConfig) -> Self {
+        Self {
+            charset: Charset::Utf8,
+            delimiter: config.delimiter,
+            include_header: config.include_header,
+            include_engine_stamped: config.include_engine_stamped,
+            lossless: config.error_on_undeclared_columns,
+            join_values: &config.join_values,
+            declared_multiple: &config.declared_multiple,
+            envelope_header: config
+                .envelope
+                .as_ref()
+                .and_then(|e| e.header_from_doc.as_deref()),
+            envelope_footer: config
+                .envelope
+                .as_ref()
+                .and_then(|e| e.footer_from_doc.as_deref()),
+            envelope_count: config
+                .envelope
+                .as_ref()
+                .and_then(|e| e.footer_record_count_field.as_deref()),
+        }
+    }
+}
+
+/// Immutable admitted policy shared by every writer from one CSV factory.
+#[derive(Clone)]
+pub struct CsvEncoderConfig(SharedStorage<PreparedCsvConfig>);
+struct PreparedCsvConfig {
+    charset: Charset,
+    delimiter: u8,
+    include_header: bool,
+    include_engine_stamped: bool,
+    lossless: bool,
+    joins: ReservedVec<PreparedJoin>,
+    multiple: ReservedVec<ReservedText>,
+    envelope: Option<crate::envelope_writer::PreparedEnvelope>,
+}
+impl CsvEncoderConfig {
+    /// Admit policy text and inventories before copying; schema mappings belong
+    /// to each encoder while this immutable configuration is shared.
+    pub fn new(
+        options: CsvEncoderOptions<'_>,
+        resources: &WriterResources,
+    ) -> Result<Self, FormatError> {
+        let scope = resources.scope()?;
+        let mut joins = ReservedVec::new(scope.allocation().clone());
+        joins.reserve_exact(options.join_values.len())?;
+        for join in options.join_values {
+            joins.push(PreparedJoin {
+                field: admitted_text(&scope, &join.field)?,
+                delimiter: admitted_text(&scope, &join.delimiter)?,
+                escape: admitted_text(&scope, &join.escape)?,
+                policy: join.on_conflict,
+            })?;
+        }
+        let mut multiple = ReservedVec::new(scope.allocation().clone());
+        multiple.reserve_exact(options.declared_multiple.len())?;
+        for name in options.declared_multiple {
+            multiple.push(admitted_text(&scope, name)?)?;
+        }
+        let envelope = crate::envelope_writer::PreparedEnvelope::from_names(
+            options.envelope_header,
+            options.envelope_footer,
+            options.envelope_count,
+            &scope,
+        )?;
+        Ok(Self(SharedStorage::try_new(
+            PreparedCsvConfig {
+                charset: options.charset,
+                delimiter: options.delimiter,
+                include_header: options.include_header,
+                include_engine_stamped: options.include_engine_stamped,
+                lossless: options.lossless,
+                joins,
+                multiple,
+                envelope,
+            },
+            scope.allocation(),
+        )?))
+    }
+}
+
+/// Shared split header. The shared backing is admitted during construction.
+/// Header names and slots are admitted while preparing the operation that emits
+/// the header, and become visible to later writers only after successful delivery.
+#[derive(Clone)]
+pub struct CsvHeaderCapture(SharedStorage<CapturedHeader>);
+struct CapturedHeader {
+    text: Mutex<Option<ReservedVec<ReservedText>>>,
+}
+impl CsvHeaderCapture {
+    pub fn new(resources: &WriterResources) -> Result<Self, FormatError> {
+        let scope = resources.scope()?;
+        let capture = SharedStorage::try_new(
+            CapturedHeader {
+                text: Mutex::new(None),
+            },
+            scope.allocation(),
+        )?;
+        // Some platforms allocate the native mutex on first lock. Establish
+        // that fixed control-block storage before any captured operation.
+        drop(capture.text.lock().unwrap_or_else(|e| e.into_inner()));
+        Ok(Self(capture))
+    }
+}
+
+/// CSV encoder for sealed operations. Borrows schema/input values and retains
+/// only admitted column policy and optional preset header text. Each rendered
+/// cell is counted, admitted, written, and released before the next cell.
+pub struct CsvEncoder {
+    config: CsvEncoderConfig,
+    schema: SharedStorage<Schema>,
+    columns: ReservedVec<PreparedColumn>,
+    header_written: bool,
+    preset: Option<ReservedVec<ReservedText>>,
+    capture: Option<CsvHeaderCapture>,
+    records: u64,
+    scope: WriterScope,
+}
+
+/// Pending counters and admitted header capture move only after delivery;
+/// preparation does not mutate the encoder.
+pub struct CsvPending {
+    header_written: bool,
+    records: u64,
+    captured: Option<ReservedVec<ReservedText>>,
+}
+
+fn csv_io_error(error: csv::Error) -> FormatError {
+    match error.into_kind() {
+        csv::ErrorKind::Io(error) => FormatError::Io(error),
+        _ => crate::preparation::ResourceError::new(
+            crate::preparation::ResourceErrorKind::Authority,
+            0,
+            0,
+        )
+        .into(),
+    }
+}
+
+fn csv_error(field: usize, kind: OutputEncodingKind) -> FormatError {
+    FormatError::OutputEncoding {
+        format: "CSV",
+        field: field + 1,
+        offset: 0,
+        kind,
+        field_name: crate::error::OutputFieldName::new(""),
+        element: None,
+    }
+}
+
+fn admitted_text(scope: &WriterScope, text: &str) -> Result<ReservedText, FormatError> {
+    let mut result = ReservedText::new(scope.allocation().clone());
+    result.push_str(text)?;
+    Ok(result)
+}
+
+impl CsvEncoder {
+    /// Admit the concrete prepared writer before allocation. The returned
+    /// handle keeps that charge until its backing has been deallocated; the
+    /// caller continues to own the destination's separate allocation contract.
+    pub fn into_boxed_writer<W: Write + Send + 'static>(
+        self,
+        destination: W,
+        resources: WriterResources,
+    ) -> Result<FormatWriterHandle, FormatError> {
+        let scope = resources.scope()?;
+        let writer = crate::preparation::PreparedWriter::new(destination, self, resources)?;
+        Ok(FormatWriterHandle::try_new(writer, scope.allocation())?)
+    }
+    /// Config is borrowed only during construction; all retained variable data
+    /// is copied after admission. The caller already owns the compiled schema.
+    pub fn new(
+        schema: SharedStorage<Schema>,
+        config: &CsvWriterConfig,
+        resources: WriterResources,
+    ) -> Result<Self, FormatError> {
+        Self::from_config(
+            schema,
+            CsvEncoderConfig::new(config.into(), &resources)?,
+            resources,
+        )
+    }
+
+    /// Build schema mappings under this writer's scope, sharing already-admitted
+    /// immutable factory policy without copying its strings.
+    pub fn from_config(
+        schema: SharedStorage<Schema>,
+        config: CsvEncoderConfig,
+        resources: WriterResources,
+    ) -> Result<Self, FormatError> {
+        let scope = resources.scope()?;
+        let mut columns = ReservedVec::new(scope.allocation().clone());
+        let count = schema
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                config.0.include_engine_stamped
+                    || schema
+                        .field_metadata(*i)
+                        .is_none_or(|m| !m.is_engine_stamped())
+            })
+            .count();
+        columns.reserve_exact(count)?;
+        for (index, name) in schema.columns().iter().enumerate() {
+            if !config.0.include_engine_stamped
+                && schema
+                    .field_metadata(index)
+                    .is_some_and(|m| m.is_engine_stamped())
+            {
+                continue;
+            }
+            let join = config
+                .0
+                .joins
+                .as_slice()
+                .iter()
+                .position(|join| join.field.as_str() == name.as_ref());
+            columns.push(PreparedColumn {
+                index,
+                multiple: config
+                    .0
+                    .multiple
+                    .as_slice()
+                    .iter()
+                    .any(|field| field.as_str() == name.as_ref()),
+                join,
+            })?;
+        }
+        Ok(Self {
+            config,
+            schema,
+            columns,
+            header_written: false,
+            preset: None,
+            capture: None,
+            records: 0,
+            scope,
+        })
+    }
+
+    /// Attach the same admitted capture to each split encoder before use.
+    pub fn with_header_capture(mut self, capture: CsvHeaderCapture) -> Self {
+        self.capture = Some(capture);
+        self
+    }
+
+    /// Retain an admitted replay header; its bytes join the next record's
+    /// preparation, so an invalid first body cannot publish a header prefix.
+    pub fn set_preset_header(&mut self, header: &[Box<str>]) -> Result<(), FormatError> {
+        let mut pending = ReservedVec::new(self.scope.allocation().clone());
+        pending.reserve_exact(header.len())?;
+        for text in header {
+            pending.push(admitted_text(&self.scope, text)?)?;
+        }
+        self.preset = Some(pending);
+        Ok(())
+    }
+
+    fn text_field(
+        &self,
+        writer: &mut csv::Writer<&mut dyn Write>,
+        text: &str,
+        column: usize,
+        scope: &WriterScope,
+    ) -> Result<(), FormatError> {
+        if self.config.0.charset == Charset::Utf8 {
+            writer.write_field(text.as_bytes()).map_err(csv_io_error)?;
+            return Ok(());
+        }
+        // A cell is indivisible to the CSV quoting API. Count and validate
+        // before admitting its exact encoded layout; no historical capacity
+        // survives this field. Both passes observe cancellation in the sink.
+        let mut count = CellCount {
+            bytes: 0,
+            failure: None,
+            scope,
+        };
+        let counted = self
+            .config
+            .0
+            .charset
+            .encode_to(text, column + 1, &mut count);
+        if let Some(error) = count.failure {
+            return Err(error.into());
+        }
+        counted.map_err(csv_charset_error)?;
+        let mut bytes = ReservedBuffer::new(scope.allocation().clone());
+        bytes.reserve_exact(count.bytes)?;
+        let mut sink = CellBuffer {
+            bytes: &mut bytes,
+            failure: None,
+            scope,
+        };
+        let encoded = self.config.0.charset.encode_to(text, column + 1, &mut sink);
+        if let Some(error) = sink.failure {
+            return Err(error.into());
+        }
+        encoded.map_err(csv_charset_error)?;
+        writer.write_field(bytes.as_slice()).map_err(csv_io_error)?;
+        Ok(())
+    }
+
+    fn cell(
+        &self,
+        writer: &mut csv::Writer<&mut dyn Write>,
+        value: &Value,
+        column: usize,
+        join: Option<&PreparedJoin>,
+        multiple: bool,
+        scope: &WriterScope,
+    ) -> Result<(), FormatError> {
+        if let Value::String(text) = value {
+            return self.text_field(writer, text, column, scope);
+        }
+        if !matches!(value, Value::Array(_) | Value::Map(_)) {
+            return scalar_text(value, column, |text| {
+                self.text_field(writer, text, column, scope)
+            });
+        }
+        if matches!(value, Value::Map(_)) {
+            return Err(csv_error(column, OutputEncodingKind::Map));
+        }
+        if !multiple {
+            return Err(csv_error(column, OutputEncodingKind::Array));
+        }
+        let _json_error = if join.is_some_and(|j| j.policy == OnConflict::EncodeJson) {
+            validate_csv_json(value, column, scope, 0)?;
+            // serde_json 1.0.149 ErrorImpl owns ErrorCode + two usize positions.
+            // ErrorCode has unit variants, Box<str>, or io::Error. This layout
+            // includes a usize discriminant AND both payloads, with their
+            // alignment/padding, so it conservatively covers the sole box.
+            // Validated finite values and decoded keys cannot take ValueSer's
+            // custom-message path. Only allocation-free sink I/O errors remain;
+            // render_csv_array drops the library error before this grant.
+            Some(scope.reserve(std::alloc::Layout::new::<(
+                usize,
+                Box<str>,
+                std::io::Error,
+                usize,
+                usize,
+            )>())?)
+        } else {
+            None
+        };
+        let mut count = CellCount {
+            bytes: 0,
+            failure: None,
+            scope,
+        };
+        let counted = render_csv_array(&mut count, value, column, join);
+        if let Some(error) = count.failure {
+            return Err(error.into());
+        }
+        counted?;
+        let mut bytes = ReservedBuffer::new(scope.allocation().clone());
+        bytes.reserve_exact(count.bytes)?;
+        let mut sink = CellBuffer {
+            bytes: &mut bytes,
+            failure: None,
+            scope,
+        };
+        let rendered = render_csv_array(&mut sink, value, column, join);
+        if let Some(error) = sink.failure {
+            return Err(error.into());
+        }
+        rendered?;
+        // The shared renderer emits UTF-8. Keep that admitted buffer live
+        // while the exact encoded cell is admitted, accounting their overlap.
+        let text = std::str::from_utf8(bytes.as_slice())
+            .map_err(|_| csv_error(column, OutputEncodingKind::Charset))?;
+        self.text_field(writer, text, column, scope)
+    }
+
+    fn section(
+        &self,
+        writer: &mut csv::Writer<&mut dyn Write>,
+        fields: &indexmap::IndexMap<OwnedKey, Value>,
+        count: Option<i64>,
+        scope: &WriterScope,
+    ) -> Result<(), FormatError> {
+        for (index, (name, value)) in fields.iter().enumerate() {
+            self.cell(writer, value, index, None, false, scope)
+                .map_err(|mut error| {
+                    if let FormatError::OutputEncoding { field_name, .. } = &mut error {
+                        *field_name = crate::error::OutputFieldName::new(name.as_str());
+                    }
+                    error
+                })?;
+        }
+        if let Some(count) = count {
+            self.cell(
+                writer,
+                &Value::Integer(count),
+                fields.len(),
+                None,
+                false,
+                scope,
+            )?;
+        }
+        writer
+            .write_record(std::iter::empty::<&[u8]>())
+            .map_err(csv_io_error)?;
+        Ok(())
+    }
+}
+
+// The CSV library flushes buffered bytes from Drop. Once preparation has an
+// outcome, that destructor must not perform new stage work or replace the
+// original error with a later resource failure.
+struct PreparationSink<'a> {
+    stage: &'a mut dyn Write,
+    active: &'a std::cell::Cell<bool>,
+}
+impl Write for PreparationSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.active.get() {
+            self.stage.write(bytes)
+        } else {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.active.get() {
+            self.stage.flush()
+        } else {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+}
+
+impl FormatEncoder for CsvEncoder {
+    type Pending = CsvPending;
+    fn prepare(
+        &self,
+        operation: OutputOperation<'_>,
+        stage: &mut dyn Write,
+        scope: &WriterScope,
+    ) -> Result<CsvPending, FormatError> {
+        // csv 1.4 owns exactly this fixed Vec<u8>; its core state is inline.
+        // The grant outlives the library writer, including its drop-time flush.
+        let _buffer = scope.reserve(std::alloc::Layout::array::<u8>(8192).map_err(|_| {
+            crate::preparation::ResourceError::new(
+                crate::preparation::ResourceErrorKind::Layout,
+                8192,
+                0,
+            )
+        })?)?;
+        // csv 1.4 boxes ErrorKind on a failed write. Unwrap each error while
+        // this exact allocation grant is live, including drop-time flushing.
+        let _error = scope.reserve(std::alloc::Layout::new::<csv::ErrorKind>())?;
+        let active = std::cell::Cell::new(true);
+        let mut sink = PreparationSink {
+            stage,
+            active: &active,
+        };
+        let mut writer = csv::WriterBuilder::new()
+            .delimiter(self.config.0.delimiter)
+            .buffer_capacity(8192)
+            .flexible(true)
+            .from_writer(&mut sink as &mut dyn Write);
+        let result = (|| {
+            let mut pending = CsvPending {
+                header_written: self.header_written,
+                records: self.records,
+                captured: None,
+            };
+            match operation {
+                OutputOperation::Record(record) => {
+                    let capture = self
+                        .capture
+                        .as_ref()
+                        .map(|capture| capture.0.text.lock().unwrap_or_else(|e| e.into_inner()));
+                    if self.config.0.lossless {
+                        for (index, (name, _)) in record.iter_user_fields().enumerate() {
+                            if !self.schema.contains(name) {
+                                return Err(FormatError::OutputEncoding {
+                                    format: "CSV",
+                                    field: index + 1,
+                                    offset: 0,
+                                    kind: OutputEncodingKind::SchemaDrift,
+                                    field_name: crate::error::OutputFieldName::new(name),
+                                    element: None,
+                                });
+                            }
+                        }
+                    }
+                    let replay = capture.as_ref().and_then(|header| header.as_ref());
+                    if !self.header_written
+                        && self.config.0.envelope.is_none()
+                        && (self.config.0.include_header
+                            || self.preset.is_some()
+                            || replay.is_some())
+                    {
+                        // Capture exactly the names this operation emits. A preset
+                        // replaces schema names; suppressed headers publish nothing.
+                        // Keep all copies pending until the complete body delivers.
+                        let mut captured = capture
+                            .as_ref()
+                            .is_some_and(|header| header.is_none())
+                            .then(|| ReservedVec::new(scope.allocation().clone()));
+                        if let Some(header) = &mut captured {
+                            header.reserve_exact(self.columns.len())?;
+                        }
+                        if let Some(preset) = self.preset.as_ref().or(replay) {
+                            if preset.len() != self.columns.len() {
+                                return Err(csv_error(
+                                    self.columns.len(),
+                                    OutputEncodingKind::SchemaDrift,
+                                ));
+                            }
+                            for (index, text) in preset.as_slice().iter().enumerate() {
+                                if let Some(header) = &mut captured {
+                                    header.push(admitted_text(scope, text.as_str())?)?;
+                                }
+                                self.text_field(&mut writer, text.as_str(), index, scope)?;
+                            }
+                        } else {
+                            for column in self.columns.as_slice() {
+                                if let Some(header) = &mut captured {
+                                    header.push(admitted_text(
+                                        scope,
+                                        self.schema.columns()[column.index].as_ref(),
+                                    )?)?;
+                                }
+                                self.text_field(
+                                    &mut writer,
+                                    self.schema.columns()[column.index].as_ref(),
+                                    column.index,
+                                    scope,
+                                )?;
+                            }
+                        }
+                        writer
+                            .write_record(std::iter::empty::<&[u8]>())
+                            .map_err(csv_io_error)?;
+                        pending.header_written = true;
+                        pending.captured = captured;
+                    }
+                    for column in self.columns.as_slice() {
+                        scope.check_cancelled()?;
+                        let value = record
+                            .get(self.schema.columns()[column.index].as_ref())
+                            .unwrap_or(&Value::Null);
+                        self.cell(
+                            &mut writer,
+                            value,
+                            column.index,
+                            column
+                                .join
+                                .map(|index| &self.config.0.joins.as_slice()[index]),
+                            column.multiple,
+                            scope,
+                        )
+                        .map_err(|mut error| {
+                            if let FormatError::OutputEncoding {
+                                field, field_name, ..
+                            } = &mut error
+                            {
+                                let name = self.schema.columns()[column.index].as_ref();
+                                // Resolve against the caller's projected record,
+                                // whose order can differ from this pinned schema.
+                                *field = record
+                                    .schema()
+                                    .columns()
+                                    .iter()
+                                    .position(|column| column.as_ref() == name)
+                                    .map_or(column.index + 1, |index| index + 1);
+                                *field_name = crate::error::OutputFieldName::new(name);
+                            }
+                            error
+                        })?;
+                    }
+                    writer
+                        .write_record(std::iter::empty::<&[u8]>())
+                        .map_err(csv_io_error)?;
+                    pending.records = self.records.saturating_add(1);
+                }
+                OutputOperation::BeginDocument(doc) => {
+                    if let Some(envelope) = &self.config.0.envelope {
+                        if let Some(fields) = envelope.header_fields(doc) {
+                            self.section(&mut writer, fields, None, scope)?;
+                        }
+                        pending.records = 0;
+                    }
+                }
+                OutputOperation::EndDocument(doc) => {
+                    if let Some(envelope) = &self.config.0.envelope
+                        && let Some(fields) = envelope.footer_fields(doc)
+                    {
+                        self.section(
+                            &mut writer,
+                            fields,
+                            envelope.has_count().then_some(self.records as i64),
+                            scope,
+                        )?;
+                    }
+                }
+                OutputOperation::Finalize => {}
+            }
+            writer.flush()?;
+            Ok(pending)
+        })();
+        active.set(false);
+        drop(writer);
+        result
+    }
+    fn commit(&mut self, pending: CsvPending) {
+        self.header_written = pending.header_written;
+        self.records = pending.records;
+        if let (Some(capture), Some(header)) = (&self.capture, pending.captured) {
+            let mut stored = capture.0.text.lock().unwrap_or_else(|e| e.into_inner());
+            if stored.is_none() {
+                *stored = Some(header);
+            }
+        }
+    }
+}
+
+impl<W: Write + Send> FormatWriter for crate::preparation::PreparedWriter<W, CsvEncoder> {
+    fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
+        self.write_operation(OutputOperation::Record(record))
+    }
+    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        self.write_operation(OutputOperation::BeginDocument(doc))
+    }
+    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        self.write_operation(OutputOperation::EndDocument(doc))
+    }
+    fn flush(&mut self) -> Result<(), FormatError> {
+        crate::preparation::PreparedWriter::flush(self)
+    }
+    fn flush_bytes(&mut self) -> Result<(), FormatError> {
+        crate::preparation::PreparedWriter::flush_bytes(self)
+    }
+}
+
+// Scalar text is bounded by the existing numeric/date types. Strings bypass it.
+/// Borrow exact scalar CSV text for a caller-owned operation. Numeric workspace
+/// is fixed on the stack; any allocation in `action` belongs to its caller.
+pub fn scalar_text<T>(
+    value: &Value,
+    column: usize,
+    action: impl FnOnce(&str) -> Result<T, FormatError>,
+) -> Result<T, FormatError> {
+    use std::fmt::Write as _;
+    struct Text {
+        bytes: [u8; 1024],
+        len: usize,
+    }
+    impl std::fmt::Write for Text {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            let end = self
+                .len
+                .checked_add(text.len())
+                .filter(|end| *end <= self.bytes.len())
+                .ok_or(std::fmt::Error)?;
+            self.bytes[self.len..end].copy_from_slice(text.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+    let mut text = Text {
+        bytes: [0; 1024],
+        len: 0,
+    };
+    let result = match value {
+        Value::Null => return action(""),
+        Value::String(s) => return action(s.as_str()),
+        Value::Bool(v) => return action(if *v { "true" } else { "false" }),
+        Value::Integer(v) => write!(text, "{v}"),
+        Value::Float(v) => write!(text, "{v}"),
+        Value::Decimal(v) => write!(text, "{v}"),
+        Value::Date(v) => v.format("%Y-%m-%d").write_to(&mut text),
+        Value::DateTime(v) => v.format("%Y-%m-%dT%H:%M:%S%.f").write_to(&mut text),
+        Value::Array(_) => return Err(csv_error(column, OutputEncodingKind::Array)),
+        Value::Map(_) => return Err(csv_error(column, OutputEncodingKind::Map)),
+    };
+    result.map_err(|_| {
+        crate::preparation::ResourceError::new(
+            crate::preparation::ResourceErrorKind::Layout,
+            1024,
+            0,
+        )
+    })?;
+    action(
+        std::str::from_utf8(&text.bytes[..text.len])
+            .map_err(|_| csv_error(column, OutputEncodingKind::Charset))?,
+    )
+}
+
+// Preserve typed resource evidence outside the library's admitted error box.
+// Return immediately on the failed chunk so cancellation never drains a value.
+struct CellCount<'a> {
+    bytes: usize,
+    failure: Option<crate::preparation::ResourceError>,
+    scope: &'a WriterScope,
+}
+impl Write for CellCount<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let result = self.scope.check_cancelled().and_then(|()| {
+            self.bytes.checked_add(bytes.len()).ok_or_else(|| {
+                crate::preparation::ResourceError::new(
+                    crate::preparation::ResourceErrorKind::Layout,
+                    usize::MAX,
+                    0,
+                )
+            })
+        });
+        self.bytes = result.map_err(|error| {
+            self.failure = Some(error);
+            std::io::Error::from(std::io::ErrorKind::Other)
+        })?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+struct CellBuffer<'a> {
+    bytes: &'a mut ReservedBuffer,
+    failure: Option<crate::preparation::ResourceError>,
+    scope: &'a WriterScope,
+}
+impl Write for CellBuffer<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        for chunk in bytes.chunks(8192) {
+            self.scope
+                .check_cancelled()
+                .and_then(|()| self.bytes.extend_from_slice(chunk))
+                .map_err(|error| {
+                    self.failure = Some(error);
+                    std::io::Error::from(std::io::ErrorKind::Other)
+                })?;
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn render_csv_array(
+    out: &mut dyn Write,
+    value: &Value,
+    column: usize,
+    join: Option<&PreparedJoin>,
+) -> Result<(), FormatError> {
+    let Value::Array(items) = value else {
+        return Err(csv_error(column, OutputEncodingKind::Array));
+    };
+    let policy = join.map_or(OnConflict::Error, |j| j.policy);
+    if policy == OnConflict::EncodeJson {
+        return serde_json::to_writer(out, &crate::json::writer::ValueSer(value))
+            .map_err(|_| csv_error(column, OutputEncodingKind::Json));
+    }
+    let delimiter = join.map_or(DEFAULT_VALUE_DELIMITER, |j| j.delimiter.as_str());
+    let escape = join.map_or("\\", |j| j.escape.as_str());
+    for (index, item) in items.iter().enumerate() {
+        if index != 0 {
+            out.write_all(delimiter.as_bytes())?;
+        }
+        scalar_text(item, column, |text| {
+            if policy == OnConflict::Error && text.contains(delimiter) {
+                let mut error = csv_error(column, OutputEncodingKind::JoinCollision);
+                if let FormatError::OutputEncoding {
+                    element, offset, ..
+                } = &mut error
+                {
+                    *element = std::num::NonZeroUsize::new(index + 1);
+                    *offset = text.find(delimiter).unwrap_or(0);
+                }
+                return Err(error);
+            }
+            if policy == OnConflict::Escape
+                && let (Some(esc), Some(delim)) = (escape.chars().next(), delimiter.chars().next())
+            {
+                for ch in text.chars() {
+                    let mut bytes = [0; 4];
+                    if ch == esc || ch == delim {
+                        out.write_all(esc.encode_utf8(&mut bytes).as_bytes())?;
+                    }
+                    out.write_all(ch.encode_utf8(&mut bytes).as_bytes())?;
+                }
+                return Ok(());
+            }
+            out.write_all(text.as_bytes())?;
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_csv_json(
+    value: &Value,
+    field: usize,
+    scope: &WriterScope,
+    depth: usize,
+) -> Result<(), FormatError> {
+    use clinker_record::nested_key::{MAX_NESTED_VALUE_DEPTH, NestedKey};
+    scope.check_cancelled()?;
+    match value {
+        Value::Float(n) if !n.is_finite() => {
+            return Err(csv_error(field, OutputEncodingKind::Json));
+        }
+        Value::Array(values) => {
+            if depth >= MAX_NESTED_VALUE_DEPTH {
+                return Err(csv_error(field, OutputEncodingKind::Json));
+            }
+            for value in values {
+                validate_csv_json(value, field, scope, depth + 1)?;
+            }
+        }
+        Value::Map(values) => {
+            if depth >= MAX_NESTED_VALUE_DEPTH {
+                return Err(csv_error(field, OutputEncodingKind::Json));
+            }
+            for (position, (key, value)) in values.iter().enumerate() {
+                // Valid keys borrow. A malformed key's existing decoder owns a
+                // copy only on error; admit that exact diagnostic allocation.
+                let _diagnostic =
+                    scope.reserve(std::alloc::Layout::array::<u8>(key.len()).map_err(|_| {
+                        crate::preparation::ResourceError::new(
+                            crate::preparation::ResourceErrorKind::Layout,
+                            key.len(),
+                            0,
+                        )
+                    })?)?;
+                let decoded = NestedKey::decode(key)
+                    .map_err(|_| csv_error(field, OutputEncodingKind::Json))?;
+                for prior in values.keys().take(position) {
+                    scope.check_cancelled()?;
+                    let prior = NestedKey::decode(prior)
+                        .map_err(|_| csv_error(field, OutputEncodingKind::Json))?;
+                    if prior.text == decoded.text {
+                        return Err(csv_error(field, OutputEncodingKind::Json));
+                    }
+                }
+                drop(_diagnostic);
+                validate_csv_json(value, field, scope, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 /// Configuration for the CSV writer.
 #[derive(Clone)]
@@ -70,533 +958,65 @@ impl Default for CsvWriterConfig {
     }
 }
 
-/// Streaming CSV writer wrapping `csv::Writer`.
-///
-/// Emits cells in the writer's pinned schema order — never the
-/// record's own schema order — so values stay aligned with the header
-/// even when an upstream projection or widening reordered the
-/// record's fields. Fields the record lacks emit an empty cell.
-/// Header row is written on first `write_record()` call if
-/// `include_header` is true.
-///
-/// Under `reconstruct_envelope`, `begin_document` emits the header section's
-/// field values as one CSV row before the document's body, and `end_document`
-/// emits the footer section's values (plus the streaming record count) as one
-/// CSV row after it — no document is buffered, so framing stays O(1-record).
-pub struct CsvWriter<W: Write> {
-    inner: csv::Writer<W>,
-    schema: SharedStorage<Schema>,
-    config: CsvWriterConfig,
-    header_written: bool,
-    /// Indices into `schema.columns()` of the columns actually emitted (after
-    /// engine-stamped filtering), computed once at construction. Both the
-    /// header row and every body row derive their column set from this, so no
-    /// per-record filtering allocation is needed.
-    column_indices: Vec<usize>,
-    /// Reusable per-record cell buffer, one `String` per emitted column. Each
-    /// row clears and rewrites these in place, retaining their capacity across
-    /// records rather than allocating a fresh row vector every record.
-    row_buf: Vec<String>,
-    /// Per-emitted-column `join_values` override, index-aligned to
-    /// `column_indices`: `Some(entry)` for a column a `join_values` entry names,
-    /// `None` otherwise. Built once at construction so a body row's array cell is
-    /// a positional lookup rather than a name scan over `config.join_values` per
-    /// column per record (mirrors the CSV reader's `split_specs`).
-    join_overrides: Vec<Option<JoinValues>>,
-    /// Per-emitted-column declaration bit, aligned to `column_indices` and
-    /// resolved once at construction so the record hot path performs no name
-    /// lookup or allocation.
-    declared_multiple: Vec<bool>,
-    /// Per-document envelope framer, present only when `config.envelope` is.
-    framer: Option<EnvelopeFramer>,
-}
-
-impl<W: Write> CsvWriter<W> {
-    pub fn new(writer: W, schema: SharedStorage<Schema>, config: CsvWriterConfig) -> Self {
-        let framer = config
-            .envelope
-            .clone()
-            .and_then(OutputEnvelopeSpec::into_framer);
-        // Envelope header/footer rows carry a different field count than the
-        // body rows (a section's fields vs the writer schema), so the writer
-        // must accept ragged records when framing is active. The non-envelope
-        // path keeps the strict equal-length default; body rows match the
-        // header length by construction (both derive from the pinned schema),
-        // so the guard is a backstop rather than a drift detector.
-        let inner = csv::WriterBuilder::new()
-            .delimiter(config.delimiter)
-            .flexible(framer.is_some())
-            .from_writer(writer);
-        let column_indices = filtered_column_indices(&schema, config.include_engine_stamped);
-        let row_buf = vec![String::new(); column_indices.len()];
-        let join_overrides: Vec<Option<JoinValues>> = column_indices
-            .iter()
-            .map(|&idx| {
-                let name = schema.columns()[idx].as_ref();
-                config.join_values.iter().find(|j| j.field == name).cloned()
-            })
-            .collect();
-        let declared_multiple = column_indices
-            .iter()
-            .map(|&idx| {
-                config
-                    .declared_multiple
-                    .contains(schema.columns()[idx].as_ref())
-            })
-            .collect();
-        Self {
-            inner,
-            schema,
-            config,
-            header_written: false,
-            column_indices,
-            row_buf,
-            join_overrides,
-            declared_multiple,
-            framer,
-        }
-    }
-
-    /// Emit one envelope section's field values (in declared order) as a CSV
-    /// row, optionally appending a trailing computed-count cell.
-    fn write_section_row(
-        inner: &mut csv::Writer<W>,
-        fields: &indexmap::IndexMap<OwnedKey, Value>,
-        count: Option<(&str, i64)>,
-    ) -> Result<(), FormatError> {
-        let mut cells: Vec<String> = Vec::new();
-        for (name, value) in fields {
-            cells.push(value_to_csv_cell(name, value)?);
-        }
-        if let Some((_field, n)) = count {
-            cells.push(n.to_string());
-        }
-        inner.write_record(&cells)?;
-        Ok(())
-    }
-
-    /// Write a pre-captured header row, bypassing first-record discovery.
-    ///
-    /// Used by `SplittingWriter` on rotation to ensure all split files
-    /// have identical headers (captured from the first file).
-    pub fn write_preset_header(&mut self, header: &[Box<str>]) -> Result<(), FormatError> {
-        let refs: Vec<&str> = header.iter().map(|h| h.as_ref()).collect();
-        self.inner.write_record(&refs)?;
-        self.header_written = true;
-        Ok(())
-    }
-
-    /// Borrow the underlying writer (e.g. for byte-count inspection).
-    pub fn get_ref(&self) -> &W {
-        self.inner.get_ref()
-    }
-}
-
-impl<W: Write + Send> FormatWriter for CsvWriter<W> {
-    fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        // In lossless mode (`include_unmapped: true`), a record column with no
-        // header slot is a data-loss drift that must fail loudly rather than
-        // be silently written narrower (issue #805). This never trips on the
-        // buffered Output arm — its header is the batch union of every
-        // record's columns — but it is the loud-drift backstop on the
-        // bounded-memory paths that pin the header to the first record (the
-        // streaming fused arm and envelope framing), where a union cannot be
-        // pre-scanned. `iter_user_fields` excludes engine stamps and the
-        // `$widened` sidecar, so only a genuine undeclared column trips it.
-        // When the flag is off, the pinned schema stays a deliberate column
-        // contract (extra fields are not written) — the `include_unmapped:
-        // false` narrowing behavior.
-        if self.config.error_on_undeclared_columns {
-            for (name, _) in record.iter_user_fields() {
-                if !self.schema.contains(name) {
-                    return Err(FormatError::SchemaDrift {
-                        format: "CSV",
-                        column: name.to_string(),
-                    });
-                }
-            }
-        }
-
-        // Header is built from the writer's pinned schema. Engine-stamped
-        // columns (today: `$ck.<field>`) are stripped unless the Output
-        // node opts in.
-        //
-        // Under envelope framing the schema column-header row is SUPPRESSED:
-        // it would otherwise emit once, before the first document's envelope
-        // header row, giving documents inconsistent layouts (header row only
-        // on the first). The per-document envelope header section replaces it.
-        if self.config.include_header && !self.header_written && self.framer.is_none() {
-            // One-time header row, derived from the precomputed column indices.
-            let header: Vec<&str> = self
-                .column_indices
-                .iter()
-                .map(|&i| self.schema.columns()[i].as_ref())
-                .collect();
-            self.inner.write_record(&header)?;
-            self.header_written = true;
-        }
-
-        // Body cells follow the writer's pinned schema — the same column set
-        // and order the header row was built from — not the record's own
-        // schema, which an upstream projection or widening may order
-        // differently for the same fields. Fields the record lacks emit an
-        // empty cell (an explicit Null), matching the fixed-width writer's
-        // missing-field policy. Each cell is written into the reusable row
-        // buffer (cleared first, so a failed map cell never leaves stale bytes).
-        let Self {
-            inner,
-            schema,
-            column_indices,
-            row_buf,
-            join_overrides,
-            declared_multiple,
-            framer,
-            ..
-        } = self;
-        let columns = schema.columns();
-        for (((slot, &idx), join), is_multiple) in row_buf
-            .iter_mut()
-            .zip(column_indices.iter())
-            .zip(join_overrides.iter())
-            .zip(declared_multiple.iter())
-        {
-            let col = columns[idx].as_ref();
-            slot.clear();
-            if let Some(v) = record.get(col) {
-                write_csv_cell(slot, col, v, join.as_ref(), *is_multiple)?;
-            }
-        }
-
-        inner.write_record(&*row_buf)?;
-        if let Some(framer) = framer.as_mut() {
-            framer.count_record();
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<(), FormatError> {
-        self.inner.flush()?;
-        Ok(())
-    }
-
-    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
-        let Some(framer) = self.framer.as_mut() else {
-            return Ok(());
-        };
-        framer.begin();
-        // Only emit a header row when the document actually carries the
-        // configured section — a missing section writes nothing.
-        if let Some(fields) = framer.header_fields(doc) {
-            Self::write_section_row(&mut self.inner, fields, None)?;
-        }
-        Ok(())
-    }
-
-    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
-        let Some(framer) = self.framer.as_ref() else {
-            return Ok(());
-        };
-        // Likewise the footer: emit only when the configured section is
-        // present; the computed count rides the present footer section.
-        if let Some(fields) = framer.footer_fields(doc) {
-            let count = framer.footer_count();
-            Self::write_section_row(&mut self.inner, fields, count)?;
-        }
-        Ok(())
-    }
-}
-
-/// CSV writer wrapper that captures the header (schema columns only)
-/// from the first record into shared state for replay on split rotation.
-///
-/// Only used by the CSV writer factory when splitting is enabled.
-/// Subsequent split files receive the captured header via `write_preset_header()`.
-/// Non-CSV formats do not need this — their factories are stateless.
-pub struct HeaderCapturingCsvWriter<W: Write> {
-    inner: CsvWriter<W>,
-    schema: SharedStorage<Schema>,
-    shared_header: Arc<Mutex<Option<Vec<Box<str>>>>>,
-    captured: bool,
-}
-
-impl<W: Write> HeaderCapturingCsvWriter<W> {
-    pub fn new(
-        inner: CsvWriter<W>,
-        schema: SharedStorage<Schema>,
-        shared_header: Arc<Mutex<Option<Vec<Box<str>>>>>,
-    ) -> Self {
-        Self {
-            inner,
-            schema,
-            shared_header,
-            captured: false,
-        }
-    }
-}
-
-impl<W: Write + Send> FormatWriter for HeaderCapturingCsvWriter<W> {
-    fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        if !self.captured {
-            // Capture header so split rotations replay the same column
-            // set; engine-stamped columns are filtered identically to
-            // the inner CSV writer.
-            let include = self.inner.config.include_engine_stamped;
-            let header: Vec<Box<str>> = self
-                .schema
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| {
-                    include
-                        || self
-                            .schema
-                            .field_metadata(*i)
-                            .is_none_or(|m| !m.is_engine_stamped())
-                })
-                .map(|(_, name)| Box::<str>::from(name.as_ref()))
-                .collect();
-            *self.shared_header.lock().unwrap() = Some(header);
-            self.captured = true;
-        }
-        self.inner.write_record(record)
-    }
-
-    fn flush(&mut self) -> Result<(), FormatError> {
-        self.inner.flush()
-    }
-
-    /// Forward the non-finalizing drain to the inner CSV writer so byte-limit
-    /// split accounting sees the true on-disk size (see the wrapper-delegation
-    /// contract on [`FormatWriter::flush_bytes`]).
-    fn flush_bytes(&mut self) -> Result<(), FormatError> {
-        self.inner.flush_bytes()
-    }
-
-    /// Forward per-document opening framing to the inner CSV writer; without
-    /// this the envelope header row would be silently dropped when a split CSV
-    /// output reconstructs an envelope.
-    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
-        self.inner.begin_document(doc)
-    }
-
-    /// Forward per-document closing framing to the inner CSV writer; see
-    /// [`Self::begin_document`].
-    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
-        self.inner.end_document(doc)
-    }
-
-    fn bytes_written(&self) -> Option<u64> {
-        self.inner.bytes_written()
-    }
-}
-
-/// The indices into `schema.columns()` of the columns the CSV writer emits,
-/// after filtering engine-stamped columns unless opted in. Computed once and
-/// reused for both the header row and every body row.
-fn filtered_column_indices(
-    schema: &SharedStorage<Schema>,
-    include_engine_stamped: bool,
-) -> Vec<usize> {
-    schema
-        .columns()
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| {
-            include_engine_stamped
-                || schema
-                    .field_metadata(*i)
-                    .is_none_or(|m| !m.is_engine_stamped())
-        })
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// Serialize a Value into a CSV cell string for an envelope `$doc` section row
-/// (not the record hot path). Envelope section values are document metadata, not
-/// `multiple:` data columns, so this renders scalars and rejects an `Array`/`Map`
-/// loudly via [`write_scalar_cell`] — a section value that is a collection is a
-/// misroute, and joining it silently would ship malformed envelope output.
-fn value_to_csv_cell(col: &str, value: &Value) -> Result<String, FormatError> {
-    let mut buf = String::new();
-    write_scalar_cell(&mut buf, col, value)?;
-    Ok(buf)
-}
-
-/// Append a Value's CSV cell rendering to `buf`. Sharing one renderer keeps the
-/// record hot path and the envelope section path byte-identical.
-///
-/// A `Value::Array` is a `multiple:` field: it is JOINED into one delimited cell
-/// per the column's `join_values` policy (`join`, defaulting to `;` /
-/// `on_conflict: error` when the column has no entry). See [`write_joined_cell`].
-///
-/// `Value::Map` still has no canonical scalar serialization for a CSV cell
-/// (silently JSON-encoding it hides routing bugs — e.g. a `$widened` sidecar
-/// reaching the writer without the projection layer's `include_unmapped: true`
-/// expansion), so it returns `FormatError::UnserializableMapValue`. CSV is the
-/// single point of truth for map rejection on this path; there is no upstream
-/// pre-walk.
-fn write_csv_cell(
-    buf: &mut String,
-    col: &str,
-    value: &Value,
-    join: Option<&JoinValues>,
-    is_multiple: bool,
-) -> Result<(), FormatError> {
-    match value {
-        Value::Array(items) if is_multiple => write_joined_cell(buf, col, value, items, join),
-        Value::Array(_) => Err(FormatError::UnserializableArrayValue {
-            format: "CSV",
-            column: col.to_string(),
-        }),
-        Value::Map(_) => Err(FormatError::UnserializableMapValue {
-            format: "CSV",
-            column: col.to_string(),
-        }),
-        scalar => write_scalar_cell(buf, col, scalar),
-    }
-}
-
-/// Render one scalar `Value` into a CSV cell. A `Value::Array`/`Value::Map`
-/// reaching here is a nested element inside a `multiple:` field (a flat cell
-/// cannot hold nested structure) and is rejected — the same misroute detection
-/// the top-level cell renderer applies.
-fn write_scalar_cell(buf: &mut String, col: &str, value: &Value) -> Result<(), FormatError> {
-    use std::fmt::Write as _;
-    match value {
-        Value::Null => {}
-        Value::Bool(b) => buf.push_str(if *b { "true" } else { "false" }),
-        Value::Integer(n) => {
-            let _ = write!(buf, "{n}");
-        }
-        Value::Float(f) => {
-            let _ = write!(buf, "{f}");
-        }
-        // A decimal carries its own (column) scale; Display preserves it.
-        Value::Decimal(d) => {
-            let _ = write!(buf, "{d}");
-        }
-        Value::String(s) => buf.push_str(s.as_str()),
-        Value::Date(d) => {
-            let _ = write!(buf, "{}", d.format("%Y-%m-%d"));
-        }
-        // `%.f` appends the fractional second only when the sub-second field is
-        // non-zero, and trims to 3/6/9 digits — so a whole-second datetime stays
-        // byte-identical to the plain `%Y-%m-%dT%H:%M:%S` rendering while
-        // millisecond/microsecond/nanosecond precision survives to text (#883).
-        Value::DateTime(dt) => {
-            let _ = write!(buf, "{}", dt.format("%Y-%m-%dT%H:%M:%S%.f"));
-        }
-        Value::Array(_) => {
-            return Err(FormatError::UnserializableArrayValue {
-                format: "CSV",
-                column: col.to_string(),
-            });
-        }
-        Value::Map(_) => {
-            return Err(FormatError::UnserializableMapValue {
-                format: "CSV",
-                column: col.to_string(),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Join a `multiple:` field's values into one delimited CSV cell.
-///
-/// `join` supplies the delimiter, collision policy, and escape character; when
-/// the column has no `join_values` entry the defaults apply (`;`,
-/// `on_conflict: error`, backslash escape). The three policies:
-///
-/// - `error`: if any rendered value contains the delimiter, refuse the record
-///   with [`FormatError::MultiValueDelimiterCollision`] (routed to the DLQ by
-///   the sink) rather than emit a cell that would split back wrongly.
-/// - `escape`: escape both the delimiter and the escape character inside each
-///   value, invertible by a matching `split_values` `escape:`.
-/// - `encode_json`: emit the whole field as an embedded JSON array (via the
-///   shared [`clinker_to_json`]), recovered by a matching `split_values`
-///   `json: true`. Lossless for any value.
-///
-/// Under `error` and `escape` a nested `Value::Array`/`Value::Map` element is
-/// rejected — a flat delimited cell cannot hold nested structure. `encode_json`
-/// serializes nested structure as nested JSON, so it accepts it.
-fn write_joined_cell(
-    buf: &mut String,
-    col: &str,
-    value: &Value,
-    items: &[Value],
-    join: Option<&JoinValues>,
-) -> Result<(), FormatError> {
-    let delimiter = join.map_or(DEFAULT_VALUE_DELIMITER, |j| j.delimiter.as_str());
-    let on_conflict = join.map_or(OnConflict::Error, |j| j.on_conflict);
-    let escape = join.map_or("\\", |j| j.escape.as_str());
-
-    if on_conflict == OnConflict::EncodeJson {
-        // The whole field becomes a JSON array. `clinker_to_json` walks the
-        // array (rejecting a non-finite float the same way the JSON writer
-        // does); a nested element serializes as nested JSON, which is lossless.
-        let json = clinker_to_json(value)?;
-        let text = serde_json::to_string(&json).map_err(|e| {
-            FormatError::Json(format!("encode_json for column {col:?} failed: {e}"))
-        })?;
-        buf.push_str(&text);
-        return Ok(());
-    }
-
-    let mut elem = String::new();
-    // `encode_json` returned above, so only `escape` and `error` reach the join
-    // loop. `escape` rewrites each value into `escaped`; `error` uses the value
-    // verbatim after checking for a delimiter collision.
-    let escaping = on_conflict == OnConflict::Escape;
-    let mut escaped = String::new();
-    for (i, item) in items.iter().enumerate() {
-        elem.clear();
-        write_scalar_cell(&mut elem, col, item)?;
-        let piece: &str = if escaping {
-            escaped.clear();
-            escape_into(&elem, delimiter, escape, &mut escaped);
-            escaped.as_str()
-        } else if elem.contains(delimiter) {
-            return Err(FormatError::MultiValueDelimiterCollision {
-                format: "CSV",
-                column: col.to_string(),
-                value: elem,
-            });
-        } else {
-            elem.as_str()
-        };
-        if i > 0 {
-            buf.push_str(delimiter);
-        }
-        buf.push_str(piece);
-    }
-    Ok(())
-}
-
-/// Append `text` to `out`, prefixing each delimiter and each escape character
-/// with the escape character. The inverse of the reader's un-escaping split, so
-/// a value carrying the delimiter (or the escape char itself) round-trips
-/// exactly. Delimiter and escape are treated as single characters (their first
-/// `char`); the plan-time gate rejects a multi-character escape.
-fn escape_into(text: &str, delimiter: &str, escape: &str, out: &mut String) {
-    let (Some(esc), Some(delim)) = (escape.chars().next(), delimiter.chars().next()) else {
-        out.push_str(text);
-        return;
-    };
-    for c in text.chars() {
-        if c == esc || c == delim {
-            out.push(esc);
-        }
-        out.push(c);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::csv::reader::{CsvReader, CsvReaderConfig};
     use crate::traits::FormatReader;
     use clinker_record::owned_storage::{OwnedMap, OwnedValues};
+    use std::sync::Arc;
+
+    #[test]
+    fn csv_json_count_cancellation_stops_serialization_early() {
+        use crate::preparation::{
+            AllocationAuthority, AllocationLease, OperationStage, OwnerId, ResourceAuthority,
+            ResourceError, ResourceErrorKind,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CancelAfter(AtomicUsize);
+        impl AllocationAuthority for CancelAfter {
+            fn try_reserve(
+                self: Arc<Self>,
+                _: OwnerId,
+                _: std::alloc::Layout,
+            ) -> Result<AllocationLease, ResourceError> {
+                Err(ResourceError::new(ResourceErrorKind::Budget, 1, 0))
+            }
+            fn release(&self, _: OwnerId, _: usize) {}
+            fn check_cancelled(&self) -> Result<(), ResourceError> {
+                if self.0.fetch_add(1, Ordering::Relaxed) >= 4 {
+                    Err(ResourceError::new(ResourceErrorKind::Cancelled, 0, 0))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl ResourceAuthority for CancelAfter {
+            fn create_stage(
+                self: Arc<Self>,
+                _: WriterScope,
+            ) -> Result<OperationStage, FormatError> {
+                Err(ResourceError::new(ResourceErrorKind::Budget, 1, 0).into())
+            }
+        }
+        let authority = Arc::new(CancelAfter(AtomicUsize::new(0)));
+        let scope = WriterResources::new(authority.clone()).scope().unwrap();
+        authority.0.store(0, Ordering::Relaxed);
+        let value = Value::Array(OwnedValues::from_vec(vec![Value::Integer(7); 10_000]));
+        let mut sink = CellCount {
+            bytes: 0,
+            failure: None,
+            scope: &scope,
+        };
+        assert!(serde_json::to_writer(&mut sink, &crate::json::writer::ValueSer(&value)).is_err());
+        assert_eq!(sink.failure.unwrap().kind, ResourceErrorKind::Cancelled);
+        assert_eq!(
+            authority.0.load(Ordering::Relaxed),
+            5,
+            "stop at the first failed chunk, without traversing the remaining array"
+        );
+        assert!(sink.bytes < 32);
+    }
 
     fn make_schema(cols: &[&str]) -> SharedStorage<Schema> {
         SharedStorage::from_arc(Arc::new(Schema::new(
@@ -608,6 +1028,18 @@ mod tests {
         Record::new(schema.clone(), values)
     }
 
+    fn prepared_writer<W: Write>(
+        destination: W,
+        schema: SharedStorage<Schema>,
+        config: CsvWriterConfig,
+    ) -> crate::preparation::PreparedWriter<W, CsvEncoder> {
+        let provider = crate::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+        );
+        let encoder = CsvEncoder::new(schema, &config, provider.resources()).unwrap();
+        crate::preparation::PreparedWriter::new(destination, encoder, provider.resources()).unwrap()
+    }
+
     fn write_to_string(
         schema: &SharedStorage<Schema>,
         config: CsvWriterConfig,
@@ -615,7 +1047,7 @@ mod tests {
     ) -> String {
         let mut buf = Vec::new();
         {
-            let mut writer = CsvWriter::new(&mut buf, schema.clone(), config);
+            let mut writer = prepared_writer(&mut buf, schema.clone(), config);
             for r in records {
                 writer.write_record(r).unwrap();
             }
@@ -935,11 +1367,9 @@ mod tests {
     }
 
     /// CSV writer rejects `Value::Map` payloads with
-    /// `FormatError::UnserializableMapValue`. The pre-walk in
-    /// `write_record` catches the misroute (e.g. a `$widened`
-    /// sidecar reaching the writer without `include_unmapped: true`
-    /// expansion) before the value-to-cell function silently
-    /// JSON-encodes the map into a single CSV cell.
+    /// `OutputEncodingKind::Map`. Preparing the record catches a misroute
+    /// (e.g. a `$widened` sidecar reaching the writer without
+    /// `include_unmapped: true` expansion) before destination delivery.
     #[test]
     fn test_csv_writer_rejects_map_value() {
         use indexmap::IndexMap;
@@ -952,14 +1382,24 @@ mod tests {
             vec![Value::Integer(7), Value::Map(OwnedMap::from_map(sidecar))],
         );
         let mut buf = Vec::new();
-        let mut writer = CsvWriter::new(&mut buf, schema.clone(), CsvWriterConfig::default());
+        let mut writer = prepared_writer(&mut buf, schema.clone(), CsvWriterConfig::default());
         let err = writer.write_record(&record).unwrap_err();
         match err {
-            FormatError::UnserializableMapValue { format, column } => {
+            FormatError::OutputEncoding {
+                format,
+                field,
+                offset,
+                kind: OutputEncodingKind::Map,
+                field_name,
+                element,
+            } => {
                 assert_eq!(format, "CSV");
-                assert_eq!(column, "payload");
+                assert_eq!(field_name.to_string(), "payload");
+                assert_eq!(field, 2);
+                assert_eq!(offset, 0);
+                assert_eq!(element, None);
             }
-            other => panic!("expected UnserializableMapValue, got {other:?}"),
+            other => panic!("expected CSV map rejection, got {other:?}"),
         }
     }
 
@@ -1051,7 +1491,7 @@ mod tests {
 
     /// The central AC#2 test at the writer boundary: a value that contains the
     /// delimiter under `on_conflict: error` refuses the record with a
-    /// `MultiValueDelimiterCollision` naming the field and the offending value,
+    /// `OutputEncodingKind::JoinCollision` locating the field and offending value,
     /// and no corrupted body cell is emitted.
     #[test]
     fn join_values_on_conflict_error_names_field_and_value() {
@@ -1064,20 +1504,32 @@ mod tests {
             ]))],
         );
         let mut buf = Vec::new();
-        let mut writer = CsvWriter::new(&mut buf, schema.clone(), declared_config(&["tags"]));
+        let mut writer = prepared_writer(&mut buf, schema.clone(), declared_config(&["tags"]));
         let err = writer.write_record(&record).unwrap_err();
         assert!(err.is_join_collision());
         match err {
-            FormatError::MultiValueDelimiterCollision {
+            FormatError::OutputEncoding {
                 format,
-                column,
-                value,
+                field,
+                offset,
+                kind: OutputEncodingKind::JoinCollision,
+                field_name,
+                element,
             } => {
                 assert_eq!(format, "CSV");
-                assert_eq!(column, "tags");
-                assert_eq!(value, "a;b");
+                assert_eq!(field_name.to_string(), "tags");
+                assert_eq!(field, 1);
+                assert_eq!(offset, 1);
+                assert_eq!(element.map(std::num::NonZeroUsize::get), Some(1));
+                let Value::Array(values) = &record.values()[field - 1] else {
+                    panic!("collision must identify the original array field");
+                };
+                assert_eq!(
+                    values[element.unwrap().get() - 1],
+                    Value::String("a;b".into())
+                );
             }
-            other => panic!("expected MultiValueDelimiterCollision, got {other:?}"),
+            other => panic!("expected CSV join collision, got {other:?}"),
         }
         drop(writer);
         assert!(
@@ -1185,7 +1637,7 @@ mod tests {
 
         // error: the ';' inside "a,b;c" collides.
         let mut buf = Vec::new();
-        let mut w = CsvWriter::new(&mut buf, schema.clone(), declared_config(&["tags"]));
+        let mut w = prepared_writer(&mut buf, schema.clone(), declared_config(&["tags"]));
         assert!(w.write_record(&record).unwrap_err().is_join_collision());
 
         // escape: round-trips through the reader despite the CSV comma-quoting.
@@ -1256,18 +1708,42 @@ mod tests {
     /// silently joined the way a record cell is.
     #[test]
     fn envelope_section_cell_rejects_an_array() {
-        let err = value_to_csv_cell(
-            "checksum",
-            &Value::Array(OwnedValues::from_vec(vec![Value::String("a".into())])),
-        )
-        .unwrap_err();
+        let schema = make_schema(&["amount"]);
+        let doc = doc_with_sections(&[(
+            "Foot",
+            &[(
+                "checksum",
+                Value::Array(OwnedValues::from_vec(vec![Value::String("a".into())])),
+            )],
+        )]);
+        let config = CsvWriterConfig {
+            envelope: Some(OutputEnvelopeSpec {
+                header_from_doc: None,
+                footer_from_doc: Some("Foot".into()),
+                footer_record_count_field: None,
+            }),
+            ..Default::default()
+        };
+        let mut writer = prepared_writer(Vec::new(), schema, config);
+        let err = writer.end_document(&doc).unwrap_err();
         match err {
-            FormatError::UnserializableArrayValue { format, column } => {
+            FormatError::OutputEncoding {
+                format,
+                field,
+                offset,
+                kind: OutputEncodingKind::Array,
+                field_name,
+                element,
+            } => {
                 assert_eq!(format, "CSV");
-                assert_eq!(column, "checksum");
+                assert_eq!(field_name.to_string(), "checksum");
+                assert_eq!(field, 1);
+                assert_eq!(offset, 0);
+                assert_eq!(element, None);
             }
-            other => panic!("expected UnserializableArrayValue, got {other:?}"),
+            other => panic!("expected CSV array rejection, got {other:?}"),
         }
+        assert!(writer.destination().is_empty());
     }
 
     /// A `Value::Array` carrying a nested `Array`/`Map` element is still
@@ -1284,10 +1760,23 @@ mod tests {
             ]))],
         );
         let mut buf = Vec::new();
-        let mut writer = CsvWriter::new(&mut buf, schema.clone(), CsvWriterConfig::default());
+        let mut writer = prepared_writer(&mut buf, schema.clone(), CsvWriterConfig::default());
         match writer.write_record(&record).unwrap_err() {
-            FormatError::UnserializableArrayValue { column, .. } => assert_eq!(column, "tags"),
-            other => panic!("expected UnserializableArrayValue for nested element, got {other:?}"),
+            FormatError::OutputEncoding {
+                format,
+                field,
+                offset,
+                kind: OutputEncodingKind::Array,
+                field_name,
+                element,
+            } => {
+                assert_eq!(format, "CSV");
+                assert_eq!(field_name.to_string(), "tags");
+                assert_eq!(field, 1);
+                assert_eq!(offset, 0);
+                assert_eq!(element, None);
+            }
+            other => panic!("expected CSV array rejection for nested element, got {other:?}"),
         }
     }
 
@@ -1311,7 +1800,7 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         {
-            let mut writer = CsvWriter::new(&mut buf, schema.clone(), config);
+            let mut writer = prepared_writer(&mut buf, schema.clone(), config);
             writer.begin_document(&doc).unwrap();
             writer
                 .write_record(&make_record(&schema, vec![Value::Integer(10)]))
@@ -1326,10 +1815,9 @@ mod tests {
         assert_eq!(out, "A\n10\n20\nSUM,2\n", "got: {out}");
     }
 
-    /// `HeaderCapturingCsvWriter` must forward `begin_document`/`end_document`
-    /// to its inner CSV writer: with an envelope spec the inner writer emits a
-    /// header row on begin and a footer row on end, so the wrapped output must
-    /// match the un-wrapped enveloped writer's framing rather than dropping it.
+    /// A prepared CSV writer with capture must preserve envelope framing:
+    /// opening and closing rows surround the body, and the footer counts only
+    /// successfully delivered records.
     #[test]
     fn header_capturing_csv_writer_forwards_document_framing() {
         let schema = make_schema(&["amount"]);
@@ -1348,9 +1836,16 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         {
-            let inner = CsvWriter::new(&mut buf, schema.clone(), config);
-            let shared_header = Arc::new(Mutex::new(None));
-            let mut writer = HeaderCapturingCsvWriter::new(inner, schema.clone(), shared_header);
+            let provider = crate::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(256 * 1024).unwrap(),
+            );
+            let capture = CsvHeaderCapture::new(&provider.resources()).unwrap();
+            let encoder = CsvEncoder::new(schema.clone(), &config, provider.resources())
+                .unwrap()
+                .with_header_capture(capture);
+            let mut writer =
+                crate::preparation::PreparedWriter::new(&mut buf, encoder, provider.resources())
+                    .unwrap();
             writer.begin_document(&doc).unwrap();
             writer
                 .write_record(&make_record(&schema, vec![Value::Integer(10)]))
@@ -1365,6 +1860,210 @@ mod tests {
     }
 
     #[test]
+    fn header_capture_pending_overlap_and_poison_keep_one_published_header() {
+        use crate::preparation::MemoryOnlyResources;
+        let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(256 * 1024).unwrap());
+        let capture = CsvHeaderCapture::new(&provider.resources()).unwrap();
+        let schema = make_schema(&["name"]);
+        let record = make_record(&schema, vec![Value::Integer(1)]);
+        let mut first = CsvEncoder::new(
+            schema.clone(),
+            &CsvWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap()
+        .with_header_capture(capture.clone());
+        let mut second = CsvEncoder::new(schema, &CsvWriterConfig::default(), provider.resources())
+            .unwrap()
+            .with_header_capture(capture.clone());
+        let scope = provider.resources().scope().unwrap();
+        let baseline = provider.used();
+        let pending_first = first
+            .prepare(
+                OutputOperation::Record(&record),
+                &mut std::io::sink(),
+                &scope,
+            )
+            .unwrap();
+        let pending_charge = provider.used() - baseline;
+        assert!(pending_charge > 0);
+        let pending_second = second
+            .prepare(
+                OutputOperation::Record(&record),
+                &mut std::io::sink(),
+                &scope,
+            )
+            .unwrap();
+        assert_eq!(provider.used(), baseline + 2 * pending_charge);
+        assert!(capture.0.text.lock().unwrap().is_none());
+        first.commit(pending_first);
+        assert_eq!(
+            provider.used(),
+            baseline + 2 * pending_charge,
+            "published and pending copies both remain owned"
+        );
+        // Poisoning must preserve the already-published admitted text.
+        let poisoned = capture.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned.0.text.lock().unwrap();
+                panic!("poison capture mutex");
+            })
+            .join()
+            .is_err()
+        );
+        second.commit(pending_second);
+        assert_eq!(
+            provider.used(),
+            baseline + pending_charge,
+            "losing pending copy releases after commit"
+        );
+        assert_eq!(
+            capture
+                .0
+                .text
+                .lock()
+                .err()
+                .unwrap()
+                .into_inner()
+                .as_ref()
+                .unwrap()
+                .as_slice()[0]
+                .as_str(),
+            "name"
+        );
+        let mut replay = CsvEncoder::new(
+            make_schema(&["other"]),
+            &CsvWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap()
+        .with_header_capture(capture.clone());
+        let mut bytes = Vec::new();
+        let pending = replay
+            .prepare(OutputOperation::Record(&record), &mut bytes, &scope)
+            .unwrap();
+        replay.commit(pending);
+        assert_eq!(bytes, b"name\n\"\"\n");
+        drop((first, second, replay, capture, scope));
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn header_capture_failed_delivery_and_replay_leave_committed_state_unchanged() {
+        use crate::preparation::{MemoryOnlyResources, PreparedWriter, ResourceErrorKind};
+        struct FailAfterPrefix {
+            bytes: Vec<u8>,
+        }
+        impl Write for FailAfterPrefix {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.bytes.is_empty() {
+                    self.bytes.extend_from_slice(&bytes[..2]);
+                    Ok(2)
+                } else {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                panic!("poisoned writer must not flush")
+            }
+        }
+        let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(256 * 1024).unwrap());
+        let capture = CsvHeaderCapture::new(&provider.resources()).unwrap();
+        let schema = make_schema(&["name"]);
+        let record = make_record(&schema, vec![Value::String("body".into())]);
+        for replay in [false, true] {
+            if replay {
+                let encoder = CsvEncoder::new(
+                    schema.clone(),
+                    &CsvWriterConfig::default(),
+                    provider.resources(),
+                )
+                .unwrap()
+                .with_header_capture(capture.clone());
+                let mut writer =
+                    PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+                writer.write_record(&record).unwrap();
+                assert_eq!(writer.destination(), b"name\nbody\n");
+            }
+            let encoder = CsvEncoder::new(
+                schema.clone(),
+                &CsvWriterConfig::default(),
+                provider.resources(),
+            )
+            .unwrap()
+            .with_header_capture(capture.clone());
+            let mut writer = PreparedWriter::new(
+                FailAfterPrefix { bytes: Vec::new() },
+                encoder,
+                provider.resources(),
+            )
+            .unwrap();
+            let retained = provider.used();
+            assert!(writer.write_record(&record).is_err());
+            assert_eq!(writer.destination().bytes, b"na");
+            assert!(!writer.encoder().header_written);
+            assert_eq!(writer.encoder().records, 0);
+            assert_eq!(capture.0.text.lock().unwrap().is_some(), replay);
+            assert_eq!(provider.used(), retained);
+            for error in [
+                writer.write_record(&record).unwrap_err(),
+                writer.flush_bytes().unwrap_err(),
+                writer.flush().unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, FormatError::Resource(error) if error.kind == ResourceErrorKind::DeliveryPoisoned)
+                );
+            }
+            assert_eq!(writer.destination().bytes, b"na");
+        }
+        drop(capture);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn header_capture_replay_filters_engine_stamps_with_explicit_opt_in() {
+        for include in [false, true] {
+            let provider = crate::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(256 * 1024).unwrap(),
+            );
+            let capture = CsvHeaderCapture::new(&provider.resources()).unwrap();
+            let schema = make_schema_with_engine_stamp("id", "$ck.id");
+            let config = CsvWriterConfig {
+                include_engine_stamped: include,
+                ..Default::default()
+            };
+            for _ in 0..2 {
+                let encoder = CsvEncoder::new(schema.clone(), &config, provider.resources())
+                    .unwrap()
+                    .with_header_capture(capture.clone());
+                let mut writer = crate::preparation::PreparedWriter::new(
+                    Vec::new(),
+                    encoder,
+                    provider.resources(),
+                )
+                .unwrap();
+                writer
+                    .write_record(&make_record(
+                        &schema,
+                        vec![Value::Integer(7), Value::Integer(9)],
+                    ))
+                    .unwrap();
+                assert_eq!(
+                    writer.destination(),
+                    if include {
+                        b"id,$ck.id\n7,9\n".as_slice()
+                    } else {
+                        b"id\n7\n".as_slice()
+                    }
+                );
+            }
+            drop(capture);
+            assert_eq!(provider.used(), 0);
+        }
+    }
+
+    #[test]
     fn csv_envelope_off_is_byte_identical() {
         // No envelope spec: begin/end_document are no-ops and the body is the
         // plain CSV the boundary-unaware path produces.
@@ -1372,7 +2071,7 @@ mod tests {
         let doc = doc_with_sections(&[("Head", &[("batch_id", Value::String("A".into()))])]);
         let mut buf = Vec::new();
         {
-            let mut writer = CsvWriter::new(
+            let mut writer = prepared_writer(
                 &mut buf,
                 schema.clone(),
                 CsvWriterConfig {
@@ -1403,7 +2102,7 @@ mod tests {
             ..Default::default()
         };
         let mut buf = Vec::new();
-        let mut writer = CsvWriter::new(&mut buf, writer_schema.clone(), config);
+        let mut writer = prepared_writer(&mut buf, writer_schema.clone(), config);
         // Record carries a `region` column the pinned schema lacks.
         let drift_schema = make_schema(&["amount", "region"]);
         let record = make_record(
@@ -1412,11 +2111,21 @@ mod tests {
         );
         let err = writer.write_record(&record).unwrap_err();
         match err {
-            FormatError::SchemaDrift { format, column } => {
+            FormatError::OutputEncoding {
+                format,
+                field,
+                offset,
+                kind: OutputEncodingKind::SchemaDrift,
+                field_name,
+                element,
+            } => {
                 assert_eq!(format, "CSV");
-                assert_eq!(column, "region");
+                assert_eq!(field_name.to_string(), "region");
+                assert_eq!(field, 2);
+                assert_eq!(offset, 0);
+                assert_eq!(element, None);
             }
-            other => panic!("expected SchemaDrift, got {other:?}"),
+            other => panic!("expected CSV schema drift, got {other:?}"),
         }
     }
 
@@ -1437,7 +2146,7 @@ mod tests {
         };
         let doc = doc_with_sections(&[("Head", &[("batch_id", Value::String("A".into()))])]);
         let mut buf = Vec::new();
-        let mut writer = CsvWriter::new(&mut buf, writer_schema.clone(), config);
+        let mut writer = prepared_writer(&mut buf, writer_schema.clone(), config);
         writer.begin_document(&doc).unwrap();
         let drift_schema = make_schema(&["amount", "region"]);
         let record = make_record(
@@ -1446,8 +2155,21 @@ mod tests {
         );
         let err = writer.write_record(&record).unwrap_err();
         match err {
-            FormatError::SchemaDrift { column, .. } => assert_eq!(column, "region"),
-            other => panic!("expected SchemaDrift, got {other:?}"),
+            FormatError::OutputEncoding {
+                format,
+                field,
+                offset,
+                kind: OutputEncodingKind::SchemaDrift,
+                field_name,
+                element,
+            } => {
+                assert_eq!(format, "CSV");
+                assert_eq!(field_name.to_string(), "region");
+                assert_eq!(field, 2);
+                assert_eq!(offset, 0);
+                assert_eq!(element, None);
+            }
+            other => panic!("expected CSV schema drift, got {other:?}"),
         }
     }
 

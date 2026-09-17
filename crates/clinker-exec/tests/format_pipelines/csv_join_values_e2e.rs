@@ -134,8 +134,8 @@ nodes:
     );
     assert_eq!(
         output.as_string(),
-        "payload\n",
-        "the schema header may be staged, but the failed record must not be serialized"
+        "",
+        "the automatic header and rejected body are one uncommitted operation"
     );
 }
 
@@ -345,4 +345,43 @@ fn assert_join_collision_entry(entries: &[clinker_exec::executor::DlqEntry]) {
         "the entry is stamped with the sink-write stage"
     );
     assert!(entry.trigger, "the failing record is its own trigger");
+}
+
+#[test]
+fn csv_join_collision_resolves_evidence_after_projection_reorders_fields() {
+    let pipeline = r#"
+pipeline:
+  name: csv_reordered_collision
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: json
+      path: in.json
+      schema:
+        - { name: order_id, type: string }
+        - { name: tags, type: string, multiple: true }
+  - type: sink
+    name: out
+    input: orders
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      mapping: [tags, order_id]
+"#;
+    let (result, output) = run_input(
+        pipeline,
+        "orders",
+        "in.json",
+        br#"[{"order_id":"1","tags":["ok","a;b"]},{"order_id":"2","tags":["x","y"]}]"#,
+    );
+    let report = result.unwrap();
+    assert_join_collision_entry(&report.dlq_entries);
+    assert_eq!(output.as_string(), "tags,order_id\nx;y,2\n");
+    assert_eq!(report.counters.records_written, 1);
+    assert_eq!(report.counters.dlq_count, 1);
 }

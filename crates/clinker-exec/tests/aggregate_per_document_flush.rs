@@ -33,6 +33,9 @@
 //! below (an Aggregate downstream of the Merge) is where forwarding the
 //! boundary changes observable output, so that is the regression guard.
 
+#[path = "common/pipeline_resource_fixtures.rs"]
+mod resource_fixtures;
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -102,6 +105,9 @@ nodes:
 /// heap threshold without requiring an impossible sub-materialization hard
 /// limit; the terminal projection removes the helper column again.
 fn count_by_category_spill_yaml(memory_limit: &str) -> String {
+    // A plain literal is shared by compiled evaluation. concat constructs a
+    // fresh 1 KiB value per row so Aggregate really retains per-group payloads.
+    let payload = "p".repeat(1024);
     format!(
         r#"
 pipeline:
@@ -118,14 +124,13 @@ nodes:
         on_no_match: skip
       schema:
         - {{ name: category, type: string }}
-        - {{ name: payload, type: string }}
   - type: transform
     name: passthrough
     input: events
     config:
       cxl: |
         emit category = category
-        emit payload = payload
+        emit payload = "".concat("{payload}")
   - type: aggregate
     name: by_category
     input: passthrough
@@ -154,28 +159,40 @@ nodes:
 /// the sorted body lines (`category,n`) and the run's ok/dlq counts.
 fn run_multi_file(memory_limit: &str, files: &[(&str, &str)]) -> (Vec<String>, u64, u64, u64) {
     let yaml = count_by_category_yaml(memory_limit);
-    run_multi_file_yaml(&yaml, files)
+    run_multi_file_yaml(&yaml, files, false)
 }
 
-fn run_multi_file_yaml(yaml: &str, files: &[(&str, &str)]) -> (Vec<String>, u64, u64, u64) {
+fn run_multi_file_yaml(
+    yaml: &str,
+    files: &[(&str, &str)],
+    predecoded: bool,
+) -> (Vec<String>, u64, u64, u64) {
     let config = parse_config(yaml).expect("parse per-document aggregate pipeline");
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile per-document aggregate pipeline");
 
-    let slots: Vec<FileSlot> = files
-        .iter()
-        .map(|(name, body)| {
-            FileSlot::new(
-                PathBuf::from(*name),
-                Box::new(Cursor::new(body.as_bytes().to_vec())),
-            )
-        })
-        .collect();
-    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
-        "events".to_string(),
-        clinker_exec::executor::SourceInput::Files(slots),
-    )]);
+    let source = if predecoded {
+        // Isolate the operator spill budget while retaining physical documents.
+        resource_fixtures::predecoded_csv_source(
+            &config,
+            &CompileContext::default(),
+            "events",
+            files,
+        )
+    } else {
+        let slots = files
+            .iter()
+            .map(|(name, body)| {
+                FileSlot::new(
+                    PathBuf::from(*name),
+                    Box::new(Cursor::new(body.as_bytes().to_vec())),
+                )
+            })
+            .collect();
+        clinker_exec::executor::SourceInput::Files(slots)
+    };
+    let readers = HashMap::from([("events".to_string(), source)]);
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -271,23 +288,23 @@ fn single_document_emits_one_aggregate_unchanged() {
 
 #[test]
 fn spilling_strategy_flushes_per_document_across_boundary() {
-    // A fused passthrough avoids a full-input scan reservation. The 96 KiB
-    // budget admits the terminal materialization, while 100 groups carrying
-    // 1 KiB `min(payload)` values cross Aggregate's value-heap threshold and
-    // force a real spill in each document.
-    let payload = "p".repeat(1024);
-    let mut doc_a = String::from("category,payload\n");
+    // Build payloads in the fused Transform so the source queue holds only
+    // categories when it admits the next file's document context. The original
+    // 96 KiB budget still faces 100 independently retained 1 KiB min(payload)
+    // values per document, forcing real Aggregate spills.
+    let mut doc_a = String::from("category\n");
     for i in 0..200 {
-        doc_a.push_str(&format!("a{},{payload}\n", i % 100));
+        doc_a.push_str(&format!("a{}\n", i % 100));
     }
-    let mut doc_b = String::from("category,payload\n");
+    let mut doc_b = String::from("category\n");
     for i in 0..200 {
-        doc_b.push_str(&format!("b{},{payload}\n", i % 100));
+        doc_b.push_str(&format!("b{}\n", i % 100));
     }
     let yaml = count_by_category_spill_yaml("96K");
     let (body, ok, dlq, spill_bytes) = run_multi_file_yaml(
         &yaml,
         &[("a.csv", doc_a.as_str()), ("b.csv", doc_b.as_str())],
+        true,
     );
     assert_eq!(dlq, 0, "spilling run produces no DLQ entries");
     assert!(
@@ -1068,4 +1085,115 @@ nodes:
          per-document close through the node buffer, so the Aggregate flushes \
          per document (x=3 from sa; x=2,y=1 from sb), not a folded x=5",
     );
+}
+
+#[test]
+fn predecoded_pressure_fixture_preserves_empty_documents_and_output() {
+    let yaml = count_by_category_yaml("64M");
+    let files = [
+        ("empty-first.csv", "category\n"),
+        ("a.csv", "category\nx\nx\ny\n"),
+        ("empty-middle.csv", "category\n"),
+        ("b.csv", "category\nx\n"),
+        ("empty-last.csv", "category\n"),
+    ];
+    let streamed = run_multi_file_yaml(&yaml, &files, false);
+    let decoded = run_multi_file_yaml(&yaml, &files, true);
+    assert_eq!(
+        (&decoded.0, decoded.1, decoded.2),
+        (&streamed.0, streamed.1, streamed.2)
+    );
+    assert_eq!(decoded.0, ["x,1", "x,2", "y,1"]);
+}
+
+#[test]
+fn predecoded_pressure_fixture_retains_typed_projection_and_file_lifecycle() {
+    use clinker_exec::source::SourceInput;
+    use clinker_format::SourceLifecycleEvent;
+    use clinker_record::Value;
+
+    let yaml = r#"
+pipeline: { name: predecoded_fixture_contract }
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      path: configured.csv
+      on_unmapped: { mode: drop }
+      schema:
+        - { name: id, type: string }
+        - { name: amount, type: int }
+  - type: sink
+    name: out
+    input: events
+    config: { name: out, type: csv, path: out.csv }
+"#;
+    let config = parse_config(yaml).unwrap();
+    let files = [
+        ("empty-first.csv", "amount,extra,id\n"),
+        (
+            "data.csv",
+            "amount,extra,id\n0007,unused,\"a,b\"\n-2,ignored,\"quoted \"\"text\"\"\nnext line\"\n",
+        ),
+        ("empty-last.csv", "amount,extra,id\n"),
+    ];
+    let SourceInput::Records(mut source) = resource_fixtures::predecoded_csv_source(
+        &config,
+        &CompileContext::default(),
+        "events",
+        &files,
+    ) else {
+        panic!("fixture must supply decoded records")
+    };
+    assert_eq!(
+        source
+            .schema()
+            .unwrap()
+            .columns()
+            .iter()
+            .map(|s| s.as_ref())
+            .collect::<Vec<_>>(),
+        ["id", "amount"]
+    );
+    assert_eq!(
+        source.current_source_file().unwrap().as_ref(),
+        "empty-first.csv"
+    );
+    let mut events = source.take_source_lifecycle_events();
+    for (id, amount) in [("a,b", 7), ("quoted \"text\"\nnext line", -2)] {
+        let row = source.next_record().unwrap().unwrap();
+        assert_eq!(row.get("id"), Some(&Value::String(id.into())));
+        assert_eq!(row.get("amount"), Some(&Value::Integer(amount)));
+        assert_eq!(source.current_source_file().unwrap().as_ref(), "data.csv");
+        events.extend(source.take_source_lifecycle_events());
+    }
+    assert!(source.next_record().unwrap().is_none());
+    events.extend(source.take_source_lifecycle_events());
+    assert_eq!(
+        source.current_source_file().unwrap().as_ref(),
+        "empty-last.csv"
+    );
+    assert_eq!(
+        events
+            .into_iter()
+            .map(|event| match event {
+                SourceLifecycleEvent::PhysicalFileOpen(path) => ("open", path.to_string()),
+                SourceLifecycleEvent::PhysicalFileClose(path) => ("close", path.to_string()),
+                SourceLifecycleEvent::Envelope(_) => panic!("plain CSV has no envelope"),
+            })
+            .collect::<Vec<_>>(),
+        [
+            ("open", "empty-first.csv"),
+            ("close", "empty-first.csv"),
+            ("open", "data.csv"),
+            ("close", "data.csv"),
+            ("open", "empty-last.csv"),
+            ("close", "empty-last.csv"),
+        ]
+        .map(|(event, path)| (event, path.to_string()))
+    );
+    assert!(source.next_record().unwrap().is_none());
+    assert!(source.take_source_lifecycle_events().is_empty());
 }

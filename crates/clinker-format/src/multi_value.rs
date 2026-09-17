@@ -268,33 +268,21 @@ pub(crate) fn split_text_value(value: &Value, delimiter: &str) -> Value {
 /// the plan-time gate rejects a multi-character escape so this stays exact.
 pub(crate) fn split_text_value_escaped(value: &Value, delimiter: &str, escape: &str) -> Value {
     fn parts(text: &str, delimiter: &str, escape: &str) -> Vec<Value> {
-        let (Some(esc), Some(delim)) = (escape.chars().next(), delimiter.chars().next()) else {
-            // Empty escape (or empty delimiter): a plain split with no escape
-            // handling, identical to `split_text_value`.
-            return text
-                .split(delimiter)
-                .map(|p| Value::String(p.into()))
-                .collect();
-        };
         let mut out = Vec::new();
         let mut cur = String::new();
-        let mut chars = text.chars();
-        while let Some(c) = chars.next() {
-            if c == esc {
-                // The escape marks the NEXT character as literal (an escaped
-                // delimiter or an escaped escape). A trailing escape with no
-                // following character is kept as a literal escape.
-                match chars.next() {
-                    Some(next) => cur.push(next),
-                    None => cur.push(esc),
+        let result: Result<(), std::convert::Infallible> =
+            visit_split_text(text, delimiter, escape, |fragment| {
+                match fragment {
+                    SplitFragment::Part(part) => out.push(Value::String(part.into())),
+                    SplitFragment::Text(part) => cur.push_str(part),
+                    SplitFragment::End => out.push(Value::String(std::mem::take(&mut cur).into())),
                 }
-            } else if c == delim {
-                out.push(Value::String(std::mem::take(&mut cur).into()));
-            } else {
-                cur.push(c);
-            }
+                Ok(())
+            });
+        match result {
+            Ok(()) => {}
+            Err(never) => match never {},
         }
-        out.push(Value::String(cur.into()));
         out
     }
     match value {
@@ -312,6 +300,43 @@ pub(crate) fn split_text_value_escaped(value: &Value, delimiter: &str, escape: &
         )),
         other => Value::Array(OwnedValues::from_vec(vec![other.clone()])),
     }
+}
+
+/// Borrowed output of the existing split grammar. Plain parts need no scratch;
+/// escaped parts consist of literal fragments followed by `End`.
+pub(crate) enum SplitFragment<'a> {
+    Part(&'a str),
+    Text(&'a str),
+    End,
+}
+
+/// Visit without allocating. Both legacy and admitted construction use this
+/// state machine, including trailing escapes and first-character delimiters.
+pub(crate) fn visit_split_text<'a, E>(
+    text: &'a str,
+    delimiter: &str,
+    escape: &str,
+    mut visit: impl FnMut(SplitFragment<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    let (Some(esc), Some(delim)) = (escape.chars().next(), delimiter.chars().next()) else {
+        for part in text.split(delimiter) {
+            visit(SplitFragment::Part(part))?;
+        }
+        return Ok(());
+    };
+    let mut chars = text.char_indices();
+    while let Some((offset, c)) = chars.next() {
+        if c == esc {
+            // The next character is literal; a trailing escape stays literal.
+            let (offset, next) = chars.next().unwrap_or((offset, esc));
+            visit(SplitFragment::Text(&text[offset..offset + next.len_utf8()]))?;
+        } else if c == delim {
+            visit(SplitFragment::End)?;
+        } else {
+            visit(SplitFragment::Text(&text[offset..offset + c.len_utf8()]))?;
+        }
+    }
+    visit(SplitFragment::End)
 }
 
 /// `keep_empty`'s default. Named rather than inlined so the inverted-industry

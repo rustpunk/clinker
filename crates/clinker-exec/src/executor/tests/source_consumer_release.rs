@@ -311,7 +311,7 @@ impl std::io::Write for GateWriter {
 /// disconnects, while the final materialized reader keeps the slot's
 /// exact charge registered through its synchronous Output turn. The
 /// gated writer freezes the run after the Source turn completed and
-/// proves that the transferred node-buffer and idle run resource provider
+/// proves that the transferred node-buffer and active run resource provider
 /// remain registered, with no source consumer left behind.
 #[test]
 fn source_charge_is_replaced_by_output_input_registration_before_write() {
@@ -386,10 +386,9 @@ nodes:
         2,
         "the Output retains its transferred node-buffer and the run writer consumer"
     );
-    assert_eq!(
-        arb.writer_resource_usage().memory,
-        0,
-        "the legacy CSV writer does not allocate through the run resource provider"
+    assert!(
+        arb.writer_resource_usage().memory > 0,
+        "the prepared CSV writer retains live admitted workspace"
     );
     assert_eq!(
         arb.backpressureable_consumer_count(),

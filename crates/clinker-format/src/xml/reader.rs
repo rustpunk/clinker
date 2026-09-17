@@ -1175,12 +1175,9 @@ impl FormatReader for XmlReader {
         }
     }
 
-    fn prepare_document(
-        &mut self,
-        config: &EnvelopeConfig,
-    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
+    fn prepare_document(&mut self, config: &EnvelopeConfig) -> Result<OwnedMap, FormatError> {
         if config.is_empty() {
-            return Ok(IndexMap::new());
+            return Ok(OwnedMap::from_map(IndexMap::new()));
         }
 
         // The path-pruned index is the retention authority: it knows which
@@ -1191,7 +1188,7 @@ impl FormatReader for XmlReader {
         let mut index =
             DocArenaIndex::new(&self.config.declared_doc_paths, self.config.max_index_bytes);
         if index.is_empty() {
-            return Ok(IndexMap::new());
+            return Ok(OwnedMap::from_map(IndexMap::new()));
         }
 
         // Compile only the wanted sections' XmlPaths into path-segment
@@ -1269,7 +1266,7 @@ impl FormatReader for XmlReader {
                 .insert(&path, Value::Map(OwnedMap::from_map(typed)))
                 .map_err(FormatError::Xml)?;
         }
-        Ok(index.into_sections())
+        Ok(OwnedMap::from_map(index.into_sections()))
     }
 }
 

@@ -2,9 +2,9 @@
 //! thread body that widens, stamps, and pushes records into the dispatch
 //! channel.
 
-use clinker_record::owned_storage::SharedStorage;
 #[cfg(test)]
-use clinker_record::owned_storage::{OwnedKey, OwnedMap};
+use clinker_record::owned_storage::OwnedKey;
+use clinker_record::owned_storage::{AllocationResources, OwnedMap, OwnedValues, SharedStorage};
 use std::io::Read;
 use std::sync::Arc;
 
@@ -15,6 +15,7 @@ use clinker_format::edifact::reader::{EdifactReader, EdifactReaderConfig};
 use clinker_format::fixed_width::reader::{FixedWidthReader, FixedWidthReaderConfig};
 use clinker_format::hl7::reader::{Hl7Reader, Hl7ReaderConfig};
 use clinker_format::json::reader::{JsonMode, JsonReader, JsonReaderConfig};
+use clinker_format::preparation::{DecodeWorkspace, TextStorage};
 use clinker_format::swift::reader::{SwiftReader, SwiftReaderConfig};
 use clinker_format::traits::FormatReader;
 use clinker_format::x12::reader::{X12Reader, X12ReaderConfig};
@@ -24,6 +25,13 @@ use clinker_plan::config::PipelineConfig;
 use clinker_plan::error::PipelineError;
 
 use super::context::SourceRuntimePolicy;
+
+/// Runtime factories always carry the run's finite authority. The legacy arm
+/// is reserved for the public, non-executing authoring reader helper.
+enum ReaderAllocation {
+    Admitted(AllocationResources),
+    Legacy,
+}
 
 /// Whether a format reads its input more than once.
 ///
@@ -72,6 +80,7 @@ fn build_format_reader(
     schema: &SourceSchema,
     source: ReopenableSource,
     numeric_observer: Option<NumericObserver>,
+    allocation: &ReaderAllocation,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     // External `.schema.yaml` (`SourceSchema::File`) references are resolved to
     // their inline form once at compile time (config load + `compile`), so the
@@ -99,6 +108,7 @@ fn build_format_reader(
                 MultiRecordKind::Csv(opts.as_ref()),
                 open_one_shot(&source)?,
                 numeric_observer,
+                allocation,
             ),
             _ => {
                 let mut config = build_csv_reader_config(opts.as_ref())?;
@@ -106,10 +116,22 @@ fn build_format_reader(
                 // reader. The multi-record backend does not consume it, and the
                 // plan-time gate rejects a multi-record source that declares it.
                 config.split_values = input.split_values.clone().unwrap_or_default();
-                Ok(Box::new(CsvReader::from_reader(
-                    open_one_shot(&source)?,
-                    config,
-                )))
+                match allocation {
+                    ReaderAllocation::Admitted(resources) => {
+                        let workspace = DecodeWorkspace::new(resources.clone())
+                            .map_err(clinker_format::FormatError::from)?;
+                        Ok(Box::new(CsvReader::from_reader_admitted(
+                            open_one_shot(&source)?,
+                            config,
+                            workspace,
+                            TextStorage::Shared,
+                        )?))
+                    }
+                    ReaderAllocation::Legacy => Ok(Box::new(CsvReader::from_reader(
+                        open_one_shot(&source)?,
+                        config,
+                    ))),
+                }
             }
         },
         clinker_plan::config::InputFormat::Json(opts) => {
@@ -139,6 +161,7 @@ fn build_format_reader(
                 MultiRecordKind::FixedWidth(opts.as_ref()),
                 open_one_shot(&source)?,
                 numeric_observer,
+                allocation,
             ),
             SourceSchema::Columns(cols) => {
                 let mut config = build_fw_reader_config(opts.as_ref());
@@ -224,8 +247,21 @@ pub fn build_source_format_reader(
     } else {
         numeric_observer
     };
-    let reader = build_format_reader(input, schema, source, format_observer)?;
-    wrap_reader_with_schema_coercion(reader, input, schema, policy, coercion_observer)
+    let reader = build_format_reader(
+        input,
+        schema,
+        source,
+        format_observer,
+        &ReaderAllocation::Legacy,
+    )?;
+    wrap_reader_with_schema_coercion(
+        reader,
+        input,
+        schema,
+        policy,
+        coercion_observer,
+        &ReaderAllocation::Legacy,
+    )
 }
 
 /// Open a single `Read` from a re-openable source for a one-pass format reader,
@@ -243,23 +279,28 @@ fn build_multi_file_reader(
     schema: &SourceSchema,
     files: Vec<crate::source::multi_file::FileSlot>,
     progress: Option<crate::progress::RunProgress>,
+    allocation: AllocationResources,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     use crate::source::multi_file::{FactoryFn, MultiFileFormatReader};
 
     // The factory closure captures the source config + unified schema by clone
     // so each file gets a fresh format reader configured identically. Format
-    // construction errors map to the wrapper's `Schema` variant via
-    // `clinker_format::FormatError` so they bubble through the trait
-    // boundary intact.
+    // construction must preserve resource/cancellation identity through the
+    // trait boundary. Each physical reader receives this same run authority
+    // before any headers or rows are decoded; there is no legacy fallback.
     let owned_config = input.clone();
     let owned_schema = schema.clone();
+    let allocation = ReaderAllocation::Admitted(allocation);
     let factory: Box<FactoryFn> = Box::new(
         move |source: ReopenableSource|
               -> Result<Box<dyn FormatReader>, clinker_format::FormatError> {
-            build_format_reader(&owned_config, &owned_schema, source, None).map_err(|e| {
-                clinker_format::FormatError::SchemaInference(format!(
-                    "format reader construction failed: {e}"
-                ))
+            build_format_reader(&owned_config, &owned_schema, source, None, &allocation).map_err(|e| match e {
+                PipelineError::Format(error) => error,
+                PipelineError::Io(error) => clinker_format::FormatError::Io(error),
+                PipelineError::Interrupted => clinker_format::FormatError::Interrupted,
+                other => clinker_format::FormatError::SchemaInference(format!(
+                    "format reader construction failed: {other}"
+                )),
             })
         },
     );
@@ -292,6 +333,7 @@ fn wrap_reader_with_schema_coercion(
     schema: &SourceSchema,
     policy: clinker_plan::config::pipeline_node::OnUnmapped,
     numeric_observer: Option<NumericObserver>,
+    allocation: &ReaderAllocation,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     use clinker_plan::config::pipeline_node::OnUnmapped;
     let source_name = input.name.as_str();
@@ -337,39 +379,76 @@ fn wrap_reader_with_schema_coercion(
                      Set `on_unmapped: drop` or `reject` to make the policy explicit."
                 );
             }
-            let coercing = match schema {
-                SourceSchema::MultiRecord { record_types, .. } => {
-                    crate::pipeline::schema_coerce::CoercingReader::new_with_record_types(
-                        reader,
-                        &columns,
-                        record_types,
-                        policy,
-                        source_name,
-                    )
-                }
-                _ => match numeric_observer {
-                    Some(observer) => {
-                        crate::pipeline::schema_coerce::CoercingReader::new_observing(
+            let coercing = match (schema, format, allocation) {
+                (
+                    SourceSchema::Columns(_),
+                    clinker_plan::config::InputFormat::Csv(_),
+                    ReaderAllocation::Admitted(resources),
+                ) => crate::pipeline::schema_coerce::CoercingReader::new_csv_admitted(
+                    reader,
+                    &columns,
+                    policy,
+                    source_name,
+                    resources.clone(),
+                ),
+                (
+                    SourceSchema::MultiRecord { record_types, .. },
+                    clinker_plan::config::InputFormat::Csv(_),
+                    ReaderAllocation::Admitted(resources),
+                ) => crate::pipeline::schema_coerce::CoercingReader::new_csv_admitted_with_record_types(
+                    reader, &columns, record_types, policy, source_name, resources.clone(),
+                ),
+                _ => match schema {
+                    SourceSchema::MultiRecord { record_types, .. } => {
+                        crate::pipeline::schema_coerce::CoercingReader::new_with_record_types(
+                            reader,
+                            &columns,
+                            record_types,
+                            policy,
+                            source_name,
+                        )
+                    }
+                    _ => match numeric_observer {
+                        Some(observer) => {
+                            crate::pipeline::schema_coerce::CoercingReader::new_observing(
+                                reader,
+                                &columns,
+                                policy,
+                                source_name,
+                                pretyped,
+                                observer,
+                            )
+                        }
+                        None => crate::pipeline::schema_coerce::CoercingReader::new(
                             reader,
                             &columns,
                             policy,
                             source_name,
                             pretyped,
-                            observer,
-                        )
-                    }
-                    None => crate::pipeline::schema_coerce::CoercingReader::new(
-                        reader,
-                        &columns,
-                        policy,
-                        source_name,
-                        pretyped,
-                    ),
+                        ),
+                    },
                 },
             }
-            .map_err(|e| PipelineError::Compilation {
-                transform_name: source_name.to_string(),
-                messages: vec![format!("schema coercion init error: {e}")],
+            .map_err(|error| match error {
+                // Header admission can fail while coercion requests the raw
+                // schema. Resource refusal and cancellation are control flow,
+                // not compilation diagnostics.
+                clinker_format::FormatError::Resource(_) => PipelineError::Format(error),
+                clinker_format::FormatError::Interrupted => PipelineError::Interrupted,
+                clinker_format::FormatError::Charset(_)
+                | clinker_format::FormatError::Csv(_)
+                | clinker_format::FormatError::Io(_)
+                    if matches!(format, clinker_plan::config::InputFormat::Csv(_)) =>
+                {
+                    // Discovering CSV columns reads source bytes. Malformed
+                    // input and read failures remain data/I/O errors even when
+                    // observed before the first record reaches the pipeline.
+                    PipelineError::Format(error)
+                }
+                other => PipelineError::Compilation {
+                    transform_name: source_name.to_string(),
+                    messages: vec![format!("schema coercion init error: {other}")],
+                },
             })?;
             Ok(Box::new(coercing))
         }
@@ -431,10 +510,52 @@ fn value_to_event_time_nanos(value: &clinker_record::Value) -> Option<i64> {
 /// `PerSourceWatermarks` (per-(source, file) max-event-time map);
 /// `total_count` increments `counters.total_count` and seeds the
 /// `$source.count` pipeline-wide total.
+#[derive(Debug)]
 pub(super) struct IngestTaskOutcome {
     pub(super) source_name: String,
     pub(super) total_count: u64,
+    /// The source observed cancellation; progress remains valid on this exit.
+    pub(super) interrupted: bool,
     pub(super) watermark_observations: Vec<(Arc<str>, i64)>,
+}
+
+impl IngestTaskOutcome {
+    fn new(source_name: String) -> Self {
+        Self {
+            source_name,
+            total_count: 0,
+            interrupted: false,
+            watermark_observations: Vec::new(),
+        }
+    }
+}
+
+/// Join every finite worker before returning a genuine failure or all progress.
+/// The caller must drop receivers and release paused consumers before entry.
+pub(super) fn join_source_workers(
+    workers: impl IntoIterator<Item = std::thread::JoinHandle<Result<IngestTaskOutcome, PipelineError>>>,
+    op: &'static str,
+) -> Result<Vec<IngestTaskOutcome>, PipelineError> {
+    let mut outcomes = Vec::new();
+    let mut first_error = None;
+    for worker in workers {
+        let result = worker.join().unwrap_or_else(|_| {
+            Err(PipelineError::Internal {
+                op,
+                node: String::new(),
+                detail: "source ingest thread panicked".to_string(),
+            })
+        });
+        match result {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(outcomes),
+    }
 }
 
 /// Ingest a Source's records into a bounded
@@ -500,6 +621,9 @@ pub(super) fn ingest_source(
 /// Composition bodies call this entry because their Sources do not appear in
 /// the top-level [`PipelineConfig`]. The caller must supply the planner-retained
 /// resolved body; this function never reconstructs schema or reader policy.
+/// Explicit reader cancellation becomes an interrupted outcome retaining progress,
+/// before either caller observes the Source lifecycle. Other failures retain
+/// their original evidence even when shutdown has also been requested.
 pub(super) fn ingest_source_body(
     body: clinker_plan::config::pipeline_node::SourceBody,
     input: crate::source::SourceInput,
@@ -508,6 +632,43 @@ pub(super) fn ingest_source_body(
     progress: Option<crate::progress::RunProgress>,
     source_runtime: SourceRuntimePolicy,
 ) -> Result<IngestTaskOutcome, PipelineError> {
+    // Own progress outside every fallible setup/read/close boundary. Only an
+    // explicit cancellation changes the terminal outcome; a concurrently
+    // requested shutdown never erases a genuine reader or storage failure.
+    let mut outcome = IngestTaskOutcome::new(body.source.name.clone());
+    match ingest_source_body_inner(
+        body,
+        input,
+        stream,
+        shutdown_token,
+        progress,
+        source_runtime,
+        &mut outcome,
+    ) {
+        Ok(()) => {}
+        Err(PipelineError::Interrupted) => outcome.interrupted = true,
+        Err(PipelineError::Format(clinker_format::FormatError::Interrupted)) => {
+            outcome.interrupted = true;
+        }
+        Err(PipelineError::Format(clinker_format::FormatError::Resource(resource)))
+            if resource.kind == clinker_record::owned_storage::ResourceErrorKind::Cancelled =>
+        {
+            outcome.interrupted = true;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(outcome)
+}
+
+fn ingest_source_body_inner(
+    body: clinker_plan::config::pipeline_node::SourceBody,
+    input: crate::source::SourceInput,
+    stream: crate::executor::source_stream::SourceIngestChannel,
+    shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
+    progress: Option<crate::progress::RunProgress>,
+    source_runtime: SourceRuntimePolicy,
+    outcome: &mut IngestTaskOutcome,
+) -> Result<(), PipelineError> {
     let src_cfg = body.source.clone();
     // Branch once on transport. The file arm builds the
     // MultiFileFormatReader + schema-coercion stack and hands the
@@ -527,30 +688,50 @@ pub(super) fn ingest_source_body(
                     )),
                 ));
             }
-            let raw_reader =
-                build_multi_file_reader(&src_cfg, &body.schema, files, progress.clone())?;
+            let raw_reader = build_multi_file_reader(
+                &src_cfg,
+                &body.schema,
+                files,
+                progress.clone(),
+                stream.allocation_resources().clone(),
+            )?;
             let src_reader = wrap_reader_with_schema_coercion(
                 raw_reader,
                 &src_cfg,
                 &body.schema,
                 body.on_unmapped.clone(),
                 None,
+                &ReaderAllocation::Admitted(stream.allocation_resources().clone()),
             )?;
             // The file arm reaches the shared driver through the blanket
             // `RecordSource for Box<dyn FormatReader>` impl.
+            let physical_columns =
+                if matches!(src_cfg.format, clinker_plan::config::InputFormat::Csv(_)) {
+                    body.schema.as_columns().unwrap_or_default()
+                } else {
+                    &[]
+                };
             drive_record_source(
                 src_cfg,
+                physical_columns,
                 Box::new(src_reader),
                 stream,
                 shutdown_token,
                 source_runtime,
+                outcome,
             )
         }
         // A non-file transport reads no files, so it credits none. The run's
         // file denominator was already withdrawn for this shape.
-        crate::source::SourceInput::Records(src_reader) => {
-            drive_record_source(src_cfg, src_reader, stream, shutdown_token, source_runtime)
-        }
+        crate::source::SourceInput::Records(src_reader) => drive_record_source(
+            src_cfg,
+            &[],
+            src_reader,
+            stream,
+            shutdown_token,
+            source_runtime,
+            outcome,
+        ),
     }
 }
 
@@ -561,11 +742,13 @@ pub(super) fn ingest_source_body(
 /// file and non-file ingest arms — see [`ingest_source`].
 fn drive_record_source(
     src_cfg: clinker_plan::config::SourceConfig,
+    physical_columns: &[Column],
     src_reader: Box<dyn crate::source::RecordSource>,
     stream: crate::executor::source_stream::SourceIngestChannel,
     shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
     source_runtime: SourceRuntimePolicy,
-) -> Result<IngestTaskOutcome, PipelineError> {
+    outcome: &mut IngestTaskOutcome,
+) -> Result<(), PipelineError> {
     {
         let mut src_reader = src_reader;
         let shutdown_for_poll = shutdown_token.clone();
@@ -672,9 +855,7 @@ fn drive_record_source(
 
         let preserve_empty_physical_files = stream.has_order_barrier();
         let mut stream = stream;
-        let mut total_count: u64 = 0;
         let mut read_attempts: u64 = 0;
-        let mut watermark_observations: Vec<(Arc<str>, i64)> = Vec::new();
         // First successfully decoded body record for the current physical
         // file, kept together with the exact identity minted for it. A
         // trailer-level structural failure selects this pair as its DLQ
@@ -703,7 +884,6 @@ fn drive_record_source(
         // single source of truth for both the live nesting and the open
         // file's identity.
         let mut doc_stack: Vec<SharedStorage<clinker_record::DocumentContext>> = Vec::new();
-        let mut interrupted = false;
         loop {
             // Ordered sources do not publish body attempts until the complete
             // physical file closes. Poll at the ingest boundary as well as in
@@ -713,7 +893,7 @@ fn drive_record_source(
                 .as_ref()
                 .is_some_and(crate::pipeline::shutdown::ShutdownToken::is_requested)
             {
-                interrupted = true;
+                outcome.interrupted = true;
                 break;
             }
             if source_runtime
@@ -724,7 +904,7 @@ fn drive_record_source(
                 break;
             }
             let Some(read_permit) = source_runtime.acquire(shutdown_for_poll.as_ref()) else {
-                interrupted = true;
+                outcome.interrupted = true;
                 break;
             };
             read_attempts = read_attempts.saturating_add(1);
@@ -732,16 +912,15 @@ fn drive_record_source(
             drop(read_permit);
             match next_record {
                 Ok(Some(record)) => {
-                    total_count =
-                        total_count
-                            .checked_add(1)
-                            .ok_or_else(|| PipelineError::Internal {
-                                op: "source-ingest-count",
-                                node: src_cfg.name.clone(),
-                                detail: String::from(
-                                    "source record count cannot advance beyond u64::MAX",
-                                ),
-                            })?;
+                    outcome.total_count = outcome.total_count.checked_add(1).ok_or_else(|| {
+                        PipelineError::Internal {
+                            op: "source-ingest-count",
+                            node: src_cfg.name.clone(),
+                            detail: String::from(
+                                "source record count cannot advance beyond u64::MAX",
+                            ),
+                        }
+                    })?;
                     let file_arc = src_reader
                         .current_source_file()
                         .cloned()
@@ -783,7 +962,9 @@ fn drive_record_source(
                         && let Some(raw_nanos) = value_to_event_time_nanos(value)
                     {
                         let effective = raw_nanos.saturating_sub(delay_nanos);
-                        watermark_observations.push((Arc::clone(&file_arc), effective));
+                        outcome
+                            .watermark_observations
+                            .push((Arc::clone(&file_arc), effective));
                         clinker_record::Value::Integer(effective)
                     } else {
                         clinker_record::Value::Null
@@ -817,7 +998,12 @@ fn drive_record_source(
                                 file_representative = Some((Arc::clone(&file_arc), record, row_id));
                             }
                         }
-                        Err(crate::executor::source_stream::SourceStreamError::Closed) => break,
+                        Err(crate::executor::source_stream::SourceStreamError::Closed) => {
+                            outcome.interrupted = shutdown_for_poll.as_ref().is_some_and(
+                                crate::pipeline::shutdown::ShutdownToken::is_requested,
+                            );
+                            break;
+                        }
                         Err(
                             crate::executor::source_stream::SourceStreamError::OrdinalExhausted {
                                 source,
@@ -837,6 +1023,15 @@ fn drive_record_source(
                     }
                 }
                 Ok(None) => {
+                    // RecordSource transports may signal cancellation as EOF.
+                    // Observe it here, before declaring the source complete.
+                    if shutdown_for_poll
+                        .as_ref()
+                        .is_some_and(crate::pipeline::shutdown::ShutdownToken::is_requested)
+                    {
+                        outcome.interrupted = true;
+                        break;
+                    }
                     // End of input. The reader may still hold trailing
                     // envelope events — a header-only interchange (envelope
                     // structure, zero body records), or an inner envelope
@@ -884,16 +1079,15 @@ fn drive_record_source(
                         mut original_record,
                         message,
                     } = *failure;
-                    total_count =
-                        total_count
-                            .checked_add(1)
-                            .ok_or_else(|| PipelineError::Internal {
-                                op: "source-ingest-count",
-                                node: src_cfg.name.clone(),
-                                detail: String::from(
-                                    "source record count cannot advance beyond u64::MAX",
-                                ),
-                            })?;
+                    outcome.total_count = outcome.total_count.checked_add(1).ok_or_else(|| {
+                        PipelineError::Internal {
+                            op: "source-ingest-count",
+                            node: src_cfg.name.clone(),
+                            detail: String::from(
+                                "source record count cannot advance beyond u64::MAX",
+                            ),
+                        }
+                    })?;
                     let file_arc = src_reader
                         .current_source_file()
                         .cloned()
@@ -915,13 +1109,12 @@ fn drive_record_source(
                         &file_arc,
                         preserve_empty_physical_files,
                     )?;
-                    let doc_ctx = doc_stack.last().cloned().unwrap_or_else(|| {
-                        SharedStorage::from_arc(Arc::new(clinker_record::DocumentContext::new(
-                            clinker_record::DocumentId::next(),
-                            Arc::clone(&file_arc),
-                            clinker_record::EnvelopeRecord::empty(),
-                        )))
-                    });
+                    let doc_ctx = rejection_document_context(
+                        &src_cfg,
+                        &doc_stack,
+                        &file_arc,
+                        stream.allocation_resources(),
+                    )?;
                     original_record = stamp_source_rejection_record(
                         &rejection_schema,
                         reader_schema.column_count(),
@@ -929,8 +1122,15 @@ fn drive_record_source(
                             .columns()
                             .iter()
                             .map(|column| {
+                                // CSV coercion retains the physical input row
+                                // on failure. Resolve its declared aliases before
+                                // stamping onto the logical rejection schema.
+                                let physical = physical_columns
+                                    .iter()
+                                    .find(|declared| declared.name == column.as_ref())
+                                    .map_or(column.as_ref(), Column::physical_name);
                                 original_record
-                                    .get(column.as_ref())
+                                    .get(physical)
                                     .cloned()
                                     .unwrap_or(clinker_record::Value::Null)
                             })
@@ -960,7 +1160,12 @@ fn drive_record_source(
                     );
                     match stream.push_rejection(event) {
                         Ok(()) => {}
-                        Err(crate::executor::source_stream::SourceStreamError::Closed) => break,
+                        Err(crate::executor::source_stream::SourceStreamError::Closed) => {
+                            outcome.interrupted = shutdown_for_poll.as_ref().is_some_and(
+                                crate::pipeline::shutdown::ShutdownToken::is_requested,
+                            );
+                            break;
+                        }
                         Err(
                             crate::executor::source_stream::SourceStreamError::OrdinalExhausted {
                                 source,
@@ -986,16 +1191,15 @@ fn drive_record_source(
                         actual,
                         original_record: raw_record,
                     } = *failure;
-                    total_count =
-                        total_count
-                            .checked_add(1)
-                            .ok_or_else(|| PipelineError::Internal {
-                                op: "source-ingest-count",
-                                node: src_cfg.name.clone(),
-                                detail: String::from(
-                                    "source record count cannot advance beyond u64::MAX",
-                                ),
-                            })?;
+                    outcome.total_count = outcome.total_count.checked_add(1).ok_or_else(|| {
+                        PipelineError::Internal {
+                            op: "source-ingest-count",
+                            node: src_cfg.name.clone(),
+                            detail: String::from(
+                                "source record count cannot advance beyond u64::MAX",
+                            ),
+                        }
+                    })?;
                     let file_arc = src_reader
                         .current_source_file()
                         .cloned()
@@ -1017,13 +1221,12 @@ fn drive_record_source(
                         &file_arc,
                         preserve_empty_physical_files,
                     )?;
-                    let doc_ctx = doc_stack.last().cloned().unwrap_or_else(|| {
-                        SharedStorage::from_arc(Arc::new(clinker_record::DocumentContext::new(
-                            clinker_record::DocumentId::next(),
-                            Arc::clone(&file_arc),
-                            clinker_record::EnvelopeRecord::empty(),
-                        )))
-                    });
+                    let doc_ctx = rejection_document_context(
+                        &src_cfg,
+                        &doc_stack,
+                        &file_arc,
+                        stream.allocation_resources(),
+                    )?;
                     let original_record = stamp_source_rejection_record(
                         &rejection_schema,
                         reader_schema.column_count(),
@@ -1051,7 +1254,12 @@ fn drive_record_source(
                     );
                     match stream.push_rejection(event) {
                         Ok(()) => {}
-                        Err(crate::executor::source_stream::SourceStreamError::Closed) => break,
+                        Err(crate::executor::source_stream::SourceStreamError::Closed) => {
+                            outcome.interrupted = shutdown_for_poll.as_ref().is_some_and(
+                                crate::pipeline::shutdown::ShutdownToken::is_requested,
+                            );
+                            break;
+                        }
                         Err(
                             crate::executor::source_stream::SourceStreamError::OrdinalExhausted {
                                 source,
@@ -1079,16 +1287,15 @@ fn drive_record_source(
                         raw_record,
                         message,
                     } = *failure;
-                    total_count =
-                        total_count
-                            .checked_add(1)
-                            .ok_or_else(|| PipelineError::Internal {
-                                op: "source-ingest-count",
-                                node: src_cfg.name.clone(),
-                                detail: String::from(
-                                    "source record count cannot advance beyond u64::MAX",
-                                ),
-                            })?;
+                    outcome.total_count = outcome.total_count.checked_add(1).ok_or_else(|| {
+                        PipelineError::Internal {
+                            op: "source-ingest-count",
+                            node: src_cfg.name.clone(),
+                            detail: String::from(
+                                "source record count cannot advance beyond u64::MAX",
+                            ),
+                        }
+                    })?;
                     let file_arc = src_reader
                         .current_source_file()
                         .cloned()
@@ -1110,13 +1317,12 @@ fn drive_record_source(
                         &file_arc,
                         preserve_empty_physical_files,
                     )?;
-                    let doc_ctx = doc_stack.last().cloned().unwrap_or_else(|| {
-                        SharedStorage::from_arc(Arc::new(clinker_record::DocumentContext::new(
-                            clinker_record::DocumentId::next(),
-                            Arc::clone(&file_arc),
-                            clinker_record::EnvelopeRecord::empty(),
-                        )))
-                    });
+                    let doc_ctx = rejection_document_context(
+                        &src_cfg,
+                        &doc_stack,
+                        &file_arc,
+                        stream.allocation_resources(),
+                    )?;
                     let mut body_values =
                         vec![clinker_record::Value::Null; reader_schema.column_count()];
                     let record_type_index = reader_schema.index("record_type").ok_or_else(|| {
@@ -1157,7 +1363,12 @@ fn drive_record_source(
                     );
                     match stream.push_rejection(event) {
                         Ok(()) => {}
-                        Err(crate::executor::source_stream::SourceStreamError::Closed) => break,
+                        Err(crate::executor::source_stream::SourceStreamError::Closed) => {
+                            outcome.interrupted = shutdown_for_poll.as_ref().is_some_and(
+                                crate::pipeline::shutdown::ShutdownToken::is_requested,
+                            );
+                            break;
+                        }
                         Err(
                             crate::executor::source_stream::SourceStreamError::OrdinalExhausted {
                                 source,
@@ -1239,13 +1450,12 @@ fn drive_record_source(
                         // prior-file stack was just closed above, leave the
                         // stack empty, so synthesize a file-level context from
                         // the file grain instead.
-                        let doc_ctx = doc_stack.last().cloned().unwrap_or_else(|| {
-                            SharedStorage::from_arc(Arc::new(clinker_record::DocumentContext::new(
-                                clinker_record::DocumentId::next(),
-                                Arc::clone(&file_arc),
-                                clinker_record::EnvelopeRecord::empty(),
-                            )))
-                        });
+                        let doc_ctx = rejection_document_context(
+                            &src_cfg,
+                            &doc_stack,
+                            &file_arc,
+                            stream.allocation_resources(),
+                        )?;
                         let (rep_record, rejected_row_id) = match file_representative
                             .as_ref()
                             .filter(|(representative_file, _, _)| {
@@ -1306,7 +1516,7 @@ fn drive_record_source(
                 }
             }
         }
-        if !interrupted {
+        if !outcome.interrupted {
             // Close every level still open at end-of-input, innermost first.
             // This balances both the file-level document and any nested level
             // a reader left open (a truncated `--dry-run -n` read, or a reader
@@ -1319,11 +1529,7 @@ fn drive_record_source(
         // Drop the sender so the dispatch-side `recv` returns `Err`
         // (channel disconnected) once the channel drains.
         drop(stream);
-        Ok(IngestTaskOutcome {
-            source_name: src_cfg.name.clone(),
-            total_count,
-            watermark_observations,
-        })
+        Ok(())
     }
 }
 
@@ -1552,8 +1758,8 @@ fn emit_structural_reject_close(
 ///
 /// # Errors
 ///
-/// Returns [`PipelineError::Internal`] if the reader's envelope pre-scan
-/// fails for a source that declares an `envelope:` config.
+/// Preserves typed resource refusal and cancellation from pre-scan or context
+/// admission. Other pre-scan failures retain their existing internal diagnostic.
 fn open_file_level_doc(
     src_cfg: &clinker_plan::config::SourceConfig,
     stream: &mut crate::executor::source_stream::SourceIngestChannel,
@@ -1568,26 +1774,106 @@ fn open_file_level_doc(
     // emits, so every record of this file carries the same fully-populated
     // context.
     let envelope_sections = match src_cfg.envelope.as_ref() {
-        Some(cfg) => src_reader
-            .prepare_document(cfg)
-            .map_err(|e| PipelineError::Internal {
+        Some(cfg) => src_reader.prepare_document(cfg).map_err(|e| match e {
+            clinker_format::FormatError::Resource(_) => PipelineError::Format(e),
+            clinker_format::FormatError::Interrupted => PipelineError::Interrupted,
+            _ => PipelineError::Internal {
                 op: "envelope-pre-scan",
                 node: src_cfg.name.clone(),
                 detail: e.to_string(),
-            })?,
-        None => indexmap::IndexMap::new(),
+            },
+        })?,
+        None => OwnedMap::from_map(indexmap::IndexMap::new()),
     };
-    let new_ctx = SharedStorage::from_arc(Arc::new(clinker_record::DocumentContext::new(
-        clinker_record::DocumentId::next(),
-        Arc::clone(file_arc),
-        clinker_record::EnvelopeRecord::from_sections(envelope_sections),
-    )));
+    let new_ctx = build_file_level_context(
+        src_cfg,
+        envelope_sections,
+        file_arc,
+        stream.allocation_resources(),
+    )?;
     push_doc_punctuation(
         stream,
         crate::executor::stream_event::Punctuation::document_open(new_ctx.clone()),
     )?;
     doc_stack.push(new_ctx);
     Ok(())
+}
+
+/// Reuse the active document or admit a zero-body rejection context before
+/// publishing the rejection. The empty-stack case has no decoded row owner.
+fn rejection_document_context(
+    src_cfg: &clinker_plan::config::SourceConfig,
+    doc_stack: &[SharedStorage<clinker_record::DocumentContext>],
+    file_arc: &Arc<str>,
+    resources: &AllocationResources,
+) -> Result<SharedStorage<clinker_record::DocumentContext>, PipelineError> {
+    match doc_stack.last() {
+        Some(context) => Ok(context.clone()),
+        None => build_file_level_context(
+            src_cfg,
+            OwnedMap::from_map(indexmap::IndexMap::new()),
+            file_arc,
+            resources,
+        ),
+    }
+}
+
+/// Move captured sections into their published context before emitting any event.
+/// CSV schema, slots and outer context use the source's finite allocation scope;
+/// other formats retain their existing legacy outer allocation semantics.
+fn build_file_level_context(
+    src_cfg: &clinker_plan::config::SourceConfig,
+    sections: OwnedMap,
+    file_arc: &Arc<str>,
+    resources: &AllocationResources,
+) -> Result<SharedStorage<clinker_record::DocumentContext>, PipelineError> {
+    let id = clinker_record::DocumentId::next();
+    if matches!(src_cfg.format, clinker_plan::config::InputFormat::Csv(_)) {
+        let scope = resources
+            .scope()
+            .map_err(clinker_format::FormatError::from)?;
+        let mut schema = clinker_record::schema::AdmittedSchemaBuilder::try_with_capacity(
+            sections.len(),
+            &scope,
+        )
+        .map_err(clinker_format::FormatError::from)?;
+        let mut values = OwnedValues::try_with_capacity(sections.len(), &scope)
+            .map_err(clinker_format::FormatError::from)?;
+        for (name, payload) in sections {
+            schema
+                .try_push(name, None, &scope)
+                .map_err(clinker_format::FormatError::from)?;
+            values
+                .try_push(payload, &scope)
+                .map_err(|(error, _)| clinker_format::FormatError::from(error))?;
+        }
+        let schema = schema
+            .finish(&scope)
+            .map_err(clinker_format::FormatError::from)?;
+        let envelope =
+            clinker_record::EnvelopeRecord::from_owned_values(schema, values).map_err(|e| {
+                PipelineError::Internal {
+                    op: "envelope-context",
+                    node: src_cfg.name.clone(),
+                    detail: e.to_string(),
+                }
+            })?;
+        return clinker_record::DocumentContext::try_new(
+            id,
+            Arc::clone(file_arc),
+            envelope,
+            &scope,
+        )
+        .map_err(clinker_format::FormatError::from)
+        .map_err(PipelineError::from);
+    }
+    Ok(SharedStorage::from_arc(Arc::new(
+        clinker_record::DocumentContext::new(
+            id,
+            Arc::clone(file_arc),
+            clinker_record::EnvelopeRecord::from_sections(sections),
+        ),
+    )))
 }
 
 /// Apply the reader's pending physical-file and nested-envelope events.
@@ -1606,9 +1892,8 @@ fn open_file_level_doc(
 ///
 /// # Errors
 ///
-/// Returns [`PipelineError::Internal`] if opening the file-level document
-/// (when a nested event arrives before any record) triggers an envelope
-/// pre-scan failure.
+/// Forwards file-level pre-scan and admission errors, preserving resource
+/// refusal and cancellation before any nested document is published.
 fn apply_source_lifecycle_events(
     src_cfg: &clinker_plan::config::SourceConfig,
     stream: &mut crate::executor::source_stream::SourceIngestChannel,
@@ -1693,13 +1978,15 @@ fn apply_source_lifecycle_events(
 ///
 /// Returns a config validation error when the schema is not a multi-record
 /// schema, or [`PipelineError::Compilation`] when the reader rejects the
-/// discriminator / record-type declarations.
+/// discriminator / record-type declarations. Resource refusal and cancellation
+/// keep their typed runtime errors.
 fn build_multi_record_reader(
     input: &clinker_plan::config::SourceConfig,
     schema: &SourceSchema,
     kind: MultiRecordKind,
     reader: Box<dyn Read + Send>,
     numeric_observer: Option<NumericObserver>,
+    allocation: &ReaderAllocation,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     let SourceSchema::MultiRecord {
         discriminator,
@@ -1721,9 +2008,13 @@ fn build_multi_record_reader(
     // row is never misclassified as a body record (the driver calls
     // `next_record` before `prepare_document`).
     let header_tags = header_record_type_tags(input);
-    let to_pipeline_err = |e: clinker_format::FormatError| PipelineError::Compilation {
-        transform_name: input.name.clone(),
-        messages: vec![format!("multi-record reader init error: {e}")],
+    let to_pipeline_err = |e: clinker_format::FormatError| match e {
+        clinker_format::FormatError::Resource(_) => PipelineError::Format(e),
+        clinker_format::FormatError::Interrupted => PipelineError::Interrupted,
+        _ => PipelineError::Compilation {
+            transform_name: input.name.clone(),
+            messages: vec![format!("multi-record reader init error: {e}")],
+        },
     };
     let spec = clinker_format::multi_record::MultiRecordSpec {
         discriminator: discriminator.clone(),
@@ -1747,33 +2038,34 @@ fn build_multi_record_reader(
         }
         MultiRecordKind::Csv(opts) => {
             let cfg = build_csv_reader_config(opts)?;
-            // The multi-record CSV backend decodes through the csv crate's
-            // UTF-8 string path, so it cannot honor a declared non-UTF-8
-            // `encoding`. Reject it at startup rather than silently dropping
-            // the option (a single-schema CSV source supports it end-to-end).
-            if cfg.charset != Charset::Utf8 {
-                return Err(PipelineError::Config(
-                    clinker_plan::config::ConfigError::Validation(format!(
-                        "source {:?}: multi-record CSV (a `records:` schema) does not support a \
-                         non-UTF-8 `encoding`; declare `encoding: utf-8` or read it as a \
-                         single-schema CSV source",
-                        input.name
-                    )),
-                ));
+            let dialect = clinker_format::multi_record::CsvDialect {
+                delimiter: cfg.delimiter,
+                quote_char: cfg.quote_char,
+                // Skip the optional textual column header before routing tags.
+                has_header: cfg.has_header,
+            };
+            let reader = match allocation {
+                ReaderAllocation::Admitted(resources) => {
+                    let workspace = DecodeWorkspace::new(resources.clone())
+                        .map_err(clinker_format::FormatError::from)?;
+                    clinker_format::multi_record::MultiRecordReader::new_csv_admitted(
+                        reader,
+                        spec,
+                        dialect,
+                        cfg.charset,
+                        workspace,
+                        TextStorage::Shared,
+                    )
+                }
+                ReaderAllocation::Legacy => {
+                    clinker_format::multi_record::MultiRecordReader::new_csv(
+                        reader,
+                        spec,
+                        dialect,
+                        cfg.charset,
+                    )
+                }
             }
-            let reader = clinker_format::multi_record::MultiRecordReader::new_csv(
-                reader,
-                spec,
-                clinker_format::multi_record::CsvDialect {
-                    delimiter: cfg.delimiter,
-                    quote_char: cfg.quote_char,
-                    // A multi-record CSV exported with a column-header line
-                    // (the default `has_header: true`) skips that first
-                    // physical row, so a textual header is not mistaken for
-                    // an unknown discriminator value.
-                    has_header: cfg.has_header,
-                },
-            )
             .map_err(to_pipeline_err)?;
             Box::new(match numeric_observer {
                 Some(observer) => reader.with_numeric_observer(observer),
@@ -2112,7 +2404,17 @@ nodes:
             clinker_format::Column::bare("name", cxl::typecheck::Type::String),
         ]);
 
-        let mut reader = build_format_reader(&input, &schema, source, None).expect("build reader");
+        let provider = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+        );
+        let mut reader = build_format_reader(
+            &input,
+            &schema,
+            source,
+            None,
+            &super::ReaderAllocation::Admitted(provider.resources().allocation().clone()),
+        )
+        .expect("build reader");
         while reader.next_record().expect("read record").is_some() {}
 
         assert_eq!(
@@ -2242,6 +2544,10 @@ mod tests {
     /// Minimal pathless CSV `SourceConfig` — the transport the driver
     /// drives is supplied directly, so only the name/format matter.
     fn pathless_source_config() -> clinker_plan::config::SourceConfig {
+        pathless_source_body().source
+    }
+
+    fn pathless_source_body() -> clinker_plan::config::pipeline_node::SourceBody {
         let yaml = r#"
 pipeline:
   name: drive_test
@@ -2268,10 +2574,647 @@ nodes:
                 &mut spanned.value
             {
                 body.source.path = None;
-                return body.source.clone();
+                return body.clone();
             }
         }
         unreachable!("source node present")
+    }
+
+    #[test]
+    fn csv_document_context_moves_admitted_sections_and_retains_alias_ownership() {
+        let provider = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+        );
+        let resources = provider.resources().allocation().clone();
+        let scope = resources.scope().unwrap();
+        let text = clinker_record::FieldStr::try_new_unique(
+            &"retained-document-payload-".repeat(8),
+            &scope,
+        )
+        .unwrap();
+        let pointer = text.as_str().as_ptr();
+        let mut fields = OwnedMap::try_with_capacity(1, &scope).unwrap();
+        fields
+            .try_insert(
+                OwnedKey::try_new("value", &scope).unwrap(),
+                Value::String(text),
+                &scope,
+            )
+            .unwrap();
+        let mut sections = OwnedMap::try_with_capacity(1, &scope).unwrap();
+        sections
+            .try_insert(
+                OwnedKey::try_new("manifest", &scope).unwrap(),
+                Value::Map(fields),
+                &scope,
+            )
+            .unwrap();
+        let file: Arc<str> = Arc::from("input.csv");
+        let context =
+            build_file_level_context(&pathless_source_config(), sections, &file, &resources)
+                .unwrap();
+        assert_eq!(context.unaccounted_outer_heap_size(&resources), 0);
+        // Physical source identity remains its existing, separately tracked Arc.
+        assert_eq!(
+            context.unaccounted_heap_size(&resources),
+            file.len() + 2 * std::mem::size_of::<usize>()
+        );
+        let (_, Value::Map(fields)) = context.envelope_record().sections().next().unwrap() else {
+            panic!("section")
+        };
+        let Value::String(text) = fields.get("value").unwrap() else {
+            panic!("text")
+        };
+        assert_eq!(
+            text.as_str().as_ptr(),
+            pointer,
+            "the unique text allocation must move"
+        );
+        let charged = provider.used();
+        assert!(charged > 0);
+        let alias = context.clone();
+        drop(context);
+        assert_eq!(
+            provider.used(),
+            charged,
+            "published aliases retain the full charge"
+        );
+        drop(alias);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn csv_document_context_admission_fails_before_publishing_an_open() {
+        let provider =
+            clinker_format::preparation::MemoryOnlyResources::new(std::num::NonZeroUsize::MIN);
+        let (mut stream, rx) = crate::executor::source_stream::SourceIngestChannel::new(
+            1,
+            crate::pipeline::memory::ConsumerHandle::new(),
+            <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(0),
+            provider.resources().allocation().clone(),
+        );
+        let mut stack = Vec::new();
+        let mut reader: Box<dyn crate::source::RecordSource> =
+            Box::new(ScriptedReader::new(vec![]));
+        let error = open_file_level_doc(
+            &pathless_source_config(),
+            &mut stream,
+            &mut stack,
+            &mut reader,
+            &Arc::from("input.csv"),
+        )
+        .expect_err("the context must be admitted before document open");
+        assert!(
+            matches!(error, PipelineError::Format(clinker_format::FormatError::Resource(resource))
+            if resource.kind == clinker_record::owned_storage::ResourceErrorKind::Budget)
+        );
+        assert!(stack.is_empty());
+        assert!(rx.try_recv().is_err());
+        drop(reader);
+        drop(stream);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn csv_rejection_context_admits_empty_documents_and_preserves_active_owner() {
+        let source = pathless_source_config();
+        let file: Arc<str> = Arc::from("rejected.csv");
+        let denied =
+            clinker_format::preparation::MemoryOnlyResources::new(std::num::NonZeroUsize::MIN);
+        let error =
+            rejection_document_context(&source, &[], &file, denied.resources().allocation())
+                .unwrap_err();
+        assert!(
+            matches!(error, PipelineError::Format(clinker_format::FormatError::Resource(resource))
+            if resource.kind == clinker_record::owned_storage::ResourceErrorKind::Budget)
+        );
+        assert_eq!(denied.used(), 0);
+        let provider = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+        );
+        let resources = provider.resources();
+        let context =
+            rejection_document_context(&source, &[], &file, resources.allocation()).unwrap();
+        assert_eq!(
+            context.unaccounted_outer_heap_size(resources.allocation()),
+            0
+        );
+        let charged = provider.used();
+        let active = rejection_document_context(
+            &source,
+            std::slice::from_ref(&context),
+            &file,
+            denied.resources().allocation(),
+        )
+        .unwrap();
+        assert!(SharedStorage::ptr_eq(&active, &context));
+        drop(context);
+        assert_eq!(provider.used(), charged);
+        drop(active);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn document_prescan_preserves_typed_resource_and_interruption_errors() {
+        struct PrescanFailure(Option<clinker_format::FormatError>);
+        impl crate::source::RecordSource for PrescanFailure {
+            fn schema(&mut self) -> Result<SharedStorage<Schema>, clinker_format::FormatError> {
+                panic!("pre-scan must not request schema")
+            }
+            fn next_record(
+                &mut self,
+            ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+                panic!("pre-scan must not publish records")
+            }
+            fn prepare_document(
+                &mut self,
+                _: &clinker_format::EnvelopeConfig,
+            ) -> Result<OwnedMap, clinker_format::FormatError> {
+                Err(self.0.take().unwrap())
+            }
+        }
+        use clinker_record::owned_storage::{ResourceError, ResourceErrorKind};
+        let resource = ResourceError::new(ResourceErrorKind::Budget, 73, 19);
+        let cancelled = ResourceError::new(ResourceErrorKind::Cancelled, 0, 0);
+        for failure in [
+            clinker_format::FormatError::Resource(resource),
+            clinker_format::FormatError::Resource(cancelled),
+            clinker_format::FormatError::Interrupted,
+        ] {
+            let expected = match &failure {
+                clinker_format::FormatError::Resource(resource) => Some(*resource),
+                _ => None,
+            };
+            let mut source = pathless_source_config();
+            source.envelope = Some(clinker_format::EnvelopeConfig::default());
+            let provider = clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+            );
+            let (mut stream, rx) = crate::executor::source_stream::SourceIngestChannel::new(
+                1,
+                crate::pipeline::memory::ConsumerHandle::new(),
+                <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(0),
+                provider.resources().allocation().clone(),
+            );
+            let mut stack = Vec::new();
+            let mut reader: Box<dyn crate::source::RecordSource> =
+                Box::new(PrescanFailure(Some(failure)));
+            let error = open_file_level_doc(
+                &source,
+                &mut stream,
+                &mut stack,
+                &mut reader,
+                &Arc::from("input.csv"),
+            )
+            .unwrap_err();
+            match (error, expected) {
+                (
+                    PipelineError::Format(clinker_format::FormatError::Resource(actual)),
+                    Some(expected),
+                ) => assert_eq!(actual, expected),
+                (PipelineError::Interrupted, None) => {}
+                (actual, expected) => {
+                    panic!("changed pre-scan failure: {actual:?}, expected {expected:?}")
+                }
+            }
+            assert!(stack.is_empty());
+            assert!(rx.try_recv().is_err());
+            assert_eq!(provider.used(), 0);
+        }
+    }
+
+    #[test]
+    fn multi_record_csv_factory_preserves_resource_refusal() {
+        let schema = SourceSchema::MultiRecord {
+            discriminator: clinker_format::schema::Discriminator {
+                field: Some("kind".into()),
+                start: None,
+                width: None,
+            },
+            record_types: vec![clinker_format::schema::RecordType {
+                id: "detail".into(),
+                tag: "D".into(),
+                description: None,
+                parent: None,
+                join_key: None,
+                columns: vec![Column::bare("kind", cxl::typecheck::Type::String)],
+            }],
+            structure: None,
+        };
+        let provider =
+            clinker_format::preparation::MemoryOnlyResources::new(std::num::NonZeroUsize::MIN);
+        let result = build_format_reader(
+            &pathless_source_config(),
+            &schema,
+            ReopenableSource::buffer(std::io::Cursor::new(b"kind\nD\n".to_vec())).unwrap(),
+            None,
+            &ReaderAllocation::Admitted(provider.resources().allocation().clone()),
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("one byte cannot admit CSV metadata"),
+        };
+        assert!(
+            matches!(error, PipelineError::Format(clinker_format::FormatError::Resource(resource))
+            if resource.kind == clinker_record::owned_storage::ResourceErrorKind::Budget)
+        );
+        assert_eq!(provider.used(), 0);
+    }
+
+    fn body_schema_failure(
+        error: clinker_format::FormatError,
+        shutdown_requested: bool,
+    ) -> Result<IngestTaskOutcome, PipelineError> {
+        struct FailingSchema {
+            error: Option<clinker_format::FormatError>,
+            shutdown: Option<crate::pipeline::shutdown::ShutdownToken>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl crate::source::RecordSource for FailingSchema {
+            fn schema(&mut self) -> Result<SharedStorage<Schema>, clinker_format::FormatError> {
+                if let Some(shutdown) = &self.shutdown {
+                    shutdown.request();
+                }
+                Err(self.error.take().expect("schema requested once"))
+            }
+
+            fn next_record(
+                &mut self,
+            ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+                panic!("schema failure must prevent record reads");
+            }
+        }
+        impl Drop for FailingSchema {
+            fn drop(&mut self) {
+                self.dropped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let shutdown = crate::pipeline::shutdown::ShutdownToken::detached();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (stream, receiver) = crate::executor::source_stream::SourceIngestChannel::new(
+            1,
+            crate::pipeline::memory::ConsumerHandle::new(),
+            <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(0),
+            clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+            )
+            .resources()
+            .allocation()
+            .clone(),
+        );
+        // This is also the composition activation entry: there is deliberately
+        // no top-level PipelineConfig lookup or telemetry producer here.
+        let result = ingest_source_body(
+            pathless_source_body(),
+            crate::source::SourceInput::Records(Box::new(FailingSchema {
+                error: Some(error),
+                shutdown: shutdown_requested.then(|| shutdown.clone()),
+                dropped: dropped.clone(),
+            })),
+            stream,
+            Some(shutdown.clone()),
+            None,
+            SourceRuntimePolicy::new(crate::executor::RunPolicy::new(
+                std::num::NonZeroUsize::MIN,
+                crate::executor::PreviewPolicy::Disabled,
+            )),
+        );
+        assert_eq!(shutdown.is_requested(), shutdown_requested);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
+        result
+    }
+
+    #[test]
+    fn source_body_normalizes_explicit_resource_cancellation_without_shutdown_or_telemetry() {
+        use clinker_record::owned_storage::{ResourceError, ResourceErrorKind};
+        for shutdown_requested in [false, true] {
+            let error = body_schema_failure(
+                clinker_format::FormatError::Resource(ResourceError::new(
+                    ResourceErrorKind::Cancelled,
+                    0,
+                    0,
+                )),
+                shutdown_requested,
+            );
+            let outcome = error.expect("resource cancellation returns established progress");
+            assert!(outcome.interrupted);
+            assert_eq!(outcome.total_count, 0);
+            assert!(outcome.watermark_observations.is_empty());
+        }
+    }
+
+    #[test]
+    fn source_body_preserves_resource_and_data_failures_with_shutdown_requested() {
+        use clinker_record::owned_storage::{ResourceError, ResourceErrorKind};
+        for kind in [
+            ResourceErrorKind::Budget,
+            ResourceErrorKind::Allocation,
+            ResourceErrorKind::Layout,
+            ResourceErrorKind::DiskQuota,
+            ResourceErrorKind::DescriptorQuota,
+            ResourceErrorKind::Storage,
+            ResourceErrorKind::Readback,
+            ResourceErrorKind::DeliveryPoisoned,
+            ResourceErrorKind::Finalized,
+            ResourceErrorKind::Authority,
+        ] {
+            let expected = ResourceError {
+                kind,
+                requested: 42,
+                available: 7,
+                field: Some(3),
+                offset: Some(11),
+            };
+            let error = body_schema_failure(clinker_format::FormatError::Resource(expected), true)
+                .unwrap_err();
+            assert!(
+                matches!(error, PipelineError::Format(clinker_format::FormatError::Resource(actual)) if actual == expected),
+                "{error:?}"
+            );
+        }
+        let error = body_schema_failure(
+            clinker_format::FormatError::Charset("invalid byte".into()),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PipelineError::Format(clinker_format::FormatError::Charset(ref detail)) if detail == "invalid byte"),
+            "{error:?}"
+        );
+        let error = body_schema_failure(
+            clinker_format::FormatError::Io(std::io::Error::other("read failure")),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PipelineError::Format(clinker_format::FormatError::Io(ref detail)) if detail.kind() == std::io::ErrorKind::Other && detail.to_string() == "read failure"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn interrupted_next_file_preserves_the_prior_read_count() {
+        struct NextFileCancellation {
+            schema: SharedStorage<Schema>,
+            read: bool,
+            advanced: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl crate::source::RecordSource for NextFileCancellation {
+            fn schema(&mut self) -> Result<SharedStorage<Schema>, clinker_format::FormatError> {
+                Ok(self.schema.clone())
+            }
+            fn next_record(
+                &mut self,
+            ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+                if !std::mem::replace(&mut self.read, true) {
+                    return Ok(Some(clinker_record::Record::new(
+                        self.schema.clone(),
+                        vec![Value::Integer(1)],
+                    )));
+                }
+                Err(clinker_format::FormatError::StructuralCount {
+                    format: "CSV",
+                    message: "invalid trailer".into(),
+                })
+            }
+            fn advance_to_next_file(&mut self) -> Result<bool, clinker_format::FormatError> {
+                self.advanced
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(clinker_format::FormatError::Resource(
+                    clinker_record::owned_storage::ResourceError::new(
+                        clinker_record::owned_storage::ResourceErrorKind::Cancelled,
+                        42,
+                        7,
+                    ),
+                ))
+            }
+        }
+        let mut body = pathless_source_body();
+        body.source.dlq_granularity = clinker_plan::config::DlqGranularity::Document;
+        let resources = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+        );
+        let (stream, receiver) = crate::executor::source_stream::SourceIngestChannel::new(
+            32,
+            crate::pipeline::memory::ConsumerHandle::new(),
+            <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(0),
+            resources.resources().allocation().clone(),
+        );
+        let advanced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let outcome = ingest_source_body(
+            body,
+            crate::source::SourceInput::Records(Box::new(NextFileCancellation {
+                schema: clinker_record::SchemaBuilder::new()
+                    .with_field("id")
+                    .build(),
+                read: false,
+                advanced: advanced.clone(),
+            })),
+            stream,
+            None,
+            None,
+            SourceRuntimePolicy::new(crate::executor::RunPolicy::new(
+                std::num::NonZeroUsize::MIN,
+                crate::executor::PreviewPolicy::Disabled,
+            )),
+        )
+        .unwrap();
+        assert!(advanced.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(outcome.interrupted);
+        assert_eq!(outcome.total_count, 1);
+        assert!(receiver.iter().count() > 0);
+    }
+
+    #[test]
+    fn ordered_eof_cancellation_aborts_close_and_releases_spills() {
+        use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator, NoOpPolicy};
+        use crate::pipeline::shutdown::ShutdownToken;
+        struct CancelAtEof {
+            schema: SharedStorage<Schema>,
+            remaining: u8,
+            shutdown: ShutdownToken,
+            memory: Arc<MemoryArbitrator>,
+        }
+        impl crate::source::RecordSource for CancelAtEof {
+            fn schema(&mut self) -> Result<SharedStorage<Schema>, clinker_format::FormatError> {
+                Ok(self.schema.clone())
+            }
+            fn next_record(
+                &mut self,
+            ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+                if self.remaining == 0 {
+                    assert!(
+                        self.memory.cumulative_spill_bytes() > 0,
+                        "fixture must hold real spill bytes before interruption"
+                    );
+                    self.shutdown.request();
+                    return Ok(None);
+                }
+                self.remaining -= 1;
+                Ok(Some(clinker_record::Record::new(
+                    self.schema.clone(),
+                    vec![
+                        Value::Integer(i64::from(self.remaining)),
+                        Value::from("payload".repeat(3000)),
+                    ],
+                )))
+            }
+        }
+        let plan = clinker_plan::config::parse_config(
+            r#"
+pipeline: { name: interrupted_ordered_close }
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: input.csv
+      schema: [{ name: id, type: int }, { name: payload, type: string }]
+      sort_order: [id]
+  - type: sink
+    name: out
+    input: rows
+    config: { name: out, type: csv, path: out.csv }
+"#,
+        )
+        .unwrap()
+        .compile(&clinker_plan::config::CompileContext::default())
+        .unwrap();
+        let body = plan.config().source_bodies().next().unwrap().clone();
+        let order = &plan.dag().order_contract().source_orders[0];
+        let config = crate::source::order_barrier::SourceOrderConfig::from_compiled(
+            order,
+            order.source_id,
+            "rows",
+            &body.schema,
+        )
+        .unwrap();
+        let memory = Arc::new(MemoryArbitrator::with_policy(
+            1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let resource_memory = Arc::new(MemoryArbitrator::with_policy(
+            16 * 1024 * 1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let shutdown = ShutdownToken::detached();
+        let resources = crate::executor::preparation::ExecutorResources::new(
+            resource_memory.clone(),
+            shutdown.clone(),
+            None,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            None,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (stream, receiver) = crate::executor::source_stream::SourceIngestChannel::new_ordered(
+            32,
+            ConsumerHandle::new(),
+            order.source_id,
+            config,
+            memory.clone(),
+            directory.path().to_path_buf(),
+            false,
+            resources.allocation(),
+        );
+        let result = ingest_source_body(
+            body,
+            crate::source::SourceInput::Records(Box::new(CancelAtEof {
+                schema: clinker_record::SchemaBuilder::new()
+                    .with_field("id")
+                    .with_field("payload")
+                    .build(),
+                remaining: 2,
+                shutdown: shutdown.clone(),
+                memory: memory.clone(),
+            })),
+            stream,
+            Some(shutdown.clone()),
+            None,
+            SourceRuntimePolicy::new(crate::executor::RunPolicy::new(
+                std::num::NonZeroUsize::MIN,
+                crate::executor::PreviewPolicy::Disabled,
+            )),
+        );
+        // The reader signalled EOF under cancellation. The driver observes
+        // its real handle before closing or releasing the partial barrier.
+        let outcome = result.expect("close cancellation retains established progress");
+        assert!(shutdown.is_requested());
+        assert!(outcome.interrupted);
+        assert_eq!(outcome.total_count, 2);
+        assert_eq!(
+            memory.cumulative_spill_bytes(),
+            0,
+            "all live spill charges must be released"
+        );
+        assert_eq!(
+            receiver.iter().count(),
+            0,
+            "the partial barrier must not publish"
+        );
+        drop(receiver);
+        assert_eq!(memory.consumer_count(), 0);
+        assert_eq!(memory.sum_consumer_usage(), 0);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        drop(resources);
+        assert_eq!(resource_memory.writer_resource_usage().memory, 0);
+    }
+
+    #[test]
+    fn worker_failure_waits_for_every_reader_before_returning() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_dropped = dropped.clone();
+        let failure = std::thread::spawn(|| {
+            Err(PipelineError::Io(std::io::Error::other(
+                "original reader failure",
+            )))
+        });
+        let remaining = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            worker_dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut outcome = IngestTaskOutcome::new("remaining".into());
+            outcome.interrupted = true;
+            Ok(outcome)
+        });
+        let joiner = std::thread::spawn(move || {
+            result_tx
+                .send(join_source_workers(
+                    [failure, remaining],
+                    "test-source-join",
+                ))
+                .unwrap();
+        });
+        entered_rx.recv().unwrap();
+        let premature = result_rx.recv_timeout(std::time::Duration::from_millis(50));
+        // Always release before asserting so a failing test cannot strand its worker.
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            premature,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        let error = result_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(error, PipelineError::Io(ref io) if io.to_string() == "original reader failure")
+        );
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        joiner.join().unwrap();
     }
 
     /// Drive `drive_record_source` over a pathless source and collect the
@@ -2294,8 +3237,10 @@ nodes:
             .allocation()
             .clone(),
         );
+        let mut outcome = IngestTaskOutcome::new(src_cfg.name.clone());
         drive_record_source(
             src_cfg,
+            &[],
             reader,
             stream,
             None,
@@ -2303,6 +3248,7 @@ nodes:
                 std::num::NonZeroUsize::MIN,
                 crate::executor::PreviewPolicy::Disabled,
             )),
+            &mut outcome,
         )
         .expect("drive");
         rx.iter()
@@ -2387,8 +3333,10 @@ nodes:
             .allocation()
             .clone(),
         );
+        let mut outcome = IngestTaskOutcome::new(src_cfg.name.clone());
         drive_record_source(
             src_cfg,
+            &[],
             reader,
             stream,
             None,
@@ -2398,6 +3346,7 @@ nodes:
                     std::num::NonZeroU64::new(2).unwrap(),
                 ),
             )),
+            &mut outcome,
         )
         .expect("bounded preview");
         let records = rx

@@ -302,15 +302,12 @@ impl<R: Read + Send> FormatReader for SwiftReader<R> {
         std::mem::take(&mut self.pending_events)
     }
 
-    fn prepare_document(
-        &mut self,
-        config: &EnvelopeConfig,
-    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
+    fn prepare_document(&mut self, config: &EnvelopeConfig) -> Result<OwnedMap, FormatError> {
         if config.is_empty() {
-            return Ok(IndexMap::new());
+            return Ok(OwnedMap::from_map(IndexMap::new()));
         }
         self.ensure_initialized()?;
-        self.serve_sections(config)
+        self.serve_sections(config).map(OwnedMap::from_map)
     }
 }
 

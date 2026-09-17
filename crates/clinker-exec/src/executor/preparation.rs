@@ -9,6 +9,22 @@ use crate::telemetry::{
     MetricKey, SpanFact, SpanName, SpanStatus, TelemetryProducer, unix_nanos_now,
 };
 
+/// Recognize cancellation from its typed evidence, independently of a shutdown
+/// request racing with a real failure. Callers retain the original error.
+pub(super) fn is_explicit_cancellation(error: &clinker_plan::error::PipelineError) -> bool {
+    matches!(
+        error,
+        clinker_plan::error::PipelineError::Interrupted
+            | clinker_plan::error::PipelineError::Format(clinker_format::FormatError::Interrupted)
+            | clinker_plan::error::PipelineError::Format(clinker_format::FormatError::Resource(
+                ResourceError {
+                    kind: ResourceErrorKind::Cancelled,
+                    ..
+                }
+            ))
+    )
+}
+
 #[derive(Clone, Copy)]
 enum ResourceWork {
     Admission,

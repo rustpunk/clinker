@@ -10,6 +10,9 @@ mod common;
 #[path = "common/multi_output_fixtures.rs"]
 mod multi_output_fixtures;
 
+#[path = "common/pipeline_resource_fixtures.rs"]
+mod resource_fixtures;
+
 use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 
@@ -106,18 +109,12 @@ fn run_mixed_fanout_report(
     params: PipelineRunParams,
 ) -> MixedFanoutReportResult {
     let (config, buffers) = multi_output_fixture(yaml);
-    let readers: clinker_exec::executor::SourceReaders = sources
-        .iter()
-        .map(|(name, csv)| {
-            (
-                (*name).to_string(),
-                clinker_exec::executor::single_file_reader(
-                    format!("{name}.csv"),
-                    Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
-                ),
-            )
-        })
-        .collect();
+    // These fixtures pressure shared operator storage, not CSV decoding.
+    let readers = resource_fixtures::predecoded_csv_readers(
+        &config,
+        &clinker_plan::config::CompileContext::default(),
+        sources,
+    );
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = buffers
         .iter()
         .map(|(name, buffer)| {
@@ -481,8 +478,16 @@ fn shared_port_resident_spill_parity() {
             test_params(),
         )
         .expect("resident shared Output plus Merge executes");
+        let mut pressure_config =
+            clinker_plan::config::parse_config(&shared_port_merge_yaml("64K", computational_first))
+                .expect("pressure fixture parses");
+        resource_fixtures::add_csv_workspace(
+            &mut pressure_config,
+            &clinker_plan::config::CompileContext::default(),
+        );
+        let spill_limit = pressure_config.pipeline.memory.limit.unwrap();
         let spilled = run_mixed_fanout_report(
-            &shared_port_merge_yaml("64K", computational_first),
+            &shared_port_merge_yaml(&spill_limit, computational_first),
             &[("shared", &shared), ("sibling", &sibling)],
             test_params(),
         )
@@ -696,13 +701,11 @@ nodes:
         spill_root_dir: Some(spill_root.path().to_path_buf()),
         ..test_params()
     };
-    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
-        "shared".to_string(),
-        clinker_exec::executor::single_file_reader(
-            "shared.csv",
-            Box::new(std::io::Cursor::new(shared.as_bytes().to_vec())),
-        ),
-    )]);
+    let readers = resource_fixtures::predecoded_csv_readers(
+        &config,
+        &clinker_plan::config::CompileContext::default(),
+        &[("shared", &shared)],
+    );
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
         (
             "interrupting".to_string(),

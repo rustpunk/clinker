@@ -14,6 +14,9 @@
 //! so a future schema change can't silently downgrade the coverage to the
 //! inline arm.
 
+#[path = "common/resource_fixtures.rs"]
+mod resource_fixtures;
+
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 
@@ -474,12 +477,23 @@ nodes:
         .unwrap()
         .output_schema_in(plan.dag())
         .clone();
+    let mut sample = clinker_record::Record::new(
+        schema.clone(),
+        vec![clinker_record::Value::Null; schema.column_count()],
+    );
+    sample.set("row_uuid", clinker_record::Value::from(TICKET_UUID_1));
+    sample.set(
+        "note",
+        clinker_record::Value::from(format!("{note} #{}", ROWS - 1)),
+    );
+    let writer_workspace = resource_fixtures::csv_workspace_headroom(&sample) as usize;
     // Route retains its input reservation while sending one charged batch
     // into the 256-event output channel. The default batch is unchanged.
     let row_bytes =
         std::mem::size_of::<(clinker_record::Record, clinker_exec::executor::SourceRowId)>()
             + schema.column_count() * std::mem::size_of::<clinker_record::Value>();
-    let overlap = (ROWS + clinker_exec::executor::DEFAULT_BATCH_SIZE + 256) * row_bytes;
+    let overlap =
+        (ROWS + clinker_exec::executor::DEFAULT_BATCH_SIZE + 256) * row_bytes + writer_workspace;
     let yaml = yaml.replace(
         "\"1M\"",
         &format!("\"{}\"", tight_scan_limit(&plan, ROWS).max(overlap)),

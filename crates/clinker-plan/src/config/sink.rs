@@ -378,6 +378,13 @@ impl From<&OutputEnvelopeConfig> for clinker_format::OutputEnvelopeSpec {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CsvOutputOptions {
+    /// Strict UTF-8 (default) or true ISO-8859-1 for both header and body cells.
+    /// Unrepresentable text rejects the complete prepared operation.
+    #[serde(
+        deserialize_with = "super::format::deserialize_encoding",
+        serialize_with = "super::format::serialize_encoding"
+    )]
+    pub encoding: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delimiter: Option<String>,
     /// Per-document envelope reconstruction (header/footer sections). Active
@@ -527,7 +534,10 @@ pub struct X12OutputOptions {
     /// round-trips byte-faithfully. Supported values are `utf-8` and
     /// `iso-8859-1` (Latin-1); a character the charset cannot represent is
     /// rejected rather than emitted truncated.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        deserialize_with = "super::format::deserialize_encoding",
+        serialize_with = "super::format::serialize_encoding"
+    )]
     pub encoding: Option<String>,
 }
 

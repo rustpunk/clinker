@@ -581,6 +581,12 @@ impl PipelineConfig {
             }
         }
 
+        for spanned in &self.nodes {
+            if let Err(message) = validate_node_encoding(&spanned.value) {
+                diags.push(Diagnostic::error("E115", message, span_for(spanned)));
+            }
+        }
+
         diags
     }
 
@@ -5303,6 +5309,12 @@ pub(crate) fn validate_node_configs(nodes: &[Spanned<PipelineNode>]) -> Vec<Node
     // a wired `header:` is caught by the unified input-reference pass
     // (E004), exactly as for any other consumer input.
     for (node_index, spanned) in nodes.iter().enumerate() {
+        if let Err(message) = validate_node_encoding(&spanned.value) {
+            violations.push(NodeConfigViolation {
+                node_index,
+                message,
+            });
+        }
         if let PipelineNode::Envelope { header, .. } = &spanned.value
             && header.trailer.is_some()
         {
@@ -5408,6 +5420,52 @@ pub(crate) fn validate_node_configs(nodes: &[Spanned<PipelineNode>]) -> Vec<Node
     }
 
     violations
+}
+
+fn validate_node_encoding(node: &PipelineNode) -> Result<(), String> {
+    let result = match node {
+        PipelineNode::Source { config, .. } => config.source.format.resolved_charset(),
+        PipelineNode::Sink { config, .. } => config.sink.format.resolved_charset(),
+        _ => Ok(None),
+    };
+    result
+        .map(|_| ())
+        .map_err(|error| format!("node {:?}: {error}", node.name()))
+}
+
+#[cfg(test)]
+mod encoding_policy_tests {
+    use super::*;
+
+    #[test]
+    fn composition_body_encoding_gate_rejects_typed_source_and_sink_options() {
+        let yaml = "pipeline: { name: charset_gate }\nnodes:\n  - type: source\n    name: src\n    config: { name: src, path: input.csv, type: csv, schema: [{ name: value, type: string }] }\n  - type: sink\n    name: dest\n    input: src\n    config: { name: dest, path: output.csv, type: csv }\n";
+        let mut config = parse_config(yaml).unwrap();
+        for node in &mut config.nodes {
+            match &mut node.value {
+                PipelineNode::Source { config, .. } => {
+                    config.source.format = InputFormat::X12(Some(X12InputOptions {
+                        encoding: Some("windows-1252".into()),
+                        ..Default::default()
+                    }));
+                }
+                PipelineNode::Sink { config, .. } => {
+                    config.sink.format = OutputFormat::Csv(Some(CsvOutputOptions {
+                        encoding: Some("shift_jis".into()),
+                        ..Default::default()
+                    }));
+                }
+                _ => {}
+            }
+        }
+        // Composition binding calls this same node-local admission boundary.
+        let violations = validate_node_configs(&config.nodes);
+        assert_eq!(violations.len(), 2);
+        assert_eq!(violations[0].node_index, 0);
+        assert!(violations[0].message.contains("windows-1252"));
+        assert_eq!(violations[1].node_index, 1);
+        assert!(violations[1].message.contains("shift_jis"));
+    }
 }
 
 /// Validate an HL7 source's `split_fields` declarations: each names a

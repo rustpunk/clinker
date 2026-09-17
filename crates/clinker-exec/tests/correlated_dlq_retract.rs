@@ -25,6 +25,8 @@
 mod common;
 #[path = "common/dlq_fixtures.rs"]
 mod dlq_fixtures;
+#[path = "common/pipeline_resource_fixtures.rs"]
+mod resource_fixtures;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{DlqEntry, PipelineRunParams};
@@ -36,6 +38,14 @@ use std::collections::HashMap;
 type RunOutput = (PipelineCounters, Vec<DlqEntry>, String);
 
 fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, PipelineError> {
+    run_pipeline_input(yaml, csv_input, false)
+}
+
+fn run_pipeline_input(
+    yaml: &str,
+    csv_input: &str,
+    predecoded: bool,
+) -> Result<RunOutput, PipelineError> {
     let config = clinker_plan::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
@@ -48,10 +58,20 @@ fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, PipelineError>
     let primary = config.source_configs().next().unwrap().name.clone();
     let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        clinker_exec::executor::single_file_reader(
-            "test.csv",
-            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
-        ),
+        if predecoded {
+            // Keep the tiny budget focused on Aggregate's oversized-row path.
+            resource_fixtures::predecoded_csv_source(
+                &config,
+                &clinker_plan::config::CompileContext::default(),
+                &primary,
+                &[("test.csv", csv_input)],
+            )
+        } else {
+            clinker_exec::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
+            )
+        },
     )]);
 
     let buf = SharedBuffer::new();
@@ -1206,10 +1226,11 @@ O5,ENG,200
 /// architecturally-correct shapes, and neither is a crash.
 #[test]
 fn oversized_buffer_row_surfaces_typed_error_or_dlq_never_panics() {
-    // The 1 KiB budget admits correlation sorting's fixed-width scan while
-    // each 2 KiB payload still exceeds the Aggregate's per-row admission
-    // limit. `backpressure: spill` keeps the non-pausing policy so a
-    // sub-baseline test budget reaches that guard.
+    // One row keeps correlation sorting's fixed-width scan within 1 KiB;
+    // a second would fail there before reaching the Aggregate guard. The
+    // single 2 KiB payload still exceeds Aggregate's per-row admission limit.
+    // `backpressure: spill` keeps the non-pausing policy so a sub-baseline
+    // test budget reaches that guard.
     let yaml = r#"
 pipeline:
   name: degrade_fallback
@@ -1249,11 +1270,11 @@ nodes:
     include_unmapped: true
 "#;
     let large = "x".repeat(2048);
-    let csv = format!("order_id,department,amount,payload\nO1,HR,10,{large}\nO2,HR,20,{large}\n");
+    let csv = format!("order_id,department,amount,payload\nO1,HR,10,{large}\n");
 
     // Direct call: a panic in the admission path would unwind through this
     // frame and fail the test, which is exactly the regression this guards.
-    match run_pipeline(yaml, &csv) {
+    match run_pipeline_input(yaml, &csv, true) {
         Ok((counters, _dlq, output)) => {
             // Clean run. Under `continue` the oversized rows route to the
             // DLQ; a run that instead absorbed the pressure (spill) still
@@ -1284,9 +1305,9 @@ nodes:
 /// stage" promise the memory docs make against the rendered diagnostic.
 #[test]
 fn oversized_buffer_row_failfast_names_the_aggregate_stage() {
-    // The 1 KiB budget admits the fixed-width materializations introduced
-    // by correlation sorting, while one 2 KiB string contribution still
-    // exceeds the Aggregate's entire row budget. `fail_fast` (the default,
+    // A single row keeps correlation sorting's fixed-width materialization
+    // within 1 KiB, while its 2 KiB string contribution still exceeds the
+    // Aggregate's entire row budget. `fail_fast` (the default,
     // so no `error_handling` block) turns that `OversizedRow` into an E310
     // abort instead of a DLQ route.
     let yaml = r#"
@@ -1326,9 +1347,9 @@ nodes:
     include_unmapped: true
 "#;
     let large = "x".repeat(2048);
-    let csv = format!("order_id,department,amount,payload\nO1,HR,10,{large}\nO2,HR,20,{large}\n");
+    let csv = format!("order_id,department,amount,payload\nO1,HR,10,{large}\n");
 
-    match run_pipeline(yaml, &csv) {
+    match run_pipeline_input(yaml, &csv, true) {
         Err(PipelineError::MemoryBudgetExceeded { node, .. }) => {
             assert_eq!(
                 node, "dept_stats",

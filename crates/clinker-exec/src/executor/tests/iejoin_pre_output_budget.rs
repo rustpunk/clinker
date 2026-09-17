@@ -14,6 +14,12 @@
 //! must refuse the final range merge before publishing bytes, then release all
 //! owners. Feasible executions retain the exact output and spill oracles.
 //! The unchanged 8 KiB cases separately prove the local pre-output abort.
+//!
+//! Local sorter/block-pair fixtures are eagerly decoded external records. The
+//! executor currently materializes source/combine inputs before the local
+//! spillable sorter; these oracles do not prove whole-input CSV residency fits
+//! the tight limit. A separate real file-CSV test below checks finite admission
+//! refusal and cleanup, plus exact successful output at the roomy limit.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -202,7 +208,7 @@ fn run_pipeline_yaml(
 }
 
 /// Shared execution harness for the two-source (`orders` / `bands`) pipelines:
-/// wire the CSV readers and the captured output writer, run under `arb` with the
+/// eagerly decode the CSV fixtures, wire the captured output writer, run under `arb` with the
 /// given `execution_id`, and return the full execution result alongside the
 /// captured output CSV. Both the `(Result<()>, String)` entry point above and
 /// the report-returning [`run_pipeline_report`] project from this one body, so
@@ -217,30 +223,18 @@ fn run_pipeline_capture(
     Result<crate::executor::ExecutionReport, PipelineError>,
     SharedBuffer,
 ) {
-    let readers: crate::executor::SourceReaders = HashMap::from([
-        (
-            "orders".to_string(),
-            crate::executor::single_file_reader(
-                "orders.csv",
-                Box::new(std::io::Cursor::new(orders.into_bytes())),
-            ),
-        ),
-        (
-            "bands".to_string(),
-            crate::executor::single_file_reader(
-                "bands.csv",
-                Box::new(std::io::Cursor::new(bands.into_bytes())),
-            ),
-        ),
-    ]);
-
+    let config = clinker_plan::config::parse_config(yaml).expect("parse pipeline YAML");
+    let readers = crate::test_support::predecoded_csv_readers(
+        &config,
+        &clinker_plan::config::CompileContext::default(),
+        &[("orders", &orders), ("bands", &bands)],
+    );
     let out = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
         "out".to_string(),
         Box::new(out.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let config = clinker_plan::config::parse_config(yaml).expect("parse pipeline YAML");
     let params = PipelineRunParams {
         execution_id: execution_id.to_string(),
         batch_id: "batch-0".to_string(),
@@ -256,6 +250,107 @@ fn run_pipeline_capture(
         Arc::clone(arb),
     );
     (result, out)
+}
+
+#[test]
+fn file_csv_retention_refuses_tight_budget_and_completes_with_roomy_budget() {
+    // Either side alone retains more admitted pad bytes than TIGHT_LIMIT.
+    // No producer scheduling or particular failed allocation size is assumed.
+    const ROWS: usize = 400;
+    let orders = orders_csv(ROWS, 2048);
+    let bands = bands_csv(ROWS, 0, 2048);
+    let config = clinker_plan::config::parse_config(PIPELINE_YAML).expect("parse pipeline YAML");
+    let root = tempfile::tempdir().expect("output staging directory");
+    let run_files = |arb: &Arc<crate::pipeline::memory::MemoryArbitrator>,
+                     destination: &std::path::Path| {
+        let readers = HashMap::from([
+            (
+                "orders".to_string(),
+                crate::executor::single_file_reader(
+                    "orders.csv",
+                    Box::new(std::io::Cursor::new(orders.as_bytes().to_vec())),
+                ),
+            ),
+            (
+                "bands".to_string(),
+                crate::executor::single_file_reader(
+                    "bands.csv",
+                    Box::new(std::io::Cursor::new(bands.as_bytes().to_vec())),
+                ),
+            ),
+        ]);
+        // A caller-supplied Write can receive a prefix before a later Source
+        // error. The destination-local staging registry is the publication
+        // boundary: only a successful run may commit that prefix as output.
+        let staging = crate::output::staging::OutputStagingRegistry::default();
+        let (_, file) = staging
+            .stage_output(
+                "out",
+                clinker_plan::config::IfExistsPolicy::Error,
+                false,
+                |_| Ok(destination.to_path_buf()),
+            )
+            .expect("stage output beside its destination");
+        let writers = crate::executor::WriterRegistry {
+            single: HashMap::from([(
+                "out".to_string(),
+                Box::new(file) as Box<dyn std::io::Write + Send>,
+            )]),
+            output_staging: staging.clone(),
+            ..Default::default()
+        };
+        let params = PipelineRunParams {
+            execution_id: "iejoin-file-csv".to_string(),
+            batch_id: "batch-0".to_string(),
+            ..Default::default()
+        };
+        let result = PipelineExecutor::run_with_readers_writers_with_arbitrator(
+            &config,
+            readers,
+            writers,
+            &params,
+            clinker_plan::config::CompileContext::default(),
+            Arc::clone(arb),
+        );
+        (result, staging)
+    };
+    let tight = no_op_arbitrator(TIGHT_LIMIT);
+    let tight_destination = root.path().join("refused.csv");
+    let (result, tight_staging) = run_files(&tight, &tight_destination);
+    match result.expect_err("retained decoded fields exceed finite source headroom") {
+        PipelineError::Format(clinker_format::FormatError::Resource(resource)) => {
+            assert_eq!(
+                resource.kind,
+                clinker_record::owned_storage::ResourceErrorKind::Budget
+            );
+            assert!(resource.requested > resource.available);
+        }
+        other => panic!("expected typed CSV resource budget refusal; got {other:?}"),
+    }
+    assert!(
+        !tight_destination.exists(),
+        "source refusal must publish no destination"
+    );
+    assert!(tight_staging.committed_paths("out").is_empty());
+    assert_released_output_owners(&tight);
+
+    let roomy = no_op_arbitrator(ROOMY_LIMIT);
+    let roomy_destination = root.path().join("completed.csv");
+    let (result, roomy_staging) = run_files(&roomy, &roomy_destination);
+    result.expect("the identical file CSV inputs fit the roomy budget");
+    let mut expected = String::from("order_id,amount,band_id\n");
+    for i in 0..ROWS {
+        expected.push_str(&format!("o{i},{},b{i}\n", 2 * i));
+    }
+    assert_eq!(
+        std::fs::read(&roomy_destination).expect("published CSV"),
+        expected.as_bytes()
+    );
+    assert_eq!(
+        roomy_staging.committed_paths("out"),
+        vec![roomy_destination]
+    );
+    assert_released_output_owners(&roomy);
 }
 
 fn spilled_bytes(arb: &Arc<crate::pipeline::memory::MemoryArbitrator>) -> u64 {

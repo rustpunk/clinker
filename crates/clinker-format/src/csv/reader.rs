@@ -1,13 +1,69 @@
 use clinker_record::owned_storage::{OwnedKey, OwnedValues, SharedStorage};
 use std::io::Read;
 
-use clinker_record::{Record, Schema, SchemaBuilder, Value};
+use clinker_record::{AdmittedSchemaBuilder, Record, Schema, SchemaBuilder, Value};
 
 use crate::bom::SkipBom;
 use crate::charset::Charset;
 use crate::error::FormatError;
 use crate::multi_value::{SplitValues, split_text_value_escaped};
+use crate::preparation::{DecodeWorkspace, TextStorage};
+use crate::reserved::ReservedVec;
 use crate::traits::FormatReader;
+
+enum DecodeMode {
+    Legacy,
+    Admitted {
+        workspace: DecodeWorkspace,
+        storage: TextStorage,
+        split_indices: ReservedVec<Option<usize>>,
+    },
+}
+
+/// The byte boundary shared by CSV parser entry points. UTF-8 keeps the
+/// established leading-BOM policy. Latin-1 must preserve every byte, including
+/// EF BB BF: csv-core 0.1.13 strips that prefix only from its first input slice.
+/// Yielding one initial byte disables that implicit policy without changing
+/// CSV grammar or positions. This pinned dependency behavior is regression
+/// tested; an upgrade must preserve it or provide an explicit BOM switch.
+pub(crate) enum CsvInput<R: Read> {
+    Utf8(SkipBom<R>),
+    Latin1 { reader: R, first: bool },
+}
+
+impl<R: Read> CsvInput<R> {
+    pub(crate) fn new(reader: R, charset: Charset) -> Self {
+        match charset {
+            Charset::Utf8 => Self::Utf8(SkipBom::new(reader)),
+            Charset::Latin1 => Self::Latin1 {
+                reader,
+                first: true,
+            },
+        }
+    }
+}
+
+impl<R: Read> Read for CsvInput<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        match self {
+            Self::Utf8(reader) => reader.read(output),
+            Self::Latin1 { reader, first } => {
+                let bytes = if *first {
+                    reader.read(&mut output[..1])?
+                } else {
+                    reader.read(output)?
+                };
+                if bytes != 0 {
+                    *first = false;
+                }
+                Ok(bytes)
+            }
+        }
+    }
+}
 
 /// Configuration for the CSV reader.
 pub struct CsvReaderConfig {
@@ -52,9 +108,10 @@ impl Default for CsvReaderConfig {
 /// A leading UTF-8 BOM (prepended by Excel "CSV UTF-8" and PowerShell
 /// `Out-File -Encoding utf8`) is stripped before parsing via [`SkipBom`],
 /// so the first header cell — or first data field under
-/// `has_header: false` — never carries the `U+FEFF` marker.
+/// `has_header: false` — never carries the `U+FEFF` marker. Latin-1 retains
+/// those three bytes as ordinary field data.
 pub struct CsvReader<R: Read> {
-    inner: csv::Reader<SkipBom<R>>,
+    inner: csv::Reader<CsvInput<R>>,
     schema: Option<SharedStorage<Schema>>,
     config: CsvReaderConfig,
     /// Per-column split declaration, index-aligned to the schema columns:
@@ -67,6 +124,7 @@ pub struct CsvReader<R: Read> {
     split_specs: Vec<Option<SplitValues>>,
     row_count: u64,
     record_buf: csv::ByteRecord,
+    decode: DecodeMode,
 }
 
 impl<R: Read> CsvReader<R> {
@@ -75,7 +133,7 @@ impl<R: Read> CsvReader<R> {
             .delimiter(config.delimiter)
             .quote(config.quote_char)
             .has_headers(config.has_header)
-            .from_reader(SkipBom::new(reader));
+            .from_reader(CsvInput::new(reader, config.charset));
         Self {
             inner,
             schema: None,
@@ -83,15 +141,87 @@ impl<R: Read> CsvReader<R> {
             split_specs: Vec::new(),
             row_count: 0,
             record_buf: csv::ByteRecord::new(),
+            decode: DecodeMode::Legacy,
         }
     }
 
+    /// Establish finite decoded-storage admission before any header or row is
+    /// read. Moves the existing configuration without copying its strings;
+    /// retained column mappings borrow it by admitted positional indices.
+    /// Raw CSV parser buffers remain the unchanged parser allowance. Final
+    /// values and schema aliases retain admission after this reader is dropped.
+    pub fn from_reader_admitted(
+        reader: R,
+        config: CsvReaderConfig,
+        workspace: DecodeWorkspace,
+        storage: TextStorage,
+    ) -> Result<Self, FormatError> {
+        workspace.scope().check_cancelled()?;
+        let split_indices = ReservedVec::new(workspace.scope().clone());
+        let mut reader = Self::from_reader(reader, config);
+        reader.decode = DecodeMode::Admitted {
+            workspace,
+            storage,
+            split_indices,
+        };
+        Ok(reader)
+    }
+
     fn ensure_schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+        if let DecodeMode::Admitted { workspace, .. } = &self.decode {
+            workspace.scope().check_cancelled()?;
+        }
         if let Some(ref schema) = self.schema {
             return Ok(schema.clone());
         }
 
-        let schema = if self.config.has_header {
+        let schema = if let DecodeMode::Admitted { workspace, .. } = &self.decode {
+            if self.config.has_header {
+                let headers = self.inner.byte_headers()?;
+                if headers.is_empty() {
+                    return Err(FormatError::SchemaInference("header row is empty".into()));
+                }
+                let mut builder =
+                    AdmittedSchemaBuilder::try_with_capacity(headers.len(), workspace.scope())?;
+                for field in headers {
+                    workspace.with_decoded(field, self.config.charset, |text| {
+                        let name = OwnedKey::try_new(text, workspace.scope())?;
+                        builder.try_push(name, None, workspace.scope())?;
+                        Ok(())
+                    })?;
+                }
+                builder.finish(workspace.scope())?
+            } else {
+                // An admission refusal may be retried while the first raw
+                // parser record is still pending; never consume it twice.
+                let has_record = !self.record_buf.is_empty()
+                    || self.inner.read_byte_record(&mut self.record_buf)?;
+                let count = if has_record { self.record_buf.len() } else { 0 };
+                let mut builder =
+                    AdmittedSchemaBuilder::try_with_capacity(count, workspace.scope())?;
+                for index in 0..count {
+                    // A usize's decimal representation fits this fixed buffer
+                    // on every supported target; formatting cannot grow it.
+                    use std::io::Write;
+                    let mut name = std::io::Cursor::new([0u8; 3 + usize::BITS as usize]);
+                    write!(&mut name, "col_{index}")?;
+                    let text = std::str::from_utf8(&name.get_ref()[..name.position() as usize])
+                        .map_err(|_| {
+                            crate::preparation::ResourceError::new(
+                                crate::preparation::ResourceErrorKind::Layout,
+                                index,
+                                0,
+                            )
+                        })?;
+                    builder.try_push(
+                        OwnedKey::try_new(text, workspace.scope())?,
+                        None,
+                        workspace.scope(),
+                    )?;
+                }
+                builder.finish(workspace.scope())?
+            }
+        } else if self.config.has_header {
             let charset = self.config.charset;
             let headers = self.inner.byte_headers()?;
             if headers.is_empty() {
@@ -123,21 +253,82 @@ impl<R: Read> CsvReader<R> {
         // every entry names a real `multiple: true` column; an entry that
         // matches no column here is simply inert.
         if !self.config.split_values.is_empty() {
-            self.split_specs = schema
-                .columns()
-                .iter()
-                .map(|name| {
-                    self.config
-                        .split_values
-                        .iter()
-                        .find(|e| e.field.as_str() == name.as_ref())
-                        .cloned()
-                })
-                .collect();
+            if let DecodeMode::Admitted {
+                workspace,
+                split_indices,
+                ..
+            } = &mut self.decode
+            {
+                // Build privately so a failed schema retry never appends to a
+                // partially published index or drops the old backing early.
+                let mut indices = ReservedVec::new(workspace.scope().clone());
+                indices.reserve_exact(schema.column_count())?;
+                for name in schema.columns() {
+                    indices.push(
+                        self.config
+                            .split_values
+                            .iter()
+                            .position(|entry| entry.field.as_str() == name.as_ref()),
+                    )?;
+                }
+                *split_indices = indices;
+            } else {
+                self.split_specs = schema
+                    .columns()
+                    .iter()
+                    .map(|name| {
+                        self.config
+                            .split_values
+                            .iter()
+                            .find(|e| e.field.as_str() == name.as_ref())
+                            .cloned()
+                    })
+                    .collect();
+            }
         }
 
         self.schema = Some(schema.clone());
         Ok(schema)
+    }
+
+    fn decoded_record(&self, schema: SharedStorage<Schema>) -> Result<Record, FormatError> {
+        match &self.decode {
+            DecodeMode::Legacy => Ok(Record::new(
+                schema,
+                decode_record(&self.record_buf, self.config.charset, &self.split_specs)?,
+            )),
+            DecodeMode::Admitted {
+                workspace,
+                storage,
+                split_indices,
+            } => {
+                let mut values =
+                    OwnedValues::try_with_capacity(self.record_buf.len(), workspace.scope())?;
+                for (index, bytes) in self.record_buf.iter().enumerate() {
+                    let value = if let Some(spec_index) =
+                        split_indices.as_slice().get(index).copied().flatten()
+                    {
+                        workspace.with_decoded(bytes, self.config.charset, |text| {
+                            workspace.decode_split_cell(
+                                text,
+                                &self.config.split_values[spec_index],
+                                *storage,
+                            )
+                        })?
+                    } else {
+                        Value::String(workspace.decode_text(
+                            bytes,
+                            self.config.charset,
+                            *storage,
+                        )?)
+                    };
+                    values
+                        .try_push(value, workspace.scope())
+                        .map_err(|(error, _)| error)?;
+                }
+                workspace.finish_record(schema, values)
+            }
+        }
     }
 }
 
@@ -148,13 +339,11 @@ impl<R: Read + Send> FormatReader for CsvReader<R> {
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
         let schema = self.ensure_schema()?;
-        let charset = self.config.charset;
 
         // If we peeked a record during no-header schema inference, consume it first
         if !self.config.has_header && self.row_count == 0 && !self.record_buf.is_empty() {
             self.row_count += 1;
-            let values = decode_record(&self.record_buf, charset, &self.split_specs)?;
-            return Ok(Some(Record::new(schema, values)));
+            return self.decoded_record(schema).map(Some);
         }
 
         if !self.inner.read_byte_record(&mut self.record_buf)? {
@@ -162,8 +351,7 @@ impl<R: Read + Send> FormatReader for CsvReader<R> {
         }
 
         self.row_count += 1;
-        let values = decode_record(&self.record_buf, charset, &self.split_specs)?;
-        Ok(Some(Record::new(schema, values)))
+        self.decoded_record(schema).map(Some)
     }
 }
 
@@ -249,7 +437,7 @@ fn decode_record(
 /// value `json_to_value` would silently coerce to a lossy float. Recurses into
 /// arrays and objects so a nested integer is caught the same as a top-level one.
 /// `None` when every number is representable exactly (or already a float).
-fn first_lossy_integer(v: &serde_json::Value) -> Option<u64> {
+pub(crate) fn first_lossy_integer(v: &serde_json::Value) -> Option<u64> {
     match v {
         serde_json::Value::Number(n) if n.is_u64() && !n.is_i64() => n.as_u64(),
         serde_json::Value::Array(items) => items.iter().find_map(first_lossy_integer),
@@ -260,6 +448,123 @@ fn first_lossy_integer(v: &serde_json::Value) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn csv_latin1_input_boundary_preserves_bytes_errors_and_positions() {
+        use super::{Charset, CsvInput};
+        use std::io::{self, Read};
+
+        struct Chunks<'a> {
+            remaining: &'a [u8],
+            calls: usize,
+            pattern: &'a [usize],
+            fault: bool,
+        }
+        impl Read for Chunks<'_> {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                assert!(!out.is_empty(), "empty reads must not reach the source");
+                if self.fault {
+                    self.fault = false;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let size = out
+                    .len()
+                    .min(self.pattern[self.calls % self.pattern.len()])
+                    .min(self.remaining.len());
+                self.calls += 1;
+                out[..size].copy_from_slice(&self.remaining[..size]);
+                self.remaining = &self.remaining[size..];
+                Ok(size)
+            }
+        }
+        for pattern in [&[1][..], &[8192][..], &[2, 17, 1, 4096][..]] {
+            for bytes in [
+                &b""[..],
+                &b"\xef"[..],
+                &b"\xef\xbb"[..],
+                &b"\xef\xbb\xbfdata"[..],
+            ] {
+                let source = Chunks {
+                    remaining: bytes,
+                    calls: 0,
+                    pattern,
+                    fault: true,
+                };
+                let mut input = CsvInput::new(source, Charset::Latin1);
+                assert_eq!(input.read(&mut []).unwrap(), 0);
+                let mut out = [0; 16];
+                assert_eq!(
+                    input.read(&mut out).unwrap_err().kind(),
+                    io::ErrorKind::Interrupted
+                );
+                let first = input.read(&mut out).unwrap();
+                assert_eq!(first, usize::from(!bytes.is_empty()));
+                let mut actual = out[..first].to_vec();
+                input.read_to_end(&mut actual).unwrap();
+                assert_eq!(actual, bytes);
+            }
+            for (first, cell, second_line) in [
+                (&b"\xef\xbb\xbfplain,x\n"[..], &b"\xef\xbb\xbfplain"[..], 2),
+                (
+                    &b"\xef\xbb\xbf\"adjacent\",x\n"[..],
+                    &b"\xef\xbb\xbf\"adjacent\""[..],
+                    2,
+                ),
+                (
+                    &b"\"\xef\xbb\xbfline\nnext\",x\n"[..],
+                    &b"\xef\xbb\xbfline\nnext"[..],
+                    3,
+                ),
+            ] {
+                let data = [first, b"end,y\n"].concat();
+                for has_header in [false, true] {
+                    let source = Chunks {
+                        remaining: &data,
+                        calls: 0,
+                        pattern,
+                        fault: false,
+                    };
+                    let mut parser = csv::ReaderBuilder::new()
+                        .has_headers(has_header)
+                        .from_reader(CsvInput::new(source, Charset::Latin1));
+                    let mut record = csv::ByteRecord::new();
+                    if has_header {
+                        record = parser.byte_headers().unwrap().clone();
+                    } else {
+                        assert!(parser.read_byte_record(&mut record).unwrap());
+                    }
+                    assert_eq!(record.get(0), Some(cell));
+                    assert_eq!(record.position().unwrap().byte(), 0);
+                    assert_eq!(record.position().unwrap().line(), 1);
+                    assert!(parser.read_byte_record(&mut record).unwrap());
+                    assert_eq!(record.get(0), Some(&b"end"[..]));
+                    assert_eq!(record.position().unwrap().byte(), first.len() as u64);
+                    assert_eq!(record.position().unwrap().line(), second_line);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn csv_latin1_input_boundary_does_not_spend_initial_read_on_io_error() {
+        use super::{Charset, CsvInput};
+        use std::io::{self, Read};
+        struct Failing(bool);
+        impl Read for Failing {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if !self.0 {
+                    self.0 = true;
+                    return Err(io::ErrorKind::Other.into());
+                }
+                out.fill(b'x');
+                Ok(out.len())
+            }
+        }
+        let mut input = CsvInput::new(Failing(false), Charset::Latin1);
+        let mut out = [0; 8];
+        assert!(input.read(&mut out).is_err());
+        assert_eq!(input.read(&mut out).unwrap(), 1);
+        assert_eq!(input.read(&mut out).unwrap(), 8);
+    }
     use super::*;
     use clinker_record::FieldResolver;
 

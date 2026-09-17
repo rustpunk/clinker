@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use clinker_record::{DocumentContext, Record};
 
 use crate::error::FormatError;
-use crate::traits::FormatWriter;
+use crate::traits::{FormatWriter, FormatWriterHandle};
 
 /// Byte counter shared between a `CountingWriter` (write side) and
 /// a `CountedFormatWriter` or `SplittingWriter` (read side).
@@ -92,7 +92,7 @@ impl<W: Write> Write for CountingWriter<W> {
 
 /// Format writer wrapper that exposes byte count from a `SharedByteCounter`.
 ///
-/// Wraps any `Box<dyn FormatWriter>` produced by a writer factory that
+/// Retains the `FormatWriterHandle` produced by a writer factory that
 /// used a `CountingWriter` internally. The `SharedByteCounter` is the
 /// same instance passed to the `CountingWriter`, so `bytes_written()`
 /// reflects actual bytes flushed to the I/O layer.
@@ -100,12 +100,14 @@ impl<W: Write> Write for CountingWriter<W> {
 /// Used for non-split writers; split writers query their own counter
 /// inside `SplittingWriter` directly.
 pub struct CountedFormatWriter {
-    inner: Box<dyn FormatWriter>,
+    inner: FormatWriterHandle,
     counter: SharedByteCounter,
 }
 
 impl CountedFormatWriter {
-    pub fn new(inner: Box<dyn FormatWriter>, counter: SharedByteCounter) -> Self {
+    /// Retain the inner writer and its ownership without allocating a wrapper.
+    /// Heap-allocated counting wrappers require their own admitted handle.
+    pub fn new(inner: FormatWriterHandle, counter: SharedByteCounter) -> Self {
         Self { inner, counter }
     }
 }
@@ -196,7 +198,8 @@ mod tests {
         use clinker_record::{Schema, Value};
         use std::sync::Arc;
 
-        use crate::csv::writer::{CsvWriter, CsvWriterConfig};
+        use crate::csv::writer::{CsvEncoder, CsvWriterConfig};
+        use crate::preparation::MemoryOnlyResources;
 
         let counter = SharedByteCounter::new();
         let buf: Vec<u8> = Vec::new();
@@ -205,8 +208,17 @@ mod tests {
             clinker_record::owned_storage::SharedStorage::from_arc(Arc::new(Schema::new(vec![
                 "x".into(),
             ])));
-        let csv = CsvWriter::new(counting, schema.clone(), CsvWriterConfig::default());
-        let mut counted = CountedFormatWriter::new(Box::new(csv), counter.clone());
+        let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+        let encoder = CsvEncoder::new(
+            schema.clone(),
+            &CsvWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let csv = encoder
+            .into_boxed_writer(counting, provider.resources())
+            .unwrap();
+        let mut counted = CountedFormatWriter::new(csv, counter.clone());
 
         // FormatWriter::bytes_written should return Some via the shared counter
         assert_eq!(counted.bytes_written(), Some(0));
@@ -229,7 +241,10 @@ mod tests {
 
         let log = Arc::new(Mutex::new(Vec::new()));
         let probe = HookProbe::with_log(Arc::clone(&log));
-        let mut counted = CountedFormatWriter::new(Box::new(probe), SharedByteCounter::new());
+        let mut counted = CountedFormatWriter::new(
+            FormatWriterHandle::from_legacy(Box::new(probe)),
+            SharedByteCounter::new(),
+        );
 
         let doc = DocumentContext::new(
             DocumentId::next(),
@@ -254,7 +269,10 @@ mod tests {
 
         let log = Arc::new(Mutex::new(Vec::new()));
         let probe = HookProbe::with_log(Arc::clone(&log));
-        let mut counted = CountedFormatWriter::new(Box::new(probe), SharedByteCounter::new());
+        let mut counted = CountedFormatWriter::new(
+            FormatWriterHandle::from_legacy(Box::new(probe)),
+            SharedByteCounter::new(),
+        );
 
         // `flush_bytes` must reach the inner writer's non-finalizing drain, not
         // fall back to the finalizing `flush` default.

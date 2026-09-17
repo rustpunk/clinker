@@ -1,7 +1,7 @@
 # CSV Format
 
-CSV is the default file format and the most common Clinker input. The
-reader decodes each line into a record whose fields are matched
+CSV is the default file format. The reader decodes each CSV row (including
+quoted multiline cells) into a record whose fields are matched
 positionally (or by header name) against the source's declared
 `schema:`; the writer reverses the process. CSV pairs with the `file`
 transport — see [Source Nodes](../nodes/source.md) for the transport /
@@ -55,13 +55,40 @@ The reader decodes every field through the source's declared `encoding`:
   byte `0xNN` to codepoint `U+00NN`, so high bytes such as `0xE9` (`é`)
   from legacy exports decode correctly.
 
-An **unsupported** encoding is rejected at startup with a precise error
-naming the value and the supported set — it is never silently ignored.
+The same `options.encoding` setting is available on a CSV Sink. It applies to
+headers, body fields, joined values, embedded JSON cells and reconstructed
+envelope rows. UTF-8 is the default on both sides. Names are case-insensitive;
+hyphens, underscores and spaces are ignored. `UTF8`, `ISO8859_1`, `latin1`,
+`Latin-1` and `l1` resolve to the corresponding canonical spelling.
 
-> Multi-record CSV sources (those whose `schema:` is a map with a
-> `records:` list, described below) are decoded as UTF-8 only. Declaring a
-> non-UTF-8 `encoding` on such a source is rejected at startup; split the
-> file into a single-schema CSV source if it needs a non-UTF-8 charset.
+Latin-1 is **true ISO-8859-1**: bytes `0x80..0x9F` are the corresponding control
+codepoints, not punctuation from another code page. Characters above `U+00FF`
+(for example `€`) cannot be written in Latin-1 and cause an error; there is no
+replacement character or fallback. UTF-8 input strips its leading UTF-8 BOM;
+Latin-1 preserves an initial `EF BB BF` sequence as the three ordinary characters
+`ï»¿`. CSV grammar is parsed from bytes before either header or body text is
+decoded.
+
+An **unsupported** encoding is rejected during configuration admission with a
+precise error naming the value and a supported correction. Charset is part of
+the semantic plan identity; changing input or output charset changes that
+identity. Aliases and an omitted or explicit UTF-8 default resolve identically.
+Malformed UTF-8 in a header or body cell is an input-data error
+(`source.data.invalid`), including when the header is read to discover columns.
+
+The closed encoding policy across formats is:
+
+| Format | Encoding policy |
+|--------|-----------------|
+| CSV, X12 | Authored `options.encoding`: UTF-8 or true ISO-8859-1. |
+| JSON, XML, fixed-width, SWIFT MT | UTF-8 only; no authored encoding override. |
+| EDIFACT | In-band repertoire: UNOA/UNOB ASCII, UNOC ISO-8859-1, UNOY UTF-8; no authored override. |
+| HL7 | In-band repertoire: blank/`ASCII` means ASCII, `UNICODE UTF-8` means UTF-8; no authored override. |
+
+Single-schema and multi-record CSV sources support the same two encodings,
+including textual column headers, discriminator fields, body cells and declared
+envelope sections. Each file applies its own leading-BOM rule. A UTF-8 BOM is
+recognized only at the start of that file; the same bytes inside a field are data.
 
 ## Header handling
 
@@ -99,8 +126,11 @@ the cell into an array:
 no delimiter is a one-element array; each element is coerced to the column's
 declared `type:`. A quoted cell is unquoted first, so a delimiter inside the
 quotes is not a boundary. A `multiple: true` column with no covering
-`split_values` entry is rejected at compile ([E361](https://github.com/rustpunk/clinker/blob/main/docs/explain/E361.md)). The
-entry is read only on a single-schema source, not the multi-record reader below.
+`split_values` entry is rejected at compile
+([E361](https://github.com/rustpunk/clinker/blob/main/docs/explain/E361.md)).
+Multi-record CSV sources reject `split_values` and `multiple: true` columns
+with [E358](https://github.com/rustpunk/clinker/blob/main/docs/explain/E358.md)
+and E361; these input options require a single-schema source.
 See [`split_values`](../nodes/source.md#several-values-in-one-cell-split_values)
 in the Source reference for the full grammar.
 
@@ -114,6 +144,50 @@ the same as an explicit null; with `include_unmapped: false` a record
 field the output schema does not name is not written. See
 [Sink Nodes](../nodes/sink.md) for header control, field mapping,
 and null handling.
+
+```yaml
+- type: sink
+  name: export
+  input: orders
+  config:
+    name: export
+    type: csv
+    path: ./out/orders.csv
+    options:
+      encoding: iso-8859-1
+```
+
+Each output operation is prepared completely before any of its bytes reach the
+destination. The first body row and its automatic header are one operation. An
+unrepresentable cell therefore writes neither a partial row nor a stray header,
+and leaves previously accepted bytes and format state intact. Explicit document
+start and end operations are prepared separately. An I/O failure during delivery
+can leave a destination prefix and prevents further writes; successful preparation
+alone is not a delivered row. File publication is a separate contract described
+in [Storage & Spill Location](../ops/storage.md#output-publication-and-retained-attempts).
+
+CSV quoting needs each complete cell. Its encoding workspace is admitted against
+the run's resource budget before allocation and released after that cell; there
+is no authored field-size or record-size ceiling. A cell that cannot fit fails as
+a resource error rather than being truncated or dropped. Joined or embedded JSON
+cells account for the rendered text and encoded bytes while both are live.
+The complete operation also needs storage for its prepared bytes: it stays in
+memory unless an explicit spill location is available. Spill does not eliminate
+the minimum memory needed for a cell, policy, or schema mapping. See
+[Memory Tuning](../ops/memory.md#what-the-budget-measures) for the accounting
+boundary and [output preparation](../ops/storage.md#output-preparation) for
+storage and cleanup behavior.
+
+Split output captures only the header actually delivered by a successful
+operation. With `repeat_header: true`, later files replay those same names;
+with `repeat_header: false`, only the first file emits the automatic header.
+`include_header: false` suppresses that header throughout. Reconstructed
+envelope rows do not become an automatic column header.
+
+An empty stream emits no automatic header. A single empty or null cell is written
+as `""` followed by a newline; adjacent empty cells are separated by the delimiter.
+Reading an ordinary empty cell yields an empty string, so CSV does not distinguish
+an empty string from a null unless the pipeline applies its own schema policy.
 
 ### Writing multi-value cells (`join_values`)
 
@@ -143,9 +217,9 @@ overrides, per field:
 
 - **`delimiter`** — the separator written between values (default `;`).
 - **`on_conflict`** — what to do when a value contains the delimiter:
-  - `error` (default) — dead-letter the record, naming the field and the
-    offending value, rather than emit a cell that splits back wrongly. This is
-    what makes a defaulted delimiter safe.
+  - `error` (default) — reject the record with the field and element position,
+    preserving its original value for the DLQ, rather than emit a cell that splits
+    back wrongly. This is what makes a defaulted delimiter safe.
     Under `error_handling.strategy: continue`, the offending record goes to the
     [dead-letter queue](../pipelines/error-handling.md) (category
     `multi_value_join_collision`) and the run continues; under `fail_fast` it
@@ -241,7 +315,8 @@ type's columns) automatically.
             batch_id: string
 ```
 
-The reader streams **one record per line** on a single superset schema
+The reader emits **one record per CSV row**, including quoted multiline cells,
+on a single superset schema
 whose lead `record_type` column carries the matched type's `id`. A
 downstream [Route](../nodes/route.md) discriminates on that column.
 Rows of different record types may carry different column counts (ragged

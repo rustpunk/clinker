@@ -23,7 +23,7 @@
 //! per row. The `Arc` swap happens automatically as the wrapper advances
 //! across file boundaries.
 
-use clinker_record::owned_storage::{OwnedKey, SharedStorage};
+use clinker_record::owned_storage::{OwnedMap, SharedStorage};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -139,8 +139,9 @@ pub struct MultiFileFormatReader {
     /// `Arc<str>` for the file that produced the most-recently-emitted
     /// record. Updated when advancing to a new file.
     current_file: Arc<str>,
-    /// Cached schema from file 0. Compared against subsequent files'
-    /// schemas; mismatch fails fast.
+    /// Cached schema from file 0. This shared handle retains its actual backing
+    /// grants independently of active reader replacement. Compared against
+    /// subsequent files' schemas; mismatch fails fast.
     schema: Option<SharedStorage<Schema>>,
     /// Per-file factory.
     factory: Box<FactoryFn>,
@@ -249,9 +250,9 @@ impl MultiFileFormatReader {
         let Some(ref expected) = self.schema else {
             return Ok(());
         };
-        let exp_names: Vec<&str> = expected.columns().iter().map(|c| c.as_ref()).collect();
-        let cand_names: Vec<&str> = candidate.columns().iter().map(|c| c.as_ref()).collect();
-        if exp_names != cand_names {
+        if expected.columns() != candidate.columns() {
+            let exp_names: Vec<&str> = expected.columns().iter().map(|c| c.as_ref()).collect();
+            let cand_names: Vec<&str> = candidate.columns().iter().map(|c| c.as_ref()).collect();
             return Err(FormatError::SchemaInference(format!(
                 "multi-file source: schema mismatch at file {:?} — \
                  expected columns {:?}, got {:?}",
@@ -297,13 +298,13 @@ impl FormatReader for MultiFileFormatReader {
     fn prepare_document(
         &mut self,
         config: &clinker_format::EnvelopeConfig,
-    ) -> Result<indexmap::IndexMap<OwnedKey, clinker_record::Value>, FormatError> {
+    ) -> Result<OwnedMap, FormatError> {
         // Each file is its own document; forward the pre-scan to the
         // active per-file reader. The executor's ingest loop calls this
         // once per file (at each `current_source_file` transition), so
         // `active` is the file currently being streamed.
         if self.active.is_none() && !self.advance()? {
-            return Ok(indexmap::IndexMap::new());
+            return Ok(OwnedMap::from_map(indexmap::IndexMap::new()));
         }
         self.active
             .as_mut()

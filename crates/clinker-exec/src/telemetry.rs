@@ -2248,6 +2248,79 @@ replacement = "{replacement}"
             .clone()
     }
 
+    #[test]
+    fn contended_logs_do_not_credit_truncation_until_admitted() {
+        let (producer, receiver) = arena("8B");
+        let fields = [SignalField::new("amount", "123456789")];
+        let event = LogEvent {
+            event: "transform.seen",
+            severity: Severity::Info,
+            message: "seen",
+            correlation: correlation(),
+            fields: &fields,
+        };
+
+        let guard = producer.shared.lock().expect("hold the admission lock");
+        assert_eq!(
+            producer.emit_log(event),
+            AdmissionOutcome::Dropped(DropReason::Contended)
+        );
+        let rejected = producer.snapshot();
+        assert_eq!(rejected.contention_drops, 1);
+        assert_eq!(rejected.accepted, 0);
+        assert_eq!(rejected.truncated_fields, 0);
+        drop(guard);
+
+        assert!(producer.emit_log(event).is_accepted());
+        let accepted = producer.snapshot();
+        assert_eq!(accepted.accepted, 1);
+        assert_eq!(accepted.truncated_fields, 1);
+        assert_eq!(accepted.contention_drops, 1);
+        let batch = receiver
+            .try_recv_batch()
+            .expect("accepted event is drainable");
+        assert_eq!(batch.logs().len(), 1);
+        assert_eq!(
+            batch.logs()[0].fields.get("amount").map(String::as_str),
+            Some("12345…")
+        );
+    }
+
+    #[test]
+    fn exhausted_rate_budget_rejects_before_truncation_is_credited() {
+        let (producer, receiver) = arena("8B");
+        // Freeze refill in this private test state. The production policy and
+        // clock remain unchanged; no elapsed-time assumption can grant tokens.
+        {
+            let mut shared = producer.shared.lock().expect("configure test rate budget");
+            shared.rate.per_second = 0;
+            shared.rate.tokens = 1;
+        }
+        let fields = [SignalField::new("amount", "123456789")];
+        let event = LogEvent {
+            event: "transform.seen",
+            severity: Severity::Info,
+            message: "seen",
+            correlation: correlation(),
+            fields: &fields,
+        };
+        assert!(producer.emit_log(event).is_accepted());
+        assert_eq!(
+            producer.emit_log(event),
+            AdmissionOutcome::Dropped(DropReason::RateLimited)
+        );
+        let snapshot = producer.snapshot();
+        assert_eq!(snapshot.accepted, 1);
+        assert_eq!(snapshot.rate_limited_drops, 1);
+        assert_eq!(snapshot.truncated_fields, 1);
+        assert_eq!(snapshot.full_drops, 0);
+        assert_eq!(snapshot.contention_drops, 0);
+        let batch = receiver
+            .try_recv_batch()
+            .expect("accepted event is drainable");
+        assert_eq!(batch.logs().len(), 1);
+    }
+
     /// A steady per-record pipeline must not lose authored events to the drain.
     ///
     /// The drain used to hold the arena across the whole batch, including a

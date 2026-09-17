@@ -218,6 +218,10 @@ failure_registry! {
     "runtime.resource.spill_failed", Infrastructure, RetryWithBackoff, "runtime spill storage failed";
     "runtime.resource.spill_cap_exceeded", Infrastructure, PolicyRequired, "configured spill budget was exceeded";
     "rest.protocol.page_body_limit_reached", SourceProtocol, PolicyRequired, "REST response exceeded the fixed page body limit";
+    "runtime.resource.allocation_failed", Infrastructure, PolicyRequired, "runtime memory allocation could not be satisfied";
+    "runtime.resource.descriptor_cap_exceeded", Infrastructure, PolicyRequired, "runtime descriptor budget was exhausted";
+    "runtime.resource.storage_failed", Infrastructure, PolicyRequired, "runtime temporary storage could not be completed safely";
+    "runtime.resource.delivery_poisoned", Infrastructure, PolicyRequired, "output delivery failed and continuation was refused";
 }
 
 fn registry_entry(code: &str) -> Option<&'static RegistryEntry> {
@@ -312,4 +316,37 @@ fn truncate_utf8(message: &str, max_bytes: usize) -> String {
     let mut bounded = message[..end].trim_end().to_owned();
     bounded.push_str(ELLIPSIS);
     bounded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FailureCategory, FailureClassification, RetryAdvice};
+
+    #[test]
+    fn resource_failure_rows_have_precise_policy_required_messages() {
+        for (code, message) in [
+            (
+                "runtime.resource.allocation_failed",
+                "runtime memory allocation could not be satisfied",
+            ),
+            (
+                "runtime.resource.descriptor_cap_exceeded",
+                "runtime descriptor budget was exhausted",
+            ),
+            (
+                "runtime.resource.storage_failed",
+                "runtime temporary storage could not be completed safely",
+            ),
+            (
+                "runtime.resource.delivery_poisoned",
+                "output delivery failed and continuation was refused",
+            ),
+        ] {
+            let classification =
+                FailureClassification::for_code(code).expect("resource code is registered");
+            assert_eq!(classification.category(), FailureCategory::Infrastructure);
+            assert_eq!(classification.retry_advice(), RetryAdvice::PolicyRequired);
+            assert_eq!(classification.message(), message);
+        }
+    }
 }

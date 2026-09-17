@@ -46,6 +46,53 @@ reader/writer construction arms are wired. It must also state which schema,
 multi-record, envelope, splitting, and document-cardinality features it can
 represent. This is deliberate compile-time wiring, not dynamic discovery.
 
+### Allocation-aware CSV construction
+
+CSV execution uses `CsvReader::from_reader_admitted` and
+`MultiRecordReader::new_csv_admitted` with finite allocation resources. The
+explicit legacy reader constructors remain available for non-executing
+inspection and existing library callers; they do not establish runtime
+admission. Document preparation returns `OwnedMap` through both `FormatReader`
+and `RecordSource`, preserving child ownership across adapters. Legacy readers
+can move-wrap an existing map without claiming that it was admitted.
+
+Direct CSV output construction requires `WriterResources`:
+`CsvEncoder::into_boxed_writer` returns a `FormatWriterHandle`. Wrappers that
+allocate another writer use `FormatWriterHandle::try_new(value, &scope)` with
+an `AllocationScope`; all writer hooks and byte counts forward through the
+handle. `AsMut<dyn FormatWriter>` borrows the interface without exposing its
+allocation owner. `FormatWriterHandle::from_legacy(Box<dyn FormatWriter>)` is
+an explicit boundary for unchanged implementations, not a CSV fallback.
+
+Split construction uses `WriterFactory::try_new(closure, &scope)` and calls
+`create(destination, schema)` to obtain a `FormatWriterHandle` for each file.
+The factory admits the concrete closure layout before type erasure; captured
+allocations need separate owners. `WriterFactory::from_legacy` leaves an
+unchanged non-CSV factory ungoverned. `CountedFormatWriter` and
+`SplittingWriter` retain writer handles, so wrapping and rotating a CSV writer
+preserve its backing charge. See [memory ownership](memory-arbitration.md#exact-allocation-admission-for-prepared-output).
+
+### Prepared storage extensions
+
+`ResourceAuthority::create_stage` returns the sealed `OperationStage` owner.
+Implement `StageStorage` and call `StorageStage::create(scope, storage)` rather
+than implementing or boxing an operation-stage trait. The adapter admits the
+concrete backend and its progress buffer before writes; `finish` consumes the
+writable stage and moves the same owner into `PreparedBytes` without another
+backend allocation.
+
+`StageStorage` supplies read/write, `seal`, `complete` and inline failure
+evidence. `seal` rewinds and establishes complete immutable bytes; `complete`
+releases readback storage before encoder state commits. `resource_failed` must
+not allocate or change the observed error. Recover resource evidence through
+`failure`/`resource_error` at I/O boundaries, and never seal a failed prefix.
+Providers receive no destination handle. The sealed wrapper keeps the backend
+and its lease inseparable through delivery and deallocation; see
+[prepared storage](storage-internals.md#prepared-output-storage) for partial
+delivery and cleanup debt.
+
+### Fixed-width repeating groups
+
 Fixed-width repeating groups demonstrate the coordinated form of this seam.
 The strict `Column` shape carries `fields`, `occurs`, and an optional physical
 `count_field` through patching, overlay provenance, canonical identity, and

@@ -396,9 +396,9 @@ stale-user-docs sweep.)
 - Priority: Medium
 - Status: Resolved
 - Decision: D-49
-- Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` locks the per-format charset matrix; the current boundaries are implemented under `crates/clinker-format/src/` and described in `docs/user/src/formats/`.
+- Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` locks the per-format charset matrix. CSV's supported UTF-8/true Latin-1 input/output paths are implemented and locally qualified by format, runtime and compiled-CLI tests; other-format integration and the complete matrix remain partial. The current CSV contract is described in `docs/user/src/formats/csv.md` and `docs/engine/src/sink-internals.md`.
 - Implementation owner: AUTH-06
-- Verified: 2026-07-29
+- Verified: 2026-09-16
 
 ## Low Priority
 
@@ -698,7 +698,7 @@ see the Resolved Archive. This entry keeps the one remaining follow-on.)
 
 ### 61. Decoded allocation ownership
 
-Resolved by maintainer approval on 2026-09-15; [the production-contract register](15_PRODUCTION_CONTRACTS.md#decoded-allocation-ownership) records the locked target. The selected design attaches reservations to actual decoded storage through final destruction, keeps release state alive for escaped values, and adapts shared schema/context handles and matching legacy accounting. The exact fallible shared-allocation dependency and explicit parser/copy allowances are approved. Implementation and qualification are still pending in [#1199](https://github.com/rustpunk/clinker/issues/1199) and [#1189](https://github.com/rustpunk/clinker/issues/1189); the broader [#1183](https://github.com/rustpunk/clinker/issues/1183) contract remains open.
+Resolved by maintainer approval on 2026-09-15; [the production-contract register](15_PRODUCTION_CONTRACTS.md#decoded-allocation-ownership) records both the decision and current implementation. Core storage and CSV decoding now retain reservations through final backing destruction, preserve release state for escaped values, and use shared schema/document carriers with matching legacy accounting. CSV writer, factory and stage owners have actual-deallocation tests. Local qualification establishes this subset; it does not establish all-format admission, release qualification or whole-engine memory bounds. The approved parser/copy allowances remain explicit, and [variable-payload residency #1183](https://github.com/rustpunk/clinker/issues/1183) and [bounded fan-in #1044](https://github.com/rustpunk/clinker/issues/1044) remain separate work. See [memory ownership](../engine/src/memory-arbitration.md#csv-decoding-and-document-ownership) and [writer/storage extension contracts](../engine/src/extension-seams.md#allocation-aware-csv-construction).
 
 Numbers are never reused. One line per entry: the answer and its evidence.
 

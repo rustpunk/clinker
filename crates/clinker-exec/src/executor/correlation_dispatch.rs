@@ -20,6 +20,7 @@ use crate::executor::dispatch::{
     CorrelationGroupBuffer, CorrelationRecordSlot, ExecutorContext, MERGED_SOURCE_NAME, push_dlq,
     push_write_error, source_name_arc_of,
 };
+use crate::executor::preparation::is_explicit_cancellation;
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
 use crate::executor::{DlqEntry, OutputDeliveryId, build_format_writer, format_group_key};
 use clinker_plan::error::PipelineError;
@@ -345,10 +346,10 @@ fn flush_clean_records_to_writers(
             Ok(slots) => slots,
             Err(error) => {
                 if let Some(mut signal) = signal.take() {
-                    signal.record_errors(1);
-                    if matches!(&error, PipelineError::Interrupted) {
+                    if is_explicit_cancellation(&error) {
                         signal.interrupt();
                     } else {
+                        signal.record_errors(1);
                         signal.fail();
                     }
                 }
@@ -393,10 +394,10 @@ fn flush_clean_records_to_writers(
             output_schema.clone(),
             ctx.output_staging.clone(),
             sink_byte_counter.clone(),
+            ctx.writer_resources.clone(),
         ) {
             Ok(mut writer) => {
                 let mut write_failed = false;
-                let mut flush_failed = false;
                 let mut written_slots: Vec<&CorrelationRecordSlot> = Vec::new();
                 for slot in &slots {
                     let write_result = {
@@ -425,7 +426,6 @@ fn flush_clean_records_to_writers(
                     };
                     if let Err(e) = flush_result {
                         push_write_error(&mut ctx.output_errors, e);
-                        flush_failed = true;
                     } else if out_cfg.mapping.is_some() {
                         // Correlation records were projected before their group
                         // disposition. Observe only after this clean queue is
@@ -465,14 +465,19 @@ fn flush_clean_records_to_writers(
                             .as_ref()
                             .map_or(0, clinker_format::SharedByteCounter::bytes_written),
                     );
-                    let new_errors = ctx.output_errors.len().saturating_sub(errors_before);
-                    signal.record_errors(u64::try_from(new_errors).unwrap_or(u64::MAX));
-                    if write_failed || flush_failed {
+                    let new_errors = &ctx.output_errors[errors_before..];
+                    let failures = new_errors
+                        .iter()
+                        .filter(|error| !is_explicit_cancellation(error))
+                        .count();
+                    signal.record_errors(u64::try_from(failures).unwrap_or(u64::MAX));
+                    if failures != 0 {
                         signal.fail();
-                    } else if ctx
-                        .shutdown_token
-                        .as_ref()
-                        .is_some_and(crate::pipeline::shutdown::ShutdownToken::is_requested)
+                    } else if new_errors.iter().any(is_explicit_cancellation)
+                        || ctx
+                            .shutdown_token
+                            .as_ref()
+                            .is_some_and(crate::pipeline::shutdown::ShutdownToken::is_requested)
                     {
                         signal.interrupt();
                     } else {
@@ -481,15 +486,20 @@ fn flush_clean_records_to_writers(
                 }
             }
             Err(e) => {
+                let cancelled = is_explicit_cancellation(&e);
                 ctx.output_errors.push(e);
                 if let Some(mut signal) = signal.take() {
-                    signal.record_errors(1);
                     signal.record_bytes(
                         sink_byte_counter
                             .as_ref()
                             .map_or(0, clinker_format::SharedByteCounter::bytes_written),
                     );
-                    signal.fail();
+                    if cancelled {
+                        signal.interrupt();
+                    } else {
+                        signal.record_errors(1);
+                        signal.fail();
+                    }
                 }
             }
         }

@@ -3,20 +3,25 @@
 use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
-use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::Arc;
 
 use clinker_record::Schema;
 
 use clinker_format::counting::{CountedFormatWriter, CountingWriter, SharedByteCounter};
-use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig, HeaderCapturingCsvWriter};
+use clinker_format::csv::writer::{
+    CsvEncoder, CsvEncoderConfig, CsvEncoderOptions, CsvHeaderCapture, CsvWriterConfig,
+};
 use clinker_format::edifact::writer::{EdifactWriter, EdifactWriterConfig};
 use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConfig};
 use clinker_format::hl7::writer::{Hl7Writer, Hl7WriterConfig};
 use clinker_format::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
+use clinker_format::preparation::WriterResources;
 use clinker_format::splitting::{OversizeGroupPolicy, SplitPolicy, SplittingWriter, WriterFactory};
 use clinker_format::swift::writer::{SwiftWriter, SwiftWriterConfig};
+#[cfg(test)]
 use clinker_format::traits::FormatWriter;
+use clinker_format::traits::FormatWriterHandle;
 use clinker_format::x12::Charset;
 use clinker_format::x12::writer::{X12Writer, X12WriterConfig};
 use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
@@ -246,8 +251,9 @@ fn extract_output_field_defs(
 /// Build a writer factory closure for the given output format.
 ///
 /// The returned `WriterFactory` creates format writers wrapping a `CountingWriter`.
-/// For CSV with `repeat_header`, the first call creates a `HeaderCapturingCsvWriter`
-/// and subsequent calls replay the captured header via `write_preset_header`.
+/// CSV factories share admitted configuration and header capture. Only successful
+/// first-body delivery publishes a header; replay joins each later first body
+/// in one prepared operation, with no eager factory output.
 /// For fixed-width, the factory captures pre-resolved `Column`s from the output schema.
 /// Map the plan's `OutputEnvelopeConfig` onto the format-local
 /// `OutputEnvelopeSpec` the writers consume, but only when the Output declares
@@ -265,10 +271,42 @@ fn resolve_envelope_spec(
     (!spec.is_empty()).then_some(spec)
 }
 
+struct CsvFactoryState {
+    config: CsvEncoderConfig,
+    // Only non-repeating split output needs a second admitted policy. The
+    // first file still owns preparation/retry of its automatic header.
+    subsequent_config: Option<CsvEncoderConfig>,
+    opened: std::cell::Cell<bool>,
+    capture: Option<CsvHeaderCapture>,
+    resources: WriterResources,
+}
+impl CsvFactoryState {
+    fn build(
+        &self,
+        destination: CountingWriter<Box<dyn Write + Send>>,
+        schema: SharedStorage<Schema>,
+    ) -> Result<FormatWriterHandle, clinker_format::FormatError> {
+        let config = if self.opened.get() {
+            self.subsequent_config.as_ref().unwrap_or(&self.config)
+        } else {
+            &self.config
+        };
+        let encoder = CsvEncoder::from_config(schema, config.clone(), self.resources.clone())?;
+        let encoder = match &self.capture {
+            Some(capture) => encoder.with_header_capture(capture.clone()),
+            None => encoder,
+        };
+        let writer = encoder.into_boxed_writer(destination, self.resources.clone())?;
+        self.opened.set(true);
+        Ok(writer)
+    }
+}
+
 fn build_writer_factory(
     output: &SinkConfig,
     repeat_header: bool,
     field_defs: Option<Vec<clinker_format::Column>>,
+    resources: WriterResources,
 ) -> Result<WriterFactory, PipelineError> {
     // Every per-format config field derives from the Sink config; bind them
     // once so the format arms below read them by their original names.
@@ -277,17 +315,10 @@ fn build_writer_factory(
     let preserve_nulls = output.preserve_nulls.unwrap_or(false);
     let reconstruct_envelope = output.reconstruct_envelope;
     let include_unmapped = output.include_unmapped;
-    let join_values = output.join_values.clone().unwrap_or_default();
     match &output.format {
         OutputFormat::Csv(opts) => {
             let mut csv_config = build_csv_writer_config(opts.as_ref(), include_header)?;
             csv_config.include_engine_stamped = include_engine_stamped;
-            // Per-column join overrides; a `multiple:` field with no entry joins
-            // with the default `;` / `on_conflict: error`. The plan-time E362
-            // gate has already rejected `join_values` on a non-CSV output, so
-            // only the CSV arm consumes it.
-            csv_config.join_values = join_values;
-            csv_config.declared_multiple = output.declared_multiple.clone();
             // Lossless mode: when the Output carries every column through
             // (`include_unmapped: true`), a record column the pinned header
             // lacks must fail loudly rather than be silently dropped. The
@@ -296,42 +327,58 @@ fn build_writer_factory(
             // bounded-memory paths (streaming fusion, envelope framing) that
             // pin the header to the first record (issue #805).
             csv_config.error_on_undeclared_columns = include_unmapped;
-            csv_config.envelope = resolve_envelope_spec(
-                reconstruct_envelope,
-                opts.as_ref().and_then(|o| o.envelope.as_ref()),
-            );
-            if repeat_header {
-                let shared_header: Arc<Mutex<Option<Vec<Box<str>>>>> = Arc::new(Mutex::new(None));
-                let call_count = Arc::new(AtomicU32::new(0));
-                Ok(Box::new(move |counting_writer, schema| {
-                    let seq = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let inner_csv =
-                        CsvWriter::new(counting_writer, schema.clone(), csv_config.clone());
-                    if seq == 0 {
-                        // First file: capture header from first record
-                        Ok(Box::new(HeaderCapturingCsvWriter::new(
-                            inner_csv,
-                            schema,
-                            Arc::clone(&shared_header),
-                        )))
-                    } else {
-                        // Subsequent files: replay captured header
-                        let mut csv = inner_csv;
-                        if let Some(header) = shared_header.lock().unwrap().as_ref() {
-                            csv.write_preset_header(header)?;
-                        }
-                        Ok(Box::new(csv))
-                    }
-                }))
-            } else {
-                Ok(Box::new(move |counting_writer, schema| {
-                    Ok(Box::new(CsvWriter::new(
-                        counting_writer,
-                        schema,
-                        csv_config.clone(),
-                    )))
-                }))
-            }
+            let envelope = reconstruct_envelope
+                .then(|| opts.as_ref().and_then(|o| o.envelope.as_ref()))
+                .flatten();
+            let mut options = CsvEncoderOptions::from(&csv_config);
+            options.charset = opts
+                .as_ref()
+                .and_then(|o| o.encoding.as_deref())
+                .map(|name| Charset::from_output_name(name, "CSV"))
+                .transpose()
+                .map_err(PipelineError::Format)?
+                .unwrap_or_default();
+            options.join_values = output.join_values.as_deref().unwrap_or(&[]);
+            options.declared_multiple = &output.declared_multiple;
+            options.envelope_header = envelope.and_then(|e| e.header_from_doc.as_deref());
+            options.envelope_footer = envelope.and_then(|e| e.footer_from_doc.as_deref());
+            options.envelope_count = envelope.and_then(|e| e.footer_record_count_field.as_deref());
+            let subsequent_config = (output.split.is_some()
+                && !repeat_header
+                && options.include_header
+                && options.envelope_header.is_none()
+                && options.envelope_footer.is_none()
+                && options.envelope_count.is_none())
+            .then(|| {
+                CsvEncoderConfig::new(
+                    CsvEncoderOptions {
+                        include_header: false,
+                        ..options
+                    },
+                    &resources,
+                )
+            })
+            .transpose()
+            .map_err(PipelineError::Format)?;
+            let csv_config =
+                CsvEncoderConfig::new(options, &resources).map_err(PipelineError::Format)?;
+            let capture = repeat_header
+                .then(|| CsvHeaderCapture::new(&resources))
+                .transpose()
+                .map_err(PipelineError::Format)?;
+            let scope = resources
+                .scope()
+                .map_err(|error| PipelineError::Format(error.into()))?;
+            let state = CsvFactoryState {
+                config: csv_config,
+                subsequent_config,
+                opened: std::cell::Cell::new(false),
+                capture,
+                resources,
+            };
+            let factory = move |counting_writer, schema| state.build(counting_writer, schema);
+            WriterFactory::try_new(factory, scope.allocation())
+                .map_err(|error| PipelineError::Format(error.into()))
         }
         OutputFormat::Json(opts) => {
             let mut json_config = build_json_writer_config(opts.as_ref());
@@ -341,13 +388,15 @@ fn build_writer_factory(
                 reconstruct_envelope,
                 opts.as_ref().and_then(|o| o.envelope.as_ref()),
             );
-            Ok(Box::new(move |counting_writer, schema| {
-                Ok(Box::new(JsonWriter::new(
-                    counting_writer,
-                    schema,
-                    json_config.clone(),
-                )))
-            }))
+            Ok(WriterFactory::from_legacy(
+                move |counting_writer, schema| {
+                    Ok(FormatWriterHandle::from_legacy(Box::new(JsonWriter::new(
+                        counting_writer,
+                        schema,
+                        json_config.clone(),
+                    ))))
+                },
+            ))
         }
         OutputFormat::Xml(opts) => {
             let mut xml_config = build_xml_writer_config(opts.as_ref());
@@ -357,19 +406,21 @@ fn build_writer_factory(
             // `multiple:` field with no entry emits bare repeats named after the
             // field. The plan-time E362 gate has already validated the block, so
             // the XML and CSV arms each consume the sub-vocabulary they read.
-            xml_config.join_values = join_values;
+            xml_config.join_values = output.join_values.clone().unwrap_or_default();
             xml_config.declared_multiple = output.declared_multiple.clone();
             xml_config.envelope = resolve_envelope_spec(
                 reconstruct_envelope,
                 opts.as_ref().and_then(|o| o.envelope.as_ref()),
             );
-            Ok(Box::new(move |counting_writer, schema| {
-                Ok(Box::new(XmlWriter::new(
-                    counting_writer,
-                    schema,
-                    xml_config.clone(),
-                )))
-            }))
+            Ok(WriterFactory::from_legacy(
+                move |counting_writer, schema| {
+                    Ok(FormatWriterHandle::from_legacy(Box::new(XmlWriter::new(
+                        counting_writer,
+                        schema,
+                        xml_config.clone(),
+                    ))))
+                },
+            ))
         }
         OutputFormat::FixedWidth(opts) => {
             let mut fw_config = build_fw_writer_config(opts.as_ref());
@@ -381,23 +432,23 @@ fn build_writer_factory(
                 "fixed-width writer factory requires field_defs — \
                  build_format_writer must validate schema before calling",
             );
-            Ok(Box::new(move |counting_writer, _schema| {
-                Ok(Box::new(FixedWidthWriter::new(
-                    counting_writer,
-                    fields.clone(),
-                    fw_config.clone(),
-                )?))
-            }))
+            Ok(WriterFactory::from_legacy(
+                move |counting_writer, _schema| {
+                    Ok(FormatWriterHandle::from_legacy(Box::new(
+                        FixedWidthWriter::new(counting_writer, fields.clone(), fw_config.clone())?,
+                    )))
+                },
+            ))
         }
         OutputFormat::Edifact(opts) => {
             let edi_config = build_edifact_writer_config(opts.as_ref());
-            Ok(Box::new(move |counting_writer, schema| {
-                Ok(Box::new(EdifactWriter::new(
-                    counting_writer,
-                    schema,
-                    edi_config.clone(),
-                )))
-            }))
+            Ok(WriterFactory::from_legacy(
+                move |counting_writer, schema| {
+                    Ok(FormatWriterHandle::from_legacy(Box::new(
+                        EdifactWriter::new(counting_writer, schema, edi_config.clone()),
+                    )))
+                },
+            ))
         }
         OutputFormat::X12(opts) => {
             // Resolve the writer config (including charset) once here so the
@@ -409,36 +460,42 @@ fn build_writer_factory(
             // first per-split writer is built (at the first record) — still
             // pre-output and never a corrupt interchange, just not at setup.
             let x12_config = build_x12_writer_config(opts.as_ref());
-            Ok(Box::new(move |counting_writer, schema| {
-                let config = x12_config
-                    .as_ref()
-                    .map_err(|e| clinker_format::FormatError::X12(e.to_string()))?;
-                Ok(Box::new(X12Writer::new(
-                    counting_writer,
-                    schema,
-                    config.clone(),
-                )))
-            }))
+            Ok(WriterFactory::from_legacy(
+                move |counting_writer, schema| {
+                    let config = x12_config
+                        .as_ref()
+                        .map_err(|e| clinker_format::FormatError::X12(e.to_string()))?;
+                    Ok(FormatWriterHandle::from_legacy(Box::new(X12Writer::new(
+                        counting_writer,
+                        schema,
+                        config.clone(),
+                    ))))
+                },
+            ))
         }
         OutputFormat::Hl7(opts) => {
             let hl7_config = build_hl7_writer_config(opts.as_ref());
-            Ok(Box::new(move |counting_writer, schema| {
-                Ok(Box::new(Hl7Writer::new(
-                    counting_writer,
-                    schema,
-                    hl7_config.clone(),
-                )))
-            }))
+            Ok(WriterFactory::from_legacy(
+                move |counting_writer, schema| {
+                    Ok(FormatWriterHandle::from_legacy(Box::new(Hl7Writer::new(
+                        counting_writer,
+                        schema,
+                        hl7_config.clone(),
+                    ))))
+                },
+            ))
         }
         OutputFormat::Swift(opts) => {
             let swift_config = build_swift_writer_config(opts.as_ref());
-            Ok(Box::new(move |counting_writer, schema| {
-                Ok(Box::new(SwiftWriter::new(
-                    counting_writer,
-                    schema,
-                    swift_config.clone(),
-                )))
-            }))
+            Ok(WriterFactory::from_legacy(
+                move |counting_writer, schema| {
+                    Ok(FormatWriterHandle::from_legacy(Box::new(SwiftWriter::new(
+                        counting_writer,
+                        schema,
+                        swift_config.clone(),
+                    ))))
+                },
+            ))
         }
     }
 }
@@ -453,7 +510,8 @@ pub(crate) fn build_format_writer(
     schema: SharedStorage<Schema>,
     output_staging: crate::output::staging::OutputStagingRegistry,
     sink_byte_counter: Option<SharedByteCounter>,
-) -> Result<Box<dyn FormatWriter>, PipelineError> {
+    resources: WriterResources,
+) -> Result<FormatWriterHandle, PipelineError> {
     // Extract field definitions for fixed-width output (requires explicit schema).
     let field_defs = if matches!(output.format, OutputFormat::FixedWidth(_)) {
         Some(extract_output_field_defs(output)?)
@@ -462,7 +520,11 @@ pub(crate) fn build_format_writer(
     };
 
     let repeat_header = output.split.as_ref().is_some_and(|s| s.repeat_header);
-    let writer_factory = build_writer_factory(output, repeat_header, field_defs)?;
+    let scope = resources
+        .scope()
+        .map_err(|error| PipelineError::Format(error.into()))?;
+    let writer_factory = build_writer_factory(output, repeat_header, field_defs, resources)?;
+    let prepared_csv = matches!(output.format, OutputFormat::Csv(_));
 
     if let Some(ref split) = output.split {
         let policy = build_split_policy(split);
@@ -505,8 +567,11 @@ pub(crate) fn build_format_writer(
                     output_staging.stage_output(output_name.clone(), if_exists, false, path_for_n)
                 };
                 let (_path, file) = staged.map_err(|e| std::io::Error::other(format!("{e:?}")))?;
-                let buffered =
-                    Box::new(BufWriter::with_capacity(65536, file)) as Box<dyn Write + Send>;
+                let buffered: Box<dyn Write + Send> = if prepared_csv {
+                    Box::new(file)
+                } else {
+                    Box::new(BufWriter::with_capacity(65536, file))
+                };
                 Ok(match &sink_byte_counter_for_files {
                     Some(counter) => Box::new(CountingWriter::new(buffered, counter.clone())),
                     None => buffered,
@@ -516,21 +581,24 @@ pub(crate) fn build_format_writer(
         // SplittingWriter creates its own files; don't use raw_writer.
         drop(raw_writer);
 
-        Ok(Box::new(SplittingWriter::new(
-            file_factory,
-            writer_factory,
-            schema,
-            policy,
-        )))
+        FormatWriterHandle::try_new(
+            SplittingWriter::new(file_factory, writer_factory, schema, policy),
+            scope.allocation(),
+        )
+        .map_err(|error| PipelineError::Format(error.into()))
     } else {
-        let buf_writer = BufWriter::with_capacity(65536, raw_writer);
+        let buf_writer: Box<dyn Write + Send> = if prepared_csv {
+            raw_writer
+        } else {
+            Box::new(BufWriter::with_capacity(65536, raw_writer))
+        };
         let counter = sink_byte_counter.unwrap_or_default();
-        let counting_writer = CountingWriter::new(
-            Box::new(buf_writer) as Box<dyn Write + Send>,
-            counter.clone(),
-        );
-        let inner = writer_factory(counting_writer, schema).map_err(PipelineError::Format)?;
-        Ok(Box::new(CountedFormatWriter::new(inner, counter)))
+        let counting_writer = CountingWriter::new(buf_writer, counter.clone());
+        let inner = writer_factory
+            .create(counting_writer, schema)
+            .map_err(PipelineError::Format)?;
+        FormatWriterHandle::try_new(CountedFormatWriter::new(inner, counter), scope.allocation())
+            .map_err(|error| PipelineError::Format(error.into()))
     }
 }
 
@@ -596,6 +664,78 @@ nodes:
     }
 
     #[test]
+    fn csv_factory_repeat_header_controls_actual_split_destinations() {
+        for include_header in [true, false] {
+            for repeat_header in [false, true] {
+                let mut sink = compiled_split_sink("csv", false);
+                sink.include_header = Some(include_header);
+                let provider = clinker_format::preparation::MemoryOnlyResources::new(
+                    std::num::NonZeroUsize::new(256 * 1024).unwrap(),
+                );
+                let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["tags".into()])));
+                let outputs = [
+                    clinker_bench_support::io::SharedBuffer::new(),
+                    clinker_bench_support::io::SharedBuffer::new(),
+                ];
+                let files = outputs.clone();
+                let factory =
+                    build_writer_factory(&sink, repeat_header, None, provider.resources()).unwrap();
+                let retained = provider.used();
+                let scope = provider.resources().scope().unwrap();
+                let pressure = scope
+                    .reserve(std::alloc::Layout::array::<u8>(256 * 1024 - retained).unwrap())
+                    .unwrap();
+                let refused = factory.create(
+                    CountingWriter::new(Box::new(outputs[0].clone()), SharedByteCounter::new()),
+                    schema.clone(),
+                );
+                assert!(
+                    refused.is_err(),
+                    "failed construction must not consume the first-file policy"
+                );
+                drop(pressure);
+                assert_eq!(provider.used(), retained);
+                assert!(outputs[0].contents().is_empty());
+                let mut writer = SplittingWriter::new(
+                    Box::new(move |sequence| Ok(Box::new(files[sequence as usize - 1].clone()))),
+                    factory,
+                    schema.clone(),
+                    SplitPolicy {
+                        max_records: Some(1),
+                        max_bytes: None,
+                        group_key: None,
+                        oversize_group: OversizeGroupPolicy::Error,
+                    },
+                );
+                for value in [1, 2] {
+                    writer
+                        .write_record(&Record::new(schema.clone(), vec![Value::Integer(value)]))
+                        .unwrap();
+                }
+                writer.flush().unwrap();
+                assert_eq!(
+                    outputs[0].contents(),
+                    if include_header {
+                        b"tags\n1\n".as_slice()
+                    } else {
+                        b"1\n".as_slice()
+                    }
+                );
+                assert_eq!(
+                    outputs[1].contents(),
+                    if include_header && repeat_header {
+                        b"tags\n2\n".as_slice()
+                    } else {
+                        b"2\n".as_slice()
+                    }
+                );
+                drop(writer);
+                assert_eq!(provider.used(), 0);
+            }
+        }
+    }
+
+    #[test]
     fn split_csv_and_xml_writers_enforce_compiled_multiple_columns() {
         for format in ["csv", "xml"] {
             for declared in [true, false] {
@@ -623,6 +763,10 @@ nodes:
                     schema,
                     crate::output::staging::OutputStagingRegistry::default(),
                     None,
+                    clinker_format::preparation::MemoryOnlyResources::new(
+                        std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+                    )
+                    .resources(),
                 )
                 .expect("split writer builds");
                 let result = writer.write_record(&record);
@@ -638,7 +782,7 @@ nodes:
                     let message = error.to_string();
                     assert!(
                         message.contains(format.to_ascii_uppercase().as_str())
-                            && message.contains("tags"),
+                            && message.contains(if format == "csv" { "field 1" } else { "tags" }),
                         "{message}"
                     );
                 }
@@ -669,6 +813,40 @@ nodes:
         // pipeline's output is byte-identical.
         let config = build_csv_writer_config(None, None).expect("no options resolves");
         assert_eq!(config.delimiter, b',');
+    }
+
+    #[test]
+    fn csv_factory_encoding_preserves_committed_bytes_after_rejection() {
+        let mut sink = compiled_split_sink("csv", false);
+        sink.split = None;
+        sink.format = OutputFormat::Csv(Some(clinker_plan::config::CsvOutputOptions {
+            encoding: Some("latin1".into()),
+            ..Default::default()
+        }));
+        let output = clinker_bench_support::io::SharedBuffer::new();
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["caf\u{e9}".into()])));
+        let resources = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(256 * 1024).unwrap(),
+        );
+        let mut writer = build_format_writer(
+            &sink,
+            Box::new(output.clone()),
+            schema.clone(),
+            crate::output::staging::OutputStagingRegistry::default(),
+            None,
+            resources.resources(),
+        )
+        .unwrap();
+        let row = |text: &str| Record::new(schema.clone(), vec![Value::String(text.into())]);
+        writer.write_record(&row("caf\u{e9}")).unwrap();
+        let before = output.contents();
+        assert!(writer.write_record(&row("late\u{20ac}")).is_err());
+        assert_eq!(output.contents(), before);
+        writer.write_record(&row("next")).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        assert_eq!(output.contents(), b"caf\xe9\ncaf\xe9\nnext\n");
+        assert_eq!(resources.used(), 0);
     }
 
     #[test]

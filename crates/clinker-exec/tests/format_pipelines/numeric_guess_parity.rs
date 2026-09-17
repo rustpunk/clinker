@@ -394,6 +394,7 @@ fn multi_record_fixed_and_csv_delegate_numeric_text_to_positional_coercion() {
             quote_char: b'"',
             has_header: false,
         },
+        clinker_format::Charset::Utf8,
     )
     .expect("CSV multi-record reader builds");
     let csv_record = csv

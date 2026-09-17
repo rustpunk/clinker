@@ -1,10 +1,13 @@
-//! End-to-end accounting checks for transient node-buffer materializations.
+//! Accounting checks for transient node-buffer materializations of external rows.
 //!
 //! These use the crate-private arbitrator-injection entry point so the
 //! reservation gate and registry cleanup can be observed without relying on
 //! process RSS. A fixed consumer near a 100 GiB hard limit makes reservation
 //! rejection deterministic: the producer slot fits, while one additional
 //! resident scan materialization exceeds the limit by exactly one byte.
+//! Fixtures are decoded before execution with the bound source parser and
+//! coercion policy. CSV admission is a separate contract: its schema alone
+//! cannot coexist with the intentionally pinned usage in these local gates.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -51,6 +54,7 @@ fn quiet_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
 
 fn materialization_rejection_arbitrator(
     row_bytes: u64,
+    document_bytes: u64,
 ) -> (
     Arc<crate::pipeline::memory::MemoryArbitrator>,
     crate::pipeline::memory::ConsumerId,
@@ -60,20 +64,22 @@ fn materialization_rejection_arbitrator(
     // The published slot itself is spill-eligible and discharges its resident
     // charge. Keep one scan materialization just one byte over the remaining
     // headroom so rejection occurs before the consumer allocates its Vec.
-    let pinned_bytes = HARD_LIMIT - row_bytes + 1;
+    // The sole nonempty source's admitted document survives in punctuation
+    // owners even after its body rows spill. Leave exactly that measured charge.
+    let pinned_bytes = HARD_LIMIT - row_bytes + 1 - document_bytes;
     let id = arbitrator.register_consumer(Arc::new(PinnedUsage(pinned_bytes)));
     (arbitrator, id, pinned_bytes)
 }
 
 fn canonicalization_overlap_rejection_arbitrator(
-    row_bytes: u64,
+    batch_bytes: u64,
 ) -> (
     Arc<crate::pipeline::memory::MemoryArbitrator>,
     crate::pipeline::memory::ConsumerId,
     u64,
 ) {
     let arbitrator = quiet_arbitrator();
-    let pinned_bytes = HARD_LIMIT - 2 * row_bytes + 1;
+    let pinned_bytes = HARD_LIMIT - 2 * batch_bytes + 1;
     let id = arbitrator.register_consumer(Arc::new(PinnedUsage(pinned_bytes)));
     (arbitrator, id, pinned_bytes)
 }
@@ -99,21 +105,6 @@ fn fixture_compile_context() -> clinker_plan::config::CompileContext {
         .join("tests")
         .join("fixtures");
     clinker_plan::config::CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"))
-}
-
-fn readers(entries: &[(&str, &str)]) -> crate::executor::SourceReaders {
-    entries
-        .iter()
-        .map(|(name, csv)| {
-            (
-                (*name).to_string(),
-                crate::executor::single_file_reader(
-                    format!("{name}.csv"),
-                    Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
-                ),
-            )
-        })
-        .collect()
 }
 
 fn writers(
@@ -172,12 +163,14 @@ fn run_with_params(
 ) {
     let config = clinker_plan::config::parse_config(yaml).expect("parse pipeline YAML");
     let (writers, buffers) = writers(output_names);
+    let context = fixture_compile_context();
+    let readers = crate::test_support::predecoded_csv_readers(&config, &context, source_csv);
     let result = PipelineExecutor::run_with_readers_writers_with_arbitrator(
         &config,
-        readers(source_csv),
+        readers,
         writers.into(),
         params,
-        fixture_compile_context(),
+        context,
         arbitrator,
     );
     (result, buffers)
@@ -212,11 +205,19 @@ nodes:
 
 #[test]
 fn composition_materialization_rejects_before_allocation_and_restores_baseline() {
+    let source_csv = &[("src", "id\n123\n")];
+    let config = clinker_plan::config::parse_config(COMPOSITION_PASSTHROUGH).unwrap();
+    let document_bytes = crate::test_support::single_csv_document_metadata_bytes(
+        &config,
+        &fixture_compile_context(),
+        source_csv,
+    );
     let row_bytes = row_bytes_for_node(COMPOSITION_PASSTHROUGH, "src");
-    let (arbitrator, baseline_id, baseline_usage) = materialization_rejection_arbitrator(row_bytes);
+    let (arbitrator, baseline_id, baseline_usage) =
+        materialization_rejection_arbitrator(row_bytes, document_bytes);
     let (result, _) = run(
         COMPOSITION_PASSTHROUGH,
-        &[("src", "id\n123\n")],
+        source_csv,
         &["out", "sibling"],
         Arc::clone(&arbitrator),
     );
@@ -238,6 +239,7 @@ fn composition_materialization_rejects_before_allocation_and_restores_baseline()
     }
     assert_eq!(arbitrator.consumer_count(), 1);
     assert_eq!(arbitrator.sum_consumer_usage(), baseline_usage);
+    assert_eq!(arbitrator.writer_resource_usage().memory, 0);
     arbitrator.unregister_consumer(baseline_id);
 }
 
@@ -279,11 +281,19 @@ nodes:
 
 #[test]
 fn shared_transform_materialization_rejects_before_allocation_and_restores_baseline() {
+    let source_csv = &[("a", "k,v\nx,15\n"), ("b", "k,v\n"), ("c", "k,v\n")];
+    let config = clinker_plan::config::parse_config(SHARED_PREDECESSOR).unwrap();
+    let document_bytes = crate::test_support::single_csv_document_metadata_bytes(
+        &config,
+        &fixture_compile_context(),
+        source_csv,
+    );
     let row_bytes = row_bytes_for_node(SHARED_PREDECESSOR, "shared");
-    let (arbitrator, baseline_id, baseline_usage) = materialization_rejection_arbitrator(row_bytes);
+    let (arbitrator, baseline_id, baseline_usage) =
+        materialization_rejection_arbitrator(row_bytes, document_bytes);
     let (result, _) = run(
         SHARED_PREDECESSOR,
-        &[("a", "k,v\nx,15\n"), ("b", "k,v\n"), ("c", "k,v\n")],
+        source_csv,
         &["out1", "out2"],
         Arc::clone(&arbitrator),
     );
@@ -309,6 +319,7 @@ fn shared_transform_materialization_rejects_before_allocation_and_restores_basel
     }
     assert_eq!(arbitrator.consumer_count(), 1);
     assert_eq!(arbitrator.sum_consumer_usage(), baseline_usage);
+    assert_eq!(arbitrator.writer_resource_usage().memory, 0);
     arbitrator.unregister_consumer(baseline_id);
 }
 
@@ -337,11 +348,19 @@ nodes:
 
 #[test]
 fn shared_output_materialization_rejects_before_allocation_and_restores_baseline() {
+    let source_csv = &[("src", "id\n123\n")];
+    let config = clinker_plan::config::parse_config(SHARED_OUTPUT_PREDECESSOR).unwrap();
+    let document_bytes = crate::test_support::single_csv_document_metadata_bytes(
+        &config,
+        &fixture_compile_context(),
+        source_csv,
+    );
     let row_bytes = row_bytes_for_node(SHARED_OUTPUT_PREDECESSOR, "prepared");
-    let (arbitrator, baseline_id, baseline_usage) = materialization_rejection_arbitrator(row_bytes);
+    let (arbitrator, baseline_id, baseline_usage) =
+        materialization_rejection_arbitrator(row_bytes, document_bytes);
     let (result, _) = run(
         SHARED_OUTPUT_PREDECESSOR,
-        &[("src", "id\n123\n")],
+        source_csv,
         &["alpha", "beta"],
         Arc::clone(&arbitrator),
     );
@@ -366,6 +385,7 @@ fn shared_output_materialization_rejects_before_allocation_and_restores_baseline
     }
     assert_eq!(arbitrator.consumer_count(), 1);
     assert_eq!(arbitrator.sum_consumer_usage(), baseline_usage);
+    assert_eq!(arbitrator.writer_resource_usage().memory, 0);
     arbitrator.unregister_consumer(baseline_id);
 }
 
@@ -562,12 +582,36 @@ fn direct_source_composition_seed_precedes_fused_name_and_releases_registration(
 
 #[test]
 fn composition_source_canonicalization_overlap_rejects_and_releases_transfer() {
+    let source_csv = &[("src", "a\n5\n")];
+    let config = clinker_plan::config::parse_config(DIRECT_SOURCE_COMPOSITION).unwrap();
+    let document_bytes = crate::test_support::single_csv_document_metadata_bytes(
+        &config,
+        &fixture_compile_context(),
+        source_csv,
+    );
     let row_bytes = row_bytes_for_node(DIRECT_SOURCE_COMPOSITION, "src");
+    // Parent spill reload retains the original document only in punctuation
+    // sidecars. Port collection drops those before body canonicalization, whose
+    // reloaded records carry legacy contexts. Thus D is needed alongside the
+    // first batch, but is absent when the second batch reservation must fail.
+    // Choose the smallest actual batch B > D: D + B <= 2 * B - 1 permits
+    // parent collection, while the original pin plus 2 * B is HARD_LIMIT + 1.
+    let input_rows = document_bytes / row_bytes + 1;
+    let batch_bytes = input_rows * row_bytes;
+    assert!(batch_bytes > document_bytes);
+    assert!(document_bytes + batch_bytes <= 2 * batch_bytes - 1);
+    let csv = format!("a\n{}", "5\n".repeat(usize::try_from(input_rows).unwrap()));
+    let actual_rows = csv::Reader::from_reader(csv.as_bytes())
+        .records()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse canonicalization fixture rows");
+    assert_eq!(actual_rows.len() as u64, input_rows);
+    let source_csv = &[("src", csv.as_str())];
     let (arbitrator, baseline_id, baseline_usage) =
-        canonicalization_overlap_rejection_arbitrator(row_bytes);
+        canonicalization_overlap_rejection_arbitrator(batch_bytes);
     let (result, _) = run(
         DIRECT_SOURCE_COMPOSITION,
-        &[("src", "a\n5\n")],
+        source_csv,
         &["composition_out"],
         Arc::clone(&arbitrator),
     );
@@ -596,6 +640,7 @@ fn composition_source_canonicalization_overlap_rejects_and_releases_transfer() {
     }
     assert_eq!(arbitrator.consumer_count(), 1);
     assert_eq!(arbitrator.sum_consumer_usage(), baseline_usage);
+    assert_eq!(arbitrator.writer_resource_usage().memory, 0);
     arbitrator.unregister_consumer(baseline_id);
 }
 

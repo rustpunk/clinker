@@ -4,6 +4,9 @@
 //! records. A rejected value must become exactly one record error before any
 //! downstream node can observe a raw or substituted value.
 
+#[path = "common/pipeline_resource_fixtures.rs"]
+mod resource_fixtures;
+
 use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -11,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clinker_bench_support::io::{SharedBuffer, slow_reader};
+use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{
     ExecutionReport, PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders,
 };
@@ -857,6 +860,12 @@ nodes:
 "#,
             ordered_threshold_handling()
         );
+        let mut config = parse_config(&yaml).expect("ordered pressure fixture parses");
+        resource_fixtures::add_csv_workspace(&mut config, &CompileContext::default());
+        let yaml = yaml.replace(
+            &format!("limit: \"{limit}\""),
+            &format!("limit: \"{}\"", config.pipeline.memory.limit.unwrap()),
+        );
         let mut csv = String::from("id,quantity\n");
         for ordinal in (1..=180).rev() {
             if ordinal % 20 == 0 {
@@ -895,6 +904,46 @@ nodes:
 
 #[test]
 fn ordered_attempt_interrupt_cleanup() {
+    struct DelayedRecords(Box<dyn clinker_exec::source::RecordSource>);
+
+    impl clinker_exec::source::RecordSource for DelayedRecords {
+        fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+            self.0.schema()
+        }
+
+        fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
+            std::thread::sleep(Duration::from_millis(1));
+            self.0.next_record()
+        }
+
+        fn current_source_file(&self) -> Option<&Arc<str>> {
+            self.0.current_source_file()
+        }
+
+        fn prepare_document(
+            &mut self,
+            config: &clinker_format::EnvelopeConfig,
+        ) -> Result<OwnedMap, FormatError> {
+            self.0.prepare_document(config)
+        }
+
+        fn take_envelope_events(&mut self) -> Vec<clinker_format::EnvelopeEvent> {
+            self.0.take_envelope_events()
+        }
+
+        fn take_source_lifecycle_events(&mut self) -> Vec<clinker_format::SourceLifecycleEvent> {
+            self.0.take_source_lifecycle_events()
+        }
+
+        fn set_shutdown_token(&mut self, token: ShutdownToken) {
+            self.0.set_shutdown_token(token);
+        }
+
+        fn advance_to_next_file(&mut self) -> Result<bool, FormatError> {
+            self.0.advance_to_next_file()
+        }
+    }
+
     let yaml = r#"
 pipeline:
   name: ordered_attempt_interrupt
@@ -922,13 +971,21 @@ nodes:
     for ordinal in (1..=400).rev() {
         csv.push_str(&format!("{ordinal},{}\n", "x".repeat(256)));
     }
-    let readers: SourceReaders = HashMap::from([(
+    // Keep the 1K ordered-staging budget; decoding is fixture setup, while
+    // delayed record delivery preserves the interruption window during ingest.
+    let config = parse_config(yaml).expect("interrupt fixture parses");
+    let mut readers = resource_fixtures::predecoded_csv_readers(
+        &config,
+        &CompileContext::default(),
+        &[("src", &csv)],
+    );
+    let Some(SourceInput::Records(source)) = readers.remove("src") else {
+        panic!("predecoded fixture must supply records");
+    };
+    readers.insert(
         "src".to_string(),
-        SourceInput::Files(vec![FileSlot::new(
-            PathBuf::from("input.csv"),
-            slow_reader(&csv, Duration::from_millis(1)),
-        )]),
-    )]);
+        SourceInput::Records(Box::new(DelayedRecords(source))),
+    );
     let token = ShutdownToken::detached();
     let params = PipelineRunParams {
         shutdown_token: Some(token.clone()),

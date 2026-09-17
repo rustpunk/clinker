@@ -250,6 +250,18 @@ impl Record {
         &self.values
     }
 
+    /// Move a positional value out, leaving null in its existing schema slot.
+    ///
+    /// The record keeps its width and allocated slots; the returned value keeps
+    /// its actual nested/text allocation owners. An out-of-range index changes
+    /// nothing. Callers must establish that null is acceptable in the consumed
+    /// slot before publishing the remaining record.
+    pub fn take_value_at(&mut self, index: usize) -> Option<Value> {
+        self.values
+            .get_mut(index)
+            .map(|value| std::mem::replace(value, Value::Null))
+    }
+
     // ── Record-scope variables (`$record.<key>`) ────────────────────
 
     /// Read a `$record.<key>` user-declared scoped variable by key.
@@ -448,6 +460,21 @@ impl FieldResolver for Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn take_value_at_preserves_width_and_duplicate_lookup() {
+        let schema = crate::SchemaBuilder::new()
+            .with_field("same")
+            .with_field("same")
+            .build();
+        let mut record = Record::new(schema.clone(), vec![Value::Integer(1), Value::Integer(2)]);
+        assert_eq!(record.take_value_at(2), None);
+        assert_eq!(record.values(), &[Value::Integer(1), Value::Integer(2)]);
+        assert_eq!(record.take_value_at(0), Some(Value::Integer(1)));
+        assert_eq!(record.get("same"), Some(&Value::Integer(2)));
+        assert_eq!(record.values(), &[Value::Null, Value::Integer(2)]);
+        assert!(SharedStorage::ptr_eq(record.schema(), &schema));
+    }
 
     fn test_schema() -> SharedStorage<Schema> {
         let cols: Vec<crate::owned_storage::OwnedKey> = vec![

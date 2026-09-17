@@ -46,6 +46,9 @@
 //! far more records than the bounded channel holds (a deadlock would hang
 //! the run rather than complete).
 
+#[path = "common/pipeline_resource_fixtures.rs"]
+mod resource_fixtures;
+
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
@@ -282,6 +285,7 @@ nodes:
         .compile(&CompileContext::default())
         .expect("compile sizing plan");
     config.pipeline.memory.limit = Some(tight_scan_limit(&sizing_plan, ROWS).to_string());
+    resource_fixtures::add_csv_workspace(&mut config, &CompileContext::default());
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile pipeline");

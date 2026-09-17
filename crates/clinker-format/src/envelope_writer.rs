@@ -18,6 +18,59 @@ use clinker_record::owned_storage::OwnedKey;
 use clinker_record::{DocumentContext, Value};
 use indexmap::IndexMap;
 
+/// Admitted envelope names, independent of pending per-document counters.
+/// Borrowed sections never acquire a second owner or a copied value map.
+pub(crate) struct PreparedEnvelope {
+    header: Option<crate::reserved::ReservedText>,
+    footer: Option<crate::reserved::ReservedText>,
+    count: Option<crate::reserved::ReservedText>,
+}
+impl PreparedEnvelope {
+    pub(crate) fn from_names(
+        header: Option<&str>,
+        footer: Option<&str>,
+        count: Option<&str>,
+        scope: &crate::preparation::WriterScope,
+    ) -> Result<Option<Self>, crate::FormatError> {
+        if header.is_none() && footer.is_none() && count.is_none() {
+            return Ok(None);
+        }
+        let copy = |value: Option<&str>| -> Result<_, crate::FormatError> {
+            value
+                .map(|value| {
+                    let mut text = crate::reserved::ReservedText::new(scope.allocation().clone());
+                    text.push_str(value)?;
+                    Ok(text)
+                })
+                .transpose()
+        };
+        Ok(Some(Self {
+            header: copy(header)?,
+            footer: copy(footer)?,
+            count: copy(count)?,
+        }))
+    }
+    pub(crate) fn header_fields<'a>(
+        &self,
+        doc: &'a DocumentContext,
+    ) -> Option<&'a IndexMap<OwnedKey, Value>> {
+        self.header
+            .as_ref()
+            .and_then(|name| doc.section_fields(name.as_str()))
+    }
+    pub(crate) fn footer_fields<'a>(
+        &self,
+        doc: &'a DocumentContext,
+    ) -> Option<&'a IndexMap<OwnedKey, Value>> {
+        self.footer
+            .as_ref()
+            .and_then(|name| doc.section_fields(name.as_str()))
+    }
+    pub(crate) fn has_count(&self) -> bool {
+        self.count.is_some()
+    }
+}
+
 /// Format-local mirror of the plan's `OutputEnvelopeConfig`, carried on each
 /// generic writer's config. clinker-format does not depend on clinker-plan, so
 /// the executor's writer registry maps the plan config onto this struct when

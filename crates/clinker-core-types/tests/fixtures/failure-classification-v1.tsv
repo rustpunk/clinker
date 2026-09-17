@@ -42,3 +42,7 @@ admission.configuration.memory_budget_unsatisfiable	configuration	do_not_retry
 runtime.resource.spill_failed	infrastructure	retry_with_backoff
 runtime.resource.spill_cap_exceeded	infrastructure	policy_required
 rest.protocol.page_body_limit_reached	source_protocol	policy_required
+runtime.resource.allocation_failed	infrastructure	policy_required
+runtime.resource.descriptor_cap_exceeded	infrastructure	policy_required
+runtime.resource.storage_failed	infrastructure	policy_required
+runtime.resource.delivery_poisoned	infrastructure	policy_required

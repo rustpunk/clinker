@@ -11,12 +11,12 @@
 pub mod multi_file;
 pub(crate) mod order_barrier;
 
-use clinker_record::owned_storage::{OwnedKey, SharedStorage};
+use clinker_record::owned_storage::{OwnedMap, SharedStorage};
 use std::sync::Arc;
 
 use clinker_format::traits::FormatReader;
 use clinker_format::{EnvelopeConfig, EnvelopeEvent, FormatError, SourceLifecycleEvent};
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{Record, Schema};
 use indexmap::IndexMap;
 
 /// Transport-agnostic record yielder driving one Source's ingest thread.
@@ -43,7 +43,9 @@ pub trait RecordSource: Send {
     fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError>;
 
     /// Yield the next record, or `None` at end of input. Finite by
-    /// contract — every transport EOFs after exhausting its cursor.
+    /// contract — every transport EOFs after exhausting its cursor. The
+    /// consuming handoff preserves the record's allocation owners; acceptance
+    /// does not release grants held by values, schemas or document aliases.
     fn next_record(&mut self) -> Result<Option<Record>, FormatError>;
 
     /// Borrow the originating file path of the most-recently-emitted
@@ -57,14 +59,14 @@ pub trait RecordSource: Send {
 
     /// One-time envelope pre-scan for the current document, run before
     /// any `next_record` call. Mirrors [`FormatReader::prepare_document`]:
-    /// each declared section resolves to a [`Value::Map`] of typed field
-    /// values keyed by the section's field names. The default returns an
-    /// empty map for transports without envelope semantics.
-    fn prepare_document(
-        &mut self,
-        _config: &EnvelopeConfig,
-    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
-        Ok(IndexMap::new())
+    /// each declared section resolves to a [`Value::Map`](clinker_record::Value::Map)
+    /// of typed field values keyed by the section's field names. The returned [`OwnedMap`]
+    /// transfers its backing allocation and section values with any attached
+    /// allocation grants; wrappers must forward it without rebuilding or
+    /// cloning it. The default returns an empty legacy map with no input-sized
+    /// state for transports without envelope semantics.
+    fn prepare_document(&mut self, _config: &EnvelopeConfig) -> Result<OwnedMap, FormatError> {
+        Ok(OwnedMap::from_map(IndexMap::new()))
     }
 
     /// Drain the envelope-nesting events the source queued while serving
@@ -132,10 +134,7 @@ impl RecordSource for Box<dyn FormatReader> {
         (**self).current_source_file()
     }
 
-    fn prepare_document(
-        &mut self,
-        config: &EnvelopeConfig,
-    ) -> Result<IndexMap<OwnedKey, Value>, FormatError> {
+    fn prepare_document(&mut self, config: &EnvelopeConfig) -> Result<OwnedMap, FormatError> {
         (**self).prepare_document(config)
     }
 

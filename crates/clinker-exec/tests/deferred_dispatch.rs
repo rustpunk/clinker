@@ -10,6 +10,8 @@
 //! `executor/tests/deferred_dispatch.rs`.
 
 mod common;
+#[path = "common/pipeline_resource_fixtures.rs"]
+mod resource_fixtures;
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
@@ -219,17 +221,21 @@ nodes:
     type: csv
     include_unmapped: true
 "#;
-    // Pad payload values so each record consumes well over 1KB at the
-    // arena projection step.
+    // One oversized row isolates first-record arena projection; a second
+    // would exceed the upstream correlation sort's fixed-width allowance.
+    // Its payload alone consumes well over 1 KiB at the arena projection step.
     let big = "x".repeat(2048);
-    let csv = format!("order_id,department,payload\no1,HR,{big}\no2,ENG,{big}\n");
+    let csv = format!("order_id,department,payload\no1,HR,{big}\n");
 
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
     let primary = "src".to_string();
     let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        clinker_exec::executor::single_file_reader(
-            "test.csv",
-            Box::new(std::io::Cursor::new(csv.into_bytes())),
+        resource_fixtures::predecoded_csv_source(
+            &config,
+            &CompileContext::default(),
+            &primary,
+            &[("test.csv", &csv)],
         ),
     )]);
     let buf = SharedBuffer::new();
@@ -244,7 +250,6 @@ nodes:
         shutdown_token: None,
         ..Default::default()
     };
-    let config = clinker_plan::config::parse_config(yaml).expect("parse");
     let result = common::run_config(&config, readers, writers, &params);
     let err = result.expect_err(
         "tight memory limit must surface as a typed admission failure on the \

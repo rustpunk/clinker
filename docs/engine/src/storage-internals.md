@@ -6,10 +6,10 @@ This page is the engine-internals reference for the durability and concurrency m
 
 ## Prepared output storage
 
-The preparation library can seal complete operation bytes in finite memory or
-executor-backed raw temporary storage. This is an additive API; current codec
-and CLI constructors have not been migrated to it. It is distinct from source
-file staging and output publication described below.
+CSV output in the CLI and executor seals complete operation bytes in finite
+memory or executor-backed raw temporary storage. Other codecs retain their
+existing writer paths. Preparation is distinct from source file staging and
+output publication described below.
 
 An executor provider with no resolved spill root is memory-only. It never
 silently uses the operating system temporary directory. With a resolved root,
@@ -52,6 +52,13 @@ retries or commits pending state. Even zero-byte destination acceptance is a
 delivery failure. Storage is closed and removed before encoder state commits;
 cleanup failure after byte delivery also prevents commit and poisons the writer.
 Drop performs cleanup but does not finalize or retry destination writes.
+
+CSV prepares the first automatic header and body row together; explicit
+document start and end are separate operations. On preparation failure, the
+CSV adapter disables stage writes before dropping the library writer, whose
+destructor can flush buffered bytes. That discarded flush cannot replace the
+original representability or structured-value error with a later resource
+failure. Actual resource-denied I/O still recovers its typed stage evidence.
 
 Unlink failure transfers the exact disk charge, path grant and descriptor slot
 to an already-admitted cleanup-debt slot. Retry runs outside admission locks;

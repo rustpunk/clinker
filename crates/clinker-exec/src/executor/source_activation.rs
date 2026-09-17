@@ -151,28 +151,23 @@ impl SourceActivationController {
                 .consumers
                 .push((source_name.clone(), (consumer_id, handle)));
             let worker_shutdown = shutdown.clone();
-            let lifecycle_shutdown = worker_shutdown.clone();
             let lifecycle_telemetry = telemetry.cloned();
             let source_runtime = self.source_runtime.clone();
             let spawn = std::thread::Builder::new()
                 .name(format!("clinker-body-source-{source_name}"))
                 .spawn(move || {
-                    observe_source(
-                        lifecycle_telemetry.as_ref(),
-                        lifecycle_shutdown.as_ref(),
-                        || {
-                            let mut outcome = ingest_source_body(
-                                body,
-                                input,
-                                stream,
-                                worker_shutdown,
-                                None,
-                                source_runtime,
-                            )?;
-                            outcome.source_name = logical_source_name;
-                            Ok(outcome)
-                        },
-                    )
+                    observe_source(lifecycle_telemetry.as_ref(), || {
+                        let mut outcome = ingest_source_body(
+                            body,
+                            input,
+                            stream,
+                            worker_shutdown,
+                            None,
+                            source_runtime,
+                        )?;
+                        outcome.source_name = logical_source_name;
+                        Ok(outcome)
+                    })
                 });
             match spawn {
                 Ok(worker) => workers.push(worker),
@@ -223,24 +218,13 @@ impl SourceActivationController {
                 .active
                 .remove(&id)
                 .expect("active group id was collected from the same map");
-            while let Some(worker) = runtime.workers.pop() {
-                match worker.join() {
-                    Ok(Ok(outcome)) => outcomes.push(outcome),
-                    Ok(Err(error)) => {
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
-                    }
-                    Err(_) => {
-                        if first_error.is_none() {
-                            first_error = Some(PipelineError::Internal {
-                                op: "body-source-thread",
-                                node: String::new(),
-                                detail: "body Source worker panicked".to_string(),
-                            });
-                        }
-                    }
-                }
+            match super::ingest::join_source_workers(
+                runtime.workers.drain(..).rev(),
+                "body-source-thread",
+            ) {
+                Ok(group_outcomes) => outcomes.extend(group_outcomes),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
             }
             drop(runtime.group);
         }
@@ -326,11 +310,10 @@ fn observe_open<T>(
     result.map_err(capability_error)
 }
 
-pub(super) fn observe_source<T>(
+pub(super) fn observe_source(
     producer: Option<&TelemetryProducer>,
-    shutdown: Option<&crate::pipeline::shutdown::ShutdownToken>,
-    operation: impl FnOnce() -> Result<T, PipelineError>,
-) -> Result<T, PipelineError> {
+    operation: impl FnOnce() -> Result<IngestTaskOutcome, PipelineError>,
+) -> Result<IngestTaskOutcome, PipelineError> {
     let Some(producer) = producer else {
         return operation();
     };
@@ -338,11 +321,8 @@ pub(super) fn observe_source<T>(
     producer.record_metric(MetricKey::SourceStarted, 1);
     let result = operation();
     let (metric, status) = match &result {
-        Err(PipelineError::Interrupted) => (MetricKey::SourceInterrupted, SpanStatus::Unset),
         Err(_) => (MetricKey::SourceFailed, SpanStatus::Error),
-        Ok(_) if shutdown.is_some_and(crate::pipeline::shutdown::ShutdownToken::is_requested) => {
-            (MetricKey::SourceInterrupted, SpanStatus::Unset)
-        }
+        Ok(outcome) if outcome.interrupted => (MetricKey::SourceInterrupted, SpanStatus::Unset),
         Ok(_) => (MetricKey::SourceCompleted, SpanStatus::Ok),
     };
     producer.record_metric(metric, 1);
@@ -554,6 +534,177 @@ access = "read"
             0.70,
             MemoryArbitrator::default_policy(),
         ))
+    }
+
+    #[test]
+    fn body_reader_cancellation_unwinds_and_real_failure_wins_over_shutdown() {
+        struct Reader {
+            schema: clinker_record::owned_storage::SharedStorage<clinker_record::Schema>,
+            row: bool,
+            failure: bool,
+            shutdown: ShutdownToken,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl crate::source::RecordSource for Reader {
+            fn schema(
+                &mut self,
+            ) -> Result<
+                clinker_record::owned_storage::SharedStorage<clinker_record::Schema>,
+                clinker_format::FormatError,
+            > {
+                Ok(self.schema.clone())
+            }
+            fn next_record(
+                &mut self,
+            ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+                if !std::mem::replace(&mut self.row, true) {
+                    return Ok(Some(clinker_record::Record::new(
+                        self.schema.clone(),
+                        vec![clinker_record::Value::Integer(1)],
+                    )));
+                }
+                if self.failure {
+                    self.shutdown.request();
+                }
+                Err(clinker_format::FormatError::Resource(
+                    clinker_record::owned_storage::ResourceError::new(
+                        if self.failure {
+                            clinker_record::owned_storage::ResourceErrorKind::Budget
+                        } else {
+                            clinker_record::owned_storage::ResourceErrorKind::Cancelled
+                        },
+                        42,
+                        7,
+                    ),
+                ))
+            }
+        }
+        impl Drop for Reader {
+            fn drop(&mut self) {
+                self.dropped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        struct Opener(Option<SourceInput>);
+        impl CapabilityOpener for Opener {
+            fn open(
+                mut self: Box<Self>,
+            ) -> Result<Box<dyn CapabilitySession>, CapabilityOpenError> {
+                Ok(Box::new(InputSession {
+                    input: self.0.take(),
+                }))
+            }
+        }
+        let (workspace, plan) = fixture();
+        for failure in [false, true] {
+            let shutdown = ShutdownToken::detached();
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut input = Some(SourceInput::Records(Box::new(Reader {
+                schema: clinker_record::SchemaBuilder::new()
+                    .with_field("id")
+                    .build(),
+                row: false,
+                failure,
+                shutdown: shutdown.clone(),
+                dropped: dropped.clone(),
+            })));
+            let activation = plan.dag().source_activation();
+            let groups = activation
+                .groups()
+                .iter()
+                .map(|group| {
+                    let members = group
+                        .members()
+                        .iter()
+                        .copied()
+                        .map(|member| {
+                            if matches!(
+                                member.scope,
+                                clinker_plan::plan::execution::CompiledSourceScope::TopLevel
+                            ) {
+                                AdmittedSourceOpener::caller_supplied(member)
+                            } else {
+                                AdmittedSourceOpener::new(member, Box::new(Opener(input.take())))
+                            }
+                        })
+                        .collect();
+                    AdmittedActivationGroup::uncredentialed(group.id(), group.capacity(), members)
+                })
+                .collect();
+            let resources = AdmittedRunCapabilities::admit(activation, groups).unwrap();
+            let memory = memory();
+            let result = run(
+                workspace.path(),
+                &plan,
+                resources,
+                &PipelineRunParams {
+                    shutdown_token: Some(shutdown.clone()),
+                    ..Default::default()
+                },
+                memory.clone(),
+            );
+            if failure {
+                assert!(shutdown.is_requested());
+                assert!(
+                    matches!(result, Err(PipelineError::Format(clinker_format::FormatError::Resource(error)))
+                    if error.kind == clinker_record::owned_storage::ResourceErrorKind::Budget && error.requested == 42 && error.available == 7)
+                );
+            } else {
+                assert!(
+                    !shutdown.is_requested(),
+                    "reader cancellation is independent of the token"
+                );
+                let report = result.expect("body interruption remains graceful");
+                assert!(report.interrupted);
+                assert_eq!(
+                    report.counters.total_count, 2,
+                    "driver plus the one actually read body row"
+                );
+                assert_eq!(
+                    report.counters.ok_count, 0,
+                    "interrupted body cannot reach the parent sink"
+                );
+            }
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(memory.consumer_count(), 0);
+            assert_eq!(memory.sum_consumer_usage(), 0);
+        }
+    }
+
+    #[test]
+    fn source_lifecycle_uses_its_outcome_not_a_late_shutdown_request() {
+        use crate::telemetry::{MetricKey, TelemetryArena};
+        let config = clinker_plan::config::ClinkerToml::parse(
+            r#"
+[observability]
+arena_bytes = "768KB"
+ordinary_lane_bytes = "512KB"
+high_severity_lane_bytes = "256KB"
+max_batch_bytes = "8KB"
+[observability.otlp]
+endpoint = "https://collector.invalid"
+[observability.otlp.auth]
+mode = "none"
+"#,
+        )
+        .unwrap();
+        let (producer, receiver) =
+            TelemetryArena::reserve(&config.resolve_observability(None).unwrap()).unwrap();
+        let shutdown = ShutdownToken::detached();
+        let outcome = super::observe_source(Some(&producer), || {
+            shutdown.request();
+            Ok(super::IngestTaskOutcome {
+                source_name: "finished".into(),
+                total_count: 1,
+                watermark_observations: Vec::new(),
+                interrupted: false,
+            })
+        })
+        .unwrap();
+        assert!(!outcome.interrupted);
+        let batch = receiver.try_recv_batch().unwrap();
+        assert_eq!(batch.metric(MetricKey::SourceCompleted), 1);
+        assert_eq!(batch.metric(MetricKey::SourceInterrupted), 0);
     }
 
     #[test]

@@ -36,6 +36,40 @@ pub enum Charset {
 }
 
 impl Charset {
+    /// Encode borrowed field text to a fallible sink without a whole-field copy.
+    /// Latin-1 checks each scalar and reports only its field and byte position.
+    pub fn encode_to(
+        self,
+        text: &str,
+        field: usize,
+        output: &mut dyn std::io::Write,
+    ) -> Result<(), FormatError> {
+        match self {
+            Self::Utf8 => output.write_all(text.as_bytes())?,
+            Self::Latin1 => {
+                let mut bytes = [0u8; 1024];
+                let mut len = 0;
+                for (offset, ch) in text.char_indices() {
+                    bytes[len] =
+                        u8::try_from(u32::from(ch)).map_err(|_| FormatError::OutputEncoding {
+                            format: "text",
+                            field,
+                            offset,
+                            kind: crate::error::OutputEncodingKind::Charset,
+                            field_name: crate::error::OutputFieldName::new(""),
+                            element: None,
+                        })?;
+                    len += 1;
+                    if len == bytes.len() {
+                        output.write_all(&bytes)?;
+                        len = 0;
+                    }
+                }
+                output.write_all(&bytes[..len])?;
+            }
+        }
+        Ok(())
+    }
     /// Resolve a source-declared encoding name to a [`Charset`],
     /// case-insensitively, accepting the common aliases for each repertoire.
     ///
@@ -46,20 +80,40 @@ impl Charset {
     /// mis-configured source fails with actionable guidance rather than
     /// guessing.
     pub fn from_name(name: &str) -> Result<Self, FormatError> {
-        // Match on a normalized form so `UTF-8`, `utf8`, `ISO-8859-1`,
-        // `iso8859-1`, `Latin-1`, and `latin1` all resolve.
-        let normalized: String = name
-            .chars()
-            .filter(|c| !matches!(c, '-' | '_' | ' '))
-            .map(|c| c.to_ascii_lowercase())
-            .collect();
-        match normalized.as_str() {
-            "utf8" => Ok(Charset::Utf8),
-            "iso88591" | "latin1" | "l1" => Ok(Charset::Latin1),
-            _ => Err(FormatError::Charset(format!(
+        Self::recognize_name(name).ok_or_else(|| {
+            FormatError::Charset(format!(
                 "unsupported character set {name:?}. Supported encodings are \
                  \"utf-8\" (the default) and \"iso-8859-1\" (Latin-1)"
-            ))),
+            ))
+        })
+    }
+
+    /// Resolve the same closed alias set without allocating normalization or
+    /// error text. Output factories retain only an inline offending-name excerpt.
+    pub fn from_output_name(name: &str, format: &'static str) -> Result<Self, FormatError> {
+        Self::recognize_name(name).ok_or_else(|| FormatError::OutputEncoding {
+            format,
+            field: 1,
+            offset: 0,
+            kind: crate::error::OutputEncodingKind::CharsetName,
+            field_name: crate::error::OutputFieldName::new(name),
+            element: None,
+        })
+    }
+
+    fn recognize_name(name: &str) -> Option<Self> {
+        let matches = |alias: &str| {
+            name.chars()
+                .filter(|c| !matches!(c, '-' | '_' | ' '))
+                .map(|c| c.to_ascii_lowercase())
+                .eq(alias.chars())
+        };
+        if matches("utf8") {
+            Some(Self::Utf8)
+        } else if matches("iso88591") || matches("latin1") || matches("l1") {
+            Some(Self::Latin1)
+        } else {
+            None
         }
     }
 
@@ -118,6 +172,32 @@ impl Charset {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_charset_aliases_match_native_without_unbounded_errors() {
+        for name in [
+            "UTF-8",
+            "u_t f8",
+            "ISO_8859-1",
+            "Latin-1",
+            "l 1",
+            "utf\t8",
+            "windows-1252",
+            "\u{ff35}TF8",
+        ] {
+            let native = Charset::from_name(name);
+            let bounded = Charset::from_output_name(name, "X12");
+            assert_eq!(native.is_ok(), bounded.is_ok());
+            if let Ok(charset) = native {
+                assert_eq!(bounded.unwrap(), charset);
+            }
+        }
+        let error = Charset::from_output_name(&"private".repeat(100_000), "X12")
+            .unwrap_err()
+            .to_string();
+        assert!(error.len() < 256);
+        assert!(error.contains("encoding: utf-8"));
+    }
 
     #[test]
     fn from_name_resolves_utf8_aliases() {

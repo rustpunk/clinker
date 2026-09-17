@@ -236,6 +236,56 @@ completed bytes still need to be streamed into a destination-local hidden file,
 synchronized there, and promoted on that same share. A local working copy
 reduces random network I/O; it cannot make a cross-filesystem rename atomic.
 
+## CSV preparation and writer ownership
+
+The registry constructs CSV writers with the run's finite `WriterResources`.
+Direct, split, per-source-file, correlation-deferred and combined split/fan-out
+routes retain the same admitted encoder path. `CsvEncoderConfig` owns shared
+policy; each encoder owns its schema mapping. `CsvHeaderCapture` shares only
+successfully committed header names. Shared backings remain charged until
+their final alias is destroyed.
+
+`CsvEncoder` prepares into private operation storage. The first body record and
+automatic header form one operation; explicit document begin/end and finalizing
+operations have their own boundaries. A preparation failure writes none of that
+operation and leaves committed format state intact. Successful preparation is
+not a delivered record: delivery and storage completion precede encoder commit.
+Once delivery starts, a destination may accept a prefix before failure. The
+writer then rejects further operations, including flush, instead of retrying bytes.
+This boundary is distinct from quarantine-file publication above.
+
+With `repeat_header: true`, rotated CSV writers replay the captured names.
+With it disabled, only the first file emits the automatic header; a failed
+writer construction does not consume that first-file policy.
+`include_header: false` and reconstructed envelopes do not invent an automatic
+header. Header capture commits after successful delivery and cleanup, not when
+header bytes are merely prepared.
+
+`FormatWriterHandle` owns each boxed CSV writer, including outer counted and
+splitting wrappers. `WriterFactory` owns the concrete split-construction
+closure. Their external leases outlive box deallocation; internal buffers and
+captured state retain independent allocation owners. Explicit legacy handles
+preserve unchanged non-CSV implementations without claiming admission. The
+[extension seam](extension-seams.md#allocation-aware-csv-construction) describes
+the constructor contracts, and [prepared storage](storage-internals.md#prepared-output-storage)
+describes spill and cleanup debt.
+
+Memory, disk, allocation, descriptor and temporary-storage errors remain typed
+resource failures and are fatal even under `strategy: continue`. Cancellation
+is interrupted work, not a Sink error; a real failure retains its classification
+when shutdown also occurs. The CSV cell encoder preserves its original failure
+across the library writer's drop-time flush. Malformed UTF-8 in source headers
+and body cells is an input-data failure, including schema discovery; unsupported
+authored encodings fail configuration admission instead.
+
+The executable contract is covered by `clinker-format`'s
+`encoding_contract` and `writer_preparation`, the executor's
+`encoding_runtime_contract` and `writer_resources`, and the CLI's `encoding_cli`
+and `sink_surface` tests. The runtime tests observe actual spill completion and
+bytes; the CLI checks exact output, summary counters and diagnostic categories.
+Destination-prefix and cancellation fault guarantees come from the injected
+integration tests, not from successful CLI fixtures.
+
 ## Streaming vs. buffered
 
 When a single Sink sits directly downstream of an eligible linear producer, a bounded crossbeam channel connects the producer arm to the writer thread, and `Writer::write_record` fires **per record** as the producer emits. For a `Merge.interleave` whose direct predecessors are exclusively owned Sources, this combines with Source-to-Merge receiver fusion to form an end-to-end live path. Each Source must have exactly one outgoing edge, targeting that Merge; sharing any predecessor rejects receiver fusion for the whole Merge.
@@ -300,7 +350,7 @@ The bounded handoff channel between the producer and Sink (**256 events**) limit
 
 Counter behavior under the streaming path matches the buffered Sink arm **exactly**:
 
-- `records_written` increments once per `Writer::write_record` call.
+- `records_written` increments once per successful `Writer::write_record` call.
 - `ok_count` counts distinct source `row_num`s reaching the Sink.
 - `dlq_count` is unaffected — DLQ entries originate upstream.
 
@@ -315,6 +365,14 @@ Sink `sort_order` uses the shared stable resident/spill sorter through the
 planning-owned `PhysicalWriterBoundary`. Document-DLQ, envelope, per-source,
 and correlation-deferred modes apply that boundary at their actual population
 grain; they do not create a second memory budget.
+
+CSV adds admitted per-cell workspace, retained policy/header state and prepared
+operation storage under that same authority. Raw parser buffers, JSON parser
+intermediates and unchanged downstream copies remain outside this allocation
+guarantee. An explicit spill root permits prepared output to spill, but does not
+remove the finite memory needed for cell rendering and metadata. See
+[CSV decoding and document ownership](memory-arbitration.md#csv-decoding-and-document-ownership)
+for the remaining Source/Combine residency boundary.
 
 An XML source feeding a Sink still follows the XML reader's two-pass contract.
 The envelope pre-scan and body stream each open the finite source independently;
@@ -333,6 +391,13 @@ of `clinker.sink.completed`, `clinker.sink.failed`, or
 one complete `clinker.sink` span after the outcome is known. Admission loss is
 behavior-neutral: a full telemetry arena may drop the optional span but cannot
 change writer bytes or run status.
+
+Preparation adds the existing fixed-cardinality admission, stage, spill and
+cleanup observations described in [prepared-output telemetry](memory-arbitration.md#prepared-output-telemetry).
+Those counters describe resource work and never substitute for delivered Sink
+records or accepted destination bytes. No new lineage edge or dataset is needed
+for allocation ownership or temporary preparation: neither changes field
+dependencies, row routing or the external Sink identity.
 
 Lineage keeps the terminal role as an OpenLineage **output dataset**.
 `PlanNode::Sink` resolves the physical or catalog dataset identity, Sink

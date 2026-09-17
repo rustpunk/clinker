@@ -1076,7 +1076,7 @@ impl std::fmt::Display for ResourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "writer resource {:?}: requested {} bytes, available {} bytes",
+            "resource {:?}: requested {}, available {}",
             self.kind, self.requested, self.available
         )
     }
@@ -1354,6 +1354,34 @@ mod tests {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+
+    #[test]
+    fn resource_diagnostic_is_neutral_and_keeps_bounded_evidence() {
+        for (kind, requested, available, expected) in [
+            (
+                ResourceErrorKind::Budget,
+                4096,
+                1024,
+                "resource Budget: requested 4096, available 1024",
+            ),
+            (
+                ResourceErrorKind::DescriptorQuota,
+                1,
+                0,
+                "resource DescriptorQuota: requested 1, available 0",
+            ),
+        ] {
+            let mut error = ResourceError::new(kind, requested, available);
+            error.field = Some(7);
+            error.offset = Some(42);
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.requested, requested);
+            assert_eq!(error.available, available);
+            assert_eq!(error.field, Some(7));
+            assert_eq!(error.offset, Some(42));
+        }
+    }
 
     #[derive(Default)]
     struct Observation {

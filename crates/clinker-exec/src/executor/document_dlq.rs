@@ -393,7 +393,7 @@ pub(crate) struct DocumentDlqDriver<'cfg> {
     decided: HashSet<DocKey>,
     /// The Output's writer, opened on the first clean record and reused
     /// across this arm's document decisions. `None` until then.
-    writer: Option<Box<dyn clinker_format::FormatWriter>>,
+    writer: Option<clinker_format::FormatWriterHandle>,
     arbitrator: Arc<crate::pipeline::memory::MemoryArbitrator>,
     spill_root: Arc<std::path::Path>,
     spill_compress: clinker_plan::config::CompressMode,
@@ -664,6 +664,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                 output_schema,
                 ctx.output_staging.clone(),
                 ctx.sink_byte_counter.clone(),
+                ctx.writer_resources.clone(),
             ) {
                 Ok(w) => self.writer = Some(w),
                 Err(e) => {

@@ -1,12 +1,7 @@
 //! End-to-end CSV `encoding` handling in the shared format-pipeline harness.
 //!
-//! Covers the observable behaviors of a declared CSV source `encoding`:
-//! (1) a single-schema source declaring `iso-8859-1` decodes high bytes
-//! correctly through to output; (2) an unsupported encoding fails the run at
-//! startup with a precise error naming it and the supported set; (3) a
-//! multi-record CSV source (a `records:` schema) rejects a non-UTF-8 encoding
-//! at startup rather than silently dropping it (the multi-record backend is
-//! UTF-8-only).
+//! Single-schema and multi-record sources decode declared charsets through a
+//! compiled pipeline, including document sections and strict invalid input.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -119,14 +114,11 @@ nodes:
     );
 }
 
-#[test]
-fn csv_multi_record_rejects_non_utf8_encoding_at_startup() {
-    // A multi-record CSV source (a `records:` schema) is decoded by the
-    // UTF-8-only multi-record backend, so a declared non-UTF-8 `encoding` is
-    // rejected at startup instead of being silently dropped.
-    let yaml = r#"
+fn multi_record_pipeline(encoding: &str, has_header: bool) -> String {
+    format!(
+        r#"
 pipeline:
-  name: csv_mr_latin1
+  name: csv_document_charset
 nodes:
   - type: source
     name: src
@@ -135,24 +127,131 @@ nodes:
       type: csv
       path: in.csv
       options:
-        encoding: iso-8859-1
+        encoding: {encoding}
+        has_header: {has_header}
       schema:
-        discriminator: { field: record_type }
+        discriminator: {{ field: marker }}
         records:
-          - { id: header, tag: H, columns: [ { name: record_type, type: string }, { name: batch_id, type: string } ] }
-          - { id: detail, tag: D, columns: [ { name: record_type, type: string }, { name: batch_id, type: string } ] }
+          - id: metadata
+            tag: Hé
+            columns:
+              - {{ name: marker, type: string }}
+              - {{ name: batch_id, type: string }}
+          - id: detail
+            tag: Dé
+            columns:
+              - {{ name: marker, type: string }}
+              - {{ name: label, type: string }}
+      envelope:
+        sections:
+          manifest:
+            extract: {{ record_type: Hé }}
+            fields:
+              batch_id: string
+  - type: transform
+    name: attach
+    input: src
+    config:
+      cxl: |
+        emit batch = $doc.manifest.batch_id
   - type: sink
     name: out
-    input: src
+    input: attach
     config:
       name: out
       type: csv
       path: out.csv
-"#;
-    let err = run_csv(yaml, "src", "out", b"H,x\nD,y\n")
-        .expect_err("multi-record CSV must reject a non-UTF-8 encoding");
+"#
+    )
+}
+
+const MULTI_RECORD_OUTPUT: &[u8] =
+    "record_type,marker,batch_id,label,batch\ndetail,Dé,,Crème,Café\n".as_bytes();
+
+#[test]
+fn multi_record_csv_ingest_tracer() {
+    let out = run_csv(
+        &multi_record_pipeline("iso-8859-1", false),
+        "src",
+        "out",
+        b"H\xe9,Caf\xe9\nD\xe9,Cr\xe8me\n",
+    )
+    .expect("Latin-1 document pipeline executes");
+    assert_eq!(out, MULTI_RECORD_OUTPUT);
+}
+
+#[test]
+fn multi_record_csv_charset_and_header_modes_have_exact_output() {
+    for (encoding, body, header) in [
+        (
+            "utf-8",
+            "Hé,Café\nDé,Crème\n".as_bytes(),
+            "márker,label\n".as_bytes(),
+        ),
+        (
+            "iso-8859-1",
+            b"H\xe9,Caf\xe9\nD\xe9,Cr\xe8me\n".as_slice(),
+            b"m\xe1rker,label\n".as_slice(),
+        ),
+    ] {
+        for has_header in [false, true] {
+            let mut input = Vec::new();
+            if has_header {
+                input.extend_from_slice(header);
+            }
+            input.extend_from_slice(body);
+            let yaml = multi_record_pipeline(encoding, has_header);
+            assert_eq!(
+                run_csv(&yaml, "src", "out", &input).unwrap(),
+                MULTI_RECORD_OUTPUT,
+                "{encoding}, has_header={has_header}"
+            );
+            if encoding == "utf-8" {
+                let mut with_bom = b"\xef\xbb\xbf".to_vec();
+                with_bom.extend_from_slice(&input);
+                assert_eq!(
+                    run_csv(&yaml, "src", "out", &with_bom).unwrap(),
+                    MULTI_RECORD_OUTPUT,
+                    "UTF-8 BOM, has_header={has_header}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn multi_record_csv_malformed_utf8_is_not_a_structural_rejection() {
+    for (has_header, input) in [
+        (
+            true,
+            b"marker,lab\xffel\nH\xc3\xa9,Cafe\nD\xc3\xa9,ok\n".as_slice(),
+        ),
+        (false, b"H\xc3\xa9,Caf\xff\nD\xc3\xa9,ok\n".as_slice()),
+        (false, b"H\xc3\xa9,Cafe\nD\xc3\xa9,bad\xff\n".as_slice()),
+    ] {
+        let error = run_csv(
+            &multi_record_pipeline("utf-8", has_header),
+            "src",
+            "out",
+            input,
+        )
+        .expect_err("invalid UTF-8 must fail even in skipped or captured rows");
+        assert!(error.contains("UTF-8"), "{error}");
+        assert!(!error.contains("Structural"), "{error}");
+    }
+}
+
+#[test]
+fn multi_record_csv_unsupported_encoding_remains_rejected() {
+    let error = run_csv(
+        &multi_record_pipeline("shift_jis", false),
+        "src",
+        "out",
+        b"H,x\nD,y\n",
+    )
+    .expect_err("unsupported encoding");
     assert!(
-        err.contains("multi-record") && err.contains("utf-8"),
-        "error should explain the multi-record CSV limitation: {err}"
+        error.contains("shift_jis") && error.contains("iso-8859-1"),
+        "{error}"
     );
 }

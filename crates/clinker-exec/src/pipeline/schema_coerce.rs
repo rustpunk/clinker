@@ -43,7 +43,11 @@
 //! Those readers keep every other reprojection service (the
 //! `OnUnmapped` policy, the `$widened` sidecar, the `long_unique` storage hint).
 
-use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
+use clinker_record::owned_storage::{
+    AllocationResources, AllocationScope, OwnedKey, OwnedMap, OwnedValues, SharedStorage,
+};
+use clinker_record::{AdmittedSchemaBuilder, FieldStr};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -90,6 +94,8 @@ struct ReaderColumnProof {
     nullable: bool,
     precision: Option<u8>,
     scale: Option<u8>,
+    multiple: bool,
+    long_unique: bool,
 }
 
 /// Record-type id to its authored local column proofs. The multi-record reader
@@ -115,6 +121,8 @@ impl MultiRecordProofs {
                     nullable: column.ty.is_nullable(),
                     precision: column.precision,
                     scale: column.scale,
+                    multiple: column.is_multiple(),
+                    long_unique: column.is_long_unique(),
                 };
                 if columns.insert(column.name.clone().into(), proof).is_some() {
                     return Err(FormatError::SchemaInference(format!(
@@ -170,6 +178,8 @@ impl MultiRecordProofs {
 /// `OnUnmapped` policy to undeclared input fields.
 pub struct CoercingReader {
     inner: Box<dyn FormatReader>,
+    /// Present only for the explicitly admitted runtime CSV path.
+    allocation: Option<AllocationScope>,
     /// Physical input-field names the declaration consumes — lookup set
     /// for the policy's "is this key in the declaration?" check. Uses each
     /// column's PHYSICAL name (`source_name` when aliased, else `name`) so an
@@ -240,6 +250,18 @@ pub struct CoercingReader {
     numeric_observer: Option<NumericObserver>,
 }
 
+enum CoercionMode {
+    Legacy {
+        pretyped: bool,
+        proofs: Option<MultiRecordProofs>,
+        observer: Option<NumericObserver>,
+    },
+    Csv {
+        scope: AllocationScope,
+        proofs: Option<MultiRecordProofs>,
+    },
+}
+
 impl CoercingReader {
     /// Build a coercing reader from a format reader, the user-declared
     /// `schema:` block, and the per-Source `on_unmapped` policy.
@@ -263,9 +285,11 @@ impl CoercingReader {
             schema_decl,
             policy,
             source_name,
-            pretyped,
-            None,
-            None,
+            CoercionMode::Legacy {
+                pretyped,
+                proofs: None,
+                observer: None,
+            },
         )
     }
 
@@ -284,9 +308,11 @@ impl CoercingReader {
             schema_decl,
             policy,
             source_name,
-            pretyped,
-            None,
-            Some(observer),
+            CoercionMode::Legacy {
+                pretyped,
+                proofs: None,
+                observer: Some(observer),
+            },
         )
     }
 
@@ -305,9 +331,62 @@ impl CoercingReader {
             schema_decl,
             policy,
             source_name,
-            true,
-            Some(MultiRecordProofs::new(record_types)?),
-            None,
+            CoercionMode::Legacy {
+                pretyped: true,
+                proofs: Some(MultiRecordProofs::new(record_types)?),
+                observer: None,
+            },
+        )
+    }
+
+    /// Build runtime CSV projection using the same finite authority as decoding.
+    ///
+    /// Establishes its scope before requesting the inner schema. Output schema,
+    /// value slots, widening keys/maps and unique text own admitted backing;
+    /// moving a row never releases its surviving text or nested allocations.
+    pub fn new_csv_admitted(
+        inner: Box<dyn FormatReader>,
+        schema_decl: &[Column],
+        policy: OnUnmapped,
+        source_name: &str,
+        resources: AllocationResources,
+    ) -> Result<Self, FormatError> {
+        let scope = resources.scope()?;
+        scope.check_cancelled()?;
+        Self::new_inner(
+            inner,
+            schema_decl,
+            policy,
+            source_name,
+            CoercionMode::Csv {
+                scope,
+                proofs: None,
+            },
+        )
+    }
+
+    /// Admit CSV projection while retaining each active record type's native
+    /// proof. The inner reader remains responsible for admitted decoding and
+    /// document construction; this wrapper moves its resulting owners.
+    pub(crate) fn new_csv_admitted_with_record_types(
+        inner: Box<dyn FormatReader>,
+        schema_decl: &[Column],
+        record_types: &[RecordType],
+        policy: OnUnmapped,
+        source_name: &str,
+        resources: AllocationResources,
+    ) -> Result<Self, FormatError> {
+        let scope = resources.scope()?;
+        scope.check_cancelled()?;
+        Self::new_inner(
+            inner,
+            schema_decl,
+            policy,
+            source_name,
+            CoercionMode::Csv {
+                scope,
+                proofs: Some(MultiRecordProofs::new(record_types)?),
+            },
         )
     }
 
@@ -316,10 +395,16 @@ impl CoercingReader {
         schema_decl: &[Column],
         policy: OnUnmapped,
         source_name: &str,
-        pretyped: bool,
-        multi_record_proofs: Option<MultiRecordProofs>,
-        numeric_observer: Option<NumericObserver>,
+        mode: CoercionMode,
     ) -> Result<Self, FormatError> {
+        let (pretyped, multi_record_proofs, numeric_observer, allocation) = match mode {
+            CoercionMode::Legacy {
+                pretyped,
+                proofs,
+                observer,
+            } => (pretyped, proofs, observer, None),
+            CoercionMode::Csv { scope, proofs } => (proofs.is_some(), proofs, None, Some(scope)),
+        };
         // Trigger schema discovery on the inner reader so the first
         // record isn't gated behind an on-demand schema call.
         inner.schema()?;
@@ -338,6 +423,10 @@ impl CoercingReader {
                 .iter()
                 .any(|c| c.source_name.as_deref().is_some_and(|s| s != c.name));
 
+        // These declaration-derived lookup/configuration tables keep their
+        // existing legacy construction. Their size is fixed by the compiled
+        // declaration, never by the number or contents of incoming rows. CSV
+        // input-derived names and final schema/row storage are admitted below.
         // Match the names the reader actually emits. A positional reader has
         // already relabeled each field to its logical declaration; every other
         // reader still exposes the physical source key at this boundary.
@@ -397,18 +486,12 @@ impl CoercingReader {
         let mut long_unique: Vec<bool> = schema_decl.iter().map(|c| c.is_long_unique()).collect();
         let mut multiple: Vec<bool> = schema_decl.iter().map(|c| c.is_multiple()).collect();
 
-        let mut builder = SchemaBuilder::new();
-        for c in schema_decl {
-            builder = builder.with_field(c.name.as_str());
-        }
         let widened_idx = if policy.reserves_widened_sidecar() {
             // Append the `$widened` engine-stamped sidecar column. The
             // dispatch canonicalize invariant accepts engine-stamped
             // tail columns; `WidenedSidecar` joins `SourceCorrelation`
             // and `AggregateGroupIndex` in that role.
             let idx = schema_decl.len();
-            builder =
-                builder.with_field_meta(WIDENED_SIDECAR_COLUMN, FieldMetadata::widened_sidecar());
             targets.push(DeclaredTypeTarget::EngineManaged);
             formats.push(None);
             scales.push(None);
@@ -422,10 +505,34 @@ impl CoercingReader {
         } else {
             None
         };
-        let output_schema: SharedStorage<Schema> = builder.build();
+        let output_schema = if let Some(scope) = &allocation {
+            let mut builder = AdmittedSchemaBuilder::try_with_capacity(targets.len(), scope)?;
+            for column in schema_decl {
+                builder.try_push(OwnedKey::try_new(&column.name, scope)?, None, scope)?;
+            }
+            if widened_idx.is_some() {
+                builder.try_push(
+                    OwnedKey::try_new(WIDENED_SIDECAR_COLUMN, scope)?,
+                    Some(FieldMetadata::widened_sidecar()),
+                    scope,
+                )?;
+            }
+            builder.finish(scope)?
+        } else {
+            let mut builder = SchemaBuilder::new();
+            for column in schema_decl {
+                builder = builder.with_field(column.name.as_str());
+            }
+            if widened_idx.is_some() {
+                builder = builder
+                    .with_field_meta(WIDENED_SIDECAR_COLUMN, FieldMetadata::widened_sidecar());
+            }
+            builder.build()
+        };
 
         Ok(CoercingReader {
             inner,
+            allocation,
             declared_names,
             physical_names,
             aliased_exposed,
@@ -445,6 +552,189 @@ impl CoercingReader {
             source_name: source_name.into(),
             numeric_observer,
         })
+    }
+
+    fn physical_name(&self, index: usize) -> &str {
+        match &self.physical_names {
+            Some(names) => &names[index],
+            None => self.output_schema.columns()[index].as_ref(),
+        }
+    }
+
+    fn csv_rules(&self, index: usize) -> DeclaredValueRules<'_> {
+        DeclaredValueRules {
+            format: self.formats[index].as_deref(),
+            precision: self.precisions[index],
+            scale: self.scales[index],
+            nullable: self.nullable[index],
+            empty_is_null: self.empty_is_null[index],
+            field: self.output_schema.columns()[index].as_ref(),
+            numeric_observer: None,
+        }
+    }
+
+    /// Validate the entire row before extracting any value. A malformed later
+    /// field therefore returns the intact original row to the ordinary DLQ.
+    fn reproject_csv_admitted(
+        &self,
+        mut record: Record,
+        scope: &AllocationScope,
+    ) -> Result<Record, FormatError> {
+        scope.check_cancelled()?;
+        for (name, _) in record.iter_all_fields() {
+            if !self.declared_names.contains(name) {
+                if let Some(physical) = self.aliased_exposed.get(name) {
+                    return Err(FormatError::AliasNameCollision {
+                        source: self.source_name.to_string(),
+                        exposed: name.to_string(),
+                        physical: physical.to_string(),
+                    });
+                }
+                if matches!(self.policy, OnUnmapped::Reject) {
+                    return Err(FormatError::UndeclaredField {
+                        source: self.source_name.to_string(),
+                        field: name.to_string(),
+                    });
+                }
+            }
+        }
+        let count = self
+            .widened_idx
+            .unwrap_or(self.output_schema.column_count());
+        // Stage only conversion decisions and scalar results. Identity cases
+        // borrow the input during validation and move it after all fields pass.
+        // The temporary decision vectors are themselves admitted before growth.
+        let mut pending = clinker_format::reserved::ReservedVec::new(scope.clone());
+        pending.reserve_exact(count)?;
+        let active_reader_proofs = self
+            .multi_record_proofs
+            .as_ref()
+            .map(|proofs| proofs.active_columns(&record))
+            .transpose()?;
+        for index in 0..count {
+            let raw = record
+                .get(self.physical_name(index))
+                .unwrap_or(&Value::Null);
+            let name = self.output_schema.columns()[index].as_str();
+            let local_proof = active_reader_proofs.and_then(|proofs| proofs.get(name));
+            if active_reader_proofs.is_some() && name != RECORD_TYPE_COLUMN && local_proof.is_none()
+            {
+                if matches!(raw, Value::Null) {
+                    pending.push((CsvConversion::Original, false))?;
+                    continue;
+                }
+                return Err(FormatError::DeclaredType(Box::new(DeclaredTypeFailure {
+                    source: self.source_name.to_string(),
+                    field: name.to_string(),
+                    column: index + 1,
+                    declared_type: "inactive multi-record column".into(),
+                    original_value: copy_csv_value(raw, scope)?,
+                    message: format!(
+                        "reader emitted a non-null {} for a column inactive on this record type",
+                        native_value_name(raw)
+                    ),
+                    original_record: record,
+                })));
+            }
+            let mut rules = self.csv_rules(index);
+            let (target, declared_type, multiple, long_unique) = match local_proof {
+                Some(proof) => {
+                    rules.format = None;
+                    rules.precision = proof.precision;
+                    rules.scale = proof.scale;
+                    rules.nullable = proof.nullable;
+                    rules.empty_is_null = false;
+                    (
+                        &proof.target,
+                        &proof.declared_type,
+                        proof.multiple,
+                        proof.long_unique,
+                    )
+                }
+                None => (
+                    &self.targets[index],
+                    &self.declared_types[index],
+                    self.multiple[index],
+                    self.long_unique[index],
+                ),
+            };
+            let plan = csv_conversion(raw, target, &rules, multiple, scope);
+            let plan = match plan {
+                Ok(plan) => plan,
+                Err(CsvConversionError::Resource(error)) => return Err(error.into()),
+                Err(CsvConversionError::Invalid(message)) => {
+                    return Err(FormatError::DeclaredType(Box::new(DeclaredTypeFailure {
+                        source: self.source_name.to_string(),
+                        field: self.output_schema.columns()[index].to_string(),
+                        column: index + 1,
+                        declared_type: declared_type.to_string(),
+                        original_value: copy_csv_value(raw, scope)?,
+                        original_record: record,
+                        message,
+                    })));
+                }
+            };
+            pending.push((plan, long_unique))?;
+        }
+        let mut values = OwnedValues::try_with_capacity(self.output_schema.column_count(), scope)?;
+        for index in 0..count {
+            let physical = self.physical_name(index);
+            let raw = match record.schema().index(physical) {
+                Some(slot)
+                    if (index + 1..count).any(|later| self.physical_name(later) == physical) =>
+                {
+                    // Multiple declarations may consume the same physical slot.
+                    // Each necessary independent copy is admitted recursively;
+                    // the final consumer moves the original allocation owners.
+                    copy_csv_value(&record.values()[slot], scope)?
+                }
+                Some(slot) => record.take_value_at(slot).unwrap_or(Value::Null),
+                None => Value::Null,
+            };
+            let (plan, long_unique) = std::mem::replace(
+                &mut pending.as_mut_slice()[index],
+                (CsvConversion::Original, false),
+            );
+            let value = plan.finish(raw, scope)?;
+            let value = if long_unique {
+                unique_csv_value(value, scope)?
+            } else {
+                value
+            };
+            values.try_push(value, scope).map_err(|(error, _)| error)?;
+        }
+        if self.widened_idx.is_some() {
+            let extra_count = record
+                .schema()
+                .columns()
+                .iter()
+                .filter(|name| !self.declared_names.contains(name.as_str()))
+                .count();
+            let sidecar = if extra_count == 0 {
+                Value::Null
+            } else {
+                let mut map = OwnedMap::try_with_capacity(extra_count, scope)?;
+                for index in 0..record.field_count() {
+                    let name = record.schema().columns()[index].as_str();
+                    if !self.declared_names.contains(name) {
+                        let key = OwnedKey::try_new(name, scope)?;
+                        let value = record.take_value_at(index).unwrap_or(Value::Null);
+                        map.try_insert(key, value, scope)
+                            .map_err(|(error, _, _)| error)?;
+                    }
+                }
+                Value::Map(map)
+            };
+            values
+                .try_push(sidecar, scope)
+                .map_err(|(error, _)| error)?;
+        }
+        let mut projected =
+            Record::from_owned_values(self.output_schema.clone(), values).map_err(|_| {
+                FormatError::SchemaInference("CSV projection width invariant violated".into())
+            })?;
+        projected.set_doc_ctx(record.doc_ctx().clone());
+        Ok(projected)
     }
 
     /// Reproject `record` onto the output schema (declared columns
@@ -576,6 +866,7 @@ impl CoercingReader {
                         .enumerate()
                         .map(|(index, item)| {
                             validate_declared_value(item, target, &rules)
+                                .map(Cow::into_owned)
                                 .map_err(|message| format!("element {}: {message}", index + 1))
                         })
                         .collect::<Result<Vec<_>, _>>()
@@ -591,15 +882,19 @@ impl CoercingReader {
                     // cannot put a scalar in a slot the planner typed as an
                     // array and have every downstream array expression read it
                     // as the wrong shape.
-                    Value::Null => validate_declared_value(&raw, target, &rules),
-                    scalar => validate_declared_value(scalar, target, &rules).map(|value| {
-                        Value::Array(clinker_record::owned_storage::OwnedValues::from_vec(vec![
-                            value,
-                        ]))
-                    }),
+                    Value::Null => {
+                        validate_declared_value(&raw, target, &rules).map(Cow::into_owned)
+                    }
+                    scalar => validate_declared_value(scalar, target, &rules)
+                        .map(Cow::into_owned)
+                        .map(|value| {
+                            Value::Array(clinker_record::owned_storage::OwnedValues::from_vec(
+                                vec![value],
+                            ))
+                        }),
                 }
             } else {
-                validate_declared_value(&raw, target, &rules)
+                validate_declared_value(&raw, target, &rules).map(Cow::into_owned)
             };
             let coerced = match conversion {
                 Ok(value) => value,
@@ -635,12 +930,21 @@ impl CoercingReader {
 
 impl FormatReader for CoercingReader {
     fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+        if let Some(scope) = &self.allocation {
+            scope.check_cancelled()?;
+        }
         Ok(self.output_schema.clone())
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
+        if let Some(scope) = &self.allocation {
+            scope.check_cancelled()?;
+        }
         match self.inner.next_record()? {
-            Some(record) => Ok(Some(self.reproject(&record)?)),
+            Some(record) => Ok(Some(match &self.allocation {
+                Some(scope) => self.reproject_csv_admitted(record, scope)?,
+                None => self.reproject(&record)?,
+            })),
             None => Ok(None),
         }
     }
@@ -652,8 +956,7 @@ impl FormatReader for CoercingReader {
     fn prepare_document(
         &mut self,
         config: &clinker_format::EnvelopeConfig,
-    ) -> Result<indexmap::IndexMap<OwnedKey, clinker_record::Value>, clinker_format::FormatError>
-    {
+    ) -> Result<OwnedMap, clinker_format::FormatError> {
         // Envelope sections are extracted from the raw source by the
         // underlying format reader; schema coercion applies to body
         // records only, so forward the pre-scan straight through.
@@ -677,6 +980,143 @@ impl FormatReader for CoercingReader {
         // is per-record and stateless across files, so forward verbatim.
         self.inner.advance_to_next_file()
     }
+}
+
+enum CsvConversion {
+    Original,
+    Scalar(Value),
+    Repeated(clinker_format::reserved::ReservedVec<CsvConversion>),
+}
+
+enum CsvConversionError {
+    Invalid(String),
+    Resource(clinker_record::owned_storage::ResourceError),
+}
+
+impl From<clinker_record::owned_storage::ResourceError> for CsvConversionError {
+    fn from(error: clinker_record::owned_storage::ResourceError) -> Self {
+        Self::Resource(error)
+    }
+}
+
+fn csv_conversion(
+    value: &Value,
+    target: &DeclaredTypeTarget,
+    rules: &DeclaredValueRules<'_>,
+    multiple: bool,
+    scope: &AllocationScope,
+) -> Result<CsvConversion, CsvConversionError> {
+    if multiple && !matches!(value, Value::Null) {
+        let items = match value {
+            Value::Array(items) => items.as_slice(),
+            scalar => std::slice::from_ref(scalar),
+        };
+        let mut plans = clinker_format::reserved::ReservedVec::new(scope.clone());
+        plans.reserve_exact(items.len())?;
+        for (index, item) in items.iter().enumerate() {
+            let plan =
+                csv_conversion(item, target, rules, false, scope).map_err(|error| match error {
+                    CsvConversionError::Invalid(message) => {
+                        CsvConversionError::Invalid(format!("element {}: {message}", index + 1))
+                    }
+                    other => other,
+                })?;
+            plans.push(plan)?;
+        }
+        return Ok(CsvConversion::Repeated(plans));
+    }
+    validate_declared_value(value, target, rules)
+        .map(|converted| match converted {
+            Cow::Borrowed(_) => CsvConversion::Original,
+            Cow::Owned(value) => CsvConversion::Scalar(value),
+        })
+        .map_err(CsvConversionError::Invalid)
+}
+
+impl CsvConversion {
+    fn finish(self, original: Value, scope: &AllocationScope) -> Result<Value, FormatError> {
+        Ok(match self {
+            Self::Original => original,
+            Self::Scalar(value) => value,
+            Self::Repeated(mut plans) => {
+                let mut values = OwnedValues::try_with_capacity(plans.len(), scope)?;
+                match original {
+                    Value::Array(items) => {
+                        for (index, item) in items.into_iter().enumerate() {
+                            let plan =
+                                std::mem::replace(&mut plans.as_mut_slice()[index], Self::Original);
+                            values
+                                .try_push(plan.finish(item, scope)?, scope)
+                                .map_err(|(error, _)| error)?;
+                        }
+                    }
+                    scalar => {
+                        let plan = std::mem::replace(&mut plans.as_mut_slice()[0], Self::Original);
+                        values
+                            .try_push(plan.finish(scalar, scope)?, scope)
+                            .map_err(|(error, _)| error)?;
+                    }
+                }
+                Value::Array(values)
+            }
+        })
+    }
+}
+
+/// Apply a column's text storage policy to every leaf, including repeated and
+/// JSON-nested values. Arrays keep their original slot owner; map keys move
+/// unchanged into independently admitted replacement table backing.
+fn unique_csv_value(value: Value, scope: &AllocationScope) -> Result<Value, FormatError> {
+    Ok(match value {
+        Value::String(text) => Value::String(FieldStr::try_new_unique(text.as_str(), scope)?),
+        Value::Array(mut items) => {
+            for item in items.as_mut_slice() {
+                let original = std::mem::replace(item, Value::Null);
+                *item = unique_csv_value(original, scope)?;
+            }
+            Value::Array(items)
+        }
+        Value::Map(items) => {
+            let mut result = OwnedMap::try_with_capacity(items.len(), scope)?;
+            for (key, value) in items {
+                result
+                    .try_insert(key, unique_csv_value(value, scope)?, scope)
+                    .map_err(|(error, _, _)| error)?;
+            }
+            Value::Map(result)
+        }
+        scalar => scalar,
+    })
+}
+
+/// Independent copies needed by repeated physical aliases have their own
+/// backing grants. No container or unique text inherits the original grant.
+fn copy_csv_value(value: &Value, scope: &AllocationScope) -> Result<Value, FormatError> {
+    Ok(match value {
+        Value::String(text) => Value::String(FieldStr::try_new(text.as_str(), scope)?),
+        Value::Array(items) => {
+            let mut values = OwnedValues::try_with_capacity(items.len(), scope)?;
+            for item in items.iter() {
+                values
+                    .try_push(copy_csv_value(item, scope)?, scope)
+                    .map_err(|(error, _)| error)?;
+            }
+            Value::Array(values)
+        }
+        Value::Map(items) => {
+            let mut map = OwnedMap::try_with_capacity(items.len(), scope)?;
+            for (key, value) in items.iter() {
+                map.try_insert(
+                    OwnedKey::try_new(key, scope)?,
+                    copy_csv_value(value, scope)?,
+                    scope,
+                )
+                .map_err(|(error, _, _)| error)?;
+            }
+            Value::Map(map)
+        }
+        scalar => scalar.clone(),
+    })
 }
 
 /// Unwrap Nullable to get the inner type for coercion.
@@ -725,18 +1165,18 @@ struct DeclaredValueRules<'a> {
 /// This function is shared by ordinary scalar columns and every element of a
 /// `multiple:` column. It never mutates the original [`Value`], so the caller
 /// can retain the complete source value and record when admission fails.
-fn validate_declared_value(
-    value: &Value,
+fn validate_declared_value<'a>(
+    value: &'a Value,
     target: &DeclaredTypeTarget,
     rules: &DeclaredValueRules<'_>,
-) -> Result<Value, String> {
+) -> Result<Cow<'a, Value>, String> {
     if rules.empty_is_null && matches!(value, Value::String(text) if text.is_empty()) {
         if matches!(target, DeclaredTypeTarget::Coerce(Type::Numeric))
             && let Some(observer) = rules.numeric_observer
         {
             observer.observe(rules.field, observe_schema_numeric(&Value::Null));
         }
-        return Ok(Value::Null);
+        return Ok(Cow::Owned(Value::Null));
     }
     if matches!(target, DeclaredTypeTarget::Coerce(Type::Numeric))
         && let Some(observer) = rules.numeric_observer
@@ -751,8 +1191,8 @@ fn validate_declared_value(
                 declared: Type::Null | Type::Any,
             }
             | DeclaredTypeTarget::AcceptAny
-            | DeclaredTypeTarget::EngineManaged => Ok(Value::Null),
-            _ if rules.nullable => Ok(Value::Null),
+            | DeclaredTypeTarget::EngineManaged => Ok(Cow::Owned(Value::Null)),
+            _ if rules.nullable => Ok(Cow::Owned(Value::Null)),
             DeclaredTypeTarget::Coerce(declared)
             | DeclaredTypeTarget::ValidateExact(declared)
             | DeclaredTypeTarget::ReaderProven { declared, .. } => {
@@ -764,10 +1204,11 @@ fn validate_declared_value(
     match target {
         DeclaredTypeTarget::Coerce(declared) => {
             coerce_value(value, declared, rules.format, rules.precision, rules.scale)
+                .map(Cow::Owned)
         }
         DeclaredTypeTarget::ValidateExact(declared) => {
             if native_value_matches(value, declared) {
-                Ok(value.clone())
+                Ok(Cow::Borrowed(value))
             } else {
                 Err(format!(
                     "native {} does not match declared {declared}",
@@ -778,19 +1219,21 @@ fn validate_declared_value(
         DeclaredTypeTarget::ReaderProven { declared, .. } => {
             validate_reader_proof(value, declared, rules.precision, rules.scale)
         }
-        DeclaredTypeTarget::AcceptAny | DeclaredTypeTarget::EngineManaged => Ok(value.clone()),
+        DeclaredTypeTarget::AcceptAny | DeclaredTypeTarget::EngineManaged => {
+            Ok(Cow::Borrowed(value))
+        }
     }
 }
 
 /// Validate the value emitted by a positional reader against the facts that
 /// reader claims to have established. This is deliberately validation-only:
 /// a reader bug cannot be hidden by coercing its output a second time.
-fn validate_reader_proof(
-    value: &Value,
+fn validate_reader_proof<'a>(
+    value: &'a Value,
     declared: &Type,
     precision: Option<u8>,
     scale: Option<u8>,
-) -> Result<Value, String> {
+) -> Result<Cow<'a, Value>, String> {
     let declared = unwrap_nullable(declared);
     if !native_value_matches(value, declared) {
         return Err(format!(
@@ -802,8 +1245,10 @@ fn validate_reader_proof(
         Value::Float(number) if !number.is_finite() => {
             Err("non-finite float is outside the declared type".into())
         }
-        Value::Decimal(decimal) => validate_decimal_constraints(*decimal, precision, scale),
-        _ => Ok(value.clone()),
+        Value::Decimal(decimal) => {
+            validate_decimal_constraints(*decimal, precision, scale).map(Cow::Owned)
+        }
+        _ => Ok(Cow::Borrowed(value)),
     }
 }
 
@@ -934,9 +1379,9 @@ fn coerce_value(
     if matches!(value, Value::String(s) if s.is_empty()) {
         return Err(format!("empty string is not a valid {target}"));
     }
-    // `Option<&str>::into_iter` yields the one format when present, else
-    // nothing — an empty chain selects the default formats.
-    let chain: Vec<&str> = format.into_iter().collect();
+    // Borrow the configured format without allocating a one-element vector;
+    // an empty chain selects the default formats.
+    let chain = format.as_slice();
     let converted = match target {
         Type::Int => {
             if let Value::Float(number) = value
@@ -973,8 +1418,8 @@ fn coerce_value(
             return validate_decimal_constraints(decimal, precision, scale);
         }
         Type::Bool => coercion::coerce_to_bool(value),
-        Type::Date => coercion::coerce_to_date(value, &chain),
-        Type::DateTime => coercion::coerce_to_datetime(value, &chain),
+        Type::Date => coercion::coerce_to_date(value, chain),
+        Type::DateTime => coercion::coerce_to_datetime(value, chain),
         Type::Numeric => return coerce_numeric_with_observation(value).into_result(),
         _ => return Err(format!("unsupported declared coercion target {target}")),
     };
@@ -999,6 +1444,257 @@ fn coercion_failure_reason(error: coercion::CoercionError) -> String {
 mod tests {
     use super::*;
     use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
+
+    struct ProofReader {
+        row: Option<Record>,
+        schema: SharedStorage<Schema>,
+    }
+    impl FormatReader for ProofReader {
+        fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
+            Ok(self.schema.clone())
+        }
+        fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
+            Ok(self.row.take())
+        }
+    }
+
+    fn csv_proof_reader(
+        row: Record,
+        declaration: Column,
+        resources: AllocationResources,
+    ) -> CoercingReader {
+        let superset = [
+            Column::bare(RECORD_TYPE_COLUMN, Type::String),
+            Column {
+                source_name: Some("physical_value".into()),
+                ..Column::bare("value", Type::Any)
+            },
+            Column::bare("inactive", Type::Any),
+        ];
+        let types = [RecordType {
+            id: "body".into(),
+            tag: "B".into(),
+            description: None,
+            parent: None,
+            join_key: None,
+            columns: vec![declaration],
+        }];
+        let reader = Box::new(ProofReader {
+            schema: row.schema().clone(),
+            row: Some(row),
+        });
+        CoercingReader::new_csv_admitted_with_record_types(
+            reader,
+            &superset,
+            &types,
+            OnUnmapped::Drop,
+            "rows",
+            resources,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn csv_multirecord_projection_moves_nested_owners_and_logical_names() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        use std::num::NonZeroUsize;
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+        let resources = provider.resources().allocation().clone();
+        let scope = resources.scope().unwrap();
+        let text = FieldStr::try_new_unique(&"nested-unique-text-".repeat(10), &scope).unwrap();
+        let pointer = text.as_str().as_ptr();
+        let mut map = OwnedMap::try_with_capacity(1, &scope).unwrap();
+        map.try_insert(
+            OwnedKey::try_new("leaf", &scope).unwrap(),
+            Value::String(text),
+            &scope,
+        )
+        .unwrap();
+        let mut slots = OwnedValues::try_with_capacity(3, &scope).unwrap();
+        for value in [Value::String("body".into()), Value::Map(map), Value::Null] {
+            slots.try_push(value, &scope).unwrap();
+        }
+        let mut row = Record::from_owned_values(
+            SchemaBuilder::new()
+                .with_field(RECORD_TYPE_COLUMN)
+                .with_field("value")
+                .with_field("inactive")
+                .build(),
+            slots,
+        )
+        .unwrap();
+        let context = clinker_record::DocumentContext::try_new(
+            clinker_record::DocumentId::next(),
+            Arc::from("input.csv"),
+            clinker_record::EnvelopeRecord::empty(),
+            &scope,
+        )
+        .unwrap();
+        row.set_doc_ctx(context.clone());
+        let mut reader = csv_proof_reader(row, Column::bare("value", Type::Map), resources);
+        let row = reader.next_record().unwrap().unwrap();
+        assert!(SharedStorage::ptr_eq(row.doc_ctx(), &context));
+        assert!(row.values_are_governed());
+        assert_eq!(row.schema().legacy_estimated_heap_size(), 0);
+        let Value::Map(map) = row.get("value").unwrap() else {
+            panic!("local proof map")
+        };
+        assert_eq!(map.legacy_heap_size(), 0);
+        let Value::String(text) = map.get("leaf").unwrap() else {
+            panic!("unique leaf")
+        };
+        assert_eq!(
+            text.as_str().as_ptr(),
+            pointer,
+            "reader-proven identity must move, never clone"
+        );
+        assert_eq!(text.legacy_heap_size(), 0);
+        assert_eq!(row.get("inactive"), Some(&Value::Null));
+        drop(row);
+        drop(reader);
+        assert!(
+            provider.used() > 0,
+            "detached context retains its actual outer owner"
+        );
+        drop(context);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn csv_multirecord_projection_uses_local_repeated_text_policy() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        use std::num::NonZeroUsize;
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+        let resources = provider.resources().allocation().clone();
+        let scope = resources.scope().unwrap();
+        let mut repeated = OwnedValues::try_with_capacity(1, &scope).unwrap();
+        repeated
+            .try_push(
+                Value::String(
+                    FieldStr::try_new(&"repeated-local-proof-".repeat(8), &scope).unwrap(),
+                ),
+                &scope,
+            )
+            .unwrap();
+        let schema = SchemaBuilder::new()
+            .with_field(RECORD_TYPE_COLUMN)
+            .with_field("value")
+            .with_field("inactive")
+            .build();
+        let row = Record::new(
+            schema,
+            vec![
+                Value::String("body".into()),
+                Value::Array(repeated),
+                Value::Null,
+            ],
+        );
+        let declaration = Column {
+            multiple: Some(true),
+            long_unique: Some(true),
+            ..Column::bare("value", Type::String)
+        };
+        let mut reader = csv_proof_reader(row, declaration, resources);
+        let row = reader.next_record().unwrap().unwrap();
+        let Value::Array(items) = row.get("value").unwrap() else {
+            panic!("repeated value")
+        };
+        assert!(items.is_governed());
+        let Value::String(text) = &items[0] else {
+            panic!("text leaf")
+        };
+        let independent = text.clone();
+        assert_ne!(text.as_str().as_ptr(), independent.as_str().as_ptr());
+        assert_eq!(text.legacy_heap_size(), 0);
+        assert!(independent.legacy_heap_size() > 0);
+        drop(row);
+        drop(reader);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn csv_multirecord_projection_checks_local_native_null_and_decimal_proofs() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        use std::num::NonZeroUsize;
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+        let schema = SchemaBuilder::new()
+            .with_field(RECORD_TYPE_COLUMN)
+            .with_field("value")
+            .with_field("inactive")
+            .build();
+        let cases = [
+            (
+                Column::bare("value", Type::Int),
+                Value::String("42".into()),
+                Value::Null,
+                false,
+            ),
+            (
+                Column::bare("value", Type::Int),
+                Value::Null,
+                Value::Null,
+                false,
+            ),
+            (
+                Column::bare("value", Type::Int),
+                Value::Integer(42),
+                Value::Integer(1),
+                false,
+            ),
+            (
+                Column::bare("value", Type::Float),
+                Value::Float(f64::INFINITY),
+                Value::Null,
+                false,
+            ),
+            (
+                Column {
+                    precision: Some(4),
+                    scale: Some(2),
+                    ..Column::bare("value", Type::Decimal)
+                },
+                Value::Decimal(rust_decimal::Decimal::new(12345, 2)),
+                Value::Null,
+                false,
+            ),
+            (
+                Column {
+                    precision: Some(8),
+                    scale: Some(2),
+                    ..Column::bare("value", Type::Decimal)
+                },
+                Value::Decimal(rust_decimal::Decimal::new(12345, 3)),
+                Value::Null,
+                false,
+            ),
+            (
+                Column::bare("value", Type::Nullable(Box::new(Type::Int))),
+                Value::Null,
+                Value::Null,
+                true,
+            ),
+        ];
+        for (declaration, value, inactive, accepted) in cases {
+            let row = Record::new(
+                schema.clone(),
+                vec![Value::String("body".into()), value, inactive],
+            );
+            let original = row.values().to_vec();
+            let mut reader =
+                csv_proof_reader(row, declaration, provider.resources().allocation().clone());
+            let result = reader.next_record();
+            if accepted {
+                assert_eq!(result.unwrap().unwrap().values(), original);
+            } else {
+                let FormatError::DeclaredType(failure) = result.unwrap_err() else {
+                    panic!("local proof must reject")
+                };
+                assert_eq!(failure.original_record.values(), original);
+            }
+            drop(reader);
+            assert_eq!(provider.used(), 0);
+        }
+    }
 
     fn csv_reader(data: &str) -> Box<dyn FormatReader> {
         Box::new(CsvReader::from_reader(

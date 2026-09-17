@@ -161,10 +161,14 @@ impl EnvelopeRecord {
     ///
     /// The schema columns are the section names in insertion order; the values
     /// are the section payloads positionally. Keeps reader/driver population a
-    /// one-line wrap over the `IndexMap` the pre-scan already produces.
-    pub fn from_sections(sections: IndexMap<OwnedKey, Value>) -> Self {
-        let mut columns: Vec<OwnedKey> = Vec::with_capacity(sections.len());
-        let mut values: Vec<Value> = Vec::with_capacity(sections.len());
+    /// one-line move from an owned map or iterator, without rebuilding a map.
+    /// Schema and slot vectors retain legacy allocation semantics; nested owners
+    /// move unchanged. Runtime admitted callers use [`Self::from_owned_values`].
+    pub fn from_sections(sections: impl IntoIterator<Item = (OwnedKey, Value)>) -> Self {
+        let sections = sections.into_iter();
+        let capacity = sections.size_hint().0;
+        let mut columns: Vec<OwnedKey> = Vec::with_capacity(capacity);
+        let mut values: Vec<Value> = Vec::with_capacity(capacity);
         for (name, payload) in sections {
             columns.push(name);
             values.push(payload);
@@ -744,6 +748,60 @@ mod tests {
 
     fn envelope(sections: IndexMap<OwnedKey, Value>) -> EnvelopeRecord {
         EnvelopeRecord::from_sections(sections)
+    }
+
+    #[test]
+    fn from_sections_moves_owned_iteration_and_preserves_order() {
+        let payload = crate::FieldStr::new_unique(&"unique-section-payload-".repeat(8));
+        let pointer = payload.as_str().as_ptr();
+        let mut fields = IndexMap::new();
+        fields.insert(OwnedKey::from("value"), Value::String(payload));
+        let mut sections = IndexMap::new();
+        sections.insert(
+            OwnedKey::from("manifest"),
+            Value::Map(crate::owned_storage::OwnedMap::from_map(fields)),
+        );
+        sections.insert(OwnedKey::from("totals"), Value::Integer(7));
+        let owned = crate::owned_storage::OwnedMap::from_map(sections);
+        let envelope = EnvelopeRecord::from_sections(owned);
+        assert_eq!(
+            envelope
+                .schema
+                .columns()
+                .iter()
+                .map(|name| name.as_ref())
+                .collect::<Vec<&str>>(),
+            vec!["manifest", "totals"]
+        );
+        let Value::Map(fields) = &envelope.sections[0] else {
+            panic!("section map")
+        };
+        let Value::String(payload) = fields.get("value").unwrap() else {
+            panic!("unique payload")
+        };
+        assert_eq!(
+            payload.as_str().as_ptr(),
+            pointer,
+            "must move the unique text owner"
+        );
+        assert_eq!(envelope.sections[1], Value::Integer(7));
+        assert!(envelope.schema.legacy_estimated_heap_size() > 0);
+
+        // A consuming iterator with no exact size hint is equally valid.
+        let iterator = [
+            (OwnedKey::from("one"), Value::Integer(1)),
+            (OwnedKey::from("two"), Value::Integer(2)),
+        ]
+        .into_iter()
+        .filter(|_| true);
+        let envelope = EnvelopeRecord::from_sections(iterator);
+        assert_eq!(
+            envelope
+                .sections()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
     }
 
     #[test]
