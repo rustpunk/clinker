@@ -25,8 +25,8 @@ Useful for branching on dynamic types:
 
 ```
 emit formatted = match value.type_of() {
-  "Int"   => value.to_string() + " (integer)",
-  "Float" => value.round_to(2).to_string() + " (decimal)",
+  "Int"   => value.to_string().concat(" (integer)"),
+  "Float" => value.round_to(2).to_string().concat(" (decimal)"),
   _       => value.to_string()
 }
 ```

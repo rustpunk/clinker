@@ -111,10 +111,11 @@ $ cxl eval -e 'emit result = "present" ?? "default"'
 
 ## String concatenation
 
-The `+` operator concatenates strings when both operands are strings.
+Use `.concat()` to join strings in compiled pipelines. Numeric `+` is not a
+substitute for explicit text concatenation at the planner's type boundary.
 
 ```bash
-$ cxl eval -e 'emit result = "hello" + " " + "world"'
+$ cxl eval -e 'emit result = "hello".concat(" ", "world")'
 ```
 
 ```json

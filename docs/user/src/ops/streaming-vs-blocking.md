@@ -5,12 +5,12 @@ Every node in a pipeline is one of two kinds at runtime, and the difference is w
 - **Streaming** stages pass records through without holding the whole input. Their memory footprint stays small no matter how large the input is.
 - **Blocking** stages must see their entire input before they can produce any output, so they accumulate state. They stay within the memory budget and spill to disk when it gets tight, rather than holding everything in RAM.
 
-A pipeline's peak memory is therefore set by its largest blocking stage, not by the total size of all stages combined.
+Peak memory includes all concurrently live operator state, source queues, writer buffers, and retained intermediate records. The shared budget and spill policies govern that combined working set; the largest blocking stage alone is not a peak-memory bound.
 
 ## Which stages stream
 
-- **Source → Transform → Output** chains — records flow straight from the reader through the transform to the writer.
-- **`Output`** — a sink always streams its records to the configured writer.
+- **Source → Transform → Sink** chains — records flow straight from the reader through the transform to the writer.
+- **`Sink`** — a sink always streams its records to the configured writer.
 - **`Route`** — predicate fan-out passes records through.
 - **`Merge`** — concatenation or interleaving passes records through.
 - **`Aggregate` with `strategy: streaming`** — when the input is pre-sorted on the group key, each group is emitted as soon as the key advances, so the whole input is never held. (See [Aggregate Nodes](../nodes/aggregate.md#strategy-hint).)
@@ -23,7 +23,7 @@ Document boundaries (the signals behind [`$doc.*`](../pipelines/envelope-and-doc
 A stage blocks when its result depends on records it has not seen yet:
 
 - **`sort`** — the full input must be present before the first sorted record is known.
-- **Hash `Aggregate`** — a group's final value depends on every member, so the group table holds the whole input. (A `streaming`-strategy Aggregate over pre-sorted input is the exception above.)
+- **Hash `Aggregate`** — a group's final value depends on every member, so the group table retains aggregate state for every live group. (A `streaming`-strategy Aggregate over pre-sorted input is the exception above.)
 - **A `Combine`'s build side** — the lookup table is built in full before any driver record is matched. The probe side streams; the build side materializes.
 - **Time-windowed and correlation-key Aggregates** — these hold their group state for windowing or for the correlation commit, so they materialize.
 
@@ -34,7 +34,7 @@ A blocking stage keeps its accumulated state inside `pipeline.memory.limit` and 
 `clinker run <pipeline>.yaml --explain` annotates every node with its class in the **Physical Properties** section:
 
 ```text
-output.report:
+sink.report:
   buffer: streaming
 
 aggregation.dept_totals:

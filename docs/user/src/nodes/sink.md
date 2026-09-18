@@ -16,6 +16,12 @@ Sink nodes write processed records to files. They are the terminal nodes of a pi
 > Contracts](https://github.com/rustpunk/clinker/blob/main/docs/ai/15_PRODUCTION_CONTRACTS.md#terminal-destination-vocabulary)
 > for the compatibility boundary.
 
+Use the same name for the Sink node and its `config.name`. At the current
+implementation boundary, mismatched names can produce a writer-mode error or
+empty published files instead of a planning diagnostic. The examples use
+matching names; planning success alone does not establish correct output for
+a mismatched pair.
+
 ## Basic structure
 
 ```yaml
@@ -23,7 +29,7 @@ Sink nodes write processed records to files. They are the terminal nodes of a pi
   name: result
   input: transform_node
   config:
-    name: output_stage
+    name: result
     type: csv
     path: "./output/result.csv"
 ```

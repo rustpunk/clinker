@@ -145,10 +145,10 @@ the exception that *do* accumulate across records; see below.)
 Per-record evaluation keeps **per-row** memory usage bounded for the
 stateless parts of the graph (Transform, Route, Merge, most Combine
 probe-side work, Output). Every stage is charged against the configured
-RSS budget. Fused Source → Transform → Output paths run streaming, with
+RSS budget. Fused Source → Transform → Sink paths run streaming, with
 no per-stage materialization, so a 100 GB CSV passes through with the
 same footprint as a 100 KB CSV. A stage that hands its output to a single
-downstream sink Output also avoids a charged inter-stage buffer --
+downstream Sink also avoids a charged inter-stage buffer --
 single-branch Route, non-fused Merge, streaming Aggregate, and the Combine
 probe-side stream their result straight to the writer (see
 [Streaming vs. Blocking Stages](../ops/streaming-vs-blocking.md)).

@@ -13,16 +13,17 @@ nodes:
   - name: ranked_sales
     type: transform
     input: raw_sales
-    analytic_window:
-      group_by: [region]
-      sort_by:
-        - field: amount
-          order: desc
-    cxl: |
-      emit region = region
-      emit amount = amount
-      emit running_total = $window.sum(amount)
-      emit rank_position = $window.count()
+    config:
+      analytic_window:
+        group_by: [region]
+        sort_by:
+          - field: amount
+            order: desc
+      cxl: |
+        emit region = region
+        emit amount = amount
+        emit running_total = $window.sum(amount)
+        emit rank_position = $window.count()
 ```
 
 ### Window configuration fields
@@ -233,19 +234,20 @@ nodes:
   - name: sales_analysis
     type: transform
     input: daily_sales
-    analytic_window:
-      group_by: [store_id]
-      sort_by:
-        - field: sale_date
-          order: asc
-    cxl: |
-      emit store_id = store_id
-      emit sale_date = sale_date
-      emit daily_revenue = revenue
-      emit week_avg = $window.avg(revenue)
-      emit week_total = $window.sum(revenue)
-      emit prev_day_revenue = $window.lag(1)
-      emit day_over_day = revenue - ($window.lag(1) ?? revenue)
+    config:
+      analytic_window:
+        group_by: [store_id]
+        sort_by:
+          - field: sale_date
+            order: asc
+      cxl: |
+        emit store_id = store_id
+        emit sale_date = sale_date
+        emit daily_revenue = revenue
+        emit week_avg = $window.avg(revenue)
+        emit week_total = $window.sum(revenue)
+        emit prev_day_revenue = $window.lag(1)
+        emit day_over_day = revenue - ($window.lag(1) ?? revenue)
 ```
 
 This computes per-store running averages and totals over the partition's history-up-to-and-including the current row.

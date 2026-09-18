@@ -79,7 +79,7 @@ nodes:
     name: result
     input: enrich
     config:
-      name: enriched_orders
+      name: result
       type: csv
       path: "./output/enriched_orders.csv"
 ```

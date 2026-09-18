@@ -28,7 +28,7 @@ nodes:
     name: split_output
     input: transactions
     config:
-      name: monthly_report
+      name: split_output
       type: csv
       path: "./output/report.csv"
       split:
@@ -148,7 +148,7 @@ nodes:
     name: chunked
     input: current_year
     config:
-      name: transactions_2026
+      name: chunked
       type: csv
       path: "./output/transactions_2026.csv"
       split:

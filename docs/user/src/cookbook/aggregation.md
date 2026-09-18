@@ -63,15 +63,17 @@ nodes:
     name: report
     input: rollup
     config:
-      name: dept_totals
+      name: report
       type: csv
       path: "./output/dept_totals.csv"
+      sort_order: [{ field: department, order: asc }]
 ```
 
 ## Run it
 
 ```bash
 clinker run dept_rollup.yaml --dry-run
+mkdir -p output
 clinker run dept_rollup.yaml
 ```
 
@@ -81,12 +83,14 @@ clinker run dept_rollup.yaml
 
 ```csv
 department,total,count,average,maximum,minimum
-Engineering,21500,3,7166.67,9500,5000
+Engineering,21500,3,7166.666666666667,9500,5000
 Marketing,5000,2,2500,3000,2000
 Sales,6000,1,6000,6000,6000
 ```
 
-One row per department. The inactive records (Dave's $4000, Hank's $1500) are excluded by the filter.
+One row per department, ordered by the Sink's explicit `sort_order`. The
+`average` column is a binary float and is not implicitly rounded to two decimal
+places. The inactive records (Dave's $4000, Hank's $1500) are excluded by the filter.
 
 ## How aggregation works
 

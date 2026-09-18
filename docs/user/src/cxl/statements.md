@@ -25,7 +25,7 @@ Multiple `emit` statements build up the output record field by field:
 
 ```bash
 $ cxl eval -e 'emit first = "Alice"' -e 'emit last = "Smith"' \
-    -e 'emit full = first + " " + last'
+    -e 'emit full = first.concat(" ", last)'
 ```
 
 ```json

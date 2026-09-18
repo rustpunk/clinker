@@ -24,7 +24,7 @@ ORD-006,Wayne Ent,3200,EU
 pipeline:
   name: order_routing
   vars:
-    high_value_threshold: 5000
+    high_value_threshold: { type: int, default: 5000 }
 
 nodes:
   - type: source
@@ -52,7 +52,7 @@ nodes:
     name: high_value_output
     input: split_by_value.high
     config:
-      name: high_value_orders
+      name: high_value_output
       type: csv
       path: "./output/high_value.csv"
 
@@ -60,7 +60,7 @@ nodes:
     name: standard_output
     input: split_by_value.standard
     config:
-      name: standard_orders
+      name: standard_output
       type: csv
       path: "./output/standard.csv"
 ```
@@ -69,6 +69,7 @@ nodes:
 
 ```bash
 clinker run order_routing.yaml --dry-run
+mkdir -p output
 clinker run order_routing.yaml
 ```
 
@@ -132,7 +133,7 @@ Route nodes can have any number of named branches:
     name: us_output
     input: split_by_region.us
     config:
-      name: us_orders
+      name: us_output
       type: csv
       path: "./output/us_orders.csv"
 
@@ -140,7 +141,7 @@ Route nodes can have any number of named branches:
     name: eu_output
     input: split_by_region.eu
     config:
-      name: eu_orders
+      name: eu_output
       type: csv
       path: "./output/eu_orders.csv"
 
@@ -167,7 +168,7 @@ Insert a transform between the route and output to shape the data differently pe
     name: high_value_output
     input: enrich_high_value
     config:
-      name: high_value_orders
+      name: high_value_output
       type: csv
       path: "./output/high_value.csv"
 ```

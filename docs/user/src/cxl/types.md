@@ -11,11 +11,11 @@ CXL has 10 value types. Every field value, literal, and expression result is one
 | Integer | `i64` | 64-bit signed integer |
 | Float | `f64` | 64-bit double-precision float |
 | Decimal | `Decimal` | Exact base-10 fixed-point number for money/financials |
-| String | `Box<str>` | UTF-8 text |
+| String | `FieldStr` | UTF-8 text |
 | Date | `NaiveDate` | Calendar date without timezone |
 | DateTime | `NaiveDateTime` | Date and time without timezone |
-| Array | `Vec<Value>` | Ordered collection of values |
-| Map | `IndexMap<Box<str>, Value>` | Key-value pairs |
+| Array | `OwnedValues` | Ordered collection of values |
+| Map | `OwnedMap` | Key-value pairs |
 
 ## Literal syntax
 

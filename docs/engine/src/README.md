@@ -8,7 +8,7 @@ If you only need to **author and run YAML pipelines**, you want the **Clinker Us
 
 - **The execution model** — which stages stream, which block, and how the memory arbitrator decides who pauses and who spills.
 - **Correlation-key retraction** — the shadow-column lineage, per-source rollback narrowing, and the retraction protocol that lets a relaxed aggregate drop only the failing records.
-- **Operator internals** — Combine join-strategy selection, Merge back-pressure, streaming Output writes, and the schema-drift sidecar.
+- **Operator internals** — Combine join-strategy selection, Merge back-pressure, streaming Sink writes, and the schema-drift sidecar.
 - **Storage** — the staging cache, crash durability, and the locking protocol.
 - **CXL compilation** — the compiler phases and the type-unification algorithm.
 

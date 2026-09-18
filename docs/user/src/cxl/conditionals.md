@@ -151,7 +151,7 @@ emit status_text = match http_code {
   400 => "Bad Request",
   404 => "Not Found",
   500 => "Internal Server Error",
-  _   => "HTTP " + http_code.to_string()
+  _   => "HTTP ".concat(http_code.to_string())
 }
 ```
 

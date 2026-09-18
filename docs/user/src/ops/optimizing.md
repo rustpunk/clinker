@@ -4,9 +4,9 @@ Clinker keeps memory bounded and spills to disk automatically, so most pipelines
 
 ## Let stages stream instead of buffer
 
-The cheapest pipeline is one where records flow straight through without being held in memory. A **Source → Transform → Output** chain streams end to end — no intermediate stage is materialized. You get this automatically; the things that break it are fan-out (a Route with several branches, an output that forks) and blocking operators (sort, hash aggregation, the build side of a Combine).
+The cheapest pipeline is one where records flow straight through without being held in memory. A **Source → Transform → Sink** chain streams end to end — no intermediate stage is materialized. You get this automatically; the things that break it are fan-out (a Route with several branches, an output that forks) and blocking operators (sort, hash aggregation, the build side of a Combine).
 
-Practical implication: keep the hot path simple. A filter-and-reshape job that's just Source → Transform → Output already runs at minimal memory. See [Streaming vs. Blocking Stages](streaming-vs-blocking.md) for which operators stream and which block.
+Practical implication: keep the hot path simple. A filter-and-reshape job that's just Source → Transform → Sink already runs at minimal memory. See [Streaming vs. Blocking Stages](streaming-vs-blocking.md) for which operators stream and which block.
 
 ## Make aggregation stream with `sort_order`
 

@@ -38,7 +38,7 @@ $ cxl eval -e 'emit name = $pipeline.name' \
 | `$pipeline.distinct_count` | Int | Records excluded by `distinct` statements |
 
 ```
-trace info if $pipeline.total_count % 10000 == 0 then "processed " + $pipeline.total_count.to_string() + " records"
+trace info if $pipeline.total_count % 10000 == 0 then "processed ".concat($pipeline.total_count.to_string(), " records")
 ```
 
 ## $source.* -- Per-record source lineage

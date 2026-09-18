@@ -16,9 +16,9 @@ lightweight, and easy to reason about.
 **A finite batch executor with per-record streaming evaluation, not a
 long-running stream processor.** A pipeline run is a job: Sources read until
 EOF, the DAG drains, the process exits. Within a run, stateless operators
-(Transform, Route, most Combine probe-side work, Output) evaluate records one
+(Transform, Route, most Combine probe-side work, Sink) evaluate records one
 at a time without accumulating per-record state. Every stage is charged
-against the configured RSS budget. Fused Source → Transform → Output paths
+against the configured RSS budget. Fused Source → Transform → Sink paths
 run streaming with no per-stage materialization; non-fused boundaries
 (Route fan-out, Merge fan-in, Composition bodies, diamond DAGs) materialize
 records into per-stage buffers that charge against the same envelope. The
@@ -114,14 +114,14 @@ nodes:
       cxl: |
         filter status == "active"
         emit customer_id = customer_id
-        emit full_name = first_name + " " + last_name
+        emit full_name = first_name.concat(" ", last_name)
         emit tier = if lifetime_value >= 10000 then "gold" else "standard"
 
   - type: sink
     name: result
     input: enrich
     config:
-      name: enriched
+      name: result
       type: csv
       path: "./output/enriched_customers.csv"
 ```
