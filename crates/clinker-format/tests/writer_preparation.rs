@@ -13,7 +13,7 @@ use clinker_format::reserved::ReservedVec;
 fn fixed_width_late_structured_envelope_rejects_without_delivery() {
     use clinker_format::FormatWriter;
     use clinker_format::envelope_writer::OutputEnvelopeSpec;
-    use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConfig};
+    use clinker_format::fixed_width::writer::{FixedWidthEncoder, FixedWidthWriterConfig};
     use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Value};
     use std::sync::Arc;
 
@@ -35,10 +35,10 @@ fn fixed_width_late_structured_envelope_rejects_without_delivery() {
                 EnvelopeRecord::from_sections([(OwnedKey::from("authored"), section)]),
             );
             let mut bytes = Vec::new();
-            let mut writer = FixedWidthWriter::new(
-                &mut bytes,
-                vec![],
-                FixedWidthWriterConfig {
+            let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+            let encoder = FixedWidthEncoder::new(
+                &[],
+                &FixedWidthWriterConfig {
                     envelope: Some(OutputEnvelopeSpec {
                         header_from_doc: (!footer).then(|| "authored".into()),
                         footer_from_doc: footer.then(|| "authored".into()),
@@ -46,16 +46,764 @@ fn fixed_width_late_structured_envelope_rejects_without_delivery() {
                     }),
                     ..Default::default()
                 },
+                provider.resources(),
             )
             .unwrap();
+            let mut writer =
+                PreparedWriter::new(&mut bytes, encoder, provider.resources()).unwrap();
             let result = if footer {
                 writer.end_document(&doc)
             } else {
                 writer.begin_document(&doc)
             };
-            assert!(result.is_err(), "structured sections have no scalar representation");
+            assert!(
+                result.is_err(),
+                "structured sections have no scalar representation"
+            );
             drop(writer);
-            assert!(bytes.is_empty(), "the complete rejected section must stay private");
+            assert!(
+                bytes.is_empty(),
+                "the complete rejected section must stay private"
+            );
+        }
+    }
+}
+
+mod fixed_width_prepared {
+    use super::*;
+    use clinker_format::FormatWriter;
+    use clinker_format::envelope_writer::OutputEnvelopeSpec;
+    use clinker_format::fixed_width::writer::{
+        FixedWidthEncoder, FixedWidthEncoderConfig, FixedWidthWriterConfig,
+    };
+    use clinker_format::preparation::{
+        AllocationAuthority, AllocationLease, MemoryStorage, OperationStage, OwnerId,
+        ResourceAuthority, WriterResources,
+    };
+    use clinker_format::{
+        Column, FixedWidthCountField, FixedWidthFill, FixedWidthOccurs, FixedWidthOverflow,
+        FixedWidthTruncateKeep,
+    };
+    use clinker_record::schema_def::{Justify, LineSeparator, TruncationPolicy};
+    use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Record, Schema, Value};
+    use cxl::typecheck::Type;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn field(name: &str, width: usize) -> Column {
+        Column {
+            width: Some(width),
+            ..Column::bare(name, Type::String)
+        }
+    }
+    fn record(values: &[(&str, Value)]) -> Record {
+        Record::new(
+            SharedStorage::from_arc(Arc::new(Schema::new(
+                values.iter().map(|(n, _)| (*n).into()).collect(),
+            ))),
+            values.iter().map(|(_, v)| v.clone()).collect(),
+        )
+    }
+    fn doc(sections: &[(&str, &[(&str, Value)])]) -> DocumentContext {
+        DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("data.txt"),
+            EnvelopeRecord::from_sections(sections.iter().map(|(n, fields)| {
+                (
+                    OwnedKey::from(*n),
+                    Value::Map(OwnedMap::from_map(
+                        fields
+                            .iter()
+                            .map(|(n, v)| (OwnedKey::from(*n), v.clone()))
+                            .collect(),
+                    )),
+                )
+            })),
+        )
+    }
+    fn config(separator: LineSeparator) -> FixedWidthWriterConfig {
+        FixedWidthWriterConfig {
+            line_separator: separator,
+            envelope: Some(OutputEnvelopeSpec {
+                header_from_doc: Some("opening authored".into()),
+                footer_from_doc: Some("closing authored".into()),
+                footer_record_count_field: None,
+            }),
+        }
+    }
+    fn provider() -> MemoryOnlyResources {
+        MemoryOnlyResources::new(NonZeroUsize::new(2 * 1024 * 1024).unwrap())
+    }
+
+    #[test]
+    fn scalar_sections_order_presence_separators_and_multiple_documents() {
+        let values = [
+            ("text", Value::String("hé".into())),
+            ("null", Value::Null),
+            ("integer", Value::Integer(-17)),
+            ("float", Value::Float(1.25)),
+            ("decimal", Value::Decimal("12.30".parse().unwrap())),
+            ("bool", Value::Bool(true)),
+            (
+                "date",
+                Value::Date(chrono::NaiveDate::from_ymd_opt(2024, 2, 29).unwrap()),
+            ),
+            (
+                "datetime",
+                Value::DateTime(
+                    chrono::NaiveDate::from_ymd_opt(2024, 2, 29)
+                        .unwrap()
+                        .and_hms_opt(13, 14, 15)
+                        .unwrap(),
+                ),
+            ),
+        ];
+        let full = doc(&[
+            ("opening authored", &values),
+            (
+                "closing authored",
+                &[("last", Value::String("tail".into()))],
+            ),
+        ]);
+        let empty = doc(&[("opening authored", &[]), ("closing authored", &[])]);
+        let missing = doc(&[]);
+        for (sep, literal) in [
+            (LineSeparator::Lf, "\n"),
+            (LineSeparator::CrLf, "\r\n"),
+            (LineSeparator::None, ""),
+        ] {
+            let provider = provider();
+            let encoder =
+                FixedWidthEncoder::new(&[field("body", 2)], &config(sep), provider.resources())
+                    .unwrap();
+            let mut writer =
+                PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+            writer.begin_document(&full).unwrap();
+            writer
+                .write_record(&record(&[("body", Value::String("B".into()))]))
+                .unwrap();
+            assert_eq!(writer.encoder().record_count(), 1);
+            writer.end_document(&full).unwrap();
+            assert!(!writer.encoder().document_open());
+            writer.begin_document(&missing).unwrap();
+            assert_eq!(writer.encoder().record_count(), 0);
+            writer.end_document(&missing).unwrap();
+            writer.begin_document(&empty).unwrap();
+            writer.end_document(&empty).unwrap();
+            writer.begin_document(&full).unwrap();
+            writer.end_document(&full).unwrap();
+            writer.flush().unwrap();
+            let line = "hé-171.2512.30true2024022920240229131415";
+            let expected = format!(
+                "{line}{literal}B {literal}tail{literal}{literal}{literal}{line}{literal}tail{literal}"
+            );
+            assert_eq!(writer.destination(), expected.as_bytes());
+            drop(writer);
+            assert_eq!(provider.used(), 0);
+        }
+    }
+
+    #[test]
+    fn scalar_body_byte_width_padding_order_and_narrow_borrowed_text() {
+        let values = [
+            ("text", Value::String("é好".into())),
+            ("null", Value::Null),
+            ("integer", Value::Integer(-17)),
+            ("float", Value::Float(1.25)),
+            ("decimal", Value::Decimal("12.30".parse().unwrap())),
+            ("bool", Value::Bool(false)),
+            (
+                "date",
+                Value::Date(chrono::NaiveDate::from_ymd_opt(2024, 2, 29).unwrap()),
+            ),
+            (
+                "datetime",
+                Value::DateTime(
+                    chrono::NaiveDate::from_ymd_opt(2024, 2, 29)
+                        .unwrap()
+                        .and_hms_opt(13, 14, 15)
+                        .unwrap(),
+                ),
+            ),
+        ];
+        let mut fields: Vec<_> = values.iter().map(|(name, _)| field(name, 16)).collect();
+        fields[0].width = Some(4);
+        fields[0].truncation = Some(TruncationPolicy::Silent);
+        fields[2].justify = Some(Justify::Right);
+        fields[2].pad = Some("0".into());
+        let provider = provider();
+        let encoder = FixedWidthEncoder::new(
+            &fields,
+            &FixedWidthWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        writer.write_record(&record(&values)).unwrap();
+        assert_eq!(writer.destination(), "é                  0000000000000-171.25            12.30           false           20240229        20240229131415  \n".as_bytes());
+        drop(writer);
+        let mut narrow = field("value", 3);
+        narrow.truncation = Some(TruncationPolicy::Silent);
+        let encoder = FixedWidthEncoder::new(
+            &[narrow],
+            &FixedWidthWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        for text in ["a".repeat(1024 * 1024), "好".repeat(400_000)] {
+            writer
+                .write_record(&record(&[("value", Value::String(text.into()))]))
+                .unwrap();
+        }
+        assert_eq!(writer.destination(), "aaa\n好\n".as_bytes());
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn large_ascii_and_multibyte_sections_stream_exactly() {
+        for text in ["x".repeat(100_000), "好é".repeat(20_000)] {
+            let provider = provider();
+            let doc = doc(&[
+                (
+                    "opening authored",
+                    &[("text", Value::String(text.clone().into()))],
+                ),
+                (
+                    "closing authored",
+                    &[("text", Value::String(text.clone().into()))],
+                ),
+            ]);
+            let encoder =
+                FixedWidthEncoder::new(&[], &config(LineSeparator::CrLf), provider.resources())
+                    .unwrap();
+            let retained = provider.used();
+            let mut writer =
+                PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+            writer.begin_document(&doc).unwrap();
+            writer.end_document(&doc).unwrap();
+            assert_eq!(
+                writer.destination(),
+                format!("{text}\r\n{text}\r\n").as_bytes()
+            );
+            assert_eq!(
+                provider.used(),
+                retained,
+                "sections are borrowed and never retained"
+            );
+            drop(writer);
+            assert_eq!(provider.used(), 0);
+        }
+    }
+
+    #[test]
+    fn late_record_and_section_failure_preserves_committed_state() {
+        let provider = provider();
+        let encoder = FixedWidthEncoder::new(
+            &[field("a", 2), field("b", 2)],
+            &config(LineSeparator::Lf),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        let empty = doc(&[]);
+        writer.begin_document(&empty).unwrap();
+        let good = record(&[
+            ("a", Value::String("long".into())),
+            ("b", Value::Integer(1)),
+        ]);
+        writer.write_record(&good).unwrap();
+        let before = provider.used();
+        let warning = writer.encoder().truncation_warnings()[0]
+            .as_str()
+            .to_owned();
+        let bad = record(&[
+            ("a", Value::String("another warning".into())),
+            ("b", Value::Map(OwnedMap::from_map(Default::default()))),
+        ]);
+        assert!(writer.write_record(&bad).is_err());
+        assert_eq!(provider.used(), before);
+        let bad_doc = doc(&[
+            (
+                "opening authored",
+                &[
+                    ("valid", Value::Integer(5)),
+                    ("bad", Value::Array(OwnedValues::from_vec(vec![]))),
+                ],
+            ),
+            (
+                "closing authored",
+                &[("bad", Value::Map(OwnedMap::from_map(Default::default())))],
+            ),
+        ]);
+        assert!(writer.begin_document(&bad_doc).is_err());
+        assert!(writer.end_document(&bad_doc).is_err());
+        assert_eq!(writer.encoder().record_count(), 1);
+        assert!(writer.encoder().document_open());
+        assert_eq!(writer.encoder().truncation_warnings().len(), 1);
+        assert_eq!(writer.encoder().truncation_warnings()[0].as_str(), warning);
+        assert_eq!(writer.destination(), b"lo1 \n");
+        assert_eq!(provider.used(), before);
+        writer.end_document(&empty).unwrap();
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+    }
+
+    fn group(fill: FixedWidthFill, count: bool) -> Column {
+        Column {
+            start: Some(2),
+            multiple: Some(true),
+            fields: Some(vec![field("code", 2)]),
+            occurs: Some(FixedWidthOccurs {
+                min: 0,
+                max: 2,
+                fill,
+                on_overflow: FixedWidthOverflow::Error,
+                keep: None,
+            }),
+            count_field: count.then(|| FixedWidthCountField {
+                name: "count".into(),
+                width: 1,
+            }),
+            ..Column::bare("items", Type::Map)
+        }
+    }
+    fn items(values: &[&str]) -> Value {
+        Value::Array(OwnedValues::from_vec(
+            values
+                .iter()
+                .map(|text| {
+                    Value::Map(OwnedMap::from_map(
+                        [(OwnedKey::from("code"), Value::String((*text).into()))].into(),
+                    ))
+                })
+                .collect(),
+        ))
+    }
+    #[test]
+    fn group_bounds_count_overflow_gaps_and_shift_preserve_bytes() {
+        for (fill, expected) in [
+            (FixedWidthFill::Pad, b"  1AB    Z \n".as_slice()),
+            (FixedWidthFill::Shift, b"  1AB  Z \n".as_slice()),
+        ] {
+            let provider = provider();
+            let mut last = field("last", 2);
+            last.start = Some(9);
+            let mut group = group(fill, true);
+            let encoder = FixedWidthEncoder::new(
+                &[last, group.clone()],
+                &FixedWidthWriterConfig::default(),
+                provider.resources(),
+            )
+            .unwrap();
+            let mut writer =
+                PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+            writer
+                .write_record(&record(&[
+                    ("items", items(&["AB"])),
+                    ("last", Value::String("Z".into())),
+                ]))
+                .unwrap();
+            assert_eq!(writer.destination(), expected);
+            assert!(
+                writer
+                    .write_record(&record(&[("items", items(&["AA", "BB", "CC"]))]))
+                    .is_err()
+            );
+            drop(writer);
+            for (keep, bytes) in [
+                (FixedWidthTruncateKeep::First, b"  2AABB\n"),
+                (FixedWidthTruncateKeep::Last, b"  2BBCC\n"),
+            ] {
+                let occurs = group.occurs.as_mut().unwrap();
+                occurs.on_overflow = FixedWidthOverflow::Truncate;
+                occurs.keep = Some(keep);
+                let encoder = FixedWidthEncoder::new(
+                    &[group.clone()],
+                    &FixedWidthWriterConfig::default(),
+                    provider.resources(),
+                )
+                .unwrap();
+                let mut writer =
+                    PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+                writer
+                    .write_record(&record(&[("items", items(&["AA", "BB", "CC"]))]))
+                    .unwrap();
+                assert_eq!(writer.destination(), bytes);
+                drop(writer);
+            }
+            assert_eq!(provider.used(), 0);
+        }
+    }
+    #[test]
+    fn group_blank_minimum_null_and_late_occurrence_validation() {
+        let provider = provider();
+        let mut group = group(FixedWidthFill::Pad, false);
+        let encoder = FixedWidthEncoder::new(
+            &[group.clone()],
+            &FixedWidthWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        writer
+            .write_record(&record(&[("items", Value::Null)]))
+            .unwrap();
+        assert_eq!(writer.destination(), b"      \n");
+        assert!(
+            writer
+                .write_record(&record(&[("items", items(&["  "]))]))
+                .is_err()
+        );
+        assert!(
+            writer
+                .write_record(&record(&[(
+                    "items",
+                    Value::Array(OwnedValues::from_vec(vec![
+                        Value::Map(OwnedMap::from_map(
+                            [(OwnedKey::from("code"), Value::String("AB".into()))].into()
+                        )),
+                        Value::Integer(1)
+                    ]))
+                )]))
+                .is_err()
+        );
+        assert_eq!(writer.destination(), b"      \n");
+        drop(writer);
+        group.occurs.as_mut().unwrap().min = 1;
+        let encoder = FixedWidthEncoder::new(
+            &[group],
+            &FixedWidthWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        assert!(
+            writer
+                .write_record(&record(&[("items", items(&[]))]))
+                .is_err()
+        );
+        assert!(writer.destination().is_empty());
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn virtual_padding_width_cannot_delay_blank_rejection() {
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let provider = provider();
+            let mut group = group(FixedWidthFill::Pad, false);
+            group.start = Some(0);
+            group.occurs.as_mut().unwrap().max = 1;
+            group.fields.as_mut().unwrap()[0].width = Some(usize::MAX - 1);
+            let encoder = FixedWidthEncoder::new(
+                &[group],
+                &FixedWidthWriterConfig::default(),
+                provider.resources(),
+            )
+            .unwrap();
+            let mut writer =
+                PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+            let value = Value::Array(OwnedValues::from_vec(vec![Value::Map(OwnedMap::from_map(
+                [(OwnedKey::from("code"), Value::Null)].into(),
+            ))]));
+            assert!(matches!(
+                writer.write_record(&record(&[("items", value)])),
+                Err(FormatError::OutputEncoding {
+                    kind: clinker_format::error::OutputEncodingKind::FixedWidthBlankOccurrence,
+                    ..
+                })
+            ));
+            assert!(writer.destination().is_empty());
+            drop(writer);
+            assert_eq!(provider.used(), 0);
+            send.send(()).unwrap();
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("virtual padding must not require a scan of the declared width");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn shared_overlap_diagnostic_names_actual_group_in_both_declaration_orders() {
+        let mut group = group(FixedWidthFill::Pad, false);
+        group.start = Some(0);
+        let mut tail = field("tail", 1);
+        tail.start = Some(2);
+        for fields in [vec![group.clone(), tail.clone()], vec![tail, group.clone()]] {
+            let error = clinker_format::fixed_width::field::validate_write_layout(&fields)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("group 'items'"), "{error}");
+            assert!(!error.contains("group 'tail'"), "{error}");
+            assert!(
+                error.contains("range 2..3 overlaps field 'items' (0..4)"),
+                "{error}"
+            );
+            assert!(error.contains("count, payload"), "{error}");
+        }
+        let mut second = field("other", 1);
+        second.start = Some(1);
+        group.fields.as_mut().unwrap().push(second);
+        let error = clinker_format::fixed_width::field::validate_write_layout(&[group])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("child 'other' range 1..2 overlaps child 'code' range 0..2"),
+            "{error}"
+        );
+    }
+
+    struct Authority {
+        memory: MemoryOnlyResources,
+        attempts: AtomicUsize,
+        refuse: AtomicUsize,
+        cancel_checks: AtomicUsize,
+        cancel_at: AtomicUsize,
+    }
+    impl Authority {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                memory: provider(),
+                attempts: AtomicUsize::new(0),
+                refuse: AtomicUsize::new(usize::MAX),
+                cancel_checks: AtomicUsize::new(0),
+                cancel_at: AtomicUsize::new(usize::MAX),
+            })
+        }
+        fn reset(&self) {
+            self.attempts.store(0, Ordering::SeqCst);
+            self.refuse.store(usize::MAX, Ordering::SeqCst);
+            self.cancel_checks.store(0, Ordering::SeqCst);
+            self.cancel_at.store(usize::MAX, Ordering::SeqCst);
+        }
+    }
+    impl AllocationAuthority for Authority {
+        fn identity(&self) -> usize {
+            self.memory.resources().allocation().identity()
+        }
+        fn try_reserve(
+            self: Arc<Self>,
+            owner: OwnerId,
+            layout: std::alloc::Layout,
+        ) -> Result<AllocationLease, ResourceError> {
+            self.check_cancelled()?;
+            if self.attempts.fetch_add(1, Ordering::SeqCst) >= self.refuse.load(Ordering::SeqCst) {
+                return Err(ResourceError::new(
+                    ResourceErrorKind::Budget,
+                    layout.size(),
+                    0,
+                ));
+            }
+            self.memory.resources().allocation().reserve(owner, layout)
+        }
+        fn release(&self, _: OwnerId, _: usize) {
+            unreachable!("delegated grants");
+        }
+        fn check_cancelled(&self) -> Result<(), ResourceError> {
+            if self.cancel_checks.fetch_add(1, Ordering::SeqCst)
+                >= self.cancel_at.load(Ordering::SeqCst)
+            {
+                Err(ResourceError::new(ResourceErrorKind::Cancelled, 0, 0))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl ResourceAuthority for Authority {
+        fn create_stage(
+            self: Arc<Self>,
+            scope: WriterScope,
+        ) -> Result<OperationStage, FormatError> {
+            StorageStage::create(scope.clone(), MemoryStorage::new(scope))
+        }
+    }
+    #[test]
+    fn construction_admits_every_backing_and_retains_shared_config() {
+        let authority = Authority::new();
+        let resources = WriterResources::new(authority.clone());
+        let fields = [group(FixedWidthFill::Pad, true), field("tail", 2)];
+        let policy =
+            FixedWidthEncoderConfig::new(&fields, &config(LineSeparator::Lf), &resources).unwrap();
+        let attempts = authority.attempts.load(Ordering::SeqCst);
+        assert!(attempts >= 6);
+        let retained = authority.memory.used();
+        let (alias, allocations) = allocation_probe(false, || policy.clone());
+        assert_eq!(allocations, 0);
+        drop(policy);
+        assert_eq!(authority.memory.used(), retained);
+        drop(alias);
+        assert_eq!(authority.memory.used(), 0);
+        for stop in 0..attempts {
+            authority.reset();
+            authority.refuse.store(stop, Ordering::SeqCst);
+            assert!(matches!(
+                FixedWidthEncoderConfig::new(&fields, &config(LineSeparator::Lf), &resources),
+                Err(FormatError::Resource(_))
+            ));
+            assert_eq!(authority.memory.used(), 0, "constructor refusal {stop}");
+        }
+    }
+    #[test]
+    fn preparation_denial_and_cancellation_restore_all_committed_owners() {
+        let authority = Authority::new();
+        let resources = WriterResources::new(authority.clone());
+        let encoder = FixedWidthEncoder::new(
+            &[field("v", 2)],
+            &config(LineSeparator::Lf),
+            resources.clone(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, resources.clone()).unwrap();
+        let good = doc(&[]);
+        writer.begin_document(&good).unwrap();
+        let record = record(&[("v", Value::String("warning".into()))]);
+        writer.write_record(&record).unwrap();
+        let baseline = authority.memory.used();
+        let scope = resources.scope().unwrap();
+        let section = doc(&[
+            (
+                "opening authored",
+                &[("v", Value::String("x".repeat(20_000).into()))],
+            ),
+            ("closing authored", &[("v", Value::Integer(9))]),
+        ]);
+        for operation in [
+            OutputOperation::Record(&record),
+            OutputOperation::BeginDocument(&section),
+            OutputOperation::EndDocument(&section),
+        ] {
+            // First measure bounded cancellation points through immutable preparation.
+            authority.reset();
+            let measured = match &operation {
+                OutputOperation::Record(r) => OutputOperation::Record(r),
+                OutputOperation::BeginDocument(d) => OutputOperation::BeginDocument(d),
+                OutputOperation::EndDocument(d) => OutputOperation::EndDocument(d),
+                _ => unreachable!(),
+            };
+            let pending = writer
+                .encoder()
+                .prepare(measured, &mut std::io::sink(), &scope)
+                .unwrap();
+            let checks = authority.cancel_checks.load(Ordering::SeqCst);
+            let allocations = authority.attempts.load(Ordering::SeqCst);
+            drop(pending);
+            assert_eq!(authority.memory.used(), baseline);
+            for cancel in [false, true] {
+                for stop in 0..if cancel { checks } else { allocations } {
+                    authority.reset();
+                    if cancel {
+                        authority.cancel_at.store(stop, Ordering::SeqCst);
+                    } else {
+                        authority.refuse.store(stop, Ordering::SeqCst);
+                    }
+                    let operation = match &operation {
+                        OutputOperation::Record(r) => OutputOperation::Record(r),
+                        OutputOperation::BeginDocument(d) => OutputOperation::BeginDocument(d),
+                        OutputOperation::EndDocument(d) => OutputOperation::EndDocument(d),
+                        _ => unreachable!(),
+                    };
+                    assert!(
+                        writer
+                            .encoder()
+                            .prepare(operation, &mut std::io::sink(), &scope)
+                            .is_err()
+                    );
+                    assert_eq!(authority.memory.used(), baseline);
+                    assert_eq!(writer.encoder().record_count(), 1);
+                    assert!(writer.encoder().document_open());
+                    assert_eq!(writer.encoder().truncation_warnings().len(), 1);
+                    assert_eq!(writer.destination(), b"wa\n");
+                }
+            }
+        }
+        authority.reset();
+        drop(writer);
+        assert_eq!(authority.memory.used(), 0);
+    }
+
+    struct Destination {
+        bytes: Vec<u8>,
+        limit: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+        flushes: Arc<AtomicUsize>,
+    }
+    impl Write for Destination {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let remaining = self
+                .limit
+                .load(Ordering::SeqCst)
+                .saturating_sub(self.bytes.len());
+            if remaining == 0 {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let n = bytes.len().min(2).min(remaining);
+            self.bytes.extend_from_slice(&bytes[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    #[test]
+    fn short_delivery_completes_and_partial_delivery_poison_never_retries() {
+        for operation in 0..3 {
+            let provider = provider();
+            let encoder = FixedWidthEncoder::new(
+                &[field("v", 3)],
+                &config(LineSeparator::Lf),
+                provider.resources(),
+            )
+            .unwrap();
+            let limit = Arc::new(AtomicUsize::new(usize::MAX));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let flushes = Arc::new(AtomicUsize::new(0));
+            let destination = Destination {
+                bytes: Vec::new(),
+                limit: limit.clone(),
+                calls: calls.clone(),
+                flushes: flushes.clone(),
+            };
+            let mut writer =
+                PreparedWriter::new(destination, encoder, provider.resources()).unwrap();
+            let empty = doc(&[]);
+            writer.begin_document(&empty).unwrap();
+            let r = record(&[("v", Value::String("warning".into()))]);
+            writer.write_record(&r).unwrap();
+            assert_eq!(writer.destination().bytes, b"war\n");
+            let retained = provider.used();
+            limit.store(6, Ordering::SeqCst);
+            let doc = doc(&[
+                ("opening authored", &[("x", Value::String("header".into()))]),
+                ("closing authored", &[("x", Value::String("footer".into()))]),
+            ]);
+            let result = match operation {
+                0 => writer.write_record(&r),
+                1 => writer.begin_document(&doc),
+                _ => writer.end_document(&doc),
+            };
+            assert!(matches!(result, Err(FormatError::Io(_))));
+            assert_eq!(&writer.destination().bytes[..4], b"war\n");
+            assert_eq!(writer.destination().bytes.len(), 6);
+            assert_eq!(writer.encoder().record_count(), 1);
+            assert!(writer.encoder().document_open());
+            assert_eq!(writer.encoder().truncation_warnings().len(), 1);
+            assert_eq!(provider.used(), retained);
+            let attempts = calls.load(Ordering::SeqCst);
+            assert!(writer.write_record(&r).is_err());
+            assert!(writer.flush().is_err());
+            assert!(writer.flush_bytes().is_err());
+            drop(writer);
+            assert_eq!(calls.load(Ordering::SeqCst), attempts);
+            assert_eq!(flushes.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.used(), 0);
         }
     }
 }

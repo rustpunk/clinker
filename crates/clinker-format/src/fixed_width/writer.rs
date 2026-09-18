@@ -7,9 +7,724 @@ use cxl::typecheck::Type;
 
 use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
 use crate::error::FormatError;
+use crate::error::{OutputEncodingKind, OutputFieldName};
 use crate::fixed_width::field::{self, ResolvedRepeatingGroup};
+use crate::preparation::{
+    FormatEncoder, OutputOperation, PreparedWriter, WriterResources, WriterScope,
+};
+use crate::reserved::{ReservedText, ReservedVec};
 use crate::schema::{Column, FixedWidthFill, FixedWidthOverflow, FixedWidthTruncateKeep};
 use crate::traits::FormatWriter;
+use clinker_record::owned_storage::SharedStorage;
+
+fn output_error(name: &str, field: usize, offset: usize, kind: OutputEncodingKind) -> FormatError {
+    FormatError::OutputEncoding {
+        format: "fixed-width",
+        field: field + 1,
+        offset,
+        kind,
+        field_name: OutputFieldName::new(name),
+        element: None,
+    }
+}
+fn retained_text(value: &str, scope: &WriterScope) -> Result<ReservedText, FormatError> {
+    let mut text = ReservedText::new(scope.allocation().clone());
+    text.push_str(value)?;
+    Ok(text)
+}
+struct PreparedField {
+    name: ReservedText,
+    start: usize,
+    width: usize,
+    justify: Justify,
+    pad: u8,
+    truncation: TruncationPolicy,
+    trim: bool,
+    read_right: bool,
+    read_pad: Option<char>,
+}
+impl PreparedField {
+    fn new(column: &Column, start: usize, scope: &WriterScope) -> Result<Self, FormatError> {
+        let width = field::scalar_width(column, start)
+            .map_err(|e| output_error(e.name, 0, start, OutputEncodingKind::FixedWidthLayout))?;
+        let numeric = matches!(
+            column.ty.unwrap_nullable(),
+            Type::Int | Type::Float | Type::Decimal | Type::Numeric
+        );
+        Ok(Self {
+            name: retained_text(&column.name, scope)?,
+            start,
+            width,
+            justify: column.justify.clone().unwrap_or(if numeric {
+                Justify::Right
+            } else {
+                Justify::Left
+            }),
+            pad: column
+                .pad
+                .as_deref()
+                .and_then(|s| s.bytes().next())
+                .unwrap_or(b' '),
+            truncation: column.truncation.clone().unwrap_or(if numeric {
+                TruncationPolicy::Error
+            } else {
+                TruncationPolicy::Warn
+            }),
+            trim: column.trim.unwrap_or(true),
+            read_right: matches!(column.justify, Some(Justify::Right)),
+            read_pad: column.pad.as_deref().unwrap_or(" ").chars().next(),
+        })
+    }
+}
+struct PreparedGroup {
+    name: ReservedText,
+    start: usize,
+    width: usize,
+    occurrence_width: usize,
+    count_width: usize,
+    occurs: crate::schema::FixedWidthOccurs,
+    fields: ReservedVec<PreparedField>,
+}
+enum PreparedLayout {
+    Scalar(PreparedField),
+    Group(PreparedGroup),
+}
+impl PreparedLayout {
+    fn name(&self) -> &str {
+        match self {
+            Self::Scalar(f) => f.name.as_str(),
+            Self::Group(g) => g.name.as_str(),
+        }
+    }
+    fn start(&self) -> usize {
+        match self {
+            Self::Scalar(f) => f.start,
+            Self::Group(g) => g.start,
+        }
+    }
+    fn width(&self) -> usize {
+        match self {
+            Self::Scalar(f) => f.width,
+            Self::Group(g) => g.width,
+        }
+    }
+}
+struct PreparedConfig {
+    layouts: ReservedVec<PreparedLayout>,
+    separator: LineSeparator,
+    envelope: Option<crate::envelope_writer::PreparedEnvelope>,
+}
+/// Immutable admitted physical layout shared by every destination in a factory.
+/// Column/type trees remain with the caller; only derived rendering policy and
+/// admitted names are retained, with no recursive type or value copies.
+#[derive(Clone)]
+pub struct FixedWidthEncoderConfig(SharedStorage<PreparedConfig>);
+impl FixedWidthEncoderConfig {
+    /// Validate borrowed declarations, then admit each retained layout/name.
+    pub fn new(
+        fields: &[Column],
+        config: &FixedWidthWriterConfig,
+        resources: &WriterResources,
+    ) -> Result<Self, FormatError> {
+        let envelope = config.envelope.as_ref();
+        Self::from_names(
+            fields,
+            config.line_separator.clone(),
+            envelope.and_then(|e| e.header_from_doc.as_deref()),
+            envelope.and_then(|e| e.footer_from_doc.as_deref()),
+            envelope.and_then(|e| e.footer_record_count_field.as_deref()),
+            resources,
+        )
+    }
+    /// Borrow compiled envelope names without an intermediate owned spec.
+    pub fn from_names(
+        fields: &[Column],
+        separator: LineSeparator,
+        header: Option<&str>,
+        footer: Option<&str>,
+        count: Option<&str>,
+        resources: &WriterResources,
+    ) -> Result<Self, FormatError> {
+        let scope = resources.scope()?;
+        scope.check_cancelled()?;
+        field::check_write_layout(fields)
+            .map_err(|e| output_error(e.name, 0, 0, OutputEncodingKind::FixedWidthLayout))?;
+        if let Some(count) = count {
+            return Err(output_error(
+                count,
+                0,
+                0,
+                OutputEncodingKind::FixedWidthEnvelope,
+            ));
+        }
+        let mut layouts = ReservedVec::new(scope.allocation().clone());
+        layouts.reserve_exact(fields.len())?;
+        let mut next_start = 0;
+        for column in fields {
+            scope.check_cancelled()?;
+            let start = column.start.unwrap_or(next_start);
+            let layout = if field::is_group(column) {
+                let dimensions = field::group_dimensions(column, start).map_err(|e| {
+                    output_error(e.name, 0, start, OutputEncodingKind::FixedWidthLayout)
+                })?;
+                let children = column.fields.as_deref().unwrap_or_default();
+                let mut fields = ReservedVec::new(scope.allocation().clone());
+                fields.reserve_exact(children.len())?;
+                let mut next_child = 0;
+                for child in children {
+                    scope.check_cancelled()?;
+                    let child =
+                        PreparedField::new(child, child.start.unwrap_or(next_child), &scope)?;
+                    next_child = child.start + child.width;
+                    fields.push(child)?;
+                }
+                fields.as_mut_slice().sort_unstable_by_key(|f| f.start);
+                PreparedLayout::Group(PreparedGroup {
+                    name: retained_text(&column.name, &scope)?,
+                    start,
+                    width: dimensions.max_width,
+                    occurrence_width: dimensions.occurrence_width,
+                    count_width: column.count_field.as_ref().map_or(0, |c| c.width),
+                    occurs: column.occurs.clone().ok_or_else(|| {
+                        output_error(&column.name, 0, start, OutputEncodingKind::FixedWidthLayout)
+                    })?,
+                    fields,
+                })
+            } else {
+                PreparedLayout::Scalar(PreparedField::new(column, start, &scope)?)
+            };
+            next_start = layout.start() + layout.width();
+            layouts.push(layout)?;
+        }
+        layouts
+            .as_mut_slice()
+            .sort_unstable_by_key(PreparedLayout::start);
+        Ok(Self(SharedStorage::try_new(
+            PreparedConfig {
+                layouts,
+                separator,
+                envelope: crate::envelope_writer::PreparedEnvelope::from_names(
+                    header, footer, None, &scope,
+                )?,
+            },
+            scope.allocation(),
+        )?))
+    }
+}
+#[derive(Clone, Copy, Default)]
+struct FixedWidthState {
+    records: u64,
+    document_open: bool,
+}
+/// Streams complete records/sections into an admitted stage. Only delivered
+/// operations change counters or warning history; no record values are retained.
+pub struct FixedWidthEncoder {
+    config: FixedWidthEncoderConfig,
+    state: FixedWidthState,
+    warnings: ReservedVec<ReservedText>,
+}
+/// Owns prepared warning replacement until successful delivery or cancellation.
+pub struct FixedWidthPending {
+    state: FixedWidthState,
+    warnings: Option<ReservedVec<ReservedText>>,
+}
+impl FixedWidthEncoder {
+    /// Admit layout/configuration before retaining it; borrows caller columns.
+    pub fn new(
+        fields: &[Column],
+        config: &FixedWidthWriterConfig,
+        resources: WriterResources,
+    ) -> Result<Self, FormatError> {
+        Self::from_config(
+            FixedWidthEncoderConfig::new(fields, config, &resources)?,
+            resources,
+        )
+    }
+    /// Share admitted immutable policy; each writer owns its warning history.
+    pub fn from_config(
+        config: FixedWidthEncoderConfig,
+        resources: WriterResources,
+    ) -> Result<Self, FormatError> {
+        Ok(Self {
+            config,
+            state: FixedWidthState::default(),
+            warnings: ReservedVec::new(resources.scope()?.allocation().clone()),
+        })
+    }
+    /// Admit the concrete wrapper through its actual backing deallocation.
+    pub fn into_boxed_writer<W: Write + Send + 'static>(
+        self,
+        destination: W,
+        resources: WriterResources,
+    ) -> Result<crate::traits::FormatWriterHandle, FormatError> {
+        let scope = resources.scope()?;
+        let writer = PreparedWriter::new(destination, self, resources)?;
+        Ok(crate::traits::FormatWriterHandle::try_new(
+            writer,
+            scope.allocation(),
+        )?)
+    }
+    /// Complete committed warnings; pending failures never alter this history.
+    pub fn truncation_warnings(&self) -> &[ReservedText] {
+        self.warnings.as_slice()
+    }
+    /// Successfully delivered body records since the last delivered begin.
+    pub fn record_count(&self) -> u64 {
+        self.state.records
+    }
+    /// Whether the last delivered document transition opened a document.
+    pub fn document_open(&self) -> bool {
+        self.state.document_open
+    }
+}
+impl<W: Write + Send> FormatWriter for PreparedWriter<W, FixedWidthEncoder> {
+    fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
+        self.write_operation(OutputOperation::Record(record))
+    }
+    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        self.write_operation(OutputOperation::BeginDocument(doc))
+    }
+    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        self.write_operation(OutputOperation::EndDocument(doc))
+    }
+    fn flush(&mut self) -> Result<(), FormatError> {
+        PreparedWriter::flush(self)
+    }
+    fn flush_bytes(&mut self) -> Result<(), FormatError> {
+        PreparedWriter::flush_bytes(self)
+    }
+}
+
+// f64 display fits 327 bytes, decimal fits 32 and calendar types fit 32.
+// Strings bypass this fixed scratch and retain their original record owner.
+fn physical_scalar<T>(
+    value: &Value,
+    name: &str,
+    index: usize,
+    envelope: bool,
+    action: impl FnOnce(&str) -> Result<T, FormatError>,
+) -> Result<T, FormatError> {
+    use std::fmt::Write as _;
+    struct Scratch {
+        bytes: [u8; 1024],
+        len: usize,
+    }
+    impl std::fmt::Write for Scratch {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            let end = self
+                .len
+                .checked_add(s.len())
+                .filter(|end| *end <= self.bytes.len())
+                .ok_or(std::fmt::Error)?;
+            self.bytes[self.len..end].copy_from_slice(s.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+    let mut text = Scratch {
+        bytes: [0; 1024],
+        len: 0,
+    };
+    let result = match value {
+        Value::Null => return action(""),
+        Value::String(s) => return action(s.as_str()),
+        Value::Bool(v) => return action(if *v { "true" } else { "false" }),
+        Value::Integer(v) => write!(text, "{v}"),
+        Value::Float(v) => write!(text, "{v}"),
+        Value::Decimal(v) => write!(text, "{v}"),
+        Value::Date(v) => v.format("%Y%m%d").write_to(&mut text),
+        Value::DateTime(v) => v.format("%Y%m%d%H%M%S").write_to(&mut text),
+        Value::Array(_) | Value::Map(_) => {
+            return Err(output_error(
+                name,
+                index,
+                0,
+                if envelope {
+                    OutputEncodingKind::FixedWidthEnvelope
+                } else {
+                    OutputEncodingKind::FixedWidthScalar
+                },
+            ));
+        }
+    };
+    result.map_err(|_| output_error(name, index, 0, OutputEncodingKind::FixedWidthScalar))?;
+    let text = std::str::from_utf8(&text.bytes[..text.len])
+        .map_err(|_| output_error(name, index, 0, OutputEncodingKind::FixedWidthScalar))?;
+    action(text)
+}
+fn padding(
+    stage: &mut dyn Write,
+    byte: u8,
+    mut count: usize,
+    scope: &WriterScope,
+) -> Result<(), FormatError> {
+    let bytes = [byte; 1024];
+    while count != 0 {
+        scope.check_cancelled()?;
+        let n = count.min(bytes.len());
+        stage.write_all(&bytes[..n])?;
+        count -= n;
+    }
+    Ok(())
+}
+fn separator(stage: &mut dyn Write, separator: &LineSeparator) -> Result<(), FormatError> {
+    stage.write_all(match separator {
+        LineSeparator::Lf => b"\n",
+        LineSeparator::CrLf => b"\r\n",
+        LineSeparator::None => b"",
+    })?;
+    Ok(())
+}
+fn kept<'a>(text: &'a str, field: &PreparedField) -> &'a str {
+    let mut end = text.len().min(field.width);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+fn append_warning(
+    warnings: &mut ReservedVec<ReservedText>,
+    field: &PreparedField,
+    text: &str,
+    group: Option<&str>,
+    scope: &WriterScope,
+) -> Result<(), FormatError> {
+    use std::fmt::Write as _;
+    struct Message {
+        text: ReservedText,
+        error: Option<crate::preparation::ResourceError>,
+    }
+    impl std::fmt::Write for Message {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.text.push_str(text).map_err(|error| {
+                self.error = Some(error);
+                std::fmt::Error
+            })
+        }
+    }
+    let mut message = Message {
+        text: ReservedText::new(scope.allocation().clone()),
+        error: None,
+    };
+    let result = if let Some(group) = group {
+        write!(
+            message,
+            "group '{group}': child '{}' truncated from {} to {} bytes",
+            field.name.as_str(),
+            text.len(),
+            field.width
+        )
+    } else {
+        write!(
+            message,
+            "field '{}': value '{}' truncated to {} bytes",
+            field.name.as_str(),
+            text,
+            field.width
+        )
+    };
+    if result.is_err() {
+        return Err(message
+            .error
+            .unwrap_or_else(|| {
+                crate::preparation::ResourceError::new(
+                    crate::preparation::ResourceErrorKind::Layout,
+                    0,
+                    0,
+                )
+            })
+            .into());
+    }
+    warnings.push(message.text)?;
+    Ok(())
+}
+fn prepared_cell(
+    stage: &mut dyn Write,
+    field: &PreparedField,
+    value: &Value,
+    index: usize,
+    group: Option<&str>,
+    warnings: &mut ReservedVec<ReservedText>,
+    scope: &WriterScope,
+) -> Result<(), FormatError> {
+    physical_scalar(value, field.name.as_str(), index, false, |text| {
+        if text.len() > field.width {
+            match field.truncation {
+                TruncationPolicy::Error => {
+                    return Err(output_error(
+                        field.name.as_str(),
+                        index,
+                        field.width,
+                        OutputEncodingKind::FixedWidthTruncation,
+                    ));
+                }
+                TruncationPolicy::Warn => append_warning(warnings, field, text, group, scope)?,
+                TruncationPolicy::Silent => {}
+            }
+        }
+        let text = kept(text, field);
+        if matches!(field.justify, Justify::Right) {
+            padding(stage, field.pad, field.width - text.len(), scope)?;
+        }
+        stage.write_all(text.as_bytes())?;
+        if matches!(field.justify, Justify::Left) {
+            padding(stage, field.pad, field.width - text.len(), scope)?;
+        }
+        Ok(())
+    })
+}
+fn blank_cell(
+    field: &PreparedField,
+    value: &Value,
+    index: usize,
+    scope: &WriterScope,
+) -> Result<bool, FormatError> {
+    if !field.trim || matches!(value, Value::Array(_) | Value::Map(_)) {
+        return Ok(false);
+    }
+    physical_scalar(value, field.name.as_str(), index, false, |text| {
+        let text = kept(text, field);
+        let pads = field.width - text.len();
+        let left = if matches!(field.justify, Justify::Right) {
+            pads
+        } else {
+            0
+        };
+        let right = pads - left;
+        let pad = char::from(field.pad);
+        let (leading, trailing) = if field.read_right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        // Virtual padding is handled once regardless of its declared width.
+        // Only actual text is scanned, in the reader trimming direction.
+        let mut stripping = leading == 0 || Some(pad) == field.read_pad;
+        if !stripping && !pad.is_whitespace() {
+            return Ok(false);
+        }
+        let mut check = |offset: usize, c: char| -> Result<bool, FormatError> {
+            if offset % 1024 == 0 {
+                scope.check_cancelled()?;
+            }
+            if stripping && Some(c) == field.read_pad {
+                return Ok(true);
+            }
+            stripping = false;
+            Ok(c.is_whitespace())
+        };
+        if field.read_right {
+            for (offset, c) in text.chars().enumerate() {
+                if !check(offset, c)? {
+                    return Ok(false);
+                }
+            }
+        } else {
+            for (offset, c) in text.chars().rev().enumerate() {
+                if !check(offset, c)? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(trailing == 0 || (stripping && Some(pad) == field.read_pad) || pad.is_whitespace())
+    })
+}
+fn prepared_group(
+    stage: &mut dyn Write,
+    group: &PreparedGroup,
+    value: &Value,
+    index: usize,
+    warnings: &mut ReservedVec<ReservedText>,
+    scope: &WriterScope,
+) -> Result<usize, FormatError> {
+    let failure = |kind| output_error(group.name.as_str(), index, group.start, kind);
+    let supplied = match value {
+        Value::Null => &[][..],
+        Value::Array(values) => values.as_slice(),
+        _ => return Err(failure(OutputEncodingKind::FixedWidthOccurrence)),
+    };
+    if supplied.len() < group.occurs.min {
+        return Err(failure(OutputEncodingKind::FixedWidthCardinality));
+    }
+    let selected = if supplied.len() <= group.occurs.max {
+        supplied
+    } else {
+        match (group.occurs.on_overflow, group.occurs.keep) {
+            (FixedWidthOverflow::Truncate, Some(FixedWidthTruncateKeep::First)) => {
+                &supplied[..group.occurs.max]
+            }
+            (FixedWidthOverflow::Truncate, Some(FixedWidthTruncateKeep::Last)) => {
+                &supplied[supplied.len() - group.occurs.max..]
+            }
+            _ => return Err(failure(OutputEncodingKind::FixedWidthCardinality)),
+        }
+    };
+    if group.count_width != 0 {
+        // usize has at most 20 decimal digits; no count-width-sized scratch.
+        let count = i64::try_from(selected.len())
+            .map_err(|_| failure(OutputEncodingKind::FixedWidthCardinality))?;
+        physical_scalar(
+            &Value::Integer(count),
+            group.name.as_str(),
+            index,
+            false,
+            |text| {
+                padding(stage, b'0', group.count_width - text.len(), scope)?;
+                stage.write_all(text.as_bytes())?;
+                Ok(())
+            },
+        )?;
+    }
+    let slots = match group.occurs.fill {
+        FixedWidthFill::Pad => group.occurs.max,
+        FixedWidthFill::Shift => selected.len(),
+    };
+    for occurrence in 0..slots {
+        scope.check_cancelled()?;
+        let values = match selected.get(occurrence) {
+            Some(Value::Map(values)) => Some(values.as_map()),
+            Some(_) => return Err(failure(OutputEncodingKind::FixedWidthOccurrence)),
+            None => None,
+        };
+        if let Some(values) = values
+            && group.count_width == 0
+            && matches!(group.occurs.fill, FixedWidthFill::Pad)
+        {
+            let mut blank = true;
+            for field in group.fields.as_slice() {
+                scope.check_cancelled()?;
+                if !blank_cell(
+                    field,
+                    values.get(field.name.as_str()).unwrap_or(&Value::Null),
+                    index,
+                    scope,
+                )? {
+                    blank = false;
+                    break;
+                }
+            }
+            if blank {
+                return Err(failure(OutputEncodingKind::FixedWidthBlankOccurrence));
+            }
+        }
+        let mut at = 0;
+        for field in group.fields.as_slice() {
+            scope.check_cancelled()?;
+            padding(stage, b' ', field.start - at, scope)?;
+            let value = values
+                .and_then(|values| values.get(field.name.as_str()))
+                .unwrap_or(&Value::Null);
+            prepared_cell(
+                stage,
+                field,
+                value,
+                index,
+                Some(group.name.as_str()),
+                warnings,
+                scope,
+            )?;
+            at = field.start + field.width;
+        }
+        padding(stage, b' ', group.occurrence_width - at, scope)?;
+    }
+    Ok(group.count_width + slots * group.occurrence_width)
+}
+impl FormatEncoder for FixedWidthEncoder {
+    type Pending = FixedWidthPending;
+    fn prepare(
+        &self,
+        operation: OutputOperation<'_>,
+        stage: &mut dyn Write,
+        scope: &WriterScope,
+    ) -> Result<Self::Pending, FormatError> {
+        scope.check_cancelled()?;
+        let mut state = self.state;
+        let mut warnings = None;
+        match operation {
+            OutputOperation::Record(record) => {
+                for (index, (name, _)) in record.iter_user_fields().enumerate() {
+                    scope.check_cancelled()?;
+                    if !self
+                        .config
+                        .0
+                        .layouts
+                        .as_slice()
+                        .iter()
+                        .any(|layout| layout.name() == name)
+                    {
+                        return Err(output_error(
+                            name,
+                            index,
+                            0,
+                            OutputEncodingKind::SchemaDrift,
+                        ));
+                    }
+                }
+                let mut pending = ReservedVec::new(scope.allocation().clone());
+                let mut at = 0;
+                let mut shifted = 0;
+                for (index, layout) in self.config.0.layouts.as_slice().iter().enumerate() {
+                    scope.check_cancelled()?;
+                    let start = layout.start() - shifted;
+                    padding(stage, b' ', start - at, scope)?;
+                    let value = record.get(layout.name()).unwrap_or(&Value::Null);
+                    let width = match layout {
+                        PreparedLayout::Scalar(field) => {
+                            prepared_cell(stage, field, value, index, None, &mut pending, scope)?;
+                            field.width
+                        }
+                        PreparedLayout::Group(group) => {
+                            prepared_group(stage, group, value, index, &mut pending, scope)?
+                        }
+                    };
+                    shifted += layout.width() - width;
+                    at = start + width;
+                }
+                separator(stage, &self.config.0.separator)?;
+                if !pending.is_empty() {
+                    let mut replacement = ReservedVec::new(scope.allocation().clone());
+                    for text in self.warnings.as_slice().iter().chain(pending.as_slice()) {
+                        replacement.push(retained_text(text.as_str(), scope)?)?;
+                    }
+                    warnings = Some(replacement);
+                }
+                state.records = state.records.saturating_add(1);
+            }
+            OutputOperation::BeginDocument(doc) | OutputOperation::EndDocument(doc) => {
+                let begin = matches!(operation, OutputOperation::BeginDocument(_));
+                if let Some(envelope) = &self.config.0.envelope {
+                    let fields = if begin {
+                        envelope.header_fields(doc)
+                    } else {
+                        envelope.footer_fields(doc)
+                    };
+                    if let Some(fields) = fields {
+                        for (index, (name, value)) in fields.iter().enumerate() {
+                            scope.check_cancelled()?;
+                            physical_scalar(value, name, index, true, |text| {
+                                stage.write_all(text.as_bytes())?;
+                                Ok(())
+                            })?;
+                        }
+                        separator(stage, &self.config.0.separator)?;
+                    }
+                    state.document_open = begin;
+                    if begin {
+                        state.records = 0;
+                    }
+                }
+            }
+            OutputOperation::Finalize => {}
+        }
+        Ok(FixedWidthPending { state, warnings })
+    }
+    fn commit(&mut self, pending: Self::Pending) {
+        self.state = pending.state;
+        if let Some(warnings) = pending.warnings {
+            self.warnings = warnings;
+        }
+    }
+}
 
 /// Configuration for the fixed-width writer.
 #[derive(Clone)]
@@ -143,6 +858,7 @@ impl<W: Write> FixedWidthWriter<W> {
         fields: Vec<Column>,
         config: FixedWidthWriterConfig,
     ) -> Result<Self, FormatError> {
+        field::validate_write_layout(&fields)?;
         // Byte positions resolve exactly as the reader's (`start` plus
         // `width`/`end`), so what this writer emits at a range is what the
         // reader slices back out. A column omitting `start` continues at the

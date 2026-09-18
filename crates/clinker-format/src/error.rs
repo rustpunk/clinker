@@ -18,6 +18,13 @@ pub enum OutputEncodingKind {
     XmlName,
     XmlValue,
     XmlPath,
+    FixedWidthLayout,
+    FixedWidthScalar,
+    FixedWidthTruncation,
+    FixedWidthCardinality,
+    FixedWidthOccurrence,
+    FixedWidthBlankOccurrence,
+    FixedWidthEnvelope,
 }
 
 /// Inline diagnostic excerpt; the numeric field identity remains authoritative.
@@ -402,6 +409,20 @@ impl fmt::Display for FormatError {
                         r"invalid or colliding XML field path; use distinct leaf paths such as item.id and item.name; escape a literal dot as \. or a backslash as \\",
                     OutputEncodingKind::Json =>
                         "value has no valid JSON representation; check finite numbers, nested keys and depth",
+                    OutputEncodingKind::FixedWidthLayout =>
+                        "invalid fixed-width layout; declare positive disjoint byte ranges, single-byte padding and finite valid repetition bounds",
+                    OutputEncodingKind::FixedWidthScalar =>
+                        "fixed-width cell requires a scalar; project scalar fields or declare a repeating map group",
+                    OutputEncodingKind::FixedWidthTruncation =>
+                        "value exceeds its declared byte width with truncation: error; shorten the value, widen the field or select truncation: warn|silent",
+                    OutputEncodingKind::FixedWidthCardinality =>
+                        "group occurrence count violates its declared min/max; adjust the array or select on_overflow: truncate with keep: first|last",
+                    OutputEncodingKind::FixedWidthOccurrence =>
+                        "group requires an array of records; provide [] for zero occurrences or maps with the declared scalar child fields",
+                    OutputEncodingKind::FixedWidthBlankOccurrence =>
+                        "occurrence renders exactly like an unused padded slot; add count_field or provide a non-padding child value",
+                    OutputEncodingKind::FixedWidthEnvelope =>
+                        "fixed-width document sections require scalar fields and do not support a computed footer count; project scalar section values and omit footer_record_count_field",
                 }
             ),
             Self::Resource(error) => error.fmt(f),
