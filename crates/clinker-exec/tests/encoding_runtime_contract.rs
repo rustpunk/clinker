@@ -1,4 +1,4 @@
-//! CSV and native JSON/XML coverage through compiled plans and physical files.
+//! Text format coverage through compiled plans and physical files.
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -678,4 +678,180 @@ nodes:
         assert!(executed.insert(*mode));
     }
     assert_eq!(executed, MODES.iter().copied().collect());
+}
+
+#[test]
+fn physical_failed_files_preserve_source_population_sink_bytes_and_lifecycle() {
+    use clinker_exec::progress::RunProgress;
+    use clinker_exec::telemetry::{MetricKey, TelemetryArena};
+    use clinker_plan::config::ClinkerToml;
+    let policy = ClinkerToml::parse(
+        r#"
+[observability]
+arena_bytes = "768KB"
+ordinary_lane_bytes = "512KB"
+high_severity_lane_bytes = "256KB"
+max_batch_bytes = "8KB"
+rate_limit_per_second = 100000
+rate_limit_burst = 100000
+[observability.otlp]
+endpoint = "https://collector.invalid"
+[observability.otlp.auth]
+mode = "none"
+"#,
+    )
+    .unwrap()
+    .resolve_observability(None)
+    .unwrap();
+    for format in ["fixed_width", "swift"] {
+        let schema = if format == "fixed_width" {
+            "[{ name: number, type: int, start: 0, width: 2 }]"
+        } else {
+            "[{ name: block, type: string }, { name: tag, type: string }, { name: value, type: string }]"
+        };
+        let yaml = format!(
+            r#"pipeline: {{ name: physical_failure_counts }}
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: {format}
+      path: input.dat
+      schema: {schema}
+  - type: sink
+    name: out
+    input: rows
+    config:
+      name: out
+      type: json
+      path: output.json
+      options: {{ format: ndjson }}
+"#
+        );
+        let plan = parse_config(&yaml)
+            .unwrap()
+            .compile(&CompileContext::default())
+            .unwrap();
+        let valid: &[u8] = if format == "fixed_width" {
+            b"01\n"
+        } else {
+            b"{4:\n:20:one\n-}"
+        };
+        let first: &[u8] = if format == "fixed_width" {
+            b"{\"number\":1}\n"
+        } else {
+            b"{\"block\":\"4\",\"tag\":\"20\",\"value\":\"one\"}\n"
+        };
+        let continuing =
+            parse_config(&yaml.replace("nodes:", "error_handling:\n  strategy: continue\nnodes:"))
+                .unwrap()
+                .compile(&CompileContext::default())
+                .unwrap();
+        for variant in [
+            "first",
+            "second",
+            "late",
+            "unsupported-second",
+            "numeric-continue",
+        ] {
+            if variant == "numeric-continue" && format == "swift" {
+                continue;
+            }
+            let invalid: &[u8] = if variant == "numeric-continue" {
+                b"XX\n03\n"
+            } else if variant == "unsupported-second" {
+                b"\xff\xfe\0\0"
+            } else if format == "fixed_width" {
+                b"\xff1\n"
+            } else {
+                b"{4:\n:20:\xff\n-}"
+            };
+            let inputs = match variant {
+                "second" | "unsupported-second" => vec![valid.to_vec(), invalid.to_vec()],
+                "numeric-continue" => vec![[valid, invalid].concat()],
+                "late" if format == "fixed_width" => vec![[valid, invalid].concat()],
+                "late" => vec![
+                    [
+                        b"{4:\n:20:one\n:21:".as_slice(),
+                        &vec![b'x'; 32768],
+                        b"\xff\n-}",
+                    ]
+                    .concat(),
+                ],
+                _ => vec![invalid.to_vec()],
+            };
+            let expected = if variant.ends_with("second")
+                || variant == "numeric-continue"
+                || (variant == "late" && format == "fixed_width")
+            {
+                first
+            } else {
+                b""
+            };
+            let count = u64::from(!expected.is_empty());
+            let root = tempfile::tempdir().unwrap();
+            let mut files = Vec::new();
+            for (index, bytes) in inputs.iter().enumerate() {
+                let path = root.path().join(format!("input-{index}.dat"));
+                std::fs::write(&path, bytes).unwrap();
+                files.push(FileSlot::new(
+                    path.clone(),
+                    Box::new(std::fs::File::open(path).unwrap()),
+                ));
+            }
+            let output = root.path().join("output.json");
+            let writers = WriterRegistry {
+                single: [(
+                    "out".into(),
+                    Box::new(std::fs::File::create(&output).unwrap()) as Box<dyn Write + Send>,
+                )]
+                .into(),
+                ..Default::default()
+            };
+            let progress = RunProgress::new();
+            let (producer, receiver) = TelemetryArena::reserve(&policy).unwrap();
+            let params = PipelineRunParams {
+                progress: Some(progress.clone()),
+                telemetry_producer: Some(producer),
+                ..Default::default()
+            };
+            let error = PipelineExecutor::run_plan_with_readers_writers(
+                if variant == "numeric-continue" {
+                    &continuing
+                } else {
+                    &plan
+                },
+                [("rows".into(), SourceInput::Files(files))].into(),
+                writers,
+                &params,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, clinker_plan::PipelineError::Format(_)),
+                "{format}/{variant}: {error:?}"
+            );
+            assert_eq!(progress.sample().records_read, count, "{format}/{variant}");
+            assert_eq!(
+                std::fs::read(&output).unwrap(),
+                expected,
+                "{format}/{variant}"
+            );
+            let (mut records, mut bytes, mut started, mut failed, mut completed) = (0, 0, 0, 0, 0);
+            while let Some(batch) = receiver.try_recv_batch() {
+                records += batch.metric(MetricKey::SinkRecords);
+                bytes += batch.metric(MetricKey::SinkBytes);
+                started += batch.metric(MetricKey::SourceStarted);
+                failed += batch.metric(MetricKey::SourceFailed);
+                completed += batch.metric(MetricKey::SourceCompleted);
+                assert_eq!(batch.metric(MetricKey::SinkErrors), 0);
+                assert_eq!(batch.metric(MetricKey::SourceInterrupted), 0);
+            }
+            assert_eq!(
+                (records, bytes, started, failed, completed),
+                (count, expected.len() as u64, 1, 1, 0),
+                "{format}/{variant}"
+            );
+        }
+    }
 }
