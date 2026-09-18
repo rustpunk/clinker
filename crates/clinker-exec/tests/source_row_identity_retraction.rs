@@ -6,6 +6,8 @@ mod resource_fixtures;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::time::Duration;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{
@@ -13,7 +15,8 @@ use clinker_exec::executor::{
     SourceRowId,
 };
 use clinker_exec::source::multi_file::FileSlot;
-use clinker_plan::config::{CompileContext, parse_config};
+use clinker_format::FormatError;
+use clinker_plan::config::{CompileContext, ConcurrencyConfig, parse_config};
 use clinker_plan::plan::CompiledPlan;
 
 fn compile_failure_pipeline(granularity: &str, memory_limit: &str) -> CompiledPlan {
@@ -189,6 +192,139 @@ fn large_source(prefix: &str) -> String {
     csv
 }
 
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+// Each sender lives in its Source's startup callback. If ingest fails or is
+// cancelled before reaching that callback, dropping it disconnects the peer.
+struct SourceStartup {
+    ready: SyncSender<()>,
+    peer_ready: Receiver<()>,
+}
+
+impl SourceStartup {
+    fn pair() -> [Self; 2] {
+        let (a_tx, a_rx) = mpsc::sync_channel(1);
+        let (b_tx, b_rx) = mpsc::sync_channel(1);
+        [
+            Self {
+                ready: a_tx,
+                peer_ready: b_rx,
+            },
+            Self {
+                ready: b_tx,
+                peer_ready: a_rx,
+            },
+        ]
+    }
+
+    fn wait(self, timeout: Duration) -> Result<(), FormatError> {
+        self.ready.send(()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "peer source exited before startup",
+            )
+        })?;
+        self.peer_ready.recv_timeout(timeout).map_err(|error| {
+            std::io::Error::new(
+                match error {
+                    mpsc::RecvTimeoutError::Timeout => std::io::ErrorKind::TimedOut,
+                    mpsc::RecvTimeoutError::Disconnected => std::io::ErrorKind::BrokenPipe,
+                },
+                "peer source did not complete startup",
+            )
+        })?;
+        Ok(())
+    }
+}
+
+fn pressure_plan(memory_limit: &str) -> CompiledPlan {
+    let mut config = compile_failure_pipeline("document", memory_limit)
+        .config()
+        .clone();
+    // The startup callbacks hold read permits, so both must be able to run
+    // concurrently even when the host reports only one available CPU.
+    config.pipeline.concurrency = Some(ConcurrencyConfig {
+        threads: Some(2),
+        chunk_size: None,
+    });
+    config
+        .compile(&CompileContext::default())
+        .expect("pressure plan compiles")
+}
+
+#[test]
+fn predecoded_startup_requires_peer_readiness_before_the_second_row() {
+    let plan = pressure_plan("1M");
+    let csv = small_source("a", false);
+    for peer_ready in [false, true] {
+        let [startup, peer] = SourceStartup::pair();
+        if peer_ready {
+            peer.ready.send(()).expect("peer startup notification");
+        }
+        let SourceInput::Records(mut source) =
+            resource_fixtures::predecoded_csv_source_with_startup(
+                plan.config(),
+                &CompileContext::default(),
+                "src_a",
+                &[("a.csv", &csv)],
+                Some(Box::new(move || startup.wait(Duration::ZERO))),
+            )
+        else {
+            panic!("predecoded fixture must be a RecordSource");
+        };
+        assert!(
+            source
+                .next_record()
+                .expect("first row precedes startup")
+                .is_some()
+        );
+        assert!(matches!(
+            peer.peer_ready.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let second = source.next_record();
+        assert_eq!(
+            peer.peer_ready.try_recv(),
+            Ok(()),
+            "first row was accepted before startup"
+        );
+        if peer_ready {
+            assert!(second.expect("both sources ready").is_some());
+            assert!(
+                source
+                    .next_record()
+                    .expect("startup callback runs once")
+                    .is_none()
+            );
+        } else {
+            assert!(
+                matches!(second, Err(FormatError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+            );
+        }
+    }
+}
+
+#[test]
+fn predecoded_startup_releases_waiter_when_peer_exits() {
+    let [startup, peer] = SourceStartup::pair();
+    let waiter = std::thread::spawn(move || startup.wait(STARTUP_TIMEOUT));
+    // Observe the waiter at the rendezvous before simulating an ingest error
+    // or cancellation dropping the other Source's unused startup callback.
+    peer.peer_ready
+        .recv_timeout(STARTUP_TIMEOUT)
+        .expect("waiter reached startup");
+    drop(peer);
+    assert!(
+        matches!(waiter.join().expect("waiter joins"), Err(FormatError::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+    );
+
+    let [startup, peer] = SourceStartup::pair();
+    drop(peer);
+    assert!(
+        matches!(startup.wait(Duration::ZERO), Err(FormatError::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+    );
+}
+
 #[test]
 fn dlq_document_collateral_preserves_identity_and_records_when_spilled() {
     if clinker_exec::pipeline::memory::rss_bytes().is_none() {
@@ -197,15 +333,28 @@ fn dlq_document_collateral_preserves_identity_and_records_when_spilled() {
 
     let src_a = large_source("a");
     let src_b = large_source("b");
-    let resident_plan = compile_failure_pipeline("document", "1G");
-    let spilled_plan = compile_failure_pipeline("document", "1M");
-    // Document collateral, not the CSV decoder, owns this pressure fixture.
+    let resident_plan = pressure_plan("1G");
+    let spilled_plan = pressure_plan("1M");
+    // Isolate downstream collateral spilling from initial document admission:
+    // neither foreign-record queue may bulk-fill until both initial contexts
+    // exist. This is a fixture precondition, not a Source startup guarantee.
     let readers = |plan: &CompiledPlan| {
-        resource_fixtures::predecoded_csv_readers(
-            plan.config(),
-            &CompileContext::default(),
-            &[("src_a", &src_a), ("src_b", &src_b)],
-        )
+        [("src_a", "a.csv", &src_a), ("src_b", "b.csv", &src_b)]
+            .into_iter()
+            .zip(SourceStartup::pair())
+            .map(|((name, path, csv), startup)| {
+                (
+                    name.to_string(),
+                    resource_fixtures::predecoded_csv_source_with_startup(
+                        plan.config(),
+                        &CompileContext::default(),
+                        name,
+                        &[(path, csv)],
+                        Some(Box::new(move || startup.wait(STARTUP_TIMEOUT))),
+                    ),
+                )
+            })
+            .collect()
     };
     let (resident, _) = run_failure_pipeline_with_readers(&resident_plan, readers(&resident_plan));
     let (spilled, output) =

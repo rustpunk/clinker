@@ -38,8 +38,8 @@ pub fn add_csv_workspace(
     config.pipeline.memory.limit = Some((operator_budget + workspace).to_string());
 }
 
-/// Decode valid CSV fixtures before the run so a downstream pressure test owns
-/// its entire runtime budget. This does not exercise whole-input CSV admission.
+/// Decode valid CSV fixtures before the run to isolate downstream pressure from
+/// whole-input CSV admission. Initial document metadata still requires admission.
 /// Records retain the compiled source's types/projection and the supplied physical
 /// file identities, including open/close events for empty files. Envelope and
 /// malformed-input tests must keep the byte-stream source instead.
@@ -49,6 +49,21 @@ pub fn predecoded_csv_source(
     context: &clinker_plan::config::CompileContext,
     source_name: &str,
     files: &[(&str, &str)],
+) -> clinker_exec::source::SourceInput {
+    predecoded_csv_source_with_startup(config, context, source_name, files, None)
+}
+
+/// Optionally run a one-shot startup callback before reading the second row.
+/// In the ingest driver this point follows acceptance of the first row and its
+/// initial document context. A callback that waits for peer Sources requires
+/// enough configured Source read slots for every waiting participant.
+#[allow(dead_code)]
+pub fn predecoded_csv_source_with_startup(
+    config: &clinker_plan::config::PipelineConfig,
+    context: &clinker_plan::config::CompileContext,
+    source_name: &str,
+    files: &[(&str, &str)],
+    after_first_row: Option<Box<dyn FnOnce() -> Result<(), clinker_format::FormatError> + Send>>,
 ) -> clinker_exec::source::SourceInput {
     use clinker_exec::source::RecordSource;
     use clinker_format::{FormatError, SourceLifecycleEvent};
@@ -66,6 +81,8 @@ pub fn predecoded_csv_source(
         active: Option<DecodedFile>,
         current_file: Option<Arc<str>>,
         events: Vec<SourceLifecycleEvent>,
+        returned_first_row: bool,
+        after_first_row: Option<Box<dyn FnOnce() -> Result<(), FormatError> + Send>>,
     }
 
     impl DecodedCsv {
@@ -90,8 +107,14 @@ pub fn predecoded_csv_source(
         }
 
         fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
+            if self.returned_first_row
+                && let Some(after_first_row) = self.after_first_row.take()
+            {
+                after_first_row()?;
+            }
             while let Some(file) = &mut self.active {
                 if let Some(row) = file.rows.next() {
+                    self.returned_first_row = true;
                     return Ok(Some(row));
                 }
                 self.advance();
@@ -175,6 +198,8 @@ pub fn predecoded_csv_source(
         active: None,
         current_file: None,
         events: Vec::new(),
+        returned_first_row: false,
+        after_first_row,
     };
     source.advance();
     clinker_exec::source::SourceInput::Records(Box::new(source))
