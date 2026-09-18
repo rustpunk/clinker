@@ -353,6 +353,169 @@ mod swift_prepared {
         writer.flush().unwrap();
         assert_eq!(writer.destination(), b"{4:\r\n:21: final \r\n\n\r\n-}");
     }
+
+    #[test]
+    fn swift_scalar_values_keep_natural_spelling_and_optional_block_semantics() {
+        for (value, expected) in [
+            (Value::Null, ""),
+            (Value::Bool(true), "true"),
+            (Value::Integer(i64::MIN), "-9223372036854775808"),
+            (Value::Float(1.25), "1.25"),
+            (Value::Decimal("1.2300".parse().unwrap()), "1.2300"),
+            (Value::Date("2024-02-29".parse().unwrap()), "2024-02-29"),
+            (
+                Value::DateTime("2026-09-12T01:02:03.123456".parse().unwrap()),
+                "2026-09-12 01:02:03.123456",
+            ),
+            (Value::String("é好🦀  \n\n".into()), "é好🦀  \n\n"),
+        ] {
+            for block in [
+                Value::Null,
+                Value::String("".into()),
+                Value::String("04".into()),
+                Value::Integer(4),
+            ] {
+                let provider = provider();
+                let schema = record(Value::Null, Value::Null).schema().clone();
+                let row = Record::new(
+                    schema.clone(),
+                    vec![block, Value::Integer(20), value.clone()],
+                );
+                let encoder =
+                    SwiftEncoder::new(schema, &SwiftWriterConfig::default(), provider.resources())
+                        .unwrap();
+                let mut writer =
+                    PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+                writer.write_record(&row).unwrap();
+                writer.flush().unwrap();
+                assert_eq!(
+                    writer.destination(),
+                    format!("{{4:\r\n:20:{expected}\r\n-}}").as_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn swift_service_sources_reject_structures_and_unbalanced_bodies_atomically() {
+        for value in [
+            Value::Array(OwnedValues::from_vec(vec![])),
+            Value::Map(OwnedMap::from_map(Default::default())),
+            Value::String("}early".into()),
+            Value::String("{unclosed".into()),
+        ] {
+            for source in 0..4 {
+                let provider = provider();
+                let mut row = record(Value::String("20".into()), Value::String("body".into()));
+                doc(&mut row, &[("authored service", value.clone())]);
+                let mut config = SwiftWriterConfig {
+                    basic_header: Some("prefix".into()),
+                    ..Default::default()
+                };
+                match source {
+                    0 => {
+                        config.basic_header = None;
+                        config.basic_header_from_doc = Some("authored service".into());
+                    }
+                    1 => config.app_header_from_doc = Some("authored service".into()),
+                    2 => config.user_header_from_doc = Some("authored service".into()),
+                    _ => config.trailer_from_doc = Some("authored service".into()),
+                }
+                let encoder =
+                    SwiftEncoder::new(row.schema().clone(), &config, provider.resources()).unwrap();
+                let mut writer =
+                    PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+                let baseline = provider.used();
+                assert!(matches!(
+                    writer.write_record(&row),
+                    Err(FormatError::OutputEncoding {
+                        kind: OutputEncodingKind::SwiftScalar | OutputEncodingKind::SwiftService,
+                        ..
+                    })
+                ));
+                assert!(writer.destination().is_empty());
+                assert_eq!(provider.used(), baseline);
+            }
+        }
+    }
+
+    #[test]
+    fn swift_cancel_after_seal_discards_pending_trailer_and_poison_prevents_retry() {
+        use clinker_format::preparation::WriterResources;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let authority = Arc::new(super::cancellation_harness::Authority {
+            memory: provider(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cancel_after_seal: true,
+        });
+        let resources = WriterResources::new(authority.clone());
+        let mut row = record(Value::String("20".into()), Value::String("body".into()));
+        doc(
+            &mut row,
+            &[("tail", Value::String("tail bytes".repeat(3000).into()))],
+        );
+        let encoder = SwiftEncoder::new(
+            row.schema().clone(),
+            &SwiftWriterConfig {
+                trailer_from_doc: Some("tail".into()),
+                ..Default::default()
+            },
+            resources.clone(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, resources).unwrap();
+        let retained = authority.memory.used();
+        assert!(
+            matches!(writer.write_record(&row), Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Cancelled)
+        );
+        assert!(writer.destination().is_empty());
+        assert_eq!(authority.memory.used(), retained);
+        authority.cancelled.store(false, Ordering::SeqCst);
+        assert!(
+            matches!(writer.flush(), Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::DeliveryPoisoned)
+        );
+        drop(writer);
+        assert_eq!(authority.memory.used(), 0);
+    }
+
+    #[test]
+    fn swift_oversized_invalid_input_keeps_only_bounded_error_context() {
+        let provider = provider();
+        let payload = format!("{}\n:injected", "private payload ".repeat(100000));
+        let row = record(
+            Value::String("20".into()),
+            Value::String(payload.as_str().into()),
+        );
+        let encoder = SwiftEncoder::new(
+            row.schema().clone(),
+            &SwiftWriterConfig {
+                basic_header: Some("prefix".into()),
+                ..Default::default()
+            },
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        let baseline = provider.used();
+        let error = writer.write_record(&row).unwrap_err();
+        assert!(matches!(
+            error,
+            FormatError::OutputEncoding {
+                kind: OutputEncodingKind::SwiftContinuation,
+                offset: 1600001,
+                ..
+            }
+        ));
+        let message = error.to_string();
+        assert!(message.len() < 400);
+        assert!(!message.contains("private payload"));
+        assert!(writer.destination().is_empty());
+        assert_eq!(provider.used(), baseline);
+        drop(row);
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+        assert!(error.to_string().len() < 400);
+    }
 }
 
 mod fixed_width_prepared {

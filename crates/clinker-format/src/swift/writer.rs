@@ -25,9 +25,11 @@
 //! whose `block` is not `4` is rejected, since service blocks never arrive as
 //! records — they ride the document context).
 //!
-//! Memory model: streaming and O(1) in held state — only the open/finalized
-//! flags are retained, never a buffered message. A SWIFT message is a single
-//! indivisible envelope, so `flush` is the sole end-of-stream finalizer: it
+//! Memory model: the prepared encoder admits shared service configuration
+//! and the first record's resolved document trailer. Body text stays borrowed
+//! while each complete operation is staged under the supplied finite resources.
+//! Pending trailer ownership becomes committed only after successful delivery.
+//! A SWIFT message is a single indivisible envelope, so `flush` is the sole end-of-stream finalizer: it
 //! closes block 4 and writes the optional trailer exactly once. Byte-limit
 //! file splitting (which would flush — and thus finalize — mid-stream) is
 //! rejected for SWIFT outputs at config-validation time, so this writer is

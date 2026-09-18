@@ -7,6 +7,498 @@ use clinker_exec::{
 };
 use clinker_record::owned_storage::ResourceErrorKind;
 
+mod swift_resources {
+    use super::*;
+    use clinker_format::counting::{CountingWriter, SharedByteCounter};
+    use clinker_format::preparation::{FormatEncoder, OutputOperation, PreparedWriter};
+    use clinker_format::swift::writer::{SwiftEncoder, SwiftWriterConfig};
+    use clinker_format::{FormatError, FormatWriter};
+    use clinker_record::owned_storage::{OwnedKey, OwnedMap, SharedStorage};
+    use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Record, Schema, Value};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn record(body: &str, trailer: &str) -> Record {
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["tag".into(), "value".into()])));
+        let mut row = Record::new(
+            schema,
+            vec![Value::String("20".into()), Value::String(body.into())],
+        );
+        row.set_doc_ctx(SharedStorage::from_arc(Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("input.swift"),
+            EnvelopeRecord::from_sections([(
+                OwnedKey::from("authored trailer"),
+                Value::Map(OwnedMap::from_map(
+                    [(OwnedKey::from("body"), Value::String(trailer.into()))].into(),
+                )),
+            )]),
+        ))));
+        row
+    }
+    fn config() -> SwiftWriterConfig {
+        SwiftWriterConfig {
+            basic_header: Some("HEADER".into()),
+            trailer_from_doc: Some("authored trailer".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn swift_runtime_factory_config_and_writer_backings_remain_charged_through_deallocation() {
+        use clinker_format::splitting::WriterFactory;
+        use clinker_format::swift::writer::SwiftEncoderConfig;
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            256 * 1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            ShutdownToken::detached(),
+            None,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        )
+        .unwrap();
+        let resources = provider.resources();
+        let scope = resources.scope().unwrap();
+        let observer = arb.writer_resource_observer();
+        NATIVE_BACKINGS.with(|watch| {
+            watch.set(Some(NativeBackingWatch {
+                observer: &observer,
+                capture: Some(0),
+                capture_last: true,
+                backings: [NativeBacking::default(); 3],
+            }))
+        });
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                NATIVE_BACKINGS.with(|watch| watch.set(None));
+            }
+        }
+        let reset = Reset;
+        let config = SwiftEncoderConfig::new(&config(), &resources).unwrap();
+        NATIVE_BACKINGS.with(|watch| {
+            let mut state = watch.get().unwrap();
+            state.capture = None;
+            state.capture_last = false;
+            watch.set(Some(state));
+        });
+        let config_memory = observer.usage().memory;
+        let alias = config.clone();
+        let captured = resources.clone();
+        let make = move |destination, schema| {
+            SwiftEncoder::from_config(schema, config.clone())?
+                .into_boxed_writer(destination, captured.clone())
+        };
+        let factory_bytes = std::mem::size_of_val(&make);
+        NATIVE_BACKINGS.with(|watch| {
+            let mut state = watch.get().unwrap();
+            state.capture = Some(1);
+            watch.set(Some(state));
+        });
+        let factory = WriterFactory::try_new(make, scope.allocation()).unwrap();
+        let row = record("body", "tail");
+        let destination: Box<dyn Write + Send> = Box::new(std::io::sink());
+        let counter = SharedByteCounter::new();
+        let counting = CountingWriter::new(destination, counter);
+        NATIVE_BACKINGS.with(|watch| {
+            let mut state = watch.get().unwrap();
+            state.capture = Some(2);
+            watch.set(Some(state));
+        });
+        let mut writer = factory.create(counting, row.schema().clone()).unwrap();
+        let backings = NATIVE_BACKINGS.with(|watch| watch.get().unwrap().backings);
+        assert!(backings[0].bytes > 0);
+        assert_eq!(backings[1].bytes, factory_bytes);
+        assert_eq!(
+            backings[2].bytes,
+            std::mem::size_of::<PreparedWriter<CountingWriter<Box<dyn Write + Send>>, SwiftEncoder>>(
+            )
+        );
+        writer.write_record(&row).unwrap();
+        let before_factory_drop = observer.usage().memory;
+        drop(factory);
+        drop(writer);
+        assert_eq!(observer.usage().memory, config_memory);
+        arb.close_writer_resources();
+        assert!(observer.is_closed());
+        drop(alias);
+        let backings = NATIVE_BACKINGS.with(|watch| watch.get().unwrap().backings);
+        assert_eq!(
+            backings[1].admitted_at_deallocation,
+            Some(before_factory_drop)
+        );
+        // The writer drops its trailer before deallocating its own wrapper.
+        // Config remains live through the alias, so its bytes cannot mask an
+        // early release of this particular wrapper's grant.
+        assert_eq!(
+            backings[2].admitted_at_deallocation,
+            Some(config_memory + backings[2].bytes as u64)
+        );
+        assert_eq!(
+            backings[0].admitted_at_deallocation,
+            // SharedStorage moves its payload out, frees the shared backing,
+            // then drops payload children and the backing lease.
+            Some(config_memory)
+        );
+        for backing in backings {
+            assert!(backing.admitted_at_allocation >= backing.bytes as u64);
+            assert!(backing.admitted_at_deallocation.unwrap() >= backing.bytes as u64);
+        }
+        assert_eq!(observer.usage().memory, 0);
+        assert_eq!(arb.consumer_count(), 0);
+        drop(reset);
+    }
+
+    #[test]
+    fn swift_runtime_config_allocator_failures_release_every_partial_owner() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        use clinker_format::swift::writer::SwiftEncoderConfig;
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(256 * 1024).unwrap());
+        let config = SwiftWriterConfig {
+            basic_header: Some("header".repeat(2000)),
+            app_header_from_doc: Some("authored header".into()),
+            user_header: Some("{108:ref}".into()),
+            trailer_from_doc: Some("authored trailer".into()),
+            ..Default::default()
+        };
+        let resources = provider.resources();
+        ALLOCATIONS.with(|count| count.set(Some(0)));
+        let admitted = SwiftEncoderConfig::new(&config, &resources).unwrap();
+        let attempts = ALLOCATIONS.with(|count| count.replace(None).unwrap());
+        eprintln!("SWIFT configuration allocation attempts tested: {attempts}");
+        drop(admitted);
+        assert_eq!(provider.used(), 0);
+        assert!(attempts >= 5);
+        for fail in 1..=attempts {
+            ALLOCATIONS.with(|count| count.set(Some(0)));
+            FAIL_ALLOCATION.with(|fault| fault.set(Some(fail)));
+            let result = SwiftEncoderConfig::new(&config, &resources);
+            FAIL_ALLOCATION.with(|fault| fault.set(None));
+            ALLOCATIONS.with(|count| count.set(None));
+            assert!(
+                matches!(result, Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Allocation),
+                "allocation {fail}"
+            );
+            assert_eq!(provider.used(), 0);
+        }
+    }
+
+    #[test]
+    fn swift_runtime_pending_trailer_allocator_failures_release_replacement_overlap() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        let provider = MemoryOnlyResources::new(NonZeroUsize::new(256 * 1024).unwrap());
+        let resources = provider.resources();
+        let scope = resources.scope().unwrap();
+        let row = record("body", &"tail".repeat(12000));
+        let encoder = SwiftEncoder::new(row.schema().clone(), &config(), resources).unwrap();
+        let baseline = provider.used();
+        ALLOCATIONS.with(|count| count.set(Some(0)));
+        let pending = encoder
+            .prepare(OutputOperation::Record(&row), &mut std::io::sink(), &scope)
+            .unwrap();
+        let attempts = ALLOCATIONS.with(|count| count.replace(None).unwrap());
+        eprintln!("SWIFT trailer allocation attempts tested: {attempts}");
+        assert!(attempts >= 3);
+        drop(pending);
+        assert_eq!(provider.used(), baseline);
+        for fail in 1..=attempts {
+            ALLOCATIONS.with(|count| count.set(Some(0)));
+            FAIL_ALLOCATION.with(|fault| fault.set(Some(fail)));
+            let result =
+                encoder.prepare(OutputOperation::Record(&row), &mut std::io::sink(), &scope);
+            FAIL_ALLOCATION.with(|fault| fault.set(None));
+            ALLOCATIONS.with(|count| count.set(None));
+            assert!(
+                matches!(result, Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Allocation),
+                "allocation {fail}"
+            );
+            assert_eq!(provider.used(), baseline);
+        }
+    }
+    struct Destination {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        calls: Arc<AtomicUsize>,
+        failure: Arc<AtomicUsize>,
+        cancellation: Arc<AtomicUsize>,
+        token: ShutdownToken,
+    }
+    impl Write for Destination {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut output = self.bytes.lock().unwrap();
+            let remaining = self
+                .failure
+                .load(Ordering::SeqCst)
+                .saturating_sub(output.len());
+            if remaining == 0 {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let count = bytes.len().min(remaining);
+            output.extend_from_slice(&bytes[..count]);
+            if output.len() >= self.cancellation.load(Ordering::SeqCst) {
+                self.token.request();
+            }
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn swift_runtime_partial_delivery_and_cancellation_preserve_accepted_bytes_and_owners() {
+        for finalization in [false, true] {
+            for cancel in [false, true] {
+                for spill in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let arb = Arc::new(MemoryArbitrator::with_policy(
+                        2 * 1024 * 1024,
+                        0.8,
+                        0.7,
+                        Box::new(NoOpPolicy),
+                    ));
+                    let token = ShutdownToken::detached();
+                    let storage = configured(dir.path());
+                    let (producer, receiver) = telemetry();
+                    let provider = ExecutorResources::new(
+                        arb.clone(),
+                        token.clone(),
+                        spill.then_some(&storage),
+                        NonZeroUsize::new(1).unwrap(),
+                        Some(producer),
+                    )
+                    .unwrap();
+                    let baseline = arb.writer_resource_usage().memory;
+                    let body = if spill {
+                        "body ".repeat(20000)
+                    } else {
+                        "body".into()
+                    };
+                    let trailer = "tail".repeat(if spill { 20000 } else { 3000 });
+                    let row = record(&body, &trailer);
+                    let record_bytes = format!("{{1:HEADER}}{{4:\r\n:20:{body}\r\n");
+                    let bytes = Arc::new(Mutex::new(Vec::new()));
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let failure = Arc::new(AtomicUsize::new(usize::MAX));
+                    let cancellation = Arc::new(AtomicUsize::new(usize::MAX));
+                    let destination = Destination {
+                        bytes: bytes.clone(),
+                        calls: calls.clone(),
+                        failure: failure.clone(),
+                        cancellation: cancellation.clone(),
+                        token,
+                    };
+                    let counter = SharedByteCounter::new();
+                    let encoder =
+                        SwiftEncoder::new(row.schema().clone(), &config(), provider.resources())
+                            .unwrap();
+                    let mut writer = PreparedWriter::new(
+                        CountingWriter::new(destination, counter.clone()),
+                        encoder,
+                        provider.resources(),
+                    )
+                    .unwrap();
+                    let before = arb.writer_resource_usage().memory;
+                    if finalization {
+                        writer.write_record(&row).unwrap();
+                        // Drain the earlier successful record's signals so the
+                        // failing finalization must prove its own stage spill.
+                        let prior = receiver.try_recv_batch().unwrap();
+                        assert_eq!(
+                            prior.metric(clinker_exec::telemetry::MetricKey::WriterSpillCompleted),
+                            u64::from(spill)
+                        );
+                    }
+                    let committed = arb.writer_resource_usage().memory;
+                    if finalization {
+                        assert!(committed >= before + trailer.len() as u64);
+                    }
+                    let start = if finalization { record_bytes.len() } else { 0 };
+                    if cancel {
+                        cancellation.store(start + 1, Ordering::SeqCst);
+                    } else {
+                        failure.store(start + 3, Ordering::SeqCst);
+                    }
+                    let result = if finalization {
+                        writer.flush()
+                    } else {
+                        writer.write_record(&row)
+                    };
+                    if cancel {
+                        assert!(
+                            matches!(result, Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Cancelled)
+                        );
+                    } else {
+                        assert!(
+                            matches!(result, Err(FormatError::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+                        );
+                    }
+                    let delivered = bytes.lock().unwrap().clone();
+                    let complete = format!("{record_bytes}-}}{{5:{trailer}}}");
+                    assert_eq!(delivered, complete.as_bytes()[..delivered.len()]);
+                    assert!(delivered.len() > start);
+                    if !cancel {
+                        assert_eq!(delivered.len(), start + 3);
+                    }
+                    assert_eq!(counter.bytes_written(), delivered.len() as u64);
+                    assert_eq!(arb.writer_resource_usage().memory, committed);
+                    let attempts = calls.load(Ordering::SeqCst);
+                    assert!(writer.write_record(&row).is_err());
+                    assert!(writer.flush().is_err());
+                    assert!(writer.flush_bytes().is_err());
+                    drop(writer);
+                    assert_eq!(calls.load(Ordering::SeqCst), attempts);
+                    assert_eq!(arb.writer_resource_usage().memory, baseline);
+                    assert_eq!(arb.writer_resource_usage().disk, 0);
+                    assert_eq!(arb.writer_resource_usage().descriptors, 0);
+                    assert_eq!(provider.cleanup_debt_count(), 0);
+                    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+                    let batch = receiver.try_recv_batch().unwrap();
+                    assert_eq!(
+                        batch.metric(clinker_exec::telemetry::MetricKey::WriterSpillCompleted),
+                        u64::from(spill),
+                        "failing operation spill: finalize={finalization}, cancel={cancel}"
+                    );
+                    assert_eq!(
+                        batch.metric(clinker_exec::telemetry::MetricKey::WriterStageInterrupted),
+                        u64::from(cancel)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn swift_runtime_budget_denial_is_retryable_without_header_or_trailer_commit() {
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            256 * 1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            ShutdownToken::detached(),
+            None,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        )
+        .unwrap();
+        let resources = provider.resources();
+        let scope = resources.scope().unwrap();
+        let row = record("body", "retained trailer");
+        let encoder =
+            SwiftEncoder::new(row.schema().clone(), &config(), resources.clone()).unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, resources).unwrap();
+        let before = arb.writer_resource_usage().memory;
+        let pressure = scope
+            .reserve(Layout::array::<u8>((arb.limit() - before) as usize).unwrap())
+            .unwrap();
+        assert!(
+            matches!(writer.write_record(&row), Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Budget)
+        );
+        assert!(writer.destination().is_empty());
+        drop(pressure);
+        assert_eq!(arb.writer_resource_usage().memory, before);
+        writer.write_record(&row).unwrap();
+        let retained = arb.writer_resource_usage().memory;
+        assert!(retained > before);
+        let pressure = scope
+            .reserve(Layout::array::<u8>((arb.limit() - retained) as usize).unwrap())
+            .unwrap();
+        assert!(
+            matches!(writer.flush(), Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Budget)
+        );
+        assert_eq!(writer.destination(), b"{1:HEADER}{4:\r\n:20:body\r\n");
+        drop(pressure);
+        assert_eq!(arb.writer_resource_usage().memory, retained);
+        writer.flush().unwrap();
+        writer.flush().unwrap();
+        assert_eq!(
+            writer.destination(),
+            b"{1:HEADER}{4:\r\n:20:body\r\n-}{5:retained trailer}"
+        );
+        assert_eq!(arb.writer_resource_usage().memory, before);
+    }
+
+    #[test]
+    fn swift_runtime_pending_trailer_drops_before_release_and_commit_does_not_allocate() {
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            256 * 1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            ShutdownToken::detached(),
+            None,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        )
+        .unwrap();
+        let resources = provider.resources();
+        let scope = resources.scope().unwrap();
+        let observer = arb.writer_resource_observer();
+        let row = record("body", &"é".repeat(10000));
+        let mut encoder = SwiftEncoder::new(row.schema().clone(), &config(), resources).unwrap();
+        let before = observer.usage().memory;
+        for commit in [false, true] {
+            NATIVE_BACKINGS.with(|watch| {
+                watch.set(Some(NativeBackingWatch {
+                    observer: &observer,
+                    capture: Some(0),
+                    capture_last: true,
+                    backings: [NativeBacking::default(); 3],
+                }))
+            });
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    NATIVE_BACKINGS.with(|watch| watch.set(None));
+                }
+            }
+            let reset = Reset;
+            let pending = encoder
+                .prepare(OutputOperation::Record(&row), &mut std::io::sink(), &scope)
+                .unwrap();
+            NATIVE_BACKINGS.with(|watch| {
+                let mut state = watch.get().unwrap();
+                state.capture = None;
+                watch.set(Some(state));
+            });
+            assert!(observer.usage().memory >= before + 20000);
+            if commit {
+                ALLOCATIONS.with(|count| count.set(Some(0)));
+                FAIL_ALLOCATION.with(|fail| fail.set(Some(1)));
+                encoder.commit(pending);
+                FAIL_ALLOCATION.with(|fail| fail.set(None));
+                assert_eq!(ALLOCATIONS.with(|count| count.replace(None)), Some(0));
+                let pending = encoder
+                    .prepare(OutputOperation::Finalize, &mut std::io::sink(), &scope)
+                    .unwrap();
+                encoder.commit(pending);
+            } else {
+                drop(pending);
+            }
+            let backing = NATIVE_BACKINGS.with(|watch| watch.get().unwrap().backings[0]);
+            assert!(backing.bytes >= 20000);
+            assert!(backing.admitted_at_allocation >= before + backing.bytes as u64);
+            assert!(backing.admitted_at_deallocation.unwrap() >= before + backing.bytes as u64);
+            assert_eq!(observer.usage().memory, before);
+            drop(reset);
+        }
+    }
+}
+
 fn decode_coercion_reader(
     bytes: Vec<u8>,
     config: clinker_format::csv::reader::CsvReaderConfig,
