@@ -18,7 +18,7 @@
 //! The reader maps one block-4 `:tag:value` line to one
 //! [`crate::traits::FormatReader`] record under a static positional schema
 //! (`block`, `tag`, `value`) — the same one-line-one-record shape as the X12
-//! and HL7 readers, so memory scales O(1) with message size. The service
+//! and HL7 readers. The initial scan retains parsed body fields. The service
 //! blocks (1/2/3/5) are consumed by the reader to serve file-level `$doc`
 //! envelope sections and drive one balanced message-level document level;
 //! they are never emitted as body records.
@@ -71,7 +71,7 @@ mod tokenizer;
 pub mod writer;
 
 pub use reader::{SwiftReader, SwiftReaderConfig};
-pub use writer::{SwiftWriter, SwiftWriterConfig};
+pub use writer::{SwiftEncoder, SwiftEncoderConfig, SwiftWriterConfig};
 
 /// The default `$doc` section name for the basic header (block 1) when the
 /// source declares no `envelope:` mapping for it. User-chosen names override
