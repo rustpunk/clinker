@@ -1,40 +1,42 @@
 //! Integration tests for streaming-Output writes under fused
 //! `Merge.interleave` (issue #72).
 //!
-//! Sibling to `merge_interleave.rs`: those tests exercise the Merge
-//! arm's record ordering and live back-pressure with a buffered Output
-//! (records pile up in `node_buffers[merge_idx]` until the Merge
-//! finishes, then the Output arm writes them all). These tests cover
-//! the next step of that pipeline: a single Output downstream of a
-//! fused Merge.interleave takes the streaming path, so
+//! Sibling to `merge_interleave.rs`, which exercises the Merge arm's
+//! record ordering and readiness. These tests cover the streaming path taken by
+//! a single Output downstream of a fused Merge.interleave, where
 //! `Writer::write_record` fires per record as Merge emits, concurrent
 //! with Merge production.
 //!
-//! Black-box wall-clock discrimination of streaming-vs-buffered at the
-//! `std::io::Write` layer is defeated by the 64 KB `BufWriter` that
-//! `build_format_writer` wraps every raw writer in — the underlying
-//! `Write::write` callback fires only at end-of-task flush regardless
-//! of mode. These tests instead verify what the user-visible contract
-//! actually guarantees:
+//! Prepared CSV output reaches the injected `std::io::Write` directly.
+//! A source/sink handshake proves progress without comparing total run
+//! time against a throughput threshold. These tests verify:
 //!
 //! 1. Output correctness (per-source FIFO, no DLQ, total counters).
-//! 2. End-to-end back-pressure under a slow source — the pipeline
-//!    must not deadlock when the source's bounded channel fills while
-//!    the streaming writer is mid-drain.
+//! 2. Sink progress while one source withholds its body, plus termination
+//!    when a writer fails with more input than its bounded channel holds.
 //! 3. Topology repeat-stability — the per-source FIFO invariant must
 //!    survive many runs because the streaming writer thread and the
 //!    Merge arm race on a bounded crossbeam channel and OS thread
 //!    scheduling is non-deterministic.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::time::Duration;
 
 use clinker_bench_support::io::{SharedBuffer, fast_reader, slow_reader};
 use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
+
+// Suite containment for unmet progress/completion conditions, not a throughput
+// assertion: healthy completed runs have measured 2.40 s on Linux, 2.62 s on
+// macOS, and 2.706 s under a controlled scheduler pause. Retain the existing
+// 10 s watchdog to allow that observed variance while containing a true hang.
+const WATCHDOG: Duration = Duration::from_secs(10);
 
 fn slot(name: &str, csv: &str) -> FileSlot {
     FileSlot::new(PathBuf::from(format!("{name}.csv")), fast_reader(csv))
@@ -182,20 +184,208 @@ fn run_streaming_pipeline(
     (body, report.counters)
 }
 
-/// Streaming-Output correctness under a slow `src_a`. Asserts every
-/// record reaches the writer (per-source FIFO + total count), no DLQ,
-/// counters match the buffered Output arm's semantics, and the pipeline
-/// completes within a generous wall-clock bound (no deadlock when the
-/// streaming task's bounded channel meets a slow Source's bounded
-/// channel mid-drain).
+enum SourceRelease {
+    RecordCommitted,
+    Cancelled,
+}
+
+/// Yields the header, then withholds all body bytes until the sink commits a
+/// complete peer record. Empty reads must not consume the release signal.
+struct GatedBodyReader {
+    header: std::io::Cursor<Vec<u8>>,
+    body: std::io::Cursor<Vec<u8>>,
+    gate: Option<Receiver<SourceRelease>>,
+    released: Arc<AtomicBool>,
+}
+
+impl Read for GatedBodyReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if self.header.position() < self.header.get_ref().len() as u64 {
+            return self.header.read(bytes);
+        }
+        if let Some(gate) = self.gate.take() {
+            let ready = gate.recv_timeout(WATCHDOG).map_err(|error| {
+                std::io::Error::other(format!(
+                    "sink did not commit a peer record while source body waited: {error}"
+                ))
+            })?;
+            if matches!(ready, SourceRelease::Cancelled) {
+                return Err(std::io::Error::other("source progress fixture cancelled"));
+            }
+            self.released.store(true, Ordering::SeqCst);
+        }
+        // A retry after a failed gate must remain failed, not bypass the gate
+        // merely because its receiver has already been consumed.
+        if !self.released.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("source body gate was not released"));
+        }
+        self.body.read(bytes)
+    }
+}
+
+/// Only successful delivery of a complete body row releases the peer source;
+/// a header write or a partial row cannot satisfy the progress condition.
+struct ProgressWriter {
+    output: SharedBuffer,
+    release: Option<SyncSender<SourceRelease>>,
+}
+
+impl Write for ProgressWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.output.write(bytes)?;
+        if self.release.is_some()
+            && self
+                .output
+                .as_string()
+                .split_inclusive('\n')
+                .any(|row| row == "101,b-1\n" || row == "101,b-1\r\n")
+        {
+            self.release
+                .take()
+                .unwrap()
+                .try_send(SourceRelease::RecordCommitted)
+                .map_err(|error| {
+                    std::io::Error::other(format!("source release failed: {error}"))
+                })?;
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+}
+
+/// Unblock the fixture-owned source gate even if the worker's watchdog fails.
+/// Cancellation is an error, never evidence of successful sink progress.
+struct CancelSourceOnDrop(SyncSender<SourceRelease>);
+
+impl Drop for CancelSourceOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.try_send(SourceRelease::Cancelled);
+    }
+}
+
+#[test]
+fn progress_gate_requires_a_complete_body_row() {
+    let (release, gate) = sync_channel(1);
+    let mut writer = ProgressWriter {
+        output: SharedBuffer::new(),
+        release: Some(release),
+    };
+    for bytes in [b"id,tag\n".as_slice(), b"101,b-", b"1"] {
+        writer.write_all(bytes).unwrap();
+        assert!(matches!(
+            gate.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+    writer.write_all(b"\n").unwrap();
+    assert!(matches!(
+        gate.try_recv(),
+        Ok(SourceRelease::RecordCommitted)
+    ));
+}
+
+#[test]
+fn source_gate_failure_never_releases_body() {
+    for cancelled in [false, true] {
+        let (release, gate) = sync_channel(1);
+        if cancelled {
+            release.try_send(SourceRelease::Cancelled).unwrap();
+        }
+        drop(release);
+        let released = Arc::new(AtomicBool::new(false));
+        let mut reader = GatedBodyReader {
+            header: std::io::Cursor::new(Vec::new()),
+            body: std::io::Cursor::new(b"1,a-1\n".to_vec()),
+            gate: Some(gate),
+            released: released.clone(),
+        };
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        for _ in 0..2 {
+            assert!(reader.read(&mut [0; 16]).is_err());
+            assert!(!released.load(Ordering::SeqCst));
+            assert_eq!(reader.body.position(), 0);
+        }
+    }
+}
+
+/// The sink must commit a ready peer's record before `src_a` releases its body.
+/// A collect-before-write regression cannot satisfy this causal handshake.
+/// Completion is watched from another thread so an actual hang fails the test.
 #[test]
 fn streaming_writes_correct_output_under_slow_source() {
-    let start = Instant::now();
-    let (body, counters) = run_streaming_pipeline(10, 10, Duration::from_millis(50));
-    let elapsed = start.elapsed();
+    let mut config = parse_config(&pipeline_yaml()).unwrap();
+    // Flush producer batches while src_a is gated instead of retaining the
+    // ten ready rows until the default batch fills or all sources finish.
+    config.pipeline.batch_size = Some(1);
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    let (release_tx, release_rx) = sync_channel(1);
+    let _cancel_source = CancelSourceOnDrop(release_tx.clone());
+    let source_released = Arc::new(AtomicBool::new(false));
+    let readers: SourceReaders = HashMap::from([
+        (
+            "src_a".to_string(),
+            clinker_exec::executor::SourceInput::Files(vec![FileSlot::new(
+                PathBuf::from("a.csv"),
+                Box::new(GatedBodyReader {
+                    header: std::io::Cursor::new(b"id,tag\n".to_vec()),
+                    body: std::io::Cursor::new(
+                        src_a_csv(10).as_bytes()["id,tag\n".len()..].to_vec(),
+                    ),
+                    gate: Some(release_rx),
+                    released: source_released.clone(),
+                }),
+            )]),
+        ),
+        (
+            "src_b".to_string(),
+            clinker_exec::executor::SourceInput::Files(vec![slot("b", &src_b_csv(10))]),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(ProgressWriter {
+            output: buf.clone(),
+            release: Some(release_tx),
+        }) as Box<dyn Write + Send>,
+    )]);
+    let (done_tx, done_rx) = sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let result =
+            PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params());
+        let _ = done_tx.send(result);
+    });
+    let result = done_rx.recv_timeout(WATCHDOG).expect(
+        "streaming sink did not make progress and terminate while a peer source withheld its body",
+    );
+    worker.join().expect("executor thread did not panic");
+    let counters = result.expect("gated streaming pipeline executes").counters;
+    assert!(
+        source_released.load(Ordering::SeqCst),
+        "source body must be released by a committed peer body record"
+    );
+    let output = buf.as_string();
+    assert_eq!(output.lines().next(), Some("id,tag"));
+    let body: Vec<String> = output.lines().skip(1).map(str::to_string).collect();
+    assert_eq!(body.first().map(String::as_str), Some("101,b-1"));
 
     assert_eq!(body.len(), 20, "expected 20 records, got {body:?}");
     assert_per_source_fifo(&body);
+    let mut actual_rows = body.clone();
+    actual_rows.sort_unstable();
+    let expected_csv = format!("{}{}", src_a_csv(10), &src_b_csv(10)["id,tag\n".len()..]);
+    let mut expected_rows: Vec<String> = expected_csv.lines().skip(1).map(str::to_string).collect();
+    expected_rows.sort_unstable();
+    assert_eq!(
+        actual_rows, expected_rows,
+        "every complete row is preserved"
+    );
 
     // Every input record appears exactly once. Group by prefix then
     // by numeric suffix so the comparison is stable across the run's
@@ -239,14 +429,6 @@ fn streaming_writes_correct_output_under_slow_source() {
         counters.total_count, 20,
         "expected 20 total ingested records; counters={counters:?}",
     );
-
-    // No deadlock. src_a's ~500 ms drain dominates; even under heavy
-    // CI jitter the pipeline must finish well under 2 s.
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "pipeline took {elapsed:?}, expected < 2 s — \
-         streaming writer back-pressure may have deadlocked the run",
-    );
 }
 
 /// Streaming-Output preserves per-source FIFO across many independent
@@ -255,9 +437,8 @@ fn streaming_writes_correct_output_under_slow_source() {
 /// non-deterministic, so rerunning catches a regression that would tear
 /// per-source order only on a fraction of runs.
 ///
-/// 20 runs is the stability bar; bumping this number is safe but each
-/// run costs ~50 ms of slow-source delay so the test is bounded at
-/// ~1 s when stable.
+/// Twenty runs exercise repeated scheduling with a paced source. The sleeps
+/// encourage interleaving; their elapsed duration is not a success condition.
 #[test]
 fn streaming_writes_stable_across_repeats() {
     for run in 0..20 {
@@ -376,9 +557,7 @@ fn streaming_writer_failure_mid_stream_does_not_deadlock() {
         let _ = done_tx.send(result.is_ok());
     });
 
-    // 10 s is far beyond a healthy run of this size (sub-second). A true
-    // deadlock would never signal; this bound turns it into a failure.
-    match done_rx.recv_timeout(Duration::from_secs(10)) {
+    match done_rx.recv_timeout(WATCHDOG) {
         Ok(ran_ok) => {
             worker.join().expect("executor thread did not panic");
             // The pipeline drains and exits regardless of the writer
@@ -388,7 +567,7 @@ fn streaming_writer_failure_mid_stream_does_not_deadlock() {
             let _ = ran_ok;
         }
         Err(_) => panic!(
-            "streaming pipeline did not terminate within 10 s — \
+            "streaming pipeline did not terminate after writer failure — \
              dead-writer drain or sender-drop-before-join regressed"
         ),
     }
