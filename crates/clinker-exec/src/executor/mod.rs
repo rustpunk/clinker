@@ -176,23 +176,6 @@ pub(crate) struct DispatchOutcome {
     /// landed"). The synthetic `MERGED_SOURCE_NAME` slot is filtered
     /// out on the way through.
     pub(crate) per_source_dlq_counts: BTreeMap<String, u64>,
-    /// Bytes the run committed to spill files across every spill site
-    /// (node_buffer admission, grace-hash partition flush, sort-merge external
-    /// sort), net of any released when a run was unlinked — so a cascaded k-way
-    /// merge's transient intermediate runs do not inflate it. Read from
-    /// `MemoryArbitrator`'s running total at dispatch close so an aborted run
-    /// still reports the last committed value.
-    pub(crate) cumulative_spill_bytes: u64,
-    /// Per-stage on-disk spill totals, keyed by the spilling node's name.
-    /// The sum equals `cumulative_spill_bytes`; this breakdown is what an
-    /// operator compares against the per-stage pre-run `--explain`
-    /// estimate to calibrate. Empty when no stage spilled.
-    pub(crate) per_stage_spill_bytes: BTreeMap<String, u64>,
-    /// High-water mark of `MemoryArbitrator::sum_consumer_usage()` sampled
-    /// at every streaming per-batch charge. A streaming stage's peak stays
-    /// bounded to one in-flight batch (plus the channel's bound), proving
-    /// the per-batch admit/discharge model never charges the whole stage.
-    pub(crate) peak_consumer_usage_bytes: u64,
     /// `true` when a chunk-boundary shutdown poll tripped and the topo
     /// walk unwound early. Carried up so the report surfaces the
     /// interrupted state to the CLI.
@@ -201,6 +184,32 @@ pub(crate) struct DispatchOutcome {
     /// `mapping:` report (W365 / W366). Never fatal — by the time a stream
     /// ends its sibling Outputs have written.
     pub(crate) advisories: Vec<String>,
+}
+
+/// Source outcomes and resource totals established at the same join boundary.
+/// The join operation must finish every worker, including on error; no final
+/// resource snapshot is available while a worker can still retain or release it.
+#[derive(Debug)]
+struct SourceCompletion {
+    outcomes: Vec<ingest::IngestTaskOutcome>,
+    cumulative_spill_bytes: u64,
+    per_stage_spill_bytes: BTreeMap<String, u64>,
+    peak_consumer_usage_bytes: u64,
+}
+
+impl SourceCompletion {
+    fn join(
+        memory: &crate::pipeline::memory::MemoryArbitrator,
+        join_workers: impl FnOnce() -> Result<Vec<ingest::IngestTaskOutcome>, PipelineError>,
+    ) -> Result<Self, PipelineError> {
+        let outcomes = join_workers()?;
+        Ok(Self {
+            outcomes,
+            cumulative_spill_bytes: memory.cumulative_spill_bytes(),
+            per_stage_spill_bytes: memory.per_stage_spill_bytes(),
+            peak_consumer_usage_bytes: memory.peak_consumer_usage(),
+        })
+    }
 }
 
 /// Borrowed, read-only inputs threaded through `execute_dag` and
@@ -1192,7 +1201,7 @@ impl PipelineExecutor {
                 writers,
                 spill_root,
                 watermarks,
-                memory_budget,
+                memory_budget: memory_budget.clone(),
             },
             &mut collector,
             counters,
@@ -1219,9 +1228,6 @@ impl PipelineExecutor {
             per_source_rollback_cursors,
             per_source_record_counts,
             per_source_dlq_counts,
-            cumulative_spill_bytes,
-            per_stage_spill_bytes,
-            peak_consumer_usage_bytes,
             mut interrupted,
             advisories,
         } = dispatch_outcome;
@@ -1239,7 +1245,15 @@ impl PipelineExecutor {
         let mut counters = counters;
         // Join every worker before selecting the terminal result. An earlier
         // failure must never detach later workers holding readers or grants.
-        for outcome in ingest::join_source_workers(ingest_handles, "source-ingest-thread")? {
+        let SourceCompletion {
+            outcomes,
+            cumulative_spill_bytes,
+            per_stage_spill_bytes,
+            peak_consumer_usage_bytes,
+        } = SourceCompletion::join(&memory_budget, || {
+            ingest::join_source_workers(ingest_handles, "source-ingest-thread")
+        })?;
+        for outcome in outcomes {
             interrupted |= outcome.interrupted;
             counters.total_count += outcome.total_count;
             total_ingested += outcome.total_count;
@@ -2142,9 +2156,6 @@ impl PipelineExecutor {
         let per_source_dlq_counts =
             project_declared_source_dlq_counts(&ctx.dlq_per_source, merged_key);
 
-        let cumulative_spill_bytes = ctx.memory_budget.cumulative_spill_bytes();
-        let per_stage_spill_bytes = ctx.memory_budget.per_stage_spill_bytes();
-        let peak_consumer_usage_bytes = ctx.memory_budget.peak_consumer_usage();
         let interrupted = ctx.interrupted;
         // Per-Output `mapping:` findings, over the WHOLE stream. Drained here
         // rather than at each arm's close because an Output's records can reach
@@ -2160,9 +2171,6 @@ impl PipelineExecutor {
             per_source_rollback_cursors: rollback_cursors,
             per_source_record_counts,
             per_source_dlq_counts,
-            cumulative_spill_bytes,
-            per_stage_spill_bytes,
-            peak_consumer_usage_bytes,
             interrupted,
             advisories,
         })
@@ -2418,6 +2426,7 @@ nodes:
     mod per_source_projection;
     mod resident_node_buffer_spill;
     mod scheduling;
+    mod source_completion;
     mod source_consumer_release;
     mod source_pause_liveness;
     mod spill_backed_drain_overshoot;

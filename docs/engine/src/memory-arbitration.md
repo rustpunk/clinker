@@ -9,8 +9,8 @@ This page is the engine-internals reference for how Clinker tracks, attributes, 
 ### Exact allocation admission for prepared output
 
 `clinker_format::preparation` prepares one complete output operation before
-delivery. CSV writer construction in the CLI and executor uses this path;
-other codecs retain their existing allocation behavior. `MemoryOnlyResources`
+delivery. CSV, JSON and XML writer construction in the CLI and executor uses
+this path; other codecs retain their existing allocation behavior. `MemoryOnlyResources`
 requires an explicit nonzero memory budget. `ExecutorResources` shares the run's
 `MemoryArbitrator` and takes an explicit optional telemetry producer; disabling
 telemetry changes no resource limit. Neither provider offers an unlimited
@@ -52,6 +52,13 @@ descriptor usage from this ledger. `set_limit` refuses a limit below outstanding
 writer grants and leaves the previous limit unchanged; the disk setter likewise
 refuses a quota below the sum of outstanding writer disk and legacy spill bytes.
 
+The execution report samples the arbitrator's spill totals and peak consumer
+usage after dispatch has finished and every Source worker has joined. Ordered
+Sources can still release staged spill charges while unwinding cancellation;
+sampling at dispatch close would report those already-released bytes as live.
+The total and per-stage spill fields include committed charges minus releases,
+not every byte ever written to temporary storage.
+
 `WriterResourceConsumer` reports the ledger's exact live grant total through its
 `ConsumerHandle`. It is admission-managed and never backpressureable: parking
 the synchronous writer would prevent its own release progress. Spill requests
@@ -78,6 +85,37 @@ JSON tree used for JSON-encoded cells remain explicit parser allowances.
 Unchanged readers and legacy operators retain their existing owners; a later
 deep copy or spill reload is a distinct allocation, not an extension of the
 original grant.
+
+### Native JSON/XML configuration and schema caches
+
+`JsonEncoderConfig` and `XmlEncoderConfig` share immutable admitted configuration.
+Names, envelope policies and schema-derived plans use `ReservedText` and
+`ReservedVec`; the shared configuration backing remains charged through its
+final alias's actual deallocation. Construction admits the concrete writer and
+factory closure layouts before boxing. There are no raw `JsonWriter` or
+`XmlWriter` constructors: direct callers use the finite prepared APIs described
+in [extension seams](extension-seams.md#finite-native-writer-construction).
+
+`SharedStorageIdentity<Schema>` gives each plan cache an opaque identity without
+retaining the schema payload. Governed storage uses its existing allocation ID;
+legacy storage retains a weak backing identity with a separately admitted,
+conservative backing reservation. It cannot upgrade to a strong owner. The
+weak backing is dropped before its reservation, so even the final weak alias
+retains accounting until physical deallocation. Equal-content schemas with
+different storage identities do not share a cached plan accidentally.
+
+A schema change prepares the replacement while the old committed plan remains
+charged. Failed preparation drops the pending plan; only complete delivery
+commits it. Encoding borrows the record tree. XML scalar formatting uses a fixed
+128-byte stack scratch and escaping uses bounded chunks; neither codec retains
+a rendered record between operations. Encoded bytes are owned by the shared
+operation stage and may spill under the same finite authority.
+
+Strict UTF-8 input adds a four-byte probe/incomplete-scalar buffer per open.
+It changes no input-sized allocation ownership. Existing JSON parser/scanner
+and XML parser/event/record allocations retain their prior allowance; optional
+envelope indexes retain their existing cap. Prepared output does not establish
+whole-reader admission or a whole-process RSS ceiling.
 
 ### CSV decoding and document ownership
 

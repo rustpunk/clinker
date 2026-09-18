@@ -3,11 +3,11 @@ use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvEncoder, CsvWriterConfig};
 use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConfig};
 use clinker_format::json::reader::{JsonReader, JsonReaderConfig};
-use clinker_format::json::writer::{JsonWriter, JsonWriterConfig};
+use clinker_format::json::writer::{JsonEncoder, JsonWriterConfig};
 use clinker_format::preparation::{MemoryOnlyResources, PreparedWriter};
 use clinker_format::schema::Column;
 use clinker_format::traits::{FormatReader, FormatWriter};
-use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
+use clinker_format::xml::writer::{XmlEncoder, XmlWriterConfig};
 use clinker_record::owned_storage::SharedStorage;
 use clinker_record::{Record, Schema, Value};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
@@ -179,7 +179,15 @@ fn bench_json_write(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(label), &records, |b, recs| {
             b.iter(|| {
                 let buf = Vec::with_capacity(record_count * field_count * string_len);
-                let mut writer = JsonWriter::new(buf, schema.clone(), JsonWriterConfig::default());
+                let provider =
+                    MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+                let encoder = JsonEncoder::new(
+                    schema.clone(),
+                    &JsonWriterConfig::default(),
+                    provider.resources(),
+                )
+                .unwrap();
+                let mut writer = PreparedWriter::new(buf, encoder, provider.resources()).unwrap();
                 for rec in recs {
                     writer.write_record(rec).unwrap();
                 }
@@ -240,8 +248,15 @@ fn bench_xml_write(c: &mut Criterion) {
         |b, recs| {
             b.iter(|| {
                 let buf = Vec::with_capacity(MEDIUM * 50 * 20);
-                let mut writer =
-                    XmlWriter::new(buf, flat_schema.clone(), XmlWriterConfig::default());
+                let provider =
+                    MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+                let encoder = XmlEncoder::new(
+                    flat_schema.clone(),
+                    &XmlWriterConfig::default(),
+                    provider.resources(),
+                )
+                .unwrap();
+                let mut writer = PreparedWriter::new(buf, encoder, provider.resources()).unwrap();
                 for rec in recs {
                     writer.write_record(rec).unwrap();
                 }
@@ -260,8 +275,15 @@ fn bench_xml_write(c: &mut Criterion) {
         |b, recs| {
             b.iter(|| {
                 let buf = Vec::with_capacity(MEDIUM * 200);
-                let mut writer =
-                    XmlWriter::new(buf, dotted_schema.clone(), XmlWriterConfig::default());
+                let provider =
+                    MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+                let encoder = XmlEncoder::new(
+                    dotted_schema.clone(),
+                    &XmlWriterConfig::default(),
+                    provider.resources(),
+                )
+                .unwrap();
+                let mut writer = PreparedWriter::new(buf, encoder, provider.resources()).unwrap();
                 for rec in recs {
                     writer.write_record(rec).unwrap();
                 }

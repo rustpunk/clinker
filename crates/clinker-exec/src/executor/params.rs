@@ -225,8 +225,9 @@ pub struct ExecutionReport {
     /// (`node_buffers` admission, grace-hash partition flush, sort-merge
     /// external sort), net of any released as a run was unlinked — so a
     /// cascaded k-way merge's transient intermediate runs do not inflate it.
-    /// Sourced from `MemoryArbitrator`'s running total at dispatch close; an
-    /// aborted run still surfaces the last committed value.
+    /// Sourced from `MemoryArbitrator` after dispatch and all Source workers
+    /// finish, including interrupted ordered-source cleanup. Released spill
+    /// charges are excluded; this is not a count of every byte ever written.
     pub cumulative_spill_bytes: u64,
     /// Per-stage on-disk spill totals, keyed by the spilling node's name.
     /// The sum of the values equals [`Self::cumulative_spill_bytes`]; this
@@ -234,6 +235,7 @@ pub struct ExecutionReport {
     /// pre-run `--explain` per-stage estimate (the calibration loop #176
     /// exists for). Empty when no stage spilled. Distinct from
     /// `cumulative_spill_bytes`, which is the single pipeline-wide total.
+    /// Both are sampled after all Source workers have joined.
     pub per_stage_spill_bytes: BTreeMap<String, u64>,
     /// High-water mark of the arbitrator's summed pull-mode charged bytes
     /// observed across streaming per-batch charges. For a streaming stage

@@ -15,7 +15,9 @@ use clinker_format::csv::writer::{
 use clinker_format::edifact::writer::{EdifactWriter, EdifactWriterConfig};
 use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConfig};
 use clinker_format::hl7::writer::{Hl7Writer, Hl7WriterConfig};
-use clinker_format::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
+use clinker_format::json::writer::{
+    JsonEncoder, JsonEncoderConfig, JsonOutputMode, JsonWriterConfig,
+};
 use clinker_format::preparation::WriterResources;
 use clinker_format::splitting::{OversizeGroupPolicy, SplitPolicy, SplittingWriter, WriterFactory};
 use clinker_format::swift::writer::{SwiftWriter, SwiftWriterConfig};
@@ -24,7 +26,7 @@ use clinker_format::traits::FormatWriter;
 use clinker_format::traits::FormatWriterHandle;
 use clinker_format::x12::Charset;
 use clinker_format::x12::writer::{X12Writer, X12WriterConfig};
-use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
+use clinker_format::xml::writer::{XmlEncoder, XmlEncoderConfig, XmlEncoderOptions};
 use clinker_plan::config::{OutputFormat, SinkConfig};
 use clinker_plan::error::PipelineError;
 
@@ -113,25 +115,6 @@ fn build_json_writer_config(
         }
         if let Some(pretty) = opts.pretty {
             config.pretty = pretty;
-        }
-    }
-    config
-}
-
-/// Build an XmlWriterConfig from XML output options.
-fn build_xml_writer_config(
-    opts: Option<&clinker_plan::config::XmlOutputOptions>,
-) -> XmlWriterConfig {
-    let mut config = XmlWriterConfig::default();
-    if let Some(opts) = opts {
-        if let Some(ref root) = opts.root_element {
-            config.root_element = root.clone();
-        }
-        if let Some(ref rec) = opts.record_element {
-            config.record_element = rec.clone();
-        }
-        if let Some(ref prefix) = opts.attribute_prefix {
-            config.attribute_prefix = prefix.clone();
         }
     }
     config
@@ -384,43 +367,63 @@ fn build_writer_factory(
             let mut json_config = build_json_writer_config(opts.as_ref());
             json_config.include_engine_stamped = include_engine_stamped;
             json_config.preserve_nulls = preserve_nulls;
-            json_config.envelope = resolve_envelope_spec(
-                reconstruct_envelope,
-                opts.as_ref().and_then(|o| o.envelope.as_ref()),
-            );
-            Ok(WriterFactory::from_legacy(
-                move |counting_writer, schema| {
-                    Ok(FormatWriterHandle::from_legacy(Box::new(JsonWriter::new(
-                        counting_writer,
-                        schema,
-                        json_config.clone(),
-                    ))))
-                },
-            ))
+            let envelope = reconstruct_envelope
+                .then(|| opts.as_ref().and_then(|o| o.envelope.as_ref()))
+                .flatten();
+            let config = JsonEncoderConfig::from_names(
+                &json_config,
+                envelope.and_then(|e| e.header_from_doc.as_deref()),
+                envelope.and_then(|e| e.footer_from_doc.as_deref()),
+                envelope.and_then(|e| e.footer_record_count_field.as_deref()),
+                &resources,
+            )
+            .map_err(PipelineError::Format)?;
+            let scope = resources
+                .scope()
+                .map_err(|error| PipelineError::Format(error.into()))?;
+            let factory = move |counting_writer, schema| {
+                JsonEncoder::from_config(schema, config.clone())?
+                    .into_boxed_writer(counting_writer, resources.clone())
+            };
+            WriterFactory::try_new(factory, scope.allocation())
+                .map_err(|error| PipelineError::Format(error.into()))
         }
         OutputFormat::Xml(opts) => {
-            let mut xml_config = build_xml_writer_config(opts.as_ref());
-            xml_config.include_engine_stamped = include_engine_stamped;
-            xml_config.preserve_nulls = preserve_nulls;
-            // Per-field repeated-element overrides (`repeat_as` / `wrap_in`); a
-            // `multiple:` field with no entry emits bare repeats named after the
-            // field. The plan-time E362 gate has already validated the block, so
-            // the XML and CSV arms each consume the sub-vocabulary they read.
-            xml_config.join_values = output.join_values.clone().unwrap_or_default();
-            xml_config.declared_multiple = output.declared_multiple.clone();
-            xml_config.envelope = resolve_envelope_spec(
-                reconstruct_envelope,
-                opts.as_ref().and_then(|o| o.envelope.as_ref()),
-            );
-            Ok(WriterFactory::from_legacy(
-                move |counting_writer, schema| {
-                    Ok(FormatWriterHandle::from_legacy(Box::new(XmlWriter::new(
-                        counting_writer,
-                        schema,
-                        xml_config.clone(),
-                    ))))
+            let options = opts.as_ref();
+            let envelope = reconstruct_envelope
+                .then(|| options.and_then(|o| o.envelope.as_ref()))
+                .flatten();
+            let config = XmlEncoderConfig::new(
+                XmlEncoderOptions {
+                    root_element: options
+                        .and_then(|o| o.root_element.as_deref())
+                        .unwrap_or("Root"),
+                    record_element: options
+                        .and_then(|o| o.record_element.as_deref())
+                        .unwrap_or("Record"),
+                    attribute_prefix: options
+                        .and_then(|o| o.attribute_prefix.as_deref())
+                        .unwrap_or("@"),
+                    preserve_nulls,
+                    include_engine_stamped,
+                    join_values: output.join_values.as_deref().unwrap_or_default(),
+                    declared_multiple: &output.declared_multiple,
+                    envelope_header: envelope.and_then(|e| e.header_from_doc.as_deref()),
+                    envelope_footer: envelope.and_then(|e| e.footer_from_doc.as_deref()),
+                    envelope_count: envelope.and_then(|e| e.footer_record_count_field.as_deref()),
                 },
-            ))
+                &resources,
+            )
+            .map_err(PipelineError::Format)?;
+            let scope = resources
+                .scope()
+                .map_err(|error| PipelineError::Format(error.into()))?;
+            let factory = move |counting_writer, schema| {
+                XmlEncoder::from_config(schema, config.clone())?
+                    .into_boxed_writer(counting_writer, resources.clone())
+            };
+            WriterFactory::try_new(factory, scope.allocation())
+                .map_err(|error| PipelineError::Format(error.into()))
         }
         OutputFormat::FixedWidth(opts) => {
             let mut fw_config = build_fw_writer_config(opts.as_ref());
@@ -524,7 +527,12 @@ pub(crate) fn build_format_writer(
         .scope()
         .map_err(|error| PipelineError::Format(error.into()))?;
     let writer_factory = build_writer_factory(output, repeat_header, field_defs, resources)?;
-    let prepared_csv = matches!(output.format, OutputFormat::Csv(_));
+    // Prepared codecs already batch complete operations. An additional
+    // BufWriter would count bytes before delivery and retry poison on drop.
+    let prepared_output = matches!(
+        output.format,
+        OutputFormat::Csv(_) | OutputFormat::Json(_) | OutputFormat::Xml(_)
+    );
 
     if let Some(ref split) = output.split {
         let policy = build_split_policy(split);
@@ -567,7 +575,7 @@ pub(crate) fn build_format_writer(
                     output_staging.stage_output(output_name.clone(), if_exists, false, path_for_n)
                 };
                 let (_path, file) = staged.map_err(|e| std::io::Error::other(format!("{e:?}")))?;
-                let buffered: Box<dyn Write + Send> = if prepared_csv {
+                let buffered: Box<dyn Write + Send> = if prepared_output {
                     Box::new(file)
                 } else {
                     Box::new(BufWriter::with_capacity(65536, file))
@@ -587,7 +595,7 @@ pub(crate) fn build_format_writer(
         )
         .map_err(|error| PipelineError::Format(error.into()))
     } else {
-        let buf_writer: Box<dyn Write + Send> = if prepared_csv {
+        let buf_writer: Box<dyn Write + Send> = if prepared_output {
             raw_writer
         } else {
             Box::new(BufWriter::with_capacity(65536, raw_writer))
@@ -791,20 +799,48 @@ nodes:
     }
 
     #[test]
-    fn xml_writer_config_plumbs_attribute_prefix() {
-        let opts = clinker_plan::config::XmlOutputOptions {
-            attribute_prefix: Some("_".into()),
-            ..Default::default()
-        };
-        let config = build_xml_writer_config(Some(&opts));
-        assert_eq!(config.attribute_prefix, "_");
-    }
-
-    #[test]
-    fn xml_writer_config_defaults_attribute_prefix_to_at_sign() {
-        // Matches the XML reader's default so attribute fields round-trip
-        // without any output-side configuration.
-        assert_eq!(build_xml_writer_config(None).attribute_prefix, "@");
+    fn xml_factory_preserves_configured_and_default_names() {
+        for custom in [false, true] {
+            let mut sink = compiled_split_sink("xml", false);
+            sink.format =
+                OutputFormat::Xml(custom.then(|| clinker_plan::config::XmlOutputOptions {
+                    root_element: Some("Batch".into()),
+                    record_element: Some("Row".into()),
+                    attribute_prefix: Some("_".into()),
+                    ..Default::default()
+                }));
+            let provider = clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(128 * 1024).unwrap(),
+            );
+            let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![if custom {
+                "_id".into()
+            } else {
+                "@id".into()
+            }])));
+            let output = clinker_bench_support::io::SharedBuffer::new();
+            let factory = build_writer_factory(&sink, true, None, provider.resources()).unwrap();
+            let mut writer = factory
+                .create(
+                    CountingWriter::new(Box::new(output.clone()), SharedByteCounter::new()),
+                    schema.clone(),
+                )
+                .unwrap();
+            writer
+                .write_record(&Record::new(schema, vec![Value::Integer(7)]))
+                .unwrap();
+            writer.flush().unwrap();
+            assert_eq!(
+                output.contents(),
+                if custom {
+                    b"<Batch><Row id=\"7\"></Row></Batch>".as_slice()
+                } else {
+                    b"<Root><Record id=\"7\"></Record></Root>".as_slice()
+                }
+            );
+            drop(writer);
+            drop(factory);
+            assert_eq!(provider.used(), 0);
+        }
     }
 
     #[test]

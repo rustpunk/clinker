@@ -141,6 +141,91 @@ impl fmt::Display for FieldPathError {
 
 impl std::error::Error for FieldPathError {}
 
+/// Allocation-free grammar failure. The caller owns the original name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentError {
+    TrailingEscape,
+    UnknownEscape(char),
+    TooDeep,
+}
+
+/// Validated encoded segment borrowed from its caller. Rendering streams
+/// decoded chunks to caller-owned storage without allocating.
+#[derive(Clone, Copy)]
+pub struct Segment<'a>(&'a str);
+impl<'a> Segment<'a> {
+    /// Borrow the complete decoded segment when no escape was present.
+    pub fn borrowed(self) -> Option<&'a str> {
+        (!self.0.contains('\\')).then_some(self.0)
+    }
+    /// Stream validated decoded characters without owning text.
+    pub fn decoded_chars(self) -> impl Iterator<Item = char> + 'a {
+        let mut chars = self.0.chars();
+        std::iter::from_fn(move || match chars.next()? {
+            '\\' => chars.next(),
+            ch => Some(ch),
+        })
+    }
+    /// Stream decoded UTF-8 slices; stop immediately on the destination error.
+    pub fn write_to<E>(self, mut write: impl FnMut(&str) -> Result<(), E>) -> Result<(), E> {
+        let mut start = 0;
+        let bytes = self.0.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' {
+                write(&self.0[start..i])?;
+                i += 1;
+                start = i;
+            }
+            i += 1;
+        }
+        write(&self.0[start..])
+    }
+}
+
+/// Walk the shared grammar without a vector, trie or decoded copy.
+/// Each returned segment is validated; errors stop the iterator permanently.
+pub fn segments(name: &str) -> impl Iterator<Item = Result<Segment<'_>, SegmentError>> + Clone {
+    let mut offset = 0;
+    let mut depth = 0;
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        if depth == MAX_FIELD_PATH_DEPTH {
+            done = true;
+            return Some(Err(SegmentError::TooDeep));
+        }
+        let start = offset;
+        let bytes = name.as_bytes();
+        while let Some(&byte) = bytes.get(offset) {
+            if byte == b'.' {
+                break;
+            }
+            if byte == b'\\' {
+                let Some(&escape) = bytes.get(offset + 1) else {
+                    done = true;
+                    return Some(Err(SegmentError::TrailingEscape));
+                };
+                if !matches!(escape, b'.' | b'[' | b'\\') {
+                    done = true;
+                    return Some(Err(SegmentError::UnknownEscape(
+                        name[offset + 1..].chars().next().expect("nonempty suffix"),
+                    )));
+                }
+                offset += 1;
+            }
+            offset += 1;
+        }
+        let segment = Segment(&name[start..offset]);
+        done = offset == name.len();
+        offset += usize::from(!done);
+        depth += 1;
+        Some(Ok(segment))
+    })
+}
+
 /// Decode a field name into its ordered segments.
 ///
 /// A segment carrying no escape borrows from `name`; only a segment with an
@@ -151,69 +236,27 @@ impl std::error::Error for FieldPathError {}
 /// Callers decode once per schema (a writer building its expansion plan) or per
 /// document (an envelope section), never per record.
 pub fn decode(name: &str) -> Result<Vec<Cow<'_, str>>, FieldPathError> {
-    let mut out: Vec<Cow<'_, str>> = Vec::new();
-    // `decoded` stays `None` while the current segment is escape-free, so the
-    // common case borrows straight out of `name`. `chunk` marks the start of the
-    // verbatim run not yet copied into it.
-    let mut decoded: Option<String> = None;
-    let mut chunk = 0;
-    let mut i = 0;
-    let bytes = name.as_bytes();
-    loop {
-        if out.len() == MAX_FIELD_PATH_DEPTH {
-            return Err(FieldPathError::TooDeep {
-                name: name.to_string(),
-                limit: MAX_FIELD_PATH_DEPTH,
-            });
-        }
-        // `.`, `\` and `[` are ASCII and cannot occur inside a multi-byte UTF-8
-        // sequence, so scanning by byte never splits a character.
-        match bytes.get(i) {
-            None => {
-                out.push(close_segment(name, decoded, chunk, i));
-                return Ok(out);
-            }
-            Some(b'.') => {
-                out.push(close_segment(name, decoded.take(), chunk, i));
-                i += 1;
-                chunk = i;
-            }
-            Some(b'\\') => {
-                let Some(&escape) = bytes.get(i + 1) else {
-                    return Err(FieldPathError::TrailingEscape {
-                        name: name.to_string(),
-                    });
-                };
-                if !matches!(escape, b'.' | b'[' | b'\\') {
-                    return Err(FieldPathError::UnknownEscape {
-                        name: name.to_string(),
-                        escape: name[i + 1..]
-                            .chars()
-                            .next()
-                            .expect("a byte past the backslash implies a character"),
-                    });
-                }
-                let buf = decoded.get_or_insert_with(String::new);
-                buf.push_str(&name[chunk..i]);
-                buf.push(char::from(escape));
-                i += 2;
-                chunk = i;
-            }
-            Some(_) => i += 1,
-        }
-    }
-}
-
-/// Close a segment: borrow it whole when nothing was escaped, otherwise append
-/// the trailing verbatim run to the buffer the escapes were decoded into.
-fn close_segment(name: &str, decoded: Option<String>, chunk: usize, end: usize) -> Cow<'_, str> {
-    match decoded {
-        None => Cow::Borrowed(&name[chunk..end]),
-        Some(mut buf) => {
-            buf.push_str(&name[chunk..end]);
-            Cow::Owned(buf)
-        }
-    }
+    segments(name)
+        .map(|segment| {
+            let segment = segment.map_err(|error| match error {
+                SegmentError::TrailingEscape => FieldPathError::TrailingEscape {
+                    name: name.to_owned(),
+                },
+                SegmentError::UnknownEscape(escape) => FieldPathError::UnknownEscape {
+                    name: name.to_owned(),
+                    escape,
+                },
+                SegmentError::TooDeep => FieldPathError::TooDeep {
+                    name: name.to_owned(),
+                    limit: MAX_FIELD_PATH_DEPTH,
+                },
+            })?;
+            Ok(match segment.borrowed() {
+                Some(text) => Cow::Borrowed(text),
+                None => Cow::Owned(segment.decoded_chars().collect()),
+            })
+        })
+        .collect()
 }
 
 /// Encode one literal segment so it survives [`decode`] as exactly itself,
@@ -310,6 +353,41 @@ struct TrieNode<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_segments_match_decoded_grammar_and_stop_on_error() {
+        for name in ["", "a..b", r"a\.b.c", r"x\\y.\[z]", "héllo.wörld"] {
+            let streamed: Vec<String> = segments(name)
+                .map(|segment| {
+                    let mut value = String::new();
+                    segment
+                        .unwrap()
+                        .write_to(|chunk| {
+                            value.push_str(chunk);
+                            Ok::<_, ()>(())
+                        })
+                        .unwrap();
+                    value
+                })
+                .collect();
+            assert_eq!(streamed, segs(name));
+        }
+        for (name, expected) in [
+            (r"a\", SegmentError::TrailingEscape),
+            (r"a\t", SegmentError::UnknownEscape('t')),
+        ] {
+            let mut path = segments(name);
+            assert!(matches!(path.next(), Some(Err(error)) if error == expected));
+            assert!(path.next().is_none());
+        }
+        let name = vec!["a"; MAX_FIELD_PATH_DEPTH + 1].join(".");
+        assert!(matches!(
+            segments(&name).last(),
+            Some(Err(SegmentError::TooDeep))
+        ));
+        let segment = segments(r"a\.b").next().unwrap().unwrap();
+        assert_eq!(segment.write_to(|_| Err::<(), _>(17)), Err(17));
+    }
 
     fn segs(name: &str) -> Vec<String> {
         decode(name)

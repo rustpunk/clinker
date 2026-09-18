@@ -57,6 +57,18 @@ canonical escape decoding, and shares a per-record 10 MiB allocation budget and
 64-container depth cap across nested constructors. The aggregate residual
 evaluator enforces the same rules.
 
+Expression parsing uses an explicit stack of Pratt continuations, so a nested
+constructor, operator, call argument, or subscript does not retain a native
+parser call frame. The existing limit remains 256 simultaneously active
+expression contexts: a root scalar counts as one, and each nested child
+expression adds one. Thus 255 containers around a scalar parse successfully;
+the next child returns the nesting diagnostic. This parser limit is separate
+from the 64-container runtime value limit. Continuations are discarded on a
+parse error, so recovery starts the next statement with a fresh depth budget.
+The limit does not measure the final AST depth of iterative postfix or
+left-associative operator chains. Statement-level `emit each` nesting keeps
+its independent 32-level limit.
+
 The phase split is what makes CXL's compile-time guarantee meaningful: a `cxl check transform.cxl` runs Parse → Resolve → Typecheck and reports any error with a span before a single record is read, e.g.
 
 ```text

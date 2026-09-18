@@ -1165,6 +1165,19 @@ impl<W: Write> InjectedDelivery<W> {
                 return DeliveryResult::EncodingFailure;
             }
         }
+        let outcome = injected_signal_outcome(signal);
+        // Ordinary successful captures account for every item in every real
+        // batch. Opt-in probes and scripted faults retain their single-outcome
+        // contract so the fault matrix does not depend on batch scheduling.
+        if !self.ensure_signal_probes && matches!(outcome.as_deref(), None | Some("success")) {
+            return DeliveryResult::Injected {
+                accepted: item_count,
+                rejected: 0,
+                attempts: 1,
+                failed: false,
+                outcome: None,
+            };
+        }
         if !first_outcome {
             return DeliveryResult::Injected {
                 accepted: 0,
@@ -1174,7 +1187,7 @@ impl<W: Write> InjectedDelivery<W> {
                 outcome: None,
             };
         }
-        Self::outcome_result(injected_signal_outcome(signal).as_deref(), item_count)
+        Self::outcome_result(outcome.as_deref(), item_count)
     }
 
     fn needs_outcome_probe(&self, signal: OtlpSignal) -> bool {
@@ -1877,6 +1890,159 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn compiled_authored_condition_serializes_exact_eligible_records() {
+        use clinker_record::{Record, SchemaBuilder, Value as RecordValue};
+        use cxl::eval::{EvalContext, StableEvalContext};
+
+        let plan = clinker_plan::config::parse_config(include_str!(
+            "../../tests/fixtures/observability_condition.yaml"
+        ))
+        .expect("authored condition config")
+        .compile(&clinker_plan::config::CompileContext::default())
+        .expect("compiled condition plan");
+        let policy = ClinkerToml::parse(
+            r#"
+[observability]
+arena_bytes = "64KB"
+ordinary_lane_bytes = "32KB"
+high_severity_lane_bytes = "32KB"
+max_batch_bytes = "8KB"
+max_attributes_per_event = 4
+max_attribute_bytes = "256B"
+sample_every = 1
+rate_limit_per_second = 1000
+rate_limit_burst = 1000
+flush_timeout_ms = 500
+
+[[observability.field_policy]]
+event = "transform.customer_seen"
+field = "customer_id"
+action = "allow"
+"#,
+        )
+        .expect("fixed telemetry policy")
+        .resolve_observability(None)
+        .expect("resolved telemetry policy");
+        let schema = SchemaBuilder::new()
+            .with_field("customer_id")
+            .with_field("amount")
+            .build();
+        let records = [500, 5000, 900, 2000]
+            .into_iter()
+            .enumerate()
+            .map(|(index, amount)| {
+                Record::new(
+                    schema.clone(),
+                    vec![
+                        RecordValue::from(format!("customer-{}", index + 1)),
+                        RecordValue::Integer(amount),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        let stable = StableEvalContext::test_default();
+        let context = EvalContext::test_default_borrowed(&stable);
+        let (producer, receiver) = TelemetryArena::reserve(&policy).expect("fixed arena");
+        let observer = producer.clone();
+
+        // The only emitter is synchronous compiled log dispatch. No executor,
+        // source, sink, resource or exporter worker exists, and the receiver
+        // remains untouched until every condition and emission has finished.
+        clinker_exec::dispatch_compiled_transform_logs_for_testing(
+            &plan,
+            "normalize",
+            &records,
+            &context,
+            producer,
+        )
+        .expect("compiled log dispatch");
+
+        let mut payload =
+            BoundedPayload::new(ArenaBounds::from_policy(&policy).request_capacity_bytes())
+                .expect("bounded serialization buffer");
+        let correlation = RunCorrelation::bounded(
+            "condition-test",
+            "condition-test",
+            &plan.config().pipeline.name,
+        );
+        let mut customers = Vec::new();
+        let mut spans = 0;
+        let mut processed = 0;
+        while let Some(batch) = receiver.try_recv_batch() {
+            spans += batch.traces().len();
+            processed += batch
+                .metrics()
+                .iter()
+                .filter(|point| point.key == MetricKey::TransformRecords)
+                .map(|point| point.value)
+                .sum::<u64>();
+            payload
+                .encode(&logs_envelope(batch.logs(), "1", &correlation))
+                .expect("real bounded OTLP serialization");
+            let encoded: Value = serde_json::from_slice(payload.bytes()).expect("OTLP JSON");
+            for resource in encoded["resourceLogs"].as_array().unwrap() {
+                for scope in resource["scopeLogs"].as_array().unwrap() {
+                    for log in scope["logRecords"].as_array().unwrap() {
+                        assert_eq!(log["body"]["stringValue"], "customer processed");
+                        let attributes = log["attributes"].as_array().unwrap();
+                        let fields = attributes
+                            .iter()
+                            .map(|attribute| {
+                                (
+                                    attribute["key"].as_str().unwrap(),
+                                    attribute["value"]["stringValue"].as_str().unwrap(),
+                                )
+                            })
+                            .collect::<BTreeMap<_, _>>();
+                        assert_eq!(
+                            fields.len(),
+                            attributes.len(),
+                            "duplicate attributes: {log}"
+                        );
+                        assert_eq!(fields["clinker.event"], "transform.customer_seen");
+                        for (key, expected) in [
+                            ("clinker.execution_id", correlation.execution_id.as_str()),
+                            ("clinker.batch_id", correlation.batch_id.as_str()),
+                            ("clinker.pipeline_name", correlation.pipeline_name.as_str()),
+                        ] {
+                            assert_eq!(fields[key], expected);
+                            assert!(
+                                resource["resource"]["attributes"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|attribute| attribute["key"] == key
+                                        && attribute["value"]["stringValue"] == expected)
+                            );
+                        }
+                        assert!(
+                            !fields.contains_key("amount"),
+                            "condition-only field: {log}"
+                        );
+                        customers.push(fields["customer_id"].to_owned());
+                    }
+                }
+            }
+        }
+        assert_eq!(customers, ["customer-2", "customer-4"]);
+        assert_eq!(spans, 1);
+        assert_eq!(processed, 4);
+        let admission = AdmissionSummary::from_arena(observer.snapshot(), true);
+        assert_eq!(admission.capacity_bytes, 64_000);
+        assert_eq!(
+            admission.accepted, 3,
+            "two logs and one completed Transform span"
+        );
+        assert_eq!(admission.dropped_total(), 0);
+        assert_eq!(admission.retained_bytes, 0);
+        assert_eq!(admission.arena_recoveries, 0);
+        assert_eq!(admission.fields.denied, 0);
+        assert_eq!(admission.fields.truncated, 0);
+        assert_eq!(admission.fields.limit_dropped, 0);
+        assert_eq!(admission.fields.missing, 0);
+    }
+
     #[cfg(debug_assertions)]
     #[derive(Default)]
     struct CaptureWriter {
@@ -1912,6 +2078,28 @@ mod tests {
     #[cfg(debug_assertions)]
     fn injected_capture(writer: CaptureWriter) -> InjectedDelivery<CaptureWriter> {
         InjectedDelivery::with_capture(Some(writer), false)
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn injected_success_counts_every_item_and_batch_without_probes() {
+        for probes in [false, true] {
+            let mut delivery =
+                InjectedDelivery::with_capture(Some(CaptureWriter::default()), probes);
+            let mut report = OtlpDeliveryReport::default();
+            for count in [2, 3] {
+                report.record(
+                    OtlpSignal::Logs,
+                    delivery.deliver(OtlpSignal::Logs, b"{}", count),
+                    count,
+                );
+            }
+            assert_eq!(report.logs.summary.accepted, if probes { 1 } else { 5 });
+            assert_eq!(report.logs.summary.attempts, if probes { 1 } else { 2 });
+            assert_eq!(report.logs.summary.rejected, 0);
+            assert_eq!(report.logs.summary.failures, 0);
+            assert_eq!(delivery.capture.as_ref().unwrap().get_ref().flushes, 2);
+        }
     }
 
     #[cfg(debug_assertions)]

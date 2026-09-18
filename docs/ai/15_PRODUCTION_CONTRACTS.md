@@ -161,7 +161,7 @@ type.
 | D-46 | Runtime and result consumers | locked-not-implemented | Successful-record identity can collapse equal row ordinals from different sources and is not carried as a typed source-plus-ordinal identity through every path. | Use `SourceRowId { source: PlanNodeId, ordinal: u64 }`, monotonic per source across files, through stream, buffer, spill, fan-out, correlation, DLQ, and sinks; count fan-out once. | CONT-08, CORR-02 | Phase 2 / CORR-02 | Internal correction; attempt-local identity is not an idempotency key. | executor record identity and count paths | 2026-07-29 |
 | D-47 | Benchmark, cache, and report consumers | partially-implemented | Benchmark cases, generated inputs, caches, and result JSON exist without one complete versioned identity, integrity, and compatibility envelope. | Separate stable machine IDs from display labels, version serialized codes and report schema, record exact generation and platform identity, safe-miss corrupt data, and compare only compatible envelopes. | CONT-08, PERF-07 | Phase 5 / PERF-07 | Versioned tooling contract; breaking identity, type, or unit changes bump the major. | benchmark support, generation manifests, and report code | 2026-07-29 |
 | D-48 | CLI users and diagnostic maintainers | partially-implemented | A diagnostic registry and explanation pages exist, but emission, catalog, lookup, docs, metadata, and representative tests are not one enforced inventory. | Drive every visible compile, runtime, warning, and machine code plus `clinker explain --list` from one catalog; reserve retired codes forever and enforce parity in CI. | CONT-08, AUTH-07 | AUTH-07 | Additive catalog authority; retired identifiers are never reused. | `crates/clinker-core-types/src/diagnostic.rs`; `docs/explain` | 2026-07-29 |
-| D-49 | Format authors and pipeline authors | partially-implemented | CSV has locally qualified UTF-8 and true ISO-8859-1 input/output across supported single-schema and multi-record paths, with semantic charset identity, admitted decoding and operation preparation. Exact-byte CLI tests cover supported routes and explicit rejections. Other-format integration and the complete input/output matrix remain unfinished; AUTH-06 is partial. | Decode once and encode once with no guessing or lossy fallback; enforce the locked CSV, X12, EDIFACT, JSON, fixed-width, SWIFT, HL7, and XML matrix; include charset in plan identity. | CONT-08, AUTH-06 | AUTH-06 | Tightening may reject previously guessed or lossy input; broader codecs remain future work. | `crates/clinker-format/tests/encoding_contract.rs`; `crates/clinker-exec/tests/encoding_runtime_contract.rs`; `crates/clinker/tests`; `docs/engine/src/sink-internals.md` | 2026-09-16 |
+| D-49 | Format authors and pipeline authors | partially-implemented | CSV has locally qualified UTF-8 and true ISO-8859-1 input/output across supported single-schema and multi-record paths, with semantic charset identity, admitted decoding and operation preparation. Exact-byte CLI tests cover supported routes and explicit rejections. JSON/XML now use finite prepared output and strict UTF-8 physical-file boundaries, with literal CLI/runtime bytes and failure counts. Remaining-format integration and the complete input/output matrix remain unfinished; AUTH-06 is partial. | Decode once and encode once with no guessing or lossy fallback; enforce the locked CSV, X12, EDIFACT, JSON, fixed-width, SWIFT, HL7, and XML matrix; include charset in plan identity. | CONT-08, AUTH-06 | AUTH-06 | Tightening may reject previously guessed or lossy input; broader codecs remain future work. | `crates/clinker-format/tests/encoding_contract.rs`; `crates/clinker-exec/tests/encoding_runtime_contract.rs`; `crates/clinker/tests`; `docs/engine/src/sink-internals.md` | 2026-09-16 |
 | D-50 | Documentation readers and language users | partially-implemented | The `cxl` crate and tool name are stable, but documents do not consistently expand or characterize the acronym. | Expand first use as Clinker Expression Language and describe it as a per-record ETL expression language, not SQL; avoid alternate expansions and “CXL language.” | CONT-08 | CONT-08 documentation governance | Documentation-only and reversible; crate and tool names remain unchanged. | `crates/cxl`; current documentation corpus | 2026-07-29 |
 | D-51 | Contributors and design reviewers | partially-implemented | AI design and pattern pages mix invariants, repeated observations, slogans, and contextual preferences. | Keep reviewed correctness, security, bounded-resource, layering, and stable-contract invariants in design rules; classify other practices as observed, preferred, or local and preserve counterexamples. | CONT-08 | CONT-08 documentation governance | Documentation classification is reversible; authoritative DAG topology remains an invariant. | `docs/ai/30_DESIGN_RULES.md`; `docs/ai/40_COMMON_PATTERNS.md` | 2026-07-29 |
 | D-52 | Documentation contributors | implemented | `scripts/check-ai-docs.sh` now performs dependency-free offline structure, local-reference, fragment, contract, and ledger checks and is invoked by CI; scoped whitespace and mdBook gates remain audience-specific. | Keep the repository-owned offline gate blocking; build changed books; run scheduled cached external-link checks without making network availability a merge gate. | CONT-01, CONT-02, CONT-03, CONT-04, CONT-05, CONT-06, CONT-07, CONT-08, EVID-04 | Phase 1 gate; Phase 6 / EVID-04 qualification | Additive validation; changing rules requires fixture and CI updates. | `scripts/check-ai-docs.sh`; `.github/workflows/ci.yml` | 2026-07-29 |
@@ -203,7 +203,7 @@ completion of that delivery group.
 
 ## Decoded allocation ownership
 
-**Status: implemented and locally qualified for core ownership and CSV;
+**Status: implemented for core ownership, CSV and native JSON/XML;
 broader admission remains partial.** The maintainer approved this
 AUTH-06 design on 2026-09-15, including the necessary MEM-01/MEM-02/MEM-03
 accounting subset. Shared strings can outlive their original Record through
@@ -231,11 +231,18 @@ admitted decoding, coercion, shared schema/document carriers and retained
 header state. CSV output requires finite resources through the CLI, executor
 and direct writer API. Sealed writer, factory and operation-stage owners keep
 their concrete boxed backings charged through actual deallocation, including
-error and unwinding. Unchanged non-CSV constructors remain explicit legacy
-boundaries, not evidence of mandatory admission for every format.
+error and unwinding. JSON/XML output now uses the same finite stage and erased
+owner contracts, with admitted configuration/schema caches and borrowed native
+encoding. Raw JSON/XML writer constructors are removed; direct callers use
+finite encoders and prepared writers. Schema cache identities retain no schema
+payload and account for legacy weak backing until deallocation. Strict UTF-8
+opens reject unsupported BOMs and XML declarations per physical file; malformed
+input remains a data failure during schema discovery and envelope pre-scan.
+Unchanged codecs remain explicit legacy boundaries, not evidence of mandatory
+admission for every format.
 
 The approved design is no longer awaiting an implementation decision. Local
-tests establish the current CSV behavior and ownership subset; that evidence
+tests establish the current CSV/native behavior and ownership subset; that evidence
 does not assert release qualification or complete AUTH-06. The broader
 [variable-payload contract #1183](https://github.com/rustpunk/clinker/issues/1183)
 and [bounded fan-in work #1044](https://github.com/rustpunk/clinker/issues/1044)
@@ -246,7 +253,7 @@ Source and executable evidence include `crates/clinker-record/src/field_str.rs`,
 `crates/clinker-record/src/record/mod.rs`,
 `crates/clinker-format/src/preparation.rs`,
 `crates/clinker-format/tests/writer_preparation.rs` and the CSV format, runtime
-and CLI encoding tests. See [CSV decoding and document ownership](../engine/src/memory-arbitration.md#csv-decoding-and-document-ownership),
+and native CLI encoding tests. See [CSV decoding and document ownership](../engine/src/memory-arbitration.md#csv-decoding-and-document-ownership),
 [sink preparation](../engine/src/sink-internals.md#csv-preparation-and-writer-ownership)
 and [extension APIs](../engine/src/extension-seams.md#allocation-aware-csv-construction)
 for the implemented boundaries and remaining legacy paths.

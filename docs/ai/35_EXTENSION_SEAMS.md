@@ -120,6 +120,16 @@ record-to-byte behavior through the `Send`-only `FormatReader` and
 document, envelope, source-file, byte-counting, and non-finalizing flush hooks
 are part of the contract; wrappers must delegate hooks they do not own.
 
+CSV, JSON and XML output require finite prepared resources in both direct and
+runtime APIs. Native callers use `JsonEncoder`/`XmlEncoder` with `PreparedWriter`
+or admitted `FormatWriterHandle`; raw JSON/XML writer entrypoints are removed.
+Keep pending state separate until complete delivery, preserve poisoned failure
+state, and do not add a teardown retry through outer buffering. Config, schema
+cache replacements, erased writer/factory backings and operation storage each
+retain their actual allocation owner. The full construction and identity
+contract is in [finite native writer construction](../engine/src/extension-seams.md#finite-native-writer-construction).
+This does not claim admission for unchanged codecs or native reader parsers.
+
 **Required change path.** A selectable format normally needs:
 
 1. Strict, span-preserving author config in `clinker-plan`, including

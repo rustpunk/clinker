@@ -6,6 +6,8 @@ pub mod executor;
 pub mod exit_codes;
 mod integration_tests;
 mod log_dispatch;
+#[cfg(feature = "test-utils")]
+pub use log_dispatch::dispatch_compiled_transform_logs_for_testing;
 pub mod metrics;
 pub mod output;
 pub mod partial;

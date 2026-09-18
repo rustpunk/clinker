@@ -22,21 +22,642 @@
 //! rendered record values or record-sized scalar capacity.
 
 use clinker_record::owned_storage::{OwnedKey, SharedStorage};
-use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::io::Write;
 
 use quick_xml::Writer as XmlEmitter;
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 
-use clinker_record::field_path::{self, FieldPathError};
-use clinker_record::nested_key::{NestedKey, validate_nested_depth, validate_nested_keys};
+use clinker_record::field_path;
+use clinker_record::nested_key::NestedKey;
 use clinker_record::{DocumentContext, Record, Schema, Value};
 
-use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
-use crate::error::FormatError;
+use crate::envelope_writer::OutputEnvelopeSpec;
+use crate::error::{FormatError, OutputEncodingKind, OutputFieldName};
 use crate::multi_value::JoinValues;
+use crate::preparation::{
+    FormatEncoder, OutputOperation, PreparedWriter, WriterResources, WriterScope,
+};
+use crate::reserved::{ReservedText, ReservedVec};
 use crate::traits::FormatWriter;
+
+/// Borrowed factory input; all retained policy is copied only after admission.
+pub struct XmlEncoderOptions<'a> {
+    pub root_element: &'a str,
+    pub record_element: &'a str,
+    pub attribute_prefix: &'a str,
+    pub preserve_nulls: bool,
+    pub include_engine_stamped: bool,
+    pub join_values: &'a [JoinValues],
+    pub declared_multiple: &'a BTreeSet<String>,
+    pub envelope_header: Option<&'a str>,
+    pub envelope_footer: Option<&'a str>,
+    pub envelope_count: Option<&'a str>,
+}
+impl<'a> From<&'a XmlWriterConfig> for XmlEncoderOptions<'a> {
+    fn from(c: &'a XmlWriterConfig) -> Self {
+        Self {
+            root_element: &c.root_element,
+            record_element: &c.record_element,
+            attribute_prefix: &c.attribute_prefix,
+            preserve_nulls: c.preserve_nulls,
+            include_engine_stamped: c.include_engine_stamped,
+            join_values: &c.join_values,
+            declared_multiple: &c.declared_multiple,
+            envelope_header: c
+                .envelope
+                .as_ref()
+                .and_then(|e| e.header_from_doc.as_deref()),
+            envelope_footer: c
+                .envelope
+                .as_ref()
+                .and_then(|e| e.footer_from_doc.as_deref()),
+            envelope_count: c
+                .envelope
+                .as_ref()
+                .and_then(|e| e.footer_record_count_field.as_deref()),
+        }
+    }
+}
+struct PreparedXmlJoin {
+    field: ReservedText,
+    repeat: Option<ReservedText>,
+    wrap: Option<ReservedText>,
+}
+struct PreparedXmlConfig {
+    root: ReservedText,
+    record: ReservedText,
+    prefix: ReservedText,
+    preserve_nulls: bool,
+    include_engine_stamped: bool,
+    joins: ReservedVec<PreparedXmlJoin>,
+    multiple: ReservedVec<ReservedText>,
+    envelope: Option<crate::envelope_writer::PreparedEnvelope>,
+}
+/// Immutable admitted XML policy shared by physical writers from one factory.
+#[derive(Clone)]
+pub struct XmlEncoderConfig(SharedStorage<PreparedXmlConfig>);
+fn xml_text(scope: &WriterScope, value: &str) -> Result<ReservedText, FormatError> {
+    let mut text = ReservedText::new(scope.allocation().clone());
+    text.push_str(value)?;
+    Ok(text)
+}
+fn prepared_xml_error(field: usize, name: &str, kind: OutputEncodingKind) -> FormatError {
+    FormatError::OutputEncoding {
+        format: "XML",
+        field: field + 1,
+        offset: 0,
+        kind,
+        field_name: OutputFieldName::new(name),
+        element: None,
+    }
+}
+fn prepared_name(name: &str, field: usize) -> Result<(), FormatError> {
+    if is_valid_xml_name(name) {
+        Ok(())
+    } else {
+        Err(prepared_xml_error(field, name, OutputEncodingKind::XmlName))
+    }
+}
+impl XmlEncoderConfig {
+    /// Admit the shared backing, policy vectors and names before copying.
+    /// The caller continues to own the compiled options and schema.
+    pub fn new(
+        options: XmlEncoderOptions<'_>,
+        resources: &WriterResources,
+    ) -> Result<Self, FormatError> {
+        let scope = resources.scope()?;
+        prepared_name(options.root_element, 0)?;
+        prepared_name(options.record_element, 0)?;
+        let mut joins = ReservedVec::new(scope.allocation().clone());
+        joins.reserve_exact(options.join_values.len())?;
+        for j in options.join_values {
+            joins.push(PreparedXmlJoin {
+                field: xml_text(&scope, &j.field)?,
+                repeat: j
+                    .repeat_as
+                    .as_deref()
+                    .map(|s| xml_text(&scope, s))
+                    .transpose()?,
+                wrap: j
+                    .wrap_in
+                    .as_deref()
+                    .map(|s| xml_text(&scope, s))
+                    .transpose()?,
+            })?;
+        }
+        let mut multiple = ReservedVec::new(scope.allocation().clone());
+        multiple.reserve_exact(options.declared_multiple.len())?;
+        for name in options.declared_multiple {
+            multiple.push(xml_text(&scope, name)?)?;
+        }
+        let envelope = crate::envelope_writer::PreparedEnvelope::from_names(
+            options.envelope_header,
+            options.envelope_footer,
+            options.envelope_count,
+            &scope,
+        )?;
+        Ok(Self(SharedStorage::try_new(
+            PreparedXmlConfig {
+                root: xml_text(&scope, options.root_element)?,
+                record: xml_text(&scope, options.record_element)?,
+                prefix: xml_text(&scope, options.attribute_prefix)?,
+                preserve_nulls: options.preserve_nulls,
+                include_engine_stamped: options.include_engine_stamped,
+                joins,
+                multiple,
+                envelope,
+            },
+            scope.allocation(),
+        )?))
+    }
+}
+
+/// XML operation encoder. Schema/document values remain owned by the caller;
+/// only admitted policy and schema-derived tree capacities are retained.
+/// No escaped record or copied value tree is constructed.
+/// Raw construction without a finite resource provider is unavailable.
+///
+/// ```compile_fail
+/// use clinker_format::xml::writer::XmlWriter;
+/// ```
+///
+/// ```
+/// use std::num::NonZeroUsize;
+/// use std::sync::Arc;
+/// use clinker_format::{FormatWriter, xml::writer::{XmlEncoder, XmlWriterConfig}};
+/// use clinker_format::preparation::{MemoryOnlyResources, PreparedWriter};
+/// use clinker_record::{Record, Schema, Value, owned_storage::SharedStorage};
+/// let resources = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+/// let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into()])));
+/// let record = Record::new(schema.clone(), vec![Value::Integer(1)]);
+/// let encoder = XmlEncoder::new(schema, &XmlWriterConfig::default(), resources.resources())?;
+/// let mut bytes = Vec::new();
+/// let mut writer = PreparedWriter::new(&mut bytes, encoder, resources.resources())?;
+/// writer.write_record(&record)?;
+/// writer.flush()?;
+/// drop(writer);
+/// assert_eq!(bytes, b"<Root><Record><id>1</id></Record></Root>");
+/// assert_eq!(resources.used(), 0);
+/// # Ok::<(), clinker_format::FormatError>(())
+/// ```
+pub struct XmlEncoder {
+    config: XmlEncoderConfig,
+    plan_cache: Option<PreparedPlanCache>,
+    header_written: bool,
+    records: u64,
+}
+/// Replacement cache and framing counters become committed only after delivery.
+/// Keeping the prior cache in the encoder admits both lifetimes at their peak.
+pub struct XmlPending {
+    replacement: Option<PreparedPlanCache>,
+    header_written: bool,
+    records: u64,
+    finalized: bool,
+}
+// The sealed identity retains no dynamic schema columns or raw address.
+struct PreparedPlanCache {
+    schema: clinker_record::owned_storage::SharedStorageIdentity<Schema>,
+    plan: TreePlan,
+}
+impl XmlEncoder {
+    /// Admit retained policy before copying; schema values keep their caller owner.
+    pub fn new(
+        schema: SharedStorage<Schema>,
+        config: &XmlWriterConfig,
+        resources: WriterResources,
+    ) -> Result<Self, FormatError> {
+        Self::from_config(schema, XmlEncoderConfig::new(config.into(), &resources)?)
+    }
+    /// Borrow the schema through its existing owner and share admitted policy.
+    pub fn from_config(
+        _schema: SharedStorage<Schema>,
+        config: XmlEncoderConfig,
+    ) -> Result<Self, FormatError> {
+        Ok(Self {
+            config,
+            plan_cache: None,
+            header_written: false,
+            records: 0,
+        })
+    }
+    /// Admit the concrete writer until its actual backing is deallocated.
+    /// The destination keeps its existing owner; drop never finalizes output.
+    pub fn into_boxed_writer<W: Write + Send + 'static>(
+        self,
+        destination: W,
+        resources: WriterResources,
+    ) -> Result<crate::traits::FormatWriterHandle, FormatError> {
+        let scope = resources.scope()?;
+        let writer = PreparedWriter::new(destination, self, resources)?;
+        Ok(crate::traits::FormatWriterHandle::try_new(
+            writer,
+            scope.allocation(),
+        )?)
+    }
+}
+impl<W: Write + Send> FormatWriter for PreparedWriter<W, XmlEncoder> {
+    fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
+        self.write_operation(OutputOperation::Record(record))
+    }
+    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        self.write_operation(OutputOperation::BeginDocument(doc))
+    }
+    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        self.write_operation(OutputOperation::EndDocument(doc))
+    }
+    fn flush(&mut self) -> Result<(), FormatError> {
+        PreparedWriter::flush(self)
+    }
+    fn flush_bytes(&mut self) -> Result<(), FormatError> {
+        PreparedWriter::flush_bytes(self)
+    }
+}
+
+fn admitted_body(scope: &WriterScope) -> PlanBody {
+    PlanBody {
+        attrs: ReservedVec::new(scope.allocation().clone()),
+        children: ReservedVec::new(scope.allocation().clone()),
+    }
+}
+fn admitted_tree<'a>(
+    fields: impl Iterator<Item = (usize, &'a str)>,
+    config: &PreparedXmlConfig,
+    scope: &WriterScope,
+) -> Result<TreePlan, FormatError> {
+    let mut root = admitted_body(scope);
+    for (field, name) in fields {
+        scope.check_cancelled()?;
+        let mut path = ReservedVec::new(scope.allocation().clone());
+        for segment in field_path::segments(name) {
+            scope.check_cancelled()?;
+            let segment = segment
+                .map_err(|_| prepared_xml_error(field, name, OutputEncodingKind::XmlPath))?;
+            let mut text = ReservedText::new(scope.allocation().clone());
+            segment.write_to(|chunk| text.push_str(chunk))?;
+            path.push(text)?;
+        }
+        admitted_insert(&mut root, field, name, path.as_slice(), config, scope)?;
+    }
+    Ok(TreePlan { root })
+}
+fn admitted_insert(
+    body: &mut PlanBody,
+    field: usize,
+    full: &str,
+    path: &[ReservedText],
+    config: &PreparedXmlConfig,
+    scope: &WriterScope,
+) -> Result<(), FormatError> {
+    scope.check_cancelled()?;
+    let Some((segment, rest)) = path.split_first() else {
+        return Err(prepared_xml_error(field, full, OutputEncodingKind::XmlPath));
+    };
+    let segment = segment.as_str();
+    let prefix = config.prefix.as_str();
+    let attr = !prefix.is_empty() && segment.starts_with(prefix);
+    let name = if attr {
+        &segment[prefix.len()..]
+    } else {
+        segment
+    };
+    prepared_name(name, field)?;
+    if attr {
+        if !rest.is_empty()
+            || body
+                .attrs
+                .as_slice()
+                .iter()
+                .any(|a| a.name.as_str() == name)
+        {
+            return Err(prepared_xml_error(field, full, OutputEncodingKind::XmlPath));
+        }
+        body.attrs.push(PlanAttr {
+            name: xml_text(scope, name)?,
+            field,
+        })?;
+    } else if !rest.is_empty() {
+        if let Some(node) = body.children.as_mut_slice().iter_mut().find(|n| match n {
+            PlanNode::Leaf { name, .. } | PlanNode::Branch { name, .. } => name.as_str() == segment,
+        }) {
+            match node {
+                PlanNode::Branch { body, .. } => {
+                    admitted_insert(body, field, full, rest, config, scope)?
+                }
+                PlanNode::Leaf { .. } => {
+                    return Err(prepared_xml_error(field, full, OutputEncodingKind::XmlPath));
+                }
+            }
+        } else {
+            let mut branch = admitted_body(scope);
+            admitted_insert(&mut branch, field, full, rest, config, scope)?;
+            body.children.push(PlanNode::Branch {
+                name: xml_text(scope, segment)?,
+                body: branch,
+            })?;
+        }
+    } else {
+        if body.children.as_slice().iter().any(|n| match n {
+            PlanNode::Leaf { name, .. } | PlanNode::Branch { name, .. } => name.as_str() == segment,
+        }) {
+            return Err(prepared_xml_error(field, full, OutputEncodingKind::XmlPath));
+        }
+        let repeat = if let Some(j) = config
+            .joins
+            .as_slice()
+            .iter()
+            .find(|j| j.field.as_str() == full && (j.repeat.is_some() || j.wrap.is_some()))
+        {
+            let item = j.repeat.as_ref().map_or(segment, ReservedText::as_str);
+            prepared_name(item, field)?;
+            let wrap_in = j
+                .wrap
+                .as_ref()
+                .map(|w| {
+                    prepared_name(w.as_str(), field)?;
+                    xml_text(scope, w.as_str())
+                })
+                .transpose()?;
+            Some(XmlRepeat {
+                item_name: xml_text(scope, item)?,
+                wrap_in,
+            })
+        } else {
+            None
+        };
+        body.children.push(PlanNode::Leaf {
+            name: xml_text(scope, segment)?,
+            field,
+            declared_multiple: config
+                .multiple
+                .as_slice()
+                .iter()
+                .any(|n| n.as_str() == full),
+            repeat,
+        })?;
+    }
+    Ok(())
+}
+fn validate_prepared_scalar(
+    value: &Value,
+    field: usize,
+    name: &str,
+    scope: &WriterScope,
+) -> Result<(), FormatError> {
+    let error = || prepared_xml_error(field, name, OutputEncodingKind::XmlValue);
+    if matches!(value, Value::Map(_) | Value::Array(_)) {
+        return Err(error());
+    }
+    let text = scalar_text("", value)?;
+    for (offset, ch) in text.as_str().char_indices() {
+        if offset % 4096 < 4 {
+            scope.check_cancelled()?;
+        }
+        if !matches!(ch, '\u{9}' | '\u{A}' | '\u{D}' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+        {
+            let mut error = error();
+            if let FormatError::OutputEncoding { offset: at, .. } = &mut error {
+                *at = offset;
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+fn validate_prepared_value(
+    value: &Value,
+    field: usize,
+    name: &str,
+    prefix: &str,
+    depth: usize,
+    scope: &WriterScope,
+) -> Result<(), FormatError> {
+    scope.check_cancelled()?;
+    let error = || prepared_xml_error(field, name, OutputEncodingKind::XmlValue);
+    if matches!(value, Value::Map(_) | Value::Array(_))
+        && depth >= clinker_record::nested_key::MAX_NESTED_VALUE_DEPTH
+    {
+        return Err(error());
+    }
+    match value {
+        Value::Array(values) => {
+            for value in values.as_slice() {
+                // Native XML has no anonymous array-item element.
+                if matches!(value, Value::Array(_)) {
+                    return Err(error());
+                }
+                validate_prepared_value(value, field, name, prefix, depth + 1, scope)?;
+            }
+        }
+        Value::Map(values) => {
+            for (index, (raw, child)) in values.as_map().iter().enumerate() {
+                scope.check_cancelled()?;
+                // The shared decoder borrows success and copies only malformed
+                // keys. Admit that exact error-only layout until conversion.
+                let layout = std::alloc::Layout::array::<u8>(raw.len()).map_err(|_| {
+                    crate::preparation::ResourceError::new(
+                        crate::preparation::ResourceErrorKind::Layout,
+                        raw.len(),
+                        0,
+                    )
+                })?;
+                let diagnostic = scope.reserve(layout)?;
+                let key = NestedKey::decode(raw).map_err(|_| error())?;
+                for prior in values.as_map().keys().take(index) {
+                    scope.check_cancelled()?;
+                    let prior = NestedKey::decode(prior).map_err(|_| error())?;
+                    if key.text == prior.text {
+                        return Err(error());
+                    }
+                }
+                drop(diagnostic);
+                let attr = !key.escaped && !prefix.is_empty() && key.text.starts_with(prefix);
+                let text = !key.escaped && key.text == "#text";
+                if attr {
+                    prepared_name(&key.text[prefix.len()..], field)?;
+                } else if !text {
+                    prepared_name(&key.text, field)?;
+                }
+                if attr || text {
+                    validate_prepared_scalar(child, field, name, scope)?;
+                } else {
+                    validate_prepared_value(child, field, name, prefix, depth + 1, scope)?;
+                }
+            }
+        }
+        _ => validate_prepared_scalar(value, field, name, scope)?,
+    }
+    Ok(())
+}
+fn validate_prepared_body(
+    body: &PlanBody,
+    values: &impl FieldSource,
+    config: &PreparedXmlConfig,
+    scope: &WriterScope,
+) -> Result<(), FormatError> {
+    for attr in body.attrs.as_slice() {
+        scope.check_cancelled()?;
+        let (name, value) = values.field(attr.field);
+        validate_prepared_scalar(value, attr.field, name, scope)?;
+    }
+    for child in body.children.as_slice() {
+        scope.check_cancelled()?;
+        match child {
+            PlanNode::Branch { body, .. } => validate_prepared_body(body, values, config, scope)?,
+            PlanNode::Leaf {
+                field,
+                declared_multiple,
+                ..
+            } => {
+                let (name, value) = values.field(*field);
+                if matches!(value, Value::Array(_)) && !declared_multiple {
+                    return Err(prepared_xml_error(*field, name, OutputEncodingKind::Array));
+                }
+                validate_prepared_value(value, *field, name, config.prefix.as_str(), 0, scope)?;
+            }
+        }
+    }
+    Ok(())
+}
+fn prepared_element<W: Write>(
+    writer: &mut XmlEmitter<W>,
+    wrapper: &str,
+    plan: &TreePlan,
+    values: &impl FieldSource,
+    config: &PreparedXmlConfig,
+) -> Result<(), FormatError> {
+    write_planned_start(writer, wrapper, plan.root.attrs.as_slice(), values, false)?;
+    emit_body(
+        writer,
+        &plan.root,
+        values,
+        config.preserve_nulls,
+        config.prefix.as_str(),
+    )?;
+    writer
+        .write_event(Event::End(BytesEnd::new(wrapper)))
+        .map_err(xml_err)
+}
+impl FormatEncoder for XmlEncoder {
+    type Pending = XmlPending;
+    fn prepare(
+        &self,
+        operation: OutputOperation<'_>,
+        stage: &mut dyn Write,
+        workspace: &WriterScope,
+    ) -> Result<XmlPending, FormatError> {
+        workspace.check_cancelled()?;
+        let config = &self.config.0;
+        let mut pending = XmlPending {
+            replacement: None,
+            header_written: self.header_written,
+            records: self.records,
+            finalized: false,
+        };
+        let mut writer = XmlEmitter::new(stage);
+        let needs_root = matches!(
+            operation,
+            OutputOperation::Record(_) | OutputOperation::Finalize
+        ) || matches!(operation, OutputOperation::BeginDocument(_))
+            && config.envelope.is_some();
+        if needs_root && !pending.header_written {
+            writer
+                .write_event(Event::Start(BytesStart::new(config.root.as_str())))
+                .map_err(xml_err)?;
+            pending.header_written = true;
+        }
+        match operation {
+            OutputOperation::Record(record) => {
+                if self
+                    .plan_cache
+                    .as_ref()
+                    .is_none_or(|p| !p.schema.matches(record.schema()))
+                {
+                    let fields = record
+                        .schema()
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| {
+                            config.include_engine_stamped || !record.schema().is_engine_stamped(*i)
+                        })
+                        .map(|(i, n)| (i, n.as_ref()));
+                    pending.replacement = Some(PreparedPlanCache {
+                        schema: record.schema().try_identity(workspace.allocation())?,
+                        plan: admitted_tree(fields, config, workspace)?,
+                    });
+                }
+                let cache = pending
+                    .replacement
+                    .as_ref()
+                    .or(self.plan_cache.as_ref())
+                    .ok_or_else(|| {
+                        crate::preparation::ResourceError::new(
+                            crate::preparation::ResourceErrorKind::Authority,
+                            0,
+                            0,
+                        )
+                    })?;
+                let values = RecordFields::new(record);
+                validate_prepared_body(&cache.plan.root, &values, config, workspace)?;
+                prepared_element(
+                    &mut writer,
+                    config.record.as_str(),
+                    &cache.plan,
+                    &values,
+                    config,
+                )?;
+                pending.records = pending.records.saturating_add(1);
+            }
+            OutputOperation::BeginDocument(doc) => {
+                if let Some(envelope) = &config.envelope {
+                    writer
+                        .write_event(Event::Start(BytesStart::new("Document")))
+                        .map_err(xml_err)?;
+                    if let Some(fields) = envelope.header_fields(doc) {
+                        let values = SectionFields::new(fields, None);
+                        let plan = admitted_tree(values.names(), config, workspace)?;
+                        validate_prepared_body(&plan.root, &values, config, workspace)?;
+                        prepared_element(&mut writer, "header", &plan, &values, config)?;
+                    }
+                    pending.records = 0;
+                }
+            }
+            OutputOperation::EndDocument(doc) => {
+                if let Some(envelope) = &config.envelope {
+                    if let Some(fields) = envelope.footer_fields(doc) {
+                        let count = envelope
+                            .count_name()
+                            .map(|name| (name, self.records as i64));
+                        let values = SectionFields::new(fields, count);
+                        let plan = admitted_tree(values.names(), config, workspace)?;
+                        validate_prepared_body(&plan.root, &values, config, workspace)?;
+                        prepared_element(&mut writer, "footer", &plan, &values, config)?;
+                    }
+                    writer
+                        .write_event(Event::End(BytesEnd::new("Document")))
+                        .map_err(xml_err)?;
+                }
+            }
+            OutputOperation::Finalize => {
+                writer
+                    .write_event(Event::End(BytesEnd::new(config.root.as_str())))
+                    .map_err(xml_err)?;
+                pending.finalized = true;
+            }
+        }
+        Ok(pending)
+    }
+    fn commit(&mut self, pending: XmlPending) {
+        if pending.finalized {
+            self.plan_cache = None;
+        } else if let Some(cache) = pending.replacement {
+            self.plan_cache = Some(cache);
+        }
+        self.header_written = pending.header_written;
+        self.records = pending.records;
+    }
+}
 
 #[derive(Clone)]
 pub struct XmlWriterConfig {
@@ -90,239 +711,9 @@ impl Default for XmlWriterConfig {
     }
 }
 
-/// Streaming XML writer with complete-record validation before record bytes.
-///
-/// The writer borrows values twice per call and retains no per-record
-/// preparation state. Its only memoized heap state is the schema-derived XML
-/// tree plan, whose size is independent of record value widths.
-pub struct XmlWriter<W: Write> {
-    writer: XmlEmitter<W>,
-    /// Schema pinned for the writer's lifetime. The borrowed emit path walks
-    /// each record positionally, while this ownership keeps factory callers
-    /// honest about the stream's declared schema.
-    _schema: SharedStorage<Schema>,
-    config: XmlWriterConfig,
-    header_written: bool,
-    /// Per-document envelope framer, present only when `config.envelope` is.
-    framer: Option<EnvelopeFramer>,
-    /// Precompiled element-tree shape for the record body, memoized by schema
-    /// identity. The tree SHAPE (dotted-branch nesting, attribute-vs-element
-    /// classification, element names, ordering, attribute-name validity) is a
-    /// pure function of the schema's column names + config, independent of
-    /// per-record values, so it is built once and reused across records. Built
-    /// lazily on the first `write_record` from `record.schema()` and rebuilt on
-    /// a schema-identity change, so a multi-schema output stays correct.
-    plan_cache: Option<PlanCache>,
-}
-
-impl<W: Write> XmlWriter<W> {
-    pub fn new(writer: W, schema: SharedStorage<Schema>, config: XmlWriterConfig) -> Self {
-        let framer = config
-            .envelope
-            .clone()
-            .and_then(OutputEnvelopeSpec::into_framer);
-        Self {
-            writer: XmlEmitter::new(writer),
-            _schema: schema,
-            config,
-            header_written: false,
-            framer,
-            plan_cache: None,
-        }
-    }
-
-    /// Ensure `plan_cache` holds a tree plan for this record's schema. The plan
-    /// is rebuilt only when the schema identity changes (`SharedStorage::ptr_eq`), so a
-    /// single-schema stream builds it once. Attribute-name validation happens
-    /// here (at build time), before any bytes are written, so a malformed
-    /// attribute name still fails `write_record` cleanly.
-    fn ensure_plan(&mut self, record: &Record) -> Result<(), FormatError> {
-        let schema = record.schema();
-        let current = self
-            .plan_cache
-            .as_ref()
-            .is_some_and(|c| SharedStorage::ptr_eq(&c.schema, schema));
-        if !current {
-            self.plan_cache = Some(build_plan_cache(record, &self.config)?);
-        }
-        Ok(())
-    }
-
-    /// Emit a `<wrapper>…</wrapper>` element whose children are the section's
-    /// fields rendered as nested elements (reusing the dotted-name expansion),
-    /// optionally appending a `<count_field>N</count_field>` child. Called only
-    /// for a section the document actually carries (a missing section emits no
-    /// wrapper at all).
-    fn write_section_element(
-        writer: &mut XmlEmitter<W>,
-        config: &XmlWriterConfig,
-        wrapper: &str,
-        fields: &indexmap::IndexMap<OwnedKey, Value>,
-        count: Option<(&str, i64)>,
-    ) -> Result<(), FormatError> {
-        let values = SectionFields::new(fields, count);
-        let plan = build_tree_plan(values.names(), config)?;
-        validate_body(&plan.root, &values, config)?;
-        write_planned_start(writer, wrapper, &plan.root.attrs, &values, false)?;
-        emit_body(
-            writer,
-            &plan.root,
-            &values,
-            config.preserve_nulls,
-            &config.attribute_prefix,
-        )?;
-        let end = BytesEnd::new(wrapper);
-        writer
-            .write_event(Event::End(end))
-            .map_err(|e| FormatError::Xml(e.to_string()))?;
-        Ok(())
-    }
-
-    fn write_header(&mut self) -> Result<(), FormatError> {
-        if !self.header_written {
-            // The root and record element names come straight from config into
-            // `BytesStart::new`; validate them before opening the root so a
-            // malformed configured name fails loud rather than corrupting the
-            // document. Both are checked here, once, before any record element
-            // is emitted (every write path opens the header first).
-            check_xml_name(&self.config.root_element, "root element")?;
-            check_xml_name(&self.config.record_element, "record element")?;
-            self.header_written = true;
-            let start = BytesStart::new(&self.config.root_element);
-            self.writer
-                .write_event(Event::Start(start))
-                .map_err(|e| FormatError::Xml(e.to_string()))?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn retained_preparation_bytes(&self) -> usize {
-        0
-    }
-}
-
-impl<W: Write + Send> FormatWriter for XmlWriter<W> {
-    fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        // The schema plan and the complete borrowed-value validation pass both
-        // finish before the record start tag. Pass two can therefore emit
-        // directly from `record` without a prepared value tree or retained
-        // scalar strings, while a structural failure adds no record bytes.
-        self.ensure_plan(record)?;
-        let values = RecordFields::new(record);
-        let plan = &self.plan_cache.as_ref().expect("plan built above").plan;
-        validate_body(&plan.root, &values, &self.config)?;
-
-        self.write_header()?;
-
-        // Disjoint field borrows let the sink, cached schema plan, and borrowed
-        // record values remain live together throughout direct emission.
-        let Self {
-            writer,
-            plan_cache,
-            config,
-            framer,
-            ..
-        } = self;
-        let plan = &plan_cache.as_ref().expect("plan built above").plan;
-
-        write_planned_start(
-            writer,
-            &config.record_element,
-            &plan.root.attrs,
-            &values,
-            false,
-        )?;
-
-        emit_body(
-            writer,
-            &plan.root,
-            &values,
-            config.preserve_nulls,
-            &config.attribute_prefix,
-        )?;
-
-        writer
-            .write_event(Event::End(BytesEnd::new(&*config.record_element)))
-            .map_err(xml_err)?;
-
-        if let Some(framer) = framer.as_mut() {
-            framer.count_record();
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<(), FormatError> {
-        self.write_header()?; // Ensure root is opened even for 0 records
-        let end = BytesEnd::new(&*self.config.root_element);
-        self.writer
-            .write_event(Event::End(end))
-            .map_err(|e| FormatError::Xml(e.to_string()))?;
-        self.writer.get_mut().flush().map_err(FormatError::Io)?;
-        Ok(())
-    }
-
-    /// Drain the underlying sink without emitting the closing root element, so
-    /// byte-limit split accounting can observe the size mid-document. The
-    /// closing root tag is written only by [`Self::flush`] at end of file /
-    /// rotation.
-    fn flush_bytes(&mut self) -> Result<(), FormatError> {
-        self.writer.get_mut().flush().map_err(FormatError::Io)
-    }
-
-    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
-        if self.framer.is_none() {
-            return Ok(());
-        }
-        // Ensure the root element is open before the first document.
-        self.write_header()?;
-        // Open the per-document wrapper.
-        let start = BytesStart::new("Document");
-        self.writer
-            .write_event(Event::Start(start))
-            .map_err(|e| FormatError::Xml(e.to_string()))?;
-        // Reset the per-document counter, then render the header directly off
-        // the framer's borrow into the DocumentContext. `write_section_element`
-        // takes the disjoint `writer` field, so it runs while the framer borrow
-        // is live. `None` (the document lacks the configured section) emits no
-        // `<header>`.
-        let framer = self.framer.as_mut().expect("framer checked above");
-        framer.begin();
-        if let Some(fields) = framer.header_fields(doc) {
-            Self::write_section_element(&mut self.writer, &self.config, "header", fields, None)?;
-        }
-        Ok(())
-    }
-
-    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
-        let Some(framer) = self.framer.as_ref() else {
-            return Ok(());
-        };
-        // Render the footer directly off the framer's borrow: the section map
-        // and the computed count stay borrowed while the disjoint `writer` field
-        // is written. `None` (the document lacks the configured footer section)
-        // emits no `<footer>` — the count rides a present section only.
-        if let Some(fields) = framer.footer_fields(doc) {
-            let count = framer.footer_count();
-            Self::write_section_element(&mut self.writer, &self.config, "footer", fields, count)?;
-        }
-        let end = BytesEnd::new("Document");
-        self.writer
-            .write_event(Event::End(end))
-            .map_err(|e| FormatError::Xml(e.to_string()))?;
-        Ok(())
-    }
-}
-
-/// Wrap a field-name grammar failure as this writer's error.
-fn field_path_error(source: FieldPathError) -> FormatError {
-    FormatError::field_path("XML", source)
-}
-
-/// Map an emitter error into [`FormatError::Xml`]. The emitter surfaces
-/// `std::io::Error`; its `Display` carries the underlying cause.
-fn xml_err<E: std::fmt::Display>(e: E) -> FormatError {
-    FormatError::Xml(e.to_string())
+/// Preserve emitter I/O identity, including governed-stage resource failures.
+fn xml_err(e: std::io::Error) -> FormatError {
+    FormatError::Io(e)
 }
 
 #[derive(Clone, Copy)]
@@ -341,6 +732,13 @@ fn write_escaped<W: Write>(
 ) -> Result<(), FormatError> {
     let mut copied_through = 0;
     for (offset, ch) in raw.char_indices() {
+        if offset - copied_through >= 4096 {
+            writer
+                .get_mut()
+                .write_all(&raw.as_bytes()[copied_through..offset])
+                .map_err(xml_err)?;
+            copied_through = offset;
+        }
         let replacement = match ch {
             '&' => Some("&amp;"),
             '<' => Some("&lt;"),
@@ -458,16 +856,6 @@ pub(crate) fn is_valid_xml_name(name: &str) -> bool {
 /// field literally named `1st` or `a b`) would emit malformed markup while
 /// still reporting run success. `context` describes the name's origin for
 /// the diagnostic (e.g. `"field 'X': element"`, `"root element"`).
-fn check_xml_name(name: &str, context: &str) -> Result<(), FormatError> {
-    if is_valid_xml_name(name) {
-        Ok(())
-    } else {
-        Err(FormatError::Xml(format!(
-            "{context} name '{name}' is not a well-formed XML name"
-        )))
-    }
-}
-
 const SCALAR_TEXT_CAPACITY: usize = 128;
 
 struct ScalarBuffer {
@@ -623,23 +1011,22 @@ struct TreePlan {
 /// One element's precompiled body: the attributes on its start tag plus its
 /// child nodes. Values are not stored — each terminal carries the field index
 /// to borrow from the current record.
-#[derive(Default)]
 struct PlanBody {
-    attrs: Vec<PlanAttr>,
-    children: Vec<PlanNode>,
+    attrs: ReservedVec<PlanAttr>,
+    children: ReservedVec<PlanNode>,
 }
 
 /// A precompiled attribute: its (validated) XML name and the field index whose
 /// value it borrows.
 struct PlanAttr {
-    name: String,
+    name: ReservedText,
     field: usize,
 }
 
 /// A precompiled child node: a leaf element or a nested branch.
 enum PlanNode {
     Leaf {
-        name: String,
+        name: ReservedText,
         field: usize,
         /// Whether this top-level schema field declares `multiple: true`.
         /// Used only to admit a top-level array; nested arrays inside maps use
@@ -652,7 +1039,7 @@ enum PlanNode {
         repeat: Option<XmlRepeat>,
     },
     Branch {
-        name: String,
+        name: ReservedText,
         body: PlanBody,
     },
 }
@@ -665,182 +1052,9 @@ enum PlanNode {
 struct XmlRepeat {
     /// Element name emitted per array item (a `repeat_as`, or the leaf's own
     /// element name when the entry did not set one).
-    item_name: String,
+    item_name: ReservedText,
     /// Optional container element wrapping the repeated items (`wrap_in`).
-    wrap_in: Option<String>,
-}
-
-/// The memoized schema-derived plan plus the identity it was built for. Field
-/// nodes retain only raw schema indices and validated XML names; record values
-/// remain borrowed from the caller throughout validation and emission.
-struct PlanCache {
-    schema: SharedStorage<Schema>,
-    plan: TreePlan,
-}
-
-/// Build the tree plan for a record's schema. Walks the fields in iterator
-/// order (position = field index) and classifies each into the element tree,
-/// validating attribute names up front.
-fn build_plan_cache(record: &Record, config: &XmlWriterConfig) -> Result<PlanCache, FormatError> {
-    let schema = record.schema();
-    let fields = schema
-        .columns()
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| config.include_engine_stamped || !schema.is_engine_stamped(*index))
-        .map(|(index, name)| (index, name.as_ref()));
-    let plan = build_tree_plan(fields, config)?;
-    Ok(PlanCache {
-        schema: record.schema().clone(),
-        plan,
-    })
-}
-
-fn build_tree_plan<'a>(
-    fields: impl IntoIterator<Item = (usize, &'a str)> + Clone,
-    config: &XmlWriterConfig,
-) -> Result<TreePlan, FormatError> {
-    field_path::check_expandable(fields.clone().into_iter().map(|(_, name)| name))
-        .map_err(field_path_error)?;
-    let mut root = PlanBody::default();
-    for (field_index, name) in fields {
-        let path = field_path::decode(name).map_err(field_path_error)?;
-        plan_insert_field(
-            &mut root,
-            field_index,
-            name,
-            &path,
-            &config.attribute_prefix,
-            &config.join_values,
-            &config.declared_multiple,
-        )?;
-    }
-    Ok(TreePlan { root })
-}
-
-/// Insert a decoded field path into the plan, creating branches as needed —
-/// the plan-time twin of [`insert_field`], storing the field index in place of
-/// a rendered value. Attribute-prefixed segments must be terminal, and
-/// attribute names are validated here (once) rather than per record.
-fn plan_insert_field(
-    body: &mut PlanBody,
-    field_index: usize,
-    field: &str,
-    path: &[Cow<'_, str>],
-    attribute_prefix: &str,
-    join_values: &[JoinValues],
-    declared_multiple: &BTreeSet<String>,
-) -> Result<(), FormatError> {
-    let (segment, rest) = path
-        .split_first()
-        .expect("a decoded field path has at least one segment");
-    if !rest.is_empty() {
-        if !attribute_prefix.is_empty() && segment.starts_with(attribute_prefix) {
-            return Err(FormatError::Xml(format!(
-                "field '{field}': attribute-prefixed segment '{segment}' \
-                 cannot have fields nested under it — an XML attribute is a leaf"
-            )));
-        }
-        check_xml_name(segment, &format!("field '{field}': element"))?;
-        let branch = body.children.iter_mut().find(
-            |n| matches!(n, PlanNode::Branch { name, .. } if name.as_str() == segment.as_ref()),
-        );
-        if let Some(PlanNode::Branch {
-            body: branch_body, ..
-        }) = branch
-        {
-            plan_insert_field(
-                branch_body,
-                field_index,
-                field,
-                rest,
-                attribute_prefix,
-                join_values,
-                declared_multiple,
-            )
-        } else {
-            let mut branch_body = PlanBody::default();
-            plan_insert_field(
-                &mut branch_body,
-                field_index,
-                field,
-                rest,
-                attribute_prefix,
-                join_values,
-                declared_multiple,
-            )?;
-            body.children.push(PlanNode::Branch {
-                name: segment.to_string(),
-                body: branch_body,
-            });
-            Ok(())
-        }
-    } else if !attribute_prefix.is_empty() && segment.starts_with(attribute_prefix) {
-        let attr_name = &segment[attribute_prefix.len()..];
-        if attr_name.is_empty() {
-            return Err(FormatError::Xml(format!(
-                "field '{field}': attribute prefix '{attribute_prefix}' \
-                 carries no attribute name"
-            )));
-        }
-        if !is_valid_xml_name(attr_name) {
-            return Err(FormatError::Xml(format!(
-                "field '{field}': attribute name '{attr_name}' is not a \
-                 well-formed XML name"
-            )));
-        }
-        body.attrs.push(PlanAttr {
-            name: attr_name.to_string(),
-            field: field_index,
-        });
-        Ok(())
-    } else {
-        check_xml_name(segment, &format!("field '{field}': element"))?;
-        let repeat = build_repeat_spec(field, segment, join_values)?;
-        body.children.push(PlanNode::Leaf {
-            name: segment.to_string(),
-            field: field_index,
-            declared_multiple: declared_multiple.contains(field),
-            repeat,
-        });
-        Ok(())
-    }
-}
-
-/// Resolve a leaf's repeated-element naming from the output's `join_values`.
-///
-/// The entry is matched by the leaf's full flattened field name (the same
-/// name the CSV writer matches on). Returns `None` when no entry names the field
-/// or the entry carries neither XML override — the array then emits bare repeats
-/// named after the leaf. When an override is present, `repeat_as` / `wrap_in` are
-/// validated as legal XML names here, before any byte is written, so a malformed
-/// name fails the write cleanly the same way an illegal element name does.
-fn build_repeat_spec(
-    field: &str,
-    leaf_name: &str,
-    join_values: &[JoinValues],
-) -> Result<Option<XmlRepeat>, FormatError> {
-    let Some(entry) = join_values.iter().find(|j| j.field == field) else {
-        return Ok(None);
-    };
-    if entry.repeat_as.is_none() && entry.wrap_in.is_none() {
-        return Ok(None);
-    }
-    let item_name = match &entry.repeat_as {
-        Some(name) => {
-            check_xml_name(name, &format!("field '{field}': `repeat_as` element"))?;
-            name.clone()
-        }
-        None => leaf_name.to_string(),
-    };
-    let wrap_in = match &entry.wrap_in {
-        Some(name) => {
-            check_xml_name(name, &format!("field '{field}': `wrap_in` element"))?;
-            Some(name.clone())
-        }
-        None => None,
-    };
-    Ok(Some(XmlRepeat { item_name, wrap_in }))
+    wrap_in: Option<ReservedText>,
 }
 
 fn field_emits(value: &Value, is_attribute: bool, preserve_nulls: bool) -> bool {
@@ -853,161 +1067,6 @@ fn field_emits(value: &Value, is_attribute: bool, preserve_nulls: bool) -> bool 
         Value::Map(_) => true,
         _ => true,
     }
-}
-
-fn validate_body<S: FieldSource>(
-    body: &PlanBody,
-    values: &S,
-    config: &XmlWriterConfig,
-) -> Result<(), FormatError> {
-    for attr in &body.attrs {
-        let (name, value) = values.field(attr.field);
-        validate_field_value(
-            value,
-            true,
-            false,
-            config.preserve_nulls,
-            &config.attribute_prefix,
-            name,
-        )?;
-    }
-    for child in &body.children {
-        match child {
-            PlanNode::Leaf {
-                field,
-                declared_multiple,
-                ..
-            } => {
-                let (name, value) = values.field(*field);
-                validate_field_value(
-                    value,
-                    false,
-                    *declared_multiple,
-                    config.preserve_nulls,
-                    &config.attribute_prefix,
-                    name,
-                )?;
-            }
-            PlanNode::Branch { body, .. } => validate_body(body, values, config)?,
-        }
-    }
-    Ok(())
-}
-
-fn validate_field_value(
-    val: &Value,
-    is_attr: bool,
-    declared_multiple: bool,
-    _preserve_nulls: bool,
-    attribute_prefix: &str,
-    name: &str,
-) -> Result<(), FormatError> {
-    match val {
-        Value::Array(_) if !is_attr && declared_multiple => {
-            validate_xml_nested_value(val, name, attribute_prefix)
-        }
-        Value::Array(_) if !is_attr => Err(FormatError::UnserializableArrayValue {
-            format: "XML",
-            column: name.to_string(),
-        }),
-        Value::Array(_) => Err(FormatError::Xml(format!(
-            "field '{name}': an XML attribute cannot hold multiple values — a \
-                 `multiple:` field maps to repeated elements, not an attribute"
-        ))),
-        Value::Map(_) if is_attr => Err(FormatError::UnserializableMapValue {
-            format: "XML",
-            column: name.to_string(),
-        }),
-        Value::Map(_) => validate_xml_nested_value(val, name, attribute_prefix),
-        _ => validate_scalar_value(name, val),
-    }
-}
-
-fn validate_scalar_value(field: &str, value: &Value) -> Result<(), FormatError> {
-    let text = scalar_text(field, value)?;
-    if let Some(character) = text.as_str().chars().find(|character| {
-        !matches!(
-            *character,
-            '\u{9}' | '\u{A}' | '\u{D}' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{10FFFF}'
-        )
-    }) {
-        return Err(FormatError::Xml(format!(
-            "field '{field}': character U+{:04X} is not permitted in XML 1.0 text",
-            character as u32
-        )));
-    }
-    Ok(())
-}
-
-/// Validate every recursive XML decision before any bytes for the record are
-/// written. Neutral maps preserve insertion order; unescaped reserved keys
-/// become attributes or text, while escaped keys remain ordinary element
-/// names. Arrays repeat their containing element name and therefore cannot be
-/// nested directly inside another array without an intervening map key.
-fn validate_xml_nested_value(
-    value: &Value,
-    field: &str,
-    attribute_prefix: &str,
-) -> Result<(), FormatError> {
-    validate_nested_depth(value)
-        .map_err(|error| FormatError::Xml(format!("field '{field}': {error}")))?;
-    validate_nested_keys(value)
-        .map_err(|error| FormatError::Xml(format!("field '{field}': {error}")))?;
-
-    fn visit(value: &Value, field: &str, attribute_prefix: &str) -> Result<(), FormatError> {
-        match value {
-            Value::Array(items) => {
-                for item in items {
-                    if matches!(item, Value::Array(_)) {
-                        return Err(FormatError::UnserializableArrayValue {
-                            format: "XML",
-                            column: field.to_string(),
-                        });
-                    }
-                    visit(item, field, attribute_prefix)?;
-                }
-            }
-            Value::Map(entries) => {
-                for (raw_key, child) in entries.iter() {
-                    let key = NestedKey::decode(raw_key).expect("keys validated above");
-                    let is_attribute = !key.escaped
-                        && !attribute_prefix.is_empty()
-                        && key.text.starts_with(attribute_prefix);
-                    let is_text = !key.escaped && key.text == "#text";
-                    if is_attribute {
-                        let name = &key.text[attribute_prefix.len()..];
-                        if name.is_empty() {
-                            return Err(FormatError::Xml(format!(
-                                "field '{field}': attribute prefix '{attribute_prefix}' carries no attribute name"
-                            )));
-                        }
-                        check_xml_name(name, &format!("field '{field}': nested attribute"))?;
-                        if matches!(child, Value::Array(_) | Value::Map(_)) {
-                            return Err(FormatError::Xml(format!(
-                                "field '{field}': nested XML attribute '{}' must hold a scalar value",
-                                key.text
-                            )));
-                        }
-                        validate_scalar_value(field, child)?;
-                    } else if is_text {
-                        if matches!(child, Value::Array(_) | Value::Map(_)) {
-                            return Err(FormatError::Xml(format!(
-                                "field '{field}': nested XML #text must hold a scalar value"
-                            )));
-                        }
-                        validate_scalar_value(field, child)?;
-                    } else {
-                        check_xml_name(&key.text, &format!("field '{field}': nested element"))?;
-                        visit(child, field, attribute_prefix)?;
-                    }
-                }
-            }
-            _ => validate_scalar_value(field, value)?,
-        }
-        Ok(())
-    }
-
-    visit(value, field, attribute_prefix)
 }
 
 fn write_planned_start<W: Write, S: FieldSource>(
@@ -1024,7 +1083,7 @@ fn write_planned_start<W: Write, S: FieldSource>(
             continue;
         }
         let text = scalar_text(field, value)?;
-        write_attribute(writer, &attr.name, text.as_str())?;
+        write_attribute(writer, attr.name.as_str(), text.as_str())?;
     }
     finish_start_tag(writer, empty)
 }
@@ -1040,7 +1099,7 @@ fn emit_body<W: Write, S: FieldSource>(
     preserve_nulls: bool,
     attribute_prefix: &str,
 ) -> Result<(), FormatError> {
-    for child in &body.children {
+    for child in body.children.as_slice() {
         match child {
             PlanNode::Leaf {
                 name,
@@ -1055,7 +1114,7 @@ fn emit_body<W: Write, S: FieldSource>(
                 if matches!(value, Value::Array(_) | Value::Map(_)) {
                     emit_structured_leaf(
                         writer,
-                        name,
+                        name.as_str(),
                         repeat,
                         value,
                         preserve_nulls,
@@ -1071,31 +1130,45 @@ fn emit_body<W: Write, S: FieldSource>(
                 // one-element array. A field with no override (`repeat` is
                 // `None`) keeps the plain `<name>text</name>` rendering.
                 if repeat.is_some() {
-                    emit_scalar_leaf(writer, name, repeat, field_name, value)?;
+                    emit_scalar_leaf(writer, name.as_str(), repeat, field_name, value)?;
                     continue;
                 }
-                emit_scalar_element(writer, name, field_name, value)?;
+                emit_scalar_element(writer, name.as_str(), field_name, value)?;
             }
             PlanNode::Branch { name, body } => {
                 let has_attrs = body
                     .attrs
+                    .as_slice()
                     .iter()
                     .any(|attr| field_emits(values.field(attr.field).1, true, preserve_nulls));
                 let has_children = body
                     .children
+                    .as_slice()
                     .iter()
                     .any(|child| node_emits(child, values, preserve_nulls));
                 if !has_attrs && !has_children {
                     continue;
                 }
                 if has_children {
-                    write_planned_start(writer, name, &body.attrs, values, false)?;
+                    write_planned_start(
+                        writer,
+                        name.as_str(),
+                        body.attrs.as_slice(),
+                        values,
+                        false,
+                    )?;
                     emit_body(writer, body, values, preserve_nulls, attribute_prefix)?;
                     writer
                         .write_event(Event::End(BytesEnd::new(name.as_str())))
                         .map_err(xml_err)?;
                 } else {
-                    write_planned_start(writer, name, &body.attrs, values, true)?;
+                    write_planned_start(
+                        writer,
+                        name.as_str(),
+                        body.attrs.as_slice(),
+                        values,
+                        true,
+                    )?;
                 }
             }
         }
@@ -1114,7 +1187,9 @@ fn emit_structured_leaf<W: Write>(
     attribute_prefix: &str,
 ) -> Result<(), FormatError> {
     let item_name = repeat.as_ref().map_or(leaf_name, |r| r.item_name.as_str());
-    let wrap_in = repeat.as_ref().and_then(|r| r.wrap_in.as_deref());
+    let wrap_in = repeat
+        .as_ref()
+        .and_then(|r| r.wrap_in.as_ref().map(ReservedText::as_str));
     if let Some(container) = wrap_in {
         writer
             .write_event(Event::Start(BytesStart::new(container)))
@@ -1270,7 +1345,9 @@ fn emit_scalar_leaf<W: Write>(
     value: &Value,
 ) -> Result<(), FormatError> {
     let item_name = repeat.as_ref().map_or(leaf_name, |r| r.item_name.as_str());
-    let wrap_in = repeat.as_ref().and_then(|r| r.wrap_in.as_deref());
+    let wrap_in = repeat
+        .as_ref()
+        .and_then(|r| r.wrap_in.as_ref().map(ReservedText::as_str));
     if let Some(container) = wrap_in {
         writer
             .write_event(Event::Start(BytesStart::new(container)))
@@ -1293,10 +1370,12 @@ fn node_emits<S: FieldSource>(node: &PlanNode, values: &S, preserve_nulls: bool)
         PlanNode::Leaf { field, .. } => field_emits(values.field(*field).1, false, preserve_nulls),
         PlanNode::Branch { body, .. } => {
             body.attrs
+                .as_slice()
                 .iter()
                 .any(|attr| field_emits(values.field(attr.field).1, true, preserve_nulls))
                 || body
                     .children
+                    .as_slice()
                     .iter()
                     .any(|child| node_emits(child, values, preserve_nulls))
         }
@@ -1306,6 +1385,7 @@ fn node_emits<S: FieldSource>(node: &PlanNode, values: &S, preserve_nulls: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preparation::MemoryOnlyResources;
     use crate::traits::FormatReader;
     use crate::xml::reader::{XmlReader, XmlReaderConfig};
     use clinker_record::owned_storage::{OwnedMap, OwnedValues};
@@ -1314,6 +1394,31 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct ByteCounter(Arc<AtomicUsize>);
+
+    fn assert_encoding_error(
+        err: &FormatError,
+        kind: OutputEncodingKind,
+        field: usize,
+        name: &str,
+    ) {
+        let FormatError::OutputEncoding {
+            format,
+            kind: actual,
+            field: actual_field,
+            field_name,
+            ..
+        } = err
+        else {
+            panic!("expected a bounded output error, got {err:?}");
+        };
+        assert_eq!(*format, "XML");
+        assert_eq!(*actual, kind);
+        assert_eq!(*actual_field, field);
+        assert_eq!(
+            field_name.to_string(),
+            crate::error::OutputFieldName::new(name).to_string()
+        );
+    }
 
     impl ByteCounter {
         fn bytes(&self) -> usize {
@@ -1349,11 +1454,15 @@ mod tests {
         schema: &SharedStorage<Schema>,
     ) -> String {
         let mut buf = Vec::new();
-        let mut w = XmlWriter::new(&mut buf, schema.clone(), config);
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = XmlEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+        let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         for r in records {
             w.write_record(r).unwrap();
         }
         w.flush().unwrap();
+        drop(w);
         String::from_utf8(buf).unwrap()
     }
 
@@ -1443,12 +1552,17 @@ mod tests {
         let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["a".into(), "a.b".into()])));
         let record = Record::new(schema.clone(), vec![Value::Integer(1), Value::Integer(2)]);
         let mut buf = Vec::new();
-        let mut w = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = XmlEncoder::new(
+            schema.clone(),
+            &XmlWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         let err = w.write_record(&record).unwrap_err();
-        assert!(
-            matches!(err, FormatError::FieldPath { format: "XML", .. }),
-            "{err:?}"
-        );
+        assert_encoding_error(&err, OutputEncodingKind::XmlPath, 2, "a.b");
         drop(w);
         assert!(
             buf.is_empty(),
@@ -1634,13 +1748,28 @@ mod tests {
             ],
         );
         let sink = ByteCounter::default();
-        let mut writer = XmlWriter::new(sink, schema.clone(), XmlWriterConfig::default());
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = XmlEncoder::new(
+            schema.clone(),
+            &XmlWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(sink, encoder, provider.resources()).unwrap();
 
+        writer
+            .write_record(&Record::new(
+                schema.clone(),
+                vec![Value::String("small".into()), Value::String("small".into())],
+            ))
+            .unwrap();
+        let retained = provider.used();
         writer.write_record(&record).expect("large record writes");
 
         assert_eq!(
-            writer.retained_preparation_bytes(),
-            0,
+            provider.used(),
+            retained,
             "record-sized scalar preparation must not survive write_record",
         );
     }
@@ -1679,7 +1808,15 @@ mod tests {
         ] {
             let sink = ByteCounter::default();
             let observation = sink.clone();
-            let mut writer = XmlWriter::new(sink, schema.clone(), XmlWriterConfig::default());
+            let provider =
+                MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+            let encoder = XmlEncoder::new(
+                schema.clone(),
+                &XmlWriterConfig::default(),
+                provider.resources(),
+            )
+            .unwrap();
+            let mut writer = PreparedWriter::new(sink, encoder, provider.resources()).unwrap();
             writer
                 .write_record(&Record::new(
                     schema.clone(),
@@ -1704,15 +1841,28 @@ mod tests {
     fn repeated_records_never_accumulate_preparation_state() {
         let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["payload".into()])));
         let sink = ByteCounter::default();
-        let mut writer = XmlWriter::new(sink, schema.clone(), XmlWriterConfig::default());
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = XmlEncoder::new(
+            schema.clone(),
+            &XmlWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(sink, encoder, provider.resources()).unwrap();
 
+        let mut retained = None;
         for width in [1, 4096, 17, 128 * 1024, 2] {
             let record = Record::new(
                 schema.clone(),
                 vec![Value::String("<&".repeat(width).into())],
             );
             writer.write_record(&record).expect("record writes");
-            assert_eq!(writer.retained_preparation_bytes(), 0);
+            if let Some(retained) = retained {
+                assert_eq!(provider.used(), retained);
+            } else {
+                retained = Some(provider.used());
+            }
         }
     }
 
@@ -1728,12 +1878,17 @@ mod tests {
             vec![Value::Map(OwnedMap::from_map(payload))],
         );
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = XmlEncoder::new(
+            schema.clone(),
+            &XmlWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         let err = writer.write_record(&record).unwrap_err();
-        assert!(
-            matches!(&err, FormatError::Xml(message) if message.contains("duplicate logical nested key \"@id\"")),
-            "unexpected error: {err:?}"
-        );
+        assert_encoding_error(&err, OutputEncodingKind::XmlValue, 1, "payload");
         drop(writer);
         assert!(buf.is_empty(), "rejected record must emit no partial XML");
     }
@@ -1752,12 +1907,17 @@ mod tests {
             vec![Value::Map(OwnedMap::from_map(payload))],
         );
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = XmlEncoder::new(
+            schema.clone(),
+            &XmlWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         let err = writer.write_record(&record).unwrap_err();
-        assert!(
-            matches!(&err, FormatError::Xml(message) if message.contains("attribute '@ids' must hold a scalar")),
-            "unexpected error: {err:?}"
-        );
+        assert_encoding_error(&err, OutputEncodingKind::XmlValue, 1, "payload");
         drop(writer);
         assert!(buf.is_empty(), "rejected record must emit no partial XML");
     }
@@ -1975,7 +2135,7 @@ mod tests {
     }
 
     /// An illegal `repeat_as` / `wrap_in` name fails the write with
-    /// `FormatError::Xml`, leaving no partial output — element names are
+    /// a bounded `OutputEncoding` error, leaving no partial output — element names are
     /// validated as legal XML names (criterion 5), like the record/root names.
     #[test]
     fn test_xml_write_multi_value_invalid_override_name_rejected() {
@@ -1985,22 +2145,17 @@ mod tests {
                 SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "tags".into()])));
             let record = record_with_tags(&schema, 7, vec![Value::String("a".into())]);
             let mut buf = Vec::new();
-            let mut writer = XmlWriter::new(
-                &mut buf,
+            let provider =
+                MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+            let encoder = XmlEncoder::new(
                 schema.clone(),
-                xml_join_config("tags", repeat_as, wrap_in),
-            );
+                &xml_join_config("tags", repeat_as, wrap_in),
+                provider.resources(),
+            )
+            .unwrap();
+            let mut writer = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
             let err = writer.write_record(&record).unwrap_err();
-            match err {
-                FormatError::Xml(msg) => {
-                    assert!(msg.contains(bad), "message names the bad name: {msg}");
-                    assert!(
-                        msg.contains("well-formed XML name"),
-                        "message explains the malformed name: {msg}"
-                    );
-                }
-                other => panic!("expected FormatError::Xml, got {other:?}"),
-            }
+            assert_encoding_error(&err, OutputEncodingKind::XmlName, 2, bad);
             drop(writer);
             assert!(
                 buf.is_empty(),
@@ -2021,17 +2176,17 @@ mod tests {
             )]))],
         );
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = XmlEncoder::new(
+            schema.clone(),
+            &XmlWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         let err = writer.write_record(&record).unwrap_err();
-        match err {
-            FormatError::Xml(msg) => {
-                assert!(
-                    msg.contains("@tags") && msg.contains("cannot hold multiple values"),
-                    "message names the field and the reason: {msg}"
-                );
-            }
-            other => panic!("expected FormatError::Xml, got {other:?}"),
-        }
+        assert_encoding_error(&err, OutputEncodingKind::XmlValue, 1, "@tags");
         drop(writer);
         assert!(
             buf.is_empty(),
@@ -2053,12 +2208,17 @@ mod tests {
             )]))],
         );
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, schema.clone(), xml_multiple_config(&["tags"]));
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = XmlEncoder::new(
+            schema.clone(),
+            &xml_multiple_config(&["tags"]),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         let err = writer.write_record(&record).unwrap_err();
-        assert!(
-            matches!(&err, FormatError::UnserializableArrayValue { column, .. } if column == "tags"),
-            "expected UnserializableArrayValue for the nested array, got {err:?}"
-        );
+        assert_encoding_error(&err, OutputEncodingKind::XmlValue, 2, "tags");
     }
 
     /// Read a document with repeated child elements into a `multiple:` column and
@@ -2101,24 +2261,28 @@ mod tests {
     }
 
     /// Assert that writing a single record whose only field is `field`
-    /// fails with `FormatError::Xml` naming the field and explaining the
+    /// fails with `OutputEncoding` naming the offending segment and explaining the
     /// malformed element name, leaving no partial bytes behind.
     fn assert_element_name_rejected(field: &str) {
         let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![field.into()])));
         let record = Record::new(schema.clone(), vec![Value::Integer(1)]);
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = XmlEncoder::new(
+            schema.clone(),
+            &XmlWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         let err = writer.write_record(&record).unwrap_err();
-        match err {
-            FormatError::Xml(msg) => {
-                assert!(msg.contains(field), "message names the field: {msg}");
-                assert!(
-                    msg.contains("well-formed XML name"),
-                    "message explains the failure is a malformed name: {msg}"
-                );
-            }
-            other => panic!("expected FormatError::Xml, got {other:?}"),
-        }
+        assert_encoding_error(
+            &err,
+            OutputEncodingKind::XmlName,
+            1,
+            field.split('.').next().unwrap(),
+        );
         drop(writer);
         assert!(
             buf.is_empty(),
@@ -2162,58 +2326,42 @@ mod tests {
         // The configured record element name flows straight into
         // `BytesStart::new`; a malformed one fails loud before any output.
         let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["name".into()])));
-        let record = Record::new(schema.clone(), vec![Value::String("A".into())]);
         let config = XmlWriterConfig {
             record_element: "1record".into(),
             ..Default::default()
         };
-        let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, schema.clone(), config);
-        let err = writer.write_record(&record).unwrap_err();
-        match err {
-            FormatError::Xml(msg) => {
-                assert!(
-                    msg.contains("record element"),
-                    "message names the record element: {msg}"
-                );
-                assert!(msg.contains("1record"), "message names the value: {msg}");
-            }
-            other => panic!("expected FormatError::Xml, got {other:?}"),
-        }
-        drop(writer);
-        assert!(
-            buf.is_empty(),
-            "no output before a rejected record element name"
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let err = XmlEncoder::new(schema, &config, provider.resources())
+            .err()
+            .expect("invalid configured name is rejected before destination creation");
+        assert_encoding_error(&err, OutputEncodingKind::XmlName, 1, "1record");
+        assert_eq!(
+            provider.used(),
+            0,
+            "failed construction releases its allocations"
         );
     }
 
     #[test]
     fn test_xml_write_invalid_root_element_name_rejected() {
-        // The configured root element name is validated at header open, so a
+        // The configured root element name is validated during construction, so a
         // malformed one fails loud rather than emitting `<1root>`.
         let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["name".into()])));
-        let record = Record::new(schema.clone(), vec![Value::String("A".into())]);
         let config = XmlWriterConfig {
             root_element: "1root".into(),
             ..Default::default()
         };
-        let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, schema.clone(), config);
-        let err = writer.write_record(&record).unwrap_err();
-        match err {
-            FormatError::Xml(msg) => {
-                assert!(
-                    msg.contains("root element"),
-                    "message names the root element: {msg}"
-                );
-                assert!(msg.contains("1root"), "message names the value: {msg}");
-            }
-            other => panic!("expected FormatError::Xml, got {other:?}"),
-        }
-        drop(writer);
-        assert!(
-            buf.is_empty(),
-            "no output before a rejected root element name"
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let err = XmlEncoder::new(schema, &config, provider.resources())
+            .err()
+            .expect("invalid configured name is rejected before destination creation");
+        assert_encoding_error(&err, OutputEncodingKind::XmlName, 1, "1root");
+        assert_eq!(
+            provider.used(),
+            0,
+            "failed construction releases its allocations"
         );
     }
 
@@ -2376,15 +2524,17 @@ mod tests {
             vec![Value::Map(OwnedMap::from_map(sidecar))],
         );
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = XmlEncoder::new(
+            schema.clone(),
+            &XmlWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         let err = writer.write_record(&record).unwrap_err();
-        match err {
-            FormatError::UnserializableMapValue { format, column } => {
-                assert_eq!(format, "XML");
-                assert_eq!(column, "@meta");
-            }
-            other => panic!("expected UnserializableMapValue, got {other:?}"),
-        }
+        assert_encoding_error(&err, OutputEncodingKind::XmlValue, 1, "@meta");
     }
 
     #[test]
@@ -2395,17 +2545,17 @@ mod tests {
         let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["@a.b".into()])));
         let record = Record::new(schema.clone(), vec![Value::Integer(1)]);
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = XmlEncoder::new(
+            schema.clone(),
+            &XmlWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         let err = writer.write_record(&record).unwrap_err();
-        match err {
-            FormatError::Xml(msg) => {
-                assert!(
-                    msg.contains("'@a.b'") && msg.contains("'@a'"),
-                    "message names the field and offending segment: {msg}"
-                );
-            }
-            other => panic!("expected FormatError::Xml, got {other:?}"),
-        }
+        assert_encoding_error(&err, OutputEncodingKind::XmlPath, 1, "@a.b");
         drop(writer);
         assert!(
             buf.is_empty(),
@@ -2414,27 +2564,23 @@ mod tests {
     }
 
     /// Assert that writing a single record whose only field is `field`
-    /// fails with `FormatError::Xml` mentioning both the field and the
+    /// fails with `OutputEncoding` identifying the field position and the
     /// stripped attribute name, and leaves no partial bytes behind.
     fn assert_attribute_name_rejected(field: &str, attr_name: &str) {
         let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![field.into()])));
         let record = Record::new(schema.clone(), vec![Value::Integer(1)]);
         let mut buf = Vec::new();
-        let mut writer = XmlWriter::new(&mut buf, schema.clone(), XmlWriterConfig::default());
+        let provider =
+            MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+        let encoder = XmlEncoder::new(
+            schema.clone(),
+            &XmlWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
         let err = writer.write_record(&record).unwrap_err();
-        match err {
-            FormatError::Xml(msg) => {
-                assert!(
-                    msg.contains(field) && msg.contains(attr_name),
-                    "message names the field and offending attribute name: {msg}"
-                );
-                assert!(
-                    msg.contains("well-formed XML name"),
-                    "message explains the failure is a malformed name: {msg}"
-                );
-            }
-            other => panic!("expected FormatError::Xml, got {other:?}"),
-        }
+        assert_encoding_error(&err, OutputEncodingKind::XmlName, 1, attr_name);
         drop(writer);
         assert!(
             buf.is_empty(),
@@ -2618,7 +2764,15 @@ mod tests {
         );
         let mut buf = Vec::new();
         {
-            let mut w = XmlWriter::new(&mut buf, schema1.clone(), XmlWriterConfig::default());
+            let provider =
+                MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+            let encoder = XmlEncoder::new(
+                schema1.clone(),
+                &XmlWriterConfig::default(),
+                provider.resources(),
+            )
+            .unwrap();
+            let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
             w.write_record(&r1).unwrap();
             w.write_record(&r2).unwrap();
             w.flush().unwrap();
@@ -2681,7 +2835,10 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         {
-            let mut w = XmlWriter::new(&mut buf, schema.clone(), config);
+            let provider =
+                MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+            let encoder = XmlEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+            let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
             w.begin_document(&doc).unwrap();
             w.write_record(&Record::new(schema.clone(), vec![Value::Integer(10)]))
                 .unwrap();
@@ -2736,7 +2893,10 @@ mod tests {
         )]);
         let mut buf = Vec::new();
         {
-            let mut w = XmlWriter::new(&mut buf, schema.clone(), config);
+            let provider =
+                MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+            let encoder = XmlEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+            let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
             w.begin_document(&doc).unwrap();
             w.write_record(&Record::new(schema.clone(), vec![Value::Integer(10)]))
                 .unwrap();
@@ -2772,7 +2932,10 @@ mod tests {
         )]);
         let mut buf = Vec::new();
         {
-            let mut w = XmlWriter::new(&mut buf, schema.clone(), config);
+            let provider =
+                MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+            let encoder = XmlEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+            let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
             w.begin_document(&doc).unwrap();
             w.end_document(&doc).unwrap();
             w.flush().unwrap();
@@ -2811,7 +2974,10 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         {
-            let mut w = XmlWriter::new(&mut buf, schema.clone(), config);
+            let provider =
+                MemoryOnlyResources::new(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap());
+            let encoder = XmlEncoder::new(schema.clone(), &config, provider.resources()).unwrap();
+            let mut w = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
             w.begin_document(&doc1).unwrap();
             w.write_record(&Record::new(schema.clone(), vec![Value::Integer(10)]))
                 .unwrap();

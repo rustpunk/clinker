@@ -1,0 +1,35 @@
+pipeline:
+  name: telemetry_bulkhead
+nodes:
+  - type: source
+    name: customers
+    config:
+      name: customers
+      type: json
+      path: ./private/source/customers.json
+      schema:
+        - { name: customer_id, type: string }
+        - { name: amount, type: int }
+  - type: transform
+    name: normalize
+    input: customers
+    config:
+      cxl: |
+        emit customer_id = customer_id
+        emit amount = amount
+      log:
+        - name: transform.customer_seen
+          level: info
+          when: per_record
+          message: customer processed
+          fields: [customer_id]
+          every: 1
+          condition: "amount > 1000"
+  - type: sink
+    name: published_customers
+    input: normalize
+    config:
+      name: published_customers
+      type: json
+      path: ./private/output/customers.json
+      options: { format: ndjson }

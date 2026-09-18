@@ -39,7 +39,9 @@ use clinker_record::{Record, Schema, SchemaBuilder, Value};
 
 use cxl::analyzer::doc_paths::DocPath;
 
+#[cfg(test)]
 use crate::bom::UTF8_BOM;
+use crate::bom::{Utf8Input, utf8_input_error};
 use crate::doc_index::DocArenaIndex;
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, coerce_section_fields};
 use crate::error::{FanOutLimitFailure, FormatError};
@@ -402,7 +404,65 @@ struct OpenInstance {
 /// Both the body parser and the envelope pre-scan parse over this same reader
 /// shape — a fresh `Read` from the [`ReopenableSource`], never a whole-document
 /// byte buffer.
-pub(crate) type BodyParser = XmlParser<BufReader<Box<dyn Read + Send>>>;
+pub(crate) struct BodyParser {
+    inner: XmlParser<BufReader<Box<dyn Read + Send>>>,
+    declaration_allowed: bool,
+}
+impl BodyParser {
+    pub(crate) fn from_reader(reader: BufReader<Box<dyn Read + Send>>) -> Self {
+        Self {
+            inner: XmlParser::from_reader(reader),
+            declaration_allowed: true,
+        }
+    }
+    pub(crate) fn read_event_into<'a>(
+        &mut self,
+        buffer: &'a mut Vec<u8>,
+    ) -> Result<Event<'a>, FormatError> {
+        let event = self
+            .inner
+            .read_event_into(buffer)
+            .map_err(|error| FormatError::Xml(error.to_string()))?;
+        if let Event::Decl(declaration) = &event {
+            if !self.declaration_allowed {
+                return Err(xml_declaration_error());
+            }
+            validate_xml_declaration(declaration)?;
+        }
+        self.declaration_allowed = false;
+        Ok(event)
+    }
+}
+
+fn xml_declaration_error() -> FormatError {
+    FormatError::Xml("invalid XML declaration: use <?xml version=\"1.0\" encoding=\"UTF-8\"?> once at the start of UTF-8 input".into())
+}
+
+fn validate_xml_declaration(
+    declaration: &quick_xml::events::BytesDecl<'_>,
+) -> Result<(), FormatError> {
+    // Reuse quick-xml's borrowed attribute tokenizer. Duplicate checks would
+    // allocate a vector proportional to attribute count; the closed declaration
+    // grammar instead needs only an ordinal and validates every occurrence.
+    let text = std::str::from_utf8(declaration).map_err(|_| xml_declaration_error())?;
+    let start = quick_xml::events::BytesStart::from_content(text, 3);
+    let mut order = 0;
+    for attribute in start.attributes().with_checks(false) {
+        let attribute = attribute.map_err(|_| xml_declaration_error())?;
+        match (order, attribute.key.as_ref()) {
+            (0, b"version") if matches!(attribute.value.as_ref(), b"1.0" | b"1.1") => order = 1,
+            (1, b"encoding") if attribute.value.eq_ignore_ascii_case(b"UTF-8") => order = 2,
+            (1 | 2, b"standalone") if matches!(attribute.value.as_ref(), b"yes" | b"no") => {
+                order = 3
+            }
+            _ => return Err(xml_declaration_error()),
+        }
+    }
+    if order == 0 {
+        return Err(xml_declaration_error());
+    }
+    Ok(())
+}
 
 /// Streaming XML reader.
 ///
@@ -570,8 +630,10 @@ impl XmlReader {
         source: &ReopenableSource,
     ) -> Result<(BufReader<Box<dyn Read + Send>>, SourceIdentity), FormatError> {
         let (reader, identity) = source.open_with_identity().map_err(FormatError::Io)?;
-        let mut buf = BufReader::new(reader);
-        strip_leading_bom(&mut buf)?;
+        let input = Utf8Input::new(reader).map_err(utf8_input_error)?;
+        let mut buf = BufReader::new(Box::new(input) as Box<dyn Read + Send>);
+        // Establish the byte boundary before mode detection or parser setup.
+        buf.fill_buf().map_err(utf8_input_error)?;
         Ok((buf, identity))
     }
 
@@ -584,7 +646,7 @@ impl XmlReader {
     /// Returns [`FormatError::Io`] if the source cannot be opened.
     fn open_body(source: &ReopenableSource) -> Result<(BodyParser, SourceIdentity), FormatError> {
         let (buf, identity) = Self::open_buf(source)?;
-        let parser = XmlParser::from_reader(buf);
+        let parser = BodyParser::from_reader(buf);
         // Text-node whitespace is trimmed when a run is finalized
         // ([`finalize_text_run`]), not per parser event: quick-xml splits a
         // text node into `Text` + `GeneralRef` fragments, and per-fragment
@@ -602,14 +664,11 @@ impl XmlReader {
 
         loop {
             self.buf.clear();
-            let event = self
-                .parser
-                .read_event_into(&mut self.buf)
-                .map_err(|e| FormatError::Xml(e.to_string()))?;
+            let event = self.parser.read_event_into(&mut self.buf)?;
 
             match event {
                 Event::Start(ref e) => {
-                    let name = elem_name_static(&self.config.namespace_handling, &e.name());
+                    let name = elem_name_static(&self.config.namespace_handling, &e.name())?;
                     self.xml_depth += 1;
 
                     if self.matched_depth < self.path_segments.len() {
@@ -619,6 +678,10 @@ impl XmlReader {
                                 let attrs =
                                     extract_attributes_static(&self.config.attribute_prefix, e)?;
                                 let raw = self.extract_record_fields(&name, attrs)?;
+                                // Extraction consumed the matched element's end
+                                // event. Resume matching at its still-open parent,
+                                // so the next sibling must match the final segment.
+                                self.matched_depth -= 1;
                                 return Ok(Some(raw));
                             }
                         } else {
@@ -631,7 +694,7 @@ impl XmlReader {
                     }
                 }
                 Event::Empty(ref e) => {
-                    let name = elem_name_static(&self.config.namespace_handling, &e.name());
+                    let name = elem_name_static(&self.config.namespace_handling, &e.name())?;
 
                     if self.matched_depth < self.path_segments.len() {
                         if name == self.path_segments[self.matched_depth]
@@ -719,10 +782,7 @@ impl XmlReader {
 
         loop {
             buf2.clear();
-            let event = self
-                .parser
-                .read_event_into(&mut buf2)
-                .map_err(|e| FormatError::Xml(e.to_string()))?;
+            let event = self.parser.read_event_into(&mut buf2)?;
 
             // Any event other than a text fragment terminates the current text
             // node; resolve and push it before handling the structural event.
@@ -738,7 +798,7 @@ impl XmlReader {
             match event {
                 Event::Start(ref e) => {
                     self.xml_depth += 1;
-                    let name = elem_name_static(&self.config.namespace_handling, &e.name());
+                    let name = elem_name_static(&self.config.namespace_handling, &e.name())?;
                     // This element is a child of whatever is currently open, so
                     // its parent is a branch, not a value-less leaf.
                     if let Some(has_content) = element_content.last_mut() {
@@ -801,7 +861,7 @@ impl XmlReader {
                     if let Some(has_content) = element_content.last_mut() {
                         *has_content = true;
                     }
-                    let name = elem_name_static(&self.config.namespace_handling, &e.name());
+                    let name = elem_name_static(&self.config.namespace_handling, &e.name())?;
                     let prefix = if element_stack.is_empty() {
                         name.clone()
                     } else {
@@ -841,7 +901,9 @@ impl XmlReader {
                     append_general_ref(&mut text_run, r)?;
                 }
                 Event::CData(ref cd) => {
-                    let text = String::from_utf8_lossy(cd.as_ref()).into_owned();
+                    let text = std::str::from_utf8(cd.as_ref())
+                        .map_err(|_| FormatError::Io(std::io::ErrorKind::InvalidData.into()))?
+                        .to_owned();
                     if !text.is_empty() {
                         let field_name = element_stack.join(".");
                         if !field_name.is_empty() {
@@ -917,10 +979,7 @@ impl XmlReader {
         let target_depth = self.xml_depth;
         loop {
             self.buf.clear();
-            let event = self
-                .parser
-                .read_event_into(&mut self.buf)
-                .map_err(|e| FormatError::Xml(e.to_string()))?;
+            let event = self.parser.read_event_into(&mut self.buf)?;
             match event {
                 Event::Start(_) => self.xml_depth += 1,
                 Event::End(_) => {
@@ -1291,13 +1350,18 @@ fn doc_path_for_section(name: &str) -> DocPath {
 /// `Strip` drops the namespace prefix (keeping the local name); `Qualify`
 /// keeps the full namespace-qualified name. Shared by body iteration and
 /// the envelope streaming pre-scan so both map element names identically.
-pub(crate) fn elem_name_static(ns: &NamespaceMode, qname: &quick_xml::name::QName) -> String {
+pub(crate) fn elem_name_static(
+    ns: &NamespaceMode,
+    qname: &quick_xml::name::QName,
+) -> Result<String, FormatError> {
     let local = qname.local_name();
     let bytes = match ns {
         NamespaceMode::Strip => local.as_ref(),
         NamespaceMode::Qualify => qname.as_ref(),
     };
-    String::from_utf8_lossy(bytes).into_owned()
+    Ok(std::str::from_utf8(bytes)
+        .map_err(|_| FormatError::Io(std::io::ErrorKind::InvalidData.into()))?
+        .to_owned())
 }
 
 /// Extract an element's attributes as `(prefixed_key, value)` pairs.
@@ -1312,7 +1376,8 @@ pub(crate) fn extract_attributes_static(
     let mut attrs = Vec::new();
     for attr in elem.attributes() {
         let attr = attr.map_err(|e| FormatError::Xml(e.to_string()))?;
-        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+        let key = std::str::from_utf8(attr.key.as_ref())
+            .map_err(|_| FormatError::Io(std::io::ErrorKind::InvalidData.into()))?;
         // Resolve entity and character references over the UTF-8-decoded raw
         // value — the exact behavior of the removed `unescape_value()`. The
         // `normalized_value` replacement additionally collapses literal tab / CR
@@ -1412,25 +1477,6 @@ fn flush_text_field(
     fields.push((field_name, value));
     if let Some(has_content) = element_content.last_mut() {
         *has_content = true;
-    }
-    Ok(())
-}
-
-/// Consume a single leading UTF-8 BOM from a freshly opened reader, if present.
-///
-/// Each pass re-opens its own `Read`, so a Windows-authored file (Excel /
-/// PowerShell utf8 export) carries the BOM on every open; stripping it here
-/// clears the marker before it precedes the prolog/root element, for both body
-/// iteration and the envelope pre-scan. The `BufReader`'s default capacity
-/// exceeds the 3-byte BOM, so the marker is always wholly inside the first fill.
-///
-/// # Errors
-///
-/// Returns [`FormatError::Io`] if the probe read fails.
-fn strip_leading_bom(reader: &mut BufReader<Box<dyn Read + Send>>) -> Result<(), FormatError> {
-    let buf = reader.fill_buf().map_err(FormatError::Io)?;
-    if buf.starts_with(&UTF8_BOM) {
-        reader.consume(UTF8_BOM.len());
     }
     Ok(())
 }
@@ -1662,28 +1708,23 @@ mod tests {
 
         for pass in ["body", "pre-scan"] {
             let (mut buf, _identity) = XmlReader::open_buf(&source).expect("open_buf");
-            let head = buf.fill_buf().expect("fill");
-            assert!(
-                head.starts_with(b"<doc>"),
-                "{pass} open leaked a BOM: stream starts with {:?}",
-                &head[..head.len().min(UTF8_BOM.len() + 2)]
-            );
-            assert!(
-                !head.starts_with(&UTF8_BOM),
-                "{pass} open left the BOM in place"
-            );
+            let mut actual = Vec::new();
+            buf.read_to_end(&mut actual).expect("read complete bytes");
+            assert_eq!(actual, b"<doc><x>1</x></doc>", "{pass} open changed bytes");
         }
     }
 
     #[test]
     fn open_buf_passes_through_a_bomless_open_unchanged() {
         // A file with no BOM (the common case) must not lose its first bytes:
-        // `strip_leading_bom` consumes only when the marker is present, so the
+        // The byte adapter consumes only when the marker is present, so the
         // document element survives the probe intact.
         let source =
             ReopenableSource::buffer(Cursor::new(b"<doc><x>1</x></doc>".to_vec())).expect("buffer");
         let (mut buf, _identity) = XmlReader::open_buf(&source).expect("open_buf");
-        assert!(buf.fill_buf().expect("fill").starts_with(b"<doc>"));
+        let mut actual = Vec::new();
+        buf.read_to_end(&mut actual).expect("read complete bytes");
+        assert_eq!(actual, b"<doc><x>1</x></doc>");
     }
 
     #[test]

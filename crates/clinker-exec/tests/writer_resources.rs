@@ -1918,6 +1918,222 @@ enum CsvRuntimeFault {
     Prefix(Arc<std::sync::atomic::AtomicUsize>),
 }
 
+#[test]
+fn json_runtime_identity_tracer_compiled_memory_and_spill_exact_bytes() {
+    use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, WriterRegistry};
+    use clinker_exec::telemetry::MetricKey;
+    let yaml = r#"
+pipeline:
+  name: prepared_json
+  memory: { limit: 256M }
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: json
+      path: input.json
+      schema:
+        - { name: address.city, type: string }
+        - { name: items, type: any }
+  - type: sink
+    name: result
+    input: rows
+    config:
+      name: result
+      type: json
+      path: output.json
+"#;
+    let plan = clinker_plan::config::parse_config(yaml)
+        .unwrap()
+        .compile(&clinker_plan::config::CompileContext::default())
+        .unwrap();
+    let city = "x".repeat(100_000);
+    let input = format!("[{{\"address\":{{\"city\":\"{city}\"}},\"items\":[7,true,null]}}]");
+    let expected =
+        format!("[\n{{\"address\":{{\"city\":\"{city}\"}},\"items\":[7,true,null]}}\n]\n");
+    for spill in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("output.json");
+        let staging = clinker_exec::output::staging::OutputStagingRegistry::default();
+        let (_, file) = staging
+            .stage_output(
+                "result",
+                clinker_plan::config::IfExistsPolicy::Error,
+                false,
+                |_| Ok(destination.clone()),
+            )
+            .unwrap();
+        let registry = WriterRegistry {
+            single: [("result".into(), Box::new(file) as Box<dyn Write + Send>)].into(),
+            output_staging: staging,
+            ..Default::default()
+        };
+        let readers = [(
+            "rows".into(),
+            clinker_exec::executor::single_file_reader(
+                "input.json",
+                Box::new(std::io::Cursor::new(input.as_bytes().to_vec())),
+            ),
+        )]
+        .into();
+        let (producer, receiver) = telemetry();
+        let params = PipelineRunParams {
+            spill_root_dir: spill.then(|| root.path().to_owned()),
+            spill_disk_cap_bytes: Some(1024 * 1024),
+            telemetry_producer: Some(producer),
+            ..Default::default()
+        };
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, registry, &params).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), expected.as_bytes());
+        let mut spills = 0;
+        let mut stages = 0;
+        while let Some(batch) = receiver.try_recv_batch() {
+            spills += batch.metric(MetricKey::WriterSpillCompleted);
+            stages += batch.metric(MetricKey::WriterStageCompleted);
+        }
+        assert!(stages >= 2, "runtime must reach prepared operations");
+        assert_eq!(spills > 0, spill, "the spill run must really spill");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct NativeBacking {
+    pointer: usize,
+    bytes: usize,
+    admitted_at_allocation: u64,
+    admitted_at_deallocation: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct NativeBackingWatch {
+    observer: *const clinker_exec::pipeline::memory::reservation::WriterResourceObserver,
+    capture: Option<usize>,
+    capture_last: bool,
+    backings: [NativeBacking; 3],
+}
+
+thread_local! {
+    static NATIVE_BACKINGS: std::cell::Cell<Option<NativeBackingWatch>> = const { std::cell::Cell::new(None) };
+}
+
+#[test]
+fn json_runtime_identity_tracer_factory_writer_and_config_deallocate_before_release() {
+    use clinker_format::counting::{CountingWriter, SharedByteCounter};
+    use clinker_format::json::writer::{JsonEncoder, JsonEncoderConfig, JsonWriterConfig};
+    use clinker_format::preparation::PreparedWriter;
+    use clinker_format::splitting::WriterFactory;
+    use clinker_record::owned_storage::SharedStorage;
+    use clinker_record::{Record, Schema, Value};
+    let arb = Arc::new(MemoryArbitrator::with_policy(
+        256 * 1024,
+        0.8,
+        0.7,
+        Box::new(NoOpPolicy),
+    ));
+    let shutdown = ShutdownToken::detached();
+    let provider = ExecutorResources::new(
+        arb.clone(),
+        shutdown.clone(),
+        None,
+        NonZeroUsize::new(1).unwrap(),
+        None,
+    )
+    .unwrap();
+    let resources = provider.resources();
+    let scope = resources.scope().unwrap();
+    let observer = arb.writer_resource_observer();
+    NATIVE_BACKINGS.with(|watch| {
+        watch.set(Some(NativeBackingWatch {
+            observer: &observer,
+            capture: Some(0),
+            capture_last: false,
+            backings: [NativeBacking::default(); 3],
+        }))
+    });
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NATIVE_BACKINGS.with(|watch| watch.set(None));
+        }
+    }
+    let reset = Reset;
+    let config = JsonEncoderConfig::new(&JsonWriterConfig::default(), &resources).unwrap();
+    let alias = config.clone();
+    let captured_resources = resources.clone();
+    let make = move |destination, schema| {
+        JsonEncoder::from_config(schema, config.clone())?
+            .into_boxed_writer(destination, captured_resources.clone())
+    };
+    let factory_bytes = std::mem::size_of_val(&make);
+    NATIVE_BACKINGS.with(|watch| {
+        let mut state = watch.get().unwrap();
+        state.capture = Some(1);
+        watch.set(Some(state));
+    });
+    let factory = WriterFactory::try_new(make, scope.allocation()).unwrap();
+    let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["a.b".into()])));
+    let record = Record::new(schema.clone(), vec![Value::Integer(7)]);
+    let destination: Box<dyn Write + Send> = Box::new(std::io::sink());
+    let counter = SharedByteCounter::new();
+    let counting = CountingWriter::new(destination, counter.clone());
+    NATIVE_BACKINGS.with(|watch| {
+        let mut state = watch.get().unwrap();
+        state.capture = Some(2);
+        watch.set(Some(state));
+    });
+    let mut writer = factory.create(counting, schema).unwrap();
+    let backing = NATIVE_BACKINGS.with(|watch| watch.get().unwrap().backings);
+    assert!(backing[0].bytes > 0);
+    assert_eq!(backing[1].bytes, factory_bytes);
+    assert_eq!(
+        backing[2].bytes,
+        std::mem::size_of::<PreparedWriter<CountingWriter<Box<dyn Write + Send>>, JsonEncoder>>()
+    );
+    assert_eq!(
+        observer.usage().memory,
+        backing.iter().map(|b| b.bytes as u64).sum::<u64>()
+    );
+    writer.write_record(&record).unwrap();
+    let committed_memory = observer.usage().memory;
+    let committed_bytes = counter.bytes_written();
+    let changed = Record::new(
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["changed.path".into()]))),
+        vec![Value::Integer(9)],
+    );
+    let pressure = scope
+        .reserve(Layout::array::<u8>((arb.limit() - committed_memory) as usize).unwrap())
+        .unwrap();
+    assert!(
+        matches!(writer.write_record(&changed), Err(clinker_format::FormatError::Resource(error)) if error.kind == ResourceErrorKind::Budget)
+    );
+    assert_eq!(counter.bytes_written(), committed_bytes);
+    drop(pressure);
+    assert_eq!(observer.usage().memory, committed_memory);
+    writer.write_record(&changed).unwrap();
+    drop(factory);
+    shutdown.request();
+    assert!(
+        matches!(writer.write_record(&record), Err(clinker_format::FormatError::Resource(error)) if error.kind == ResourceErrorKind::Cancelled)
+    );
+    drop(writer);
+    assert_eq!(observer.usage().memory, backing[0].bytes as u64);
+    arb.close_writer_resources();
+    assert!(observer.is_closed());
+    drop(alias);
+    let backing = NATIVE_BACKINGS.with(|watch| watch.get().unwrap().backings);
+    for owner in backing {
+        assert!(owner.admitted_at_allocation >= owner.bytes as u64);
+        assert!(owner.admitted_at_deallocation.unwrap() >= owner.bytes as u64);
+    }
+    assert_eq!(observer.usage().memory, 0);
+    assert_eq!(observer.usage().disk, 0);
+    assert_eq!(observer.usage().descriptors, 0);
+    assert_eq!(arb.consumer_count(), 0);
+    drop(reset);
+}
+
 fn csv_runtime_run(
     root: &std::path::Path,
     spill: bool,
@@ -2117,11 +2333,47 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
             return std::ptr::null_mut();
         }
         // SAFETY: the caller supplies a valid allocation layout.
-        unsafe { std::alloc::System.alloc(layout) }
+        let pointer = unsafe { std::alloc::System.alloc(layout) };
+        let _ = NATIVE_BACKINGS.try_with(|watch| {
+            if let Some(mut state) = watch.get()
+                && let Some(slot) = state.capture
+            {
+                // SAFETY: the test guard retains this observer until disabled;
+                // reading the warmed resource ledger allocates nothing.
+                let memory = unsafe { &*state.observer }.usage().memory;
+                if !state.capture_last {
+                    state.capture = None;
+                }
+                state.backings[slot] = NativeBacking {
+                    pointer: pointer as usize,
+                    bytes: layout.size(),
+                    admitted_at_allocation: memory,
+                    admitted_at_deallocation: None,
+                };
+                watch.set(Some(state));
+            }
+        });
+        pointer
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
-        // SAFETY: every allocation above came from System.
+        // SAFETY: every allocation above came from System. Observe the ledger
+        // after actual deallocation, before the containing owner can release it.
         unsafe { std::alloc::System.dealloc(pointer, layout) }
+        let _ = NATIVE_BACKINGS.try_with(|watch| {
+            if let Some(mut state) = watch.get() {
+                for backing in &mut state.backings {
+                    if backing.pointer == pointer as usize
+                        && backing.admitted_at_deallocation.is_none()
+                    {
+                        // SAFETY: the test guard retains the observer through
+                        // final deallocation and this read allocates nothing.
+                        backing.admitted_at_deallocation =
+                            Some(unsafe { &*state.observer }.usage().memory);
+                    }
+                }
+                watch.set(Some(state));
+            }
+        });
     }
 }
 #[global_allocator]
@@ -3433,5 +3685,781 @@ fn decode_multi_record_resource_refusal_aborts_despite_continue() {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+fn xml_runtime_run(
+    root: &std::path::Path,
+    spill: bool,
+    cap: Option<u64>,
+    fault: CsvRuntimeFault,
+    envelope: bool,
+) -> (
+    Result<clinker_exec::executor::ExecutionReport, clinker_plan::error::PipelineError>,
+    clinker_exec::output::staging::OutputStagingRegistry,
+    std::path::PathBuf,
+) {
+    use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, WriterRegistry};
+    let yaml = r##"
+pipeline:
+  name: prepared_xml
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: input.csv
+      schema:
+        - { name: value, type: string }
+  - type: transform
+    name: nested
+    input: rows
+    config:
+      cxl: |
+        emit value = {"@kind": "entry", "#text": value, child: [1, 2]}
+  - type: sink
+    name: result
+    input: nested
+    config:
+      name: result
+      type: xml
+      path: output.xml
+"##;
+    let invalid = matches!(fault, CsvRuntimeFault::InvalidBody);
+    let yaml = if invalid {
+        yaml.replace(
+            "type: csv\n      path: input.csv",
+            "type: json\n      path: input.json",
+        )
+        .replace("type: string", "type: any")
+    } else {
+        yaml.to_owned()
+    };
+    let yaml = if envelope {
+        yaml.replace(
+            "type: csv\n      path: input.csv",
+            r#"type: json
+      path: input.json
+      options:
+        record_path: records
+      envelope:
+        sections:
+          Opening:
+            extract: { json_pointer: "/Opening" }
+            fields:
+              id: int
+          Closing:
+            extract: { json_pointer: "/Closing" }
+            fields:
+              status: string"#,
+        )
+        .replace(
+            "      path: output.xml",
+            r#"      path: output.xml
+      reconstruct_envelope: true
+      options:
+        envelope:
+          header_from_doc: Opening
+          footer_from_doc: Closing
+          footer_record_count_field: rows"#,
+        )
+    } else {
+        yaml
+    };
+    let config = clinker_plan::config::parse_config(&yaml).unwrap();
+    let plan = config
+        .compile(&clinker_plan::config::CompileContext::default())
+        .unwrap();
+    let destination = root.join("output.xml");
+    let staging = clinker_exec::output::staging::OutputStagingRegistry::default();
+    let (_, file) = staging
+        .stage_output(
+            "result",
+            clinker_plan::config::IfExistsPolicy::Error,
+            false,
+            |_| Ok(destination.clone()),
+        )
+        .unwrap();
+    struct PrefixFile {
+        file: std::fs::File,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Write for PrefixFile {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                self.file.write(&bytes[..1])
+            } else {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            panic!("failed delivery must not be retried or flushed")
+        }
+    }
+    let raw: Box<dyn Write + Send> = match fault {
+        CsvRuntimeFault::Prefix(calls) => Box::new(PrefixFile { file, calls }),
+        _ => Box::new(file),
+    };
+    let registry = WriterRegistry {
+        single: [("result".into(), raw)].into(),
+        output_staging: staging.clone(),
+        ..Default::default()
+    };
+    let input = if envelope {
+        format!(
+            r#"{{"Opening":{{"id":7}},"Closing":{{"status":"done"}},"records":[{{"value":"{}"}}]}}"#,
+            "x".repeat(100_000)
+        )
+    } else if invalid {
+        r#"[{"value":["invalid"]}]"#.to_owned()
+    } else {
+        format!("value\n{}\n", "x".repeat(100_000))
+    };
+    let readers = [(
+        "rows".into(),
+        clinker_exec::executor::single_file_reader(
+            "input.csv",
+            Box::new(std::io::Cursor::new(input.into_bytes())),
+        ),
+    )]
+    .into();
+    let (producer, receiver) = telemetry();
+    let params = PipelineRunParams {
+        telemetry_producer: Some(producer),
+        spill_root_dir: spill.then(|| root.to_owned()),
+        spill_disk_cap_bytes: cap,
+        ..Default::default()
+    };
+    let result = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, registry, &params);
+    if result.is_ok() {
+        use clinker_exec::telemetry::MetricKey;
+        let mut spills = 0;
+        let mut stages = 0;
+        while let Some(batch) = receiver.try_recv_batch() {
+            spills += batch.metric(MetricKey::WriterSpillCompleted);
+            stages += batch.metric(MetricKey::WriterStageCompleted);
+        }
+        assert!(stages >= 2, "runtime must reach prepared XML operations");
+        assert_eq!(spills > 0, spill, "spill qualification must really spill");
+    }
+    (result, staging, destination)
+}
+
+#[test]
+fn xml_runtime_disk_stage_denial_never_publishes_root_or_body() {
+    let root = tempfile::tempdir().unwrap();
+    let (result, staging, destination) =
+        xml_runtime_run(root.path(), true, Some(1), CsvRuntimeFault::None, false);
+    assert!(
+        matches!(&result, Err(clinker_plan::error::PipelineError::Format(clinker_format::FormatError::Resource(error))) if error.kind == ResourceErrorKind::DiskQuota),
+        "XML operations must retain typed disk refusal: {result:?}"
+    );
+    assert!(!destination.exists());
+    for partial in staging.partials() {
+        assert_eq!(std::fs::metadata(partial.partial_path).unwrap().len(), 0);
+    }
+}
+
+#[test]
+fn xml_runtime_nested_cxl_memory_and_spill_files_match_exact_bytes() {
+    for envelope in [false, true] {
+        for spill in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (result, _, destination) =
+                xml_runtime_run(root.path(), spill, None, CsvRuntimeFault::None, envelope);
+            result.unwrap();
+            let text = "x".repeat(100_000);
+            let record = format!(
+                r#"<Record><value kind="entry">{text}<child>1</child><child>2</child></value></Record>"#
+            );
+            let expected = if envelope {
+                format!(
+                    "<Root><Document><header><id>7</id></header>{record}<footer><status>done</status><rows>1</rows></footer></Document></Root>"
+                )
+            } else {
+                format!("<Root>{record}</Root>")
+            };
+            assert_eq!(std::fs::read(&destination).unwrap(), expected.as_bytes());
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+}
+
+#[test]
+fn xml_runtime_factory_writer_and_config_deallocate_before_release() {
+    use clinker_format::counting::{CountingWriter, SharedByteCounter};
+    use clinker_format::preparation::PreparedWriter;
+    use clinker_format::splitting::WriterFactory;
+    use clinker_format::xml::writer::{XmlEncoder, XmlEncoderConfig, XmlWriterConfig};
+    use clinker_record::owned_storage::SharedStorage;
+    use clinker_record::{Record, Schema, Value};
+    let arb = Arc::new(MemoryArbitrator::with_policy(
+        256 * 1024,
+        0.8,
+        0.7,
+        Box::new(NoOpPolicy),
+    ));
+    let shutdown = ShutdownToken::detached();
+    let provider = ExecutorResources::new(
+        arb.clone(),
+        shutdown.clone(),
+        None,
+        NonZeroUsize::new(1).unwrap(),
+        None,
+    )
+    .unwrap();
+    let resources = provider.resources();
+    let scope = resources.scope().unwrap();
+    let observer = arb.writer_resource_observer();
+    NATIVE_BACKINGS.with(|watch| {
+        watch.set(Some(NativeBackingWatch {
+            observer: &observer,
+            capture: Some(0),
+            capture_last: true,
+            backings: [NativeBacking::default(); 3],
+        }))
+    });
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NATIVE_BACKINGS.with(|watch| watch.set(None));
+        }
+    }
+    let reset = Reset;
+    let config = XmlEncoderConfig::new((&XmlWriterConfig::default()).into(), &resources).unwrap();
+    NATIVE_BACKINGS.with(|watch| {
+        let mut state = watch.get().unwrap();
+        state.capture = None;
+        state.capture_last = false;
+        watch.set(Some(state));
+    });
+    let config_memory = observer.usage().memory;
+    let alias = config.clone();
+    let captured_resources = resources.clone();
+    let make = move |destination, schema| {
+        XmlEncoder::from_config(schema, config.clone())?
+            .into_boxed_writer(destination, captured_resources.clone())
+    };
+    let factory_bytes = std::mem::size_of_val(&make);
+    NATIVE_BACKINGS.with(|watch| {
+        let mut state = watch.get().unwrap();
+        state.capture = Some(1);
+        watch.set(Some(state));
+    });
+    let factory = WriterFactory::try_new(make, scope.allocation()).unwrap();
+    let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["a.b".into()])));
+    let record = Record::new(schema.clone(), vec![Value::Integer(7)]);
+    let destination: Box<dyn Write + Send> = Box::new(std::io::sink());
+    let counter = SharedByteCounter::new();
+    let counting = CountingWriter::new(destination, counter.clone());
+    NATIVE_BACKINGS.with(|watch| {
+        let mut state = watch.get().unwrap();
+        state.capture = Some(2);
+        watch.set(Some(state));
+    });
+    let mut writer = factory.create(counting, schema).unwrap();
+    let backing = NATIVE_BACKINGS.with(|watch| watch.get().unwrap().backings);
+    assert!(backing[0].bytes > 0);
+    assert_eq!(backing[1].bytes, factory_bytes);
+    assert_eq!(
+        backing[2].bytes,
+        std::mem::size_of::<PreparedWriter<CountingWriter<Box<dyn Write + Send>>, XmlEncoder>>()
+    );
+    assert_eq!(
+        observer.usage().memory,
+        config_memory + backing[1].bytes as u64 + backing[2].bytes as u64
+    );
+    writer.write_record(&record).unwrap();
+    let committed_memory = observer.usage().memory;
+    let committed_bytes = counter.bytes_written();
+    let changed = Record::new(
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["changed.path".into()]))),
+        vec![Value::Integer(9)],
+    );
+    let pressure = scope
+        .reserve(Layout::array::<u8>((arb.limit() - committed_memory) as usize).unwrap())
+        .unwrap();
+    assert!(
+        matches!(writer.write_record(&changed), Err(clinker_format::FormatError::Resource(error)) if error.kind == ResourceErrorKind::Budget)
+    );
+    assert_eq!(counter.bytes_written(), committed_bytes);
+    drop(pressure);
+    assert_eq!(observer.usage().memory, committed_memory);
+    writer.write_record(&changed).unwrap();
+    drop(factory);
+    shutdown.request();
+    assert!(
+        matches!(writer.write_record(&record), Err(clinker_format::FormatError::Resource(error)) if error.kind == ResourceErrorKind::Cancelled)
+    );
+    drop(writer);
+    assert_eq!(observer.usage().memory, config_memory);
+    arb.close_writer_resources();
+    assert!(observer.is_closed());
+    drop(alias);
+    let backing = NATIVE_BACKINGS.with(|watch| watch.get().unwrap().backings);
+    for owner in backing {
+        assert!(owner.admitted_at_allocation >= owner.bytes as u64);
+        assert!(owner.admitted_at_deallocation.unwrap() >= owner.bytes as u64);
+    }
+    assert_eq!(observer.usage().memory, 0);
+    assert_eq!(observer.usage().disk, 0);
+    assert_eq!(observer.usage().descriptors, 0);
+    assert_eq!(arb.consumer_count(), 0);
+    drop(reset);
+}
+
+#[test]
+fn nested_runtime_pressure_and_delivery_outcomes_ignore_telemetry_admission() {
+    use clinker_exec::telemetry::{MetricKey, SpanName, SpanStatus};
+    use clinker_format::json::writer::{JsonEncoder, JsonWriterConfig};
+    use clinker_format::xml::writer::{XmlEncoder, XmlWriterConfig};
+    use clinker_format::{FormatError, FormatWriterHandle};
+    use clinker_record::{Record, Schema, Value, owned_storage::SharedStorage};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct Destination {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        calls: Arc<AtomicUsize>,
+        token: ShutdownToken,
+        prefix_failure: bool,
+        cancel_at: Option<usize>,
+    }
+    impl Write for Destination {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let calls = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.prefix_failure && calls > 0 {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let n = if self.prefix_failure {
+                3.min(bytes.len())
+            } else {
+                bytes.len()
+            };
+            let mut output = self.bytes.lock().unwrap();
+            output.extend_from_slice(&bytes[..n]);
+            if self.cancel_at == Some(output.len()) {
+                self.token.request();
+            }
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    for xml in [false, true] {
+        let text = "x".repeat(100_000);
+        let record_bytes = if xml {
+            format!("<Root><Record><value>{text}</value></Record>")
+        } else {
+            format!("[\n{{\"value\":\"{text}\"}}")
+        };
+        let complete = format!("{record_bytes}{}", if xml { "</Root>" } else { "\n]\n" });
+        for spill in [false, true] {
+            for mode in 0..3 {
+                for fault in ["none", "pressure", "disk", "descriptor", "prefix", "cancel"] {
+                    if !spill && matches!(fault, "disk" | "descriptor" | "pressure") {
+                        continue;
+                    }
+                    let root = tempfile::tempdir().unwrap();
+                    let arb = Arc::new(MemoryArbitrator::with_policy(
+                        512 * 1024,
+                        0.8,
+                        0.7,
+                        Box::new(NoOpPolicy),
+                    ));
+                    if fault == "disk" {
+                        arb.set_max_spill_bytes(0).unwrap();
+                    }
+                    let token = ShutdownToken::detached();
+                    let (producer, receiver) = telemetry();
+                    if mode == 2 {
+                        saturate_writer_telemetry(&producer);
+                    }
+                    let arena = producer.snapshot();
+                    let storage = configured(root.path());
+                    let provider = ExecutorResources::new(
+                        arb.clone(),
+                        token.clone(),
+                        spill.then_some(&storage),
+                        NonZeroUsize::new(1).unwrap(),
+                        (mode != 0).then(|| producer.clone()),
+                    )
+                    .unwrap();
+                    let baseline = arb.writer_resource_usage().memory;
+                    let bytes = Arc::new(Mutex::new(Vec::new()));
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let destination = Destination {
+                        bytes: bytes.clone(),
+                        calls: calls.clone(),
+                        token,
+                        prefix_failure: fault == "prefix",
+                        cancel_at: (fault == "cancel").then_some(record_bytes.len()),
+                    };
+                    let schema =
+                        SharedStorage::from_arc(Arc::new(Schema::new(vec!["value".into()])));
+                    let record =
+                        Record::new(schema.clone(), vec![Value::String(text.as_str().into())]);
+                    let resources = provider.resources();
+                    let mut writer: FormatWriterHandle = if xml {
+                        XmlEncoder::new(schema, &XmlWriterConfig::default(), resources.clone())
+                            .unwrap()
+                            .into_boxed_writer(destination, resources.clone())
+                            .unwrap()
+                    } else {
+                        JsonEncoder::new(schema, &JsonWriterConfig::default(), resources.clone())
+                            .unwrap()
+                            .into_boxed_writer(destination, resources.clone())
+                            .unwrap()
+                    };
+                    let scope = resources.scope().unwrap();
+                    let pressure = (fault == "pressure").then(|| {
+                        scope
+                            .reserve(
+                                Layout::array::<u8>(
+                                    (arb.limit() - arb.writer_resource_usage().memory - 96 * 1024)
+                                        as usize,
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap()
+                    });
+                    let descriptor = (fault == "descriptor").then(|| scope.stage().unwrap());
+                    let result = writer.write_record(&record);
+                    let success = matches!(fault, "none" | "pressure");
+                    if success {
+                        result.unwrap();
+                        writer.flush_bytes().unwrap();
+                        assert_eq!(*bytes.lock().unwrap(), record_bytes.as_bytes());
+                        writer.flush().unwrap();
+                        writer.flush().unwrap();
+                        assert_eq!(*bytes.lock().unwrap(), complete.as_bytes());
+                    } else {
+                        let error = result.unwrap_err();
+                        match fault {
+                            "disk" => assert!(
+                                matches!(error, FormatError::Resource(error) if error.kind == ResourceErrorKind::DiskQuota)
+                            ),
+                            "descriptor" => assert!(
+                                matches!(error, FormatError::Resource(error) if error.kind == ResourceErrorKind::DescriptorQuota)
+                            ),
+                            "prefix" => assert!(
+                                matches!(error, FormatError::Io(error) if error.kind() == std::io::ErrorKind::BrokenPipe)
+                            ),
+                            "cancel" => assert!(
+                                matches!(error, FormatError::Resource(error) if error.kind == ResourceErrorKind::Cancelled)
+                            ),
+                            _ => unreachable!(),
+                        }
+                        let expected = match fault {
+                            "prefix" => &record_bytes.as_bytes()[..3],
+                            "cancel" => record_bytes.as_bytes(),
+                            _ => b"",
+                        };
+                        assert_eq!(*bytes.lock().unwrap(), expected);
+                        if matches!(fault, "prefix" | "cancel") {
+                            let attempts = calls.load(Ordering::SeqCst);
+                            assert!(
+                                matches!(writer.flush(), Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::DeliveryPoisoned)
+                            );
+                            assert_eq!(calls.load(Ordering::SeqCst), attempts);
+                        }
+                    }
+                    drop(descriptor);
+                    drop(pressure);
+                    drop(writer);
+                    drop(scope);
+                    drop(resources);
+                    assert_eq!(
+                        arb.writer_resource_usage().memory,
+                        baseline,
+                        "{xml}/{spill}/{mode}/{fault}"
+                    );
+                    assert_eq!(arb.writer_resource_usage().disk, 0);
+                    assert_eq!(arb.writer_resource_usage().descriptors, 0);
+                    assert_eq!(provider.cleanup_debt_count(), 0);
+                    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+                    assert_eq!(producer.snapshot().owned_bytes, arena.owned_bytes);
+                    if mode == 2 {
+                        assert_eq!(producer.snapshot().accepted, arena.accepted);
+                    }
+                    if mode == 0 {
+                        assert!(receiver.try_recv_batch().is_none());
+                    } else {
+                        let batch = receiver.try_recv_batch().unwrap();
+                        assert_eq!(
+                            batch.metric(MetricKey::WriterStageCompleted),
+                            if success { 2 } else { 0 }
+                        );
+                        assert_eq!(
+                            batch.metric(MetricKey::WriterStageInterrupted),
+                            u64::from(fault == "cancel")
+                        );
+                        assert_eq!(
+                            batch.metric(MetricKey::WriterStageFailed),
+                            u64::from(matches!(fault, "disk" | "descriptor")),
+                            "{xml}/{spill}/{mode}/{fault}"
+                        );
+                        // Destination errors belong to Sink; the storage owner
+                        // abandons unconsumed bytes without inventing a storage failure.
+                        assert_eq!(
+                            batch.metric(MetricKey::WriterStageDropped),
+                            u64::from(matches!(fault, "prefix" | "descriptor"))
+                        );
+                        if success {
+                            assert_eq!(batch.metric(MetricKey::WriterSpillCompleted) > 0, spill);
+                        }
+                        let spans: Vec<_> = batch
+                            .traces()
+                            .iter()
+                            .filter(|span| span.name == SpanName::WriterStage)
+                            .collect();
+                        if mode == 2 {
+                            assert!(spans.is_empty());
+                        } else if fault != "descriptor" {
+                            assert_eq!(spans.len(), if success { 2 } else { 1 });
+                            for span in spans {
+                                assert!(
+                                    span.started_at_unix_nanos > 0
+                                        && span.started_at_unix_nanos <= span.ended_at_unix_nanos
+                                );
+                                assert_eq!(
+                                    span.status,
+                                    if success {
+                                        SpanStatus::Ok
+                                    } else if matches!(fault, "cancel" | "prefix") {
+                                        SpanStatus::Unset
+                                    } else {
+                                        SpanStatus::Error
+                                    }
+                                );
+                            }
+                        }
+                    }
+                    drop(provider);
+                    assert_eq!(arb.writer_resource_usage().memory, 0);
+                    assert_eq!(arb.consumer_count(), 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_runtime_sink_reports_exact_outcomes_without_teardown_retry() {
+    use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, WriterRegistry};
+    use clinker_exec::telemetry::{MetricKey, SpanName, SpanStatus};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Destination {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        calls: Arc<AtomicUsize>,
+        fault: &'static str,
+        token: ShutdownToken,
+    }
+    impl Write for Destination {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fault == "prefix" && call != 0 {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let n = if self.fault == "prefix" {
+                3
+            } else {
+                bytes.len()
+            };
+            self.bytes.lock().unwrap().extend_from_slice(&bytes[..n]);
+            if self.fault == "cancel" {
+                self.token.request();
+            }
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            assert_eq!(
+                self.fault, "none",
+                "failed or cancelled destinations must not flush"
+            );
+            Ok(())
+        }
+    }
+    for format in ["json", "xml"] {
+        for (full, fault) in [false, true]
+            .into_iter()
+            .flat_map(|full| ["none", "prefix", "cancel"].map(|fault| (full, fault)))
+        {
+            let root = tempfile::tempdir().unwrap();
+            let yaml = format!(
+                r#"
+pipeline:
+  name: exact_delivery
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: input.csv
+      schema:
+        - {{ name: value, type: string }}
+  - type: sink
+    name: result
+    input: rows
+    config:
+      name: result
+      type: {format}
+      path: output.{format}
+"#
+            );
+            let plan = clinker_plan::config::parse_config(&yaml)
+                .unwrap()
+                .compile(&clinker_plan::config::CompileContext::default())
+                .unwrap();
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let token = ShutdownToken::detached();
+            let registry = WriterRegistry {
+                single: [(
+                    "result".into(),
+                    Box::new(Destination {
+                        bytes: bytes.clone(),
+                        calls: calls.clone(),
+                        fault,
+                        token: token.clone(),
+                    }) as Box<dyn Write + Send>,
+                )]
+                .into(),
+                ..Default::default()
+            };
+            let readers = [(
+                "rows".into(),
+                clinker_exec::executor::single_file_reader(
+                    "input.csv",
+                    Box::new(std::io::Cursor::new(
+                        format!("value\n{}\n", "x".repeat(100_000)).into_bytes(),
+                    )),
+                ),
+            )]
+            .into();
+            let (producer, receiver) = telemetry();
+            if full {
+                saturate_writer_telemetry(&producer);
+            }
+            let arena = producer.snapshot();
+            let params = PipelineRunParams {
+                shutdown_token: Some(token),
+                spill_root_dir: Some(root.path().to_owned()),
+                telemetry_producer: Some(producer.clone()),
+                ..Default::default()
+            };
+            let result =
+                PipelineExecutor::run_plan_with_readers_writers(&plan, readers, registry, &params);
+            let value = "x".repeat(100_000);
+            let complete = if format == "json" {
+                format!("[\n{{\"value\":\"{value}\"}}\n]\n")
+            } else {
+                format!("<Root><Record><value>{value}</value></Record></Root>")
+            };
+            let (accepted, expected_counts, status) = match fault {
+                "prefix" => {
+                    assert!(result.is_err());
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        2,
+                        "{format}: teardown must not retry"
+                    );
+                    (3, [1, 1, 0, 1, 3, 0, 0], SpanStatus::Error)
+                }
+                "cancel" => {
+                    let report = result.unwrap();
+                    assert_eq!(report.per_source_record_counts["rows"], 1);
+                    assert!(report.interrupted);
+                    assert_eq!(report.counters.records_written, 0);
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    let n = clinker_format::preparation::PROGRESS_BYTES / 2;
+                    (n, [1, 0, 0, 0, n as u64, 0, 1], SpanStatus::Unset)
+                }
+                _ => {
+                    let report = result.unwrap();
+                    assert_eq!(report.per_source_record_counts["rows"], 1);
+                    assert!(!report.interrupted);
+                    assert_eq!(report.counters.records_written, 1);
+                    (
+                        complete.len(),
+                        [1, 0, 1, 0, complete.len() as u64, 1, 0],
+                        SpanStatus::Ok,
+                    )
+                }
+            };
+            assert_eq!(*bytes.lock().unwrap(), &complete.as_bytes()[..accepted]);
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+            let mut counts = [0; 7];
+            let mut sink_spans = 0;
+            let mut sources = [0; 4];
+            let keys = [
+                MetricKey::SinkStarted,
+                MetricKey::SinkFailed,
+                MetricKey::SinkRecords,
+                MetricKey::SinkErrors,
+                MetricKey::SinkBytes,
+                MetricKey::SinkCompleted,
+                MetricKey::SinkInterrupted,
+            ];
+            while let Some(batch) = receiver.try_recv_batch() {
+                for (index, key) in [
+                    MetricKey::SourceStarted,
+                    MetricKey::SourceCompleted,
+                    MetricKey::SourceInterrupted,
+                    MetricKey::SourceFailed,
+                ]
+                .iter()
+                .enumerate()
+                {
+                    sources[index] += batch.metric(*key);
+                }
+                for (index, key) in keys.iter().enumerate() {
+                    counts[index] += batch.metric(*key);
+                }
+                for span in batch
+                    .traces()
+                    .iter()
+                    .filter(|span| span.name == SpanName::Sink)
+                {
+                    sink_spans += 1;
+                    assert_eq!(span.status, status);
+                    assert!(
+                        span.started_at_unix_nanos > 0
+                            && span.started_at_unix_nanos <= span.ended_at_unix_nanos
+                    );
+                }
+            }
+            assert_eq!(
+                counts, expected_counts,
+                "{format}/{fault}: count only the accepted byte prefix"
+            );
+            assert_eq!(sources[0], 1);
+            assert_eq!(sources[1] + sources[2], 1);
+            assert_eq!(sources[3], 0);
+            assert!(sink_spans <= 1);
+            let after = producer.snapshot();
+            assert_eq!(after.owned_bytes, arena.owned_bytes);
+            if full {
+                assert_eq!(sink_spans, 0);
+                assert_eq!(after.accepted, arena.accepted);
+            } else if sink_spans == 0 {
+                // Even with free byte capacity, the fixed slot inventory may
+                // fill during source admission. Outcomes remain exact when
+                // that denies the terminal span; never enlarge the arena.
+                assert!(
+                    after.contention_drops > arena.contention_drops
+                        || after.full_drops > arena.full_drops,
+                    "{format}/{fault}: {after:?} vs {arena:?}"
+                );
+            }
+        }
     }
 }

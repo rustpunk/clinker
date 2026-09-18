@@ -37,7 +37,9 @@ use serde::Deserialize;
 
 use cxl::analyzer::doc_paths::DocPath;
 
+#[cfg(test)]
 use crate::bom::UTF8_BOM;
+use crate::bom::{Utf8Input, utf8_input_error};
 use crate::doc_index::DocArenaIndex;
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, EnvelopeFieldType};
 use crate::error::{FanOutLimitFailure, FormatError};
@@ -406,8 +408,10 @@ impl JsonReader {
         source: &ReopenableSource,
     ) -> Result<(BufReader<Box<dyn Read + Send>>, SourceIdentity), FormatError> {
         let (reader, identity) = source.open_with_identity().map_err(FormatError::Io)?;
-        let mut buf = BufReader::new(reader);
-        strip_leading_bom(&mut buf)?;
+        let input = Utf8Input::new(reader).map_err(utf8_input_error)?;
+        let mut buf = BufReader::new(Box::new(input) as Box<dyn Read + Send>);
+        // Establish the byte boundary before mode detection or parser setup.
+        buf.fill_buf().map_err(utf8_input_error)?;
         Ok((buf, identity))
     }
 
@@ -479,7 +483,7 @@ impl JsonReader {
             InnerReader::Array(stream) => stream.next(),
             InnerReader::Ndjson { reader, line_buf } => loop {
                 line_buf.clear();
-                let n = reader.read_line(line_buf).map_err(FormatError::Io)?;
+                let n = reader.read_line(line_buf).map_err(utf8_input_error)?;
                 if n == 0 {
                     return Ok(None);
                 }
@@ -1161,7 +1165,7 @@ fn peek_first_byte(
     reader: &mut BufReader<Box<dyn Read + Send>>,
 ) -> Result<Option<u8>, FormatError> {
     loop {
-        let buf = reader.fill_buf().map_err(FormatError::Io)?;
+        let buf = reader.fill_buf().map_err(utf8_input_error)?;
         if buf.is_empty() {
             return Ok(None);
         }
@@ -1174,21 +1178,6 @@ fn peek_first_byte(
         let len = buf.len();
         reader.consume(len);
     }
-}
-
-/// Consume a single leading UTF-8 BOM from a freshly opened reader, if present.
-///
-/// Each pass re-opens its own `Read`, so a Windows-authored file (Excel /
-/// PowerShell utf8 export) carries the BOM on every open; stripping it here
-/// clears the marker for body iteration, the NDJSON line scan, and the
-/// envelope pre-scan alike. The `BufReader`'s default capacity exceeds the
-/// 3-byte BOM, so the marker is always wholly inside the first fill.
-fn strip_leading_bom(reader: &mut BufReader<Box<dyn Read + Send>>) -> Result<(), FormatError> {
-    let buf = reader.fill_buf().map_err(FormatError::Io)?;
-    if buf.starts_with(&UTF8_BOM) {
-        reader.consume(UTF8_BOM.len());
-    }
-    Ok(())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

@@ -54,20 +54,25 @@ impl PreparedEnvelope {
         &self,
         doc: &'a DocumentContext,
     ) -> Option<&'a IndexMap<OwnedKey, Value>> {
-        self.header
-            .as_ref()
-            .and_then(|name| doc.section_fields(name.as_str()))
+        self.header_name().and_then(|name| doc.section_fields(name))
     }
     pub(crate) fn footer_fields<'a>(
         &self,
         doc: &'a DocumentContext,
     ) -> Option<&'a IndexMap<OwnedKey, Value>> {
-        self.footer
-            .as_ref()
-            .and_then(|name| doc.section_fields(name.as_str()))
+        self.footer_name().and_then(|name| doc.section_fields(name))
     }
     pub(crate) fn has_count(&self) -> bool {
         self.count.is_some()
+    }
+    pub(crate) fn count_name(&self) -> Option<&str> {
+        self.count.as_ref().map(|name| name.as_str())
+    }
+    pub(crate) fn header_name(&self) -> Option<&str> {
+        self.header.as_ref().map(|name| name.as_str())
+    }
+    pub(crate) fn footer_name(&self) -> Option<&str> {
+        self.footer.as_ref().map(|name| name.as_str())
     }
 }
 

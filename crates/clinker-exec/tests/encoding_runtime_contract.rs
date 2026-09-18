@@ -1,4 +1,4 @@
-//! CSV reader coverage through compiled plans and physical source files.
+//! CSV and native JSON/XML coverage through compiled plans and physical files.
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -494,4 +494,188 @@ mode = "none"
             );
         }
     }
+}
+
+#[test]
+fn nested_failed_second_file_preserves_source_and_sink_count_prefixes() {
+    use clinker_exec::progress::RunProgress;
+    use clinker_exec::telemetry::{MetricKey, TelemetryArena};
+    use clinker_plan::config::ClinkerToml;
+    const MODES: &[&str] = &[
+        "json-array",
+        "json-ndjson",
+        "json-body",
+        "xml-ordinary",
+        "xml-body",
+        "xml-envelope",
+        "xml-prescan",
+    ];
+    let policy = ClinkerToml::parse(
+        r#"
+[observability]
+arena_bytes = "768KB"
+ordinary_lane_bytes = "512KB"
+high_severity_lane_bytes = "256KB"
+max_batch_bytes = "8KB"
+rate_limit_per_second = 100000
+rate_limit_burst = 100000
+[observability.otlp]
+endpoint = "https://collector.invalid"
+[observability.otlp.auth]
+mode = "none"
+"#,
+    )
+    .unwrap()
+    .resolve_observability(None)
+    .unwrap();
+    let mut executed = BTreeSet::new();
+    for mode in MODES {
+        let xml = mode.starts_with("xml");
+        let format = if xml { "xml" } else { "json" };
+        let options = match *mode {
+            "json-ndjson" => "      options: { format: ndjson }\n",
+            "json-body" => "      options: { record_path: items }\n",
+            "xml-body" | "xml-envelope" | "xml-prescan" => {
+                "      options: { record_path: Root/items/row }\n"
+            }
+            _ => "",
+        };
+        let envelope = if matches!(*mode, "xml-envelope" | "xml-prescan") {
+            "      envelope:\n        sections:\n          manifest:\n            extract: { xml_path: /Root/manifest }\n            fields: { batch: int }\n"
+        } else {
+            ""
+        };
+        let transform = if *mode == "xml-prescan" {
+            "  - type: transform\n    name: attach\n    input: rows\n    config:\n      cxl: |\n        emit id = id\n        emit batch = $doc.manifest.batch\n"
+        } else {
+            ""
+        };
+        let upstream = if *mode == "xml-prescan" {
+            "attach"
+        } else {
+            "rows"
+        };
+        let yaml = format!(
+            r#"
+pipeline:
+  name: native_failure_counts
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: {format}
+      path: input.{format}
+{options}{envelope}      schema: [{{ name: id, type: int }}]
+{transform}  - type: sink
+    name: out
+    input: {upstream}
+    config:
+      name: out
+      type: json
+      path: output.json
+      options: {{ format: ndjson }}
+"#
+        );
+        let plan = parse_config(&yaml)
+            .unwrap()
+            .compile(&CompileContext::default())
+            .unwrap();
+        let valid: &[u8] = match *mode {
+            "json-array" => b"[{\"id\":1}]",
+            "json-ndjson" => b"{\"id\":1}\n",
+            "json-body" => b"{\"items\":[{\"id\":1}]}",
+            "xml-ordinary" => b"<row><id>1</id></row>",
+            _ => b"<Root><items><row><id>1</id></row></items><manifest><batch>7</batch></manifest></Root>",
+        };
+        let expected: &[u8] = if *mode == "xml-prescan" {
+            b"{\"id\":1,\"batch\":7}\n"
+        } else {
+            b"{\"id\":1}\n"
+        };
+        for variant in ["unsupported-second", "malformed-second", "malformed-late"] {
+            let late = variant == "malformed-late";
+            let padding = " ".repeat(32 * 1024);
+            let mut corrupt = match *mode {
+                "json-array" => format!("[{{\"id\":1}},{padding}{{\"id\":2}}]").into_bytes(),
+                "json-ndjson" => format!("{{\"id\":1}}\n{padding}{{\"id\":2}}\n").into_bytes(),
+                "json-body" => format!("{{\"items\":[{{\"id\":1}},{padding}{{\"id\":2}}]}}").into_bytes(),
+                "xml-ordinary" => format!("<row><id>1</id>{padding}<tail>2</tail></row>").into_bytes(),
+                _ => format!("<Root><manifest><batch>7</batch></manifest><items><row><id>1</id></row>{padding}<row><id>2</id></row></items></Root>").into_bytes(),
+            };
+            let offset = corrupt.iter().rposition(|byte| *byte == b'2').unwrap();
+            corrupt[offset] = 0xff;
+            let invalid: &[u8] = if variant == "unsupported-second" {
+                b"\xff\xfe\0\0"
+            } else {
+                b"\xef\xbb\xbf\xff"
+            };
+            let inputs = if late {
+                vec![corrupt.as_slice()]
+            } else {
+                vec![valid, invalid]
+            };
+            let expected = if late && matches!(*mode, "xml-ordinary" | "xml-prescan") {
+                b"".as_slice()
+            } else {
+                expected
+            };
+            let count = u64::from(!expected.is_empty());
+            let root = tempfile::tempdir().unwrap();
+            let mut files = Vec::new();
+            for (index, bytes) in inputs.iter().enumerate() {
+                let path = root.path().join(format!("input-{index}.{format}"));
+                std::fs::write(&path, bytes).unwrap();
+                files.push(FileSlot::new(
+                    path.clone(),
+                    Box::new(std::fs::File::open(path).unwrap()),
+                ));
+            }
+            let path = root.path().join("output.json");
+            let writers = WriterRegistry {
+                single: [(
+                    "out".into(),
+                    Box::new(std::fs::File::create(&path).unwrap()) as Box<dyn Write + Send>,
+                )]
+                .into(),
+                ..Default::default()
+            };
+            let progress = RunProgress::new();
+            let (producer, receiver) = TelemetryArena::reserve(&policy).unwrap();
+            let params = PipelineRunParams {
+                progress: Some(progress.clone()),
+                telemetry_producer: Some(producer),
+                ..Default::default()
+            };
+            let error = PipelineExecutor::run_plan_with_readers_writers(
+                &plan,
+                [("rows".into(), SourceInput::Files(files))].into(),
+                writers,
+                &params,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, clinker_plan::PipelineError::Format(_)),
+                "{mode}: {error:?}"
+            );
+            assert_eq!(progress.sample().records_read, count, "{mode}/{variant}");
+            assert_eq!(std::fs::read(&path).unwrap(), expected, "{mode}");
+            let mut records = 0;
+            let mut bytes = 0;
+            let mut source_failed = 0;
+            while let Some(batch) = receiver.try_recv_batch() {
+                records += batch.metric(MetricKey::SinkRecords);
+                bytes += batch.metric(MetricKey::SinkBytes);
+                source_failed += batch.metric(MetricKey::SourceFailed);
+                assert_eq!(batch.metric(MetricKey::SinkErrors), 0, "{mode}");
+            }
+            assert_eq!(
+                (records, bytes, source_failed),
+                (count, expected.len() as u64, 1),
+                "{mode}"
+            );
+        }
+        assert!(executed.insert(*mode));
+    }
+    assert_eq!(executed, MODES.iter().copied().collect());
 }
