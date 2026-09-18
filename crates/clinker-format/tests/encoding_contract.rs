@@ -94,6 +94,123 @@ fn swift_invalid_utf8_is_rejected_before_block_tokens() {
     }
 }
 
+#[test]
+fn swift_chunked_unicode_and_interrupted_reads_preserve_values() {
+    use clinker_format::swift::{SwiftReader, SwiftReaderConfig};
+    struct InterruptedChunks<'a> {
+        remaining: &'a [u8],
+        chunk: usize,
+        interrupt: bool,
+    }
+    impl std::io::Read for InterruptedChunks<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            self.interrupt = !self.interrupt;
+            if self.interrupt {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let n = out.len().min(self.chunk).min(self.remaining.len());
+            out[..n].copy_from_slice(&self.remaining[..n]);
+            self.remaining = &self.remaining[n..];
+            Ok(n)
+        }
+    }
+    for chunk in 1..=9 {
+        let source = InterruptedChunks {
+            remaining: "{1:Hé𐀀}{4:\r\n:20:é€𐀀\r\n next\n\r\n-}".as_bytes(),
+            chunk,
+            interrupt: false,
+        };
+        let mut reader = SwiftReader::new(source, SwiftReaderConfig::default());
+        let row = reader.next_record().unwrap().unwrap();
+        assert_eq!(
+            row.get("value"),
+            Some(&Value::String("é€𐀀\r\n next\n".into()))
+        );
+        assert!(reader.next_record().unwrap().is_none());
+    }
+}
+
+#[test]
+fn swift_non_encoding_io_failure_is_terminal_and_keeps_its_kind() {
+    use clinker_format::swift::{SwiftReader, SwiftReaderConfig};
+    struct FailingRead {
+        prefix: &'static [u8],
+        kind: std::io::ErrorKind,
+    }
+    impl std::io::Read for FailingRead {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.prefix.is_empty() {
+                return Err(self.kind.into());
+            }
+            std::io::Read::read(&mut self.prefix, out)
+        }
+    }
+    for kind in [std::io::ErrorKind::Other, std::io::ErrorKind::InvalidData] {
+        let mut reader = SwiftReader::new(
+            FailingRead {
+                prefix: b"{1:HEADER}{4:\n:20:GOOD\n-}",
+                kind,
+            },
+            SwiftReaderConfig::default(),
+        );
+        assert!(
+            matches!(reader.next_record(), Err(clinker_format::FormatError::Io(error)) if error.kind() == kind)
+        );
+        assert!(reader.next_record().unwrap().is_none());
+        assert!(reader.take_envelope_events().is_empty());
+    }
+}
+
+#[test]
+fn swift_empty_and_adjacent_blocks_keep_framing_and_cardinality() {
+    use clinker_format::swift::{SwiftReader, SwiftReaderConfig};
+    for input in ["", " \r\n\t", "{4:-}", "{1:HEAD}{4:\r\n-}{5:TAIL}"] {
+        let mut reader = SwiftReader::new(input.as_bytes(), SwiftReaderConfig::default());
+        assert!(reader.next_record().unwrap().is_none());
+        assert_eq!(reader.take_envelope_events().len(), 2);
+        assert!(reader.next_record().unwrap().is_none());
+        assert!(reader.take_envelope_events().is_empty());
+    }
+    let mut reader = SwiftReader::new(
+        &b"{1:H}{2:A}{3:{X:Y}}{4:\n:20:A\r\n:20:B\n-}{5:{C:D}}"[..],
+        SwiftReaderConfig::default(),
+    );
+    for value in ["A", "B"] {
+        let row = reader.next_record().unwrap().unwrap();
+        assert_eq!(row.get("value"), Some(&Value::String(value.into())));
+    }
+    assert!(reader.next_record().unwrap().is_none());
+    // Adjacent complete messages remain invalid in the single-message reader.
+    let mut reader = SwiftReader::new(
+        &b"{1:H}{4:\n:20:A\n-}{1:H}{4:\n:20:B\n-}"[..],
+        SwiftReaderConfig::default(),
+    );
+    assert!(reader.next_record().is_err());
+    assert!(reader.next_record().unwrap().is_none());
+}
+
+#[test]
+fn swift_final_structural_break_matches_framer_without_trimming_value_data() {
+    use clinker_format::swift::{SwiftReader, SwiftReaderConfig};
+    for ending in ["\n", "\r\n", "\r"] {
+        for value in ["A", "A\r", "A\r\r", "A\n", "A\r\n", "A\r\n\r\n", "A  "] {
+            // A final CR followed by LF forms the indivisible structural CRLF.
+            // Use CRLF/CR framing to distinguish a CR belonging to value data.
+            if ending == "\n" && value.ends_with('\r') {
+                continue;
+            }
+            let input = format!("{{4:\r\n:20:{value}{ending}-}}");
+            let mut reader = SwiftReader::new(input.as_bytes(), SwiftReaderConfig::default());
+            assert_eq!(
+                reader.next_record().unwrap().unwrap().get("value"),
+                Some(&Value::String(value.into())),
+                "{input:?}"
+            );
+            assert!(reader.next_record().unwrap().is_none());
+        }
+    }
+}
+
 fn physical_column(name: &str, start: usize, width: usize) -> clinker_format::Column {
     clinker_format::Column {
         start: Some(start),

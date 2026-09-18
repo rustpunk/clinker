@@ -116,7 +116,10 @@ impl<R: BufRead> BlockTokenizer<R> {
     /// `true` when a non-whitespace byte is waiting.
     fn skip_inter_block_whitespace(&mut self) -> Result<bool, FormatError> {
         loop {
-            let buf = self.reader.fill_buf()?;
+            let buf = match self.reader.fill_buf() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
             if buf.is_empty() {
                 return Ok(false);
             }
@@ -151,7 +154,10 @@ impl<R: BufRead> BlockTokenizer<R> {
         let mut header_seen = false;
 
         loop {
-            let buf = self.reader.fill_buf()?;
+            let buf = match self.reader.fill_buf() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
             if buf.is_empty() {
                 return Err(FormatError::Swift(format!(
                     "SWIFT block truncated: reached end of input before the block's closing \
@@ -253,42 +259,41 @@ fn ends_with_line_anchored_trailer(raw: &[u8]) -> bool {
 /// Returns [`FormatError::Swift`] when the block is not brace-framed, has no
 /// `:` after the id, or carries a missing/non-numeric/out-of-range block id.
 fn parse_block(raw: &[u8]) -> Result<Option<ParsedBlock>, FormatError> {
+    // Validate the complete block before interpreting its id or body. Invalid
+    // bytes must never become replacement text in either values or diagnostics.
+    let text = std::str::from_utf8(raw).map_err(|error| {
+        FormatError::Swift(format!(
+            "SWIFT block is not valid UTF-8: {error}; save the message as valid UTF-8"
+        ))
+    })?;
     if raw.first() != Some(&b'{') || raw.last() != Some(&b'}') {
         return Err(FormatError::Swift(
             "SWIFT block is not enclosed in braces; expected '{n:...}'".into(),
         ));
     }
-    let inner = &raw[1..raw.len() - 1];
-    let colon = inner.iter().position(|&b| b == b':').ok_or_else(|| {
+    let inner = &text[1..text.len() - 1];
+    let colon = inner.find(':').ok_or_else(|| {
         FormatError::Swift("SWIFT block has no ':' after the block id; expected '{n:...}'".into())
     })?;
-    let id_bytes = &inner[..colon];
-    if id_bytes.is_empty() || !id_bytes.iter().all(u8::is_ascii_digit) {
+    let id_text = &inner[..colon];
+    if id_text.is_empty() || !id_text.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(FormatError::Swift(format!(
             "SWIFT block id {:?} is not a number; expected a numeric block id (1-5)",
-            String::from_utf8_lossy(id_bytes)
+            id_text
         )));
     }
-    let id: u8 = std::str::from_utf8(id_bytes)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| {
-            FormatError::Swift(format!(
-                "SWIFT block id {:?} is out of range; expected 1-5",
-                String::from_utf8_lossy(id_bytes)
-            ))
-        })?;
-    let mut body_bytes = &inner[colon + 1..];
-    // Block 4's body keeps its `:tag:value` lines but loses the `-}` trailer.
-    if id == TEXT_BLOCK_ID && body_bytes.ends_with(b"-") {
-        body_bytes = &body_bytes[..body_bytes.len() - 1];
-    }
-    let body = String::from_utf8(body_bytes.to_vec()).map_err(|e| {
+    let id: u8 = id_text.parse().map_err(|_| {
         FormatError::Swift(format!(
-            "SWIFT block {id} body is not valid UTF-8: {e}. Non-UTF-8 SWIFT messages are not \
-             supported"
+            "SWIFT block id {:?} is out of range; expected 1-5",
+            id_text
         ))
     })?;
+    let mut body_bytes = &inner[colon + 1..];
+    // Block 4's body keeps its `:tag:value` lines but loses the `-}` trailer.
+    if id == TEXT_BLOCK_ID && body_bytes.ends_with('-') {
+        body_bytes = &body_bytes[..body_bytes.len() - 1];
+    }
+    let body = body_bytes.to_owned();
     Ok(Some(ParsedBlock { id, body }))
 }
 
@@ -308,18 +313,27 @@ fn parse_block(raw: &[u8]) -> Result<Option<ParsedBlock>, FormatError> {
 /// Returns [`FormatError::Swift`] when a `:tag:` opener has no second colon
 /// closing the tag, or carries an empty tag — a malformed message-text line.
 pub(crate) fn split_block4(body: &str) -> Result<Vec<ParsedBlock4Line>, FormatError> {
-    // The body ends with the structural line break that precedes the `-}`
-    // trailer. Drop exactly that one break so its trailing empty segment is
+    // The framer accepts CRLF, LF, or a lone CR before the `-}` trailer.
+    // Drop exactly that one structural break so its trailing empty segment is
     // not folded as a spurious blank continuation onto the final field; an
     // interior blank line inside a field still survives the split below.
     let body = body
         .strip_suffix('\n')
         .map(|b| b.strip_suffix('\r').unwrap_or(b))
-        .unwrap_or(body);
+        .unwrap_or_else(|| body.strip_suffix('\r').unwrap_or(body));
 
     let mut lines: Vec<ParsedBlock4Line> = Vec::new();
-    for segment in body.split('\n') {
-        let segment = segment.strip_suffix('\r').unwrap_or(segment);
+    let mut segments = body.split('\n').peekable();
+    let mut preceding_separator = "";
+    while let Some(segment) = segments.next() {
+        let (segment, following_separator) = if segments.peek().is_some() {
+            match segment.strip_suffix('\r') {
+                Some(segment) => (segment, "\r\n"),
+                None => (segment, "\n"),
+            }
+        } else {
+            (segment, "")
+        };
         if let Some(rest) = segment.strip_prefix(':') {
             let tag_end = rest.find(':').ok_or_else(|| {
                 FormatError::Swift(format!(
@@ -342,7 +356,7 @@ pub(crate) fn split_block4(body: &str) -> Result<Vec<ParsedBlock4Line>, FormatEr
             // A continuation line of the current field's value (blank or not).
             // Re-join the line break the split removed so the value — and any
             // interior blank line within it — is byte-faithful.
-            last.value.push('\n');
+            last.value.push_str(preceding_separator);
             last.value.push_str(segment);
         } else if !segment.is_empty() {
             return Err(FormatError::Swift(format!(
@@ -352,6 +366,7 @@ pub(crate) fn split_block4(body: &str) -> Result<Vec<ParsedBlock4Line>, FormatEr
         }
         // A leading blank segment before the first field is structural
         // whitespace (the `\r\n` after the `{4:` opener) — skipped silently.
+        preceding_separator = following_separator;
     }
     Ok(lines)
 }
@@ -434,9 +449,9 @@ mod tests {
         let lines = split_block4(&blocks[3].body).unwrap();
         // :50K: carries an account line then a name continuation line.
         let f50k = lines.iter().find(|l| l.tag == "50K").unwrap();
-        assert_eq!(f50k.value, "/12345678\nJOHN DOE");
+        assert_eq!(f50k.value, "/12345678\r\nJOHN DOE");
         let f59 = lines.iter().find(|l| l.tag == "59").unwrap();
-        assert_eq!(f59.value, "/98765432\nJANE SMITH");
+        assert_eq!(f59.value, "/98765432\r\nJANE SMITH");
     }
 
     #[test]
@@ -538,7 +553,7 @@ mod tests {
         let lines = split_block4(&blocks[0].body).unwrap();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].tag, "77E");
-        assert_eq!(lines[0].value, "LINE1\n\nLINE3");
+        assert_eq!(lines[0].value, "LINE1\r\n\r\nLINE3");
     }
 
     #[test]
