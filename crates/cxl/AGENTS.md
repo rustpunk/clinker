@@ -35,7 +35,7 @@ extraction, and runtime evaluation over `clinker-record` values.
 ## Internal module map
 
 - `lexer.rs`: tokenization, spans, and source length limits.
-- `parser.rs`: hand-rolled Pratt parser, module parsing, AST `node_count`, and recursion limits.
+- `parser.rs` and `parser/expression.rs`: Pratt parser, module parsing, AST `node_count`, and bounded expression continuations.
 - `ast.rs`: CXL AST, `NodeId`, and recursive emit walkers.
 - `resolve/`: name resolution, scoped vars, typo suggestions, and resolver test doubles.
 - `typecheck/`: type lattice, row model, aggregate-mode checks, and typed side tables.

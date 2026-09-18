@@ -1,11 +1,13 @@
 use crate::ast::*;
 use crate::lexer::{Lexer, Span, Token};
 
-/// Maximum expression nesting depth. Prevents stack overflow on malicious input.
+mod expression;
+
+/// Maximum active expression contexts, including the root expression.
 const MAX_DEPTH: u32 = 256;
 
 /// Returns true for identifiers that are aggregate function names. Used by
-/// NUD lookahead in `parse_nud()` to branch to `parse_agg_call()` instead of
+/// expression lookahead to schedule aggregate-call arguments instead of
 /// treating the identifier as a field reference.
 ///
 /// Aggregate function set: sum, count, avg, min, max, collect, weighted_avg.
@@ -48,7 +50,6 @@ pub struct Parser {
     tokens: Vec<(Token, Span)>,
     pos: usize,
     errors: Vec<ParseError>,
-    depth: u32,
     next_id: u32,
     /// Current `emit each` block nesting depth. Fan-out may nest (an
     /// `emit each` inside another `emit each` body, fanning out within
@@ -56,7 +57,7 @@ pub struct Parser {
     /// ceiling — not a parser-level ban — gates total output cardinality.
     /// The depth is still capped at [`MAX_EMIT_EACH_DEPTH`] so adversarial
     /// input cannot drive `parse_emit_each`'s statement recursion into a
-    /// stack overflow, the same stack-safety guarantee `depth` gives the
+    /// stack overflow, the same stack-safety guarantee the frame limit gives the
     /// expression parser.
     emit_each_depth: u32,
 }
@@ -132,7 +133,6 @@ impl Parser {
             tokens,
             pos: 0,
             errors: Vec::new(),
-            depth: 0,
             next_id: 0,
             emit_each_depth: 0,
         };
@@ -189,7 +189,6 @@ impl Parser {
             tokens,
             pos: 0,
             errors: Vec::new(),
-            depth: 0,
             next_id: 0,
             emit_each_depth: 0,
         };
@@ -772,246 +771,12 @@ impl Parser {
         })
     }
 
-    // ── Pratt expression parser ────────────────────────────────────
-
-    fn parse_expr(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
-        self.depth += 1;
-        if self.depth > MAX_DEPTH {
-            self.depth -= 1;
-            return Err(self.error(
-                "expression nesting too deep (max 256 levels)",
-                "The parser has a maximum nesting depth to prevent stack overflow",
-                "Simplify the expression or break it into let-bindings",
-            ));
-        }
-
-        let mut lhs = self.parse_nud()?;
-
-        loop {
-            // Check for newline/eof — stop the expression
-            if self.at_eof() || *self.peek() == Token::Newline {
-                break;
-            }
-
-            // Stop tokens that end an expression context
-            if matches!(
-                self.peek(),
-                Token::RParen
-                    | Token::RBrace
-                    | Token::RBracket
-                    | Token::Comma
-                    | Token::FatArrow
-                    | Token::Then
-                    | Token::Else
-                    | Token::For
-                    | Token::If
-            ) {
-                break;
-            }
-
-            let tok = self.peek().clone();
-
-            if let Some((l_bp, r_bp)) = infix_bp(&tok) {
-                if l_bp < min_bp {
-                    break;
-                }
-
-                // Non-associative comparison check
-                if is_comparison(&tok)
-                    && let Expr::Binary { op, .. } = &lhs
-                    && matches!(
-                        op,
-                        BinOp::Eq | BinOp::Neq | BinOp::Gt | BinOp::Lt | BinOp::Gte | BinOp::Lte
-                    )
-                {
-                    self.depth -= 1;
-                    return Err(self.error(
-                        "comparisons are not chainable",
-                        "CXL comparisons are non-associative — a == b == c is ambiguous",
-                        "use (a == b) and (b == c) instead",
-                    ));
-                }
-
-                // LBracket: postfix bracket-index access for arrays and
-                // maps. Mirrors Dot's precedence so `arr[0].name` and
-                // `record.field[0]` parse without parens. The receiver
-                // is the existing `lhs`; the index expression is parsed
-                // at BP 0 (full expression), then `]` closes it.
-                if tok == Token::LBracket {
-                    self.advance(); // consume '['
-                    let lhs_span = lhs.span();
-                    let index = self.parse_expr(0)?;
-                    self.expect_token(&Token::RBracket, "']'")?;
-                    let end = self.prev_span();
-                    let nid = self.alloc_id();
-                    lhs = Expr::IndexAccess {
-                        node_id: nid,
-                        receiver: Box::new(lhs),
-                        index: Box::new(index),
-                        span: Span::new(lhs_span.start as usize, end.end as usize),
-                    };
-                    continue;
-                }
-
-                // Dot: postfix field access or method call
-                if tok == Token::Dot {
-                    self.advance(); // consume '.'
-                    // Accept identifiers AND keyword tokens that double
-                    // as method names (`filter`, `distinct`, `match`,
-                    // `not`, `it`, etc.) — the lexer eagerly produces
-                    // keyword tokens for those reserved words, but in
-                    // method-call position any of them should bind as
-                    // the method name string.
-                    let method_name = self.expect_ident_or_keyword("field or method name")?;
-                    let lhs_span = lhs.span();
-
-                    if *self.peek() == Token::LParen {
-                        // Method call
-                        let nid = self.alloc_id();
-                        self.advance(); // consume '('
-                        let args = self.parse_arg_list()?;
-                        let end = self.prev_span();
-                        lhs = Expr::MethodCall {
-                            node_id: nid,
-                            receiver: Box::new(lhs),
-                            method: method_name.into(),
-                            args,
-                            span: Span::new(lhs_span.start as usize, end.end as usize),
-                        };
-                    } else {
-                        // Field access → QualifiedFieldRef (supports chained dots)
-                        let end = self.prev_span();
-                        let new_span = Span::new(lhs_span.start as usize, end.end as usize);
-                        match lhs {
-                            Expr::FieldRef { name, .. } => {
-                                let nid = self.alloc_id();
-                                lhs = Expr::QualifiedFieldRef {
-                                    node_id: nid,
-                                    parts: vec![name, method_name.into()].into_boxed_slice(),
-                                    span: new_span,
-                                };
-                            }
-                            Expr::QualifiedFieldRef { parts, .. } => {
-                                let nid = self.alloc_id();
-                                let mut new_parts = parts.into_vec();
-                                new_parts.push(method_name.into());
-                                lhs = Expr::QualifiedFieldRef {
-                                    node_id: nid,
-                                    parts: new_parts.into_boxed_slice(),
-                                    span: new_span,
-                                };
-                            }
-                            _ => {
-                                // For chained access like window.lag(1).field, keep as method
-                                let nid = self.alloc_id();
-                                lhs = Expr::MethodCall {
-                                    node_id: nid,
-                                    receiver: Box::new(lhs),
-                                    method: method_name.into(),
-                                    args: vec![],
-                                    span: new_span,
-                                };
-                                continue;
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                // Coalesce
-                if tok == Token::QuestionQuestion {
-                    let nid = self.alloc_id();
-                    self.advance();
-                    let rhs = self.parse_expr(r_bp)?;
-                    let start = lhs.span();
-                    let end = rhs.span();
-                    lhs = Expr::Coalesce {
-                        node_id: nid,
-                        lhs: Box::new(lhs),
-                        rhs: Box::new(rhs),
-                        span: Span::new(start.start as usize, end.end as usize),
-                    };
-                    continue;
-                }
-
-                // Standard binary operator
-                if let Some(op) = token_to_binop(&tok) {
-                    let nid = self.alloc_id();
-                    self.advance();
-                    let rhs = self.parse_expr(r_bp)?;
-                    let start = lhs.span();
-                    let end = rhs.span();
-                    lhs = Expr::Binary {
-                        node_id: nid,
-                        op,
-                        lhs: Box::new(lhs),
-                        rhs: Box::new(rhs),
-                        span: Span::new(start.start as usize, end.end as usize),
-                    };
-                    continue;
-                }
-            }
-
-            break;
-        }
-
-        self.depth -= 1;
-        Ok(lhs)
-    }
-
-    /// Null-denotation: prefix operators and atoms.
-    fn parse_nud(&mut self) -> Result<Expr, ParseError> {
+    /// Nonrecursive atoms. Expression continuations handle operators and children.
+    fn parse_atom(&mut self) -> Result<Expr, ParseError> {
         let tok = self.peek().clone();
         let start = self.current_span();
 
         match tok {
-            // Prefix not
-            Token::Not => {
-                let nid = self.alloc_id();
-                self.advance();
-                let bp = prefix_bp(&Token::Not).unwrap();
-                let operand = self.parse_expr(bp)?;
-                let end = operand.span();
-                Ok(Expr::Unary {
-                    node_id: nid,
-                    op: UnaryOp::Not,
-                    operand: Box::new(operand),
-                    span: Span::new(start.start as usize, end.end as usize),
-                })
-            }
-
-            // Prefix unary minus
-            Token::Minus => {
-                let nid = self.alloc_id();
-                self.advance();
-                let bp = prefix_bp(&Token::Minus).unwrap();
-                let operand = self.parse_expr(bp)?;
-                let end = operand.span();
-                Ok(Expr::Unary {
-                    node_id: nid,
-                    op: UnaryOp::Neg,
-                    operand: Box::new(operand),
-                    span: Span::new(start.start as usize, end.end as usize),
-                })
-            }
-
-            // Parenthesized expression
-            Token::LParen => {
-                self.advance();
-                let expr = self.parse_expr(0)?;
-                self.expect_token(&Token::RParen, "')'")?;
-                Ok(expr)
-            }
-
-            Token::LBracket => self.parse_array_expr(),
-            Token::LBrace => self.parse_map_expr(),
-
-            // if/then/else
-            Token::If => self.parse_if_expr(),
-
-            // match
-            Token::Match => self.parse_match_expr(),
-
             // Literals
             Token::IntLit(v) => {
                 let nid = self.alloc_id();
@@ -1185,27 +950,14 @@ impl Parser {
                     }
                     "window" => {
                         let fn_name = self.expect_ident("window function name")?;
-                        if *self.peek() == Token::LParen {
-                            let nid = self.alloc_id();
-                            self.advance();
-                            let args = self.parse_arg_list()?;
-                            let end = self.prev_span();
-                            Ok(Expr::WindowCall {
-                                node_id: nid,
-                                function: fn_name.into(),
-                                args,
-                                span: Span::new(start.start as usize, end.end as usize),
-                            })
-                        } else {
-                            let nid = self.alloc_id();
-                            let end = self.prev_span();
-                            Ok(Expr::WindowCall {
-                                node_id: nid,
-                                function: fn_name.into(),
-                                args: vec![],
-                                span: Span::new(start.start as usize, end.end as usize),
-                            })
-                        }
+                        let nid = self.alloc_id();
+                        let end = self.prev_span();
+                        Ok(Expr::WindowCall {
+                            node_id: nid,
+                            function: fn_name.into(),
+                            args: vec![],
+                            span: Span::new(start.start as usize, end.end as usize),
+                        })
                     }
                     "doc" => {
                         let section = self.expect_ident("envelope section name")?;
@@ -1230,23 +982,15 @@ impl Parser {
                 }
             }
 
-            // Identifiers (field references) — with aggregate function lookahead.
-            // If the identifier matches a known aggregate name AND the next token
-            // is `(`, parse as an `AggCall`. Otherwise parse as a `FieldRef` so that
-            // columns named e.g. `sum` or `count` still work outside a call site.
-            Token::Ident(ref name) => {
-                let name_cloned = name.clone();
-                if is_aggregate_name(&name_cloned) && matches!(self.peek_ahead(1), Token::LParen) {
-                    self.parse_agg_call(name_cloned, start)
-                } else {
-                    let nid = self.alloc_id();
-                    self.advance();
-                    Ok(Expr::FieldRef {
-                        node_id: nid,
-                        name: name_cloned,
-                        span: start,
-                    })
-                }
+            // Aggregate calls are intercepted by the expression driver.
+            Token::Ident(name) => {
+                let nid = self.alloc_id();
+                self.advance();
+                Ok(Expr::FieldRef {
+                    node_id: nid,
+                    name,
+                    span: start,
+                })
             }
 
             _ => Err(self.error(
@@ -1254,334 +998,6 @@ impl Parser {
                 "Expected an expression (literal, identifier, '(', 'if', 'match', etc.)",
                 "Check for missing operands or mismatched delimiters",
             )),
-        }
-    }
-
-    fn parse_array_expr(&mut self) -> Result<Expr, ParseError> {
-        let node_id = self.alloc_id();
-        let start = self.current_span();
-        self.advance();
-        self.skip_newlines();
-
-        if *self.peek() == Token::RBracket {
-            self.advance();
-            let end = self.prev_span();
-            return Ok(Expr::ArrayLiteral {
-                node_id,
-                elements: Vec::new(),
-                span: Span::new(start.start as usize, end.end as usize),
-            });
-        }
-
-        let first = self.parse_expr(0)?;
-        self.skip_newlines();
-        if *self.peek() == Token::For {
-            self.advance();
-            self.skip_newlines();
-            let binding = self.expect_ident("array-comprehension binding")?;
-            self.expect_token(&Token::In, "'in'")?;
-            self.skip_newlines();
-            let source = self.parse_expr(0)?;
-            self.skip_newlines();
-            let predicate = if *self.peek() == Token::If {
-                self.advance();
-                self.skip_newlines();
-                let predicate = self.parse_expr(0)?;
-                self.skip_newlines();
-                Some(Box::new(predicate))
-            } else {
-                None
-            };
-            self.expect_token(&Token::RBracket, "']'")?;
-            let end = self.prev_span();
-            return Ok(Expr::ArrayComprehension {
-                node_id,
-                item: Box::new(first),
-                binding: binding.into(),
-                source: Box::new(source),
-                predicate,
-                span: Span::new(start.start as usize, end.end as usize),
-            });
-        }
-
-        let mut elements = vec![first];
-        while *self.peek() == Token::Comma {
-            self.advance();
-            self.skip_newlines();
-            if *self.peek() == Token::RBracket {
-                break;
-            }
-            elements.push(self.parse_expr(0)?);
-            self.skip_newlines();
-        }
-        self.expect_token(&Token::RBracket, "']'")?;
-        let end = self.prev_span();
-        Ok(Expr::ArrayLiteral {
-            node_id,
-            elements,
-            span: Span::new(start.start as usize, end.end as usize),
-        })
-    }
-
-    fn parse_map_expr(&mut self) -> Result<Expr, ParseError> {
-        let node_id = self.alloc_id();
-        let start = self.current_span();
-        self.advance();
-        self.skip_newlines();
-        let mut entries = Vec::new();
-        let mut static_keys = Vec::<String>::new();
-
-        while *self.peek() != Token::RBrace {
-            let entry_start = self.current_span();
-            let key = match self.peek().clone() {
-                Token::Ident(key) | Token::StringLit(key) => {
-                    self.advance();
-                    let decoded = clinker_record::nested_key::NestedKey::decode(&key).map_err(
-                        |error| {
-                            self.error(
-                                &error.to_string(),
-                                "nested map keys use one canonical backslash escape grammar",
-                                "use `\\@name`, `\\#text`, or `\\\\name` only when escaping a reserved-looking literal key",
-                            )
-                        },
-                    )?;
-                    if static_keys
-                        .iter()
-                        .any(|existing| existing == decoded.text.as_ref())
-                    {
-                        return Err(self.error(
-                            &format!("duplicate map key {:?}", decoded.text),
-                            "static map keys must be unique after canonical escape decoding",
-                            "remove or rename the duplicate key",
-                        ));
-                    }
-                    static_keys.push(decoded.text.into_owned());
-                    MapKey::Static(key)
-                }
-                Token::LBracket => {
-                    self.advance();
-                    self.skip_newlines();
-                    let key = self.parse_expr(0)?;
-                    self.skip_newlines();
-                    self.expect_token(&Token::RBracket, "']'")?;
-                    MapKey::Computed(Box::new(key))
-                }
-                _ => {
-                    return Err(self.error(
-                        "map keys must be identifiers, strings, or computed string expressions",
-                        "CXL maps use `{ name: value }`, `{ \"name\": value }`, or `{ [expr]: value }`",
-                        "quote the key or wrap a string-valued expression in brackets",
-                    ));
-                }
-            };
-            self.skip_newlines();
-            self.expect_token(&Token::Colon, "':'")?;
-            self.skip_newlines();
-            let value = self.parse_expr(0)?;
-            let value_span = value.span();
-            entries.push(MapEntry {
-                key,
-                value,
-                span: Span::new(entry_start.start as usize, value_span.end as usize),
-            });
-            self.skip_newlines();
-            if *self.peek() != Token::Comma {
-                break;
-            }
-            self.advance();
-            self.skip_newlines();
-            if *self.peek() == Token::RBrace {
-                break;
-            }
-        }
-
-        self.expect_token(&Token::RBrace, "'}'")?;
-        let end = self.prev_span();
-        Ok(Expr::MapLiteral {
-            node_id,
-            entries,
-            span: Span::new(start.start as usize, end.end as usize),
-        })
-    }
-
-    fn parse_if_expr(&mut self) -> Result<Expr, ParseError> {
-        let nid = self.alloc_id();
-        let start = self.current_span();
-        self.advance(); // consume 'if'
-
-        // Parse condition at 'or' BP floor (BP 5) so `if a or b then ...` captures fully
-        let condition = self.parse_expr(5)?;
-        self.expect_token(&Token::Then, "'then'")?;
-
-        // Parse then-branch at coalesce BP floor (BP 1) so it extends far right
-        let then_branch = self.parse_expr(1)?;
-
-        self.skip_newlines();
-        let else_branch = if *self.peek() == Token::Else {
-            self.advance();
-            Some(Box::new(self.parse_expr(1)?))
-        } else {
-            None
-        };
-
-        let end = if let Some(ref eb) = else_branch {
-            eb.span()
-        } else {
-            then_branch.span()
-        };
-
-        Ok(Expr::IfThenElse {
-            node_id: nid,
-            condition: Box::new(condition),
-            then_branch: Box::new(then_branch),
-            else_branch,
-            span: Span::new(start.start as usize, end.end as usize),
-        })
-    }
-
-    fn parse_match_expr(&mut self) -> Result<Expr, ParseError> {
-        let nid = self.alloc_id();
-        let start = self.current_span();
-        self.advance(); // consume 'match'
-
-        // Peek: if '{' then condition form, else value form
-        let subject = if *self.peek() != Token::LBrace {
-            Some(Box::new(self.parse_expr(0)?))
-        } else {
-            None
-        };
-
-        self.expect_token(&Token::LBrace, "'{'")?;
-        let mut arms = Vec::new();
-
-        while *self.peek() != Token::RBrace && !self.at_eof() {
-            self.skip_newlines();
-            if *self.peek() == Token::RBrace {
-                break;
-            }
-            let arm_nid = self.alloc_id();
-            let arm_start = self.current_span();
-            let pattern = self.parse_expr(0)?;
-            self.expect_token(&Token::FatArrow, "'=>'")?;
-            let body = self.parse_expr(0)?;
-            let arm_end = body.span();
-
-            // Optional trailing comma
-            if *self.peek() == Token::Comma {
-                self.advance();
-            }
-            self.skip_newlines();
-
-            arms.push(MatchArm {
-                node_id: arm_nid,
-                pattern,
-                body,
-                span: Span::new(arm_start.start as usize, arm_end.end as usize),
-            });
-        }
-
-        self.expect_token(&Token::RBrace, "'}'")?;
-        let end = self.prev_span();
-
-        Ok(Expr::Match {
-            node_id: nid,
-            subject,
-            arms,
-            span: Span::new(start.start as usize, end.end as usize),
-        })
-    }
-
-    fn parse_arg_list(&mut self) -> Result<Vec<Expr>, ParseError> {
-        let mut args = Vec::new();
-        if *self.peek() != Token::RParen {
-            args.push(self.parse_arg_or_closure()?);
-            while *self.peek() == Token::Comma {
-                self.advance();
-                args.push(self.parse_arg_or_closure()?);
-            }
-        }
-        self.expect_token(&Token::RParen, "')'")?;
-        Ok(args)
-    }
-
-    /// Parse a single argument inside a method call's argument list.
-    /// Detects the `it => body` closure shape via two-token lookahead;
-    /// otherwise falls back to a regular expression. The closure body
-    /// is a single expression at full BP — block-bodied closures are
-    /// not part of the surface map.
-    fn parse_arg_or_closure(&mut self) -> Result<Expr, ParseError> {
-        if matches!(self.peek(), Token::It) && matches!(self.peek_ahead(1), Token::FatArrow) {
-            let nid = self.alloc_id();
-            let start = self.current_span();
-            self.advance(); // consume `it`
-            self.advance(); // consume `=>`
-            let body = self.parse_expr(0)?;
-            let end = body.span();
-            Ok(Expr::Closure {
-                node_id: nid,
-                param: "it".into(),
-                body: Box::new(body),
-                span: Span::new(start.start as usize, end.end as usize),
-            })
-        } else {
-            self.parse_expr(0)
-        }
-    }
-
-    /// Parse a free-standing aggregate function call: `name(args...)`.
-    /// The identifier token is still at `self.pos`.
-    fn parse_agg_call(&mut self, name: Box<str>, start: Span) -> Result<Expr, ParseError> {
-        let nid = self.alloc_id();
-        self.advance(); // consume the identifier
-        self.expect_token(&Token::LParen, "'('")?;
-        let args = self.parse_agg_arg_list()?;
-        let end = self.prev_span();
-
-        // `count()` with no args is sugar for `count(*)` — emit a Wildcard arg.
-        // `collect()` with no args is reserved for window aggregates and is
-        // not yet implemented.
-        let args = if args.is_empty() && &*name == "count" {
-            let wnid = self.alloc_id();
-            vec![Expr::Wildcard {
-                node_id: wnid,
-                span: start,
-            }]
-        } else {
-            args
-        };
-
-        Ok(Expr::AggCall {
-            node_id: nid,
-            name,
-            args,
-            span: Span::new(start.start as usize, end.end as usize),
-        })
-    }
-
-    /// Parse an aggregate argument list. Unlike `parse_arg_list`, this intercepts
-    /// `Token::Star` before entering `parse_expr(0)` so that `count(*)` parses
-    /// as `[Wildcard]` rather than trying to consume `*` as multiplication.
-    fn parse_agg_arg_list(&mut self) -> Result<Vec<Expr>, ParseError> {
-        let mut args = Vec::new();
-        if *self.peek() != Token::RParen {
-            args.push(self.parse_agg_arg()?);
-            while *self.peek() == Token::Comma {
-                self.advance();
-                args.push(self.parse_agg_arg()?);
-            }
-        }
-        self.expect_token(&Token::RParen, "')'")?;
-        Ok(args)
-    }
-
-    fn parse_agg_arg(&mut self) -> Result<Expr, ParseError> {
-        if *self.peek() == Token::Star {
-            let nid = self.alloc_id();
-            let span = self.current_span();
-            self.advance();
-            Ok(Expr::Wildcard { node_id: nid, span })
-        } else {
-            self.parse_expr(0)
         }
     }
 
