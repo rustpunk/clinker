@@ -1,11 +1,14 @@
 //! End-to-end contracts for the CLI-owned optional-observability bulkhead.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+#[path = "common/condition_accounting.rs"]
+mod condition_accounting;
 
 fn clinker_bin() -> &'static str {
     env!("CARGO_BIN_EXE_clinker")
@@ -783,11 +786,9 @@ fn a_run_that_reserved_an_arena_reports_its_admission_however_early_it_stops() {
     );
 }
 
-/// Four customers with varying amounts, and a per-record event gated on a
-/// field the directive never requests. The gate reads `amount`; only
-/// `customer_id` is exported. JSON keeps this log-selection fixture independent
-/// of the CSV allocation-span load without changing the fixed telemetry arena.
-fn write_gated_pipeline(root: &Path, output: &str) {
+/// The same authored YAML drives the sole-producer serializer test and this
+/// concurrent whole-DAG run. Its condition reads a field it never exports.
+fn write_gated_pipeline(root: &Path) {
     std::fs::create_dir_all(root.join("private/source")).expect("source directory");
     std::fs::create_dir_all(root.join("private/output")).expect("output directory");
     std::fs::write(
@@ -797,154 +798,85 @@ fn write_gated_pipeline(root: &Path, output: &str) {
     .expect("input fixture");
     std::fs::write(
         root.join("pipeline.yaml"),
-        format!(
-            r#"pipeline:
-  name: telemetry_bulkhead
-nodes:
-  - type: source
-    name: customers
-    config:
-      name: customers
-      type: json
-      path: ./private/source/customers.json
-      schema:
-        - {{ name: customer_id, type: string }}
-        - {{ name: amount, type: int }}
-  - type: transform
-    name: normalize
-    input: customers
-    config:
-      cxl: |
-        emit customer_id = customer_id
-        emit amount = amount
-      log:
-        - name: transform.customer_seen
-          level: info
-          when: per_record
-          message: customer processed
-          fields: [customer_id]
-          every: 1
-          condition: "amount > 1000"
-  - type: sink
-    name: published_customers
-    input: normalize
-    config:
-      name: published_customers
-      type: json
-      path: {output}
-      options: {{ format: ndjson }}
-"#
-        ),
+        include_str!("fixtures/observability_condition.yaml"),
     )
     .expect("pipeline fixture");
 }
 
-/// Every exported log record's attributes, flattened to `key -> stringValue`.
-fn captured_log_attributes(capture: &Path) -> Vec<BTreeMap<String, String>> {
-    let mut records = Vec::new();
-    for entry in capture_events(capture) {
-        if entry["signal"] != "logs" {
-            continue;
-        }
-        let Some(resource_logs) = entry["payload"]["resourceLogs"].as_array() else {
-            continue;
-        };
-        for resource in resource_logs {
-            let Some(scope_logs) = resource["scopeLogs"].as_array() else {
-                continue;
-            };
-            for scope in scope_logs {
-                let Some(log_records) = scope["logRecords"].as_array() else {
-                    continue;
-                };
-                for record in log_records {
-                    let attributes = record["attributes"]
-                        .as_array()
-                        .map(|attributes| {
-                            attributes
-                                .iter()
-                                .filter_map(|attribute| {
-                                    Some((
-                                        attribute["key"].as_str()?.to_owned(),
-                                        attribute["value"]["stringValue"].as_str()?.to_owned(),
-                                    ))
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    records.push(attributes);
-                }
-            }
-        }
-    }
-    records
-}
-
-/// End-to-end proof that an authored `condition` survives the whole path —
-/// YAML admission, planning, lowering, and executor dispatch — and reaches a
-/// real OTLP payload having actually suppressed the records it excludes.
-///
-/// The dispatcher-level unit tests in `clinker-exec` cover the gate itself;
-/// this covers everything between the author's file and the collector.
+/// Concurrent export may refuse a signal without changing pipeline execution.
+/// Exact gate selection is covered by the synchronous compiled-dispatch test;
+/// this run requires independent, complete accounting for every missing event.
 #[test]
 fn authored_condition_gates_the_exported_payload() {
     let root = fixture();
-    write_gated_pipeline(root.path(), "./private/output/customers.json");
+    write_gated_pipeline(root.path());
     write_observability_policy(
         root.path(),
         "https://collector.example.com",
         "mode = \"none\"",
     );
     let capture = root.path().join("otlp.ndjson");
-
-    let output = invoke(root.path(), &capture, false);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+    let output = Command::new(clinker_bin())
+        .current_dir(root.path())
+        .env("CLINKER_TEST_OTLP_OUTCOME", "success")
+        .env("CLINKER_TEST_OTLP_CAPTURE", &capture)
+        .env_remove("CLINKER_TEST_OTLP_ENSURE_SIGNAL_PROBES")
+        .env_remove("CLINKER_TEST_OTLP_LOGS_OUTCOME")
+        .env_remove("CLINKER_TEST_OTLP_METRICS_OUTCOME")
+        .env_remove("CLINKER_TEST_OTLP_TRACES_OUTCOME")
+        .env_remove("CLINKER_TEST_OTLP_WORKER_START_FAILURE")
+        .env_remove("CLINKER_TEST_OTLP_FLUSH_HOLD_MS")
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--machine",
+            "ndjson-v1",
+            "--batch-id",
+            "telemetry-bulkhead",
+        ])
+        .output()
+        .expect("run clinker");
+    let captured = std::fs::read_to_string(&capture);
+    let published = std::fs::read_to_string(root.path().join("private/output/customers.json"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Keep the complete machine stream (including its terminal), transport
+    // capture and child diagnostics even when a precondition or JSON parse fails.
+    let diagnostics = format!(
+        "status: {}\nstdout (including terminal):\n{stdout}\nstderr:\n{stderr}\ncomplete capture:\n{}\npublished: {published:?}",
+        output.status,
+        captured.as_deref().unwrap_or("<capture unavailable>"),
     );
-
-    // Every input record reached the transform, so a missing log event is the
-    // gate's doing and not a short input. Without this the assertion below
-    // would also pass on a pipeline that silently processed two rows.
-    let published = std::fs::read_to_string(root.path().join("private/output/customers.json"))
-        .expect("published output");
-    assert_eq!(
-        published.lines().collect::<Vec<_>>(),
-        vec![
-            r#"{"customer_id":"customer-1","amount":500}"#,
-            r#"{"customer_id":"customer-2","amount":5000}"#,
-            r#"{"customer_id":"customer-3","amount":900}"#,
-            r#"{"customer_id":"customer-4","amount":2000}"#,
-        ],
-        "all four input records must be published regardless of log gating"
-    );
-
-    let events = captured_log_attributes(&capture)
-        .into_iter()
-        .filter(|attributes| {
-            attributes.get("clinker.event").map(String::as_str) == Some("transform.customer_seen")
-        })
-        .collect::<Vec<_>>();
-    let gated = events
-        .iter()
-        .filter_map(|attributes| attributes.get("customer_id").cloned())
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        gated,
-        vec!["customer-2".to_owned(), "customer-4".to_owned()],
-        "only records satisfying `amount > 1000` may reach the collector"
-    );
-
-    // The gate reads `amount`, which the directive never requested. Reading a
-    // field to decide whether to fire must not export it.
-    assert!(
-        events
-            .iter()
-            .all(|attributes| !attributes.contains_key("amount")),
-        "a gated field must not become an exported attribute: {events:?}"
-    );
+    let result = (|| -> Result<(), String> {
+        if !output.status.success() {
+            return Err("CLI execution failed".to_owned());
+        }
+        let published = published.map_err(|error| format!("published output: {error}"))?;
+        if published.lines().collect::<Vec<_>>()
+            != [
+                r#"{"customer_id":"customer-1","amount":500}"#,
+                r#"{"customer_id":"customer-2","amount":5000}"#,
+                r#"{"customer_id":"customer-3","amount":900}"#,
+                r#"{"customer_id":"customer-4","amount":2000}"#,
+            ]
+        {
+            return Err("all four input records must be published in order".to_owned());
+        }
+        let machine = stdout
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("machine JSON: {error}"))?;
+        let terminal = machine.last().ok_or("missing machine terminal")?;
+        let entries = captured
+            .map_err(|error| format!("capture read: {error}"))?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("capture JSON: {error}"))?;
+        condition_accounting::reconcile(terminal, &entries)
+    })();
+    assert!(result.is_ok(), "{}\n{diagnostics}", result.unwrap_err());
 }
 
 #[test]

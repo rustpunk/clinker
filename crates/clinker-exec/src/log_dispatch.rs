@@ -18,6 +18,57 @@ use crate::telemetry::{
     TelemetryProducer, bounded_identity, unix_nanos_now,
 };
 
+/// Execute one Transform's compiled log directives synchronously for exporter
+/// tests. Records and the evaluation context must match its compiled input.
+/// This drives the real log lifecycle and condition evaluator, not Transform
+/// CXL or DAG execution. It starts no Source, Sink, resource or exporter worker;
+/// callers can retain the receiver until this sole producer has finished.
+///
+/// Returns a typed invariant error if the named compiled Transform is absent.
+#[cfg(feature = "test-utils")]
+pub fn dispatch_compiled_transform_logs_for_testing(
+    plan: &clinker_plan::plan::CompiledPlan,
+    transform_name: &str,
+    records: &[Record],
+    eval_ctx: &EvalContext<'_>,
+    producer: TelemetryProducer,
+) -> Result<(), clinker_plan::error::PipelineError> {
+    let payload = plan
+        .dag()
+        .graph
+        .node_weights()
+        .find_map(|node| match node {
+            clinker_plan::plan::execution::PlanNode::Transform { name, resolved, .. }
+                if name == transform_name =>
+            {
+                resolved.as_ref()
+            }
+            _ => None,
+        })
+        .ok_or_else(|| clinker_plan::error::PipelineError::Internal {
+            op: "compiled-log-dispatch-test",
+            node: transform_name.to_owned(),
+            detail: "expected a resolved Transform in the compiled plan".to_owned(),
+        })?;
+    let mut dispatcher = LogDispatcher::new(
+        Some(producer),
+        &payload.log,
+        &payload.log_conditions,
+        TransformSignalContext {
+            execution_id: "condition-test",
+            batch_id: "condition-test",
+            pipeline_name: &plan.config().pipeline.name,
+            logical_node: transform_name,
+        },
+    );
+    dispatcher.fire_before_transform();
+    for record in records {
+        dispatcher.fire_per_record(record, eval_ctx);
+    }
+    dispatcher.finish();
+    Ok(())
+}
+
 /// Logical run correlation supplied by the executor's stable context.
 pub(crate) struct TransformSignalContext<'a> {
     pub(crate) execution_id: &'a str,
