@@ -9,8 +9,9 @@ This page is the engine-internals reference for how Clinker tracks, attributes, 
 ### Exact allocation admission for prepared output
 
 `clinker_format::preparation` prepares one complete output operation before
-delivery. CSV, JSON and XML writer construction in the CLI and executor uses
-this path; other codecs retain their existing allocation behavior. `MemoryOnlyResources`
+delivery. CSV, JSON, XML, fixed-width and SWIFT writer construction in the CLI
+and executor uses this path; EDIFACT, X12 and HL7 retain their existing
+allocation behavior. `MemoryOnlyResources`
 requires an explicit nonzero memory budget. `ExecutorResources` shares the run's
 `MemoryArbitrator` and takes an explicit optional telemetry producer; disabling
 telemetry changes no resource limit. Neither provider offers an unlimited
@@ -116,6 +117,44 @@ It changes no input-sized allocation ownership. Existing JSON parser/scanner
 and XML parser/event/record allocations retain their prior allowance; optional
 envelope indexes retain their existing cap. Prepared output does not establish
 whole-reader admission or a whole-process RSS ceiling.
+
+### Physical-text configuration, warnings and trailers
+
+`FixedWidthEncoderConfig` retains admitted derived layout policies, field and
+group names, and selected envelope names. Layout validation borrows the
+caller's column/type trees; the encoder does not clone recursive schemas.
+Each `FixedWidthEncoder` owns its complete committed warning history.
+Preparation reserves new messages plus old/replacement metadata overlap
+before delivery. Commit moves preinitialized String slots without allocating
+or failing. Existing messages keep their original backing; converting admitted
+UTF-8 text into a String transfers the same allocation and lease. The lease
+outlives actual String backing deallocation, including abandoned pending
+warnings and final history destruction.
+
+`SwiftEncoderConfig` shares admitted service literals or document-section
+names; literal precedence avoids retaining an unused section name. Column
+indices are resolved from the supplied schema without retaining its payload.
+The first successful body operation commits the document-derived trailer to
+`SwiftEncoder`; later record contexts cannot replace it. Literal trailers
+stay with the shared configuration. Pending trailer growth reserves the old
+and replacement backing simultaneously, and commit only moves ownership.
+
+Both encoders borrow record strings and document fields. Scalar formatting
+uses fixed 1 KiB stack scratch, and fixed-width padding uses a fixed chunk.
+Large strings are not copied into a rendered cell before truncation. Encoded
+bytes belong to the shared operation stage; retained warnings and trailers
+remain memory charges even when staged bytes spill. Factory and writer boxes
+keep the admitted concrete-layout owners described above. There are no raw
+fixed-width or SWIFT writer constructors: direct callers provide finite
+`WriterResources` to the encoder and `PreparedWriter`.
+
+Strict fixed-width decoding validates each selected physical byte range;
+ignored gaps and tails retain their existing behavior. SWIFT validates raw
+block UTF-8 and preserves continuation separators. Its failed initialization
+releases partial body fields, service text and pending envelope events and
+remains terminal. These reader corrections do not admit existing line buffers,
+parser allocations, retained SWIFT fields or legacy document maps. Reader
+materialization and the remaining EDI writers are outside this writer guarantee.
 
 ### CSV decoding and document ownership
 
@@ -230,6 +269,14 @@ outcomes, so this primitive does not duplicate them. `WriterSpillBytes` counts
 bytes actually written to temporary storage, including partial writes. Cleanup
 attempt counters include retries; they do not claim remaining debt has been
 released. Read current debt and live bytes from the storage and ledger APIs.
+
+`WriterSpillCompleted` establishes that an operation spilled successfully.
+The final execution report's post-Source-join spill snapshot can be zero
+after those files have been released; it is not a cumulative spill-event
+counter. Source parsing failures remain data failures, while cancellation is
+interrupted. Reader value fidelity and failed-row selection are covered by
+the Source's declared-column lineage mapping; writer representation and
+temporary staging add no dataset or syntax-token edges.
 
 Each span is emitted once after its outcome, with both timestamps closed. The
 producer's fixed counters coalesce; span admission may shed load. Full, sampled
