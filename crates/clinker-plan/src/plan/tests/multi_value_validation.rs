@@ -1986,3 +1986,218 @@ nodes:
         found[0].0
     );
 }
+
+#[test]
+fn fixed_width_layout_diagnostics_preserve_code_span_details_and_help() {
+    let base = r#"        - name: items
+          type: map
+          multiple: true
+          start: 0
+          occurs: { max: 2 }
+          fields:
+            - { name: code, type: string, start: 0, width: 2 }"#;
+    let cases = [
+        (
+            base.replace("max: 2", "min: 3, max: 2"),
+            "greater than",
+            "set `min`",
+        ),
+        (
+            base.replace("max: 2", "max: 10").replace(
+                "          fields:",
+                "          count_field: { name: total, width: 1 }\n          fields:",
+            ),
+            "count field 'total'",
+            "at least 2",
+        ),
+        (
+            base.replace("max: 2", &format!("max: {}", usize::MAX)),
+            "overflows",
+            "max",
+        ),
+        (
+            base.replace(
+                "start: 0\n          occurs:",
+                &format!("start: {}\n          occurs:", usize::MAX),
+            ),
+            "overflows",
+            "start",
+        ),
+        (
+            format!("{base}\n        - {{ name: tail, type: string, start: 2, width: 1 }}"),
+            "overlaps",
+            "disjoint",
+        ),
+        (
+            base.replace("width: 2 }", "width: 2, end: 2 }"),
+            "mutually exclusive",
+            "declare one",
+        ),
+        (
+            base.replace("width: 2 }", "width: 2, multiple: true }"),
+            "child 'code'",
+            "flatten",
+        ),
+        (
+            base.replace("width: 2 }", "width: 0 }"),
+            "width must be > 0",
+            "code",
+        ),
+        (
+            base.replace("max: 2", "max: 2, on_overflow: truncate"),
+            "without `keep`",
+            "keep: first",
+        ),
+    ];
+    for (schema, detail, correction) in cases {
+        for input in [true, false] {
+            let yaml = if input {
+                source_format_pipeline("fixed_width", &format!("      schema:\n{schema}"))
+            } else {
+                format!(
+                    "{}      schema:\n{schema}\n",
+                    json_pipeline("      schema: [{ name: id, type: string }]", "fixed_width")
+                )
+            };
+            let config = parse_config(&yaml).expect("layout fixture parses");
+            let expected_span = clinker_core_types::span::Span::line_only(
+                config.nodes[usize::from(!input)].referenced.line() as u32,
+            );
+            let diagnostics = compile_err(&yaml);
+            let code = if input { "E358" } else { "E359" };
+            let matching: Vec<_> = diagnostics.iter().filter(|d| d.code == code).collect();
+            assert_eq!(matching.len(), 1, "{diagnostics:?}");
+            let diagnostic = matching[0];
+            assert_eq!(diagnostic.primary.span, expected_span);
+            assert!(
+                diagnostic.message.contains(
+                    "invalid fixed-width repeating-group layout: invalid record at row 0:"
+                ),
+                "{diagnostic:?}"
+            );
+            assert!(diagnostic.message.contains(detail), "{diagnostic:?}");
+            assert!(diagnostic.message.contains(correction), "{diagnostic:?}");
+            assert_eq!(
+                diagnostic.help.as_deref(),
+                Some(
+                    "declare `type: map`, `multiple: true`, scalar child `fields`, and `occurs: { max: <positive count> }`; keep every maximum byte range disjoint"
+                )
+            );
+        }
+    }
+}
+
+#[test]
+fn fixed_width_input_and_output_layout_rules_remain_distinct() {
+    let sequential = r#"        - name: items
+          type: map
+          multiple: true
+          occurs: { max: 2, fill: shift }
+          fields:
+            - { name: code, type: string, width: 2 }
+        - { name: tail, type: string, width: 1 }"#;
+    compile_ok(&format!(
+        "{}      schema:\n{sequential}\n",
+        json_pipeline("      schema: [{ name: id, type: string }]", "fixed_width")
+    ));
+    let source = source_format_pipeline("fixed_width", &format!("      schema:\n{sequential}"));
+    let missing_start = compile_err(&source);
+    assert!(
+        missing_start
+            .iter()
+            .any(|d| d.code == "E358" && d.message.contains("must have `start`"))
+    );
+    let explicit = sequential
+        .replace("          occurs:", "          start: 0\n          occurs:")
+        .replace(
+            "name: tail, type: string, width",
+            "name: tail, type: string, start: 4, width",
+        );
+    let ambiguous = compile_err(&source_format_pipeline(
+        "fixed_width",
+        &format!("      schema:\n{explicit}"),
+    ));
+    assert!(ambiguous.iter().any(|d| d.code == "E358"
+        && d.message.contains("count_field")
+        && d.message.contains("make the group last")));
+    let counted = explicit
+        .replace(
+            "          occurs:",
+            "          count_field: { name: total, width: 1 }\n          occurs:",
+        )
+        .replace("start: 4, width", "start: 5, width");
+    compile_ok(&fixed_width_group_pipeline(&counted));
+
+    // Scalars on input may intentionally project the same physical bytes.
+    let overlapping_scalars = counted.replace("start: 5, width: 1", "start: 6, width: 2")
+        + "\n        - { name: alias, type: string, start: 7, width: 1 }";
+    compile_ok(&source_format_pipeline(
+        "fixed_width",
+        &format!("      schema:\n{overlapping_scalars}"),
+    ));
+    let output = compile_err(&format!(
+        "{}      schema:\n{overlapping_scalars}\n",
+        json_pipeline("      schema: [{ name: id, type: string }]", "fixed_width")
+    ));
+    assert!(
+        output
+            .iter()
+            .any(|d| d.code == "E359" && d.message.contains("overlaps"))
+    );
+}
+
+#[test]
+fn fixed_width_groups_refuse_non_fixed_width_and_multi_record_schemas() {
+    let group = r#"        - name: items
+          type: map
+          multiple: true
+          start: 0
+          occurs: { max: 2 }
+          fields:
+            - { name: code, type: string, width: 2 }"#;
+    let non_fixed = source_format_pipeline("json", &format!("      schema:\n{group}"));
+    let diagnostics = compile_err(&non_fixed);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|d| d.code == "E358")
+        .expect("format gate");
+    assert!(diagnostic.message.contains("non-fixed-width schema"));
+    assert!(
+        diagnostic
+            .help
+            .as_deref()
+            .unwrap()
+            .contains("type: fixed_width")
+    );
+    assert_ne!(
+        diagnostic.primary.span,
+        clinker_core_types::span::Span::SYNTHETIC
+    );
+    let nested = group
+        .lines()
+        .map(|line| format!("      {line}\n"))
+        .collect::<String>();
+    let source = format!(
+        "      schema:\n        discriminator: {{ start: 0, width: 1 }}\n        records:\n          - id: detail\n            tag: D\n            columns:\n{nested}"
+    );
+    let diagnostics = compile_err(&source_format_pipeline("fixed_width", &source));
+    let diagnostic = diagnostics
+        .iter()
+        .find(|d| d.code == "E358")
+        .expect("multi-record gate");
+    assert!(
+        diagnostic.message.contains("single column-list schema"),
+        "{diagnostic:?}"
+    );
+    assert!(
+        diagnostic
+            .help
+            .as_deref()
+            .unwrap()
+            .contains("flatten each occurrence")
+    );
+    assert_ne!(
+        diagnostic.primary.span,
+        clinker_core_types::span::Span::SYNTHETIC
+    );
+}

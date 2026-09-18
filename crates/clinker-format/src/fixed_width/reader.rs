@@ -95,10 +95,6 @@ impl ReadLayout {
             Self::Group(group) => group.end(),
         }
     }
-
-    fn is_group(&self) -> bool {
-        matches!(self, Self::Group(_))
-    }
 }
 
 impl<R: Read> FixedWidthReader<R> {
@@ -107,6 +103,7 @@ impl<R: Read> FixedWidthReader<R> {
         fields: Vec<Column>,
         config: FixedWidthReaderConfig,
     ) -> Result<Self, FormatError> {
+        field::validate_read_layout(&fields)?;
         let layouts: Vec<ReadLayout> = fields
             .iter()
             .map(|column| {
@@ -126,45 +123,6 @@ impl<R: Read> FixedWidthReader<R> {
                 }
             })
             .collect::<Result<_, _>>()?;
-
-        let mut physical_order: Vec<usize> = (0..layouts.len()).collect();
-        physical_order.sort_by_key(|&index| layouts[index].start());
-        for pair in physical_order.windows(2) {
-            let previous = &layouts[pair[0]];
-            let next = &layouts[pair[1]];
-            if (previous.is_group() || next.is_group()) && next.start() < previous.end() {
-                return Err(field::invalid_group(
-                    if next.is_group() {
-                        next.name()
-                    } else {
-                        previous.name()
-                    },
-                    &format!(
-                        "range {}..{} overlaps '{}' at {}..{}; give the group, count, payload, and adjacent fields disjoint maximum ranges",
-                        next.start(),
-                        next.end(),
-                        previous.name(),
-                        previous.start(),
-                        previous.end()
-                    ),
-                ));
-            }
-        }
-
-        for (position, &index) in physical_order.iter().enumerate() {
-            let ReadLayout::Group(group) = &layouts[index] else {
-                continue;
-            };
-            if matches!(group.occurs.fill, crate::FixedWidthFill::Shift)
-                && group.count_field.is_none()
-                && position + 1 != physical_order.len()
-            {
-                return Err(field::invalid_group(
-                    &group.name,
-                    "uses `fill: shift` before another field without a `count_field`; add a count field so the next byte position is unambiguous, or make the group last",
-                ));
-            }
-        }
 
         let schema = fields
             .iter()

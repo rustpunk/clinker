@@ -111,19 +111,9 @@ fn validate_positional_group_schema(
     };
 
     let result = if input {
-        clinker_format::fixed_width::FixedWidthReader::new(
-            std::io::empty(),
-            columns.clone(),
-            clinker_format::fixed_width::FixedWidthReaderConfig::default(),
-        )
-        .map(|_| ())
+        clinker_format::fixed_width::field::validate_read_layout(columns)
     } else {
-        clinker_format::fixed_width::FixedWidthWriter::new(
-            Vec::<u8>::new(),
-            columns.clone(),
-            clinker_format::fixed_width::FixedWidthWriterConfig::default(),
-        )
-        .map(|_| ())
+        clinker_format::fixed_width::field::validate_write_layout(columns)
     };
     result.err().map(|error| DeclarationFault {
         message: format!("invalid fixed-width repeating-group layout: {error}"),
