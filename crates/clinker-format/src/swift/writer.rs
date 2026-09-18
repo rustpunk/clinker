@@ -40,9 +40,434 @@ use clinker_record::owned_storage::SharedStorage;
 use clinker_record::{Record, Schema, Value};
 
 use crate::error::FormatError;
+use crate::error::{OutputEncodingKind, OutputFieldName};
+use crate::preparation::{
+    FormatEncoder, OutputOperation, PreparedWriter, WriterResources, WriterScope,
+};
+use crate::reserved::ReservedText;
 use crate::swift::BODY_FIELD;
 use crate::swift::tokenizer::TEXT_BLOCK_ID;
 use crate::traits::FormatWriter;
+
+enum PreparedService {
+    Omitted,
+    Literal(ReservedText),
+    Document(ReservedText),
+}
+
+/// Immutable service policy admitted once and shared across destinations.
+/// Literal bodies take precedence, so unused document names are not retained.
+#[derive(Clone)]
+pub struct SwiftEncoderConfig(SharedStorage<[PreparedService; 4]>);
+
+impl SwiftEncoderConfig {
+    /// Copy only retained service sources under the supplied finite authority.
+    pub fn new(
+        config: &SwiftWriterConfig,
+        resources: &WriterResources,
+    ) -> Result<Self, FormatError> {
+        Self::from_sources(
+            [
+                (
+                    config.basic_header.as_deref(),
+                    config.basic_header_from_doc.as_deref(),
+                ),
+                (
+                    config.app_header.as_deref(),
+                    config.app_header_from_doc.as_deref(),
+                ),
+                (
+                    config.user_header.as_deref(),
+                    config.user_header_from_doc.as_deref(),
+                ),
+                (
+                    config.trailer.as_deref(),
+                    config.trailer_from_doc.as_deref(),
+                ),
+            ],
+            resources,
+        )
+    }
+
+    /// Borrow literal/document pairs in service-block order 1, 2, 3, 5.
+    /// This admits copies directly from compiled config without an owned intermediate.
+    pub fn from_sources(
+        sources: [(Option<&str>, Option<&str>); 4],
+        resources: &WriterResources,
+    ) -> Result<Self, FormatError> {
+        let scope = resources.scope()?;
+        let mut blocks = [
+            PreparedService::Omitted,
+            PreparedService::Omitted,
+            PreparedService::Omitted,
+            PreparedService::Omitted,
+        ];
+        for (slot, (literal, document)) in blocks.iter_mut().zip(sources) {
+            scope.check_cancelled()?;
+            *slot = if let Some(value) = literal {
+                PreparedService::Literal(swift_text(value, &scope)?)
+            } else if let Some(name) = document {
+                PreparedService::Document(swift_text(name, &scope)?)
+            } else {
+                PreparedService::Omitted
+            };
+        }
+        Ok(Self(SharedStorage::try_new(blocks, scope.allocation())?))
+    }
+}
+
+fn swift_text(value: &str, scope: &WriterScope) -> Result<ReservedText, FormatError> {
+    let mut text = ReservedText::new(scope.allocation().clone());
+    let mut remaining = value;
+    while !remaining.is_empty() {
+        scope.check_cancelled()?;
+        let mut end = remaining.len().min(8192);
+        while !remaining.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.push_str(&remaining[..end])?;
+        remaining = &remaining[end..];
+    }
+    Ok(text)
+}
+
+fn swift_error(name: &str, index: usize, offset: usize, kind: OutputEncodingKind) -> FormatError {
+    FormatError::OutputEncoding {
+        format: "swift",
+        field: index + 1,
+        offset,
+        kind,
+        field_name: OutputFieldName::new(name),
+        element: None,
+    }
+}
+
+// Fixed stack scratch avoids a heap allocation for every formatted scalar.
+#[allow(clippy::large_enum_variant)]
+enum SwiftScalar<'a> {
+    Borrowed(&'a str),
+    Formatted { bytes: [u8; 1024], len: usize },
+}
+impl SwiftScalar<'_> {
+    fn text(&self) -> &str {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Formatted { bytes, len } => {
+                // Scratch only accepts complete UTF-8 strings from fmt::Write.
+                std::str::from_utf8(&bytes[..*len]).expect("scalar formatter preserves UTF-8")
+            }
+        }
+    }
+}
+fn swift_scalar<'a>(
+    value: &'a Value,
+    name: &str,
+    index: usize,
+) -> Result<SwiftScalar<'a>, FormatError> {
+    use std::fmt::Write as _;
+    struct Scratch {
+        bytes: [u8; 1024],
+        len: usize,
+    }
+    impl std::fmt::Write for Scratch {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            let end = self
+                .len
+                .checked_add(value.len())
+                .filter(|end| *end <= self.bytes.len())
+                .ok_or(std::fmt::Error)?;
+            self.bytes[self.len..end].copy_from_slice(value.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+    // Strings borrow their owner. Rust scalar Display has a fixed maximum
+    // below this stack bound, including f64's non-exponential representation.
+    let mut scratch = Scratch {
+        bytes: [0; 1024],
+        len: 0,
+    };
+    let result = match value {
+        Value::Null => return Ok(SwiftScalar::Borrowed("")),
+        Value::String(value) => return Ok(SwiftScalar::Borrowed(value.as_str())),
+        Value::Bool(value) => {
+            return Ok(SwiftScalar::Borrowed(if *value { "true" } else { "false" }));
+        }
+        Value::Integer(value) => write!(scratch, "{value}"),
+        Value::Float(value) => write!(scratch, "{value}"),
+        Value::Decimal(value) => write!(scratch, "{value}"),
+        Value::Date(value) => write!(scratch, "{value}"),
+        Value::DateTime(value) => write!(scratch, "{value}"),
+        Value::Map(_) | Value::Array(_) => {
+            return Err(swift_error(name, index, 0, OutputEncodingKind::SwiftScalar));
+        }
+    };
+    result.map_err(|_| swift_error(name, index, 0, OutputEncodingKind::SwiftScalar))?;
+    Ok(SwiftScalar::Formatted {
+        bytes: scratch.bytes,
+        len: scratch.len,
+    })
+}
+
+fn service_body<'a>(
+    source: &'a PreparedService,
+    record: Option<&'a Record>,
+    index: usize,
+) -> Result<Option<SwiftScalar<'a>>, FormatError> {
+    match source {
+        PreparedService::Omitted => Ok(None),
+        PreparedService::Literal(text) => Ok(Some(SwiftScalar::Borrowed(text.as_str()))),
+        PreparedService::Document(section) => {
+            let Some(record) = record else {
+                return Ok(None);
+            };
+            let value = record
+                .doc_ctx()
+                .section_fields(section.as_str())
+                .and_then(|fields| fields.get(BODY_FIELD))
+                .ok_or_else(|| {
+                    swift_error(
+                        section.as_str(),
+                        index,
+                        0,
+                        OutputEncodingKind::SwiftDocument,
+                    )
+                })?;
+            swift_scalar(value, section.as_str(), index).map(Some)
+        }
+    }
+}
+
+fn validate_service(body: &str, index: usize, scope: &WriterScope) -> Result<(), FormatError> {
+    let mut depth = 0usize;
+    for (offset, byte) in body.bytes().enumerate() {
+        if offset.is_multiple_of(8192) {
+            scope.check_cancelled()?;
+        }
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    swift_error(
+                        "service body",
+                        index,
+                        offset,
+                        OutputEncodingKind::SwiftService,
+                    )
+                })?
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(swift_error(
+            "service body",
+            index,
+            body.len(),
+            OutputEncodingKind::SwiftService,
+        ));
+    }
+    Ok(())
+}
+fn emit_service(stage: &mut dyn Write, id: u8, body: &str) -> Result<(), FormatError> {
+    stage.write_all(&[b'{', b'0' + id, b':'])?;
+    stage.write_all(body.as_bytes())?;
+    stage.write_all(b"}")?;
+    Ok(())
+}
+
+/// Stages complete SWIFT operations; only first-record document trailer bytes
+/// remain live. Config is shared and admitted; schema/value payloads are borrowed.
+pub struct SwiftEncoder {
+    config: SwiftEncoderConfig,
+    indices: [Option<usize>; 3],
+    header_written: bool,
+    trailer: Option<ReservedText>,
+}
+/// Newly resolved trailer storage stays charged until delivery or abandonment.
+pub struct SwiftPending {
+    opened: bool,
+    trailer: Option<ReservedText>,
+    finalized: bool,
+}
+impl SwiftEncoder {
+    /// Admits service policy and resolves columns without retaining the schema.
+    pub fn new(
+        schema: SharedStorage<Schema>,
+        config: &SwiftWriterConfig,
+        resources: WriterResources,
+    ) -> Result<Self, FormatError> {
+        Self::from_config(schema, SwiftEncoderConfig::new(config, &resources)?)
+    }
+    /// Shares admitted policy; the caller's schema remains caller-owned.
+    pub fn from_config(
+        schema: SharedStorage<Schema>,
+        config: SwiftEncoderConfig,
+    ) -> Result<Self, FormatError> {
+        let indices = ["block", "tag", "value"].map(|name| schema.index(name));
+        Ok(Self {
+            config,
+            indices,
+            header_written: false,
+            trailer: None,
+        })
+    }
+    /// Admit the concrete wrapper until its backing has actually been freed.
+    pub fn into_boxed_writer<W: Write + Send + 'static>(
+        self,
+        destination: W,
+        resources: WriterResources,
+    ) -> Result<crate::traits::FormatWriterHandle, FormatError> {
+        let scope = resources.scope()?;
+        let writer = PreparedWriter::new(destination, self, resources)?;
+        Ok(crate::traits::FormatWriterHandle::try_new(
+            writer,
+            scope.allocation(),
+        )?)
+    }
+}
+impl FormatEncoder for SwiftEncoder {
+    type Pending = SwiftPending;
+    fn prepare(
+        &self,
+        operation: OutputOperation<'_>,
+        stage: &mut dyn Write,
+        scope: &WriterScope,
+    ) -> Result<SwiftPending, FormatError> {
+        scope.check_cancelled()?;
+        let mut pending = SwiftPending {
+            opened: false,
+            trailer: None,
+            finalized: false,
+        };
+        let record = match operation {
+            OutputOperation::Record(record) => Some(record),
+            _ => None,
+        };
+        if matches!(
+            operation,
+            OutputOperation::BeginDocument(_) | OutputOperation::EndDocument(_)
+        ) {
+            return Ok(pending);
+        }
+        let body = if let Some(record) = record {
+            let mut cells = [
+                SwiftScalar::Borrowed(""),
+                SwiftScalar::Borrowed(""),
+                SwiftScalar::Borrowed(""),
+            ];
+            for (i, name) in ["block", "tag", "value"].iter().enumerate() {
+                if let Some(value) = self.indices[i].and_then(|index| record.values().get(index)) {
+                    cells[i] = swift_scalar(value, name, self.indices[i].unwrap_or(i))?;
+                }
+            }
+            let [block, tag, value] = &cells;
+            if !block.text().is_empty() && block.text().parse::<u8>() != Ok(TEXT_BLOCK_ID) {
+                return Err(swift_error(
+                    "block",
+                    self.indices[0].unwrap_or(0),
+                    0,
+                    OutputEncodingKind::SwiftBlock,
+                ));
+            }
+            if tag.text().is_empty() {
+                return Err(swift_error(
+                    "tag",
+                    self.indices[1].unwrap_or(1),
+                    0,
+                    OutputEncodingKind::SwiftTag,
+                ));
+            }
+            for (offset, byte) in tag.text().bytes().enumerate() {
+                if offset.is_multiple_of(8192) {
+                    scope.check_cancelled()?;
+                }
+                if matches!(byte, b':' | b'\r' | b'\n') {
+                    return Err(swift_error(
+                        "tag",
+                        self.indices[1].unwrap_or(1),
+                        offset,
+                        OutputEncodingKind::SwiftTag,
+                    ));
+                }
+            }
+            let bytes = value.text().as_bytes();
+            for (offset, byte) in bytes.iter().enumerate() {
+                if offset.is_multiple_of(8192) {
+                    scope.check_cancelled()?;
+                }
+                if *byte == b'\n'
+                    && (bytes.get(offset + 1) == Some(&b':')
+                        || bytes.get(offset + 1..offset + 3) == Some(b"-}"))
+                {
+                    return Err(swift_error(
+                        "value",
+                        self.indices[2].unwrap_or(2),
+                        offset + 1,
+                        OutputEncodingKind::SwiftContinuation,
+                    ));
+                }
+            }
+            Some(cells)
+        } else {
+            None
+        };
+        if !self.header_written {
+            for (index, id) in [1, 2, 3, 5].into_iter().enumerate() {
+                if let Some(body) = service_body(&self.config.0[index], record, index)? {
+                    validate_service(body.text(), index, scope)?;
+                    if id == 5 {
+                        if matches!(&self.config.0[index], PreparedService::Document(_)) {
+                            pending.trailer = Some(swift_text(body.text(), scope)?);
+                        }
+                    } else {
+                        emit_service(stage, id, body.text())?;
+                    }
+                }
+            }
+            stage.write_all(b"{4:\r\n")?;
+            pending.opened = true;
+        }
+        if let Some([_, tag, value]) = body {
+            stage.write_all(b":")?;
+            stage.write_all(tag.text().as_bytes())?;
+            stage.write_all(b":")?;
+            stage.write_all(value.text().as_bytes())?;
+            stage.write_all(b"\r\n")?;
+        } else {
+            stage.write_all(b"-}")?;
+            let trailer = match &self.config.0[3] {
+                PreparedService::Literal(text) => Some(text.as_str()),
+                _ => self.trailer.as_ref().map(ReservedText::as_str),
+            };
+            if let Some(body) = trailer {
+                emit_service(stage, 5, body)?;
+            }
+            pending.finalized = true;
+        }
+        Ok(pending)
+    }
+    fn commit(&mut self, pending: SwiftPending) {
+        if pending.opened {
+            self.header_written = true;
+            self.trailer = pending.trailer;
+        }
+        if pending.finalized {
+            self.trailer = None;
+        }
+    }
+}
+impl<W: Write + Send> FormatWriter for PreparedWriter<W, SwiftEncoder> {
+    fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
+        self.write_operation(OutputOperation::Record(record))
+    }
+    fn flush(&mut self) -> Result<(), FormatError> {
+        PreparedWriter::flush(self)
+    }
+    fn flush_bytes(&mut self) -> Result<(), FormatError> {
+        PreparedWriter::flush_bytes(self)
+    }
+}
 
 /// One service block's source: a literal config body wins; otherwise the
 /// body is echoed from the named `$doc` section; otherwise the block is
