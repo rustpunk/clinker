@@ -11,23 +11,38 @@ use clinker_format::reserved::ReservedVec;
 
 #[test]
 fn swift_invalid_first_record_never_delivers_service_header() {
-    use clinker_format::swift::writer::{SwiftWriter, SwiftWriterConfig};
     use clinker_format::FormatWriter;
+    use clinker_format::swift::writer::{SwiftEncoder, SwiftWriterConfig};
     use clinker_record::{Record, Schema, Value};
     use std::sync::Arc;
-    let schema = SharedStorage::from_arc(Arc::new(Schema::new(
-        vec!["block".into(), "tag".into(), "value".into()],
-    )));
-    let record = Record::new(schema.clone(), vec![Value::Integer(4), Value::Null, Value::String("body".into())]);
+    let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
+        "block".into(),
+        "tag".into(),
+        "value".into(),
+    ])));
+    let record = Record::new(
+        schema.clone(),
+        vec![Value::Integer(4), Value::Null, Value::String("body".into())],
+    );
     let mut bytes = Vec::new();
-    let mut writer = SwiftWriter::new(&mut bytes, schema, SwiftWriterConfig {
-        basic_header: Some("header".into()),
-        trailer: Some("trailer".into()),
-        ..Default::default()
-    });
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+    let encoder = SwiftEncoder::new(
+        schema,
+        &SwiftWriterConfig {
+            basic_header: Some("header".into()),
+            trailer: Some("trailer".into()),
+            ..Default::default()
+        },
+        provider.resources(),
+    )
+    .unwrap();
+    let mut writer = PreparedWriter::new(&mut bytes, encoder, provider.resources()).unwrap();
     assert!(writer.write_record(&record).is_err());
     drop(writer);
-    assert!(bytes.is_empty(), "invalid first body must not deliver a service prefix");
+    assert!(
+        bytes.is_empty(),
+        "invalid first body must not deliver a service prefix"
+    );
 }
 
 #[test]
@@ -87,6 +102,256 @@ fn fixed_width_late_structured_envelope_rejects_without_delivery() {
                 "the complete rejected section must stay private"
             );
         }
+    }
+}
+
+mod swift_prepared {
+    use super::*;
+    use clinker_format::FormatWriter;
+    use clinker_format::error::OutputEncodingKind;
+    use clinker_format::swift::writer::{SwiftEncoder, SwiftWriterConfig};
+    use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Record, Schema, Value};
+    use std::sync::Arc;
+
+    fn record(tag: Value, value: Value) -> Record {
+        Record::new(
+            SharedStorage::from_arc(Arc::new(Schema::new(vec![
+                "block".into(),
+                "tag".into(),
+                "value".into(),
+            ]))),
+            vec![Value::Integer(4), tag, value],
+        )
+    }
+    fn doc(record: &mut Record, sections: &[(&str, Value)]) {
+        record.set_doc_ctx(SharedStorage::from_arc(Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("input.swift"),
+            EnvelopeRecord::from_sections(sections.iter().map(|(name, value)| {
+                (
+                    OwnedKey::from(*name),
+                    Value::Map(OwnedMap::from_map(
+                        [(OwnedKey::from("body"), value.clone())].into(),
+                    )),
+                )
+            })),
+        ))));
+    }
+    fn provider() -> MemoryOnlyResources {
+        MemoryOnlyResources::new(NonZeroUsize::new(512 * 1024).unwrap())
+    }
+
+    #[test]
+    fn swift_service_body_and_first_document_trailer_are_exact() {
+        let provider = provider();
+        let mut first = record(
+            Value::String("20".into()),
+            Value::String("  :inline-}\r\n next\n\n".into()),
+        );
+        doc(
+            &mut first,
+            &[
+                ("author header", Value::String("DOC".into())),
+                ("author trailer", Value::String("{CHK: A }".into())),
+            ],
+        );
+        let mut second = record(Value::String("20".into()), Value::String("second".into()));
+        doc(
+            &mut second,
+            &[("author trailer", Value::String("DIFFERENT".into()))],
+        );
+        let encoder = SwiftEncoder::new(
+            first.schema().clone(),
+            &SwiftWriterConfig {
+                basic_header: Some("LITERAL".into()),
+                basic_header_from_doc: Some("missing ignored".into()),
+                app_header_from_doc: Some("author header".into()),
+                user_header: Some("{108:ref}".into()),
+                trailer_from_doc: Some("author trailer".into()),
+                ..Default::default()
+            },
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        writer.write_record(&first).unwrap();
+        drop(first);
+        writer.write_record(&second).unwrap();
+        writer.flush_bytes().unwrap();
+        assert_eq!(
+            writer.destination(),
+            b"{1:LITERAL}{2:DOC}{3:{108:ref}}{4:\r\n:20:  :inline-}\r\n next\n\n\r\n:20:second\r\n"
+        );
+        writer.flush().unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.destination(), b"{1:LITERAL}{2:DOC}{3:{108:ref}}{4:\r\n:20:  :inline-}\r\n next\n\n\r\n:20:second\r\n-}{5:{CHK: A }}");
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn swift_failed_first_service_does_not_capture_trailer_or_header() {
+        let provider = provider();
+        let mut first = record(Value::String("20".into()), Value::String("valid".into()));
+        let encoder = SwiftEncoder::new(
+            first.schema().clone(),
+            &SwiftWriterConfig {
+                basic_header: Some("prefix".into()),
+                trailer_from_doc: Some("authored tail".into()),
+                ..Default::default()
+            },
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        let baseline = provider.used();
+        assert!(matches!(
+            writer.write_record(&first),
+            Err(FormatError::OutputEncoding {
+                kind: OutputEncodingKind::SwiftDocument,
+                ..
+            })
+        ));
+        assert!(writer.destination().is_empty());
+        assert_eq!(provider.used(), baseline);
+        doc(
+            &mut first,
+            &[("authored tail", Value::String("new tail".into()))],
+        );
+        writer.write_record(&first).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(
+            writer.destination(),
+            b"{1:prefix}{4:\r\n:20:valid\r\n-}{5:new tail}"
+        );
+    }
+
+    #[test]
+    fn swift_invalid_fields_are_bounded_and_atomic() {
+        for (column, value, kind, offset) in [
+            (
+                0,
+                Value::String("5".into()),
+                OutputEncodingKind::SwiftBlock,
+                0,
+            ),
+            (1, Value::Null, OutputEncodingKind::SwiftTag, 0),
+            (
+                1,
+                Value::String("20:injected".into()),
+                OutputEncodingKind::SwiftTag,
+                2,
+            ),
+            (
+                1,
+                Value::String("20\rline".into()),
+                OutputEncodingKind::SwiftTag,
+                2,
+            ),
+            (
+                2,
+                Value::String("text\r\n:20:injected".into()),
+                OutputEncodingKind::SwiftContinuation,
+                6,
+            ),
+            (
+                2,
+                Value::String("text\n-}injected".into()),
+                OutputEncodingKind::SwiftContinuation,
+                5,
+            ),
+            (
+                2,
+                Value::Array(OwnedValues::from_vec(vec![])),
+                OutputEncodingKind::SwiftScalar,
+                0,
+            ),
+            (
+                2,
+                Value::Map(OwnedMap::from_map(Default::default())),
+                OutputEncodingKind::SwiftScalar,
+                0,
+            ),
+        ] {
+            let provider = provider();
+            let good = record(Value::String("20".into()), Value::String("good".into()));
+            let mut values = good.values().to_vec();
+            values[column] = value;
+            let bad = Record::new(good.schema().clone(), values);
+            let encoder = SwiftEncoder::new(
+                good.schema().clone(),
+                &SwiftWriterConfig {
+                    basic_header: Some("prefix".into()),
+                    ..Default::default()
+                },
+                provider.resources(),
+            )
+            .unwrap();
+            let mut writer =
+                PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+            let error = writer.write_record(&bad).unwrap_err();
+            assert!(
+                matches!(error, FormatError::OutputEncoding { format: "swift", kind: actual, field, offset: actual_offset, .. } if actual == kind && field == column + 1 && actual_offset == offset)
+            );
+            assert!(error.to_string().len() < 400);
+            assert!(writer.destination().is_empty());
+            writer.write_record(&good).unwrap();
+            writer.flush().unwrap();
+            assert_eq!(writer.destination(), b"{1:prefix}{4:\r\n:20:good\r\n-}");
+        }
+    }
+
+    #[test]
+    fn swift_zero_records_finalize_literals_once() {
+        let provider = provider();
+        let schema = record(Value::Null, Value::Null).schema().clone();
+        let encoder = SwiftEncoder::new(
+            schema,
+            &SwiftWriterConfig {
+                basic_header: Some("F01".into()),
+                app_header_from_doc: Some("unused without record".into()),
+                trailer: Some("{CHK:AB}".into()),
+                ..Default::default()
+            },
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        writer.flush_bytes().unwrap();
+        assert!(writer.destination().is_empty());
+        writer.flush().unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.destination(), b"{1:F01}{4:\r\n-}{5:{CHK:AB}}");
+    }
+
+    #[test]
+    fn swift_duplicate_columns_use_schema_last_wins_identity() {
+        let provider = provider();
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "block".into(),
+            "tag".into(),
+            "value".into(),
+            "block".into(),
+            "tag".into(),
+            "value".into(),
+        ])));
+        let record = Record::new(
+            schema.clone(),
+            vec![
+                Value::Integer(5),
+                Value::String("20".into()),
+                Value::String("discarded".into()),
+                Value::Integer(4),
+                Value::String("21".into()),
+                Value::String(" final \r\n\n".into()),
+            ],
+        );
+        let encoder =
+            SwiftEncoder::new(schema, &SwiftWriterConfig::default(), provider.resources()).unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        writer.write_record(&record).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.destination(), b"{4:\r\n:21: final \r\n\n\r\n-}");
     }
 }
 

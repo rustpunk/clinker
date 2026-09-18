@@ -25,6 +25,12 @@ pub enum OutputEncodingKind {
     FixedWidthOccurrence,
     FixedWidthBlankOccurrence,
     FixedWidthEnvelope,
+    SwiftBlock,
+    SwiftTag,
+    SwiftContinuation,
+    SwiftScalar,
+    SwiftService,
+    SwiftDocument,
 }
 
 /// Inline diagnostic excerpt; the numeric field identity remains authoritative.
@@ -424,6 +430,18 @@ impl fmt::Display for FormatError {
                         "occurrence renders exactly like an unused padded slot; add count_field or provide a non-padding child value",
                     OutputEncodingKind::FixedWidthEnvelope =>
                         "fixed-width document sections require scalar fields and do not support a computed footer count; project scalar section values and omit footer_record_count_field",
+                    OutputEncodingKind::SwiftBlock =>
+                        "SWIFT body records require block 4; set block to \"4\" or omit it and configure service blocks separately",
+                    OutputEncodingKind::SwiftTag =>
+                        "SWIFT requires a nonempty tag without colons or line breaks; set tag to a field name such as \"20\"",
+                    OutputEncodingKind::SwiftContinuation =>
+                        "SWIFT continuation lines cannot begin with ':' or '-}'; rewrite the continuation so it cannot be read as a tag or block terminator",
+                    OutputEncodingKind::SwiftScalar =>
+                        "SWIFT requires scalar fields; project scalar values or use CXL to_string",
+                    OutputEncodingKind::SwiftService =>
+                        "SWIFT service bodies require balanced braces; provide a body such as \"{CHK:AB}\" without the outer service block",
+                    OutputEncodingKind::SwiftDocument =>
+                        "SWIFT service source has no body field; declare the named document section with a scalar body field or provide a literal service body",
                 }
             ),
             Self::Resource(error) => error.fmt(f),
