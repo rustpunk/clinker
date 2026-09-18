@@ -248,7 +248,15 @@ fn ends_with_line_anchored_trailer(raw: &[u8]) -> bool {
     if before_trailer == HEADER_LEN {
         return true;
     }
-    matches!(raw.get(before_trailer - 1), Some(b'\n') | Some(b'\r'))
+    raw.get(before_trailer - 1)
+        .copied()
+        .is_some_and(is_block4_trailer_boundary)
+}
+
+/// Bytes that anchor the block-4 trailer; shared by input framing and output
+/// representability checks so accepted field data cannot close its own block.
+pub(crate) fn is_block4_trailer_boundary(byte: u8) -> bool {
+    matches!(byte, b'\n' | b'\r')
 }
 
 /// Parse one raw top-level block (`{n:body}` or `{4:body-}`) into its id and

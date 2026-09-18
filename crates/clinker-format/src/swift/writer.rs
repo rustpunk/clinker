@@ -18,7 +18,7 @@
 //! a `:` tag marker — only arise when a value is built from arbitrary records
 //! (CSV/JSON → Transform → SWIFT), never from the reader. Rather than emit
 //! silently-corrupt output, the writer rejects such a value with a clear
-//! error (see `reject_unrepresentable_value`).
+//! bounded output-encoding error before delivering any bytes.
 //!
 //! Record columns map by name: `block`, `tag`, `value`. Only `tag`/`value`
 //! become block-4 lines; `block` is the constant `4` discriminator (a record
@@ -48,7 +48,7 @@ use crate::preparation::{
 };
 use crate::reserved::ReservedText;
 use crate::swift::BODY_FIELD;
-use crate::swift::tokenizer::TEXT_BLOCK_ID;
+use crate::swift::tokenizer::{TEXT_BLOCK_ID, is_block4_trailer_boundary};
 use crate::traits::FormatWriter;
 
 enum PreparedService {
@@ -398,9 +398,9 @@ impl FormatEncoder for SwiftEncoder {
                 if offset.is_multiple_of(8192) {
                     scope.check_cancelled()?;
                 }
-                if *byte == b'\n'
-                    && (bytes.get(offset + 1) == Some(&b':')
-                        || bytes.get(offset + 1..offset + 3) == Some(b"-}"))
+                if (*byte == b'\n' && bytes.get(offset + 1) == Some(&b':'))
+                    || (is_block4_trailer_boundary(*byte)
+                        && bytes.get(offset + 1..offset + 3) == Some(b"-}"))
                 {
                     return Err(swift_error(
                         "value",
@@ -471,19 +471,6 @@ impl<W: Write + Send> FormatWriter for PreparedWriter<W, SwiftEncoder> {
     }
 }
 
-/// One service block's source: a literal config body wins; otherwise the
-/// body is echoed from the named `$doc` section; otherwise the block is
-/// omitted.
-struct ServiceBlock {
-    /// The numeric block id (`1`, `2`, `3`, `5`).
-    id: u8,
-    /// Literal block body written verbatim. Takes precedence over `from_doc`.
-    literal: Option<String>,
-    /// Name of a `$doc` section to echo the block body from (read under the
-    /// shared `body` field). Used only when `literal` is unset.
-    from_doc: Option<String>,
-}
-
 /// Configuration for the SWIFT writer.
 ///
 /// Each service block (1/2/3/5) is either written from a literal body, echoed
@@ -514,358 +501,6 @@ pub struct SwiftWriterConfig {
     pub trailer_from_doc: Option<String>,
 }
 
-/// Streaming SWIFT MT message writer.
-///
-/// Holds the resolved `block`/`tag`/`value` column indices, the service-block
-/// configuration, and the open/finalized flags. Block-4 lines stream one
-/// record at a time; the envelope is opened on the first record and closed
-/// by `flush`.
-pub struct SwiftWriter<W: Write> {
-    writer: W,
-    config: SwiftWriterConfig,
-    block_idx: Option<usize>,
-    tag_idx: Option<usize>,
-    value_idx: Option<usize>,
-    /// `true` once the headers and the `{4:` opener have been written, so
-    /// later records skip straight to their `:tag:value` line.
-    header_written: bool,
-    /// The resolved block-5 trailer body, captured during the header phase
-    /// (when the first record's document context is available) and written by
-    /// `flush` after block 4 closes. `None` when no trailer is configured. A
-    /// `trailer_from_doc` echo must read the document context, which only a
-    /// record carries — so the trailer is resolved up front, not at flush.
-    trailer_body: Option<String>,
-    /// `true` once `flush` has closed block 4 and written the trailer, so a
-    /// repeat `flush` is a no-op.
-    finalized: bool,
-}
-
-impl<W: Write> SwiftWriter<W> {
-    /// Build a writer over a sink with the given schema and config. The
-    /// `block`, `tag`, and `value` columns are resolved to positional indices
-    /// once; the body lines stream one record at a time thereafter.
-    pub fn new(writer: W, schema: SharedStorage<Schema>, config: SwiftWriterConfig) -> Self {
-        let mut block_idx = None;
-        let mut tag_idx = None;
-        let mut value_idx = None;
-        for (i, col) in schema.columns().iter().enumerate() {
-            match &**col {
-                "block" => block_idx = Some(i),
-                "tag" => tag_idx = Some(i),
-                "value" => value_idx = Some(i),
-                _ => {}
-            }
-        }
-        Self {
-            writer,
-            config,
-            block_idx,
-            tag_idx,
-            value_idx,
-            header_written: false,
-            trailer_body: None,
-            finalized: false,
-        }
-    }
-
-    /// Re-emit the service blocks 1/2/3 in order and open block 4 on the first
-    /// record. Each service block is `{<id>:<body>}` with its body verbatim
-    /// (block 3's nested `{108:...}` re-emitted byte-for-byte, no escaping);
-    /// an omitted block writes nothing. Block 4 is opened with `{4:` and the
-    /// `\r\n` that frames its first line, mirroring the reader's framing.
-    fn write_header(&mut self, record: &Record) -> Result<(), FormatError> {
-        if self.header_written {
-            return Ok(());
-        }
-        self.header_written = true;
-
-        for block in self.service_blocks_1_2_3() {
-            if let Some(body) = self.resolve_block_body(&block, record)? {
-                self.write_service_block(block.id, &body)?;
-            }
-        }
-        // Resolve the trailer now, while the record's document context is in
-        // hand; `flush` writes the stashed body after block 4 closes (it has
-        // no record to echo a `trailer_from_doc` section from).
-        self.trailer_body = self.resolve_block_body(&self.trailer_block(), record)?;
-        // Open the message-text block. `{4:` then the framing `\r\n`, so the
-        // first `:tag:value` line begins its own line and the closing `-}`
-        // trailer the writer appends at flush is line-anchored.
-        self.writer.write_all(b"{4:\r\n").map_err(FormatError::Io)?;
-        Ok(())
-    }
-
-    /// The service blocks the header phase emits, in wire order (1, 2, 3).
-    /// Block 5 (the trailer) is written by `flush`, after block 4 closes.
-    fn service_blocks_1_2_3(&self) -> [ServiceBlock; 3] {
-        [
-            ServiceBlock {
-                id: 1,
-                literal: self.config.basic_header.clone(),
-                from_doc: self.config.basic_header_from_doc.clone(),
-            },
-            ServiceBlock {
-                id: 2,
-                literal: self.config.app_header.clone(),
-                from_doc: self.config.app_header_from_doc.clone(),
-            },
-            ServiceBlock {
-                id: 3,
-                literal: self.config.user_header.clone(),
-                from_doc: self.config.user_header_from_doc.clone(),
-            },
-        ]
-    }
-
-    /// The block-5 trailer source (literal or echoed from `$doc`).
-    fn trailer_block(&self) -> ServiceBlock {
-        ServiceBlock {
-            id: 5,
-            literal: self.config.trailer.clone(),
-            from_doc: self.config.trailer_from_doc.clone(),
-        }
-    }
-
-    /// Resolve a service block's body: the literal config wins; otherwise echo
-    /// the body verbatim from the named `$doc` section under the shared `body`
-    /// field; otherwise `None` (the block is omitted).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FormatError::Swift`] when `from_doc` names a section the
-    /// record's document context does not carry — a writer pointed at a
-    /// section the source never declared.
-    fn resolve_block_body(
-        &self,
-        block: &ServiceBlock,
-        record: &Record,
-    ) -> Result<Option<String>, FormatError> {
-        if let Some(literal) = &block.literal {
-            return Ok(Some(literal.clone()));
-        }
-        let Some(section) = &block.from_doc else {
-            return Ok(None);
-        };
-        let ctx = record.doc_ctx();
-        let value = ctx.get_section_field(section, BODY_FIELD).ok_or_else(|| {
-            FormatError::Swift(format!(
-                "block {id} echo names `$doc` section {section:?}, but the record's document \
-                 context carries no `{BODY_FIELD}` field for it. Ensure the source declares an \
-                 envelope section of the same name over block {id} (e.g. \
-                 `extract: {{ segment: \"{id}\" }}`).",
-                id = block.id,
-            ))
-        })?;
-        Ok(Some(value_to_field(
-            &value,
-            &format!("{section}.{BODY_FIELD}"),
-        )?))
-    }
-
-    /// Write one service block as `{<id>:<body>}` with the body verbatim.
-    /// SWIFT block bodies (including block 3/5 nested `{sub:tag}` sub-blocks)
-    /// are opaque, so no byte is escaped — the reader kept them verbatim and
-    /// the writer re-frames them verbatim.
-    fn write_service_block(&mut self, id: u8, body: &str) -> Result<(), FormatError> {
-        self.writer.write_all(b"{").map_err(FormatError::Io)?;
-        self.writer
-            .write_all(id.to_string().as_bytes())
-            .map_err(FormatError::Io)?;
-        self.writer.write_all(b":").map_err(FormatError::Io)?;
-        self.writer
-            .write_all(body.as_bytes())
-            .map_err(FormatError::Io)?;
-        self.writer.write_all(b"}").map_err(FormatError::Io)?;
-        Ok(())
-    }
-
-    /// Re-emit one block-4 record as a `:tag:value\r\n` line. A record whose
-    /// `block` column is not the constant `4` is rejected — service blocks
-    /// ride the document context, never the record stream. The value is
-    /// written verbatim — interior braces and a mid-line `-}` reproduce as
-    /// data — *unless* the shape is unrepresentable in unescaped block-4 free
-    /// text (see [`reject_unrepresentable_value`]), in which case the record
-    /// is rejected rather than emitted as silently-corrupt output.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FormatError::Swift`] when the record carries no `tag`, a
-    /// `block` value other than `4`, a `value` whose continuation line begins
-    /// with the block terminator (`-}`) or a tag marker (`:`), or
-    /// [`FormatError::UnserializableMapValue`] when `tag`/`value` hold a
-    /// `Value::Map`/`Value::Array`.
-    fn write_body_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        let values = record.values();
-
-        if let Some(idx) = self.block_idx
-            && let Some(v) = values.get(idx)
-        {
-            let block = value_to_field(v, "block")?;
-            // An empty/null `block` is treated as the message-text block —
-            // a Transform that projects only `tag`/`value` need not restamp
-            // the discriminator the reader set. A non-empty `block` must parse
-            // to the text-block id; comparing the parsed number ties the check
-            // to TEXT_BLOCK_ID without allocating its string form per record.
-            if !block.is_empty() && block.parse::<u8>() != Ok(TEXT_BLOCK_ID) {
-                return Err(FormatError::Swift(format!(
-                    "record carries block {block:?}, but the SWIFT writer emits only block-4 \
-                     message-text lines as records (block \"4\"). Service blocks (1/2/3/5) are \
-                     written from the writer's header/trailer options or echoed from `$doc`, not \
-                     from the record stream."
-                )));
-            }
-        }
-
-        let tag = match self.tag_idx.and_then(|i| values.get(i)) {
-            Some(v) => value_to_field(v, "tag")?,
-            None => String::new(),
-        };
-        if tag.is_empty() {
-            return Err(FormatError::Swift(
-                "record carries no `tag`; every SWIFT block-4 line needs a field tag to write \
-                 (`:tag:value`)"
-                    .into(),
-            ));
-        }
-        let value = match self.value_idx.and_then(|i| values.get(i)) {
-            Some(v) => value_to_field(v, "value")?,
-            None => String::new(),
-        };
-        reject_unrepresentable_value(&tag, &value)?;
-
-        self.writer.write_all(b":").map_err(FormatError::Io)?;
-        self.writer
-            .write_all(tag.as_bytes())
-            .map_err(FormatError::Io)?;
-        self.writer.write_all(b":").map_err(FormatError::Io)?;
-        self.writer
-            .write_all(value.as_bytes())
-            .map_err(FormatError::Io)?;
-        self.writer.write_all(b"\r\n").map_err(FormatError::Io)?;
-        Ok(())
-    }
-}
-
-impl<W: Write + Send> FormatWriter for SwiftWriter<W> {
-    fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        self.write_header(record)?;
-        self.write_body_record(record)
-    }
-
-    fn flush(&mut self) -> Result<(), FormatError> {
-        if self.finalized {
-            return Ok(());
-        }
-        self.finalized = true;
-        // A header-only output (no records) still frames a valid empty
-        // message: open block 4 so the `-}` trailer below closes a real
-        // block. The first-record header phase is skipped when no record
-        // arrived, so open it here from no record context — only the
-        // literal-config service blocks can appear in that case.
-        if !self.header_written {
-            self.header_written = true;
-            for block in self.service_blocks_1_2_3() {
-                if let Some(body) = block.literal {
-                    self.write_service_block(block.id, &body)?;
-                }
-            }
-            // No record means no document context, so only a literal trailer
-            // can frame block 5 in a zero-record output.
-            self.trailer_body = self.config.trailer.clone();
-            self.writer.write_all(b"{4:\r\n").map_err(FormatError::Io)?;
-        }
-        // Close block 4 with the line-anchored `-}` trailer: the last body
-        // line ended with `\r\n`, so `-}` begins its own line and the reader
-        // recognizes it as the trailer rather than data.
-        self.writer.write_all(b"-}").map_err(FormatError::Io)?;
-        // Re-emit the trailer (block 5) after block 4 closes from the body
-        // resolved during the header phase (literal config or a
-        // `trailer_from_doc` echo of the first record's document context).
-        if let Some(body) = self.trailer_body.take() {
-            self.write_service_block(5, &body)?;
-        }
-        self.writer.flush().map_err(FormatError::Io)?;
-        Ok(())
-    }
-
-    /// Drain the underlying sink without closing block 4 or emitting the block-5
-    /// trailer, so byte-limit split accounting stays non-finalizing. Plan
-    /// validation rejects byte splitting for this single-message format; this
-    /// keeps the trait contract honest regardless, with the trailers written
-    /// only by [`Self::flush`].
-    fn flush_bytes(&mut self) -> Result<(), FormatError> {
-        self.writer.flush().map_err(FormatError::Io)
-    }
-}
-
-/// Reject a block-4 value whose folded continuation lines cannot be framed
-/// faithfully in unescaped block-4 free text.
-///
-/// Block 4 has no escape mechanism, so the writer emits values verbatim. A
-/// value written as `:tag:value\r\n` splits back on its interior `\n` line
-/// breaks on re-read: each continuation line (a line after the first, which
-/// rides directly after `:tag:`) becomes its own physical block-4 line. A
-/// continuation line that begins with `-}` re-reads as the line-anchored
-/// block-4 terminator (closing the block early — truncation), and one that
-/// begins with `:` re-reads as a spurious new `:tag:` field. The reader can
-/// never *produce* such a value, so a reader → writer round-trip is safe; but
-/// a value built from arbitrary records (CSV/JSON → Transform → SWIFT) can,
-/// and emitting it verbatim would write silently-corrupt output. Fail loud
-/// instead.
-///
-/// The first line of the value is exempt: it is preceded by the `:tag:`
-/// marker on the wire, so it can never be mistaken for a fresh tag or the
-/// terminator.
-///
-/// # Errors
-///
-/// Returns [`FormatError::Swift`] naming the offending continuation line.
-fn reject_unrepresentable_value(tag: &str, value: &str) -> Result<(), FormatError> {
-    for line in value.split('\n').skip(1) {
-        let starts_with_trailer = line.starts_with("-}");
-        if starts_with_trailer || line.starts_with(':') {
-            let marker = if starts_with_trailer {
-                "the block terminator `-}`"
-            } else {
-                "a tag marker `:`"
-            };
-            return Err(FormatError::Swift(format!(
-                "SWIFT block-4 field `:{tag}:` has a continuation line {line:?} beginning with \
-                 {marker}. Block-4 free text has no escape mechanism, so a value line that starts \
-                 with `-}}` (the block terminator) or `:` (a field-tag marker) cannot be written \
-                 back faithfully — it would re-read as an early block close or a spurious field. \
-                 Rewrite the value so no continuation line begins with `-}}` or `:`."
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Render a `Value` to SWIFT field text. `Null` renders as the empty string;
-/// scalars render via their natural string form. A `Value::Map` or
-/// `Value::Array` has no scalar SWIFT representation, so it raises rather than
-/// silently emitting an empty field — mirroring the other formats' explicit
-/// posture for non-scalar payloads.
-fn value_to_field(value: &Value, column: &str) -> Result<String, FormatError> {
-    let text = match value {
-        Value::Null => String::new(),
-        Value::Bool(b) => b.to_string(),
-        Value::Integer(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Decimal(d) => d.to_string(),
-        Value::String(s) => s.to_string(),
-        Value::Date(d) => d.to_string(),
-        Value::DateTime(dt) => dt.to_string(),
-        Value::Map(_) | Value::Array(_) => {
-            return Err(FormatError::UnserializableMapValue {
-                format: "swift",
-                column: column.to_string(),
-            });
-        }
-    };
-    Ok(text)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -878,6 +513,18 @@ mod tests {
     use indexmap::IndexMap;
     use std::io::Cursor;
     use std::sync::Arc;
+
+    fn finite_writer<W: Write + Send>(
+        destination: W,
+        schema: SharedStorage<Schema>,
+        config: SwiftWriterConfig,
+    ) -> PreparedWriter<W, SwiftEncoder> {
+        let resources = crate::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+        );
+        let encoder = SwiftEncoder::new(schema, &config, resources.resources()).unwrap();
+        PreparedWriter::new(destination, encoder, resources.resources()).unwrap()
+    }
 
     /// A `[block, tag, value]` schema, the one the reader emits.
     fn schema() -> SharedStorage<Schema> {
@@ -900,11 +547,12 @@ mod tests {
         schema: &SharedStorage<Schema>,
     ) -> String {
         let mut buf = Vec::new();
-        let mut w = SwiftWriter::new(Cursor::new(&mut buf), schema.clone(), config);
+        let mut w = finite_writer(Cursor::new(&mut buf), schema.clone(), config);
         for r in records {
             w.write_record(r).unwrap();
         }
         w.flush().unwrap();
+        drop(w);
         String::from_utf8(buf).unwrap()
     }
 
@@ -1026,7 +674,7 @@ mod tests {
         let s = schema();
         let rec = record(&s, "4", "20", "REF");
         let mut buf = Vec::new();
-        let mut w = SwiftWriter::new(
+        let mut w = finite_writer(
             Cursor::new(&mut buf),
             s.clone(),
             SwiftWriterConfig {
@@ -1037,6 +685,7 @@ mod tests {
         w.write_record(&rec).unwrap();
         w.flush().unwrap();
         w.flush().unwrap();
+        drop(w);
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out.matches("-}").count(), 1, "trailer written twice: {out}");
         assert_eq!(
@@ -1051,14 +700,22 @@ mod tests {
         let s = schema();
         let rec = record(&s, "1", "20", "REF");
         let mut buf = Vec::new();
-        let mut w = SwiftWriter::new(
+        let mut w = finite_writer(
             Cursor::new(&mut buf),
             s.clone(),
             SwiftWriterConfig::default(),
         );
         let err = w.write_record(&rec).unwrap_err();
         assert!(
-            matches!(&err, FormatError::Swift(m) if m.contains("block-4")),
+            matches!(
+                &err,
+                FormatError::OutputEncoding {
+                    kind: OutputEncodingKind::SwiftBlock,
+                    field: 1,
+                    offset: 0,
+                    ..
+                }
+            ),
             "expected a block-4 rejection, got: {err:?}"
         );
     }
@@ -1083,14 +740,22 @@ mod tests {
         let s = schema();
         let rec = record(&s, "4", "77E", "LINE1\n-}EVIL");
         let mut buf = Vec::new();
-        let mut w = SwiftWriter::new(
+        let mut w = finite_writer(
             Cursor::new(&mut buf),
             s.clone(),
             SwiftWriterConfig::default(),
         );
         let err = w.write_record(&rec).unwrap_err();
         assert!(
-            matches!(&err, FormatError::Swift(m) if m.contains("block terminator")),
+            matches!(
+                &err,
+                FormatError::OutputEncoding {
+                    kind: OutputEncodingKind::SwiftContinuation,
+                    field: 3,
+                    offset: 6,
+                    ..
+                }
+            ),
             "expected a block-terminator rejection, got: {err:?}"
         );
     }
@@ -1102,14 +767,22 @@ mod tests {
         let s = schema();
         let rec = record(&s, "4", "86", "NARRATIVE\n:99:NOTAFIELD");
         let mut buf = Vec::new();
-        let mut w = SwiftWriter::new(
+        let mut w = finite_writer(
             Cursor::new(&mut buf),
             s.clone(),
             SwiftWriterConfig::default(),
         );
         let err = w.write_record(&rec).unwrap_err();
         assert!(
-            matches!(&err, FormatError::Swift(m) if m.contains("tag marker")),
+            matches!(
+                &err,
+                FormatError::OutputEncoding {
+                    kind: OutputEncodingKind::SwiftContinuation,
+                    field: 3,
+                    offset: 10,
+                    ..
+                }
+            ),
             "expected a tag-marker rejection, got: {err:?}"
         );
     }
@@ -1137,14 +810,22 @@ mod tests {
             ],
         );
         let mut buf = Vec::new();
-        let mut w = SwiftWriter::new(
+        let mut w = finite_writer(
             Cursor::new(&mut buf),
             s.clone(),
             SwiftWriterConfig::default(),
         );
         let err = w.write_record(&rec).unwrap_err();
         assert!(
-            matches!(&err, FormatError::Swift(m) if m.contains("no `tag`")),
+            matches!(
+                &err,
+                FormatError::OutputEncoding {
+                    kind: OutputEncodingKind::SwiftTag,
+                    field: 2,
+                    offset: 0,
+                    ..
+                }
+            ),
             "expected a missing-tag error, got: {err:?}"
         );
     }
@@ -1163,15 +844,23 @@ mod tests {
             ],
         );
         let mut buf = Vec::new();
-        let mut w = SwiftWriter::new(
+        let mut w = finite_writer(
             Cursor::new(&mut buf),
             s.clone(),
             SwiftWriterConfig::default(),
         );
         let err = w.write_record(&rec).unwrap_err();
         assert!(
-            matches!(&err, FormatError::UnserializableMapValue { format: "swift", column } if column == "value"),
-            "expected UnserializableMapValue for value, got: {err:?}"
+            matches!(
+                &err,
+                FormatError::OutputEncoding {
+                    kind: OutputEncodingKind::SwiftScalar,
+                    field: 3,
+                    offset: 0,
+                    ..
+                }
+            ),
+            "expected scalar encoding rejection for value, got: {err:?}"
         );
     }
 
@@ -1184,10 +873,18 @@ mod tests {
             ..Default::default()
         };
         let mut buf = Vec::new();
-        let mut w = SwiftWriter::new(Cursor::new(&mut buf), s.clone(), config);
+        let mut w = finite_writer(Cursor::new(&mut buf), s.clone(), config);
         let err = w.write_record(&rec).unwrap_err();
         assert!(
-            matches!(&err, FormatError::Swift(m) if m.contains("no `body` field")),
+            matches!(
+                &err,
+                FormatError::OutputEncoding {
+                    kind: OutputEncodingKind::SwiftDocument,
+                    field: 1,
+                    offset: 0,
+                    ..
+                }
+            ),
             "expected an absent-section error, got: {err:?}"
         );
     }

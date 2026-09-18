@@ -64,6 +64,22 @@ fn swift_writer_rejects_every_framer_anchored_trailer_before_delivery() {
             let first = if prior_success { ":79:FIRST\r\n" } else { "" };
             assert_eq!(output.contents(), format!("{{1:HEADER}}{{4:\r\n{first}:79:A\r:20:still data SEE-}}NOTE\r\n-}}{{5:TRAILER}}").as_bytes());
             assert_eq!(resources.used(), 0);
+            let emitted = output.contents();
+            let mut reader = clinker_format::swift::SwiftReader::new(
+                emitted.as_slice(),
+                clinker_format::swift::SwiftReaderConfig::default(),
+            );
+            if prior_success {
+                assert_eq!(
+                    reader.next_record().unwrap().unwrap().get("value"),
+                    Some(&Value::String("FIRST".into()))
+                );
+            }
+            assert_eq!(
+                reader.next_record().unwrap().unwrap().get("value"),
+                Some(&Value::String("A\r:20:still data SEE-}NOTE".into()))
+            );
+            assert!(reader.next_record().unwrap().is_none());
         }
     }
 }
