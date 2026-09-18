@@ -10,6 +10,57 @@ use clinker_format::reserved::ReservedBuffer;
 use clinker_format::reserved::ReservedVec;
 
 #[test]
+fn fixed_width_late_structured_envelope_rejects_without_delivery() {
+    use clinker_format::FormatWriter;
+    use clinker_format::envelope_writer::OutputEnvelopeSpec;
+    use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConfig};
+    use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Value};
+    use std::sync::Arc;
+
+    for footer in [false, true] {
+        for structured in [
+            Value::Array(OwnedValues::from_vec(vec![Value::Integer(1)])),
+            Value::Map(OwnedMap::from_map(Default::default())),
+        ] {
+            let section = Value::Map(OwnedMap::from_map(
+                [
+                    (OwnedKey::from("valid"), Value::String("prefix".into())),
+                    (OwnedKey::from("unsupported"), structured),
+                ]
+                .into(),
+            ));
+            let doc = DocumentContext::new(
+                DocumentId::next(),
+                Arc::from("input.txt"),
+                EnvelopeRecord::from_sections([(OwnedKey::from("authored"), section)]),
+            );
+            let mut bytes = Vec::new();
+            let mut writer = FixedWidthWriter::new(
+                &mut bytes,
+                vec![],
+                FixedWidthWriterConfig {
+                    envelope: Some(OutputEnvelopeSpec {
+                        header_from_doc: (!footer).then(|| "authored".into()),
+                        footer_from_doc: footer.then(|| "authored".into()),
+                        footer_record_count_field: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let result = if footer {
+                writer.end_document(&doc)
+            } else {
+                writer.begin_document(&doc)
+            };
+            assert!(result.is_err(), "structured sections have no scalar representation");
+            drop(writer);
+            assert!(bytes.is_empty(), "the complete rejected section must stay private");
+        }
+    }
+}
+
+#[test]
 fn allocation_only_scope_and_writer_stage_share_one_finite_ledger() {
     let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
     let resources = provider.resources();
