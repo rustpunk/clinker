@@ -1,14 +1,13 @@
-use clinker_record::owned_storage::OwnedKey;
 use std::io::Write;
 
 use clinker_record::schema_def::{Justify, LineSeparator, TruncationPolicy};
 use clinker_record::{DocumentContext, Record, Value};
 use cxl::typecheck::Type;
 
-use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
+use crate::envelope_writer::OutputEnvelopeSpec;
 use crate::error::FormatError;
 use crate::error::{OutputEncodingKind, OutputFieldName};
-use crate::fixed_width::field::{self, ResolvedRepeatingGroup};
+use crate::fixed_width::field;
 use crate::preparation::{
     FormatEncoder, OutputOperation, PreparedWriter, WriterResources, WriterScope,
 };
@@ -860,607 +859,43 @@ impl Default for FixedWidthWriterConfig {
     }
 }
 
-/// Pre-resolved field for writing.
-#[derive(Clone)]
-struct WriteField {
-    name: String,
-    /// 0-based byte offset of the field's first cell byte within the record,
-    /// resolved with the same semantics the reader slices by.
-    start: usize,
-    width: usize,
-    justify: Justify,
-    pad_char: char,
-    truncation: TruncationPolicy,
-}
-
-struct WriteGroup {
-    resolved: ResolvedRepeatingGroup,
-    fields: Vec<WriteField>,
-}
-
-enum WriteLayout {
-    Scalar(WriteField),
-    Group(WriteGroup),
-}
-
-impl WriteLayout {
-    fn name(&self) -> &str {
-        match self {
-            Self::Scalar(field) => &field.name,
-            Self::Group(group) => &group.resolved.name,
-        }
-    }
-
-    fn start(&self) -> usize {
-        match self {
-            Self::Scalar(field) => field.start,
-            Self::Group(group) => group.resolved.start,
-        }
-    }
-
-    fn end(&self) -> usize {
-        match self {
-            Self::Scalar(field) => field.start + field.width,
-            Self::Group(group) => group.resolved.end(),
-        }
-    }
-
-    fn is_group(&self) -> bool {
-        matches!(self, Self::Group(_))
-    }
-}
-
-fn write_field(column: &Column, start: usize, width: usize) -> Result<WriteField, FormatError> {
-    let is_numeric = matches!(
-        column.ty.unwrap_nullable(),
-        Type::Int | Type::Float | Type::Decimal | Type::Numeric
-    );
-    let justify = column.justify.clone().unwrap_or(if is_numeric {
-        Justify::Right
-    } else {
-        Justify::Left
-    });
-    field::validate_pad(&column.name, column.pad.as_deref())?;
-    let pad_char = column
-        .pad
-        .as_deref()
-        .and_then(|pad| pad.chars().next())
-        .unwrap_or(' ');
-    let truncation = column.truncation.clone().unwrap_or(if is_numeric {
-        TruncationPolicy::Error
-    } else {
-        TruncationPolicy::Warn
-    });
-    Ok(WriteField {
-        name: column.name.clone(),
-        start,
-        width,
-        justify,
-        pad_char,
-        truncation,
-    })
-}
-
-/// Schema-driven fixed-width record writer.
-/// Type-aware truncation: numeric -> Error, string -> Warn (configurable per field).
-///
-/// Every field is emitted at its declared byte range (`start` plus
-/// `width`/`end`, resolved with the reader's semantics), independent of
-/// declaration order; gaps between declared ranges are space-filled so a
-/// written record reads back under the same schema. Overlapping ranges are
-/// rejected at construction. A column omitting `start` continues at the
-/// previous column's end (sequential layout).
-///
-/// Under `reconstruct_envelope`, `begin_document` emits the header section's
-/// field values as one leading line and `end_document` the footer's as one
-/// trailing line, each joined positionally in declared field order with the
-/// configured line separator. The body streams between them, so framing stays
-/// O(1-record).
-pub struct FixedWidthWriter<W: Write> {
-    writer: W,
-    layouts: Vec<WriteLayout>,
-    config: FixedWidthWriterConfig,
-    truncation_warnings: Vec<String>,
-    /// Per-document envelope framer, present only when `config.envelope` is.
-    framer: Option<EnvelopeFramer>,
-}
-
-impl<W: Write> FixedWidthWriter<W> {
-    pub fn new(
-        writer: W,
-        fields: Vec<Column>,
-        config: FixedWidthWriterConfig,
-    ) -> Result<Self, FormatError> {
-        field::validate_write_layout(&fields)?;
-        // Byte positions resolve exactly as the reader's (`start` plus
-        // `width`/`end`), so what this writer emits at a range is what the
-        // reader slices back out. A column omitting `start` continues at the
-        // previous column's end, keeping a width-only schema sequential.
-        let mut layouts: Vec<WriteLayout> = Vec::with_capacity(fields.len());
-        let mut next_start = 0usize;
-        for column in &fields {
-            let start = column.start.unwrap_or(next_start);
-            let layout = if column.fields.is_some()
-                || column.occurs.is_some()
-                || column.count_field.is_some()
-            {
-                let resolved = ResolvedRepeatingGroup::from_column_at(column, start)?;
-                let children = column.fields.as_deref().unwrap_or(&[]);
-                let write_fields = resolved
-                    .fields
-                    .iter()
-                    .map(|resolved_child| {
-                        let child = children
-                            .iter()
-                            .find(|child| child.name == resolved_child.name)
-                            .expect("resolved child came from this declaration");
-                        write_field(child, resolved_child.start, resolved_child.width)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                WriteLayout::Group(WriteGroup {
-                    resolved,
-                    fields: write_fields,
-                })
-            } else {
-                let width = field::resolve_width(column, start)?;
-                start.checked_add(width).ok_or_else(|| {
-                    field::invalid_field(&column.name, "'start' + width overflows")
-                })?;
-                WriteLayout::Scalar(write_field(column, start, width)?)
-            };
-            next_start = layout.end();
-            layouts.push(layout);
-        }
-
-        // Emit in byte order regardless of declaration order. Overlapping
-        // ranges have no consistent byte layout — later bytes would clobber
-        // earlier ones — so they are a construction defect, not a per-record
-        // surprise.
-        layouts.sort_by_key(WriteLayout::start);
-        for pair in layouts.windows(2) {
-            let (prev, next) = (&pair[0], &pair[1]);
-            if next.start() < prev.end() {
-                let error = if next.is_group() || prev.is_group() {
-                    field::invalid_group(
-                        if next.is_group() {
-                            next.name()
-                        } else {
-                            prev.name()
-                        },
-                        &format!(
-                            "range {}..{} overlaps field '{}' ({}..{}); give the group, count, payload, and adjacent fields disjoint maximum ranges",
-                            next.start(),
-                            next.end(),
-                            prev.name(),
-                            prev.start(),
-                            prev.end()
-                        ),
-                    )
-                } else {
-                    field::invalid_field(
-                        next.name(),
-                        &format!(
-                            "range {}..{} overlaps field '{}' ({}..{})",
-                            next.start(),
-                            next.end(),
-                            prev.name(),
-                            prev.start(),
-                            prev.end()
-                        ),
-                    )
-                };
-                return Err(error);
-            }
-        }
-
-        let framer = config
-            .envelope
-            .clone()
-            .and_then(OutputEnvelopeSpec::into_framer);
-        Ok(Self {
-            writer,
-            layouts,
-            config,
-            truncation_warnings: Vec::new(),
-            framer,
-        })
-    }
-
-    /// Emit one envelope section as a single fixed-width line: the section's
-    /// field values (in declared order) concatenated, then the configured line
-    /// separator. Envelope sections carry no width schema, so values are
-    /// written unpadded — a header/trailer LINE round-trips, but not a
-    /// column-positioned one (that would need a width declaration the envelope
-    /// config does not carry). Called only for a section the document actually
-    /// carries (a missing section emits no line). A computed footer count is
-    /// rejected at plan time for fixed-width (E346).
-    fn write_section_line(
-        writer: &mut W,
-        config: &FixedWidthWriterConfig,
-        fields: &indexmap::IndexMap<OwnedKey, Value>,
-    ) -> Result<(), FormatError> {
-        let mut line = String::new();
-        for value in fields.values() {
-            line.push_str(&value_to_envelope_cell(value));
-        }
-        writer.write_all(line.as_bytes())?;
-        match config.line_separator {
-            LineSeparator::Lf => writer.write_all(b"\n")?,
-            LineSeparator::CrLf => writer.write_all(b"\r\n")?,
-            LineSeparator::None => {}
-        }
-        Ok(())
-    }
-
-    /// Get any truncation warnings emitted during writing.
-    pub fn truncation_warnings(&self) -> &[String] {
-        &self.truncation_warnings
-    }
-
-    /// Encode and validate one complete record before the destination sees any
-    /// bytes. Capacity is bounded by the maximum resolved record layout plus
-    /// its fixed line separator.
-    fn encode_record(&mut self, record: &Record) -> Result<Vec<u8>, FormatError> {
-        for (name, _) in record.iter_user_fields() {
-            if !self.layouts.iter().any(|layout| layout.name() == name) {
-                return Err(FormatError::SchemaDrift {
-                    format: "fixed-width",
-                    column: name.to_string(),
-                });
-            }
-        }
-
-        let separator_width = match self.config.line_separator {
-            LineSeparator::Lf => 1,
-            LineSeparator::CrLf => 2,
-            LineSeparator::None => 0,
-        };
-        let max_record_width = self.layouts.iter().map(WriteLayout::end).max().unwrap_or(0);
-        let capacity = max_record_width
-            .checked_add(separator_width)
-            .ok_or_else(|| FormatError::InvalidRecord {
-                row: 0,
-                message: "fixed-width record length overflows after adding its line separator"
-                    .to_string(),
-            })?;
-        let mut encoded = Vec::with_capacity(capacity);
-        let null = Value::Null;
-        let mut shifted_left = 0usize;
-        let layouts = &self.layouts;
-        let warnings = &mut self.truncation_warnings;
-
-        for layout in layouts {
-            let start = layout.start().checked_sub(shifted_left).ok_or_else(|| {
-                FormatError::InvalidRecord {
-                    row: 0,
-                    message: format!(
-                        "field '{}': prior shifted groups move this field before byte zero",
-                        layout.name()
-                    ),
-                }
-            })?;
-            encoded.resize(start, b' ');
-            match layout {
-                WriteLayout::Scalar(field) => {
-                    let value = record.get(&field.name).unwrap_or(&null);
-                    encode_scalar_cell(&mut encoded, field, value, warnings, None)?;
-                }
-                WriteLayout::Group(group) => {
-                    let value = record.get(&group.resolved.name).unwrap_or(&null);
-                    let width = encode_group(&mut encoded, group, value, warnings)?;
-                    if matches!(group.resolved.occurs.fill, FixedWidthFill::Shift) {
-                        shifted_left += group.resolved.max_width() - width;
-                    }
-                }
-            }
-        }
-
-        match self.config.line_separator {
-            LineSeparator::Lf => encoded.push(b'\n'),
-            LineSeparator::CrLf => encoded.extend_from_slice(b"\r\n"),
-            LineSeparator::None => {}
-        }
-        Ok(encoded)
-    }
-}
-
-fn encode_group(
-    encoded: &mut Vec<u8>,
-    group: &WriteGroup,
-    value: &Value,
-    warnings: &mut Vec<String>,
-) -> Result<usize, FormatError> {
-    let supplied = match value {
-        Value::Null => &[][..],
-        Value::Array(values) => values.as_slice(),
-        _ => {
-            return Err(FormatError::InvalidRecord {
-                row: 0,
-                message: format!(
-                    "group '{}': expected an array of records; provide `[]` for zero occurrences",
-                    group.resolved.name
-                ),
-            });
-        }
-    };
-    if supplied.len() < group.resolved.occurs.min {
-        return Err(FormatError::InvalidRecord {
-            row: 0,
-            message: format!(
-                "group '{}': declared minimum is {}, but the record contains {} occurrence(s)",
-                group.resolved.name,
-                group.resolved.occurs.min,
-                supplied.len()
-            ),
-        });
-    }
-
-    let selected = if supplied.len() <= group.resolved.occurs.max {
-        supplied
-    } else {
-        match group.resolved.occurs.on_overflow {
-            FixedWidthOverflow::Error => {
-                return Err(FormatError::InvalidRecord {
-                    row: 0,
-                    message: format!(
-                        "group '{}': declared maximum is {}, but the record contains {} occurrence(s); reduce the array or select `on_overflow: truncate` with `keep: first|last`",
-                        group.resolved.name,
-                        group.resolved.occurs.max,
-                        supplied.len()
-                    ),
-                });
-            }
-            FixedWidthOverflow::Truncate => match group.resolved.occurs.keep {
-                Some(FixedWidthTruncateKeep::First) => &supplied[..group.resolved.occurs.max],
-                Some(FixedWidthTruncateKeep::Last) => {
-                    &supplied[supplied.len() - group.resolved.occurs.max..]
-                }
-                None => unreachable!("layout validation requires a retained end"),
-            },
-        }
-    };
-
-    if let Some(count_field) = &group.resolved.count_field {
-        let count = format!("{:0width$}", selected.len(), width = count_field.width);
-        encoded.extend_from_slice(count.as_bytes());
-    }
-
-    let slots = match group.resolved.occurs.fill {
-        FixedWidthFill::Pad => group.resolved.occurs.max,
-        FixedWidthFill::Shift => selected.len(),
-    };
-    for index in 0..slots {
-        let values = match selected.get(index) {
-            Some(Value::Map(values)) => Some(values.as_map()),
-            Some(_) => {
-                return Err(FormatError::InvalidRecord {
-                    row: 0,
-                    message: format!(
-                        "group '{}': occurrence {} is not a record; provide a map with the declared child fields",
-                        group.resolved.name,
-                        index + 1
-                    ),
-                });
-            }
-            None => None,
-        };
-        let renders_as_unused_padding = match values {
-            Some(values) => group_occurrence_is_blank(group, values)?,
-            None => false,
-        };
-        if group.resolved.count_field.is_none()
-            && matches!(group.resolved.occurs.fill, FixedWidthFill::Pad)
-            && renders_as_unused_padding
-        {
-            return Err(FormatError::InvalidRecord {
-                row: 0,
-                message: format!(
-                    "group '{}': occurrence {} renders exactly like an unused padded slot; add a `count_field` or provide at least one non-padding child value",
-                    group.resolved.name,
-                    index + 1
-                ),
-            });
-        }
-        let occurrence_start = encoded.len();
-        for child in &group.fields {
-            encoded.resize(occurrence_start + child.start, b' ');
-            let value = values
-                .and_then(|map| map.get(child.name.as_str()))
-                .unwrap_or(&Value::Null);
-            encode_scalar_cell(encoded, child, value, warnings, Some(&group.resolved.name))?;
-        }
-        encoded.resize(occurrence_start + group.resolved.occurrence_width(), b' ');
-    }
-    Ok(group.resolved.encoded_width(selected.len()))
-}
-
-fn group_occurrence_is_blank(
-    group: &WriteGroup,
-    values: &indexmap::IndexMap<OwnedKey, Value>,
-) -> Result<bool, FormatError> {
-    for (field, resolved) in group.fields.iter().zip(&group.resolved.fields) {
-        let value = values.get(field.name.as_str()).unwrap_or(&Value::Null);
-        if matches!(value, Value::Array(_) | Value::Map(_)) {
-            return Ok(false);
-        }
-        let formatted = format_scalar_value(field, value)?;
-        let padded = pad_and_justify(field, &formatted);
-        if !field::strip_padding(&padded, resolved).is_empty() {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn encode_scalar_cell(
-    encoded: &mut Vec<u8>,
-    field: &WriteField,
-    value: &Value,
-    warnings: &mut Vec<String>,
-    group_name: Option<&str>,
-) -> Result<(), FormatError> {
-    if group_name.is_some() && matches!(value, Value::Array(_) | Value::Map(_)) {
-        return Err(FormatError::InvalidRecord {
-            row: 0,
-            message: format!(
-                "group '{}': child '{}' must be scalar; flatten the occurrence record to the declared child fields",
-                group_name.unwrap_or_default(),
-                field.name
-            ),
-        });
-    }
-    let formatted = format_scalar_value(field, value)?;
-    if formatted.len() > field.width {
-        match field.truncation {
-            TruncationPolicy::Error => {
-                let message = match group_name {
-                    Some(group_name) => format!(
-                        "group '{group_name}': child '{}' is {} bytes, exceeding its declared width {}; shorten the child value or change its width/truncation policy",
-                        field.name,
-                        formatted.len(),
-                        field.width
-                    ),
-                    None => format!(
-                        "field '{}': value '{}' ({} bytes) exceeds width {} — truncation policy is 'error'",
-                        field.name,
-                        formatted,
-                        formatted.len(),
-                        field.width
-                    ),
-                };
-                return Err(FormatError::InvalidRecord { row: 0, message });
-            }
-            TruncationPolicy::Warn => {
-                warnings.push(match group_name {
-                    Some(group_name) => format!(
-                        "group '{group_name}': child '{}' truncated from {} to {} bytes",
-                        field.name,
-                        formatted.len(),
-                        field.width
-                    ),
-                    None => format!(
-                        "field '{}': value '{}' truncated to {} bytes",
-                        field.name, formatted, field.width
-                    ),
-                });
-            }
-            TruncationPolicy::Silent => {}
-        }
-    }
-    encoded.extend_from_slice(pad_and_justify(field, &formatted).as_bytes());
-    Ok(())
-}
-
-fn format_scalar_value(field: &WriteField, value: &Value) -> Result<String, FormatError> {
-    Ok(match value {
-        Value::Null => String::new(),
-        Value::String(value) => value.to_string(),
-        Value::Integer(value) => value.to_string(),
-        Value::Float(value) => value.to_string(),
-        Value::Decimal(value) => value.to_string(),
-        Value::Bool(value) => value.to_string(),
-        Value::Date(value) => value.format("%Y%m%d").to_string(),
-        Value::DateTime(value) => value.format("%Y%m%d%H%M%S").to_string(),
-        Value::Array(_) => {
-            return Err(FormatError::UnserializableArrayValue {
-                format: "fixed-width",
-                column: field.name.clone(),
-            });
-        }
-        Value::Map(_) => {
-            return Err(FormatError::UnserializableMapValue {
-                format: "fixed-width",
-                column: field.name.clone(),
-            });
-        }
-    })
-}
-
-fn pad_and_justify(field: &WriteField, value: &str) -> String {
-    let mut cut = value.len().min(field.width);
-    while !value.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let kept = &value[..cut];
-    let padding = field.width - cut;
-    let mut output = String::with_capacity(field.width);
-    match field.justify {
-        Justify::Left => {
-            output.push_str(kept);
-            output.extend(std::iter::repeat_n(field.pad_char, padding));
-        }
-        Justify::Right => {
-            output.extend(std::iter::repeat_n(field.pad_char, padding));
-            output.push_str(kept);
-        }
-    }
-    output
-}
-
-impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
-    fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        let encoded = self.encode_record(record)?;
-        self.writer.write_all(&encoded)?;
-
-        if let Some(framer) = self.framer.as_mut() {
-            framer.count_record();
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<(), FormatError> {
-        self.writer.flush().map_err(FormatError::Io)
-    }
-
-    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
-        let Some(framer) = self.framer.as_mut() else {
-            return Ok(());
-        };
-        framer.begin();
-        // Render the header directly off the framer's borrow into the
-        // DocumentContext: `write_section_line` takes the disjoint `writer`
-        // field, so it runs while the framer borrow is live. `None` (document
-        // lacks the configured section) emits no header line.
-        if let Some(fields) = framer.header_fields(doc) {
-            Self::write_section_line(&mut self.writer, &self.config, fields)?;
-        }
-        Ok(())
-    }
-
-    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
-        let Some(framer) = self.framer.as_ref() else {
-            return Ok(());
-        };
-        if let Some(fields) = framer.footer_fields(doc) {
-            Self::write_section_line(&mut self.writer, &self.config, fields)?;
-        }
-        Ok(())
-    }
-}
-
-/// Stringify an envelope section value for a fixed-width header/trailer line.
-/// Envelope sections carry no width schema, so values are written as their
-/// natural string form (no padding); `Null` is the empty string.
-fn value_to_envelope_cell(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::String(s) => s.to_string(),
-        Value::Integer(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Decimal(d) => d.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Date(d) => d.format("%Y%m%d").to_string(),
-        Value::DateTime(dt) => dt.format("%Y%m%d%H%M%S").to_string(),
-        Value::Array(_) | Value::Map(_) => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clinker_record::owned_storage::{OwnedMap, OwnedValues, SharedStorage};
+    use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
     use clinker_record::{Record, Schema, Value};
     use std::sync::Arc;
+
+    fn finite_writer<W: Write + Send>(
+        destination: W,
+        fields: Vec<Column>,
+        config: FixedWidthWriterConfig,
+    ) -> Result<PreparedWriter<W, FixedWidthEncoder>, FormatError> {
+        let provider = crate::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+        );
+        let encoder = FixedWidthEncoder::new(&fields, &config, provider.resources())?;
+        Ok(PreparedWriter::new(
+            destination,
+            encoder,
+            provider.resources(),
+        )?)
+    }
+
+    fn layout_error(fields: Vec<Column>) -> FormatError {
+        let error =
+            field::validate_write_layout(&fields).expect_err("pure validation rejects layout");
+        let result = finite_writer(Vec::new(), fields, FixedWidthWriterConfig::default());
+        assert!(matches!(
+            result,
+            Err(FormatError::OutputEncoding {
+                format: "fixed-width",
+                kind: OutputEncodingKind::FixedWidthLayout,
+                ..
+            })
+        ));
+        error
+    }
 
     fn field(name: &str) -> Column {
         Column::bare(name, Type::String)
@@ -1505,7 +940,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer =
-                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+                finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
             let rec = make_record(
                 &["id", "name", "amount"],
                 vec![
@@ -1550,7 +985,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer =
-                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+                finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
             writer
                 .write_record(&make_record(
                     &["id", "name"],
@@ -1591,7 +1026,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer =
-                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+                finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
             let rec = make_record(&["name"], vec![Value::String("Alice".into())]);
             writer.write_record(&rec).unwrap();
             writer.flush().unwrap();
@@ -1615,7 +1050,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer =
-                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+                finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
             let rec = make_record(&["amount"], vec![Value::Integer(42)]);
             writer.write_record(&rec).unwrap();
             writer.flush().unwrap();
@@ -1641,12 +1076,12 @@ mod tests {
         let warning_msg;
         {
             let mut writer =
-                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+                finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
             let rec = make_record(&["name"], vec![Value::String("LongName".into())]);
             writer.write_record(&rec).unwrap();
             writer.flush().unwrap();
-            warning_count = writer.truncation_warnings().len();
-            warning_msg = writer.truncation_warnings()[0].clone();
+            warning_count = writer.encoder().truncation_warnings().len();
+            warning_msg = writer.encoder().truncation_warnings()[0].clone();
         }
 
         let output = String::from_utf8(buf).unwrap();
@@ -1675,11 +1110,11 @@ mod tests {
         let warning_msg;
         {
             let mut writer =
-                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+                finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
             let rec = make_record(&["name"], vec![Value::String("café".into())]);
             writer.write_record(&rec).unwrap();
             writer.flush().unwrap();
-            warning_msg = writer.truncation_warnings()[0].clone();
+            warning_msg = writer.encoder().truncation_warnings()[0].clone();
         }
 
         // Valid UTF-8 of exactly the byte width — the partial `é` is dropped,
@@ -1715,12 +1150,12 @@ mod tests {
         let warning_count;
         {
             let mut writer =
-                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+                finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
             // `é` is 2 bytes; width 1 cannot hold it, so the cell is one pad byte.
             let rec = make_record(&["flag"], vec![Value::String("é".into())]);
             writer.write_record(&rec).unwrap();
             writer.flush().unwrap();
-            warning_count = writer.truncation_warnings().len();
+            warning_count = writer.encoder().truncation_warnings().len();
         }
 
         let output = String::from_utf8(buf).expect("output must be valid UTF-8");
@@ -1743,10 +1178,7 @@ mod tests {
             f
         }];
 
-        let mut buf = Vec::new();
-        let err = FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default())
-            .err()
-            .expect("multi-byte pad must be rejected at construction");
+        let err = layout_error(fields);
         match err {
             FormatError::InvalidRecord { row, message } => {
                 assert_eq!(row, 0, "construction defect reports row 0");
@@ -1779,10 +1211,7 @@ mod tests {
             f
         }];
 
-        let mut buf = Vec::new();
-        let err = FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default())
-            .err()
-            .expect("multi-character pad must be rejected at construction");
+        let err = layout_error(fields);
         match err {
             FormatError::InvalidRecord { row, message } => {
                 assert_eq!(row, 0);
@@ -1812,7 +1241,7 @@ mod tests {
 
         let mut buf = Vec::new();
         let mut writer =
-            FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+            finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
 
         let rec = make_record(&["amount"], vec![Value::Integer(12345)]);
         let err = writer.write_record(&rec);
@@ -1854,8 +1283,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer =
-                FixedWidthWriter::new(&mut buf, write_fields, FixedWidthWriterConfig::default())
-                    .unwrap();
+                finite_writer(&mut buf, write_fields, FixedWidthWriterConfig::default()).unwrap();
             let rec = make_record(
                 &["id", "name"],
                 vec![Value::Integer(42), Value::String("Alice".into())],
@@ -1878,7 +1306,7 @@ mod tests {
     }
 
     /// Fixed-width writer rejects `Value::Map` payloads with
-    /// `FormatError::UnserializableMapValue`. The previous behavior
+    /// the bounded fixed-width scalar error. The previous behavior
     /// silently emitted an empty fixed-width field for any map
     /// in `format_value`; the explicit precheck in `write_record`
     /// surfaces the misroute (typically a `$widened` sidecar
@@ -1901,19 +1329,26 @@ mod tests {
         let fields = vec![id_field, payload_field];
         let mut buf = Vec::new();
         let mut writer =
-            FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+            finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
         let err = writer.write_record(&record).unwrap_err();
         match err {
-            FormatError::UnserializableMapValue { format, column } => {
+            FormatError::OutputEncoding {
+                format,
+                field: 2,
+                offset: 0,
+                kind: OutputEncodingKind::FixedWidthScalar,
+                field_name: column,
+                element: None,
+            } => {
                 assert_eq!(format, "fixed-width");
-                assert_eq!(column, "payload");
+                assert_eq!(column.to_string(), "payload");
             }
-            other => panic!("expected UnserializableMapValue, got {other:?}"),
+            other => panic!("expected bounded Map rejection, got {other:?}"),
         }
     }
 
     /// Fixed-width writer rejects `Value::Array` payloads with
-    /// `FormatError::UnserializableArrayValue`, parallel to the map
+    /// the bounded fixed-width scalar error, parallel to the map
     /// rejection. The prior behavior emitted an empty positional cell for
     /// any array, silently dropping the payload and hiding a misroute (e.g.
     /// a `match: collect` combine output sent to a fixed-width output).
@@ -1938,14 +1373,21 @@ mod tests {
         let fields = vec![id_field, tags_field];
         let mut buf = Vec::new();
         let mut writer =
-            FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+            finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
         let err = writer.write_record(&record).unwrap_err();
         match err {
-            FormatError::UnserializableArrayValue { format, column } => {
+            FormatError::OutputEncoding {
+                format,
+                field: 2,
+                offset: 0,
+                kind: OutputEncodingKind::FixedWidthScalar,
+                field_name: column,
+                element: None,
+            } => {
                 assert_eq!(format, "fixed-width");
-                assert_eq!(column, "tags");
+                assert_eq!(column.to_string(), "tags");
             }
-            other => panic!("expected UnserializableArrayValue, got {other:?}"),
+            other => panic!("expected bounded Array rejection, got {other:?}"),
         }
     }
 
@@ -1980,7 +1422,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer =
-                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+                finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
             let rec = make_record(
                 &["a", "b"],
                 vec![Value::String("AB".into()), Value::String("CD".into())],
@@ -2031,7 +1473,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer =
-                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+                finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
             let rec = make_record(
                 &["a", "b"],
                 vec![Value::String("Alice".into()), Value::String("Bob".into())],
@@ -2078,7 +1520,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer =
-                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+                finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
             let rec = make_record(
                 &["a", "b"],
                 vec![Value::String("XX".into()), Value::String("YY".into())],
@@ -2118,10 +1560,7 @@ mod tests {
             },
         ];
 
-        let mut buf = Vec::new();
-        let err = FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default())
-            .err()
-            .expect("overlapping ranges must be rejected at construction");
+        let err = layout_error(fields);
         match err {
             FormatError::InvalidRecord { row, message } => {
                 assert_eq!(row, 0, "construction defect reports row 0");
@@ -2151,10 +1590,7 @@ mod tests {
             f
         }];
 
-        let mut buf = Vec::new();
-        let err = FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default())
-            .err()
-            .expect("width+end together must be rejected");
+        let err = layout_error(fields);
         let msg = err.to_string();
         assert!(
             msg.contains("mutually exclusive"),
@@ -2184,7 +1620,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer =
-                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+                finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
             let rec = make_record(
                 &["a", "b"],
                 vec![Value::String("x".into()), Value::Integer(42)],
@@ -2209,17 +1645,14 @@ mod tests {
             f
         }];
 
-        let mut buf = Vec::new();
-        let err = FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default())
-            .err()
-            .expect("overflowing range must be rejected");
+        let err = layout_error(fields);
         let msg = err.to_string();
         assert!(msg.contains("overflows"), "error should say so: {msg}");
     }
 
     /// A record carrying a user column the fixed-width layout does not declare
     /// — the shape `auto_widen` produces when a later record surfaces a column
-    /// the first lacked — is a loud SchemaDrift, not a silently-narrower line
+    /// the first lacked — is a loud schema-drift error, not a silently-narrower line
     /// (issue #805). Checked before any byte is emitted, so the drifting
     /// record leaves no partial line behind.
     #[test]
@@ -2233,7 +1666,7 @@ mod tests {
         }];
         let mut buf = Vec::new();
         let mut writer =
-            FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+            finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
         // Record carries `region` beyond the declared `id`.
         let record = make_record(
             &["id", "region"],
@@ -2241,11 +1674,18 @@ mod tests {
         );
         let err = writer.write_record(&record).unwrap_err();
         match err {
-            FormatError::SchemaDrift { format, column } => {
+            FormatError::OutputEncoding {
+                format,
+                field: 2,
+                offset: 0,
+                kind: OutputEncodingKind::SchemaDrift,
+                field_name: column,
+                element: None,
+            } => {
                 assert_eq!(format, "fixed-width");
-                assert_eq!(column, "region");
+                assert_eq!(column.to_string(), "region");
             }
-            other => panic!("expected SchemaDrift, got {other:?}"),
+            other => panic!("expected bounded SchemaDrift rejection, got {other:?}"),
         }
         drop(writer);
         assert!(
@@ -2279,7 +1719,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer =
-                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+                finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
             // Record declares only `id` — `name` is a legitimate absent cell.
             writer
                 .write_record(&make_record(&["id"], vec![Value::Integer(7)]))
@@ -2316,7 +1756,7 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         {
-            let mut w = FixedWidthWriter::new(&mut buf, vec![amount], config).unwrap();
+            let mut w = finite_writer(&mut buf, vec![amount], config).unwrap();
             w.begin_document(&doc).unwrap();
             w.write_record(&make_record(&["amount"], vec![Value::Integer(7)]))
                 .unwrap();
@@ -2356,7 +1796,7 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         {
-            let mut w = FixedWidthWriter::new(&mut buf, vec![amount], config).unwrap();
+            let mut w = finite_writer(&mut buf, vec![amount], config).unwrap();
             w.begin_document(&doc1).unwrap();
             w.write_record(&make_record(&["amount"], vec![Value::Integer(7)]))
                 .unwrap();

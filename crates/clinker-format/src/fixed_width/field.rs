@@ -331,6 +331,87 @@ pub fn validate_write_layout(columns: &[Column]) -> Result<(), FormatError> {
     check_write_layout(columns).map_err(LayoutError::into_format)
 }
 
+/// Validate input byte ranges without constructing a reader or retaining schema
+/// copies. Scalar ranges may overlap; groups require disjoint maximum ranges,
+/// explicit starts and an unambiguous following position when shifted.
+/// Only rejected layouts allocate diagnostic text.
+pub fn validate_read_layout(columns: &[Column]) -> Result<(), FormatError> {
+    let range = |column: &Column| -> Result<(usize, usize), FormatError> {
+        let start = column.start.ok_or_else(|| {
+            if is_group(column) {
+                invalid_group(
+                    &column.name,
+                    "must have `start` on an input schema so its first byte is known",
+                )
+            } else {
+                invalid_field(&column.name, "must have 'start'")
+            }
+        })?;
+        let width = layout_width(column, start).map_err(LayoutError::into_format)?;
+        Ok((start, start + width))
+    };
+    // Keep declaration-order validation ahead of cross-field validation.
+    for column in columns {
+        range(column)?;
+    }
+    // Visit the same stable physical ordering as the reader without retaining a
+    // second layout. This is plan/construction work, independent of row count.
+    let mut previous_key = None;
+    let mut previous: Option<(&Column, usize, usize)> = None;
+    for _ in columns {
+        let Some((index, column)) = columns
+            .iter()
+            .enumerate()
+            .filter(|(index, column)| previous_key.is_none_or(|key| (column.start, *index) > key))
+            .min_by_key(|(index, column)| (column.start, *index))
+        else {
+            break;
+        };
+        let (start, end) = range(column)?;
+        if let Some((prior, prior_start, prior_end)) = previous
+            && (is_group(prior) || is_group(column))
+            && start < prior_end
+        {
+            return Err(invalid_group(
+                if is_group(column) {
+                    &column.name
+                } else {
+                    &prior.name
+                },
+                &format!(
+                    "range {start}..{end} overlaps '{}' at {prior_start}..{prior_end}; give the group, count, payload, and adjacent fields disjoint maximum ranges",
+                    prior.name
+                ),
+            ));
+        }
+        previous_key = Some((column.start, index));
+        previous = Some((column, start, end));
+    }
+    if let Some((_, column)) = columns
+        .iter()
+        .enumerate()
+        .filter(|(index, column)| {
+            is_group(column)
+                && column
+                    .occurs
+                    .as_ref()
+                    .is_some_and(|occurs| matches!(occurs.fill, FixedWidthFill::Shift))
+                && column.count_field.is_none()
+                && columns
+                    .iter()
+                    .enumerate()
+                    .any(|(other_index, other)| (other.start, other_index) > (column.start, *index))
+        })
+        .min_by_key(|(index, column)| (column.start, *index))
+    {
+        return Err(invalid_group(
+            &column.name,
+            "uses `fill: shift` before another field without a `count_field`; add a count field so the next byte position is unambiguous, or make the group last",
+        ));
+    }
+    Ok(())
+}
+
 /// Result of one scalar coercion together with parser-owned numeric evidence
 /// when the declared target is `numeric`.
 ///

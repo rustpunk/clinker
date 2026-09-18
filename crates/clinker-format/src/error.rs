@@ -412,7 +412,8 @@ impl fmt::Display for FormatError {
                     OutputEncodingKind::FixedWidthLayout =>
                         "invalid fixed-width layout; declare positive disjoint byte ranges, single-byte padding and finite valid repetition bounds",
                     OutputEncodingKind::FixedWidthScalar =>
-                        "fixed-width cell requires a scalar; project scalar fields or declare a repeating map group",
+                        "fixed-width cell requires a scalar; project scalar fields, coerce with CXL to_string, \
+                         or route to JSON output; arrays of records require multiple: true with bounded fields and occurs",
                     OutputEncodingKind::FixedWidthTruncation =>
                         "value exceeds its declared byte width with truncation: error; shorten the value, widen the field or select truncation: warn|silent",
                     OutputEncodingKind::FixedWidthCardinality =>

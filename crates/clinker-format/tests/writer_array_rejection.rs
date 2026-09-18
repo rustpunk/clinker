@@ -2,7 +2,7 @@
 //!
 //! The fixed-width writer still rejects a stray array — most often a
 //! `match: collect` combine output misrouted to a positional format — as an
-//! explicit `FormatError::UnserializableArrayValue` naming the offending column,
+//! explicit the bounded fixed-width scalar error naming the offending column,
 //! listing the schema, scalar-coercion, and JSON remedies. The
 //! CSV and XML encode arrays only for columns whose schema declares
 //! `multiple: true`; an undeclared array remains a loud routing error. JSON
@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use clinker_format::csv::writer::{CsvEncoder, CsvWriterConfig};
 use clinker_format::error::OutputEncodingKind;
-use clinker_format::fixed_width::{FixedWidthWriter, FixedWidthWriterConfig};
+use clinker_format::fixed_width::{FixedWidthEncoder, FixedWidthWriterConfig};
 use clinker_format::json::writer::{JsonEncoder, JsonWriterConfig};
 use clinker_format::preparation::{MemoryOnlyResources, PreparedWriter};
 use clinker_format::xml::writer::{XmlEncoder, XmlWriterConfig};
@@ -151,14 +151,19 @@ fn fixed_width_writer_rejects_array_payload() {
     tags.start = Some(5);
     tags.width = Some(10);
     let mut buf = Vec::new();
-    let mut writer =
-        FixedWidthWriter::new(&mut buf, vec![id, tags], FixedWidthWriterConfig::default())
-            .expect("fixed-width writer constructs from a valid layout");
+    let provider = MemoryOnlyResources::new(std::num::NonZeroUsize::new(1024 * 1024).unwrap());
+    let encoder = FixedWidthEncoder::new(
+        &[id, tags],
+        &FixedWidthWriterConfig::default(),
+        provider.resources(),
+    )
+    .expect("fixed-width encoder admits a valid layout");
+    let mut writer = PreparedWriter::new(&mut buf, encoder, provider.resources()).unwrap();
     let err = writer.write_record(&record).unwrap_err();
     assert!(
-        matches!(&err, FormatError::UnserializableArrayValue { format, column }
-            if *format == "fixed-width" && column == "tags"),
-        "expected UnserializableArrayValue for fixed-width/tags, got {err:?}"
+        matches!(&err, FormatError::OutputEncoding { format: "fixed-width", field: 2, offset: 0, kind: OutputEncodingKind::FixedWidthScalar, field_name, element: None }
+            if field_name.to_string() == "tags"),
+        "expected bounded array rejection for fixed-width/tags, got {err:?}"
     );
     assert_lists_remedies(&err);
 }
