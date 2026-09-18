@@ -1,4 +1,4 @@
-//! Exact-byte CSV qualification through the compiled command-line executable.
+//! Exact-byte text format qualification through the compiled executable.
 //!
 //! Destination-prefix failure, cancellation, and forced stage spill are tested
 //! at the integration-owned writer boundary in `writer_resources` and
@@ -1845,4 +1845,549 @@ fn nested_input_xml_metadata_never_inflates_selected_body_count() {
             "{mode}"
         );
     }
+}
+
+const EXPECTED_PHYSICAL_ROUTES: &[&str] = &[
+    "fixed_width/file",
+    "fixed_width/files",
+    "fixed_width/fanout",
+    "fixed_width/split",
+    "fixed_width/split-fanout",
+    "fixed_width/empty",
+    "swift/file",
+    "swift/files",
+    "swift/fanout",
+    "swift/empty",
+    "swift/reconstruct",
+    "swift/reject-files",
+    "swift/reconstruct-fanout",
+    "swift/reject-split",
+    "swift/reject-split-fanout",
+];
+
+fn assert_physical_completed(output: &Output, rows: u64, artifacts: u64) {
+    assert_completed(output, rows, rows, 0);
+    let outcome = terminal(output, 0, "completed");
+    assert_eq!(outcome["publication"]["complete"], true);
+    assert_eq!(outcome["publication"]["cleanup_debt_count"], 0);
+    assert_eq!(outcome["publication"]["artifact_count"], artifacts);
+    assert_eq!(
+        outcome["publication"]["state_counts"]["published"],
+        artifacts
+    );
+}
+
+#[test]
+fn physical_cli_fixed_width_parse_failure_is_terminal_under_continue() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("pipeline.yaml"),
+        r#"pipeline: { name: physical_data_policy }
+error_handling:
+  strategy: continue
+  dlq: { path: rejected.csv }
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: fixed_width
+      path: input.dat
+      dlq_granularity: record
+      schema: [{ name: number, type: int, start: 0, width: 2 }]
+  - type: sink
+    name: out
+    input: rows
+    config:
+      name: out
+      type: json
+      path: output.json
+      options: { format: ndjson }
+"#,
+    )
+    .unwrap();
+    std::fs::write(root.path().join("input.dat"), b"01\nXX\n03\n").unwrap();
+    let result = run(root.path());
+    // A typed physical-reader parse error is terminal, even under continue;
+    // it is not a row rejection delivered through the coercion/DLQ path.
+    assert_eq!(
+        terminal(&result, 4, "failed")["failure"]["code"],
+        "source.data.invalid"
+    );
+    assert!(!root.path().join("output.json").exists());
+    let partials = nested_partial_outputs(root.path());
+    assert!(partials.iter().any(|bytes| bytes == b"{\"number\":1}\n"));
+    assert!(
+        partials
+            .iter()
+            .all(|bytes| bytes == b"{\"number\":1}\n" || bytes.is_empty())
+    );
+    let diagnostic = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        diagnostic.contains("row 2") && diagnostic.contains("XX"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
+fn physical_cli_malformed_files_preserve_exact_successful_prefixes() {
+    for format in ["fixed_width", "swift"] {
+        for variant in [
+            "utf8",
+            "bom",
+            "unsupported-bom",
+            "first",
+            "second",
+            "late",
+            "invalid-value",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let schema = if format == "fixed_width" {
+                "[{ name: number, type: int, start: 0, width: 2 }]"
+            } else {
+                "[{ name: block, type: string }, { name: tag, type: string }, { name: value, type: string }]"
+            };
+            let yaml = format!(
+                r#"pipeline: {{ name: physical_input }}
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: {format}
+      glob: input-*.dat
+      schema: {schema}
+  - type: sink
+    name: out
+    input: rows
+    config:
+      name: out
+      type: json
+      path: output.json
+      options: {{ format: ndjson }}
+"#
+            );
+            std::fs::write(root.path().join("pipeline.yaml"), yaml).unwrap();
+            let valid: &[u8] = if format == "fixed_width" {
+                b"01\n"
+            } else {
+                b"{4:\n:20:one\n-}"
+            };
+            let first: &[u8] = if format == "fixed_width" {
+                b"{\"number\":1}\n"
+            } else {
+                b"{\"block\":\"4\",\"tag\":\"20\",\"value\":\"one\"}\n"
+            };
+            let invalid: &[u8] = match (format, variant) {
+                (_, "unsupported-bom") => b"\xff\xfe\0\0",
+                ("fixed_width", "invalid-value") => b"XX\n",
+                ("fixed_width", _) => b"\xff1\n",
+                (_, "invalid-value") => b"{4:\n:20:one\n",
+                _ => b"{4:\n:20:\xff\n-}",
+            };
+            let bytes = if variant == "bom" {
+                [b"\xef\xbb\xbf".as_slice(), valid].concat()
+            } else if matches!(variant, "utf8" | "second") {
+                valid.to_vec()
+            } else if variant == "late" {
+                if format == "fixed_width" {
+                    [valid, invalid].concat()
+                } else {
+                    [
+                        b"{4:\n:20:one\n:21:".as_slice(),
+                        &vec![b'x'; 32768],
+                        b"\xff\n-}",
+                    ]
+                    .concat()
+                }
+            } else {
+                invalid.to_vec()
+            };
+            std::fs::write(root.path().join("input-a.dat"), bytes).unwrap();
+            if variant == "second" {
+                std::fs::write(root.path().join("input-b.dat"), invalid).unwrap();
+            }
+            let result = run(root.path());
+            if variant == "utf8" || (variant == "bom" && format == "fixed_width") {
+                assert_physical_completed(&result, 1, 1);
+                assert_eq!(
+                    std::fs::read(root.path().join("output.json")).unwrap(),
+                    first
+                );
+            } else {
+                let outcome = terminal(&result, 4, "failed");
+                assert_eq!(
+                    outcome["failure"]["code"], "source.data.invalid",
+                    "{format}/{variant}: {outcome}"
+                );
+                assert!(!root.path().join("output.json").exists());
+                let expected =
+                    if variant == "second" || (variant == "late" && format == "fixed_width") {
+                        first
+                    } else {
+                        b""
+                    };
+                let partials = nested_partial_outputs(root.path());
+                assert!(
+                    partials.iter().any(|bytes| bytes == expected),
+                    "{format}/{variant}: {partials:?}"
+                );
+                assert!(
+                    partials
+                        .iter()
+                        .all(|bytes| bytes == expected || bytes.is_empty()),
+                    "{format}/{variant}: {partials:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn physical_cli_fixed_width_repetition_keeps_utf8_byte_positions() {
+    let root = tempfile::tempdir().unwrap();
+    let columns = r#"        - name: items
+          type: map
+          multiple: true
+          start: 0
+          count_field: { name: total, width: 1 }
+          occurs: { min: 0, max: 2, fill: pad }
+          fields:
+            - { name: text, type: string, start: 0, width: 2 }
+"#;
+    let yaml = format!(
+        r#"pipeline: {{ name: physical_repetition }}
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: fixed_width
+      path: input.dat
+      schema:
+{columns}  - type: sink
+    name: out
+    input: rows
+    config:
+      name: out
+      type: fixed_width
+      path: output.dat
+      schema:
+{columns}"#
+    );
+    std::fs::write(root.path().join("pipeline.yaml"), yaml).unwrap();
+    let bytes = b"2\xc3\xa9\xc3\xb1\n1\xc3\xb1  \n0    \n";
+    std::fs::write(root.path().join("input.dat"), bytes).unwrap();
+    assert_physical_completed(&run(root.path()), 3, 1);
+    assert_eq!(
+        std::fs::read(root.path().join("output.dat")).unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn physical_cli_fixed_width_selected_sections_reconstruct_each_file() {
+    for variant in ["file", "files", "bad-header", "bad-footer"] {
+        let root = tempfile::tempdir().unwrap();
+        let yaml = r#"pipeline: { name: physical_sections }
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: fixed_width
+      glob: input-*.dat
+      schema:
+        discriminator: { start: 0, width: 1 }
+        records:
+          - id: opening
+            tag: H
+            columns:
+              - { name: kind, type: string, start: 0, width: 1 }
+              - { name: label, type: string, start: 1, width: 2 }
+          - id: detail
+            tag: D
+            columns:
+              - { name: kind, type: string, start: 0, width: 1 }
+              - { name: text, type: string, start: 1, width: 2 }
+          - id: closing
+            tag: F
+            columns:
+              - { name: kind, type: string, start: 0, width: 1 }
+              - { name: count, type: int, start: 1, width: 2 }
+      envelope:
+        sections:
+          manifest:
+            extract: { record_type: H }
+            fields: { label: string }
+          totals:
+            extract: { record_type: F }
+            fields: { count: int }
+  - type: sink
+    name: out
+    input: rows
+    config:
+      name: out
+      type: fixed_width
+      path: output.dat
+      reconstruct_envelope: true
+      schema: [{ name: text, type: string, width: 2 }]
+      include_unmapped: false
+      mapping: [text]
+      options:
+        envelope: { header_from_doc: manifest, footer_from_doc: totals }
+"#;
+        std::fs::write(root.path().join("pipeline.yaml"), yaml).unwrap();
+        // Flat-file section extraction captures the leading header region.
+        // The selected totals section is rendered as the output footer.
+        let input: &[u8] = match variant {
+            "bad-header" => b"H\xffx\nF01\nD\xc3\xb1\n",
+            "bad-footer" => b"H\xc3\xa9\nF\xff1\nD\xc3\xb1\n",
+            _ => b"H\xc3\xa9\nF01\nD\xc3\xb1\n",
+        };
+        std::fs::write(root.path().join("input-a.dat"), input).unwrap();
+        if variant == "files" {
+            std::fs::write(root.path().join("input-b.dat"), input).unwrap();
+        }
+        let result = run(root.path());
+        if variant.starts_with("bad-") {
+            assert_eq!(
+                terminal(&result, 4, "failed")["failure"]["code"],
+                "source.data.invalid"
+            );
+            assert!(!root.path().join("output.dat").exists());
+            // Reconstruction waits for the full document's selected sections.
+            assert!(
+                nested_partial_outputs(root.path())
+                    .iter()
+                    .all(Vec::is_empty)
+            );
+        } else {
+            let rows = if variant == "files" { 2 } else { 1 };
+            assert_physical_completed(&result, rows, 1);
+            let document = b"\xc3\xa9\n\xc3\xb1\n1\n";
+            let expected = if variant == "files" {
+                [document.as_slice(), document].concat()
+            } else {
+                document.to_vec()
+            };
+            assert_eq!(
+                std::fs::read(root.path().join("output.dat")).unwrap(),
+                expected,
+                "{variant}"
+            );
+        }
+    }
+}
+
+fn physical_pipeline(format: &str, route: &str) -> String {
+    let files = route.contains("files") || route.contains("fanout");
+    let source_path = if route == "reject-files" {
+        "paths: [input-a.dat, input-b.dat]"
+    } else if files {
+        "glob: input-*.dat"
+    } else {
+        "path: input-a.dat"
+    };
+    let output_path = if route.contains("fanout") {
+        "output_{source_file}.dat"
+    } else {
+        "output.dat"
+    };
+    let schema = if format == "fixed_width" {
+        "        - { name: label, type: string, start: 1, width: 2 }\n        - { name: number, type: int, start: 4, width: 2 }\n"
+    } else {
+        "        - { name: block, type: string }\n        - { name: tag, type: string }\n        - { name: value, type: string }\n"
+    };
+    let envelope = if route.starts_with("reconstruct") {
+        "      envelope:\n        sections:\n          routing:\n            extract: { segment: '1' }\n          signature:\n            extract: { segment: '5' }\n"
+    } else {
+        ""
+    };
+    let sink = if format == "fixed_width" {
+        "      schema:\n        - { name: label, type: string, width: 2 }\n        - { name: number, type: int, width: 2 }\n"
+    } else if route.starts_with("reconstruct") {
+        "      options: { basic_header_from_doc: routing, trailer_from_doc: signature }\n"
+    } else {
+        ""
+    };
+    let split = if route.contains("split") {
+        "      split: { max_records: 1 }\n"
+    } else {
+        ""
+    };
+    let consolidate = if format == "swift" && route == "files" {
+        "  - type: envelope\n    name: combined\n    body: rows\n    config: { strategy: concat }\n"
+    } else {
+        ""
+    };
+    let upstream = if consolidate.is_empty() {
+        "rows"
+    } else {
+        "combined"
+    };
+    format!(
+        r#"pipeline: {{ name: physical_routes }}
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: {format}
+      {source_path}
+{envelope}      schema:
+{schema}{consolidate}  - type: sink
+    name: out
+    input: {upstream}
+    config:
+      name: out
+      type: {format}
+      path: {output_path}
+{sink}{split}"#
+    )
+}
+
+#[test]
+fn physical_cli_routes_preserve_literal_bytes_counts_and_publication() {
+    use std::collections::BTreeSet;
+    let mut executed = BTreeSet::new();
+    for format in ["fixed_width", "swift"] {
+        let routes: &[&str] = if format == "fixed_width" {
+            &["file", "files", "fanout", "split", "split-fanout", "empty"]
+        } else {
+            &[
+                "file",
+                "files",
+                "fanout",
+                "empty",
+                "reconstruct",
+                "reject-files",
+                "reconstruct-fanout",
+                "reject-split",
+                "reject-split-fanout",
+            ]
+        };
+        for route in routes {
+            let id = format!("{format}/{route}");
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(
+                root.path().join("pipeline.yaml"),
+                physical_pipeline(format, route),
+            )
+            .unwrap();
+            let files = route.contains("files") || route.contains("fanout");
+            let input: &[u8] = if *route == "empty" {
+                if format == "swift" {
+                    b"{1:HDR}{4:\r\n-}{5:TAIL}"
+                } else {
+                    b""
+                }
+            } else if format == "fixed_width" {
+                // Ignored octets must not shift the selected UTF-8 byte cells.
+                b"\xff\xc3\xa9\xfe01ignored\n\xff\xc3\xb1\xfe02tail\n"
+            } else {
+                b"{1:HDR}{4:\r\n:20:  first  \r\ncontinuation \n\r\n:20:second\r\n-}{5:TAIL}"
+            };
+            std::fs::write(root.path().join("input-a.dat"), input).unwrap();
+            if files {
+                std::fs::write(root.path().join("input-b.dat"), input).unwrap();
+            }
+            let result = run(root.path());
+            if route.starts_with("reject-") {
+                assert_eq!(
+                    terminal(&result, 1, "failed")["failure"]["code"],
+                    "admission.configuration.invalid",
+                    "{id}"
+                );
+                let diagnostic = String::from_utf8_lossy(&result.stderr);
+                let required = if *route == "reject-files" {
+                    ["E355", "out", "swift", "strategy: concat", "source_file"]
+                } else {
+                    ["E342", "out", "swift", "split", "remove"]
+                };
+                for text in required {
+                    assert!(diagnostic.contains(text), "{id}: {diagnostic}");
+                }
+                assert!(nested_partial_outputs(root.path()).is_empty(), "{id}");
+                assert!(
+                    !std::fs::read_dir(root.path()).unwrap().any(|entry| {
+                        entry
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("output")
+                    }),
+                    "{id}"
+                );
+            } else {
+                let count = if *route == "empty" {
+                    0
+                } else if files {
+                    4
+                } else {
+                    2
+                };
+                let artifacts = if *route == "split-fanout" {
+                    4
+                } else if route.contains("split") || route.contains("fanout") {
+                    2
+                } else {
+                    1
+                };
+                assert_physical_completed(&result, count, artifacts);
+                let body: &[u8] = if *route == "empty" {
+                    b""
+                } else if format == "fixed_width" {
+                    b"\xc3\xa9 1\n\xc3\xb1 2\n"
+                } else if route.starts_with("reconstruct") {
+                    b"{1:HDR}{4:\r\n:20:  first  \r\ncontinuation \n\r\n:20:second\r\n-}{5:TAIL}"
+                } else {
+                    b"{4:\r\n:20:  first  \r\ncontinuation \n\r\n:20:second\r\n-}"
+                };
+                if route.contains("split") {
+                    for stem in if files {
+                        vec!["output_input-a", "output_input-b"]
+                    } else {
+                        vec!["output"]
+                    } {
+                        for (suffix, expected) in
+                            [("0001", b"\xc3\xa9 1\n"), ("0002", b"\xc3\xb1 2\n")]
+                        {
+                            assert_eq!(
+                                std::fs::read(root.path().join(format!("{stem}_{suffix}.dat")))
+                                    .unwrap(),
+                                expected,
+                                "{id}"
+                            );
+                        }
+                    }
+                } else if route.contains("fanout") {
+                    for name in ["output_input-a.dat", "output_input-b.dat"] {
+                        assert_eq!(std::fs::read(root.path().join(name)).unwrap(), body, "{id}");
+                    }
+                } else {
+                    let expected = if files
+                        && format == "swift"
+                        && !route.starts_with("reconstruct")
+                    {
+                        b"{4:\r\n:20:  first  \r\ncontinuation \n\r\n:20:second\r\n:20:  first  \r\ncontinuation \n\r\n:20:second\r\n-}".to_vec()
+                    } else if files {
+                        [body, body].concat()
+                    } else {
+                        body.to_vec()
+                    };
+                    assert_eq!(
+                        std::fs::read(root.path().join("output.dat")).unwrap(),
+                        expected,
+                        "{id}"
+                    );
+                }
+            }
+            assert!(executed.insert(id));
+        }
+    }
+    assert_eq!(
+        executed.iter().map(String::as_str).collect::<BTreeSet<_>>(),
+        EXPECTED_PHYSICAL_ROUTES.iter().copied().collect()
+    );
 }
