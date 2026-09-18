@@ -10,6 +10,27 @@ use clinker_format::reserved::ReservedBuffer;
 use clinker_format::reserved::ReservedVec;
 
 #[test]
+fn swift_invalid_first_record_never_delivers_service_header() {
+    use clinker_format::swift::writer::{SwiftWriter, SwiftWriterConfig};
+    use clinker_format::FormatWriter;
+    use clinker_record::{Record, Schema, Value};
+    use std::sync::Arc;
+    let schema = SharedStorage::from_arc(Arc::new(Schema::new(
+        vec!["block".into(), "tag".into(), "value".into()],
+    )));
+    let record = Record::new(schema.clone(), vec![Value::Integer(4), Value::Null, Value::String("body".into())]);
+    let mut bytes = Vec::new();
+    let mut writer = SwiftWriter::new(&mut bytes, schema, SwiftWriterConfig {
+        basic_header: Some("header".into()),
+        trailer: Some("trailer".into()),
+        ..Default::default()
+    });
+    assert!(writer.write_record(&record).is_err());
+    drop(writer);
+    assert!(bytes.is_empty(), "invalid first body must not deliver a service prefix");
+}
+
+#[test]
 fn fixed_width_late_structured_envelope_rejects_without_delivery() {
     use clinker_format::FormatWriter;
     use clinker_format::envelope_writer::OutputEnvelopeSpec;
