@@ -15,6 +15,60 @@ use std::sync::Arc;
 use clinker_format::preparation::{DecodeWorkspace, TextStorage};
 
 #[test]
+fn swift_writer_rejects_every_framer_anchored_trailer_before_delivery() {
+    use clinker_bench_support::io::SharedBuffer;
+    use clinker_format::error::OutputEncodingKind;
+    use clinker_format::swift::writer::{SwiftEncoder, SwiftWriterConfig};
+    for value in ["A\r-}tail", "A\n-}tail", "A\r\n-}tail"] {
+        for prior_success in [false, true] {
+            let schema =
+                SharedStorage::from_arc(Arc::new(Schema::new(vec!["tag".into(), "value".into()])));
+            let resources = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+            let encoder = SwiftEncoder::new(
+                schema.clone(),
+                &SwiftWriterConfig {
+                    basic_header: Some("HEADER".into()),
+                    trailer: Some("TRAILER".into()),
+                    ..Default::default()
+                },
+                resources.resources(),
+            )
+            .unwrap();
+            let output = SharedBuffer::new();
+            let mut writer =
+                PreparedWriter::new(output.clone(), encoder, resources.resources()).unwrap();
+            let record = |value: &str| {
+                Record::new(
+                    schema.clone(),
+                    vec![Value::String("79".into()), Value::String(value.into())],
+                )
+            };
+            if prior_success {
+                writer.write_record(&record("FIRST")).unwrap();
+            }
+            let committed_bytes = output.contents();
+            let retained = resources.used();
+            let error = writer
+                .write_record(&record(value))
+                .expect_err("framer-anchored trailer cannot be value data");
+            assert!(
+                matches!(error, clinker_format::FormatError::OutputEncoding { kind: OutputEncodingKind::SwiftContinuation, field: 2, offset, .. } if offset == value.find("-}").unwrap())
+            );
+            assert_eq!(output.contents(), committed_bytes);
+            assert_eq!(resources.used(), retained);
+            writer
+                .write_record(&record("A\r:20:still data SEE-}NOTE"))
+                .unwrap();
+            writer.flush().unwrap();
+            drop(writer);
+            let first = if prior_success { ":79:FIRST\r\n" } else { "" };
+            assert_eq!(output.contents(), format!("{{1:HEADER}}{{4:\r\n{first}:79:A\r:20:still data SEE-}}NOTE\r\n-}}{{5:TRAILER}}").as_bytes());
+            assert_eq!(resources.used(), 0);
+        }
+    }
+}
+
+#[test]
 fn swift_continuations_preserve_original_separators_and_trailing_empty_lines() {
     use clinker_format::swift::{SwiftReader, SwiftReaderConfig};
     let input = "{1:HEADER}{4:\r\n:79:  café{inline}-} :20:text  \r\n next\n\r\n\r\n:79:second\n\n:86:\r\n-}{5:{CHK:X}}";
