@@ -6,9 +6,10 @@ This page is the engine-internals reference for the durability and concurrency m
 
 ## Prepared output storage
 
-CSV output in the CLI and executor seals complete operation bytes in finite
-memory or executor-backed raw temporary storage. Other codecs retain their
-existing writer paths. Preparation is distinct from source file staging and
+CSV, JSON, XML, fixed-width and SWIFT output in the CLI and executor seals
+complete operation bytes in finite memory or executor-backed raw temporary
+storage. EDIFACT, X12 and HL7 retain their existing writer paths.
+Preparation is distinct from source file staging and
 output publication described below.
 
 An executor provider with no resolved spill root is memory-only. It never
@@ -59,6 +60,21 @@ CSV adapter disables stage writes before dropping the library writer, whose
 destructor can flush buffered bytes. That discarded flush cannot replace the
 original representability or structured-value error with a later resource
 failure. Actual resource-denied I/O still recovers its typed stage evidence.
+
+Fixed-width prepares document start, each body record and document end
+separately. Pending warnings and document counters commit only after sealed
+bytes have been delivered and storage released. The entire header or footer
+is staged from borrowed scalar fields; an unsupported late field cannot leak
+a prefix. SWIFT stages first-record service blocks with that record's body,
+retaining a document-sourced trailer only on successful delivery. Finalization
+stages the close marker and trailer once; `flush_bytes` never finalizes.
+
+Ordinary and split fixed-width destinations, and ordinary SWIFT destinations,
+receive prepared bytes directly without an outer `BufWriter`. Accepted-byte
+counters therefore observe the destination's writes, and no outer buffer can
+retry a failed prefix during drop. All SWIFT splitting remains rejected
+by planning. These delivery rules do not turn a generic `Write` destination
+into an atomic publication boundary.
 
 Unlink failure transfers the exact disk charge, path grant and descriptor slot
 to an already-admitted cleanup-debt slot. Retry runs outside admission locks;
