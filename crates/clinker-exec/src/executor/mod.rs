@@ -176,23 +176,6 @@ pub(crate) struct DispatchOutcome {
     /// landed"). The synthetic `MERGED_SOURCE_NAME` slot is filtered
     /// out on the way through.
     pub(crate) per_source_dlq_counts: BTreeMap<String, u64>,
-    /// Bytes the run committed to spill files across every spill site
-    /// (node_buffer admission, grace-hash partition flush, sort-merge external
-    /// sort), net of any released when a run was unlinked — so a cascaded k-way
-    /// merge's transient intermediate runs do not inflate it. Read from
-    /// `MemoryArbitrator`'s running total at dispatch close so an aborted run
-    /// still reports the last committed value.
-    pub(crate) cumulative_spill_bytes: u64,
-    /// Per-stage on-disk spill totals, keyed by the spilling node's name.
-    /// The sum equals `cumulative_spill_bytes`; this breakdown is what an
-    /// operator compares against the per-stage pre-run `--explain`
-    /// estimate to calibrate. Empty when no stage spilled.
-    pub(crate) per_stage_spill_bytes: BTreeMap<String, u64>,
-    /// High-water mark of `MemoryArbitrator::sum_consumer_usage()` sampled
-    /// at every streaming per-batch charge. A streaming stage's peak stays
-    /// bounded to one in-flight batch (plus the channel's bound), proving
-    /// the per-batch admit/discharge model never charges the whole stage.
-    pub(crate) peak_consumer_usage_bytes: u64,
     /// `true` when a chunk-boundary shutdown poll tripped and the topo
     /// walk unwound early. Carried up so the report surfaces the
     /// interrupted state to the CLI.
@@ -1192,7 +1175,7 @@ impl PipelineExecutor {
                 writers,
                 spill_root,
                 watermarks,
-                memory_budget,
+                memory_budget: memory_budget.clone(),
             },
             &mut collector,
             counters,
@@ -1219,9 +1202,6 @@ impl PipelineExecutor {
             per_source_rollback_cursors,
             per_source_record_counts,
             per_source_dlq_counts,
-            cumulative_spill_bytes,
-            per_stage_spill_bytes,
-            peak_consumer_usage_bytes,
             mut interrupted,
             advisories,
         } = dispatch_outcome;
@@ -1247,6 +1227,12 @@ impl PipelineExecutor {
                 watermarks.observe(&outcome.source_name, &file_arc, ts);
             }
         }
+        // Sources can still own ordered spill files when dispatch stops. Join
+        // their cleanup before taking the run's single terminal resource
+        // snapshot, including any last producer-side peak usage sample.
+        let cumulative_spill_bytes = memory_budget.cumulative_spill_bytes();
+        let per_stage_spill_bytes = memory_budget.per_stage_spill_bytes();
+        let peak_consumer_usage_bytes = memory_budget.peak_consumer_usage();
         if auto_commit_staged {
             if !interrupted
                 && params
@@ -2142,9 +2128,6 @@ impl PipelineExecutor {
         let per_source_dlq_counts =
             project_declared_source_dlq_counts(&ctx.dlq_per_source, merged_key);
 
-        let cumulative_spill_bytes = ctx.memory_budget.cumulative_spill_bytes();
-        let per_stage_spill_bytes = ctx.memory_budget.per_stage_spill_bytes();
-        let peak_consumer_usage_bytes = ctx.memory_budget.peak_consumer_usage();
         let interrupted = ctx.interrupted;
         // Per-Output `mapping:` findings, over the WHOLE stream. Drained here
         // rather than at each arm's close because an Output's records can reach
@@ -2160,9 +2143,6 @@ impl PipelineExecutor {
             per_source_rollback_cursors: rollback_cursors,
             per_source_record_counts,
             per_source_dlq_counts,
-            cumulative_spill_bytes,
-            per_stage_spill_bytes,
-            peak_consumer_usage_bytes,
             interrupted,
             advisories,
         })

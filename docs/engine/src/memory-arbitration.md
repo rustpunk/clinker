@@ -52,6 +52,13 @@ descriptor usage from this ledger. `set_limit` refuses a limit below outstanding
 writer grants and leaves the previous limit unchanged; the disk setter likewise
 refuses a quota below the sum of outstanding writer disk and legacy spill bytes.
 
+The execution report samples the arbitrator's spill totals and peak consumer
+usage after dispatch has finished and every Source worker has joined. Ordered
+Sources can still release staged spill charges while unwinding cancellation;
+sampling at dispatch close would report those already-released bytes as live.
+The total and per-stage spill fields include committed charges minus releases,
+not every byte ever written to temporary storage.
+
 `WriterResourceConsumer` reports the ledger's exact live grant total through its
 `ConsumerHandle`. It is admission-managed and never backpressureable: parking
 the synchronous writer would prevent its own release progress. Spill requests

@@ -904,43 +904,78 @@ nodes:
 
 #[test]
 fn ordered_attempt_interrupt_cleanup() {
-    struct DelayedRecords(Box<dyn clinker_exec::source::RecordSource>);
+    struct PausedRecords {
+        source: Box<dyn clinker_exec::source::RecordSource>,
+        returned_first: bool,
+        staged: std::sync::mpsc::SyncSender<()>,
+        dispatch_closed: std::sync::mpsc::Receiver<()>,
+        shutdown: ShutdownToken,
+    }
 
-    impl clinker_exec::source::RecordSource for DelayedRecords {
+    impl clinker_exec::source::RecordSource for PausedRecords {
         fn schema(&mut self) -> Result<SharedStorage<Schema>, FormatError> {
-            self.0.schema()
+            self.source.schema()
         }
 
         fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
-            std::thread::sleep(Duration::from_millis(1));
-            self.0.next_record()
+            if self.returned_first {
+                // Reaching the next read proves the first synchronous ordered
+                // push, including its spill decision, has completed.
+                self.staged.send(()).expect("staging observer remains live");
+                self.dispatch_closed
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("dispatcher must close before joining the paused source");
+                assert!(self.shutdown.is_requested());
+                return Ok(None);
+            }
+            let row = self.source.next_record()?;
+            self.returned_first = row.is_some();
+            Ok(row)
         }
 
         fn current_source_file(&self) -> Option<&Arc<str>> {
-            self.0.current_source_file()
+            self.source.current_source_file()
         }
 
         fn prepare_document(
             &mut self,
             config: &clinker_format::EnvelopeConfig,
         ) -> Result<OwnedMap, FormatError> {
-            self.0.prepare_document(config)
+            self.source.prepare_document(config)
         }
 
         fn take_envelope_events(&mut self) -> Vec<clinker_format::EnvelopeEvent> {
-            self.0.take_envelope_events()
+            self.source.take_envelope_events()
         }
 
         fn take_source_lifecycle_events(&mut self) -> Vec<clinker_format::SourceLifecycleEvent> {
-            self.0.take_source_lifecycle_events()
+            self.source.take_source_lifecycle_events()
         }
 
         fn set_shutdown_token(&mut self, token: ShutdownToken) {
-            self.0.set_shutdown_token(token);
+            self.source.set_shutdown_token(token);
         }
 
         fn advance_to_next_file(&mut self) -> Result<bool, FormatError> {
-            self.0.advance_to_next_file()
+            self.source.advance_to_next_file()
+        }
+    }
+
+    struct DispatchClosed(std::sync::mpsc::SyncSender<()>);
+
+    impl std::io::Write for DispatchClosed {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            panic!("unused lifecycle writer must never receive output");
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for DispatchClosed {
+        fn drop(&mut self) {
+            let _ = self.0.try_send(());
         }
     }
 
@@ -971,8 +1006,8 @@ nodes:
     for ordinal in (1..=400).rev() {
         csv.push_str(&format!("{ordinal},{}\n", "x".repeat(256)));
     }
-    // Keep the 1K ordered-staging budget; decoding is fixture setup, while
-    // delayed record delivery preserves the interruption window during ingest.
+    // Keep the 1K ordered-staging budget; decoding is fixture setup. Pause
+    // after real staging so cancellation must clean an existing spill.
     let config = parse_config(yaml).expect("interrupt fixture parses");
     let mut readers = resource_fixtures::predecoded_csv_readers(
         &config,
@@ -982,22 +1017,64 @@ nodes:
     let Some(SourceInput::Records(source)) = readers.remove("src") else {
         panic!("predecoded fixture must supply records");
     };
+    let token = ShutdownToken::detached();
+    let (staged_tx, staged_rx) = std::sync::mpsc::sync_channel(1);
+    let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(1);
     readers.insert(
         "src".to_string(),
-        SourceInput::Records(Box::new(DelayedRecords(source))),
+        SourceInput::Records(Box::new(PausedRecords {
+            source,
+            returned_first: false,
+            staged: staged_tx,
+            dispatch_closed: closed_rx,
+            shutdown: token.clone(),
+        })),
     );
-    let token = ShutdownToken::detached();
+    let spill_root = tempfile::tempdir().expect("isolated spill root");
     let params = PipelineRunParams {
         shutdown_token: Some(token.clone()),
+        spill_root_dir: Some(spill_root.path().to_path_buf()),
         ..Default::default()
     };
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let (report, output) = execute_yaml(yaml, readers, params);
+        let plan = config
+            .compile(&CompileContext::default())
+            .expect("interrupt plan compiles");
+        let output = SharedBuffer::new();
+        // An unused registry entry remains in the dispatch context until that
+        // context drops, after its outcome has been assembled and before the
+        // outer executor joins Sources. It forces the previously racy order:
+        // dispatch finishes while the Source still owns its staged spill.
+        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
+            ("out".to_string(), Box::new(output.clone()) as _),
+            (
+                "dispatch_lifecycle".to_string(),
+                Box::new(DispatchClosed(closed_tx)) as _,
+            ),
+        ]);
+        let report =
+            PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params);
         let _ = done_tx.send((report, output.as_string()));
     });
 
-    std::thread::sleep(Duration::from_millis(30));
+    // Retain setup errors until after requesting cancellation and joining the
+    // worker, so a failed staging precondition cannot strand the paused source.
+    let staged_spill_bytes = (|| -> std::io::Result<u64> {
+        staged_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(std::io::Error::other)?;
+        let mut bytes = 0;
+        for run in std::fs::read_dir(spill_root.path())? {
+            for file in std::fs::read_dir(run?.path())? {
+                let file = file?;
+                if file.file_name() != ".lock" {
+                    bytes += file.metadata()?.len();
+                }
+            }
+        }
+        Ok(bytes)
+    })();
     token.request();
     let prompt = done_rx.recv_timeout(Duration::from_millis(200));
     let completed_promptly = prompt.is_ok();
@@ -1010,11 +1087,19 @@ nodes:
     worker.join().expect("ordered ingest worker panicked");
 
     assert!(
+        staged_spill_bytes.expect("first row reached ordered staging") > 0,
+        "interruption must begin with a real ordered spill"
+    );
+    assert!(
         completed_promptly,
         "ordered staging ignored the shutdown request"
     );
     let report = report.expect("shutdown is a graceful interruption");
     assert!(report.interrupted);
+    assert_eq!(
+        report.counters.total_count, 1,
+        "cancellation discarded a staged prefix"
+    );
     assert_eq!(report.cumulative_spill_bytes, 0);
     assert!(
         report
@@ -1025,6 +1110,12 @@ nodes:
     assert!(
         output.is_empty(),
         "interrupted staged rows leaked to output"
+    );
+    assert_eq!(
+        std::fs::read_dir(spill_root.path())
+            .expect("spill root remains")
+            .count(),
+        0
     );
 }
 
