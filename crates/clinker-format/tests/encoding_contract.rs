@@ -14,6 +14,558 @@ use std::sync::Arc;
 
 use clinker_format::preparation::{DecodeWorkspace, TextStorage};
 
+fn physical_column(name: &str, start: usize, width: usize) -> clinker_format::Column {
+    clinker_format::Column {
+        start: Some(start),
+        width: Some(width),
+        ..clinker_format::Column::bare(name, cxl::typecheck::Type::String)
+    }
+}
+
+fn physical_reader<'a>(
+    input: impl std::io::Read + Send + 'a,
+    columns: Vec<clinker_format::Column>,
+    multi: bool,
+    separator: clinker_record::schema_def::LineSeparator,
+) -> Box<dyn FormatReader + 'a> {
+    use clinker_format::fixed_width::{FixedWidthReader, FixedWidthReaderConfig};
+    use clinker_format::multi_record::{MultiRecordReader, MultiRecordSpec};
+    use clinker_format::schema::{Discriminator, RecordType};
+    if multi {
+        Box::new(
+            MultiRecordReader::new_fixed_width(
+                input,
+                MultiRecordSpec {
+                    discriminator: Discriminator {
+                        start: Some(0),
+                        width: Some(1),
+                        field: None,
+                    },
+                    record_types: vec![RecordType {
+                        id: "detail".into(),
+                        tag: "D".into(),
+                        description: None,
+                        parent: None,
+                        join_key: None,
+                        columns,
+                    }],
+                    structure: vec![],
+                    header_tags: vec![],
+                },
+                separator,
+            )
+            .unwrap(),
+        )
+    } else {
+        Box::new(
+            FixedWidthReader::new(
+                input,
+                columns,
+                FixedWidthReaderConfig {
+                    line_separator: separator,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        )
+    }
+}
+
+fn physical_unicode_columns() -> Vec<clinker_format::Column> {
+    vec![
+        physical_column("kind", 0, 1),
+        physical_column("accent", 1, 2),
+        physical_column("ideograph", 3, 3),
+        physical_column("astral", 6, 4),
+    ]
+}
+
+#[test]
+fn fixed_width_bom_chunks_and_separators_preserve_physical_unicode_cells() {
+    use clinker_record::schema_def::LineSeparator;
+    for multi in [false, true] {
+        for (separator, ending) in [
+            (LineSeparator::Lf, "\n"),
+            (LineSeparator::CrLf, "\r\n"),
+            (LineSeparator::None, ""),
+        ] {
+            for bom in ["", "\u{feff}"] {
+                let bytes = format!("{bom}Dé中𐍈{ending}Dé中𐍈{ending}").into_bytes();
+                for chunk in 1..=12 {
+                    let pattern = [chunk];
+                    let input = DecodeChunks {
+                        remaining: &bytes,
+                        pattern: &pattern,
+                        reads: 0,
+                    };
+                    let mut reader = physical_reader(
+                        input,
+                        physical_unicode_columns(),
+                        multi,
+                        separator.clone(),
+                    );
+                    for _ in 0..2 {
+                        let row = reader.next_record().unwrap().unwrap();
+                        assert_eq!(row.get("kind"), Some(&Value::String("D".into())));
+                        assert_eq!(row.get("accent"), Some(&Value::String("é".into())));
+                        assert_eq!(row.get("ideograph"), Some(&Value::String("中".into())));
+                        assert_eq!(row.get("astral"), Some(&Value::String("𐍈".into())));
+                    }
+                    assert!(reader.next_record().unwrap().is_none());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fixed_width_selected_cell_boundaries_and_late_malformed_bytes_are_strict() {
+    use clinker_format::FormatError;
+    use clinker_record::schema_def::LineSeparator;
+    for multi in [false, true] {
+        for (separator, ending) in [
+            (LineSeparator::Lf, &b"\n"[..]),
+            (LineSeparator::CrLf, &b"\r\n"[..]),
+            (LineSeparator::None, &b""[..]),
+        ] {
+            for invalid in [&b"D\xc3!"[..], &b"D\xffx"[..], &b"D\x80x"[..]] {
+                let mut bytes = b"Dab".to_vec();
+                bytes.extend_from_slice(ending);
+                bytes.extend_from_slice(invalid);
+                bytes.extend_from_slice(ending);
+                let mut reader = physical_reader(
+                    DecodeChunks {
+                        remaining: &bytes,
+                        pattern: &[1],
+                        reads: 0,
+                    },
+                    vec![physical_column("kind", 0, 1), physical_column("text", 1, 2)],
+                    multi,
+                    separator.clone(),
+                );
+                assert_eq!(
+                    reader.next_record().unwrap().unwrap().get("text"),
+                    Some(&Value::String("ab".into()))
+                );
+                let error = reader.next_record().unwrap_err();
+                assert!(
+                    matches!(error, FormatError::InvalidRecord { row: 2, .. }),
+                    "{error}"
+                );
+                assert!(
+                    error.to_string().contains("field 'text': invalid UTF-8"),
+                    "{error}"
+                );
+            }
+        }
+        // Every interior byte boundary of a two-, three- and four-byte scalar
+        // is invalid at either end of a selected cell, even on a valid UTF-8 line.
+        for text in ["é", "中", "𐍈"] {
+            let bytes = format!("D{text}\n").into_bytes();
+            for boundary in 1..text.len() {
+                for (start, width) in [(1, boundary), (1 + boundary, text.len() - boundary)] {
+                    let mut reader = physical_reader(
+                        bytes.as_slice(),
+                        vec![
+                            physical_column("kind", 0, 1),
+                            physical_column("text", start, width),
+                        ],
+                        multi,
+                        LineSeparator::Lf,
+                    );
+                    let error = reader.next_record().unwrap_err();
+                    assert!(
+                        matches!(error, FormatError::InvalidRecord { row: 1, .. }),
+                        "{error}"
+                    );
+                    assert!(
+                        error.to_string().contains("field 'text': invalid UTF-8"),
+                        "{error}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fixed_width_ignored_byte_ranges_remain_invisible_without_normalization() {
+    use clinker_record::schema_def::LineSeparator;
+    for multi in [false, true] {
+        for (separator, ending) in [
+            (LineSeparator::Lf, &b"\n"[..]),
+            (LineSeparator::CrLf, &b"\r\n"[..]),
+            (LineSeparator::None, &b""[..]),
+        ] {
+            let mut bytes = Vec::new();
+            for _ in 0..2 {
+                bytes.extend_from_slice(b"D\xff\xc3\xa9\xfeZ");
+                if !matches!(separator, LineSeparator::None) {
+                    bytes.extend(std::iter::repeat_n(0xff, 20_000));
+                }
+                bytes.extend_from_slice(ending);
+            }
+            let mut reader = physical_reader(
+                DecodeChunks {
+                    remaining: &bytes,
+                    pattern: &[1, 2, 17],
+                    reads: 0,
+                },
+                vec![
+                    physical_column("kind", 0, 1),
+                    physical_column("text", 2, 2),
+                    physical_column("tail", 5, 1),
+                ],
+                multi,
+                separator,
+            );
+            for _ in 0..2 {
+                let record = reader.next_record().unwrap().unwrap();
+                assert_eq!(record.get("text"), Some(&Value::String("é".into())));
+                assert_eq!(record.get("tail"), Some(&Value::String("Z".into())));
+            }
+            assert!(reader.next_record().unwrap().is_none());
+        }
+    }
+}
+
+#[test]
+fn fixed_width_non_utf8_boms_are_not_decoded_or_accepted_as_selected_data() {
+    use clinker_record::schema_def::LineSeparator;
+    for multi in [false, true] {
+        for prefix in [
+            &b"\xff\xfe"[..],
+            &b"\xfe\xff"[..],
+            &b"\xff\xfe\0\0"[..],
+            &b"\0\0\xfe\xff"[..],
+        ] {
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice("Dé中𐍈\n".as_bytes());
+            let mut reader = physical_reader(
+                DecodeChunks {
+                    remaining: &bytes,
+                    pattern: &[1],
+                    reads: 0,
+                },
+                physical_unicode_columns(),
+                multi,
+                LineSeparator::Lf,
+            );
+            assert!(reader.next_record().is_err(), "unsupported BOM {prefix:?}");
+        }
+        let mut reader = physical_reader(
+            &b"\xef\xbb\xbf"[..],
+            physical_unicode_columns(),
+            multi,
+            LineSeparator::Lf,
+        );
+        assert!(reader.next_record().unwrap().is_none());
+        // Only the leading BOM is removed. An interior U+FEFF stays in its cell.
+        let mut reader = physical_reader(
+            &b"D\xef\xbb\xbf\n"[..],
+            vec![physical_column("kind", 0, 1), physical_column("text", 1, 3)],
+            multi,
+            LineSeparator::Lf,
+        );
+        assert_eq!(
+            reader.next_record().unwrap().unwrap().get("text"),
+            Some(&Value::String("\u{feff}".into()))
+        );
+    }
+}
+
+#[test]
+fn fixed_width_physical_file_opens_reset_bom_and_malformed_row_evidence() {
+    use clinker_format::{FormatError, ReopenableSource};
+    use clinker_record::schema_def::LineSeparator;
+    struct Files(Vec<std::path::PathBuf>);
+    impl Drop for Files {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    let mut files = Files(vec![]);
+    for multi in [false, true] {
+        for malformed_file in [0, 1] {
+            for file_index in 0..2 {
+                let path = std::env::temp_dir().join(format!(
+                    "fixed-width-open-{}-{:?}-{multi}-{malformed_file}-{file_index}",
+                    std::process::id(),
+                    std::thread::current().id()
+                ));
+                files.0.push(path.clone());
+                let mut bytes = b"\xef\xbb\xbfDab\n".to_vec();
+                if file_index == malformed_file {
+                    bytes.extend_from_slice(b"D\xffx\n");
+                }
+                std::fs::write(&path, bytes).unwrap();
+                let source = ReopenableSource::path(&path);
+                // Each actual physical file has a fresh reader, as in the
+                // executor's per-file factory; each reopen starts at row one.
+                for _ in 0..2 {
+                    let mut reader = physical_reader(
+                        source.open().unwrap(),
+                        vec![physical_column("kind", 0, 1), physical_column("text", 1, 2)],
+                        multi,
+                        LineSeparator::Lf,
+                    );
+                    assert_eq!(
+                        reader.next_record().unwrap().unwrap().get("text"),
+                        Some(&Value::String("ab".into()))
+                    );
+                    if file_index == malformed_file {
+                        let error = reader.next_record().unwrap_err();
+                        assert!(
+                            matches!(error, FormatError::InvalidRecord { row: 2, .. }),
+                            "{error}"
+                        );
+                        assert!(error.to_string().contains("field 'text': invalid UTF-8"));
+                    } else {
+                        assert!(reader.next_record().unwrap().is_none());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fixed_width_repeating_and_split_cells_keep_unicode_byte_boundaries() {
+    use clinker_format::fixed_width::{FixedWidthReader, FixedWidthReaderConfig};
+    use clinker_format::{
+        FixedWidthCountField, FixedWidthFill, FixedWidthOccurs, FixedWidthOverflow,
+    };
+    let group = clinker_format::Column {
+        start: Some(0),
+        multiple: Some(true),
+        fields: Some(vec![physical_column("text", 0, 2)]),
+        occurs: Some(FixedWidthOccurs {
+            min: 0,
+            max: 2,
+            fill: FixedWidthFill::Pad,
+            on_overflow: FixedWidthOverflow::Error,
+            keep: None,
+        }),
+        count_field: Some(FixedWidthCountField {
+            name: "total".into(),
+            width: 1,
+        }),
+        ..clinker_format::Column::bare("items", cxl::typecheck::Type::Map)
+    };
+    let mut reader = FixedWidthReader::new(
+        DecodeChunks {
+            remaining: "2éñ\n".as_bytes(),
+            pattern: &[1],
+            reads: 0,
+        },
+        vec![group.clone()],
+        FixedWidthReaderConfig::default(),
+    )
+    .unwrap();
+    let row = reader.next_record().unwrap().unwrap();
+    let Some(Value::Array(values)) = row.get("items") else {
+        panic!("group array")
+    };
+    assert_eq!(values.len(), 2);
+    for (value, expected) in values.iter().zip(["é", "ñ"]) {
+        let Value::Map(fields) = value else {
+            panic!("occurrence map")
+        };
+        assert_eq!(fields.get("text"), Some(&Value::String(expected.into())));
+    }
+    let mut reader = FixedWidthReader::new(
+        &b"2\xc3\xa9\xc3x\n"[..],
+        vec![group],
+        FixedWidthReaderConfig::default(),
+    )
+    .unwrap();
+    assert!(
+        reader
+            .next_record()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid UTF-8")
+    );
+
+    let mut column = physical_column("text", 0, 5);
+    column.multiple = Some(true);
+    let config = FixedWidthReaderConfig {
+        split_values: vec![clinker_format::multi_value::SplitValues {
+            field: "text".into(),
+            delimiter: ";".into(),
+            escape: String::new(),
+            json: false,
+        }],
+        ..Default::default()
+    };
+    let mut reader = FixedWidthReader::new(
+        DecodeChunks {
+            remaining: "é;ñ\n".as_bytes(),
+            pattern: &[1],
+            reads: 0,
+        },
+        vec![column],
+        config,
+    )
+    .unwrap();
+    let row = reader.next_record().unwrap().unwrap();
+    let Some(Value::Array(values)) = row.get("text") else {
+        panic!("split array")
+    };
+    assert_eq!(
+        values.as_slice(),
+        &[Value::String("é".into()), Value::String("ñ".into())]
+    );
+}
+
+#[test]
+fn fixed_width_multi_record_document_sections_are_strict_at_selected_ranges() {
+    use clinker_format::multi_record::{MultiRecordReader, MultiRecordSpec};
+    use clinker_format::schema::{Discriminator, RecordType, StructureConstraint};
+    use clinker_record::schema_def::LineSeparator;
+    let record_type = |id: &str, tag: &str, field: clinker_format::Column| RecordType {
+        id: id.into(),
+        tag: tag.into(),
+        description: None,
+        parent: None,
+        join_key: None,
+        columns: vec![physical_column("kind", 0, 1), field],
+    };
+    let mut count = physical_column("count", 1, 2);
+    count.ty = cxl::typecheck::Type::Int;
+    let spec = || MultiRecordSpec {
+        discriminator: Discriminator {
+            start: Some(0),
+            width: Some(1),
+            field: None,
+        },
+        record_types: vec![
+            record_type("batch", "H", physical_column("label", 1, 2)),
+            record_type("detail", "D", physical_column("text", 1, 2)),
+            record_type("end", "T", count.clone()),
+        ],
+        structure: vec![StructureConstraint {
+            record: "end".into(),
+            count: "count".into(),
+        }],
+        header_tags: vec!["H".into()],
+    };
+    for (separator, ending) in [
+        (LineSeparator::Lf, &b"\n"[..]),
+        (LineSeparator::CrLf, &b"\r\n"[..]),
+        (LineSeparator::None, &b""[..]),
+    ] {
+        for bad_row in [None, Some(1), Some(2), Some(3)] {
+            let mut bytes = b"\xef\xbb\xbf".to_vec();
+            for (index, row) in ["Hé", "Dñ", "T01"].into_iter().enumerate() {
+                if bad_row == Some(index + 1) {
+                    bytes.extend_from_slice(&[row.as_bytes()[0], 0xff, b'x']);
+                } else {
+                    bytes.extend_from_slice(row.as_bytes());
+                }
+                bytes.extend_from_slice(ending);
+            }
+            let mut reader = MultiRecordReader::new_fixed_width(
+                DecodeChunks {
+                    remaining: &bytes,
+                    pattern: &[1],
+                    reads: 0,
+                },
+                spec(),
+                separator.clone(),
+            )
+            .unwrap();
+            let sections = reader.prepare_document(&multi_record_envelope());
+            if bad_row == Some(1) {
+                let error = sections.unwrap_err();
+                assert!(
+                    error.to_string().contains("field 'label': invalid UTF-8"),
+                    "{error}"
+                );
+                continue;
+            }
+            let sections = sections.unwrap();
+            let Some(Value::Map(section)) = sections.get("customer_metadata") else {
+                panic!("declared document section")
+            };
+            assert_eq!(section.get("label"), Some(&Value::String("é".into())));
+            let record = reader.next_record();
+            if bad_row == Some(2) {
+                let error = record.unwrap_err();
+                assert!(
+                    error.to_string().contains("field 'text': invalid UTF-8"),
+                    "{error}"
+                );
+                continue;
+            }
+            assert_eq!(
+                record.unwrap().unwrap().get("text"),
+                Some(&Value::String("ñ".into()))
+            );
+            let terminal = reader.next_record();
+            if bad_row == Some(3) {
+                let error = terminal.unwrap_err();
+                assert!(
+                    error.to_string().contains("field 'count': invalid UTF-8"),
+                    "{error}"
+                );
+            } else {
+                assert!(terminal.unwrap().is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn fixed_width_short_blocks_and_transport_failures_keep_their_classification() {
+    use clinker_format::FormatError;
+    use clinker_record::schema_def::LineSeparator;
+    struct Fault(std::io::ErrorKind);
+    impl std::io::Read for Fault {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(self.0, "physical input unavailable"))
+        }
+    }
+    for multi in [false, true] {
+        for kind in [std::io::ErrorKind::Other, std::io::ErrorKind::InvalidData] {
+            let mut reader = physical_reader(
+                Fault(kind),
+                physical_unicode_columns(),
+                multi,
+                LineSeparator::Lf,
+            );
+            let error = reader.next_record().unwrap_err();
+            assert!(
+                matches!(&error, FormatError::Io(io) if io.kind() == kind),
+                "{error}"
+            );
+        }
+        let mut reader = physical_reader(
+            &b"DabD"[..],
+            vec![physical_column("kind", 0, 1), physical_column("text", 1, 2)],
+            multi,
+            LineSeparator::None,
+        );
+        assert_eq!(
+            reader.next_record().unwrap().unwrap().get("text"),
+            Some(&Value::String("ab".into()))
+        );
+        let error = reader.next_record().unwrap_err();
+        assert!(
+            matches!(error, FormatError::InvalidRecord { row: 2, .. }),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete record: expected 3 bytes, got 1"),
+            "{error}"
+        );
+    }
+}
+
 #[derive(Default)]
 struct DecodeAuthority {
     used: std::sync::atomic::AtomicUsize,
