@@ -186,6 +186,32 @@ pub(crate) struct DispatchOutcome {
     pub(crate) advisories: Vec<String>,
 }
 
+/// Source outcomes and resource totals established at the same join boundary.
+/// The join operation must finish every worker, including on error; no final
+/// resource snapshot is available while a worker can still retain or release it.
+#[derive(Debug)]
+struct SourceCompletion {
+    outcomes: Vec<ingest::IngestTaskOutcome>,
+    cumulative_spill_bytes: u64,
+    per_stage_spill_bytes: BTreeMap<String, u64>,
+    peak_consumer_usage_bytes: u64,
+}
+
+impl SourceCompletion {
+    fn join(
+        memory: &crate::pipeline::memory::MemoryArbitrator,
+        join_workers: impl FnOnce() -> Result<Vec<ingest::IngestTaskOutcome>, PipelineError>,
+    ) -> Result<Self, PipelineError> {
+        let outcomes = join_workers()?;
+        Ok(Self {
+            outcomes,
+            cumulative_spill_bytes: memory.cumulative_spill_bytes(),
+            per_stage_spill_bytes: memory.per_stage_spill_bytes(),
+            peak_consumer_usage_bytes: memory.peak_consumer_usage(),
+        })
+    }
+}
+
 /// Borrowed, read-only inputs threaded through `execute_dag` and
 /// `execute_dag_branching`: the compiled program, the bound plan, and
 /// the per-run parameters. Grouped so both entry points share one
@@ -1219,7 +1245,15 @@ impl PipelineExecutor {
         let mut counters = counters;
         // Join every worker before selecting the terminal result. An earlier
         // failure must never detach later workers holding readers or grants.
-        for outcome in ingest::join_source_workers(ingest_handles, "source-ingest-thread")? {
+        let SourceCompletion {
+            outcomes,
+            cumulative_spill_bytes,
+            per_stage_spill_bytes,
+            peak_consumer_usage_bytes,
+        } = SourceCompletion::join(&memory_budget, || {
+            ingest::join_source_workers(ingest_handles, "source-ingest-thread")
+        })?;
+        for outcome in outcomes {
             interrupted |= outcome.interrupted;
             counters.total_count += outcome.total_count;
             total_ingested += outcome.total_count;
@@ -1227,12 +1261,6 @@ impl PipelineExecutor {
                 watermarks.observe(&outcome.source_name, &file_arc, ts);
             }
         }
-        // Sources can still own ordered spill files when dispatch stops. Join
-        // their cleanup before taking the run's single terminal resource
-        // snapshot, including any last producer-side peak usage sample.
-        let cumulative_spill_bytes = memory_budget.cumulative_spill_bytes();
-        let per_stage_spill_bytes = memory_budget.per_stage_spill_bytes();
-        let peak_consumer_usage_bytes = memory_budget.peak_consumer_usage();
         if auto_commit_staged {
             if !interrupted
                 && params
@@ -2398,6 +2426,7 @@ nodes:
     mod per_source_projection;
     mod resident_node_buffer_spill;
     mod scheduling;
+    mod source_completion;
     mod source_consumer_release;
     mod source_pause_liveness;
     mod spill_backed_drain_overshoot;

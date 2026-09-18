@@ -908,7 +908,7 @@ fn ordered_attempt_interrupt_cleanup() {
         source: Box<dyn clinker_exec::source::RecordSource>,
         returned_first: bool,
         staged: std::sync::mpsc::SyncSender<()>,
-        dispatch_closed: std::sync::mpsc::Receiver<()>,
+        cancelled: std::sync::mpsc::Receiver<()>,
         shutdown: ShutdownToken,
     }
 
@@ -922,9 +922,9 @@ fn ordered_attempt_interrupt_cleanup() {
                 // Reaching the next read proves the first synchronous ordered
                 // push, including its spill decision, has completed.
                 self.staged.send(()).expect("staging observer remains live");
-                self.dispatch_closed
+                self.cancelled
                     .recv_timeout(Duration::from_secs(5))
-                    .expect("dispatcher must close before joining the paused source");
+                    .expect("test must release the source after requesting cancellation");
                 assert!(self.shutdown.is_requested());
                 return Ok(None);
             }
@@ -958,24 +958,6 @@ fn ordered_attempt_interrupt_cleanup() {
 
         fn advance_to_next_file(&mut self) -> Result<bool, FormatError> {
             self.source.advance_to_next_file()
-        }
-    }
-
-    struct DispatchClosed(std::sync::mpsc::SyncSender<()>);
-
-    impl std::io::Write for DispatchClosed {
-        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            panic!("unused lifecycle writer must never receive output");
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl Drop for DispatchClosed {
-        fn drop(&mut self) {
-            let _ = self.0.try_send(());
         }
     }
 
@@ -1019,14 +1001,14 @@ nodes:
     };
     let token = ShutdownToken::detached();
     let (staged_tx, staged_rx) = std::sync::mpsc::sync_channel(1);
-    let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(1);
+    let (cancelled_tx, cancelled_rx) = std::sync::mpsc::sync_channel(1);
     readers.insert(
         "src".to_string(),
         SourceInput::Records(Box::new(PausedRecords {
             source,
             returned_first: false,
             staged: staged_tx,
-            dispatch_closed: closed_rx,
+            cancelled: cancelled_rx,
             shutdown: token.clone(),
         })),
     );
@@ -1038,23 +1020,7 @@ nodes:
     };
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let plan = config
-            .compile(&CompileContext::default())
-            .expect("interrupt plan compiles");
-        let output = SharedBuffer::new();
-        // An unused registry entry remains in the dispatch context until that
-        // context drops, after its outcome has been assembled and before the
-        // outer executor joins Sources. It forces the previously racy order:
-        // dispatch finishes while the Source still owns its staged spill.
-        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
-            ("out".to_string(), Box::new(output.clone()) as _),
-            (
-                "dispatch_lifecycle".to_string(),
-                Box::new(DispatchClosed(closed_tx)) as _,
-            ),
-        ]);
-        let report =
-            PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params);
+        let (report, output) = execute_yaml(yaml, readers, params);
         let _ = done_tx.send((report, output.as_string()));
     });
 
@@ -1076,6 +1042,9 @@ nodes:
         Ok(bytes)
     })();
     token.request();
+    // Release the producer directly: dispatch may already be waiting for its
+    // channel to disconnect, so producer cleanup must not depend on dispatch.
+    let released = cancelled_tx.try_send(());
     let prompt = done_rx.recv_timeout(Duration::from_millis(200));
     let completed_promptly = prompt.is_ok();
     let (report, output) = match prompt {
@@ -1086,6 +1055,7 @@ nodes:
     };
     worker.join().expect("ordered ingest worker panicked");
 
+    released.expect("paused source must remain live until cancellation");
     assert!(
         staged_spill_bytes.expect("first row reached ordered staging") > 0,
         "interruption must begin with a real ordered spill"
