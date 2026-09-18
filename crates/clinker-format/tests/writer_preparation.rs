@@ -5511,6 +5511,9 @@ mod nested_fault_boundaries {
         Destination,
         AfterWrite,
         Complete,
+        ZeroWrite,
+        Interrupted,
+        DestinationFlush,
     }
     const FAULTS: [Fault; 13] = [
         Fault::Budget,
@@ -5679,6 +5682,12 @@ mod nested_fault_boundaries {
     impl Write for Destination {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.calls += 1;
+            if self.authority.is(Fault::ZeroWrite) {
+                return Ok(0);
+            }
+            if self.authority.is(Fault::Interrupted) && self.remaining.replace(usize::MAX) == 0 {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
             if self.authority.is(Fault::Destination) && self.remaining.get() == 0 {
                 return Err(std::io::ErrorKind::BrokenPipe.into());
             }
@@ -5695,6 +5704,9 @@ mod nested_fault_boundaries {
             Ok(n)
         }
         fn flush(&mut self) -> std::io::Result<()> {
+            if self.authority.is(Fault::DestinationFlush) {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
             Ok(())
         }
     }
@@ -5947,6 +5959,279 @@ mod nested_fault_boundaries {
             )
             .unwrap()
         });
+    }
+
+    fn physical_literal(swift: bool, index: usize) -> &'static [u8] {
+        match (swift, index) {
+            (false, 0 | 1) => b"HEAD\n",
+            (false, 2 | 3) => b"war\n",
+            (false, 4 | 5) => b"TAIL\n",
+            (false, 6 | 7) | (true, 0 | 1 | 4 | 5) => b"",
+            (true, 2) => b"{1:HEADER}{4:\r\n:20:warning\r\n",
+            (true, 3) => b":20:warning\r\n",
+            (true, 6) => b"{1:HEADER}{4:\r\n-}",
+            (true, 7) => b"-}{5:TAIL}",
+            _ => unreachable!(),
+        }
+    }
+
+    fn physical<E: FormatEncoder>(
+        swift: bool,
+        build: impl Fn(WriterResources, SharedStorage<clinker_record::Schema>) -> E,
+        state: impl Fn(&E) -> Vec<String>,
+    ) {
+        let schema = SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(if swift {
+            vec!["tag".into(), "value".into()]
+        } else {
+            vec!["value".into()]
+        })));
+        let doc = Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("input.txt"),
+            EnvelopeRecord::from_sections([("opening", "HEAD"), ("closing", "TAIL")].map(
+                |(section, text)| {
+                    (
+                        section.into(),
+                        Value::Map(OwnedMap::from_map(
+                            [("body".into(), Value::String(text.into()))].into(),
+                        )),
+                    )
+                },
+            )),
+        ));
+        let mut record = Record::new(
+            schema.clone(),
+            if swift {
+                vec![Value::String("20".into()), Value::String("warning".into())]
+            } else {
+                vec![Value::String("warning".into())]
+            },
+        );
+        record.set_doc_ctx(SharedStorage::from_arc(doc.clone()));
+        let mut cases = 0;
+        for index in 0..8 {
+            for fault in FAULTS.into_iter().chain([
+                Fault::ZeroWrite,
+                Fault::Interrupted,
+                Fault::DestinationFlush,
+            ]) {
+                let literal = physical_literal(swift, index);
+                // Empty operations still exercise admission, seal, cancellation
+                // and completion; byte-dependent faults cannot fire on them.
+                if literal.is_empty()
+                    && matches!(
+                        fault,
+                        Fault::Write
+                            | Fault::BeforeSeal
+                            | Fault::Read
+                            | Fault::ShortRead
+                            | Fault::Destination
+                            | Fault::AfterWrite
+                            | Fault::ZeroWrite
+                            | Fault::Interrupted
+                    )
+                {
+                    continue;
+                }
+                cases += 1;
+                let authority = Arc::new(Authority {
+                    memory: MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap()),
+                    fault: AtomicUsize::new(0),
+                    cancelled: AtomicBool::new(false),
+                    stages: AtomicUsize::new(0),
+                });
+                let resources = WriterResources::new(authority.clone());
+                let mut writer = PreparedWriter::new(
+                    Destination {
+                        bytes: Vec::new(),
+                        authority: authority.clone(),
+                        remaining: std::cell::Cell::new(usize::MAX),
+                        calls: 0,
+                    },
+                    build(resources.clone(), schema.clone()),
+                    resources.clone(),
+                )
+                .unwrap();
+                let prior: &[usize] = match index {
+                    0 | 6 => &[],
+                    1 | 7 => &[0, 2, 5],
+                    2 | 4 => &[0],
+                    3 | 5 => &[0, 2],
+                    _ => unreachable!(),
+                };
+                let mut expected = Vec::new();
+                for &step in prior {
+                    writer
+                        .write_operation(operation(step, &record, &doc))
+                        .unwrap();
+                    expected.extend_from_slice(physical_literal(swift, step));
+                }
+                assert_eq!(writer.destination().bytes, expected);
+                let before = snapshot(writer.encoder(), &resources, &record, &doc);
+                let committed = state(writer.encoder());
+                let retained = authority.memory.used();
+                writer
+                    .destination()
+                    .remaining
+                    .set(if fault == Fault::Interrupted { 0 } else { 2 });
+                authority.fault.store(fault as usize, Ordering::SeqCst);
+                if fault == Fault::DestinationFlush {
+                    let calls = writer.destination().calls;
+                    assert!(matches!(writer.flush_bytes(), Err(FormatError::Io(error))
+                        if error.kind() == std::io::ErrorKind::BrokenPipe));
+                    authority.reset();
+                    assert_eq!(state(writer.encoder()), committed);
+                    assert_eq!(writer.destination().bytes, expected);
+                    assert!(matches!(writer.flush(), Err(FormatError::Resource(error))
+                        if error.kind == ResourceErrorKind::DeliveryPoisoned));
+                    assert_eq!(writer.destination().calls, calls);
+                } else if fault == Fault::Interrupted {
+                    let calls = writer.destination().calls;
+                    writer
+                        .write_operation(operation(index, &record, &doc))
+                        .unwrap();
+                    expected.extend_from_slice(literal);
+                    assert_eq!(writer.destination().bytes, expected);
+                    assert_eq!(writer.destination().calls, calls + 2);
+                } else {
+                    let error = writer
+                        .write_operation(operation(index, &record, &doc))
+                        .unwrap_err();
+                    let kind = match fault {
+                        Fault::Budget => ResourceErrorKind::Budget,
+                        Fault::Layout => ResourceErrorKind::Layout,
+                        Fault::Allocation => ResourceErrorKind::Allocation,
+                        Fault::BeforeSeal | Fault::AfterSeal | Fault::AfterWrite => {
+                            ResourceErrorKind::Cancelled
+                        }
+                        Fault::Read | Fault::ShortRead => ResourceErrorKind::Readback,
+                        _ => ResourceErrorKind::Storage,
+                    };
+                    match (&error, fault) {
+                        (FormatError::Io(error), Fault::Destination) => {
+                            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe)
+                        }
+                        (FormatError::Io(error), Fault::ZeroWrite) => {
+                            assert_eq!(error.kind(), std::io::ErrorKind::WriteZero)
+                        }
+                        (FormatError::Resource(error), Fault::ShortRead) => {
+                            assert_eq!(error.kind, kind);
+                            assert_eq!((error.requested, error.available), (literal.len(), 0));
+                        }
+                        (FormatError::Resource(error), _) => assert_eq!(
+                            *error,
+                            authority.evidence(kind),
+                            "{swift}/{index}/{fault:?}"
+                        ),
+                        _ => panic!("{swift}/{index}/{fault:?}: {error:?}"),
+                    }
+                    match fault {
+                        Fault::Destination => expected.extend_from_slice(&literal[..2]),
+                        Fault::AfterWrite | Fault::Complete => expected.extend_from_slice(literal),
+                        _ => {}
+                    }
+                    assert_eq!(
+                        writer.destination().bytes,
+                        expected,
+                        "{swift}/{index}/{fault:?}"
+                    );
+                    authority.reset();
+                    assert_eq!(state(writer.encoder()), committed);
+                    assert_eq!(
+                        snapshot(writer.encoder(), &resources, &record, &doc),
+                        before
+                    );
+                    assert_eq!(authority.memory.used(), retained);
+                    assert_eq!(authority.stages.load(Ordering::SeqCst), 0);
+                    if matches!(
+                        fault,
+                        Fault::AfterSeal
+                            | Fault::Read
+                            | Fault::ShortRead
+                            | Fault::Destination
+                            | Fault::AfterWrite
+                            | Fault::Complete
+                            | Fault::ZeroWrite
+                    ) {
+                        let calls = writer.destination().calls;
+                        for op in [operation(index, &record, &doc), OutputOperation::Finalize] {
+                            assert!(
+                                matches!(writer.write_operation(op), Err(FormatError::Resource(error))
+                                if error.kind == ResourceErrorKind::DeliveryPoisoned)
+                            );
+                        }
+                        assert!(writer.flush_bytes().is_err());
+                        assert_eq!(writer.destination().calls, calls);
+                    } else {
+                        writer
+                            .write_operation(operation(index, &record, &doc))
+                            .unwrap();
+                        expected.extend_from_slice(literal);
+                        assert_eq!(writer.destination().bytes, expected);
+                    }
+                }
+                drop(writer);
+                assert_eq!(authority.memory.used(), 0);
+                assert_eq!(authority.stages.load(Ordering::SeqCst), 0);
+            }
+        }
+        assert_eq!(cases, if swift { 96 } else { 112 });
+    }
+
+    #[test]
+    fn physical_fault_fixed_width_operations_preserve_warnings_and_framing() {
+        use clinker_format::fixed_width::writer::{FixedWidthEncoder, FixedWidthWriterConfig};
+        physical(
+            false,
+            |resources, _| {
+                FixedWidthEncoder::new(
+                    &[clinker_format::Column {
+                        width: Some(3),
+                        ..clinker_format::Column::bare("value", cxl::typecheck::Type::String)
+                    }],
+                    &FixedWidthWriterConfig {
+                        envelope: Some(clinker_format::OutputEnvelopeSpec {
+                            header_from_doc: Some("opening".into()),
+                            footer_from_doc: Some("closing".into()),
+                            footer_record_count_field: None,
+                        }),
+                        ..Default::default()
+                    },
+                    resources,
+                )
+                .unwrap()
+            },
+            |encoder| {
+                let mut state = encoder.truncation_warnings().to_vec();
+                state.push(format!(
+                    "{}:{}",
+                    encoder.record_count(),
+                    encoder.document_open()
+                ));
+                state
+            },
+        );
+    }
+
+    #[test]
+    fn physical_fault_swift_operations_preserve_service_and_trailer_state() {
+        use clinker_format::swift::writer::{SwiftEncoder, SwiftWriterConfig};
+        physical(
+            true,
+            |resources, schema| {
+                SwiftEncoder::new(
+                    schema,
+                    &SwiftWriterConfig {
+                        basic_header: Some("HEADER".into()),
+                        trailer_from_doc: Some("closing".into()),
+                        ..Default::default()
+                    },
+                    resources,
+                )
+                .unwrap()
+            },
+            |_| Vec::new(),
+        );
     }
 }
 
