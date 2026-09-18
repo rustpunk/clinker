@@ -29,6 +29,42 @@
 //! `-}` trailer. Block-4 free text is opaque, so values are written with zero
 //! escaping; the reader strips exactly the structural separators the writer
 //! re-adds, making the reader → writer → reader round-trip byte-faithful.
+//!
+//! Resource-free writer construction is unavailable at either module path:
+//!
+//! ```compile_fail,E0432
+//! use clinker_format::swift::SwiftWriter;
+//! let _: Option<SwiftWriter<Vec<u8>>> = None;
+//! ```
+//!
+//! ```compile_fail,E0432
+//! use clinker_format::swift::writer::SwiftWriter;
+//! let _: Option<SwiftWriter<Vec<u8>>> = None;
+//! ```
+//!
+//! Use finite resources for retained configuration and staged output:
+//!
+//! ```
+//! use clinker_format::swift::writer::{SwiftEncoder, SwiftWriterConfig};
+//! use clinker_format::preparation::{MemoryOnlyResources, PreparedWriter};
+//! use clinker_format::FormatWriter;
+//! use clinker_record::{Record, Schema, Value, owned_storage::SharedStorage};
+//! use std::{num::NonZeroUsize, sync::Arc};
+//! # fn main() -> Result<(), clinker_format::FormatError> {
+//! let resources = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+//! let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["tag".into(), "value".into()])));
+//! let encoder = SwiftEncoder::new(schema.clone(), &SwiftWriterConfig::default(), resources.resources())?;
+//! let mut bytes = Vec::new();
+//! {
+//!     let mut writer = PreparedWriter::new(&mut bytes, encoder, resources.resources())?;
+//!     writer.write_record(&Record::new(schema, vec![Value::String("79".into()), Value::String("one\r\ntwo".into())]))?;
+//!     writer.flush()?;
+//! }
+//! assert_eq!(bytes, b"{4:\r\n:79:one\r\ntwo\r\n-}");
+//! assert_eq!(resources.used(), 0);
+//! # Ok(())
+//! # }
+//! ```
 
 pub mod reader;
 mod tokenizer;
