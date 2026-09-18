@@ -224,7 +224,7 @@ pub(crate) fn group_dimensions(
     };
     let mut next_start = 0;
     let mut occurrence_width = 0;
-    for (index, child) in children.iter().enumerate() {
+    for child in children {
         if is_group(child) || child.is_multiple() {
             return Err(LayoutError {
                 name: &column.name,
@@ -235,34 +235,35 @@ pub(crate) fn group_dimensions(
         let child_start = child.start.unwrap_or(next_start);
         let width = scalar_width(child, child_start)?;
         let end = child_start + width;
-        let mut prior_end = 0;
-        for prior in &children[..index] {
-            let prior_start = prior.start.unwrap_or(prior_end);
-            prior_end = prior_start + scalar_width(prior, prior_start)?;
-            if child_start < prior_end && prior_start < end {
-                let (next, next_start, next_end, previous, previous_start, previous_end) =
-                    if child_start >= prior_start {
-                        (child, child_start, end, prior, prior_start, prior_end)
-                    } else {
-                        (prior, prior_start, prior_end, child, child_start, end)
-                    };
-                return Err(LayoutError {
-                    name: &column.name,
-                    group: true,
-                    detail: LayoutDetail::Overlap(
-                        true,
-                        &next.name,
-                        next_start,
-                        next_end,
-                        &previous.name,
-                        previous_start,
-                        previous_end,
-                    ),
-                });
-            }
-        }
         next_start = end;
         occurrence_width = occurrence_width.max(end);
+    }
+    // Individual declaration errors precede overlap errors. Overlap selection
+    // follows stable physical order, before repeated-width arithmetic.
+    let mut previous: Option<PhysicalRange<'_>> = None;
+    while let Some(next) = next_physical_range(
+        children,
+        previous.as_ref().map(PhysicalRange::key),
+        scalar_width,
+    )? {
+        if let Some(prior) = &previous
+            && next.start < prior.end
+        {
+            return Err(LayoutError {
+                name: &column.name,
+                group: true,
+                detail: LayoutDetail::Overlap(
+                    true,
+                    &next.column.name,
+                    next.start,
+                    next.end,
+                    &prior.column.name,
+                    prior.start,
+                    prior.end,
+                ),
+            });
+        }
+        previous = Some(next);
     }
     let repeated = occurrence_width.checked_mul(occurs.max).ok_or_else(|| fail("layout width overflows `occurs.max * occurrence_width`; reduce the declared bound or child widths"))?;
     let max_width = count_width.checked_add(repeated).ok_or_else(|| {
@@ -284,44 +285,83 @@ fn layout_width(column: &Column, start: usize) -> Result<usize, LayoutError<'_>>
         scalar_width(column, start)
     }
 }
-pub(crate) fn check_write_layout(columns: &[Column]) -> Result<(), LayoutError<'_>> {
+
+struct PhysicalRange<'a> {
+    column: &'a Column,
+    index: usize,
+    start: usize,
+    end: usize,
+}
+impl PhysicalRange<'_> {
+    fn key(&self) -> (usize, usize) {
+        (self.start, self.index)
+    }
+}
+
+/// Select the next stable physical range with constant borrowed state. Every
+/// scan resolves implicit starts in declaration order, never physical order.
+fn next_physical_range<'a>(
+    columns: &'a [Column],
+    after: Option<(usize, usize)>,
+    width: fn(&'a Column, usize) -> Result<usize, LayoutError<'a>>,
+) -> Result<Option<PhysicalRange<'a>>, LayoutError<'a>> {
+    let mut next: Option<PhysicalRange<'_>> = None;
     let mut next_start = 0;
     for (index, column) in columns.iter().enumerate() {
         let start = column.start.unwrap_or(next_start);
-        let end = start + layout_width(column, start)?;
-        let mut prior_end = 0;
-        for prior in &columns[..index] {
-            let prior_start = prior.start.unwrap_or(prior_end);
-            prior_end = prior_start + layout_width(prior, prior_start)?;
-            if start < prior_end && prior_start < end {
-                let (next, next_start, next_end, previous, previous_start, previous_end) =
-                    if start >= prior_start {
-                        (column, start, end, prior, prior_start, prior_end)
-                    } else {
-                        (prior, prior_start, prior_end, column, start, end)
-                    };
-                let group = is_group(next) || is_group(previous);
-                let owner = if is_group(next) || !group {
-                    next
-                } else {
-                    previous
-                };
-                return Err(LayoutError {
-                    name: &owner.name,
-                    group,
-                    detail: LayoutDetail::Overlap(
-                        false,
-                        &next.name,
-                        next_start,
-                        next_end,
-                        &previous.name,
-                        previous_start,
-                        previous_end,
-                    ),
-                });
-            }
+        let end = start + width(column, start)?;
+        let key = (start, index);
+        if after.is_none_or(|after| key > after)
+            && next.as_ref().is_none_or(|next| key < next.key())
+        {
+            next = Some(PhysicalRange {
+                column,
+                index,
+                start,
+                end,
+            });
         }
         next_start = end;
+    }
+    Ok(next)
+}
+
+pub(crate) fn check_write_layout(columns: &[Column]) -> Result<(), LayoutError<'_>> {
+    let mut next_start = 0;
+    for column in columns {
+        let start = column.start.unwrap_or(next_start);
+        next_start = start + layout_width(column, start)?;
+    }
+    let mut previous: Option<PhysicalRange<'_>> = None;
+    while let Some(next) = next_physical_range(
+        columns,
+        previous.as_ref().map(PhysicalRange::key),
+        layout_width,
+    )? {
+        if let Some(prior) = &previous
+            && next.start < prior.end
+        {
+            let group = is_group(next.column) || is_group(prior.column);
+            let owner = if is_group(next.column) || !group {
+                next.column
+            } else {
+                prior.column
+            };
+            return Err(LayoutError {
+                name: &owner.name,
+                group,
+                detail: LayoutDetail::Overlap(
+                    false,
+                    &next.column.name,
+                    next.start,
+                    next.end,
+                    &prior.column.name,
+                    prior.start,
+                    prior.end,
+                ),
+            });
+        }
+        previous = Some(next);
     }
     Ok(())
 }
