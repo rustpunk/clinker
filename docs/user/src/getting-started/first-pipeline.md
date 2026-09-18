@@ -52,7 +52,7 @@ nodes:
     name: report
     input: classify
     config:
-      name: salary_report
+      name: report
       type: csv
       path: "./salary_report.csv"
 ```
@@ -62,7 +62,7 @@ This pipeline has three nodes:
 1. **`employees`** (source) -- reads the CSV file and declares the schema.
 2. **`classify`** (transform) -- passes all fields through and adds a `level`
    field based on salary.
-3. **`report`** (output) -- writes the result to a new CSV file.
+3. **`report`** (sink) -- writes the result to a new CSV file.
 
 The `input:` field on each consumer node wires the DAG together. Data flows
 from `employees` through `classify` to `report`.
@@ -89,9 +89,15 @@ records:
 clinker run my_first_pipeline.yaml --dry-run -n 2
 ```
 
-This reads the first 2 records from the source, runs them through the pipeline,
-and prints the results to the terminal. Useful for sanity-checking
-transformations before committing to a full run.
+This reads at most 2 records from this source, runs them through the pipeline,
+and writes the preview to stdout without opening `salary_report.csv`. For a
+pipeline with several Sources, the limit applies separately to each Source;
+output counts can differ after filters, joins, or aggregates. Use
+`--dry-run-output preview.csv` to select an explicit preview destination.
+
+At revision `3b343a4e`, this example's bounded preview can fail with an internal
+node-buffer cleanup error. Its ordinary run produces the output below. See
+[the preview limitation](../ops/validation.md#bounded-execution-preview).
 
 ## 5. Understand the execution plan
 

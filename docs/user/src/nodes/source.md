@@ -21,7 +21,7 @@ Source nodes read data from files and are the entry points of every pipeline. Th
 
 ## Schema declaration
 
-The `schema:` field is **required** on every source node. Clinker does not infer types from data -- you must declare each column's name and CXL type explicitly. This schema drives compile-time type checking across the entire pipeline.
+The `schema:` field is **required** on every source node. Runtime ingestion does not guess types from data: declare each column's name and CXL type explicitly. This schema drives compile-time type checking across the entire pipeline.
 
 Each entry is a `{ name, type }` pair:
 
@@ -31,7 +31,7 @@ schema:
   - { name: salary, type: int }
   - { name: hired_at, type: date_time }
   - { name: is_active, type: bool }
-  - { name: notes, type: nullable(string) }
+  - { name: notes, type: { nullable: string } }
 ```
 
 ### Available types
@@ -49,7 +49,7 @@ schema:
 | `array` | Ordered sequence of values |
 | `map` | String-keyed object |
 | `any` | Unknown type -- field used in type-agnostic contexts |
-| `nullable(T)` | Nullable wrapper around any inner type (e.g. `nullable(int)`) |
+| `{ nullable: T }` | Nullable wrapper around a concrete inner type, for example `{ nullable: int }` |
 
 ### Check the schema through the planner
 
@@ -88,15 +88,14 @@ inference-only `int | float` union CXL resolves during type unification — is
 [**E158**](../ops/exit-codes.md#plan-time-diagnostic-codes); declare `int` or
 `float` explicitly.
 
-There is no `clinker guess` command in the current CLI. Decision D-55 locks an
-authoring-only inference workflow under AUTH-03: a deterministic, bounded
-multi-file preview by default, plus an exhaustive bounded-memory mode for
-conclusive evidence. That future command will inspect only columns marked
-`numeric`; it will not run transformations or outputs, and it will not weaken
-runtime validation. Until AUTH-03 ships, inspect the source data yourself and
-commit a concrete `int` or `float` declaration before compiling the pipeline.
-See [Production Contracts](https://github.com/rustpunk/clinker/blob/main/docs/ai/15_PRODUCTION_CONTRACTS.md#scoped-provenance-nested-windows-and-numeric-authoring)
-for the locked safety and write-back rules.
+`clinker guess pipeline.yaml` provides an authoring-only preview for columns
+explicitly marked `numeric`. It proposes concrete `int` or `float` declarations;
+it does not infer arbitrary schemas or change the runtime admission rules.
+The default preview is bounded and read-only. `--check` exhausts the admitted
+manifest; `--write` can publish one guarded, unambiguous inline edit. Resolve
+all `numeric` declarations to concrete types before executing the pipeline.
+See [Numeric schema authoring](../ops/validation.md) and the
+[`guess` command](../ops/cli-reference.md#clinker-guess).
 
 ### `long_unique` — storage hint for high-cardinality text
 

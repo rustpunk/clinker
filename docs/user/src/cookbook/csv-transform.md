@@ -58,7 +58,7 @@ nodes:
     name: report
     input: classify
     config:
-      name: salary_report
+      name: report
       type: csv
       path: "./output/salary_report.csv"
 
@@ -76,8 +76,13 @@ clinker run salary_tiers.yaml --dry-run
 clinker run salary_tiers.yaml --dry-run -n 3
 
 # Full run
+mkdir -p output
 clinker run salary_tiers.yaml
 ```
+
+At revision `3b343a4e`, bounded preview of this example can fail with an internal
+node-buffer cleanup error; the ordinary run produces the output below. See
+[the preview limitation](../ops/validation.md#bounded-execution-preview).
 
 ## Expected output
 
@@ -97,7 +102,10 @@ id,name,department,salary,level,salary_band
 
 **Schema declaration.** The source node declares the schema explicitly with typed columns. This enables compile-time type checking of CXL expressions -- if you write `salary + name`, the type checker catches the error before any data is read.
 
-**Emit statements.** Each `emit` in the transform produces one output column. The output schema is defined entirely by the emit statements -- input columns that are not emitted are dropped. This is intentional: explicit output schemas prevent accidental data leakage.
+**Emit statements.** A Transform adds or replaces the fields it emits. Other input
+columns can pass through. To select the public output columns deliberately, use
+the Sink's `mapping`/`exclude` settings and `include_unmapped: false`; an emit list
+alone is not a data-leakage boundary.
 
 **Match expressions.** The `match` block evaluates conditions top to bottom and returns the value of the first matching arm. The `_` wildcard is the default case and must appear last.
 
@@ -129,8 +137,8 @@ Records where `salary < 60000` are dropped silently -- they do not appear in the
       cxl: |
         emit id = id
         emit name = name
-        emit monthly_salary = (salary.to_float() / 12.0).round(2)
-        emit salary_display = "$" + salary.to_string()
+        emit monthly_salary = (salary.to_float() / 12.0).round_to(2)
+        emit salary_display = "$".concat(salary.to_string())
 ```
 
 The `.to_float()` conversion is required because `salary` is declared as `int` and division by a float literal requires matching types.

@@ -219,16 +219,29 @@ Inspect `outcome`, every owner-level `unresolved_reasons` entry, coverage, and
 the emitted patch. A preview exit of 0 is not proof that every selected field
 resolved; use `--check` when the exit status must enforce that condition.
 
-## Preview options are not yet a bounded preview
+## Bounded execution preview
 
-The CLI accepts `--dry-run -n N` and `--dry-run-output PATH`, but those options
-are not currently wired to a bounded preview. Supplying `-n` proceeds through
-the ordinary execution path instead of enforcing a record limit, and
-`--dry-run-output` is parsed without redirecting preview output.
+`clinker run pipeline.yaml --dry-run -n N` executes a bounded sample after
+planning. `N` must be positive; the runtime checks the limit before each read
+and reads at most `N` records from each declared Source, including Sources
+inside composition bodies. This is a source-record limit, not an output-row
+limit: filtering, aggregation, joins, and fan-out can change the output count.
 
-Do not use either option to protect a production destination. Until bounded
-preview is implemented and tested, run representative data with an explicitly
-isolated destination you can inspect.
+Configured Sink paths are never opened or published. Instead, all preview
+Sinks serialize in stable plan order to stdout, or to the one explicitly
+selected `--dry-run-output PATH`. That explicit destination is written; choose
+it deliberately. Preview emits no live run telemetry or lineage lifecycle.
+
+Without `-n`, `--dry-run` performs planning only and reads no input records.
+`--dry-run-output` requires `-n`, and `-n` requires `--dry-run`. A successful
+sample validates only the sampled data; it does not prove that the rest of
+the input will pass. See [CLI options](cli-reference.md).
+
+> **Known limitation:** At revision `3b343a4e`, some bounded previews fail
+> during cleanup with `completed node-buffer scope retained ...`, even when
+> the same pipeline completes in an ordinary run. Treat that nonzero exit as
+> a failed preview. Planning-only validation remains available; use an ordinary
+> run with disposable output paths to verify actual results.
 
 ## Advisory workspace schema analysis
 

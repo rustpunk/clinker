@@ -29,16 +29,25 @@ Exit code 2 is not a crash. It means:
 - All viable records were processed and written to output files.
 - Some records could not be processed and were diverted to the dead-letter queue.
 
-Your scheduler should treat exit code 2 as a **warning**, not a failure. The DLQ file contains the problematic records along with the error that caused each one to be rejected.
+Your scheduler should distinguish completed-with-DLQ from an aborted run. Whether
+downstream work may continue is a data-quality policy decision. The DLQ contains
+the problematic records and their rejection diagnostics.
 
-To control when exit code 2 escalates to a hard failure, use `--error-threshold`:
+To bound the tolerated type-error ratio, configure the YAML policy:
 
-```bash
-# Abort if more than 100 records hit the DLQ
-clinker run pipeline.yaml --error-threshold 100
+```yaml
+error_handling:
+  strategy: continue
+  type_error_threshold: 0.05
+  dlq:
+    path: ./output/errors.csv
+    format: csv
 ```
 
-With a threshold set, the pipeline aborts (exit code 3) when the DLQ count exceeds the threshold, rather than continuing to completion.
+The threshold is a ratio from 0 to 1, not a record count. Exceeding the configured
+type-error ratio produces exit 3. It does not count every possible DLQ reason.
+The retired `--error-threshold` flag is rejected; see
+[error handling](../pipelines/error-handling.md) for the policy's population.
 
 ## Diagnosing failures
 

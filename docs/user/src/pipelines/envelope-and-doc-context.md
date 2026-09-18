@@ -36,12 +36,14 @@ record:
 
 ```yaml
 nodes:
-  - transform: tag
-    inputs: { in: payments }
-    project:
-      - batch: $doc.BatchInfo.batch_id
-      - expected_total: $doc.Summary.record_count
-      - amount: amount
+  - type: transform
+    name: tag
+    input: payments
+    config:
+      cxl: |
+        emit batch = $doc.BatchInfo.batch_id
+        emit expected_total = $doc.Summary.record_count
+        emit amount = amount
 ```
 
 ## Section names are yours

@@ -78,11 +78,11 @@ CXL has 10 value types, and unification operates over them plus two compile-time
 | Integer | `i64` | 64-bit signed integer |
 | Float | `f64` | 64-bit double-precision float |
 | Decimal | `rust_decimal::Decimal` | Exact base-10 fixed-point number (16 bytes) for monetary/financial data |
-| String | `Box<str>` | UTF-8 text |
+| String | `FieldStr` | UTF-8 text |
 | Date | `NaiveDate` | Calendar date without timezone |
 | DateTime | `NaiveDateTime` | Date and time without timezone |
-| Array | `Vec<Value>` | Ordered collection of values |
-| Map | `IndexMap<Box<str>, Value>` | Key-value pairs |
+| Array | `OwnedValues` | Ordered collection of values |
+| Map | `OwnedMap` | Key-value pairs |
 
 Two further type-level constructs appear only at compile time, never as a runtime `Value`:
 

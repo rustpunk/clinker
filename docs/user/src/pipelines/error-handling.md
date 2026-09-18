@@ -160,16 +160,19 @@ the first type failure, while `1.0` never trips. Values must be finite and in
 
 ### Correlation key
 
-Group DLQ rejections by a key field. When any record in a correlation group fails, **records from the failing source's contribution to that group** are routed to the DLQ:
+Declare `correlation_key` on the contributing Source's `config:` block, not on
+`error_handling:`. Group DLQ rejections by a key field. When any record in a correlation group fails, **records from the failing source's contribution to that group** are routed to the DLQ:
 
 ```yaml
-  correlation_key: order_id
+# Inside a Source's config:
+correlation_key: order_id
 ```
 
 For compound keys:
 
 ```yaml
-  correlation_key: [order_id, customer_id]
+# Inside a Source's config:
+correlation_key: [order_id, customer_id]
 ```
 
 This is useful for transactional data where partial processing of a group is worse than rejecting the entire group. For example, if one line item in an order fails validation, you may want to reject the entire order.
@@ -200,6 +203,7 @@ nodes:
       name: claims
       type: x12
       glob: ./claims/*.edi
+      schema: [{ name: seg_id, type: string }]
       dlq_granularity: document   # record (default) | document
 ```
 
@@ -251,6 +255,7 @@ nodes:
       name: claims
       type: x12
       glob: ./claims/*.edi
+      schema: [{ name: seg_id, type: string }]
       dlq_granularity: document   # reuse the document opt-in — no separate config
 ```
 
@@ -292,6 +297,7 @@ nodes:
       name: orders
       type: csv
       path: "./data/orders.csv"
+      correlation_key: order_id
       schema:
         - { name: order_id, type: int }
         - { name: customer_id, type: int }
@@ -331,5 +337,4 @@ error_handling:
     include_reason: true
     include_source_row: true
   type_error_threshold: 0.10
-  correlation_key: order_id
 ```

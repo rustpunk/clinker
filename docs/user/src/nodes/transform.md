@@ -10,7 +10,7 @@ Transform nodes apply CXL expressions to each record, producing new fields, filt
   input: customers
   config:
     cxl: |
-      emit full_name = first_name + " " + last_name
+      emit full_name = first_name.concat(" ", last_name)
       emit tier = if lifetime_value >= 10000 then "gold" else "standard"
       filter status == "active"
 ```
@@ -317,7 +317,7 @@ in deployment policy.
   config:
     cxl: |
       emit employee_id = employee_id
-      emit display_name = last_name + ", " + first_name
+      emit display_name = last_name.concat(", ", first_name)
       emit department = department.upper()
       emit salary = salary
       emit annual_bonus = if salary >= 80000 then salary * 0.15

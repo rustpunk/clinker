@@ -5,7 +5,7 @@ A Clinker pipeline is a single flat `nodes:` list. Every entry carries a
 taxonomy**. There is no separate "join section" or "filter section":
 records flow through one homogeneous graph of typed nodes, wired together
 by [`input:` / `inputs:`](../pipelines/structure.md#wiring-by-node-kind).
-This part documents the nine record-processing node kinds; a tenth,
+This part documents the ten runtime node kinds; an eleventh,
 [Composition](../pipelines/compositions.md), is a call-site that inlines a
 reusable sub-pipeline and is covered under Pipelines.
 
@@ -16,12 +16,12 @@ nodes, and leaves at a Sink:
 | Node | Role | Arity | Streaming vs blocking |
 |------|------|-------|-----------------------|
 | [Source](source.md) | Reads records from a file or network cursor; the entry point. | 0 → 1 | Streaming |
-| [Transform](transform.md) | Record-level CXL projection, filter, and lookup. | 1 → 1 | Streaming |
+| [Transform](transform.md) | Record-level CXL projection, filter, and lookup. | 1 → 0..N records | Streaming |
 | [Route](route.md) | Predicate-based fan-out into named branches. | 1 → N | Streaming |
 | [Merge](merge.md) | Streamwise concatenation of inputs that share a schema. | N → 1 | Streaming |
 | [Combine](combine.md) | N-ary record combining with mixed predicates (equi + range + arbitrary CXL). | N → 1 | Blocking (build side) |
 | [Aggregate](aggregate.md) | Grouped or windowed reduction. | 1 → 1 | Blocking (or streaming when sorted) |
-| [Reshape](reshape.md) | Pivot / unpivot between wide and long record shapes. | 1 → 1 | Blocking |
+| [Reshape](reshape.md) | Group-aware mutation and synthesis of records. | 1 input → 1 output port | Blocking |
 | [Cull](cull.md) | Per-correlation-group removal on a group-level predicate, with a `removed_to` side-output port. | 1 → 2 | Blocking |
 | [Envelope](envelope.md) | Frames a body stream into per-document documents; a composable framing stage. | 1 → 1 | Streaming |
 | [Sink](sink.md) | Writes records to an output destination; the exit point. | 1 → 0 | Streaming |

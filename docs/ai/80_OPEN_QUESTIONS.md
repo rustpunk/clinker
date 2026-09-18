@@ -574,32 +574,29 @@ stale-user-docs sweep.)
 - Implementation owner: Phase 2 / CORR-03
 - Verified: 2026-07-29
 
-### 31. Authoring-time `numeric -> int|float` inference (`clinker guess`) is unbuilt
+### 31. Authoring-time `numeric -> int|float` inference (`clinker guess`)
 
-(The schema-resolver unification this question originally tracked has landed;
-see the Resolved Archive. This entry keeps the one remaining follow-on.)
+(The schema-resolver unification and the authoring-time inference flow have
+landed. Runtime admission still rejects unresolved `numeric` with E158.)
 
-- Question: The `numeric` type is an inference-only union that never survives a
-  resolved schema (compile rejects unresolved `type: numeric` with E158). The
-  planned authoring-time path that concretizes it — a `clinker guess` flow that
-  infers `int` versus `float` from sample data — is unbuilt. Should it be built,
-  and with what sampling/precision rules?
-- Why it matters: Until an inference path exists, users must hand-resolve
-  `numeric` columns; docs and examples must keep declaring concrete
-  `int`/`float`, and agents must not treat `numeric` as a runtime type.
+- Resolution: `clinker guess` supplies bounded preview, exhaustive check, and
+  guarded write modes. It can resolve numeric placeholders and review repeated
+  source fields. Runtime execution requires concrete schema types.
+- Why it matters: Authoring inference does not introduce runtime type guessing.
+  See [the user contract](../user/src/ops/validation.md#guessing-numeric-types-and-repeated-source-fields)
+  for budgets, evidence requirements, and publication safeguards.
 - Files/modules involved: `crates/clinker-plan/src/schema/mod.rs`,
   `crates/cxl/src/typecheck/types.rs`, `crates/clinker/src/main.rs`,
   `docs/user/src/nodes/source.md`.
-- Suggested way to resolve it: Design the `clinker guess` sampling and
-  concretization rules, then implement it as an authoring-time CLI flow that
-  rewrites the schema declaration; keep runtime strictness unchanged.
 - Priority: Medium
 - Filed: 2026-07-02; narrowed to the `clinker guess` follow-on 2026-07-24.
 - Status: Resolved
 - Decision: D-55
-- Evidence: `docs/ai/15_PRODUCTION_CONTRACTS.md` locks bounded preview, exhaustive evidence, and guarded rewrite semantics; `crates/clinker-plan/src/schema/mod.rs` retains strict E158 runtime admission and `crates/clinker/src/main.rs` has no current `guess` command.
+- Evidence: `crates/clinker/src/guess.rs` implements the flow;
+  `crates/clinker/src/main.rs` exposes the command; runtime schema admission
+  remains in `crates/clinker-plan/src/schema/mod.rs`.
 - Implementation owner: AUTH-03
-- Verified: 2026-07-29
+- Verified: 2026-09-18 against `3b343a4e`.
 
 ### 32. Should reserved composition call-site `outputs:` and `alias:` be removed or implemented?
 
@@ -693,6 +690,45 @@ see the Resolved Archive. This entry keeps the one remaining follow-on.)
   option.
 - Priority: High
 - Filed: 2026-08-02.
+
+## Runtime findings from documentation verification
+
+### 62. Bounded preview can fail node-buffer cleanup
+
+- Filed: 2026-09-18.
+- Status: Open; reproduced against `3b343a4e`.
+- Priority: High.
+- Evidence: Bounded previews of the first-pipeline and CSV-transform recipes
+  fail with `completed node-buffer scope retained 1 slot(s), 1 reader-count
+  entry/entries, and 1 memory registration(s)`. Their ordinary runs complete
+  and match the documented CSV bytes. The same diagnostic occurs in the
+  tutorial site's validation and DLQ fixtures, including with output parents
+  already present.
+- Files/modules involved: `crates/clinker-exec/src/executor/dispatch.rs`,
+  `crates/clinker/src/main.rs`, `docs/user/src/ops/validation.md`.
+- Suggested way to resolve it: Trace preview completion and retained reader
+  ownership; add a regression that checks cleanup and output for bounded
+  execution through typed Sources and Sinks. Do not suppress the invariant.
+- Implementation owner: CLI and executor maintainers.
+
+### 63. Mismatched Sink names can fail writing or publish empty files
+
+- Filed: 2026-09-18.
+- Status: Open; reproduced against `3b343a4e`.
+- Priority: High.
+- Evidence: With Sink node `report` and `config.name: salary_report`, the
+  first-pipeline recipe plans successfully but fails an ordinary run with
+  `compiled writer mode Streaming reached the RecordsOnly byte-emission path`.
+  Routing and aggregation recipes with mismatched names instead exit zero and
+  publish empty files. Aligning each `config.name` with its node `name` restores
+  the expected output. Documentation examples now use matching names.
+- Files/modules involved: `crates/clinker-exec/src/executor/sink_dispatch.rs`,
+  `crates/clinker-plan/src/config/pipeline_node.rs`,
+  `docs/user/src/nodes/sink.md`.
+- Suggested way to resolve it: Establish one canonical Sink identity or reject
+  inconsistent names during planning. Cover both explicit writer-boundary
+  failure and empty-file publication in execution tests.
+- Implementation owner: Planner and executor maintainers.
 
 ## Resolved Archive
 

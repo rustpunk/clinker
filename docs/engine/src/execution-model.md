@@ -9,6 +9,17 @@ Every node in a pipeline plan is one of two kinds at runtime:
 - **Streaming** stages hand their output downstream in bounded batches over a back-pressured channel, never crossing an inter-stage buffer that charges the memory budget. The two *fused* streaming paths additionally hold at most one batch of in-flight events at a time, so their inter-stage memory does not grow with input size. The other streaming stages still build their own result before handing it off — streaming spares them the *second* copy into a charged buffer and overlaps the writer with downstream work, but their own working set is as large as a blocking stage's would be.
 - **Blocking** stages must see their whole input before they can produce any output. They accumulate state inside the memory budget and spill to disk when the soft threshold trips, rather than holding everything in RAM.
 
+## Source decoding and schema admission
+
+Format decoding and pipeline typing are separate boundaries. A single-record
+CSV decoder produces text cells; `CoercingReader` in
+`clinker-exec::pipeline::schema_coerce` applies the declared schema before
+records enter source buffering or downstream operators. Numeric and date
+columns are therefore typed at source admission, not lazily on their first CXL
+use. Invalid declared values follow the source's row-error policy. Positional
+readers that already parse typed fields carry that proof through the same
+boundary, which validates it without parsing the text twice.
+
 ## Materialized input invariant
 
 Every planned materialized edge has an occupied node-buffer slot when its
@@ -80,7 +91,7 @@ The transfer keeps one continuous registration and charges both allocations
 only for their real overlap: there is no unregistered interval and no second
 consumer charge for the same bytes.
 
-This distinction is what makes Clinker a bounded-memory executor: a pipeline's peak memory is set by its largest live blocking-or-non-fused-streaming stage plus one batch per fused streaming stage, not by the cumulative size of every stage at once. A streaming stage's output is never separately buffered between dispatch arms, so it is never charged twice: the arbitrator counts each in-flight batch once when the producer flushes it and discharges that charge as the consumer drains it. If RSS still crosses the soft threshold while a single-consumer streaming stage holds batches in flight, the engine spills those batches' records to disk one batch at a time — the streaming handoff is the per-batch counterpart of a blocking stage's full-stage spill, not an exemption from spilling.
+This distinction is what makes Clinker a bounded-memory executor: the budget covers the combined live state of operators, source queues, materialized boundaries, and in-flight batches. A largest-stage estimate alone is not an upper bound, especially when several consumers retain the same upstream boundary. A streaming stage's output is never separately buffered between dispatch arms, so it is never charged twice: the arbitrator counts each in-flight batch once when the producer flushes it and discharges that charge as the consumer drains it. If RSS still crosses the soft threshold while a single-consumer streaming stage holds batches in flight, the engine spills those batches' records to disk one batch at a time — the streaming handoff is the per-batch counterpart of a blocking stage's full-stage spill, not an exemption from spilling.
 
 ## Plan admission and runtime entry
 

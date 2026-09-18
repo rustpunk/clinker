@@ -25,13 +25,14 @@ nodes:
   - name: dept_summary
     type: aggregate
     input: employees
-    group_by: [department]
-    cxl: |
-      emit total_salary = sum(salary)
-      emit headcount = count(*)
-      emit avg_salary = avg(salary)
-      emit max_salary = max(salary)
-      emit min_salary = min(salary)
+    config:
+      group_by: [department]
+      cxl: |
+        emit total_salary = sum(salary)
+        emit headcount = count(*)
+        emit avg_salary = avg(salary)
+        emit max_salary = max(salary)
+        emit min_salary = min(salary)
 ```
 
 ### Group-by fields pass through automatically
@@ -137,13 +138,14 @@ nodes:
   - name: category_stats
     type: aggregate
     input: products
-    group_by: [category]
-    cxl: |
-      emit total_revenue = sum(price * quantity)
-      emit avg_price = avg(price)
-      emit margin_pct = (sum(revenue) - sum(cost)) / sum(revenue) * 100
-      emit product_count = count(*)
-      emit has_premium = max(price) > 100
+    config:
+      group_by: [category]
+      cxl: |
+        emit total_revenue = sum(price * quantity)
+        emit avg_price = avg(price)
+        emit margin_pct = (sum(revenue) - sum(cost)) / sum(revenue) * 100
+        emit product_count = count(*)
+        emit has_premium = max(price) > 100
 ```
 
 ## Restrictions

@@ -26,6 +26,21 @@ format split and the schema rules every source shares.
       encoding: "utf-8"      # default "utf-8"
 ```
 
+## Declared types
+
+CSV has no native numeric or date types: decoding first produces text cells.
+Source ingestion then parses and validates each declared column against
+`schema:` before buffering, sorting, or downstream CXL evaluation. With
+`type: int`, the cell `42` reaches a Transform as an integer; with
+`type: string`, the cell `0042` remains text, including its leading zeroes.
+No explicit CXL cast is needed for a column already declared with its intended
+type. Casts such as `.to_int()` are useful when a pipeline deliberately keeps
+text in its schema and converts it later.
+
+A value that fails its declared type rejects the row under the configured
+error policy; it never silently falls back to text. See
+[Declared-type failures](../nodes/source.md#declared-type-failures).
+
 ## Options
 
 All CSV options are optional. With no `options:` block, Clinker uses
