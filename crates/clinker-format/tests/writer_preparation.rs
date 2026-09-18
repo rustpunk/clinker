@@ -138,6 +138,22 @@ mod fixed_width_prepared {
     }
 
     #[test]
+    fn warning_history_keeps_existing_text_backing_across_successful_append() {
+        for text in ["x".repeat(4096), "好é".repeat(819)] {
+            let provider = provider();
+            let encoder = FixedWidthEncoder::new(&[field("value", 2)], &FixedWidthWriterConfig::default(), provider.resources()).unwrap();
+            let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+            let record = record(&[("value", Value::String(text.into()))]);
+            writer.write_record(&record).unwrap();
+            let pointer = writer.encoder().truncation_warnings()[0].as_str().as_ptr();
+            writer.write_record(&record).unwrap();
+            assert_eq!(writer.encoder().truncation_warnings().len(), 2);
+            assert_eq!(writer.encoder().truncation_warnings()[0].as_str().as_ptr(), pointer, "successful append must move the old message owner without copying its bytes");
+            drop(writer); assert_eq!(provider.used(), 0);
+        }
+    }
+
+    #[test]
     fn scalar_sections_order_presence_separators_and_multiple_documents() {
         let values = [
             ("text", Value::String("hé".into())),
