@@ -13,14 +13,16 @@ use clinker_format::csv::writer::{
     CsvEncoder, CsvEncoderConfig, CsvEncoderOptions, CsvHeaderCapture, CsvWriterConfig,
 };
 use clinker_format::edifact::writer::{EdifactWriter, EdifactWriterConfig};
-use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConfig};
+use clinker_format::fixed_width::writer::{
+    FixedWidthEncoder, FixedWidthEncoderConfig, FixedWidthWriterConfig,
+};
 use clinker_format::hl7::writer::{Hl7Writer, Hl7WriterConfig};
 use clinker_format::json::writer::{
     JsonEncoder, JsonEncoderConfig, JsonOutputMode, JsonWriterConfig,
 };
 use clinker_format::preparation::WriterResources;
 use clinker_format::splitting::{OversizeGroupPolicy, SplitPolicy, SplittingWriter, WriterFactory};
-use clinker_format::swift::writer::{SwiftWriter, SwiftWriterConfig};
+use clinker_format::swift::writer::{SwiftEncoder, SwiftEncoderConfig};
 #[cfg(test)]
 use clinker_format::traits::FormatWriter;
 use clinker_format::traits::FormatWriterHandle;
@@ -181,28 +183,15 @@ fn build_hl7_writer_config(
     }
 }
 
-fn build_swift_writer_config(
-    opts: Option<&clinker_plan::config::SwiftOutputOptions>,
-) -> SwiftWriterConfig {
-    SwiftWriterConfig {
-        basic_header: opts.and_then(|o| o.basic_header.clone()),
-        basic_header_from_doc: opts.and_then(|o| o.basic_header_from_doc.clone()),
-        app_header: opts.and_then(|o| o.app_header.clone()),
-        app_header_from_doc: opts.and_then(|o| o.app_header_from_doc.clone()),
-        user_header: opts.and_then(|o| o.user_header.clone()),
-        user_header_from_doc: opts.and_then(|o| o.user_header_from_doc.clone()),
-        trailer: opts.and_then(|o| o.trailer.clone()),
-        trailer_from_doc: opts.and_then(|o| o.trailer_from_doc.clone()),
-    }
-}
-
-/// Extract the fixed-width output column list from an output config's `schema:`.
+/// Prepare the fixed-width layout by borrowing the output config's `schema:`.
 ///
 /// Fixed-width output requires an explicit single-record column list specifying
 /// names, widths, and optionally start positions, justification, and padding.
-fn extract_output_field_defs(
+fn fixed_width_encoder_config(
     output: &SinkConfig,
-) -> Result<Vec<clinker_format::Column>, PipelineError> {
+    config: &FixedWidthWriterConfig,
+    resources: &WriterResources,
+) -> Result<FixedWidthEncoderConfig, PipelineError> {
     let schema = output.schema.as_ref().ok_or_else(|| {
         PipelineError::Config(clinker_plan::config::ConfigError::Validation(
             "fixed-width output format requires an explicit `schema:` column list".into(),
@@ -222,36 +211,28 @@ fn extract_output_field_defs(
         }
         other => other,
     };
-    schema.as_columns().map(<[_]>::to_vec).ok_or_else(|| {
+    let fields = schema.as_columns().ok_or_else(|| {
         PipelineError::Config(clinker_plan::config::ConfigError::Validation(
             "fixed-width output schema must be a single-record column list (not a multi-record \
              or generated schema)"
                 .into(),
         ))
-    })
-}
-
-/// Build a writer factory closure for the given output format.
-///
-/// The returned `WriterFactory` creates format writers wrapping a `CountingWriter`.
-/// CSV factories share admitted configuration and header capture. Only successful
-/// first-body delivery publishes a header; replay joins each later first body
-/// in one prepared operation, with no eager factory output.
-/// For fixed-width, the factory captures pre-resolved `Column`s from the output schema.
-/// Map the plan's `OutputEnvelopeConfig` onto the format-local
-/// `OutputEnvelopeSpec` the writers consume, but only when the Output declares
-/// `reconstruct_envelope: true`. Returns `None` (no framing) when the flag is
-/// off, no envelope config is declared, or the declared config is empty — so
-/// the flag-off path stays byte-identical.
-fn resolve_envelope_spec(
-    reconstruct_envelope: bool,
-    cfg: Option<&clinker_plan::config::OutputEnvelopeConfig>,
-) -> Option<clinker_format::OutputEnvelopeSpec> {
-    if !reconstruct_envelope {
-        return None;
-    }
-    let spec = clinker_format::OutputEnvelopeSpec::from(cfg?);
-    (!spec.is_empty()).then_some(spec)
+    })?;
+    let envelope = match &output.format {
+        OutputFormat::FixedWidth(options) if output.reconstruct_envelope => {
+            options.as_ref().and_then(|o| o.envelope.as_ref())
+        }
+        _ => None,
+    };
+    FixedWidthEncoderConfig::from_names(
+        fields,
+        config.line_separator.clone(),
+        envelope.and_then(|e| e.header_from_doc.as_deref()),
+        envelope.and_then(|e| e.footer_from_doc.as_deref()),
+        envelope.and_then(|e| e.footer_record_count_field.as_deref()),
+        resources,
+    )
+    .map_err(PipelineError::Format)
 }
 
 struct CsvFactoryState {
@@ -288,7 +269,6 @@ impl CsvFactoryState {
 fn build_writer_factory(
     output: &SinkConfig,
     repeat_header: bool,
-    field_defs: Option<Vec<clinker_format::Column>>,
     resources: WriterResources,
 ) -> Result<WriterFactory, PipelineError> {
     // Every per-format config field derives from the Sink config; bind them
@@ -426,22 +406,20 @@ fn build_writer_factory(
                 .map_err(|error| PipelineError::Format(error.into()))
         }
         OutputFormat::FixedWidth(opts) => {
-            let mut fw_config = build_fw_writer_config(opts.as_ref());
-            fw_config.envelope = resolve_envelope_spec(
-                reconstruct_envelope,
-                opts.as_ref().and_then(|o| o.envelope.as_ref()),
-            );
-            let fields = field_defs.expect(
-                "fixed-width writer factory requires field_defs — \
-                 build_format_writer must validate schema before calling",
-            );
-            Ok(WriterFactory::from_legacy(
-                move |counting_writer, _schema| {
-                    Ok(FormatWriterHandle::from_legacy(Box::new(
-                        FixedWidthWriter::new(counting_writer, fields.clone(), fw_config.clone())?,
-                    )))
-                },
-            ))
+            let config = fixed_width_encoder_config(
+                output,
+                &build_fw_writer_config(opts.as_ref()),
+                &resources,
+            )?;
+            let scope = resources
+                .scope()
+                .map_err(|error| PipelineError::Format(error.into()))?;
+            let factory = move |counting_writer, _schema| {
+                FixedWidthEncoder::from_config(config.clone(), resources.clone())?
+                    .into_boxed_writer(counting_writer, resources.clone())
+            };
+            WriterFactory::try_new(factory, scope.allocation())
+                .map_err(|error| PipelineError::Format(error.into()))
         }
         OutputFormat::Edifact(opts) => {
             let edi_config = build_edifact_writer_config(opts.as_ref());
@@ -489,16 +467,37 @@ fn build_writer_factory(
             ))
         }
         OutputFormat::Swift(opts) => {
-            let swift_config = build_swift_writer_config(opts.as_ref());
-            Ok(WriterFactory::from_legacy(
-                move |counting_writer, schema| {
-                    Ok(FormatWriterHandle::from_legacy(Box::new(SwiftWriter::new(
-                        counting_writer,
-                        schema,
-                        swift_config.clone(),
-                    ))))
-                },
-            ))
+            let opts = opts.as_ref();
+            let config = SwiftEncoderConfig::from_sources(
+                [
+                    (
+                        opts.and_then(|o| o.basic_header.as_deref()),
+                        opts.and_then(|o| o.basic_header_from_doc.as_deref()),
+                    ),
+                    (
+                        opts.and_then(|o| o.app_header.as_deref()),
+                        opts.and_then(|o| o.app_header_from_doc.as_deref()),
+                    ),
+                    (
+                        opts.and_then(|o| o.user_header.as_deref()),
+                        opts.and_then(|o| o.user_header_from_doc.as_deref()),
+                    ),
+                    (
+                        opts.and_then(|o| o.trailer.as_deref()),
+                        opts.and_then(|o| o.trailer_from_doc.as_deref()),
+                    ),
+                ],
+                &resources,
+            )?;
+            let scope = resources
+                .scope()
+                .map_err(|error| PipelineError::Format(error.into()))?;
+            let factory = move |counting_writer, schema| {
+                SwiftEncoder::from_config(schema, config.clone())?
+                    .into_boxed_writer(counting_writer, resources.clone())
+            };
+            WriterFactory::try_new(factory, scope.allocation())
+                .map_err(|error| PipelineError::Format(error.into()))
         }
     }
 }
@@ -515,23 +514,20 @@ pub(crate) fn build_format_writer(
     sink_byte_counter: Option<SharedByteCounter>,
     resources: WriterResources,
 ) -> Result<FormatWriterHandle, PipelineError> {
-    // Extract field definitions for fixed-width output (requires explicit schema).
-    let field_defs = if matches!(output.format, OutputFormat::FixedWidth(_)) {
-        Some(extract_output_field_defs(output)?)
-    } else {
-        None
-    };
-
     let repeat_header = output.split.as_ref().is_some_and(|s| s.repeat_header);
     let scope = resources
         .scope()
         .map_err(|error| PipelineError::Format(error.into()))?;
-    let writer_factory = build_writer_factory(output, repeat_header, field_defs, resources)?;
+    let writer_factory = build_writer_factory(output, repeat_header, resources)?;
     // Prepared codecs already batch complete operations. An additional
     // BufWriter would count bytes before delivery and retry poison on drop.
     let prepared_output = matches!(
         output.format,
-        OutputFormat::Csv(_) | OutputFormat::Json(_) | OutputFormat::Xml(_)
+        OutputFormat::Csv(_)
+            | OutputFormat::Json(_)
+            | OutputFormat::Xml(_)
+            | OutputFormat::FixedWidth(_)
+            | OutputFormat::Swift(_)
     );
 
     if let Some(ref split) = output.split {
@@ -630,6 +626,153 @@ mod tests {
     use clinker_plan::config::{CompileContext, parse_config};
     use clinker_record::{Record, Value};
 
+    #[test]
+    fn swift_factory_delivers_atomic_header_and_actual_destination_bytes() {
+        let config = parse_config(
+            r#"
+pipeline:
+  name: swift_output
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: in.json
+      schema:
+        - { name: tag, type: string }
+        - { name: value, type: string }
+  - type: sink
+    name: out
+    input: src
+    config:
+      name: out
+      type: swift
+      path: out.swift
+      options:
+        basic_header: HEADER
+        trailer: TRAILER
+"#,
+        )
+        .unwrap();
+        let plan = config.compile(&CompileContext::default()).unwrap();
+        let sink = plan.config().sink_configs().next().unwrap();
+        let provider = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(128 * 1024).unwrap(),
+        );
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["tag".into(), "value".into()])));
+        let bytes = clinker_bench_support::io::SharedBuffer::new();
+        let counter = SharedByteCounter::new();
+        let mut writer = build_format_writer(
+            sink,
+            Box::new(bytes.clone()),
+            schema.clone(),
+            Default::default(),
+            Some(counter.clone()),
+            provider.resources(),
+        )
+        .unwrap();
+        assert!(
+            writer
+                .write_record(&Record::new(
+                    schema.clone(),
+                    vec![Value::Null, Value::String("bad".into())]
+                ))
+                .is_err()
+        );
+        assert!(bytes.contents().is_empty());
+        assert_eq!(counter.bytes_written(), 0);
+        writer
+            .write_record(&Record::new(
+                schema,
+                vec![Value::String("20".into()), Value::String("body".into())],
+            ))
+            .unwrap();
+        assert_eq!(bytes.contents(), b"{1:HEADER}{4:\r\n:20:body\r\n");
+        assert_eq!(counter.bytes_written(), bytes.contents().len() as u64);
+        writer.flush().unwrap();
+        assert_eq!(
+            bytes.contents(),
+            b"{1:HEADER}{4:\r\n:20:body\r\n-}{5:TRAILER}"
+        );
+        assert_eq!(counter.bytes_written(), bytes.contents().len() as u64);
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn fixed_width_factory_delivers_exact_records_and_refuses_late_fields() {
+        let config = parse_config(
+            r#"
+pipeline:
+  name: physical_output
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: in.json
+      schema:
+        - { name: id, type: int }
+        - { name: text, type: string }
+  - type: sink
+    name: out
+    input: src
+    config:
+      name: out
+      type: fixed_width
+      path: out.txt
+      schema:
+        - { name: id, type: int, width: 3, pad: '0' }
+        - { name: text, type: string, width: 4 }
+"#,
+        )
+        .unwrap();
+        let plan = config.compile(&CompileContext::default()).unwrap();
+        let sink = plan.config().sink_configs().next().unwrap();
+        let provider = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(128 * 1024).unwrap(),
+        );
+        let factory = build_writer_factory(sink, false, provider.resources()).unwrap();
+        let retained = provider.used();
+        assert!(retained > 0);
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "text".into()])));
+        let bytes = clinker_bench_support::io::SharedBuffer::new();
+        let counter = SharedByteCounter::new();
+        let mut writer = factory
+            .create(
+                CountingWriter::new(Box::new(bytes.clone()), counter.clone()),
+                schema.clone(),
+            )
+            .unwrap();
+        let invalid = Record::new(
+            schema.clone(),
+            vec![
+                Value::Integer(7),
+                Value::Map(clinker_record::owned_storage::OwnedMap::from_map(
+                    Default::default(),
+                )),
+            ],
+        );
+        assert!(writer.write_record(&invalid).is_err());
+        assert!(bytes.contents().is_empty());
+        writer
+            .write_record(&Record::new(
+                schema,
+                vec![Value::Integer(7), Value::String("é好".into())],
+            ))
+            .unwrap();
+        writer.flush().unwrap();
+        assert_eq!(bytes.contents(), "007é  \n".as_bytes());
+        drop(writer);
+        assert_eq!(provider.used(), retained);
+        drop(factory);
+        assert_eq!(provider.used(), 0);
+    }
+
     fn compiled_split_sink(format: &str, declared_multiple: bool) -> SinkConfig {
         let multiple = if declared_multiple {
             ", multiple: true"
@@ -687,7 +830,7 @@ nodes:
                 ];
                 let files = outputs.clone();
                 let factory =
-                    build_writer_factory(&sink, repeat_header, None, provider.resources()).unwrap();
+                    build_writer_factory(&sink, repeat_header, provider.resources()).unwrap();
                 let retained = provider.used();
                 let scope = provider.resources().scope().unwrap();
                 let pressure = scope
@@ -818,7 +961,7 @@ nodes:
                 "@id".into()
             }])));
             let output = clinker_bench_support::io::SharedBuffer::new();
-            let factory = build_writer_factory(&sink, true, None, provider.resources()).unwrap();
+            let factory = build_writer_factory(&sink, true, provider.resources()).unwrap();
             let mut writer = factory
                 .create(
                     CountingWriter::new(Box::new(output.clone()), SharedByteCounter::new()),

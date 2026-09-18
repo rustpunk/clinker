@@ -54,15 +54,18 @@ above are arbitrary identifiers chosen by the pipeline author — `Head`
 all equally valid. A section name is whatever string you put in the
 `sections:` map; CXL exposes it verbatim as `$doc.<that_name>.<field>`.
 
-## All sections are available everywhere in the body stream
+## Extracted sections are available throughout the body stream
 
-Every declared section is available to *every* body record, no matter
-where the section physically sits in the file. A header at the top and a
-trailer at the bottom are both visible from the first record to the
-last, so every body record sees every `$doc.<section>.<field>` value.
+Every extracted section is available to *every* body record. JSON and XML
+can pre-scan declared sections anywhere in the document, so a header at the
+top and a trailer at the bottom are both visible from the first record to
+the last. SWIFT likewise scans its service blocks before emitting fields.
+Multi-record CSV and fixed-width `record_type` extraction captures the
+leading header region only; it does not extract arbitrary trailing sections.
 
-This means a trailer field is available *during* body processing, not
-just at end-of-file. A pipeline can compute, on every row, a ratio
+For formats with trailing-section extraction, a trailer field is available
+*during* body processing, not just at end-of-file. A pipeline can compute,
+on every row, a ratio
 against the trailer's total:
 
 ```yaml
@@ -156,6 +159,7 @@ Each section declares how the reader locates its payload:
 | EDIFACT | `segment`        | A service-segment tag — only `UNB`               |
 | X12     | `segment`        | A service-segment tag — only `ISA` (GS/ST surface as nested levels) |
 | HL7 v2  | `segment`        | A header-segment tag — only `FHS` (BHS/MSH surface as nested levels) |
+| SWIFT MT | `segment`      | A service block: `"1"`, `"2"`, `"3"`, or `"5"` (or its default label) |
 | Multi-record CSV / fixed-width | `record_type` | A header record-type tag, e.g. `H` |
 
 `xml_path` and the source-level `record_path` option are both slash-paths over
@@ -550,6 +554,42 @@ records between — and for an inner envelope that opens or closes after the
 file's last body record. Every envelope boundary a reader signals is
 applied, whether or not a record follows it, so the document frame stays
 balanced end to end.
+
+## Fixed-width document output
+
+A fixed-width Sink can echo any extracted section as its header or footer.
+The names select document context; they do not declare new input extraction
+rules. For example, these Sink config keys select sections named `manifest`
+and `totals`:
+
+```yaml
+reconstruct_envelope: true
+options:
+  envelope:
+    header_from_doc: manifest
+    footer_from_doc: totals
+```
+
+Both names are author-defined. With a multi-record flat-file source, both
+sections must have been captured in the leading header region, even though
+`totals` is rendered at the end of the output document. A structural trailer
+count check does not make that trailing input record an extracted section.
+
+Header and footer fields concatenate in stored order without the body's
+fixed-width padding. Strings remain verbatim, numbers and booleans use scalar
+spellings, dates use `YYYYMMDD`, datetimes use `YYYYMMDDhhmmss`, and null adds
+no text. Arrays and maps are unsupported: a structured field anywhere in the
+section rejects that entire header or footer before delivery. A missing
+section emits nothing; a present empty section emits only the configured
+LF/CRLF separator, or no bytes with `line_separator: none`.
+
+Document start, each record, and document end are separate prepared operations.
+Only successful delivery advances document state or the body count; opening
+the next document starts its own count and selects its own sections. Earlier
+successful operations remain delivered if a later footer fails. A computed
+footer record-count field is unsupported for fixed-width (E346). See
+[fixed-width output](../formats/fixed-width.md#scalar-document-headers-and-footers)
+and [output preparation](../ops/storage.md#output-preparation).
 
 ## Native JSON and XML output boundaries
 

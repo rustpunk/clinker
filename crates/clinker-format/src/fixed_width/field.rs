@@ -23,6 +23,435 @@ use crate::schema::{
     Column, FixedWidthCountField, FixedWidthFill, FixedWidthOccurs, FixedWidthOverflow,
 };
 
+/// Borrowed layout failure. Validation itself allocates nothing; readers and
+/// planners may render the complete diagnostic, while prepared output keeps
+/// only bounded field evidence.
+pub struct LayoutError<'a> {
+    pub(crate) name: &'a str,
+    group: bool,
+    detail: LayoutDetail<'a>,
+}
+enum LayoutDetail<'a> {
+    Rule(&'static str),
+    Cardinality(usize, usize),
+    Count(&'a str, usize, usize, u32),
+    Child(&'a str),
+    Overlap(bool, &'a str, usize, usize, &'a str, usize, usize),
+}
+impl LayoutError<'_> {
+    fn into_format(self) -> FormatError {
+        let message = self.to_string();
+        FormatError::InvalidRecord { row: 0, message }
+    }
+}
+impl std::fmt::Display for LayoutError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} '{}': ",
+            if self.group { "group" } else { "field" },
+            self.name
+        )?;
+        match self.detail {
+            LayoutDetail::Rule(message) => f.write_str(message),
+            LayoutDetail::Cardinality(min, max) => write!(
+                f,
+                "has `occurs.min: {min}` greater than `occurs.max: {max}`; set `min` no greater than `max`"
+            ),
+            LayoutDetail::Count(name, width, max, digits) => write!(
+                f,
+                "count field '{name}' is {width} byte(s) wide but `occurs.max: {max}` needs {digits}; increase `count_field.width` to at least {digits}"
+            ),
+            LayoutDetail::Child(name) => write!(
+                f,
+                "child '{name}' repeats or contains nested fields; flatten the child into one scalar occurrence layout"
+            ),
+            LayoutDetail::Overlap(
+                true,
+                next,
+                start,
+                end,
+                previous,
+                previous_start,
+                previous_end,
+            ) => write!(
+                f,
+                "child '{next}' range {start}..{end} overlaps child '{previous}' range {previous_start}..{previous_end}; give each child a disjoint range"
+            ),
+            LayoutDetail::Overlap(false, _, start, end, previous, previous_start, previous_end) => {
+                write!(
+                    f,
+                    "range {start}..{end} overlaps field '{previous}' ({previous_start}..{previous_end})"
+                )?;
+                if self.group {
+                    f.write_str("; give the group, count, payload, and adjacent fields disjoint maximum ranges")
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+fn layout_rule<'a>(column: &'a Column, group: bool, message: &'static str) -> LayoutError<'a> {
+    LayoutError {
+        name: &column.name,
+        group,
+        detail: LayoutDetail::Rule(message),
+    }
+}
+
+/// Checked scalar range, borrowing all policy from its caller's declaration.
+pub(crate) fn scalar_width(column: &Column, start: usize) -> Result<usize, LayoutError<'_>> {
+    let fail = |message| layout_rule(column, false, message);
+    let width = match (column.width, column.end) {
+        (Some(_), Some(_)) => {
+            return Err(fail(
+                "'width' and 'end' are mutually exclusive — declare one",
+            ));
+        }
+        (Some(width), None) => width,
+        (None, Some(end)) => end
+            .checked_sub(start)
+            .ok_or_else(|| fail("'end' must be >= 'start'"))?,
+        (None, None) => return Err(fail("must have 'width' or 'end'")),
+    };
+    if width == 0 {
+        return Err(fail("width must be > 0"));
+    }
+    start
+        .checked_add(width)
+        .ok_or_else(|| fail("'start' + width overflows"))?;
+    if column
+        .pad
+        .as_ref()
+        .is_some_and(|pad| !pad.is_empty() && pad.len() != 1)
+    {
+        return Err(fail(
+            "pad must be a single-byte character (for example ' ' or '0')",
+        ));
+    }
+    Ok(width)
+}
+
+/// Allocation-free dimensions shared by reader, planner and prepared writer.
+pub(crate) struct GroupDimensions {
+    pub(crate) occurrence_width: usize,
+    pub(crate) max_width: usize,
+}
+pub(crate) fn is_group(column: &Column) -> bool {
+    column.fields.is_some() || column.occurs.is_some() || column.count_field.is_some()
+}
+pub(crate) fn group_dimensions(
+    column: &Column,
+    start: usize,
+) -> Result<GroupDimensions, LayoutError<'_>> {
+    let fail = |message| layout_rule(column, true, message);
+    let children = column
+        .fields
+        .as_deref()
+        .ok_or_else(|| fail("requires `fields`; add the per-occurrence child layout"))?;
+    let occurs = column.occurs.as_ref().ok_or_else(|| {
+        fail("requires `occurs` with a positive `max` (for example `occurs: { max: 2 }`)")
+    })?;
+    if !column.is_multiple() || !matches!(column.ty.unwrap_nullable(), Type::Map) {
+        return Err(fail(
+            "must declare `type: map` and `multiple: true` so its logical value is an array of records",
+        ));
+    }
+    if column.width.is_some()
+        || column.end.is_some()
+        || column.justify.is_some()
+        || column.pad.is_some()
+        || column.trim.is_some()
+        || column.truncation.is_some()
+    {
+        return Err(fail(
+            "mixes scalar layout keys with `fields`/`occurs`; remove `width`, `end`, `justify`, `pad`, `trim`, and `truncation` from the group",
+        ));
+    }
+    if children.is_empty() {
+        return Err(fail(
+            "has no child fields; add at least one fixed-width child field",
+        ));
+    }
+    if occurs.max == 0 {
+        return Err(fail(
+            "has `occurs.max: 0`; set `max` to a positive finite count",
+        ));
+    }
+    if occurs.min > occurs.max {
+        return Err(LayoutError {
+            name: &column.name,
+            group: true,
+            detail: LayoutDetail::Cardinality(occurs.min, occurs.max),
+        });
+    }
+    match (occurs.on_overflow, occurs.keep) {
+        (FixedWidthOverflow::Truncate, None) => {
+            return Err(fail(
+                "uses `on_overflow: truncate` without `keep`; add `keep: first` or `keep: last`",
+            ));
+        }
+        (FixedWidthOverflow::Error, Some(_)) => {
+            return Err(fail(
+                "sets `keep` while `on_overflow` is `error`; remove `keep` or select `on_overflow: truncate`",
+            ));
+        }
+        _ => {}
+    }
+    let count_width = if let Some(count) = &column.count_field {
+        if count.name.trim().is_empty() {
+            return Err(fail(
+                "has a count field with an empty `name`; provide a diagnostic name",
+            ));
+        }
+        if count.width == 0 {
+            return Err(fail(
+                "has `count_field.width: 0`; set the width to a positive byte count",
+            ));
+        }
+        let digits = occurs.max.ilog10() + 1;
+        if digits as usize > count.width {
+            return Err(LayoutError {
+                name: &column.name,
+                group: true,
+                detail: LayoutDetail::Count(&count.name, count.width, occurs.max, digits),
+            });
+        }
+        count.width
+    } else {
+        0
+    };
+    let mut next_start = 0;
+    let mut occurrence_width = 0;
+    for child in children {
+        if is_group(child) || child.is_multiple() {
+            return Err(LayoutError {
+                name: &column.name,
+                group: true,
+                detail: LayoutDetail::Child(&child.name),
+            });
+        }
+        let child_start = child.start.unwrap_or(next_start);
+        let width = scalar_width(child, child_start)?;
+        let end = child_start + width;
+        next_start = end;
+        occurrence_width = occurrence_width.max(end);
+    }
+    // Individual declaration errors precede overlap errors. Overlap selection
+    // follows stable physical order, before repeated-width arithmetic.
+    let mut previous: Option<PhysicalRange<'_>> = None;
+    while let Some(next) = next_physical_range(
+        children,
+        previous.as_ref().map(PhysicalRange::key),
+        scalar_width,
+    )? {
+        if let Some(prior) = &previous
+            && next.start < prior.end
+        {
+            return Err(LayoutError {
+                name: &column.name,
+                group: true,
+                detail: LayoutDetail::Overlap(
+                    true,
+                    &next.column.name,
+                    next.start,
+                    next.end,
+                    &prior.column.name,
+                    prior.start,
+                    prior.end,
+                ),
+            });
+        }
+        previous = Some(next);
+    }
+    let repeated = occurrence_width.checked_mul(occurs.max).ok_or_else(|| fail("layout width overflows `occurs.max * occurrence_width`; reduce the declared bound or child widths"))?;
+    let max_width = count_width.checked_add(repeated).ok_or_else(|| {
+        fail("layout width overflows after adding `count_field.width`; reduce the declared widths")
+    })?;
+    start.checked_add(max_width).ok_or_else(|| {
+        fail("`start` plus the bounded group width overflows; reduce the start or declared widths")
+    })?;
+    Ok(GroupDimensions {
+        occurrence_width,
+        max_width,
+    })
+}
+
+fn layout_width(column: &Column, start: usize) -> Result<usize, LayoutError<'_>> {
+    if is_group(column) {
+        Ok(group_dimensions(column, start)?.max_width)
+    } else {
+        scalar_width(column, start)
+    }
+}
+
+struct PhysicalRange<'a> {
+    column: &'a Column,
+    index: usize,
+    start: usize,
+    end: usize,
+}
+impl PhysicalRange<'_> {
+    fn key(&self) -> (usize, usize) {
+        (self.start, self.index)
+    }
+}
+
+/// Select the next stable physical range with constant borrowed state. Every
+/// scan resolves implicit starts in declaration order, never physical order.
+fn next_physical_range<'a>(
+    columns: &'a [Column],
+    after: Option<(usize, usize)>,
+    width: fn(&'a Column, usize) -> Result<usize, LayoutError<'a>>,
+) -> Result<Option<PhysicalRange<'a>>, LayoutError<'a>> {
+    let mut next: Option<PhysicalRange<'_>> = None;
+    let mut next_start = 0;
+    for (index, column) in columns.iter().enumerate() {
+        let start = column.start.unwrap_or(next_start);
+        let end = start + width(column, start)?;
+        let key = (start, index);
+        if after.is_none_or(|after| key > after)
+            && next.as_ref().is_none_or(|next| key < next.key())
+        {
+            next = Some(PhysicalRange {
+                column,
+                index,
+                start,
+                end,
+            });
+        }
+        next_start = end;
+    }
+    Ok(next)
+}
+
+pub(crate) fn check_write_layout(columns: &[Column]) -> Result<(), LayoutError<'_>> {
+    let mut next_start = 0;
+    for column in columns {
+        let start = column.start.unwrap_or(next_start);
+        next_start = start + layout_width(column, start)?;
+    }
+    let mut previous: Option<PhysicalRange<'_>> = None;
+    while let Some(next) = next_physical_range(
+        columns,
+        previous.as_ref().map(PhysicalRange::key),
+        layout_width,
+    )? {
+        if let Some(prior) = &previous
+            && next.start < prior.end
+        {
+            let group = is_group(next.column) || is_group(prior.column);
+            let owner = if is_group(next.column) || !group {
+                next.column
+            } else {
+                prior.column
+            };
+            return Err(LayoutError {
+                name: &owner.name,
+                group,
+                detail: LayoutDetail::Overlap(
+                    false,
+                    &next.column.name,
+                    next.start,
+                    next.end,
+                    &prior.column.name,
+                    prior.start,
+                    prior.end,
+                ),
+            });
+        }
+        previous = Some(next);
+    }
+    Ok(())
+}
+/// Validate a writer's complete physical layout without constructing a writer
+/// or retaining schema copies. Only a rejected layout allocates its diagnostic.
+pub fn validate_write_layout(columns: &[Column]) -> Result<(), FormatError> {
+    check_write_layout(columns).map_err(LayoutError::into_format)
+}
+
+/// Validate input byte ranges without constructing a reader or retaining schema
+/// copies. Scalar ranges may overlap; groups require disjoint maximum ranges,
+/// explicit starts and an unambiguous following position when shifted.
+/// Only rejected layouts allocate diagnostic text.
+pub fn validate_read_layout(columns: &[Column]) -> Result<(), FormatError> {
+    let range = |column: &Column| -> Result<(usize, usize), FormatError> {
+        let start = column.start.ok_or_else(|| {
+            if is_group(column) {
+                invalid_group(
+                    &column.name,
+                    "must have `start` on an input schema so its first byte is known",
+                )
+            } else {
+                invalid_field(&column.name, "must have 'start'")
+            }
+        })?;
+        let width = layout_width(column, start).map_err(LayoutError::into_format)?;
+        Ok((start, start + width))
+    };
+    // Keep declaration-order validation ahead of cross-field validation.
+    for column in columns {
+        range(column)?;
+    }
+    // Visit the same stable physical ordering as the reader without retaining a
+    // second layout. This is plan/construction work, independent of row count.
+    let mut previous_key = None;
+    let mut previous: Option<(&Column, usize, usize)> = None;
+    for _ in columns {
+        let Some((index, column)) = columns
+            .iter()
+            .enumerate()
+            .filter(|(index, column)| previous_key.is_none_or(|key| (column.start, *index) > key))
+            .min_by_key(|(index, column)| (column.start, *index))
+        else {
+            break;
+        };
+        let (start, end) = range(column)?;
+        if let Some((prior, prior_start, prior_end)) = previous
+            && (is_group(prior) || is_group(column))
+            && start < prior_end
+        {
+            return Err(invalid_group(
+                if is_group(column) {
+                    &column.name
+                } else {
+                    &prior.name
+                },
+                &format!(
+                    "range {start}..{end} overlaps '{}' at {prior_start}..{prior_end}; give the group, count, payload, and adjacent fields disjoint maximum ranges",
+                    prior.name
+                ),
+            ));
+        }
+        previous_key = Some((column.start, index));
+        previous = Some((column, start, end));
+    }
+    if let Some((_, column)) = columns
+        .iter()
+        .enumerate()
+        .filter(|(index, column)| {
+            is_group(column)
+                && column
+                    .occurs
+                    .as_ref()
+                    .is_some_and(|occurs| matches!(occurs.fill, FixedWidthFill::Shift))
+                && column.count_field.is_none()
+                && columns
+                    .iter()
+                    .enumerate()
+                    .any(|(other_index, other)| (other.start, other_index) > (column.start, *index))
+        })
+        .min_by_key(|(index, column)| (column.start, *index))
+    {
+        return Err(invalid_group(
+            &column.name,
+            "uses `fill: shift` before another field without a `count_field`; add a count field so the next byte position is unambiguous, or make the group last",
+        ));
+    }
+    Ok(())
+}
+
 /// Result of one scalar coercion together with parser-owned numeric evidence
 /// when the declared target is `numeric`.
 ///
@@ -163,171 +592,24 @@ impl ResolvedRepeatingGroup {
     /// repetition, invalid cardinality/overflow policy, overlapping child
     /// ranges, an invalid count field, or checked layout overflow.
     pub fn from_column_at(column: &Column, start: usize) -> Result<Self, FormatError> {
-        let children = column.fields.as_ref().ok_or_else(|| {
-            invalid_group(
-                &column.name,
-                "requires `fields`; add the per-occurrence child layout",
-            )
-        })?;
-        let occurs = column.occurs.clone().ok_or_else(|| {
-            invalid_group(
-                &column.name,
-                "requires `occurs` with a positive `max` (for example `occurs: { max: 2 }`)",
-            )
-        })?;
-
-        if !column.is_multiple() || !matches!(column.ty.unwrap_nullable(), Type::Map) {
-            return Err(invalid_group(
-                &column.name,
-                "must declare `type: map` and `multiple: true` so its logical value is an array of records",
-            ));
-        }
-        if column.width.is_some()
-            || column.end.is_some()
-            || column.justify.is_some()
-            || column.pad.is_some()
-            || column.trim.is_some()
-            || column.truncation.is_some()
-        {
-            return Err(invalid_group(
-                &column.name,
-                "mixes scalar layout keys with `fields`/`occurs`; remove `width`, `end`, `justify`, `pad`, `trim`, and `truncation` from the group",
-            ));
-        }
-        if children.is_empty() {
-            return Err(invalid_group(
-                &column.name,
-                "has no child fields; add at least one fixed-width child field",
-            ));
-        }
-        if occurs.max == 0 {
-            return Err(invalid_group(
-                &column.name,
-                "has `occurs.max: 0`; set `max` to a positive finite count",
-            ));
-        }
-        if occurs.min > occurs.max {
-            return Err(invalid_group(
-                &column.name,
-                &format!(
-                    "has `occurs.min: {}` greater than `occurs.max: {}`; set `min` no greater than `max`",
-                    occurs.min, occurs.max
-                ),
-            ));
-        }
-        match (occurs.on_overflow, occurs.keep) {
-            (FixedWidthOverflow::Truncate, None) => {
-                return Err(invalid_group(
-                    &column.name,
-                    "uses `on_overflow: truncate` without `keep`; add `keep: first` or `keep: last`",
-                ));
-            }
-            (FixedWidthOverflow::Error, Some(_)) => {
-                return Err(invalid_group(
-                    &column.name,
-                    "sets `keep` while `on_overflow` is `error`; remove `keep` or select `on_overflow: truncate`",
-                ));
-            }
-            _ => {}
-        }
-
-        let count_width = match &column.count_field {
-            Some(count) if count.name.trim().is_empty() => {
-                return Err(invalid_group(
-                    &column.name,
-                    "has a count field with an empty `name`; provide a diagnostic name",
-                ));
-            }
-            Some(count) if count.width == 0 => {
-                return Err(invalid_group(
-                    &column.name,
-                    "has `count_field.width: 0`; set the width to a positive byte count",
-                ));
-            }
-            Some(count) => {
-                let digits = occurs.max.to_string().len();
-                if digits > count.width {
-                    return Err(invalid_group(
-                        &column.name,
-                        &format!(
-                            "count field '{}' is {} byte(s) wide but `occurs.max: {}` needs {digits}; increase `count_field.width` to at least {digits}",
-                            count.name, count.width, occurs.max
-                        ),
-                    ));
-                }
-                count.width
-            }
-            None => 0,
-        };
-
-        let mut fields = Vec::with_capacity(children.len());
-        let mut next_start = 0usize;
-        for child in children {
-            if child.fields.is_some()
-                || child.occurs.is_some()
-                || child.count_field.is_some()
-                || child.is_multiple()
-            {
-                return Err(invalid_group(
-                    &column.name,
-                    &format!(
-                        "child '{}' repeats or contains nested fields; flatten the child into one scalar occurrence layout",
-                        child.name
-                    ),
-                ));
-            }
+        let dimensions = group_dimensions(column, start).map_err(LayoutError::into_format)?;
+        let mut fields = Vec::with_capacity(column.fields.as_ref().map_or(0, Vec::len));
+        let mut next_start = 0;
+        for child in column.fields.as_deref().unwrap_or_default() {
             let child_start = child.start.unwrap_or(next_start);
             let resolved = ResolvedField::from_column_at(child, child_start)?;
             next_start = resolved.end();
             fields.push(resolved);
         }
-        fields.sort_by_key(|field| field.start);
-        for pair in fields.windows(2) {
-            let (previous, next) = (&pair[0], &pair[1]);
-            if next.start < previous.end() {
-                return Err(invalid_group(
-                    &column.name,
-                    &format!(
-                        "child '{}' range {}..{} overlaps child '{}' range {}..{}; give each child a disjoint range",
-                        next.name,
-                        next.start,
-                        next.end(),
-                        previous.name,
-                        previous.start,
-                        previous.end()
-                    ),
-                ));
-            }
-        }
-
-        let occurrence_width = fields.iter().map(ResolvedField::end).max().unwrap_or(0);
-        let repeated_width = occurrence_width.checked_mul(occurs.max).ok_or_else(|| {
-            invalid_group(
-                &column.name,
-                "layout width overflows `occurs.max * occurrence_width`; reduce the declared bound or child widths",
-            )
-        })?;
-        let max_width = count_width.checked_add(repeated_width).ok_or_else(|| {
-            invalid_group(
-                &column.name,
-                "layout width overflows after adding `count_field.width`; reduce the declared widths",
-            )
-        })?;
-        start.checked_add(max_width).ok_or_else(|| {
-            invalid_group(
-                &column.name,
-                "`start` plus the bounded group width overflows; reduce the start or declared widths",
-            )
-        })?;
-
+        fields.sort_unstable_by_key(|field| field.start);
         Ok(Self {
             name: column.name.clone(),
             start,
             fields,
-            occurs,
+            occurs: column.occurs.clone().expect("validated group policy"),
             count_field: column.count_field.clone(),
-            occurrence_width,
-            max_width,
+            occurrence_width: dimensions.occurrence_width,
+            max_width: dimensions.max_width,
         })
     }
 
@@ -365,27 +647,7 @@ impl ResolvedRepeatingGroup {
 /// `width` and `end`, declares neither, declares `end < start`, or resolves
 /// to a zero width.
 pub fn resolve_width(f: &Column, start: usize) -> Result<usize, FormatError> {
-    let width = match (f.width, f.end) {
-        (Some(_), Some(_)) => {
-            return Err(invalid_field(
-                &f.name,
-                "'width' and 'end' are mutually exclusive — declare one",
-            ));
-        }
-        (Some(w), None) => w,
-        (None, Some(end)) => end
-            .checked_sub(start)
-            .ok_or_else(|| invalid_field(&f.name, "'end' must be >= 'start'"))?,
-        (None, None) => {
-            return Err(invalid_field(&f.name, "must have 'width' or 'end'"));
-        }
-    };
-
-    if width == 0 {
-        return Err(invalid_field(&f.name, "width must be > 0"));
-    }
-
-    Ok(width)
+    scalar_width(f, start).map_err(LayoutError::into_format)
 }
 
 /// Read one physical record line into `buf`, returning `false` at end of input.
@@ -864,6 +1126,117 @@ mod tests {
     use super::*;
     use crate::schema::Column;
     use chrono::NaiveDate;
+
+    fn overlap_columns(valid_last: bool) -> Vec<Column> {
+        [
+            ("a", 0, Some(4)),
+            ("b", 3, Some(4)),
+            ("c", if valid_last { 2 } else { 8 }, valid_last.then_some(1)),
+        ]
+        .into_iter()
+        .map(|(name, start, width)| Column {
+            start: Some(start),
+            width,
+            ..Column::bare(name, Type::String)
+        })
+        .collect()
+    }
+
+    fn overlap_group(valid_last: bool) -> Column {
+        Column {
+            start: Some(0),
+            multiple: Some(true),
+            fields: Some(overlap_columns(valid_last)),
+            occurs: Some(FixedWidthOccurs {
+                min: 0,
+                max: 1,
+                fill: FixedWidthFill::Pad,
+                on_overflow: FixedWidthOverflow::Error,
+                keep: None,
+            }),
+            ..Column::bare("g", Type::Map)
+        }
+    }
+
+    fn assert_layout_message(result: Result<(), FormatError>, expected: &str) {
+        match result.expect_err("layout must fail") {
+            FormatError::InvalidRecord { row, message } => {
+                assert_eq!(row, 0);
+                assert_eq!(message, expected);
+            }
+            error => panic!("unexpected layout error: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn layout_diagnostic_group_overlap_uses_first_physical_pair() {
+        let columns = [overlap_group(true)];
+        let expected = "group 'g': child 'c' range 2..3 overlaps child 'a' range 0..4; give each child a disjoint range";
+        assert_layout_message(validate_read_layout(&columns), expected);
+        assert_layout_message(validate_write_layout(&columns), expected);
+    }
+
+    #[test]
+    fn layout_diagnostic_writer_overlap_uses_first_physical_pair() {
+        assert_layout_message(
+            validate_write_layout(&overlap_columns(true)),
+            "field 'c': range 2..3 overlaps field 'a' (0..4)",
+        );
+    }
+
+    #[test]
+    fn layout_diagnostic_group_rules_precede_child_overlap() {
+        let columns = [overlap_group(false)];
+        assert_layout_message(
+            validate_read_layout(&columns),
+            "field 'c': must have 'width' or 'end'",
+        );
+        assert_layout_message(
+            validate_write_layout(&columns),
+            "field 'c': must have 'width' or 'end'",
+        );
+    }
+
+    #[test]
+    fn layout_diagnostic_writer_rules_precede_top_level_overlap() {
+        assert_layout_message(
+            validate_write_layout(&overlap_columns(false)),
+            "field 'c': must have 'width' or 'end'",
+        );
+    }
+
+    #[test]
+    fn layout_diagnostic_physical_sort_retains_implicit_starts_and_stable_ties() {
+        let columns = [
+            Column {
+                start: Some(8),
+                width: Some(2),
+                ..Column::bare("a", Type::String)
+            },
+            Column {
+                start: Some(0),
+                width: Some(2),
+                ..Column::bare("b", Type::String)
+            },
+            Column {
+                width: Some(2),
+                ..Column::bare("c", Type::String)
+            },
+        ];
+        assert!(validate_write_layout(&columns).is_ok());
+        let mut group = overlap_group(true);
+        group.fields = Some(columns.to_vec());
+        assert!(validate_write_layout(&[group]).is_ok());
+        let tied = ["a", "b", "c"].map(|name| Column {
+            start: Some(4),
+            width: Some(2),
+            ..Column::bare(name, Type::String)
+        });
+        assert_layout_message(
+            validate_write_layout(&tied),
+            "field 'b': range 4..6 overlaps field 'a' (4..6)",
+        );
+    }
 
     fn pad_column(name: &str, pad: &str) -> Column {
         Column {

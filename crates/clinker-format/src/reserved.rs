@@ -240,6 +240,26 @@ impl ReservedText {
     pub fn into_bytes(self) -> ReservedBuffer {
         self.0
     }
+
+    /// Transfer UTF-8 backing without copying or reallocating. The receiving
+    /// owner must never grow the String and must destroy it before its lease.
+    /// Kept crate-private so callers cannot detach uncharged growable storage.
+    pub(crate) fn into_string_parts(self) -> (String, Option<AllocationLease>) {
+        let mut bytes = self.0;
+        let (pointer, len, capacity) = (bytes.ptr.as_ptr(), bytes.len, bytes.capacity);
+        let lease = bytes.grant.take();
+        bytes.ptr = NonNull::dangling();
+        bytes.len = 0;
+        bytes.capacity = 0;
+        // SAFETY: ReservedBuffer allocates Layout::array::<u8>(capacity), the
+        // identical allocator/layout Vec<u8> and String use. Exactly len bytes
+        // are initialized and all entered through str appends. Empty storage
+        // has an aligned dangling pointer. The old owner was disarmed above;
+        // the returned lease still covers the entire unchanged allocation.
+        let text =
+            unsafe { String::from_utf8_unchecked(Vec::from_raw_parts(pointer, len, capacity)) };
+        (text, lease)
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +267,30 @@ mod tests {
     use super::*;
     use crate::preparation::MemoryOnlyResources;
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn fixed_width_warning_text_transfer_preserves_backing_and_charge() {
+        for value in ["", "complete ASCII warning", "complete é好 warning"] {
+            let provider = MemoryOnlyResources::new(NonZeroUsize::new(4096).unwrap());
+            let mut text = ReservedText::new(provider.resources().allocation().scope().unwrap());
+            text.push_str(value).unwrap();
+            let pointer = text.as_str().as_ptr();
+            let charge = provider.used();
+            let (text, lease) = text.into_string_parts();
+            assert_eq!(text.as_ptr(), pointer);
+            assert_eq!(text, value);
+            assert_eq!(text.capacity(), charge);
+            assert_eq!(provider.used(), charge);
+            drop(text);
+            assert_eq!(
+                provider.used(),
+                charge,
+                "lease survives the transferred backing"
+            );
+            drop(lease);
+            assert_eq!(provider.used(), 0);
+        }
+    }
 
     #[test]
     fn memory_allocator_failure_releases_new_grant_preserves_old() {
