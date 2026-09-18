@@ -14,6 +14,86 @@ use std::sync::Arc;
 
 use clinker_format::preparation::{DecodeWorkspace, TextStorage};
 
+#[test]
+fn swift_continuations_preserve_original_separators_and_trailing_empty_lines() {
+    use clinker_format::swift::{SwiftReader, SwiftReaderConfig};
+    let input = "{1:HEADER}{4:\r\n:79:  café{inline}-} :20:text  \r\n next\n\r\n\r\n:79:second\n\n:86:\r\n-}{5:{CHK:X}}";
+    let mut reader = SwiftReader::new(input.as_bytes(), SwiftReaderConfig::default());
+    let expected = [
+        (
+            "79",
+            Value::String("  café{inline}-} :20:text  \r\n next\n\r\n".into()),
+        ),
+        ("79", Value::String("second\n".into())),
+        ("86", Value::Null),
+    ];
+    for (tag, value) in expected {
+        let row = reader.next_record().unwrap().unwrap();
+        assert_eq!(
+            row.values(),
+            &[Value::String("4".into()), Value::String(tag.into()), value]
+        );
+    }
+    assert!(reader.next_record().unwrap().is_none());
+    assert!(reader.next_record().unwrap().is_none());
+}
+
+#[test]
+fn swift_failed_initialization_never_releases_partial_rows_or_sections() {
+    use clinker_format::envelope::{EnvelopeConfig, EnvelopeExtract, EnvelopeSection};
+    use clinker_format::swift::{SwiftReader, SwiftReaderConfig};
+    let mut envelope = EnvelopeConfig::default();
+    envelope.sections.insert(
+        "authored".into(),
+        EnvelopeSection {
+            extract: EnvelopeExtract::Segment("1".into()),
+            fields: Default::default(),
+        },
+    );
+    for input in [
+        "{1:HEADER}{2:truncated",
+        "{1:HEADER}{4:\n:20:GOOD\n-}{4:\n::BAD\n-}",
+        "{1:HEADER}{4:\n:20:GOOD\n-}{5:truncated",
+    ] {
+        for prepare_first in [false, true] {
+            let mut reader = SwiftReader::new(input.as_bytes(), SwiftReaderConfig::default());
+            if prepare_first {
+                assert!(reader.prepare_document(&envelope).is_err());
+            } else {
+                assert!(reader.next_record().is_err());
+            }
+            for _ in 0..3 {
+                assert!(
+                    reader.next_record().unwrap().is_none(),
+                    "partial row escaped: {input}"
+                );
+                assert!(
+                    reader.prepare_document(&envelope).is_err(),
+                    "partial header escaped: {input}"
+                );
+                assert!(reader.take_envelope_events().is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn swift_invalid_utf8_is_rejected_before_block_tokens() {
+    use clinker_format::swift::{SwiftReader, SwiftReaderConfig};
+    for input in [
+        &b"{\xff:header}"[..],
+        &b"{1:\xff}"[..],
+        &b"{1:HEADER}{4:\n:20:\xff\n-}"[..],
+        &b"{1:HEADER}{4:\n:20:GOOD\n-}{5:\xff}"[..],
+    ] {
+        let mut reader = SwiftReader::new(input, SwiftReaderConfig::default());
+        let error = reader.next_record().unwrap_err();
+        assert!(error.to_string().contains("UTF-8"), "{error}");
+        assert!(!error.to_string().contains('\u{fffd}'), "{error}");
+        assert!(reader.next_record().unwrap().is_none());
+    }
+}
+
 fn physical_column(name: &str, start: usize, width: usize) -> clinker_format::Column {
     clinker_format::Column {
         start: Some(start),
