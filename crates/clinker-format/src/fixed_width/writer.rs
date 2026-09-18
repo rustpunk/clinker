@@ -216,17 +216,136 @@ struct FixedWidthState {
     records: u64,
     document_open: bool,
 }
+
+// Slots are initialized before delivery, including spare capacity. This lets
+// commit move owners into existing slots without a fallible push or allocation.
+// Field order is load-bearing: all String backings drop before their leases.
+struct WarningHistory {
+    strings: ReservedVec<String>,
+    leases: ReservedVec<Option<crate::preparation::AllocationLease>>,
+    len: usize,
+}
+impl WarningHistory {
+    fn empty(scope: &WriterScope) -> Self {
+        Self {
+            strings: ReservedVec::new(scope.allocation().clone()),
+            leases: ReservedVec::new(scope.allocation().clone()),
+            len: 0,
+        }
+    }
+    fn with_capacity(capacity: usize, scope: &WriterScope) -> Result<Self, FormatError> {
+        let mut history = Self::empty(scope);
+        history.strings.reserve_exact(capacity)?;
+        history.leases.reserve_exact(capacity)?;
+        for _ in 0..capacity {
+            scope.check_cancelled()?;
+            history.strings.push(String::new())?;
+            history.leases.push(None)?;
+        }
+        Ok(history)
+    }
+    fn slots(
+        &mut self,
+    ) -> impl Iterator<
+        Item = (
+            &mut String,
+            &mut Option<crate::preparation::AllocationLease>,
+        ),
+    > {
+        self.strings
+            .as_mut_slice()
+            .iter_mut()
+            .zip(self.leases.as_mut_slice())
+    }
+    // The caller establishes enough initialized vacant slots in prepare.
+    // Source slots become empty while the grants follow their String owners.
+    fn append(&mut self, source: &mut Self) {
+        let old_len = self.len;
+        let source_len = source.len;
+        for ((text, lease), (from_text, from_lease)) in self
+            .slots()
+            .skip(old_len)
+            .zip(source.slots().take(source_len))
+        {
+            std::mem::swap(text, from_text);
+            std::mem::swap(lease, from_lease);
+        }
+        self.len += source_len;
+        source.len = 0;
+    }
+}
+struct PendingWarnings {
+    messages: WarningHistory,
+    replacement: Option<WarningHistory>,
+}
+impl PendingWarnings {
+    fn new(
+        current: &WarningHistory,
+        mut pending: ReservedVec<ReservedText>,
+        scope: &WriterScope,
+    ) -> Result<Option<Self>, FormatError> {
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        let count = pending.len();
+        let needed = current.len.checked_add(count).ok_or_else(|| {
+            crate::preparation::ResourceError::new(
+                crate::preparation::ResourceErrorKind::Layout,
+                count,
+                0,
+            )
+        })?;
+        let replacement = if needed > current.strings.len() {
+            let preferred = current
+                .strings
+                .len()
+                .checked_mul(2)
+                .unwrap_or(needed)
+                .max(needed);
+            let replacement = match WarningHistory::with_capacity(preferred, scope) {
+                Err(FormatError::Resource(error))
+                    if preferred != needed
+                        && error.kind == crate::preparation::ResourceErrorKind::Budget =>
+                {
+                    WarningHistory::with_capacity(needed, scope)?
+                }
+                result => result?,
+            };
+            Some(replacement)
+        } else {
+            None
+        };
+        let mut messages = WarningHistory::with_capacity(count, scope)?;
+        for ((text, lease), pending) in messages.slots().zip(pending.as_mut_slice()) {
+            scope.check_cancelled()?;
+            let owner = std::mem::replace(pending, ReservedText::new(scope.allocation().clone()));
+            (*text, *lease) = owner.into_string_parts();
+        }
+        messages.len = count;
+        Ok(Some(Self {
+            messages,
+            replacement,
+        }))
+    }
+    fn commit(mut self, history: &mut WarningHistory) {
+        if let Some(mut replacement) = self.replacement {
+            replacement.append(history);
+            *history = replacement;
+        }
+        history.append(&mut self.messages);
+    }
+}
 /// Streams complete records/sections into an admitted stage. Only delivered
 /// operations change counters or warning history; no record values are retained.
 pub struct FixedWidthEncoder {
     config: FixedWidthEncoderConfig,
     state: FixedWidthState,
-    warnings: ReservedVec<ReservedText>,
+    warnings: WarningHistory,
 }
 /// Owns prepared warning replacement until successful delivery or cancellation.
 pub struct FixedWidthPending {
     state: FixedWidthState,
-    warnings: Option<ReservedVec<ReservedText>>,
+    warnings: Option<PendingWarnings>,
 }
 impl FixedWidthEncoder {
     /// Admit layout/configuration before retaining it; borrows caller columns.
@@ -248,7 +367,7 @@ impl FixedWidthEncoder {
         Ok(Self {
             config,
             state: FixedWidthState::default(),
-            warnings: ReservedVec::new(resources.scope()?.allocation().clone()),
+            warnings: WarningHistory::empty(&resources.scope()?),
         })
     }
     /// Admit the concrete wrapper through its actual backing deallocation.
@@ -265,8 +384,8 @@ impl FixedWidthEncoder {
         )?)
     }
     /// Complete committed warnings; pending failures never alter this history.
-    pub fn truncation_warnings(&self) -> &[ReservedText] {
-        self.warnings.as_slice()
+    pub fn truncation_warnings(&self) -> &[String] {
+        &self.warnings.strings.as_slice()[..self.warnings.len]
     }
     /// Successfully delivered body records since the last delivered begin.
     pub fn record_count(&self) -> u64 {
@@ -504,7 +623,7 @@ fn blank_cell(
             return Ok(false);
         }
         let mut check = |offset: usize, c: char| -> Result<bool, FormatError> {
-            if offset % 1024 == 0 {
+            if offset.is_multiple_of(1024) {
                 scope.check_cancelled()?;
             }
             if stripping && Some(c) == field.read_pad {
@@ -681,13 +800,7 @@ impl FormatEncoder for FixedWidthEncoder {
                     at = start + width;
                 }
                 separator(stage, &self.config.0.separator)?;
-                if !pending.is_empty() {
-                    let mut replacement = ReservedVec::new(scope.allocation().clone());
-                    for text in self.warnings.as_slice().iter().chain(pending.as_slice()) {
-                        replacement.push(retained_text(text.as_str(), scope)?)?;
-                    }
-                    warnings = Some(replacement);
-                }
+                warnings = PendingWarnings::new(&self.warnings, pending, scope)?;
                 state.records = state.records.saturating_add(1);
             }
             OutputOperation::BeginDocument(doc) | OutputOperation::EndDocument(doc) => {
@@ -721,7 +834,7 @@ impl FormatEncoder for FixedWidthEncoder {
     fn commit(&mut self, pending: Self::Pending) {
         self.state = pending.state;
         if let Some(warnings) = pending.warnings {
-            self.warnings = warnings;
+            warnings.commit(&mut self.warnings);
         }
     }
 }

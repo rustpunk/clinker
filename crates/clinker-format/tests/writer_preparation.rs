@@ -141,15 +141,288 @@ mod fixed_width_prepared {
     fn warning_history_keeps_existing_text_backing_across_successful_append() {
         for text in ["x".repeat(4096), "好é".repeat(819)] {
             let provider = provider();
-            let encoder = FixedWidthEncoder::new(&[field("value", 2)], &FixedWidthWriterConfig::default(), provider.resources()).unwrap();
-            let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+            let encoder = FixedWidthEncoder::new(
+                &[field("value", 2)],
+                &FixedWidthWriterConfig::default(),
+                provider.resources(),
+            )
+            .unwrap();
+            let mut writer =
+                PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
             let record = record(&[("value", Value::String(text.into()))]);
             writer.write_record(&record).unwrap();
             let pointer = writer.encoder().truncation_warnings()[0].as_str().as_ptr();
             writer.write_record(&record).unwrap();
             assert_eq!(writer.encoder().truncation_warnings().len(), 2);
-            assert_eq!(writer.encoder().truncation_warnings()[0].as_str().as_ptr(), pointer, "successful append must move the old message owner without copying its bytes");
-            drop(writer); assert_eq!(provider.used(), 0);
+            assert_eq!(
+                writer.encoder().truncation_warnings()[0].as_str().as_ptr(),
+                pointer,
+                "successful append must move the old message owner without copying its bytes"
+            );
+            drop(writer);
+            assert_eq!(provider.used(), 0);
+        }
+    }
+
+    #[test]
+    fn complete_warning_slice_survives_many_tiny_records() {
+        let provider = provider();
+        let encoder = FixedWidthEncoder::new(
+            &[field("v", 1)],
+            &FixedWidthWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        let mut expected = Vec::new();
+        let mut pointers = Vec::new();
+        for index in 0..1025 {
+            let text = format!("x{index}");
+            writer
+                .write_record(&record(&[("v", Value::String(text.clone().into()))]))
+                .unwrap();
+            expected.push(format!("field 'v': value '{text}' truncated to 1 bytes"));
+            let history: &[String] = writer.encoder().truncation_warnings();
+            assert_eq!(history, expected);
+            assert!(
+                history
+                    .iter()
+                    .zip(&pointers)
+                    .all(|(text, pointer)| text.as_ptr() == *pointer)
+            );
+            pointers.push(history.last().unwrap().as_ptr());
+        }
+        assert_eq!(writer.destination(), &b"x\n".repeat(1025));
+        assert_eq!(writer.encoder().record_count(), 1025);
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn pending_warning_overlap_and_delivery_commit_never_allocate() {
+        for text in ["A".repeat(32_768), "好é".repeat(8192)] {
+            let provider = provider();
+            let resources = provider.resources();
+            let scope = resources.scope().unwrap();
+            let mut encoder = FixedWidthEncoder::new(
+                &[field("v", 1)],
+                &FixedWidthWriterConfig::default(),
+                resources,
+            )
+            .unwrap();
+            let record = record(&[("v", Value::String(text.clone().into()))]);
+            let expected = format!("field 'v': value '{text}' truncated to 1 bytes");
+            let mut destination = Vec::new();
+            for count in 1..=9 {
+                let retained = provider.used();
+                let mut stage = scope.stage().unwrap();
+                let pending = encoder
+                    .prepare(OutputOperation::Record(&record), &mut stage, &scope)
+                    .unwrap();
+                assert!(
+                    provider.used() > retained + expected.len(),
+                    "new complete message and pending storage overlap all old owners"
+                );
+                assert_eq!(encoder.truncation_warnings().len(), count - 1);
+                stage.finish().unwrap().deliver(&mut destination).unwrap();
+                let (_, allocations) = allocation_probe(true, || encoder.commit(pending));
+                assert_eq!(
+                    allocations, 0,
+                    "successful delivery commit cannot allocate even under allocator refusal"
+                );
+                let warnings: &[String] = encoder.truncation_warnings();
+                assert_eq!(warnings.len(), count);
+                assert!(warnings.iter().all(|w| w == &expected));
+            }
+            assert_eq!(destination.len(), 18);
+            drop(encoder);
+            assert_eq!(provider.used(), 0);
+        }
+    }
+
+    #[test]
+    fn message_backing_is_freed_before_its_admission_lease() {
+        for value in ["ascii".repeat(1024), "é好".repeat(1024)] {
+            let provider = provider();
+            let encoder = FixedWidthEncoder::new(
+                &[field("v", 1)],
+                &FixedWidthWriterConfig::default(),
+                provider.resources(),
+            )
+            .unwrap();
+            let config_charge = provider.used();
+            let mut writer =
+                PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+            let record = record(&[("v", Value::String(value.into()))]);
+            writer.write_record(&record).unwrap();
+            let pointer = writer.encoder().truncation_warnings()[0].as_ptr() as *mut u8;
+            let capacity = writer.encoder().truncation_warnings()[0].capacity();
+            BACKING_WATCH.with(|watch| {
+                watch.set(Some(BackingWatch {
+                    provider: &provider,
+                    pointer,
+                    bytes: capacity,
+                    live_at_deallocation: None,
+                    live_at_allocation: None,
+                    layout: Some(std::alloc::Layout::array::<u8>(capacity).unwrap()),
+                    deallocations: 0,
+                }))
+            });
+            for _ in 0..8 {
+                writer.write_record(&record).unwrap();
+            }
+            assert!(
+                BACKING_WATCH.with(|watch| watch.get().unwrap().live_at_deallocation.is_none()),
+                "growing metadata must preserve the message backing"
+            );
+            let warning_charge = provider.used() - config_charge;
+            drop(writer);
+            let watched = BACKING_WATCH.with(|watch| watch.take().unwrap());
+            assert_eq!(watched.deallocations, 1);
+            assert_eq!(
+                watched.live_at_deallocation,
+                Some(warning_charge),
+                "all message grants remain until their Strings and metadata are freed"
+            );
+            assert!(warning_charge >= capacity);
+            assert_eq!(provider.used(), 0);
+        }
+    }
+
+    #[test]
+    fn warning_message_and_metadata_refusal_at_every_growth_preserves_history() {
+        let authority = Authority::new();
+        let resources = WriterResources::new(authority.clone());
+        let scope = resources.scope().unwrap();
+        let encoder = FixedWidthEncoder::new(
+            &[field("v", 1)],
+            &FixedWidthWriterConfig::default(),
+            resources.clone(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, resources).unwrap();
+        let record = record(&[("v", Value::String("é好".repeat(64).into()))]);
+        for count in 0..9 {
+            let before = authority.memory.used();
+            let previous = writer.encoder().truncation_warnings().to_vec();
+            let pointers: Vec<_> = writer
+                .encoder()
+                .truncation_warnings()
+                .iter()
+                .map(|text| text.as_ptr())
+                .collect();
+            authority.reset();
+            let (pending, allocations) = allocation_probe(false, || {
+                writer.encoder().prepare(
+                    OutputOperation::Record(&record),
+                    &mut std::io::sink(),
+                    &scope,
+                )
+            });
+            let grants = authority.attempts.load(Ordering::SeqCst);
+            drop(pending.unwrap());
+            assert_eq!(authority.memory.used(), before);
+            assert!(grants > 0 && allocations > 0);
+            for fail_allocator in [false, true] {
+                for stop in 0..if fail_allocator { allocations } else { grants } {
+                    authority.reset();
+                    let (result, _) = allocation_probe(false, || {
+                        if fail_allocator {
+                            ALLOCATIONS_LEFT.with(|remaining| remaining.set(Some(stop)));
+                        } else {
+                            authority.refuse.store(stop, Ordering::SeqCst);
+                        }
+                        writer.encoder().prepare(
+                            OutputOperation::Record(&record),
+                            &mut std::io::sink(),
+                            &scope,
+                        )
+                    });
+                    assert!(
+                        matches!(result, Err(FormatError::Resource(error)) if error.kind == if fail_allocator { ResourceErrorKind::Allocation } else { ResourceErrorKind::Budget }),
+                        "growth {count}, failure {stop}"
+                    );
+                    assert_eq!(authority.memory.used(), before);
+                    assert_eq!(writer.encoder().truncation_warnings(), previous);
+                    assert!(
+                        writer
+                            .encoder()
+                            .truncation_warnings()
+                            .iter()
+                            .zip(&pointers)
+                            .all(|(text, pointer)| text.as_ptr() == *pointer)
+                    );
+                    assert_eq!(writer.encoder().record_count(), count);
+                    assert_eq!(writer.destination(), &b" \n".repeat(count as usize));
+                }
+            }
+            authority.reset();
+            writer.write_record(&record).unwrap();
+        }
+        drop(writer);
+        assert_eq!(authority.memory.used(), 0);
+    }
+
+    #[test]
+    fn cancelled_sealed_or_final_delivery_preserves_warning_owners_and_poison() {
+        use super::cancellation_harness::{Authority as CancelAuthority, CancelOnWrite};
+        use std::sync::atomic::AtomicBool;
+        for after_seal in [false, true] {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let authority = Arc::new(CancelAuthority {
+                memory: provider(),
+                cancelled: cancelled.clone(),
+                cancel_after_seal: after_seal,
+            });
+            let resources = authority.memory.resources();
+            let scope = resources.scope().unwrap();
+            let mut encoder = FixedWidthEncoder::new(
+                &[field("v", 1)],
+                &FixedWidthWriterConfig::default(),
+                resources,
+            )
+            .unwrap();
+            let record = record(&[("v", Value::String("warning".into()))]);
+            let mut stage = scope.stage().unwrap();
+            let pending = encoder
+                .prepare(OutputOperation::Record(&record), &mut stage, &scope)
+                .unwrap();
+            let mut bytes = Vec::new();
+            stage.finish().unwrap().deliver(&mut bytes).unwrap();
+            encoder.commit(pending);
+            let pointer = encoder.truncation_warnings()[0].as_ptr();
+            let retained = authority.memory.used();
+            let mut writer = PreparedWriter::new(
+                CancelOnWrite {
+                    cancelled,
+                    bytes,
+                    attempts: 0,
+                },
+                encoder,
+                WriterResources::new(authority.clone()),
+            )
+            .unwrap();
+            assert!(
+                matches!(writer.write_record(&record), Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Cancelled)
+            );
+            assert_eq!(writer.encoder().record_count(), 1);
+            assert_eq!(writer.encoder().truncation_warnings().len(), 1);
+            assert_eq!(writer.encoder().truncation_warnings()[0].as_ptr(), pointer);
+            assert_eq!(
+                writer.destination().bytes,
+                if after_seal {
+                    b"w\n".as_slice()
+                } else {
+                    b"w\nw\n".as_slice()
+                }
+            );
+            assert_eq!(authority.memory.used(), retained);
+            let attempts = writer.destination().attempts;
+            assert!(writer.write_record(&record).is_err());
+            assert!(writer.flush().is_err());
+            assert_eq!(writer.destination().attempts, attempts);
+            drop(writer);
+            assert_eq!(authority.memory.used(), 0);
         }
     }
 
@@ -806,8 +1079,14 @@ mod fixed_width_prepared {
                 _ => writer.end_document(&doc),
             };
             assert!(matches!(result, Err(FormatError::Io(_))));
-            assert_eq!(&writer.destination().bytes[..4], b"war\n");
-            assert_eq!(writer.destination().bytes.len(), 6);
+            assert_eq!(
+                &writer.destination().bytes,
+                match operation {
+                    0 => b"war\nwa",
+                    1 => b"war\nhe",
+                    _ => b"war\nfo",
+                }
+            );
             assert_eq!(writer.encoder().record_count(), 1);
             assert!(writer.encoder().document_open());
             assert_eq!(writer.encoder().truncation_warnings().len(), 1);
