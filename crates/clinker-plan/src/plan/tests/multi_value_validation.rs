@@ -2088,6 +2088,59 @@ fn fixed_width_layout_diagnostics_preserve_code_span_details_and_help() {
 }
 
 #[test]
+fn fixed_width_overlap_diagnostic_priority_preserves_source_and_sink_context() {
+    for (last, expected) in [
+        (
+            "start: 2, width: 1",
+            "group 'g': child 'c' range 2..3 overlaps child 'a' range 0..4; give each child a disjoint range",
+        ),
+        ("start: 8", "field 'c': must have 'width' or 'end'"),
+    ] {
+        let schema = format!(
+            r#"        - name: g
+          type: map
+          multiple: true
+          start: 0
+          occurs: {{ min: 0, max: 1, fill: pad, on_overflow: error }}
+          fields:
+            - {{ name: a, type: string, start: 0, width: 4 }}
+            - {{ name: b, type: string, start: 3, width: 4 }}
+            - {{ name: c, type: string, {last} }}"#
+        );
+        for input in [true, false] {
+            let yaml = if input {
+                source_format_pipeline("fixed_width", &format!("      schema:\n{schema}"))
+            } else {
+                format!(
+                    "{}      schema:\n{schema}\n",
+                    json_pipeline("      schema: [{ name: id, type: string }]", "fixed_width")
+                )
+            };
+            let config = parse_config(&yaml).expect("diagnostic fixture parses");
+            let span = clinker_core_types::span::Span::line_only(
+                config.nodes[usize::from(!input)].referenced.line() as u32,
+            );
+            let diagnostics = compile_err(&yaml);
+            let code = if input { "E358" } else { "E359" };
+            let matching: Vec<_> = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == code)
+                .collect();
+            assert_eq!(matching.len(), 1, "{diagnostics:?}");
+            let diagnostic = matching[0];
+            assert_eq!(diagnostic.primary.span, span);
+            assert!(diagnostic.message.contains(&format!("invalid fixed-width repeating-group layout: invalid record at row 0: {expected}")), "{diagnostic:?}");
+            assert_eq!(
+                diagnostic.help.as_deref(),
+                Some(
+                    "declare `type: map`, `multiple: true`, scalar child `fields`, and `occurs: { max: <positive count> }`; keep every maximum byte range disjoint"
+                )
+            );
+        }
+    }
+}
+
+#[test]
 fn fixed_width_input_and_output_layout_rules_remain_distinct() {
     let sequential = r#"        - name: items
           type: map

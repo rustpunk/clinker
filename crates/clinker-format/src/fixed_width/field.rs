@@ -1087,6 +1087,117 @@ mod tests {
     use crate::schema::Column;
     use chrono::NaiveDate;
 
+    fn overlap_columns(valid_last: bool) -> Vec<Column> {
+        [
+            ("a", 0, Some(4)),
+            ("b", 3, Some(4)),
+            ("c", if valid_last { 2 } else { 8 }, valid_last.then_some(1)),
+        ]
+        .into_iter()
+        .map(|(name, start, width)| Column {
+            start: Some(start),
+            width,
+            ..Column::bare(name, Type::String)
+        })
+        .collect()
+    }
+
+    fn overlap_group(valid_last: bool) -> Column {
+        Column {
+            start: Some(0),
+            multiple: Some(true),
+            fields: Some(overlap_columns(valid_last)),
+            occurs: Some(FixedWidthOccurs {
+                min: 0,
+                max: 1,
+                fill: FixedWidthFill::Pad,
+                on_overflow: FixedWidthOverflow::Error,
+                keep: None,
+            }),
+            ..Column::bare("g", Type::Map)
+        }
+    }
+
+    fn assert_layout_message(result: Result<(), FormatError>, expected: &str) {
+        match result.expect_err("layout must fail") {
+            FormatError::InvalidRecord { row, message } => {
+                assert_eq!(row, 0);
+                assert_eq!(message, expected);
+            }
+            error => panic!("unexpected layout error: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn layout_diagnostic_group_overlap_uses_first_physical_pair() {
+        let columns = [overlap_group(true)];
+        let expected = "group 'g': child 'c' range 2..3 overlaps child 'a' range 0..4; give each child a disjoint range";
+        assert_layout_message(validate_read_layout(&columns), expected);
+        assert_layout_message(validate_write_layout(&columns), expected);
+    }
+
+    #[test]
+    fn layout_diagnostic_writer_overlap_uses_first_physical_pair() {
+        assert_layout_message(
+            validate_write_layout(&overlap_columns(true)),
+            "field 'c': range 2..3 overlaps field 'a' (0..4)",
+        );
+    }
+
+    #[test]
+    fn layout_diagnostic_group_rules_precede_child_overlap() {
+        let columns = [overlap_group(false)];
+        assert_layout_message(
+            validate_read_layout(&columns),
+            "field 'c': must have 'width' or 'end'",
+        );
+        assert_layout_message(
+            validate_write_layout(&columns),
+            "field 'c': must have 'width' or 'end'",
+        );
+    }
+
+    #[test]
+    fn layout_diagnostic_writer_rules_precede_top_level_overlap() {
+        assert_layout_message(
+            validate_write_layout(&overlap_columns(false)),
+            "field 'c': must have 'width' or 'end'",
+        );
+    }
+
+    #[test]
+    fn layout_diagnostic_physical_sort_retains_implicit_starts_and_stable_ties() {
+        let columns = [
+            Column {
+                start: Some(8),
+                width: Some(2),
+                ..Column::bare("a", Type::String)
+            },
+            Column {
+                start: Some(0),
+                width: Some(2),
+                ..Column::bare("b", Type::String)
+            },
+            Column {
+                width: Some(2),
+                ..Column::bare("c", Type::String)
+            },
+        ];
+        assert!(validate_write_layout(&columns).is_ok());
+        let mut group = overlap_group(true);
+        group.fields = Some(columns.to_vec());
+        assert!(validate_write_layout(&[group]).is_ok());
+        let tied = ["a", "b", "c"].map(|name| Column {
+            start: Some(4),
+            width: Some(2),
+            ..Column::bare(name, Type::String)
+        });
+        assert_layout_message(
+            validate_write_layout(&tied),
+            "field 'b': range 4..6 overlaps field 'a' (4..6)",
+        );
+    }
+
     fn pad_column(name: &str, pad: &str) -> Column {
         Column {
             start: Some(0),
