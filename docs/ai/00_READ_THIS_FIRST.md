@@ -29,50 +29,22 @@ ledger is reserved for unresolved or explicitly deferred questions.
 
 ## How to use these docs
 
-Recommended reading order by task:
+Read by task, not up front: the "Where To Look" table in
+[AGENTS.md](../../AGENTS.md) routes each kind of task to the docs it needs.
+Task-specific additions to that table:
 
-1. **New AI session / general orientation:** read
-   [AGENTS.md](../../AGENTS.md), this file,
-   [docs/ai/20_CRATE_MAP.md](20_CRATE_MAP.md),
-   [docs/ai/30_DESIGN_RULES.md](30_DESIGN_RULES.md), and
-   [docs/ai/50_TESTING_AND_COMMANDS.md](50_TESTING_AND_COMMANDS.md).
-2. **Feature implementation:** add
-   [docs/ai/10_ARCHITECTURE.md](10_ARCHITECTURE.md),
-   [docs/ai/35_EXTENSION_SEAMS.md](35_EXTENSION_SEAMS.md),
-   [docs/ai/40_COMMON_PATTERNS.md](40_COMMON_PATTERNS.md), the relevant
-   crate-level `AGENTS.md`, and user/engine docs for the touched behavior.
-3. **Bug fixing:** read the crate map, design rules, testing commands, the
-   nearest crate-level `AGENTS.md`, and tests or fixtures near the bug. Use
-   [docs/ai/70_GLOSSARY.md](70_GLOSSARY.md) when terminology affects behavior.
-4. **Cross-crate refactor:** read architecture, crate map, design rules,
-   extension seams, common patterns, open questions, and
-   [docs/ai/AI_CHANGELOG.md](AI_CHANGELOG.md) before editing.
-5. **Performance work:** read
-   [docs/ai/60_PERFORMANCE_NOTES.md](60_PERFORMANCE_NOTES.md), testing
-   commands, architecture, and the relevant benchmarks/tests.
-6. **Test/documentation work:** read
-   [docs/ai/50_TESTING_AND_COMMANDS.md](50_TESTING_AND_COMMANDS.md), the
-   affected user/engine/AI docs, and
-   [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md) for known stale areas.
-7. **Crate-level work:** read
-   [docs/ai/90_CRATE_AGENT_PLAN.md](90_CRATE_AGENT_PLAN.md) and the nearest
-   crate-level `AGENTS.md` if present.
+- **Bug fixing:** tests or fixtures near the bug; use
+  [docs/ai/70_GLOSSARY.md](70_GLOSSARY.md) when terminology affects behavior.
+- **Cross-crate refactor:** also read
+  [docs/ai/AI_CHANGELOG.md](AI_CHANGELOG.md) before editing.
+- **Crate-level work:** read
+  [docs/ai/90_CRATE_AGENT_PLAN.md](90_CRATE_AGENT_PLAN.md) and the nearest
+  crate-level `AGENTS.md` if present.
+- **Test/documentation work:** check
+  [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md) for known stale areas.
 
-## Minimum reading checklist for AI agents
-
-Before editing code, an AI agent must read:
-
-- [AGENTS.md](../../AGENTS.md)
-- [docs/ai/00_READ_THIS_FIRST.md](00_READ_THIS_FIRST.md)
-- [docs/ai/20_CRATE_MAP.md](20_CRATE_MAP.md)
-- [docs/ai/30_DESIGN_RULES.md](30_DESIGN_RULES.md)
-- [docs/ai/50_TESTING_AND_COMMANDS.md](50_TESTING_AND_COMMANDS.md)
-- The nearest crate-level `AGENTS.md`, if present.
-
-Also read architecture, common-pattern, performance, or glossary docs when the
-task touches those areas. For docs-only tasks, still check
-`git status --short` before editing and avoid changing source files unless the
-user explicitly asks.
+For docs-only tasks, still check `git status --short` before editing and
+avoid changing source files unless the user explicitly asks.
 
 ## Repository memory model
 
@@ -138,6 +110,9 @@ required by the audience and files changed.
 - [docs/ai/30_DESIGN_RULES.md](30_DESIGN_RULES.md): design constraints for
   finite batch execution, crate layering, YAML parsing, dependency policy,
   bounded memory, config strictness, and review gates.
+- [docs/ai/32_NODE_OBLIGATIONS.md](32_NODE_OBLIGATIONS.md): the lineage,
+  telemetry, and memory-budget obligations every node, feature, and refactor
+  answers, with triggers and exemptions.
 - [docs/ai/35_EXTENSION_SEAMS.md](35_EXTENSION_SEAMS.md): change-oriented map
   of format, transport, node, CXL, diagnostic, runtime-resource, composition,
   and edge-consumer seams.
@@ -183,6 +158,7 @@ docs, or intended behavior need clarification.
 | New crate | [docs/ai/20_CRATE_MAP.md](20_CRATE_MAP.md), root [AGENTS.md](../../AGENTS.md) if repo-wide guidance changes |
 | Architecture change | [docs/ai/10_ARCHITECTURE.md](10_ARCHITECTURE.md), [docs/ai/AI_CHANGELOG.md](AI_CHANGELOG.md), [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md) if uncertainty remains |
 | New design rule | [docs/ai/30_DESIGN_RULES.md](30_DESIGN_RULES.md) |
+| Node, lineage, telemetry, or memory-budget obligation change | [docs/ai/32_NODE_OBLIGATIONS.md](32_NODE_OBLIGATIONS.md), root [AGENTS.md](../../AGENTS.md) summary if the triggers change |
 | Extension or cross-layer change | [docs/ai/35_EXTENSION_SEAMS.md](35_EXTENSION_SEAMS.md), plus the owning subsystem docs |
 | New repeated pattern | [docs/ai/40_COMMON_PATTERNS.md](40_COMMON_PATTERNS.md) |
 | New command/test workflow | [docs/ai/50_TESTING_AND_COMMANDS.md](50_TESTING_AND_COMMANDS.md) |

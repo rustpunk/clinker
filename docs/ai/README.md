@@ -39,6 +39,8 @@ Validate this page against:
   behavior, locked production contracts, evidence, compatibility, and owners.
 - `20_CRATE_MAP.md`: current workspace crate roles and dependency direction.
 - `30_DESIGN_RULES.md`: architecture, dependency, config, and review rules.
+- `32_NODE_OBLIGATIONS.md`: lineage, telemetry, and memory-budget obligations
+  for nodes, features, and refactors.
 - `35_EXTENSION_SEAMS.md`: extension contracts and coordinated cross-layer
   change paths.
 - `40_COMMON_PATTERNS.md`: repeated implementation patterns and local conventions.
