@@ -229,6 +229,12 @@ pub struct CompileArtifacts {
     /// lowering omits a node `bind_schema` visited (e.g. a
     /// failed-binding composition).
     pub top_level_node_ids: Vec<PlanNodeId>,
+    /// Typed output row of every top-level node that bound one, keyed by
+    /// node name in declaration order — the top-level counterpart of
+    /// [`BoundBody::body_rows`]. A node whose upstream failed to bind has no
+    /// entry. Moved onto `CompiledPlan` and read by tooling; the executor
+    /// never consults it.
+    pub top_level_rows: IndexMap<String, Row>,
 }
 
 impl CompileArtifacts {
@@ -432,6 +438,15 @@ pub fn bind_schema(
         &mut schema_by_name,
         &mut declared_multiple_by_name,
     );
+    artifacts.top_level_rows = nodes
+        .iter()
+        .filter_map(|spanned| {
+            let name = spanned.value.name();
+            schema_by_name
+                .remove(name)
+                .map(|row| (name.to_string(), row))
+        })
+        .collect();
 
     // Cross-Transform duplicate `declares:` (the only path that
     // produced multi-writer for a `(scope, var)` pair) is now caught at

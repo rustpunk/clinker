@@ -31,6 +31,7 @@ use crate::config::PipelineConfig;
 use crate::config::composition::{ProvenanceDb, SchemaProvenanceDb};
 use crate::resources::CompiledModuleRegistry;
 use clinker_format::SourceSchema;
+use cxl::typecheck::Row;
 use indexmap::IndexMap;
 
 /// Semantic kind of one retained channel-resolution layer.
@@ -188,6 +189,11 @@ pub struct CompiledPlan {
     /// <source>.<column>.<attribute>`. Excluded from `pipeline_hash`; rebuilt
     /// each compile.
     schema_provenance: SchemaProvenanceDb,
+    /// Typed output row per top-level node, keyed by node name in
+    /// declaration order, as bound against the effective (post-overlay)
+    /// pipeline. The top-level counterpart of [`BoundBody::body_rows`].
+    /// Tooling metadata: excluded from `pipeline_hash` and semantic identity.
+    output_rows: IndexMap<String, Row>,
     /// Complete immutable CXL module closure captured during planning.
     cxl_modules: CompiledModuleRegistry,
 }
@@ -209,6 +215,7 @@ impl CompiledPlan {
             statistics,
             mut provenance,
             cxl_modules,
+            top_level_rows: output_rows,
             ..
         } = artifacts;
         // Base-seed the schema provenance from the resolved schemas. The overlay
@@ -229,6 +236,7 @@ impl CompiledPlan {
             pipeline_hash,
             bound_schemas,
             schema_provenance,
+            output_rows,
             cxl_modules,
         }
     }
@@ -311,6 +319,25 @@ impl CompiledPlan {
     /// re-reading the file at runtime.
     pub fn bound_schemas(&self) -> &IndexMap<String, SourceSchema> {
         &self.bound_schemas
+    }
+
+    /// Typed output row of the top-level node `name`, with field names and
+    /// CXL types as bound at compile time against the effective
+    /// (post-overlay) pipeline.
+    ///
+    /// `None` for an undeclared name, for a node inside a composition body
+    /// (read those from [`BoundBody::body_rows`] via [`Self::body_of`]), and
+    /// for a node whose upstream failed to bind. A Composition node's row is
+    /// the row of its first output port that bound. A Sink's row is the row
+    /// it binds against, before any output mapping renames columns on write.
+    pub fn output_row(&self, name: &str) -> Option<&Row> {
+        self.output_rows.get(name)
+    }
+
+    /// Every top-level node's typed output row, keyed by node name in
+    /// declaration order. See [`Self::output_row`] for which nodes appear.
+    pub fn output_rows(&self) -> &IndexMap<String, Row> {
+        &self.output_rows
     }
 
     /// Per-attribute source-schema provenance, queried by `explain --field
