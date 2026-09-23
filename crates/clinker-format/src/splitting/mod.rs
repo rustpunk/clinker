@@ -191,6 +191,11 @@ pub struct SplittingWriter {
     oversize_warned: bool,
     /// Cumulative bytes written across all rotated files (excludes current file).
     total_bytes: u64,
+    /// Truncations of every retired file's writer, with record numbers
+    /// shifted to count across the whole split output.
+    truncations: Option<crate::truncation::TruncationSummary>,
+    /// Records written to every retired file (excludes the current file).
+    records_before_file: u64,
 }
 
 impl SplittingWriter {
@@ -212,6 +217,8 @@ impl SplittingWriter {
             file_seq: 0,
             oversize_warned: false,
             total_bytes: 0,
+            truncations: None,
+            records_before_file: 0,
         }
     }
 
@@ -233,7 +240,14 @@ impl SplittingWriter {
     fn rotate_file(&mut self) -> Result<(), FormatError> {
         if let Some(ref mut writer) = self.current_writer {
             writer.flush()?;
+            // The writer is dropped next; keep its account first.
+            if let Some(summary) = writer.truncation_summary() {
+                self.truncations
+                    .get_or_insert_default()
+                    .merge_after(summary, self.records_before_file);
+            }
         }
+        self.records_before_file += self.records_in_file;
         self.current_writer = None;
         self.open_new_file()?;
         Ok(())
@@ -375,6 +389,20 @@ impl FormatWriter for SplittingWriter {
 
     fn bytes_written(&self) -> Option<u64> {
         Some(self.total_bytes + self.byte_counter.bytes_written())
+    }
+
+    /// Retired files' truncations plus the active writer's, with record
+    /// numbers counted across the whole split output.
+    fn truncation_summary(&self) -> Option<crate::truncation::TruncationSummary> {
+        let mut summary = self.truncations.clone().unwrap_or_default();
+        if let Some(current) = self
+            .current_writer
+            .as_ref()
+            .and_then(|writer| writer.truncation_summary())
+        {
+            summary.merge_after(current, self.records_before_file);
+        }
+        (!summary.is_empty()).then_some(summary)
     }
 
     /// Forward per-document opening framing to the active inner writer so it

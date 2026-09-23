@@ -212,6 +212,20 @@ pub trait FormatWriter: Send {
     fn bytes_written(&self) -> Option<u64> {
         None
     }
+
+    /// Values this writer cut to fit a column under `truncation: warn`, over
+    /// every record it delivered. `None` for a writer with no truncation
+    /// policy (every format but fixed-width) or one that truncated nothing.
+    ///
+    /// Reads storage the writer sized when it was built; building the summary
+    /// allocates only its own schema-bounded result, so call it once, when the
+    /// output is done.
+    ///
+    /// A wrapper writer holding an inner writer must forward this hook, or the
+    /// inner writer's truncations never reach the run report.
+    fn truncation_summary(&self) -> Option<crate::truncation::TruncationSummary> {
+        None
+    }
 }
 
 /// Unique writer owner that retains backing admission through deallocation.
@@ -295,6 +309,9 @@ impl FormatWriter for FormatWriterHandle {
     fn bytes_written(&self) -> Option<u64> {
         self.inner.bytes_written()
     }
+    fn truncation_summary(&self) -> Option<crate::truncation::TruncationSummary> {
+        self.inner.truncation_summary()
+    }
 }
 
 /// Shared test fixtures for the `FormatWriter` wrapper-delegation contract.
@@ -315,6 +332,8 @@ pub(crate) mod test_support {
     /// delegation tests so both assert against one fixture.
     pub(crate) struct HookProbe {
         log: Arc<Mutex<Vec<String>>>,
+        /// Records this probe (not the shared log) received.
+        writes: u64,
     }
 
     impl HookProbe {
@@ -322,7 +341,7 @@ pub(crate) mod test_support {
         /// split writer factory) construct the probe while retaining its own
         /// handle on the shared log.
         pub(crate) fn with_log(log: Arc<Mutex<Vec<String>>>) -> Self {
-            Self { log }
+            Self { log, writes: 0 }
         }
 
         fn record(&self, entry: impl Into<String>) {
@@ -333,6 +352,7 @@ pub(crate) mod test_support {
     impl FormatWriter for HookProbe {
         fn write_record(&mut self, _record: &Record) -> Result<(), FormatError> {
             self.record("write");
+            self.writes += 1;
             Ok(())
         }
 
@@ -354,6 +374,25 @@ pub(crate) mod test_support {
         fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
             self.record(format!("end:{}", doc.source_file()));
             Ok(())
+        }
+
+        /// One `probe` column truncated once per record written, listing this
+        /// writer's own 1-based record numbers.
+        fn truncation_summary(&self) -> Option<crate::truncation::TruncationSummary> {
+            use crate::truncation::{
+                ColumnTruncation, TRUNCATION_EXAMPLE_LIMIT, TruncationSummary,
+            };
+            let writes = self.writes;
+            (writes > 0).then(|| TruncationSummary {
+                columns: vec![ColumnTruncation {
+                    column: "probe".into(),
+                    width: 1,
+                    cells: writes,
+                    longest_bytes: 2,
+                    example_records: (1..=writes.min(TRUNCATION_EXAMPLE_LIMIT as u64)).collect(),
+                    more_records: writes > TRUNCATION_EXAMPLE_LIMIT as u64,
+                }],
+            })
         }
     }
 }
@@ -390,6 +429,18 @@ mod writer_owner_tests {
         fn bytes_written(&self) -> Option<u64> {
             Some(self.0)
         }
+        fn truncation_summary(&self) -> Option<crate::truncation::TruncationSummary> {
+            Some(crate::truncation::TruncationSummary {
+                columns: vec![crate::truncation::ColumnTruncation {
+                    column: "probe".into(),
+                    width: 1,
+                    cells: self.0,
+                    longest_bytes: 2,
+                    example_records: vec![],
+                    more_records: false,
+                }],
+            })
+        }
     }
 
     #[test]
@@ -422,6 +473,12 @@ mod writer_owner_tests {
             assert_eq!(writer.bytes_written(), Some(29));
             writer.as_mut().flush().unwrap();
             assert_eq!(writer.bytes_written(), Some(31));
+            assert_eq!(
+                writer
+                    .truncation_summary()
+                    .map(|summary| summary.total_cells()),
+                Some(31)
+            );
             drop(writer);
             assert_eq!(provider.used(), 0);
         }

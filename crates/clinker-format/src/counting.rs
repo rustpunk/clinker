@@ -142,6 +142,11 @@ impl FormatWriter for CountedFormatWriter {
     fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
         self.inner.end_document(doc)
     }
+
+    /// Forward to the wrapped writer so its truncations reach the run report.
+    fn truncation_summary(&self) -> Option<crate::truncation::TruncationSummary> {
+        self.inner.truncation_summary()
+    }
 }
 
 #[cfg(test)]
@@ -281,6 +286,29 @@ mod tests {
             *log.lock().unwrap(),
             vec!["flush_bytes"],
             "flush_bytes forwards through the counting wrapper without finalizing",
+        );
+    }
+
+    #[test]
+    fn counted_format_writer_forwards_truncation_summary_to_inner() {
+        use std::sync::{Arc, Mutex};
+
+        let probe = HookProbe::with_log(Arc::new(Mutex::new(Vec::new())));
+        let mut counted = CountedFormatWriter::new(
+            FormatWriterHandle::from_legacy(Box::new(probe)),
+            SharedByteCounter::new(),
+        );
+        assert_eq!(counted.truncation_summary(), None);
+        let schema = clinker_record::owned_storage::SharedStorage::from_arc(Arc::new(
+            clinker_record::Schema::new(vec![]),
+        ));
+        counted.write_record(&Record::new(schema, vec![])).unwrap();
+        assert_eq!(
+            counted
+                .truncation_summary()
+                .map(|summary| summary.total_cells()),
+            Some(1),
+            "the inner writer's account reaches the wrapper's caller",
         );
     }
 }

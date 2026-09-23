@@ -34,7 +34,7 @@
 //!     writer.write_record(&Record::new(schema, vec![Value::String("é".into())]))?;
 //!     writer.flush()?;
 //!     assert_eq!(writer.encoder().record_count(), 1);
-//!     assert!(writer.encoder().truncation_warnings().is_empty());
+//!     assert!(writer.encoder().truncation_summary().is_none());
 //! }
 //! assert_eq!(bytes, "é  \n".as_bytes());
 //! assert_eq!(resources.used(), 0);

@@ -14,6 +14,7 @@ use crate::preparation::{
 use crate::reserved::{ReservedText, ReservedVec};
 use crate::schema::{Column, FixedWidthFill, FixedWidthOverflow, FixedWidthTruncateKeep};
 use crate::traits::FormatWriter;
+use crate::truncation::{ColumnTruncation, TRUNCATION_EXAMPLE_LIMIT, TruncationSummary};
 use clinker_record::owned_storage::SharedStorage;
 
 fn output_error(name: &str, field: usize, offset: usize, kind: OutputEncodingKind) -> FormatError {
@@ -111,15 +112,20 @@ struct PreparedField {
     justify: Justify,
     pad: u8,
     truncation: TruncationPolicy,
+    /// Index of this field's truncation tally; `Some` exactly for `warn`.
+    tally: Option<usize>,
     trim: bool,
     read_right: bool,
     read_pad: Option<char>,
 }
 impl PreparedField {
+    /// `slots` counts the tallies assigned so far and advances for a `warn`
+    /// field, so every tally index is dense and fixed at construction.
     fn new(
         column: &Column,
         start: usize,
         declared: usize,
+        slots: &mut usize,
         scope: &WriterScope,
     ) -> Result<Self, FormatError> {
         let width = field::scalar_width(column, start).map_err(|e| {
@@ -134,6 +140,15 @@ impl PreparedField {
             column.ty.unwrap_nullable(),
             Type::Int | Type::Float | Type::Decimal | Type::Numeric
         );
+        let truncation = column.truncation.clone().unwrap_or(if numeric {
+            TruncationPolicy::Error
+        } else {
+            TruncationPolicy::Warn
+        });
+        let tally = matches!(truncation, TruncationPolicy::Warn).then(|| {
+            *slots += 1;
+            *slots - 1
+        });
         Ok(Self {
             name: retained_text(&column.name, scope)?,
             declared,
@@ -149,11 +164,8 @@ impl PreparedField {
                 .as_deref()
                 .and_then(|s| s.bytes().next())
                 .unwrap_or(b' '),
-            truncation: column.truncation.clone().unwrap_or(if numeric {
-                TruncationPolicy::Error
-            } else {
-                TruncationPolicy::Warn
-            }),
+            truncation,
+            tally,
             trim: column.trim.unwrap_or(true),
             read_right: matches!(column.justify, Some(Justify::Right)),
             read_pad: column.pad.as_deref().unwrap_or(" ").chars().next(),
@@ -202,6 +214,8 @@ impl PreparedLayout {
 }
 struct PreparedConfig {
     layouts: ReservedVec<PreparedLayout>,
+    /// Number of `warn` fields, top-level and group children alike.
+    tallies: usize,
     separator: LineSeparator,
     envelope: Option<crate::envelope_writer::PreparedEnvelope>,
 }
@@ -257,6 +271,7 @@ impl FixedWidthEncoderConfig {
         let mut layouts = ReservedVec::new(scope.allocation().clone());
         layouts.reserve_exact(fields.len())?;
         let mut next_start = 0;
+        let mut tallies = 0;
         for (declared, column) in fields.iter().enumerate() {
             scope.check_cancelled()?;
             let start = column.start.unwrap_or(next_start);
@@ -279,6 +294,7 @@ impl FixedWidthEncoderConfig {
                         child,
                         child.start.unwrap_or(next_child),
                         declared,
+                        &mut tallies,
                         &scope,
                     )?;
                     next_child = child.start + child.width;
@@ -303,7 +319,13 @@ impl FixedWidthEncoderConfig {
                     fields,
                 })
             } else {
-                PreparedLayout::Scalar(PreparedField::new(column, start, declared, &scope)?)
+                PreparedLayout::Scalar(PreparedField::new(
+                    column,
+                    start,
+                    declared,
+                    &mut tallies,
+                    &scope,
+                )?)
             };
             next_start = layout.start() + layout.width();
             layouts.push(layout)?;
@@ -314,6 +336,7 @@ impl FixedWidthEncoderConfig {
         Ok(Self(SharedStorage::try_new(
             PreparedConfig {
                 layouts,
+                tallies,
                 separator,
                 envelope: crate::envelope_writer::PreparedEnvelope::from_names(
                     header, footer, None, &scope,
@@ -329,135 +352,75 @@ struct FixedWidthState {
     document_open: bool,
 }
 
-// Slots are initialized before delivery, including spare capacity. This lets
-// commit move owners into existing slots without a fallible push or allocation.
-// Field order is load-bearing: all String backings drop before their leases.
-struct WarningHistory {
-    strings: ReservedVec<String>,
-    leases: ReservedVec<Option<crate::preparation::AllocationLease>>,
+/// One `warn` field's account over every delivered record.
+#[derive(Clone, Copy, Default)]
+struct Tally {
+    cells: u64,
+    longest: usize,
+    /// Delivered record numbers (1-based, across documents) of the first
+    /// records that truncated here; `listed` of them are set.
+    examples: [u64; TRUNCATION_EXAMPLE_LIMIT],
+    listed: usize,
+    more: bool,
+}
+/// The record being prepared: what it truncated, per tally, before delivery
+/// decides whether it counts.
+#[derive(Clone, Copy, Default)]
+struct Hit {
+    cells: u64,
+    longest: usize,
+}
+/// Per-record staging, reused for every record. `dirty` marks hits left by a
+/// record that failed after truncating, so the next prepare clears them.
+struct Scratch {
+    hits: ReservedVec<Hit>,
+    dirty: bool,
+}
+impl Scratch {
+    fn hit(&mut self, tally: usize, original: usize) {
+        if let Some(hit) = self.hits.as_mut_slice().get_mut(tally) {
+            hit.cells = hit.cells.saturating_add(1);
+            hit.longest = hit.longest.max(original);
+            self.dirty = true;
+        }
+    }
+    fn clear(&mut self) {
+        if self.dirty {
+            self.hits.as_mut_slice().fill(Hit::default());
+            self.dirty = false;
+        }
+    }
+}
+fn filled<T: Copy + Default>(
     len: usize,
-}
-impl WarningHistory {
-    fn empty(scope: &WriterScope) -> Self {
-        Self {
-            strings: ReservedVec::new(scope.allocation().clone()),
-            leases: ReservedVec::new(scope.allocation().clone()),
-            len: 0,
-        }
+    scope: &WriterScope,
+) -> Result<ReservedVec<T>, FormatError> {
+    let mut values = ReservedVec::new(scope.allocation().clone());
+    values.reserve_exact(len)?;
+    for _ in 0..len {
+        values.push(T::default())?;
     }
-    fn with_capacity(capacity: usize, scope: &WriterScope) -> Result<Self, FormatError> {
-        let mut history = Self::empty(scope);
-        history.strings.reserve_exact(capacity)?;
-        history.leases.reserve_exact(capacity)?;
-        for _ in 0..capacity {
-            scope.check_cancelled()?;
-            history.strings.push(String::new())?;
-            history.leases.push(None)?;
-        }
-        Ok(history)
-    }
-    fn slots(
-        &mut self,
-    ) -> impl Iterator<
-        Item = (
-            &mut String,
-            &mut Option<crate::preparation::AllocationLease>,
-        ),
-    > {
-        self.strings
-            .as_mut_slice()
-            .iter_mut()
-            .zip(self.leases.as_mut_slice())
-    }
-    // The caller establishes enough initialized vacant slots in prepare.
-    // Source slots become empty while the grants follow their String owners.
-    fn append(&mut self, source: &mut Self) {
-        let old_len = self.len;
-        let source_len = source.len;
-        for ((text, lease), (from_text, from_lease)) in self
-            .slots()
-            .skip(old_len)
-            .zip(source.slots().take(source_len))
-        {
-            std::mem::swap(text, from_text);
-            std::mem::swap(lease, from_lease);
-        }
-        self.len += source_len;
-        source.len = 0;
-    }
-}
-struct PendingWarnings {
-    messages: WarningHistory,
-    replacement: Option<WarningHistory>,
-}
-impl PendingWarnings {
-    fn new(
-        current: &WarningHistory,
-        mut pending: ReservedVec<ReservedText>,
-        scope: &WriterScope,
-    ) -> Result<Option<Self>, FormatError> {
-        if pending.is_empty() {
-            return Ok(None);
-        }
-        let count = pending.len();
-        let needed = current.len.checked_add(count).ok_or_else(|| {
-            crate::preparation::ResourceError::new(
-                crate::preparation::ResourceErrorKind::Layout,
-                count,
-                0,
-            )
-        })?;
-        let replacement = if needed > current.strings.len() {
-            let preferred = current
-                .strings
-                .len()
-                .checked_mul(2)
-                .unwrap_or(needed)
-                .max(needed);
-            let replacement = match WarningHistory::with_capacity(preferred, scope) {
-                Err(FormatError::Resource(error))
-                    if preferred != needed
-                        && error.kind == crate::preparation::ResourceErrorKind::Budget =>
-                {
-                    WarningHistory::with_capacity(needed, scope)?
-                }
-                result => result?,
-            };
-            Some(replacement)
-        } else {
-            None
-        };
-        let mut messages = WarningHistory::with_capacity(count, scope)?;
-        for ((text, lease), pending) in messages.slots().zip(pending.as_mut_slice()) {
-            scope.check_cancelled()?;
-            let owner = std::mem::replace(pending, ReservedText::new(scope.allocation().clone()));
-            (*text, *lease) = owner.into_string_parts();
-        }
-        messages.len = count;
-        Ok(Some(Self {
-            messages,
-            replacement,
-        }))
-    }
-    fn commit(mut self, history: &mut WarningHistory) {
-        if let Some(mut replacement) = self.replacement {
-            replacement.append(history);
-            *history = replacement;
-        }
-        history.append(&mut self.messages);
-    }
+    Ok(values)
 }
 /// Streams complete records/sections into an admitted stage. Only delivered
-/// operations change counters or warning history; no record values are retained.
+/// operations change counters or truncation tallies; no record values are
+/// retained. Every tally and the per-record staging are sized by the layout
+/// when the encoder is built, so recording a truncation never allocates and a
+/// `truncation: warn` field never fails a record.
 pub struct FixedWidthEncoder {
     config: FixedWidthEncoderConfig,
     state: FixedWidthState,
-    warnings: WarningHistory,
+    /// Body records delivered across every document.
+    delivered: u64,
+    tallies: ReservedVec<Tally>,
+    // `prepare` takes `&self`; the staging it writes is folded in `commit`.
+    scratch: std::cell::RefCell<Scratch>,
 }
-/// Owns prepared warning replacement until successful delivery or cancellation.
+/// Prepared state, applied only once delivery succeeds.
 pub struct FixedWidthPending {
     state: FixedWidthState,
-    warnings: Option<PendingWarnings>,
+    record: bool,
+    truncated: bool,
 }
 impl FixedWidthEncoder {
     /// Admit layout/configuration before retaining it; borrows caller columns.
@@ -471,15 +434,22 @@ impl FixedWidthEncoder {
             resources,
         )
     }
-    /// Share admitted immutable policy; each writer owns its warning history.
+    /// Share admitted immutable policy; each writer owns its truncation tallies.
     pub fn from_config(
         config: FixedWidthEncoderConfig,
         resources: WriterResources,
     ) -> Result<Self, FormatError> {
+        let scope = resources.scope()?;
+        let slots = config.0.tallies;
         Ok(Self {
-            config,
             state: FixedWidthState::default(),
-            warnings: WarningHistory::empty(&resources.scope()?),
+            delivered: 0,
+            tallies: filled(slots, &scope)?,
+            scratch: std::cell::RefCell::new(Scratch {
+                hits: filled(slots, &scope)?,
+                dirty: false,
+            }),
+            config,
         })
     }
     /// Admit the concrete wrapper through its actual backing deallocation.
@@ -495,9 +465,42 @@ impl FixedWidthEncoder {
             scope.allocation(),
         )?)
     }
-    /// Complete committed warnings; pending failures never alter this history.
-    pub fn truncation_warnings(&self) -> &[String] {
-        &self.warnings.strings.as_slice()[..self.warnings.len]
+    /// Values delivered records had cut under `truncation: warn`, in layout
+    /// order; a record that failed or was never delivered is not counted.
+    /// `None` when nothing was truncated.
+    pub fn truncation_summary(&self) -> Option<TruncationSummary> {
+        let tallies = self.tallies.as_slice();
+        let mut columns = Vec::new();
+        let mut account = |field: &PreparedField, group: Option<&str>| {
+            let Some(tally) = field.tally.and_then(|index| tallies.get(index)) else {
+                return;
+            };
+            if tally.cells == 0 {
+                return;
+            }
+            columns.push(ColumnTruncation {
+                column: match group {
+                    Some(group) => format!("{group}.{}", field.name.as_str()),
+                    None => field.name.as_str().to_string(),
+                },
+                width: field.width,
+                cells: tally.cells,
+                longest_bytes: tally.longest,
+                example_records: tally.examples[..tally.listed].to_vec(),
+                more_records: tally.more,
+            });
+        };
+        for layout in self.config.0.layouts.as_slice() {
+            match layout {
+                PreparedLayout::Scalar(field) => account(field, None),
+                PreparedLayout::Group(group) => {
+                    for field in group.fields.as_slice() {
+                        account(field, Some(group.name.as_str()));
+                    }
+                }
+            }
+        }
+        (!columns.is_empty()).then_some(TruncationSummary { columns })
     }
     /// Successfully delivered body records since the last delivered begin.
     pub fn record_count(&self) -> u64 {
@@ -523,6 +526,9 @@ impl<W: Write + Send> FormatWriter for PreparedWriter<W, FixedWidthEncoder> {
     }
     fn flush_bytes(&mut self) -> Result<(), FormatError> {
         PreparedWriter::flush_bytes(self)
+    }
+    fn truncation_summary(&self) -> Option<TruncationSummary> {
+        self.encoder().truncation_summary()
     }
 }
 
@@ -610,79 +616,22 @@ fn kept<'a>(text: &'a str, field: &PreparedField) -> &'a str {
     }
     &text[..end]
 }
-fn append_warning(
-    warnings: &mut ReservedVec<ReservedText>,
-    field: &PreparedField,
-    text: &str,
-    group: Option<&str>,
-    scope: &WriterScope,
-) -> Result<(), FormatError> {
-    use std::fmt::Write as _;
-    struct Message {
-        text: ReservedText,
-        error: Option<crate::preparation::ResourceError>,
-    }
-    impl std::fmt::Write for Message {
-        fn write_str(&mut self, text: &str) -> std::fmt::Result {
-            self.text.push_str(text).map_err(|error| {
-                self.error = Some(error);
-                std::fmt::Error
-            })
-        }
-    }
-    let mut message = Message {
-        text: ReservedText::new(scope.allocation().clone()),
-        error: None,
-    };
-    let result = if let Some(group) = group {
-        write!(
-            message,
-            "group '{group}': child '{}' truncated from {} to {} bytes",
-            field.name.as_str(),
-            text.len(),
-            field.width
-        )
-    } else {
-        write!(
-            message,
-            "field '{}': value '{}' truncated to {} bytes",
-            field.name.as_str(),
-            text,
-            field.width
-        )
-    };
-    if result.is_err() {
-        return Err(message
-            .error
-            .unwrap_or_else(|| {
-                crate::preparation::ResourceError::new(
-                    crate::preparation::ResourceErrorKind::Layout,
-                    0,
-                    0,
-                )
-            })
-            .into());
-    }
-    warnings.push(message.text)?;
-    Ok(())
-}
 fn prepared_cell(
     stage: &mut dyn Write,
     field: &PreparedField,
     value: &Value,
     at: CellAt<'_>,
-    group: Option<&str>,
-    warnings: &mut ReservedVec<ReservedText>,
+    scratch: &mut Scratch,
     scope: &WriterScope,
 ) -> Result<(), FormatError> {
     physical_scalar(value, at, false, |text| {
         if text.len() > field.width {
-            match field.truncation {
-                TruncationPolicy::Error => {
+            match (field.truncation.clone(), field.tally) {
+                (TruncationPolicy::Error, _) => {
                     return Err(at.error(field.width, OutputEncodingKind::FixedWidthTruncation));
                 }
-                TruncationPolicy::Warn => append_warning(warnings, field, text, group, scope)?,
-                TruncationPolicy::Silent => {}
+                (TruncationPolicy::Warn, Some(tally)) => scratch.hit(tally, text.len()),
+                (TruncationPolicy::Warn, None) | (TruncationPolicy::Silent, _) => {}
             }
         }
         let text = kept(text, field);
@@ -757,7 +706,7 @@ fn prepared_group(
     group: &PreparedGroup,
     value: &Value,
     cell: CellAt<'_>,
-    warnings: &mut ReservedVec<ReservedText>,
+    scratch: &mut Scratch,
     scope: &WriterScope,
 ) -> Result<usize, FormatError> {
     let failure = |kind| cell.error(group.start, kind);
@@ -836,8 +785,7 @@ fn prepared_group(
                 field,
                 value,
                 cell.child(field.name.as_str(), occurrence),
-                Some(group.name.as_str()),
-                warnings,
+                scratch,
                 scope,
             )?;
             at = field.start + field.width;
@@ -856,7 +804,11 @@ impl FormatEncoder for FixedWidthEncoder {
     ) -> Result<Self::Pending, FormatError> {
         scope.check_cancelled()?;
         let mut state = self.state;
-        let mut warnings = None;
+        let mut record_op = false;
+        let mut scratch = self.scratch.try_borrow_mut().map_err(|_| {
+            FormatError::FixedWidth("truncation staging re-entered during prepare".to_string())
+        })?;
+        scratch.clear();
         match operation {
             OutputOperation::Record(record) => {
                 for (index, (name, _)) in record.iter_user_fields().enumerate() {
@@ -877,7 +829,6 @@ impl FormatEncoder for FixedWidthEncoder {
                         ));
                     }
                 }
-                let mut pending = ReservedVec::new(scope.allocation().clone());
                 let mut at = 0;
                 let mut shifted = 0;
                 for layout in self.config.0.layouts.as_slice() {
@@ -888,19 +839,19 @@ impl FormatEncoder for FixedWidthEncoder {
                     let cell = CellAt::record(record, layout.name(), layout.declared());
                     let width = match layout {
                         PreparedLayout::Scalar(field) => {
-                            prepared_cell(stage, field, value, cell, None, &mut pending, scope)?;
+                            prepared_cell(stage, field, value, cell, &mut scratch, scope)?;
                             field.width
                         }
                         PreparedLayout::Group(group) => {
-                            prepared_group(stage, group, value, cell, &mut pending, scope)?
+                            prepared_group(stage, group, value, cell, &mut scratch, scope)?
                         }
                     };
                     shifted += layout.width() - width;
                     at = start + width;
                 }
                 separator(stage, &self.config.0.separator)?;
-                warnings = PendingWarnings::new(&self.warnings, pending, scope)?;
                 state.records = state.records.saturating_add(1);
+                record_op = true;
             }
             OutputOperation::BeginDocument(doc) | OutputOperation::EndDocument(doc) => {
                 let begin = matches!(operation, OutputOperation::BeginDocument(_));
@@ -928,13 +879,42 @@ impl FormatEncoder for FixedWidthEncoder {
             }
             OutputOperation::Finalize => {}
         }
-        Ok(FixedWidthPending { state, warnings })
+        Ok(FixedWidthPending {
+            state,
+            record: record_op,
+            truncated: scratch.dirty,
+        })
     }
     fn commit(&mut self, pending: Self::Pending) {
         self.state = pending.state;
-        if let Some(warnings) = pending.warnings {
-            warnings.commit(&mut self.warnings);
+        if !pending.record {
+            return;
         }
+        self.delivered = self.delivered.saturating_add(1);
+        if !pending.truncated {
+            return;
+        }
+        let scratch = self.scratch.get_mut();
+        for (tally, hit) in self
+            .tallies
+            .as_mut_slice()
+            .iter_mut()
+            .zip(scratch.hits.as_slice())
+        {
+            if hit.cells == 0 {
+                continue;
+            }
+            tally.cells = tally.cells.saturating_add(hit.cells);
+            tally.longest = tally.longest.max(hit.longest);
+            match tally.examples.get_mut(tally.listed) {
+                Some(slot) => {
+                    *slot = self.delivered;
+                    tally.listed += 1;
+                }
+                None => tally.more = true,
+            }
+        }
+        scratch.clear();
     }
 }
 
@@ -1172,22 +1152,29 @@ mod tests {
         }];
 
         let mut buf = Vec::new();
-        let warning_count;
-        let warning_msg;
+        let summary;
         {
             let mut writer =
                 finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
             let rec = make_record(&["name"], vec![Value::String("LongName".into())]);
             writer.write_record(&rec).unwrap();
             writer.flush().unwrap();
-            warning_count = writer.encoder().truncation_warnings().len();
-            warning_msg = writer.encoder().truncation_warnings()[0].clone();
+            summary = writer.truncation_summary();
         }
 
         let output = String::from_utf8(buf).unwrap();
         assert_eq!(output, "LongN\n"); // truncated to 5 chars
-        assert_eq!(warning_count, 1);
-        assert!(warning_msg.contains("truncated"));
+        assert_eq!(
+            summary.unwrap().columns,
+            vec![ColumnTruncation {
+                column: "name".into(),
+                width: 5,
+                cells: 1,
+                longest_bytes: 8,
+                example_records: vec![1],
+                more_records: false,
+            }]
+        );
     }
 
     /// A non-ASCII value whose UTF-8 encoding overruns the field's byte width
@@ -1207,29 +1194,23 @@ mod tests {
         }];
 
         let mut buf = Vec::new();
-        let warning_msg;
+        let summary;
         {
             let mut writer =
                 finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
             let rec = make_record(&["name"], vec![Value::String("café".into())]);
             writer.write_record(&rec).unwrap();
             writer.flush().unwrap();
-            warning_msg = writer.encoder().truncation_warnings()[0].clone();
+            summary = writer.truncation_summary().unwrap();
         }
 
         // Valid UTF-8 of exactly the byte width — the partial `é` is dropped,
         // not split, and the freed byte is space-padded.
         let output = String::from_utf8(buf).expect("output must be valid UTF-8");
         assert_eq!(output, "caf \n");
-        // Diagnostics report byte counts, not char counts.
-        assert!(
-            warning_msg.contains("bytes"),
-            "warning should say bytes: {warning_msg}"
-        );
-        assert!(
-            !warning_msg.contains("chars"),
-            "warning must not say chars: {warning_msg}"
-        );
+        // The account measures bytes, not chars: `café` is 5 bytes, 4 chars.
+        assert_eq!(summary.columns[0].longest_bytes, 5);
+        assert_eq!(summary.columns[0].width, 4);
     }
 
     /// A multi-byte character that does not fit in the byte width at all yields
@@ -1247,7 +1228,7 @@ mod tests {
         }];
 
         let mut buf = Vec::new();
-        let warning_count;
+        let summary;
         {
             let mut writer =
                 finite_writer(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
@@ -1255,12 +1236,12 @@ mod tests {
             let rec = make_record(&["flag"], vec![Value::String("é".into())]);
             writer.write_record(&rec).unwrap();
             writer.flush().unwrap();
-            warning_count = writer.encoder().truncation_warnings().len();
+            summary = writer.truncation_summary();
         }
 
         let output = String::from_utf8(buf).expect("output must be valid UTF-8");
         assert_eq!(output, " \n");
-        assert_eq!(warning_count, 0, "silent truncation emits no warning");
+        assert_eq!(summary, None, "silent truncation records nothing");
     }
 
     /// A multi-byte `pad` character cannot fill an exact byte width — each push

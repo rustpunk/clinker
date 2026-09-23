@@ -1196,6 +1196,48 @@ fn splitting_writer_forwards_flush_bytes_to_active_inner() {
     );
 }
 
+/// Truncations survive rotation: each retired file's writer is summarized
+/// before it is dropped, and its file-local record numbers are shifted to
+/// count across the whole split output.
+#[test]
+fn splitting_writer_carries_truncations_across_rotation() {
+    let schema = make_schema(&["id"]);
+    let registry = FileRegistry::new();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let writer_factory = WriterFactory::from_legacy(move |_counting, _schema| {
+        Ok(FormatWriterHandle::from_legacy(Box::new(
+            HookProbe::with_log(Arc::clone(&log)),
+        )))
+    });
+    let policy = SplitPolicy {
+        max_records: Some(3),
+        max_bytes: None,
+        group_key: None,
+        oversize_group: OversizeGroupPolicy::default(),
+    };
+    let mut writer = SplittingWriter::new(
+        registry.file_factory(),
+        writer_factory,
+        schema.clone(),
+        policy,
+    );
+    assert_eq!(writer.truncation_summary(), None);
+    for id in 0..7 {
+        writer
+            .write_record(&Record::new(schema.clone(), vec![Value::Integer(id)]))
+            .unwrap();
+    }
+
+    let summary = writer
+        .truncation_summary()
+        .expect("every probe record truncates");
+    assert_eq!(summary.columns.len(), 1);
+    let probe = &summary.columns[0];
+    assert_eq!(probe.cells, 7, "3 + 3 + 1 records over three files");
+    assert_eq!(probe.example_records, vec![1, 2, 3, 4, 5, 6, 7]);
+    assert!(!probe.more_records);
+}
+
 // Helper for test_split_naming_pattern — wraps the executor's apply_split_naming logic
 // (we duplicate it here since the original is in clinker-exec and we're in clinker-format)
 pub(crate) fn apply_split_naming_wrapper(base_path: &str, naming: &str, seq: u32) -> String {

@@ -530,8 +530,8 @@ mod fixed_width_prepared {
         ResourceAuthority, WriterResources,
     };
     use clinker_format::{
-        Column, FixedWidthCountField, FixedWidthFill, FixedWidthOccurs, FixedWidthOverflow,
-        FixedWidthTruncateKeep,
+        Column, ColumnTruncation, FixedWidthCountField, FixedWidthFill, FixedWidthOccurs,
+        FixedWidthOverflow, FixedWidthTruncateKeep, TRUNCATION_EXAMPLE_LIMIT,
     };
     use clinker_record::schema_def::{Justify, LineSeparator, TruncationPolicy};
     use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Record, Schema, Value};
@@ -587,7 +587,7 @@ mod fixed_width_prepared {
     }
 
     #[test]
-    fn warning_history_keeps_existing_text_backing_across_successful_append() {
+    fn truncation_tally_counts_every_record_in_fixed_storage() {
         for text in ["x".repeat(4096), "好é".repeat(819)] {
             let provider = provider();
             let encoder = FixedWidthEncoder::new(
@@ -598,222 +598,222 @@ mod fixed_width_prepared {
             .unwrap();
             let mut writer =
                 PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
-            let record = record(&[("value", Value::String(text.into()))]);
+            assert_eq!(writer.encoder().truncation_summary(), None);
+            let record = record(&[("value", Value::String(text.clone().into()))]);
             writer.write_record(&record).unwrap();
-            let pointer = writer.encoder().truncation_warnings()[0].as_str().as_ptr();
-            writer.write_record(&record).unwrap();
-            assert_eq!(writer.encoder().truncation_warnings().len(), 2);
-            assert_eq!(
-                writer.encoder().truncation_warnings()[0].as_str().as_ptr(),
-                pointer,
-                "successful append must move the old message owner without copying its bytes"
-            );
-            drop(writer);
-            assert_eq!(provider.used(), 0);
-        }
-    }
-
-    #[test]
-    fn complete_warning_slice_survives_many_tiny_records() {
-        let provider = provider();
-        let encoder = FixedWidthEncoder::new(
-            &[field("v", 1)],
-            &FixedWidthWriterConfig::default(),
-            provider.resources(),
-        )
-        .unwrap();
-        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
-        let mut expected = Vec::new();
-        let mut pointers = Vec::new();
-        for index in 0..1025 {
-            let text = format!("x{index}");
-            writer
-                .write_record(&record(&[("v", Value::String(text.clone().into()))]))
-                .unwrap();
-            expected.push(format!("field 'v': value '{text}' truncated to 1 bytes"));
-            let history: &[String] = writer.encoder().truncation_warnings();
-            assert_eq!(history, expected);
-            assert!(
-                history
-                    .iter()
-                    .zip(&pointers)
-                    .all(|(text, pointer)| text.as_ptr() == *pointer)
-            );
-            pointers.push(history.last().unwrap().as_ptr());
-        }
-        assert_eq!(writer.destination(), &b"x\n".repeat(1025));
-        assert_eq!(writer.encoder().record_count(), 1025);
-        drop(writer);
-        assert_eq!(provider.used(), 0);
-    }
-
-    #[test]
-    fn pending_warning_overlap_and_delivery_commit_never_allocate() {
-        for text in ["A".repeat(32_768), "好é".repeat(8192)] {
-            let provider = provider();
-            let resources = provider.resources();
-            let scope = resources.scope().unwrap();
-            let mut encoder = FixedWidthEncoder::new(
-                &[field("v", 1)],
-                &FixedWidthWriterConfig::default(),
-                resources,
-            )
-            .unwrap();
-            let record = record(&[("v", Value::String(text.clone().into()))]);
-            let expected = format!("field 'v': value '{text}' truncated to 1 bytes");
-            let mut destination = Vec::new();
-            for count in 1..=9 {
-                let retained = provider.used();
-                let mut stage = scope.stage().unwrap();
-                let pending = encoder
-                    .prepare(OutputOperation::Record(&record), &mut stage, &scope)
-                    .unwrap();
-                assert!(
-                    provider.used() > retained + expected.len(),
-                    "new complete message and pending storage overlap all old owners"
-                );
-                assert_eq!(encoder.truncation_warnings().len(), count - 1);
-                stage.finish().unwrap().deliver(&mut destination).unwrap();
-                let (_, allocations) = allocation_probe(true, || encoder.commit(pending));
-                assert_eq!(
-                    allocations, 0,
-                    "successful delivery commit cannot allocate even under allocator refusal"
-                );
-                let warnings: &[String] = encoder.truncation_warnings();
-                assert_eq!(warnings.len(), count);
-                assert!(warnings.iter().all(|w| w == &expected));
-            }
-            assert_eq!(destination.len(), 18);
-            drop(encoder);
-            assert_eq!(provider.used(), 0);
-        }
-    }
-
-    #[test]
-    fn message_backing_is_freed_before_its_admission_lease() {
-        for value in ["ascii".repeat(1024), "é好".repeat(1024)] {
-            let provider = provider();
-            let encoder = FixedWidthEncoder::new(
-                &[field("v", 1)],
-                &FixedWidthWriterConfig::default(),
-                provider.resources(),
-            )
-            .unwrap();
-            let config_charge = provider.used();
-            let mut writer =
-                PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
-            let record = record(&[("v", Value::String(value.into()))]);
-            writer.write_record(&record).unwrap();
-            let pointer = writer.encoder().truncation_warnings()[0].as_ptr() as *mut u8;
-            let capacity = writer.encoder().truncation_warnings()[0].capacity();
-            BACKING_WATCH.with(|watch| {
-                watch.set(Some(BackingWatch {
-                    provider: &provider,
-                    pointer,
-                    bytes: capacity,
-                    live_at_deallocation: None,
-                    live_at_allocation: None,
-                    layout: Some(std::alloc::Layout::array::<u8>(capacity).unwrap()),
-                    deallocations: 0,
-                }))
-            });
-            for _ in 0..8 {
+            let retained = provider.used();
+            for _ in 1..1025 {
                 writer.write_record(&record).unwrap();
             }
-            assert!(
-                BACKING_WATCH.with(|watch| watch.get().unwrap().live_at_deallocation.is_none()),
-                "growing metadata must preserve the message backing"
-            );
-            let warning_charge = provider.used() - config_charge;
-            drop(writer);
-            let watched = BACKING_WATCH.with(|watch| watch.take().unwrap());
-            assert_eq!(watched.deallocations, 1);
             assert_eq!(
-                watched.live_at_deallocation,
-                Some(warning_charge),
-                "all message grants remain until their Strings and metadata are freed"
+                provider.used(),
+                retained,
+                "the account is sized at construction; truncating more never grows it"
             );
-            assert!(warning_charge >= capacity);
+            let summary = writer.encoder().truncation_summary().unwrap();
+            assert_eq!(
+                summary.columns,
+                vec![ColumnTruncation {
+                    column: "value".into(),
+                    width: 2,
+                    cells: 1025,
+                    longest_bytes: text.len(),
+                    example_records: (1..=TRUNCATION_EXAMPLE_LIMIT as u64).collect(),
+                    more_records: true,
+                }]
+            );
+            assert_eq!(writer.encoder().record_count(), 1025);
+            drop(writer);
             assert_eq!(provider.used(), 0);
         }
     }
 
+    /// `truncation: warn` cannot fail a record: preparing one that truncates
+    /// needs no budget grant and no allocation, and committing it allocates
+    /// nothing even under allocator refusal.
     #[test]
-    fn warning_message_and_metadata_refusal_at_every_growth_preserves_history() {
+    fn warn_truncation_needs_no_budget_or_allocation() {
         let authority = Authority::new();
         let resources = WriterResources::new(authority.clone());
         let scope = resources.scope().unwrap();
-        let encoder = FixedWidthEncoder::new(
+        let mut encoder = FixedWidthEncoder::new(
             &[field("v", 1)],
             &FixedWidthWriterConfig::default(),
-            resources.clone(),
+            resources,
         )
         .unwrap();
-        let mut writer = PreparedWriter::new(Vec::new(), encoder, resources).unwrap();
-        let record = record(&[("v", Value::String("é好".repeat(64).into()))]);
-        for count in 0..9 {
-            let before = authority.memory.used();
-            let previous = writer.encoder().truncation_warnings().to_vec();
-            let pointers: Vec<_> = writer
-                .encoder()
-                .truncation_warnings()
-                .iter()
-                .map(|text| text.as_ptr())
-                .collect();
+        let before = authority.memory.used();
+        for (count, text) in ["é好".repeat(64), "A".repeat(32_768)].iter().enumerate() {
+            let record = record(&[("v", Value::String(text.clone().into()))]);
             authority.reset();
-            let (pending, allocations) = allocation_probe(false, || {
-                writer.encoder().prepare(
+            authority.refuse.store(0, Ordering::SeqCst);
+            let (pending, allocations) = allocation_probe(true, || {
+                encoder.prepare(
                     OutputOperation::Record(&record),
                     &mut std::io::sink(),
                     &scope,
                 )
             });
-            let grants = authority.attempts.load(Ordering::SeqCst);
-            drop(pending.unwrap());
+            let pending = pending.expect("a warn truncation cannot be refused");
+            assert_eq!(allocations, 0, "preparing a truncation allocates nothing");
+            let (_, allocations) = allocation_probe(true, || encoder.commit(pending));
+            assert_eq!(allocations, 0, "committing a truncation allocates nothing");
             assert_eq!(authority.memory.used(), before);
-            assert!(grants > 0 && allocations > 0);
-            for fail_allocator in [false, true] {
-                for stop in 0..if fail_allocator { allocations } else { grants } {
-                    authority.reset();
-                    let (result, _) = allocation_probe(false, || {
-                        if fail_allocator {
-                            ALLOCATIONS_LEFT.with(|remaining| remaining.set(Some(stop)));
-                        } else {
-                            authority.refuse.store(stop, Ordering::SeqCst);
-                        }
-                        writer.encoder().prepare(
-                            OutputOperation::Record(&record),
-                            &mut std::io::sink(),
-                            &scope,
-                        )
-                    });
-                    assert!(
-                        matches!(result, Err(FormatError::Resource(error)) if error.kind == if fail_allocator { ResourceErrorKind::Allocation } else { ResourceErrorKind::Budget }),
-                        "growth {count}, failure {stop}"
-                    );
-                    assert_eq!(authority.memory.used(), before);
-                    assert_eq!(writer.encoder().truncation_warnings(), previous);
-                    assert!(
-                        writer
-                            .encoder()
-                            .truncation_warnings()
-                            .iter()
-                            .zip(&pointers)
-                            .all(|(text, pointer)| text.as_ptr() == *pointer)
-                    );
-                    assert_eq!(writer.encoder().record_count(), count);
-                    assert_eq!(writer.destination(), &b" \n".repeat(count as usize));
-                }
-            }
-            authority.reset();
-            writer.write_record(&record).unwrap();
+            let summary = encoder.truncation_summary().unwrap();
+            assert_eq!(summary.columns[0].cells, count as u64 + 1);
+            assert_eq!(
+                summary.columns[0].example_records,
+                (1..=count as u64 + 1).collect::<Vec<_>>()
+            );
         }
-        drop(writer);
+        authority.reset();
+        drop(encoder);
         assert_eq!(authority.memory.used(), 0);
     }
 
+    /// Only delivered records count. A record whose later field fails after an
+    /// earlier one truncated, or whose prepared bytes are never delivered,
+    /// leaves no trace, and the next delivered record is numbered after the
+    /// last delivered one.
     #[test]
-    fn cancelled_sealed_or_final_delivery_preserves_warning_owners_and_poison() {
+    fn undelivered_or_failed_records_leave_the_tally_unchanged() {
+        let provider = provider();
+        let resources = provider.resources();
+        let scope = resources.scope().unwrap();
+        let fields = [
+            field("name", 2),
+            Column {
+                width: Some(2),
+                ..Column::bare("amount", Type::Int)
+            },
+        ];
+        let mut encoder =
+            FixedWidthEncoder::new(&fields, &FixedWidthWriterConfig::default(), resources).unwrap();
+        let fits = record(&[
+            ("name", Value::String("long".into())),
+            ("amount", Value::Integer(7)),
+        ]);
+        let overflows = record(&[
+            ("name", Value::String("longer".into())),
+            ("amount", Value::Integer(12_345)),
+        ]);
+
+        let pending = encoder
+            .prepare(OutputOperation::Record(&fits), &mut std::io::sink(), &scope)
+            .unwrap();
+        encoder.commit(pending);
+        let committed = encoder.truncation_summary();
+
+        // `name` truncates, then `amount` rejects the record.
+        assert!(
+            encoder
+                .prepare(
+                    OutputOperation::Record(&overflows),
+                    &mut std::io::sink(),
+                    &scope
+                )
+                .is_err()
+        );
+        assert_eq!(encoder.truncation_summary(), committed);
+        // Prepared but never delivered.
+        let _undelivered = encoder
+            .prepare(OutputOperation::Record(&fits), &mut std::io::sink(), &scope)
+            .unwrap();
+        assert_eq!(encoder.truncation_summary(), committed);
+
+        let pending = encoder
+            .prepare(OutputOperation::Record(&fits), &mut std::io::sink(), &scope)
+            .unwrap();
+        encoder.commit(pending);
+        let name = &encoder.truncation_summary().unwrap().columns[0];
+        assert_eq!(
+            name.cells, 2,
+            "abandoned attempts left no staged hits behind"
+        );
+        assert_eq!(
+            name.longest_bytes, 4,
+            "the failed record's 6-byte value never counted"
+        );
+        assert_eq!(name.example_records, vec![1, 2]);
+    }
+
+    /// Truncations in repeating-group children are counted per child, named
+    /// `group.child`, and numbered by delivered record across documents.
+    #[test]
+    fn group_children_and_documents_share_one_record_numbering() {
+        let provider = provider();
+        let group = Column {
+            start: Some(0),
+            multiple: Some(true),
+            fields: Some(vec![
+                Column {
+                    start: Some(0),
+                    width: Some(2),
+                    ..Column::bare("code", Type::String)
+                },
+                Column {
+                    start: Some(2),
+                    width: Some(1),
+                    truncation: Some(TruncationPolicy::Silent),
+                    ..Column::bare("flag", Type::String)
+                },
+            ]),
+            occurs: Some(FixedWidthOccurs {
+                min: 0,
+                max: 2,
+                fill: FixedWidthFill::Pad,
+                on_overflow: FixedWidthOverflow::Error,
+                keep: None,
+            }),
+            ..Column::bare("items", Type::Map)
+        };
+        let item = |code: &str| {
+            Value::Map(OwnedMap::from_map(
+                [
+                    (OwnedKey::from("code"), Value::String(code.into())),
+                    (OwnedKey::from("flag"), Value::String("yes".into())),
+                ]
+                .into_iter()
+                .collect(),
+            ))
+        };
+        let encoder =
+            FixedWidthEncoder::new(&[group], &config(LineSeparator::Lf), provider.resources())
+                .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        let rows = |codes: &[&str]| {
+            record(&[(
+                "items",
+                Value::Array(OwnedValues::from_vec(
+                    codes.iter().map(|c| item(c)).collect(),
+                )),
+            )])
+        };
+        let document = doc(&[]);
+        writer.begin_document(&document).unwrap();
+        writer.write_record(&rows(&["ok", "long"])).unwrap();
+        writer.end_document(&document).unwrap();
+        writer.begin_document(&document).unwrap();
+        writer.write_record(&rows(&["ok"])).unwrap();
+        writer.write_record(&rows(&["longer", "longest"])).unwrap();
+        writer.end_document(&document).unwrap();
+
+        assert_eq!(
+            writer.encoder().truncation_summary().unwrap().columns,
+            vec![ColumnTruncation {
+                column: "items.code".into(),
+                width: 2,
+                cells: 3,
+                longest_bytes: 7,
+                example_records: vec![1, 3],
+                more_records: false,
+            }],
+            "`silent` records nothing; numbering continues across documents"
+        );
+    }
+
+    #[test]
+    fn cancelled_sealed_or_final_delivery_preserves_tally_and_poison() {
         use super::cancellation_harness::{Authority as CancelAuthority, CancelOnWrite};
         use std::sync::atomic::AtomicBool;
         for after_seal in [false, true] {
@@ -839,7 +839,7 @@ mod fixed_width_prepared {
             let mut bytes = Vec::new();
             stage.finish().unwrap().deliver(&mut bytes).unwrap();
             encoder.commit(pending);
-            let pointer = encoder.truncation_warnings()[0].as_ptr();
+            let committed = encoder.truncation_summary();
             let retained = authority.memory.used();
             let mut writer = PreparedWriter::new(
                 CancelOnWrite {
@@ -855,8 +855,7 @@ mod fixed_width_prepared {
                 matches!(writer.write_record(&record), Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Cancelled)
             );
             assert_eq!(writer.encoder().record_count(), 1);
-            assert_eq!(writer.encoder().truncation_warnings().len(), 1);
-            assert_eq!(writer.encoder().truncation_warnings()[0].as_ptr(), pointer);
+            assert_eq!(writer.encoder().truncation_summary(), committed);
             assert_eq!(
                 writer.destination().bytes,
                 if after_seal {
@@ -1055,9 +1054,8 @@ mod fixed_width_prepared {
         ]);
         writer.write_record(&good).unwrap();
         let before = provider.used();
-        let warning = writer.encoder().truncation_warnings()[0]
-            .as_str()
-            .to_owned();
+        let warning = writer.encoder().truncation_summary();
+        assert_eq!(warning.as_ref().map(|s| s.total_cells()), Some(1));
         let bad = record(&[
             ("a", Value::String("another warning".into())),
             ("b", Value::Map(OwnedMap::from_map(Default::default()))),
@@ -1081,8 +1079,7 @@ mod fixed_width_prepared {
         assert!(writer.end_document(&bad_doc).is_err());
         assert_eq!(writer.encoder().record_count(), 1);
         assert!(writer.encoder().document_open());
-        assert_eq!(writer.encoder().truncation_warnings().len(), 1);
-        assert_eq!(writer.encoder().truncation_warnings()[0].as_str(), warning);
+        assert_eq!(writer.encoder().truncation_summary(), warning);
         assert_eq!(writer.destination(), b"lo1 \n");
         assert_eq!(provider.used(), before);
         writer.end_document(&empty).unwrap();
@@ -1430,7 +1427,7 @@ mod fixed_width_prepared {
                 .unwrap();
             let checks = authority.cancel_checks.load(Ordering::SeqCst);
             let allocations = authority.attempts.load(Ordering::SeqCst);
-            drop(pending);
+            let _ = pending;
             assert_eq!(authority.memory.used(), baseline);
             for cancel in [false, true] {
                 for stop in 0..if cancel { checks } else { allocations } {
@@ -1455,7 +1452,13 @@ mod fixed_width_prepared {
                     assert_eq!(authority.memory.used(), baseline);
                     assert_eq!(writer.encoder().record_count(), 1);
                     assert!(writer.encoder().document_open());
-                    assert_eq!(writer.encoder().truncation_warnings().len(), 1);
+                    assert_eq!(
+                        writer
+                            .encoder()
+                            .truncation_summary()
+                            .map(|s| s.total_cells()),
+                        Some(1)
+                    );
                     assert_eq!(writer.destination(), b"wa\n");
                 }
             }
@@ -1538,7 +1541,13 @@ mod fixed_width_prepared {
             );
             assert_eq!(writer.encoder().record_count(), 1);
             assert!(writer.encoder().document_open());
-            assert_eq!(writer.encoder().truncation_warnings().len(), 1);
+            assert_eq!(
+                writer
+                    .encoder()
+                    .truncation_summary()
+                    .map(|s| s.total_cells()),
+                Some(1)
+            );
             assert_eq!(provider.used(), retained);
             let attempts = calls.load(Ordering::SeqCst);
             assert!(writer.write_record(&r).is_err());
@@ -6202,7 +6211,11 @@ mod nested_fault_boundaries {
                 .unwrap()
             },
             |encoder| {
-                let mut state = encoder.truncation_warnings().to_vec();
+                let mut state: Vec<String> = encoder
+                    .truncation_summary()
+                    .map(|summary| format!("{summary:?}"))
+                    .into_iter()
+                    .collect();
                 state.push(format!(
                     "{}:{}",
                     encoder.record_count(),

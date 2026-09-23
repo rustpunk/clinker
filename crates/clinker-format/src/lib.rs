@@ -22,6 +22,7 @@ pub mod source;
 pub mod splitting;
 pub mod swift;
 pub mod traits;
+pub mod truncation;
 pub mod x12;
 pub mod xml;
 
@@ -51,6 +52,7 @@ pub use schema::{
 };
 pub use source::{ByteTally, ReopenableSource, RetainedFileGuard};
 pub use traits::{FormatReader, FormatWriter, FormatWriterHandle, SourceLifecycleEvent};
+pub use truncation::{ColumnTruncation, TRUNCATION_EXAMPLE_LIMIT, TruncationSummary};
 
 // Default positional-element/field ceilings each reader enforces on a
 // body segment, re-exported under format-disambiguated names so the
