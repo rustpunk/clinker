@@ -21,7 +21,7 @@ Read what the task needs, when it needs it:
 | work on performance or the pure-Rust build | [60_PERFORMANCE_NOTES](docs/ai/60_PERFORMANCE_NOTES.md), [65_PURE_RUST_BUILD_FINDINGS](docs/ai/65_PURE_RUST_BUILD_FINDINGS.md) |
 | meet an unfamiliar term | [70_GLOSSARY](docs/ai/70_GLOSSARY.md) |
 | hit something unclear | search [80_OPEN_QUESTIONS](docs/ai/80_OPEN_QUESTIONS.md), then record it there |
-| work inside a crate | that crate's `AGENTS.md` |
+| work inside a crate | that crate's `AGENTS.md`, if present |
 | create, triage, split, or close issues | [GITHUB_ISSUE_AGENT_WORKFLOW](docs/ai/GITHUB_ISSUE_AGENT_WORKFLOW.md) |
 
 ## Workspace Layout
@@ -61,7 +61,7 @@ When a planning or execution framework drives the work, this file, the PR delive
 
 - A maintainer-approved plan authorizes commits on a non-`main` feature branch for the Agent Tasks it names. Pushing, opening PRs, and merging follow the delivery policy and the hooks, never a framework default.
 - Planning state is local and stays out of git (see Repository Hygiene).
-- Choices about dependencies, rip-versus-wire, public surfaces, or the memory model always stop for the maintainer, including in a framework's automatic modes.
+- A choice that meets the [Decision Gate Threshold](docs/ai/GITHUB_ISSUE_AGENT_WORKFLOW.md#decision-gate-threshold) — including every never-agent-decidable case — stops for the maintainer, including in a framework's automatic modes.
 - Planning coordinates may appear in commit subjects on a branch. PR titles and descriptions become the squashed commit on `main`, so they use domain wording.
 
 ## Correctness Posture
@@ -105,7 +105,6 @@ A gate that was not run, or whose result was read from the wrong place, is a gat
 
 ## Repository Hygiene
 
-- The git identity for this repository is `rustpunk`, which is not the machine default. Check it before the first commit of a session.
 - Implementation stages are planning coordinates, not durable vocabulary. Never
   name functions, types, tests, commands, diagnostics, comments, or committed
   documentation after a phase number. Use the domain behavior or a stable
