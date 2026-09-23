@@ -4,20 +4,25 @@
 
 Clinker is a bounded-memory, single-process batch DAG executor for finite ETL-style jobs. Pipelines are YAML, expressions are CXL, planning lives separately from runtime execution, and the main CLI is the `clinker` crate.
 
-Do not invent architecture; update docs when changing behavior.
+Do not invent architecture; update docs when changing behavior. Verify claims against source, manifests, tests, and examples; treat older docs as secondary context when they conflict with current code.
 
-## Read First
+## Where To Look
 
-Start here, then verify claims against source, manifests, tests, and examples:
+Read what the task needs, when it needs it:
 
-- [docs/ai/00_READ_THIS_FIRST.md](docs/ai/00_READ_THIS_FIRST.md)
-- [docs/ai/10_ARCHITECTURE.md](docs/ai/10_ARCHITECTURE.md)
-- [docs/ai/20_CRATE_MAP.md](docs/ai/20_CRATE_MAP.md)
-- [docs/ai/30_DESIGN_RULES.md](docs/ai/30_DESIGN_RULES.md)
-- [docs/ai/50_TESTING_AND_COMMANDS.md](docs/ai/50_TESTING_AND_COMMANDS.md)
-- [docs/ai/80_OPEN_QUESTIONS.md](docs/ai/80_OPEN_QUESTIONS.md)
-
-Treat older docs as secondary context when they conflict with current code.
+| When you… | Read |
+|---|---|
+| are new to the repository | [docs/ai/00_READ_THIS_FIRST.md](docs/ai/00_READ_THIS_FIRST.md) |
+| need the architecture or where code lives | [10_ARCHITECTURE](docs/ai/10_ARCHITECTURE.md), [20_CRATE_MAP](docs/ai/20_CRATE_MAP.md) |
+| design or review a change | [30_DESIGN_RULES](docs/ai/30_DESIGN_RULES.md), [40_COMMON_PATTERNS](docs/ai/40_COMMON_PATTERNS.md), [45_COMMON_AGENT_MISTAKES](docs/ai/45_COMMON_AGENT_MISTAKES.md) |
+| add a node, operator, format, or extension point | [35_EXTENSION_SEAMS](docs/ai/35_EXTENSION_SEAMS.md), [32_NODE_OBLIGATIONS](docs/ai/32_NODE_OBLIGATIONS.md) |
+| touch a production-facing guarantee | [15_PRODUCTION_CONTRACTS](docs/ai/15_PRODUCTION_CONTRACTS.md) |
+| pick a gate or command | [50_TESTING_AND_COMMANDS](docs/ai/50_TESTING_AND_COMMANDS.md) |
+| work on performance or the pure-Rust build | [60_PERFORMANCE_NOTES](docs/ai/60_PERFORMANCE_NOTES.md), [65_PURE_RUST_BUILD_FINDINGS](docs/ai/65_PURE_RUST_BUILD_FINDINGS.md) |
+| meet an unfamiliar term | [70_GLOSSARY](docs/ai/70_GLOSSARY.md) |
+| hit something unclear | search [80_OPEN_QUESTIONS](docs/ai/80_OPEN_QUESTIONS.md), then record it there |
+| work inside a crate | that crate's `AGENTS.md` |
+| create, triage, split, or close issues | [GITHUB_ISSUE_AGENT_WORKFLOW](docs/ai/GITHUB_ISSUE_AGENT_WORKFLOW.md) |
 
 ## Workspace Layout
 
@@ -42,17 +47,6 @@ Treat older docs as secondary context when they conflict with current code.
 - Preserve bounded-memory behavior: memory arbitration, backpressure, spill, and node-buffer semantics are load-bearing.
 - Reuse typed boundaries: `CompiledPlan`, `ValidatedPath`, `Spanned<T>`, `RecordSource`, `FormatReader`, `FormatWriter`.
 
-## Commands
-
-Before claiming success, run the smallest relevant gate from
-[docs/ai/50_TESTING_AND_COMMANDS.md](docs/ai/50_TESTING_AND_COMMANDS.md).
-Use targeted `cargo test -p <crate>` while iterating, then broaden validation
-when the change crosses crate boundaries.
-
-For docs-only AI onboarding edits, the current smallest gate is
-`git diff --check`. See the command guide for mdBook, rustdoc, cargo-deny,
-bench, socket, and file-descriptor caveats.
-
 ## Safety Rules
 
 - During documentation-only tasks, do not modify Rust source.
@@ -61,11 +55,22 @@ bench, socket, and file-descriptor caveats.
 - Never push to main directly; push only feature branches created for an explicitly requested task.
 - If a term, architecture rule, or behavior is unclear, record it in [docs/ai/80_OPEN_QUESTIONS.md](docs/ai/80_OPEN_QUESTIONS.md) instead of guessing.
 
+## Workflow Frameworks
+
+When a planning or execution framework drives the work, this file, the PR delivery policy, and the repository's hooks override the framework's defaults. A framework owns only its planning-state layout and task sequencing.
+
+- A maintainer-approved plan authorizes commits on a non-`main` feature branch for the Agent Tasks it names. Pushing, opening PRs, and merging follow the delivery policy and the hooks, never a framework default.
+- Planning state is local and stays out of git (see Repository Hygiene).
+- Choices about dependencies, rip-versus-wire, public surfaces, or the memory model always stop for the maintainer, including in a framework's automatic modes.
+- Planning coordinates may appear in commit subjects on a branch. PR titles and descriptions become the squashed commit on `main`, so they use domain wording.
+
 ## Correctness Posture
 
 The project is greenfield and has no deployed users, so the cost of getting a design right is a rewrite and the cost of getting it wrong is permanent. That asymmetry decides the calls below.
 
 - Prefer the breaking change. A compatibility shim preserves a shape nobody depends on at the price of carrying it forever.
+- Replacing a design removes the old path in the same change: no shim, no `Legacy*`/`Internal*` rename in place of a deletion, no old and new path coexisting at the change's closing commit.
+- Removing a capability, surface, field, option, or behavior without an equivalent replacement is capability deletion, not refactoring: it needs the replacement in the same change or the maintainer's explicit confirmation. No Rust caller is not proof a surface is dead — it may be reachable from YAML, CXL, the CLI, or output, or be intended but not yet wired.
 - Complexity and effort are not reasons to defer a correct refactor. "Large" is an estimate, not an objection. This is a rule about not flinching from the refactor the task requires; it is not a licence to widen the task. A correct refactor that was not asked for is still scope the maintainer did not agree to.
 - When a fix introduces a regression, revert it and reconsider the approach rather than patching forward. Two consecutive fixes to defects your own previous fix introduced means the approach is wrong, not that a third fix is missing. Stop, restore the last known-good state, and say what the failed approach assumed — a fix chain is the most expensive way to discover a bad premise.
 - When the choice is between a correct hard option and an expedient easy one, take the correct one. This holds at implementation time as strongly as at planning time: a correctness deferral invented while coding is the same defect as one written into the plan, and it arrives without the review a plan gets.
@@ -85,54 +90,13 @@ Recurring ground truths. Each has been got wrong more than once; treat a design 
 
 ## Observability And Memory Obligations
 
-OpenLineage lineage, OTLP telemetry, and the memory budget are part of a node's contract, not instrumentation fitted afterwards. Every new node, new feature, and refactor answers all three trigger tests below. "Where appropriate" is decided by the trigger, and an exemption is claimed out loud in the PR rather than left silent — an unstated exemption is indistinguishable from an oversight.
-
-Backfill is in scope for the node types whose contract the change actually alters — where the change adds, removes, or redefines a node's lineage edges, its execution work, or what it retains. Bring those up to the obligations in the same PR; leaving them at the old standard is what keeps the gaps permanent.
-
-Merely editing a file that a node type happens to live in does not trigger backfill. When a change reveals an unmet obligation on a node it does not otherwise alter, file a follow-up issue naming the node and the unmet obligation rather than widening the PR. This bound is deliberate: an unbounded "touched" trigger makes every fix reachable from every other node, and the resulting edits introduce defects whose fixes trigger further backfill.
-
-Deployment configuration for both delivery paths is the workspace `ObservabilityConfig` in `crates/clinker-plan/src/config/observability.rs`, whose `otlp` and `lineage` tables are independently optional, and delivery is wired at the CLI edge in `crates/clinker/src/observability.rs`. Neither path may become a dependency of the engine core.
-
-Three mechanisms make an omission invisible today, which is why these are written as obligations rather than reminders:
-
-- The `clinker-lineage` builder dispatches over plan nodes through catch-all arms, so a new `PlanNode` variant compiles clean and silently produces no lineage.
-- `MetricKey` and `SpanName` in `clinker_exec::telemetry` name only `Transform` work, so every other node type is telemetry-blind by construction.
-- Registering with `MemoryArbitrator` is a call a consumer makes, not an obligation the compiler enforces, so an operator that accumulates without registering builds and passes its tests.
-
-### Lineage
-
-Trigger: the change affects how a column's value is determined, or whether, where, and in what order a row travels.
-
-- Reading a field to produce a value earns a DIRECT edge; reading it to decide inclusion, routing, grouping, or ordering earns INDIRECT influence.
-- A new or renamed dataset boundary — anything that reads or writes external data — earns its `dataset_identity` mapping.
-- Adding a `PlanNode` variant earns an explicit arm in the lineage builder, including when the correct arm is a documented no-op. A variant left to a catch-all reads exactly like one that was forgotten.
-- `clinker-lineage` stays plan-time and read-only, keeps no dependency on `clinker-exec`, holds no clock, and takes no in-crate HTTP transport. Meet run-lifecycle lineage through `emit::start_event` and `emit::terminal_event`, driven from the CLI edge in `crates/clinker/src/lifecycle.rs`.
-- Exempt: a change touching no field values and no row selection, grouping, or ordering — a performance refactor with identical output, an internal error type, diagnostic wording.
-
-### Telemetry
-
-Trigger: the change introduces execution work with a lifecycle, or an outcome worth counting.
-
-- Work that starts, finishes, and can fail earns a `SpanName` variant and an `emit_span`; records, errors, drops, spills, and retries earn a `MetricKey` variant and a `record_metric`. Extending those enums is the ordinary way to meet this obligation, not an escalation.
-- Keep both enums closed and fixed-cardinality. A metric keyed by a data value — a group key, a filename, an author-supplied node output — is what makes a startup-sized arena unsizable.
-- Emission is admission-controlled and may be dropped. No behavior may depend on a signal being admitted, and no producer may block, grow the arena, or spill to make room.
-- Emit a span once, after its work completes, closed at both ends. A collector has no representation for half a span, and independent admission can deliver one half without the other; the live "has begun" signal is the corresponding metric.
-- Event fields are deny-by-default and pass field policy before serialization. Carry record values as `SignalValue::Record` so policy sees them typed — formatting a record into a message string moves it past the policy that governs it.
-- Exempt: plan-time code that performs no execution work, and a count already derivable from existing metrics.
-
-### Memory budget
-
-Trigger: the change retains anything whose size grows with input — buffered records, hash tables, group state, sort runs, join build sides, spill indexes, retained tails.
-
-- That state implements `MemoryConsumer`, registers through `register_consumer` on entry and unregisters on every exit path including error and cancellation, reports true bytes through its `ConsumerHandle`, and honors both `take_spill_request` and `wait_while_paused`.
-- Exempt: allocation bounded by a constant independent of input size, or state an ancestor consumer already accounts for — name that consumer.
-- Small inputs in practice, a passing test, and short-lived state are not bounds. The question is whether a bound exists that holds however much data arrives.
-- Growing a buffer never answers a dropped telemetry signal. The observability arena is fixed and sheds load deliberately, so enlarging it to retain signals converts a reporting gap into a memory-bound violation.
+OpenLineage lineage, OTLP telemetry, and the memory budget are part of a node's contract, not instrumentation fitted afterwards. Every new node, new feature, and refactor answers three trigger tests — lineage (a column's value, or whether, where, and in what order a row travels), telemetry (execution work with a lifecycle, or an outcome worth counting), and memory budget (state that grows with input) — and meets each obligation or states its exemption in the PR. Backfill covers only the node types whose contract the change alters; an unmet obligation on another node becomes a follow-up issue. The full triggers, obligations, and exemptions are in [docs/ai/32_NODE_OBLIGATIONS.md](docs/ai/32_NODE_OBLIGATIONS.md): read it before changing plan nodes, operators, dataset boundaries, or retained state.
 
 ## Verification
 
 A gate that was not run, or whose result was read from the wrong place, is a gate that did not happen.
 
+- Before claiming success, run the smallest relevant gate from [docs/ai/50_TESTING_AND_COMMANDS.md](docs/ai/50_TESTING_AND_COMMANDS.md): targeted `cargo test -p <crate>` while iterating, broader validation when the change crosses crate boundaries, `git diff --check` for docs-only AI onboarding edits. The command guide covers the mdBook, rustdoc, cargo-deny, bench, socket, and file-descriptor caveats.
 - `--explain` proves a pipeline compiles. It never proves the output is right. Execute examples against real data and compare bytes before claiming a behavior works.
 - Run the full check-job gauntlet before pushing — `cargo fmt --all --check` included. A targeted `-p` clippy pass is not the gate; formatting and cross-crate lints fail independently of it.
 - Before declaring a sprint done, run `cargo test --benches -p clinker-benchmarks`, not just `cargo check --benches`. The bench targets run end-to-end pipeline pre-flights that a compile check cannot fail on.
@@ -148,7 +112,7 @@ A gate that was not run, or whose result was read from the wrong place, is a gat
   decision or requirement identifier instead.
 - Stage by explicit path. `git add -A` sweeps scratch and probe files that tooling leaves in the tree; review `git status` and `git show --stat` before pushing.
 - Never use `git add -f`. Ignored paths — `docs/internal/`, `notes/`, local settings — are ignored deliberately.
-- Local progress and tracking files stay out of git.
+- Local progress, planning, and tracking files stay out of git.
 - Delete a local branch once its pull request merges. Only squash merges are enabled, so a landed branch shares no commit with `main` and `git branch --merged` never lists it — run `scripts/prune-landed-branches.sh` (dry run; `--apply` to delete) instead of judging by ancestry.
 - Do not name specific prior-art tools or vendors in issues, PRs, or comments. Make the argument on its merits; the comparison belongs in internal notes.
 
@@ -197,16 +161,12 @@ Approval is gated on the capability, not on the manifest diff. It covers develop
 
 ## GitHub Issue Workflow
 
-For creating, triaging, splitting, or closing GitHub issues, follow [docs/ai/GITHUB_ISSUE_AGENT_WORKFLOW.md](docs/ai/GITHUB_ISSUE_AGENT_WORKFLOW.md).
-
-Use that workflow only when the task involves GitHub issues, milestones, labels, sub-issues, or autonomous issue closure.
-
-Agent workflow policy:
+For creating, triaging, splitting, or closing GitHub issues, follow [docs/ai/GITHUB_ISSUE_AGENT_WORKFLOW.md](docs/ai/GITHUB_ISSUE_AGENT_WORKFLOW.md), including its close protocol. Use that workflow only when the task involves GitHub issues, milestones, labels, sub-issues, or autonomous issue closure.
 
 - Milestones are planning containers, not implementation issues.
 - Agents may implement only scoped Agent Task issues marked `agent-ready`.
 - Route vague, stale, broad, or under-specified work through a Readiness Review.
-- Route unresolved product, architecture, dependency, public API, schema, auth, security, memory, or compatibility choices through a Decision Gate.
+- Route unresolved product, architecture, dependency, public API, schema, auth, security, memory, or compatibility choices through a Decision Gate when they meet the [Decision Gate Threshold](docs/ai/GITHUB_ISSUE_AGENT_WORKFLOW.md#decision-gate-threshold).
 - A PR closes a coherent group of Agent Tasks — grouped by shared subsystem, dependency chain, or review context; a single-task PR is the degenerate case when no coherent grouping exists. Never split one Agent Task across multiple PRs.
 - Agents must not merge PRs by default; leave PRs for maintainer review and merge unless a maintainer explicitly instructs otherwise. A maintainer-approved delivery plan that specifies merge-on-green for a set of PRs counts as explicit instruction for those PRs.
 
@@ -216,6 +176,6 @@ Agent workflow policy:
 - Relevant tests/checks were run, or skipped with a clear reason.
 - `git diff --check` passes.
 - Behavior changes have matching docs and tests.
-- Each obligation in [Observability And Memory Obligations](#observability-and-memory-obligations) is met for every node type the change touches, or its exemption is stated in the PR.
+- Each obligation in [docs/ai/32_NODE_OBLIGATIONS.md](docs/ai/32_NODE_OBLIGATIONS.md) is met for every node type the change touches, or its exemption is stated in the PR.
 - Open questions are captured in `docs/ai/80_OPEN_QUESTIONS.md`.
 - Final response summarizes changed files, validation, and any remaining risks.

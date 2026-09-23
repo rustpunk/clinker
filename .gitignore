@@ -55,3 +55,7 @@ crates/clinker/out.csv
 # destination, so running the CLI with an output inside the repository leaves
 # one here. It is runtime state, never source.
 .clinker-attempts/
+
+# Local planning state written by agent workflow frameworks; tracking files
+# stay out of git (AGENTS.md, Repository Hygiene).
+.planning/

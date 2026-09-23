@@ -58,21 +58,13 @@ Recommended reading order by task:
    [docs/ai/90_CRATE_AGENT_PLAN.md](90_CRATE_AGENT_PLAN.md) and the nearest
    crate-level `AGENTS.md` if present.
 
-## Minimum reading checklist for AI agents
+## Reading for AI agents
 
-Before editing code, an AI agent must read:
-
-- [AGENTS.md](../../AGENTS.md)
-- [docs/ai/00_READ_THIS_FIRST.md](00_READ_THIS_FIRST.md)
-- [docs/ai/20_CRATE_MAP.md](20_CRATE_MAP.md)
-- [docs/ai/30_DESIGN_RULES.md](30_DESIGN_RULES.md)
-- [docs/ai/50_TESTING_AND_COMMANDS.md](50_TESTING_AND_COMMANDS.md)
-- The nearest crate-level `AGENTS.md`, if present.
-
-Also read architecture, common-pattern, performance, or glossary docs when the
-task touches those areas. For docs-only tasks, still check
-`git status --short` before editing and avoid changing source files unless the
-user explicitly asks.
+Read by task, not up front: the "Where To Look" table in
+[AGENTS.md](../../AGENTS.md) routes each kind of task to the docs it needs.
+Before editing code in a crate, read that crate's `AGENTS.md`. For docs-only
+tasks, still check `git status --short` before editing and avoid changing
+source files unless the user explicitly asks.
 
 ## Repository memory model
 
