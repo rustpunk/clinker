@@ -665,6 +665,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                 ctx.output_staging.clone(),
                 ctx.sink_byte_counter.clone(),
                 ctx.writer_resources.clone(),
+                &ctx.truncation_ledger,
             ) {
                 Ok(w) => self.writer = Some(w),
                 Err(e) => {

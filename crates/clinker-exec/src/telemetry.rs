@@ -170,11 +170,13 @@ pub enum MetricKey {
     WriterCleanupCompleted,
     WriterCleanupFailed,
     WriterCleanupInterrupted,
+    /// Values a Sink cut to fit a `truncation: warn` column.
+    SinkTruncations,
 }
 
 impl MetricKey {
     /// Every fixed metric key in stable counter-index order.
-    pub const ALL: [Self; 54] = [
+    pub const ALL: [Self; 55] = [
         Self::TransformStarted,
         Self::TransformCompleted,
         Self::TransformRecords,
@@ -229,6 +231,7 @@ impl MetricKey {
         Self::WriterCleanupCompleted,
         Self::WriterCleanupFailed,
         Self::WriterCleanupInterrupted,
+        Self::SinkTruncations,
     ];
     /// Number of entries in [`Self::ALL`].
     pub const COUNT: usize = Self::ALL.len();
@@ -291,6 +294,7 @@ impl MetricKey {
             Self::WriterCleanupCompleted => 51,
             Self::WriterCleanupFailed => 52,
             Self::WriterCleanupInterrupted => 53,
+            Self::SinkTruncations => 54,
         }
     }
 }
@@ -396,6 +400,7 @@ pub(crate) struct SinkSignal {
     records: u64,
     errors: u64,
     bytes: u64,
+    truncations: u64,
     closed: bool,
 }
 
@@ -413,6 +418,7 @@ impl SinkSignal {
             records: 0,
             errors: 0,
             bytes: 0,
+            truncations: 0,
             closed: false,
         }
     }
@@ -431,6 +437,11 @@ impl SinkSignal {
     /// Record bytes accepted by the physical writer boundary.
     pub(crate) fn record_bytes(&mut self, bytes: u64) {
         self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    /// Record values this work unit cut to fit a `truncation: warn` column.
+    pub(crate) fn record_truncations(&mut self, truncations: u64) {
+        self.truncations = self.truncations.saturating_add(truncations);
     }
 
     /// Close a work unit that reached its runtime completion boundary.
@@ -474,6 +485,10 @@ impl SinkSignal {
         if self.bytes > 0 {
             self.producer
                 .record_metric(MetricKey::SinkBytes, self.bytes);
+        }
+        if self.truncations > 0 {
+            self.producer
+                .record_metric(MetricKey::SinkTruncations, self.truncations);
         }
     }
 
@@ -2062,6 +2077,7 @@ mod tests {
             MetricKey::WriterCleanupCompleted,
             MetricKey::WriterCleanupFailed,
             MetricKey::WriterCleanupInterrupted,
+            MetricKey::SinkTruncations,
         ];
 
         assert_eq!(MetricKey::COUNT, expected.len());
@@ -2092,6 +2108,7 @@ mod tests {
             let mut signal = SinkSignal::new(producer, "sink".to_string());
             signal.record_records(2);
             signal.record_bytes(17);
+            signal.record_truncations(3);
             match terminal {
                 MetricKey::SinkCompleted => signal.complete(),
                 MetricKey::SinkFailed => signal.fail(),
@@ -2112,6 +2129,11 @@ mod tests {
             );
             assert_eq!(batch.metric(MetricKey::SinkRecords), 2);
             assert_eq!(batch.metric(MetricKey::SinkBytes), 17);
+            assert_eq!(
+                batch.metric(MetricKey::SinkTruncations),
+                3,
+                "truncations are reported on every terminal outcome"
+            );
             assert_eq!(batch.traces().len(), 1);
             assert_eq!(batch.traces()[0].name, SpanName::Sink);
             assert_eq!(batch.traces()[0].status, expected_status);

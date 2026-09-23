@@ -41,6 +41,7 @@ pub(crate) mod structured_output_guard;
 pub(crate) mod time_window;
 pub(crate) mod transform;
 pub(crate) mod transform_dispatch;
+pub(crate) mod truncation_report;
 mod util;
 pub(crate) mod watermark;
 pub(crate) mod window_runtime;
@@ -1699,6 +1700,9 @@ impl PipelineExecutor {
             &sink_configs,
             &writers,
         );
+        // One run-scoped truncation account, shared by the streaming writer
+        // threads spawned below and every writer the dispatch arms build.
+        let truncation_ledger = truncation_report::TruncationLedger::default();
         let mut streaming_output_senders: HashMap<
             petgraph::graph::NodeIndex,
             crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
@@ -1750,6 +1754,7 @@ impl PipelineExecutor {
             let sink_resources = streaming::StreamingSinkResources {
                 writer_resources: writer_resources.clone(),
                 allocation_resources: allocation_resources.clone(),
+                truncation_ledger: truncation_ledger.clone(),
             };
             let handle = std::thread::Builder::new()
                 .name(format!("clinker-output-{output_name}"))
@@ -1822,6 +1827,7 @@ impl PipelineExecutor {
             combine_input_snapshots: HashMap::new(),
             output_errors: Vec::new(),
             mapping_probes: BTreeMap::new(),
+            truncation_ledger: truncation_ledger.clone(),
             ok_source_rows: HashSet::new(),
             ok_deliveries: HashSet::new(),
             records_emitted: 0,
@@ -2162,7 +2168,10 @@ impl PipelineExecutor {
         // the projection from several arms and several chunks, and only the
         // union distinguishes a column no record carried from one some record
         // did.
-        let advisories = collect_mapping_advisories(ctx.sink_configs, &ctx.mapping_probes);
+        let mut advisories = collect_mapping_advisories(ctx.sink_configs, &ctx.mapping_probes);
+        // Every Sink writer has dropped by now (the streaming threads were
+        // joined above), so each one's truncations are settled in the ledger.
+        advisories.extend(ctx.truncation_ledger.advisories(ctx.sink_configs));
         Ok(DispatchOutcome {
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),

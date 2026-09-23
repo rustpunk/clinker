@@ -385,6 +385,7 @@ pub(super) fn drain_streaming_channel<C: StreamingConsumer>(
 /// any sibling `output_errors`.
 struct SinkStreamConsumer {
     writer_resources: clinker_format::preparation::WriterResources,
+    truncation_ledger: super::truncation_report::TruncationLedger,
     spec: StreamingSinkSpec,
     out: StreamingOutputTaskOutput,
     /// Set only when channel disconnect reached the writer-finalization hook.
@@ -408,6 +409,7 @@ impl SinkStreamConsumer {
         spec: StreamingSinkSpec,
         sink_byte_counter: Option<clinker_format::SharedByteCounter>,
         writer_resources: clinker_format::preparation::WriterResources,
+        truncation_ledger: super::truncation_report::TruncationLedger,
     ) -> Self {
         debug_assert!(spec.writer_boundary.is_incremental_streaming());
         let structured_guard = StructuredOutputDocumentGuard::new(&spec.out_cfg.format);
@@ -416,6 +418,7 @@ impl SinkStreamConsumer {
         let out_cfg = spec.out_cfg.clone();
         Self {
             writer_resources,
+            truncation_ledger,
             spec,
             out: StreamingOutputTaskOutput {
                 records_written: 0,
@@ -512,6 +515,7 @@ impl StreamingConsumer for SinkStreamConsumer {
                 crate::output::staging::OutputStagingRegistry::default(),
                 self.sink_byte_counter.clone(),
                 self.writer_resources.clone(),
+                &self.truncation_ledger,
             ) {
                 Ok(w) => {
                     self.writer = Some(w);
@@ -637,6 +641,7 @@ impl StreamingConsumer for SinkStreamConsumer {
 pub(super) struct StreamingSinkResources {
     pub(super) writer_resources: clinker_format::preparation::WriterResources,
     pub(super) allocation_resources: clinker_record::owned_storage::AllocationResources,
+    pub(super) truncation_ledger: super::truncation_report::TruncationLedger,
 }
 
 /// Streaming-output writer thread body — the `Sink` instantiation of the
@@ -657,7 +662,10 @@ pub(super) fn streaming_sink(
     let StreamingSinkResources {
         writer_resources,
         allocation_resources,
+        truncation_ledger,
     } = resources;
+    let truncation_key = spec.out_cfg.name.clone();
+    let truncations_before = truncation_ledger.truncated_cells(&truncation_key);
     let mut signal = telemetry_producer
         .map(|producer| crate::telemetry::SinkSignal::new(producer, spec.output_name.clone()));
     let sink_byte_counter = signal
@@ -668,8 +676,12 @@ pub(super) fn streaming_sink(
         spec,
         sink_byte_counter.clone(),
         writer_resources,
+        truncation_ledger.clone(),
     );
     drain_streaming_channel(&rx, &charge_handle, &mut consumer, &allocation_resources);
+    // The writer is finished (flushed on close, or abandoned on a fatal
+    // record); dropping it now settles its truncations before they are read.
+    drop(consumer.writer.take());
     let errors = consumer
         .out
         .errors
@@ -687,6 +699,11 @@ pub(super) fn streaming_sink(
             sink_byte_counter
                 .as_ref()
                 .map_or(0, clinker_format::SharedByteCounter::bytes_written),
+        );
+        signal.record_truncations(
+            truncation_ledger
+                .truncated_cells(&truncation_key)
+                .saturating_sub(truncations_before),
         );
         signal.record_errors(u64::try_from(errors).unwrap_or(u64::MAX));
         let has_failure = errors > 0;

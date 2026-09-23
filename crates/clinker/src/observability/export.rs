@@ -1830,6 +1830,7 @@ fn metric_name(key: MetricKey) -> &'static str {
         MetricKey::SinkRecords => "clinker.sink.records",
         MetricKey::SinkErrors => "clinker.sink.errors",
         MetricKey::SinkBytes => "clinker.sink.bytes",
+        MetricKey::SinkTruncations => "clinker.sink.truncations",
         MetricKey::WriterAdmissionStarted => "clinker.writer.admission.started",
         MetricKey::WriterAdmissionCompleted => "clinker.writer.admission.completed",
         MetricKey::WriterAdmissionFailed => "clinker.writer.admission.failed",
@@ -2480,6 +2481,7 @@ action = "allow"
             (MetricKey::SinkRecords, "clinker.sink.records"),
             (MetricKey::SinkErrors, "clinker.sink.errors"),
             (MetricKey::SinkBytes, "clinker.sink.bytes"),
+            (MetricKey::SinkTruncations, "clinker.sink.truncations"),
             (
                 MetricKey::WriterAdmissionStarted,
                 "clinker.writer.admission.started",
@@ -2633,6 +2635,7 @@ action = "allow"
                 "clinker.writer.cleanup.completed",
                 "clinker.writer.cleanup.failed",
                 "clinker.writer.cleanup.interrupted",
+                "clinker.sink.truncations",
             ]
         );
         assert_eq!(

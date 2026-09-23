@@ -118,18 +118,19 @@ and XML parser/event/record allocations retain their prior allowance; optional
 envelope indexes retain their existing cap. Prepared output does not establish
 whole-reader admission or a whole-process RSS ceiling.
 
-### Physical-text configuration, warnings and trailers
+### Physical-text configuration, truncation tallies and trailers
 
 `FixedWidthEncoderConfig` retains admitted derived layout policies, field and
 group names, and selected envelope names. Layout validation borrows the
 caller's column/type trees; the encoder does not clone recursive schemas.
-Each `FixedWidthEncoder` owns its complete committed warning history.
-Preparation reserves new messages plus old/replacement metadata overlap
-before delivery. Commit moves preinitialized String slots without allocating
-or failing. Existing messages keep their original backing; converting admitted
-UTF-8 text into a String transfers the same allocation and lease. The lease
-outlives actual String backing deallocation, including abandoned pending
-warnings and final history destruction.
+Each `FixedWidthEncoder` owns a `truncation: warn` tally per warn field and a
+reused per-record staging array, both allocated once, when the encoder is
+built, and sized by the layout: a count, a longest length and eight record
+numbers per field. Preparing a record writes its hits into the staging array;
+commit folds them into the tally. Neither step allocates or requests budget,
+so a warn truncation cannot fail a record, and no value text is retained. A
+record that fails or is never delivered leaves only staged hits, cleared by
+the next preparation.
 
 `SwiftEncoderConfig` shares admitted service literals or document-section
 names; literal precedence avoids retaining an unused section name. Column
@@ -142,8 +143,8 @@ and replacement backing simultaneously, and commit only moves ownership.
 Both encoders borrow record strings and document fields. Scalar formatting
 uses fixed 1 KiB stack scratch, and fixed-width padding uses a fixed chunk.
 Large strings are not copied into a rendered cell before truncation. Encoded
-bytes belong to the shared operation stage; retained warnings and trailers
-remain memory charges even when staged bytes spill. Factory and writer boxes
+bytes belong to the shared operation stage; truncation tallies and retained
+trailers remain memory charges even when staged bytes spill. Factory and writer boxes
 keep the admitted concrete-layout owners described above. There are no raw
 fixed-width or SWIFT writer constructors: direct callers provide finite
 `WriterResources` to the encoder and `PreparedWriter`.

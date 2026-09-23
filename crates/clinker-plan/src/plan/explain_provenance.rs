@@ -556,6 +556,7 @@ pub const EXPLAIN_PAGES: &[(&str, &str)] = &[
     ("W306", include_str!("../../../../docs/explain/W306.md")),
     ("W365", include_str!("../../../../docs/explain/W365.md")),
     ("W366", include_str!("../../../../docs/explain/W366.md")),
+    ("W367", include_str!("../../../../docs/explain/W367.md")),
 ];
 
 /// Look up an optional diagnostic detail page embedded at compile time.

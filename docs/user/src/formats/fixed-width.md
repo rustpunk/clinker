@@ -59,14 +59,22 @@ resolved, on both the read and write sides. An absent or empty `pad` defaults
 to a space. Under `truncation: error` an over-long value is still a hard error
 before any slicing.
 
-`truncation: warn` truncates and retains a warning; `silent` performs the
-same truncation silently. Numeric columns default to `error`, and other
-columns default to `warn`. The complete warning history includes every
-successfully delivered truncation under `warn`, across documents; it is
-neither capped nor discarded.
-A rejected or partly delivered operation adds no warnings and does not
-advance the committed record count. If the available memory cannot retain
-the next warning, that operation fails before delivering bytes.
+`truncation: warn` truncates and reports it; `silent` performs the same
+truncation and reports nothing. Numeric columns default to `error`, and
+other columns default to `warn`.
+
+When a run finishes, each output that truncated under `warn` prints one
+**W367** warning to standard error, naming every such column with the exact
+number of values cut, the longest original value in bytes, the column width,
+and the numbers of the first eight output records that were cut (records
+count from 1 across everything that output wrote, including every file of a
+split output). The warning does not change the exit code. The report never
+copies a value, so it cannot leak data into logs, and its memory is fixed by
+the schema when the output opens: recording a truncation cannot fail, so
+`warn` never turns an over-long value into a rejected record. A record
+that is rejected or not delivered is not counted. Truncations are also
+counted by the `clinker.sink.truncations` metric. Run
+`clinker explain --code W367` for the fixes.
 
 A `type: decimal` output column with a `scale` rounds its values to that
 many fractional places on write (banker's rounding), the same contract a
@@ -225,8 +233,10 @@ Direct callers construct `FixedWidthEncoder` with their columns,
 `FixedWidthWriterConfig`, and finite `WriterResources`, then wrap it in
 `PreparedWriter`. `MemoryOnlyResources::new` requires an explicit nonzero
 budget. The resource-free writer constructor is unavailable. Read the
-complete borrowed warning slice through
-`writer.encoder().truncation_warnings()` (`&[String]`).
+truncation account through `FormatWriter::truncation_summary()` (or
+`writer.encoder().truncation_summary()`): `None` when nothing was truncated,
+otherwise per-column counts, longest lengths, and the first delivered record
+numbers.
 
 Preparation validates the complete operation before destination writes.
 Preparation failure leaves committed state unchanged and permits a corrected

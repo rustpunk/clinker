@@ -1681,4 +1681,121 @@ nodes:
             "output must include both order IDs: {output}"
         );
     }
+
+    fn fixed_width_pipeline(source_type: &str, correlation: &str, upstream: &str) -> String {
+        format!(
+            r#"
+pipeline:
+  name: w367_truncation_report
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: people
+  config:
+    name: people
+    type: {source_type}
+    path: test.input
+    {correlation}
+    schema:
+    - {{ name: id, type: string }}
+    - {{ name: name, type: string }}
+{upstream}
+- type: sink
+  name: out
+  input: {input}
+  config:
+    name: out
+    type: fixed_width
+    path: output.dat
+    schema:
+    - {{ name: id, type: string, start: 0, width: 2 }}
+    - {{ name: name, type: string, start: 2, width: 5 }}
+"#,
+            input = if upstream.is_empty() {
+                "people"
+            } else {
+                "shaped"
+            },
+        )
+    }
+
+    const W367_ROWS_CSV: &str = "id,name\n1,Ann\n2,Bartholomew\n3,Cleo\n4,Maximilian\n";
+
+    /// A string column defaults to `truncation: warn`: every over-width value is
+    /// cut, the rows still write, and the run ends with one W367 naming the
+    /// exact count, the longest original length and the record numbers.
+    #[test]
+    fn fixed_width_truncation_is_reported_once_per_output() {
+        let run = run_pipeline_reporting(&fixed_width_pipeline("csv", "", ""), W367_ROWS_CSV)
+            .expect("warn never fails a record");
+        assert_eq!(run.counters.records_written, 4);
+        assert_eq!(run.output, "1 Ann  \n2 Barth\n3 Cleo \n4 Maxim\n");
+        assert_eq!(run.advisories.len(), 1, "{:?}", run.advisories);
+        assert!(
+            run.advisories[0].starts_with(
+                "W367 output 'out': 2 value(s) truncated to fit under `truncation: warn`: \
+                 name ×2 (longest 11 bytes, width 5; records 2, 4)."
+            ),
+            "{}",
+            run.advisories[0]
+        );
+    }
+
+    /// The correlation-deferred commit builds its own writer; its truncations
+    /// reach the same report.
+    #[test]
+    fn correlation_committed_fixed_width_truncation_is_reported() {
+        let input = r#"[
+          {"id":"1","name":"Ann"},
+          {"id":"2","name":"Bartholomew"},
+          {"id":"3","name":"Cleo"},
+          {"id":"4","name":"Maximilian"}
+        ]"#;
+        let run = run_pipeline_reporting(
+            &fixed_width_pipeline("json", "correlation_key: id", ""),
+            input,
+        )
+        .expect("the run completes");
+        assert_eq!(run.counters.records_written, 4);
+        assert_eq!(run.advisories.len(), 1, "{:?}", run.advisories);
+        assert!(
+            run.advisories[0].contains("name ×2 (longest 11 bytes, width 5;"),
+            "{}",
+            run.advisories[0]
+        );
+    }
+
+    /// A Sink fed by a blocking operator writes from the buffered dispatch arm;
+    /// its truncations reach the same report.
+    #[test]
+    fn buffered_fixed_width_truncation_is_reported() {
+        let upstream = r#"- type: aggregate
+  name: shaped
+  input: people
+  config:
+    group_by: [id]
+    cxl: |
+      emit name = max(name)"#;
+        let run = run_pipeline_reporting(&fixed_width_pipeline("csv", "", upstream), W367_ROWS_CSV)
+            .expect("the run completes");
+        assert_eq!(run.counters.records_written, 4);
+        assert_eq!(run.advisories.len(), 1, "{:?}", run.advisories);
+        assert!(
+            run.advisories[0].contains("name ×2 (longest 11 bytes, width 5;"),
+            "{}",
+            run.advisories[0]
+        );
+    }
+
+    #[test]
+    fn fixed_width_output_that_fits_reports_nothing() {
+        let run = run_pipeline_reporting(
+            &fixed_width_pipeline("csv", "", ""),
+            "id,name\n1,Ann\n2,Cleo\n",
+        )
+        .expect("the run completes");
+        assert_eq!(run.output, "1 Ann  \n2 Cleo \n");
+        assert!(run.advisories.is_empty(), "{:?}", run.advisories);
+    }
 }

@@ -388,6 +388,7 @@ fn flush_clean_records_to_writers(
             continue;
         };
         let errors_before = ctx.output_errors.len();
+        let truncations_before = ctx.truncation_ledger.truncated_cells(&out_cfg.name);
         match build_format_writer(
             out_cfg,
             raw_writer,
@@ -395,6 +396,7 @@ fn flush_clean_records_to_writers(
             ctx.output_staging.clone(),
             sink_byte_counter.clone(),
             ctx.writer_resources.clone(),
+            &ctx.truncation_ledger,
         ) {
             Ok(mut writer) => {
                 let mut write_failed = false;
@@ -458,12 +460,19 @@ fn flush_clean_records_to_writers(
                 ctx.counters.ok_count += newly_ok;
                 ctx.counters.records_written += written;
                 ctx.records_emitted += written;
+                // Settle the writer's truncations before they are read.
+                drop(writer);
                 if let Some(mut signal) = signal.take() {
                     signal.record_records(written);
                     signal.record_bytes(
                         sink_byte_counter
                             .as_ref()
                             .map_or(0, clinker_format::SharedByteCounter::bytes_written),
+                    );
+                    signal.record_truncations(
+                        ctx.truncation_ledger
+                            .truncated_cells(&out_cfg.name)
+                            .saturating_sub(truncations_before),
                     );
                     let new_errors = &ctx.output_errors[errors_before..];
                     let failures = new_errors

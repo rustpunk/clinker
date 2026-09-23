@@ -513,7 +513,9 @@ pub(crate) fn build_format_writer(
     output_staging: crate::output::staging::OutputStagingRegistry,
     sink_byte_counter: Option<SharedByteCounter>,
     resources: WriterResources,
+    truncation_ledger: &crate::executor::truncation_report::TruncationLedger,
 ) -> Result<FormatWriterHandle, PipelineError> {
+    use crate::executor::truncation_report::TruncationReporting;
     let repeat_header = output.split.as_ref().is_some_and(|s| s.repeat_header);
     let scope = resources
         .scope()
@@ -586,7 +588,11 @@ pub(crate) fn build_format_writer(
         drop(raw_writer);
 
         FormatWriterHandle::try_new(
-            SplittingWriter::new(file_factory, writer_factory, schema, policy),
+            TruncationReporting::new(
+                SplittingWriter::new(file_factory, writer_factory, schema, policy),
+                truncation_ledger.clone(),
+                output.name.clone(),
+            ),
             scope.allocation(),
         )
         .map_err(|error| PipelineError::Format(error.into()))
@@ -601,8 +607,15 @@ pub(crate) fn build_format_writer(
         let inner = writer_factory
             .create(counting_writer, schema)
             .map_err(PipelineError::Format)?;
-        FormatWriterHandle::try_new(CountedFormatWriter::new(inner, counter), scope.allocation())
-            .map_err(|error| PipelineError::Format(error.into()))
+        FormatWriterHandle::try_new(
+            TruncationReporting::new(
+                CountedFormatWriter::new(inner, counter),
+                truncation_ledger.clone(),
+                output.name.clone(),
+            ),
+            scope.allocation(),
+        )
+        .map_err(|error| PipelineError::Format(error.into()))
     }
 }
 
@@ -671,6 +684,7 @@ nodes:
             Default::default(),
             Some(counter.clone()),
             provider.resources(),
+            &Default::default(),
         )
         .unwrap();
         assert!(
@@ -918,6 +932,7 @@ nodes:
                         std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
                     )
                     .resources(),
+                    &Default::default(),
                 )
                 .expect("split writer builds");
                 let result = writer.write_record(&record);
@@ -1014,6 +1029,7 @@ nodes:
             crate::output::staging::OutputStagingRegistry::default(),
             None,
             resources.resources(),
+            &Default::default(),
         )
         .unwrap();
         let row = |text: &str| Record::new(schema.clone(), vec![Value::String(text.into())]);

@@ -427,6 +427,7 @@ diagnostic_registry! {
     "W307", Warning, "A physical source file violated its declared record order and was repaired before release";
     "W365", Warning, "A Sink `mapping:` column was present on no record";
     "W366", Warning, "An upstream column was displaced by a Sink `mapping:` name";
+    "W367", Warning, "A fixed-width output truncated values under `truncation: warn`";
 }
 
 /// Whether `code` is listed in [`REGISTRY`].
