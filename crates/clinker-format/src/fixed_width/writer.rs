@@ -26,6 +26,77 @@ fn output_error(name: &str, field: usize, offset: usize, kind: OutputEncodingKin
         element: None,
     }
 }
+/// Declared 0-based position of the top-level column `name` borrows from: the
+/// column itself or one of its repeating-group children. Layout validation
+/// reports names borrowed from `columns`, so identity is by address.
+fn declared_position(columns: &[Column], name: &str) -> usize {
+    let is = |column: &Column| std::ptr::eq(column.name.as_str(), name);
+    columns
+        .iter()
+        .position(|column| {
+            is(column) || column.fields.as_deref().unwrap_or_default().iter().any(is)
+        })
+        .unwrap_or(0)
+}
+/// Diagnostic identity of one cell. `field` in [`FormatError::OutputEncoding`]
+/// is the 1-based position of the column among the record's user fields (the
+/// numbering every writer shares and the DLQ indexes by), so a record cell is
+/// resolved against its record, and only when an error is actually built.
+#[derive(Clone, Copy)]
+struct CellAt<'a> {
+    /// Name excerpt carried in the diagnostic.
+    name: &'a str,
+    record: Option<&'a Record>,
+    /// Record column the position is resolved from; for a repeating-group
+    /// child this is the group.
+    column: &'a str,
+    /// Declared 0-based position: used when no record carries `column`.
+    declared: usize,
+    /// 1-based occurrence of a repeating-group child.
+    element: Option<std::num::NonZeroUsize>,
+}
+impl<'a> CellAt<'a> {
+    fn fixed(name: &'a str, declared: usize) -> Self {
+        Self {
+            name,
+            record: None,
+            column: name,
+            declared,
+            element: None,
+        }
+    }
+    fn record(record: &'a Record, column: &'a str, declared: usize) -> Self {
+        Self {
+            record: Some(record),
+            ..Self::fixed(column, declared)
+        }
+    }
+    fn child(self, name: &'a str, occurrence: usize) -> Self {
+        Self {
+            name,
+            element: std::num::NonZeroUsize::new(occurrence + 1),
+            ..self
+        }
+    }
+    fn error(self, offset: usize, kind: OutputEncodingKind) -> FormatError {
+        let field = self
+            .record
+            .and_then(|record| {
+                record
+                    .iter_user_fields()
+                    .position(|(name, _)| name == self.column)
+            })
+            .unwrap_or(self.declared);
+        FormatError::OutputEncoding {
+            format: "fixed-width",
+            field: field + 1,
+            offset,
+            kind,
+            field_name: OutputFieldName::new(self.name),
+            element: self.element,
+        }
+    }
+}
 fn retained_text(value: &str, scope: &WriterScope) -> Result<ReservedText, FormatError> {
     let mut text = ReservedText::new(scope.allocation().clone());
     text.push_str(value)?;
@@ -33,6 +104,8 @@ fn retained_text(value: &str, scope: &WriterScope) -> Result<ReservedText, Forma
 }
 struct PreparedField {
     name: ReservedText,
+    /// Declared position of the top-level column (the group, for a child).
+    declared: usize,
     start: usize,
     width: usize,
     justify: Justify,
@@ -43,15 +116,27 @@ struct PreparedField {
     read_pad: Option<char>,
 }
 impl PreparedField {
-    fn new(column: &Column, start: usize, scope: &WriterScope) -> Result<Self, FormatError> {
-        let width = field::scalar_width(column, start)
-            .map_err(|e| output_error(e.name, 0, start, OutputEncodingKind::FixedWidthLayout))?;
+    fn new(
+        column: &Column,
+        start: usize,
+        declared: usize,
+        scope: &WriterScope,
+    ) -> Result<Self, FormatError> {
+        let width = field::scalar_width(column, start).map_err(|e| {
+            output_error(
+                e.name,
+                declared,
+                start,
+                OutputEncodingKind::FixedWidthLayout,
+            )
+        })?;
         let numeric = matches!(
             column.ty.unwrap_nullable(),
             Type::Int | Type::Float | Type::Decimal | Type::Numeric
         );
         Ok(Self {
             name: retained_text(&column.name, scope)?,
+            declared,
             start,
             width,
             justify: column.justify.clone().unwrap_or(if numeric {
@@ -77,6 +162,7 @@ impl PreparedField {
 }
 struct PreparedGroup {
     name: ReservedText,
+    declared: usize,
     start: usize,
     width: usize,
     occurrence_width: usize,
@@ -99,6 +185,12 @@ impl PreparedLayout {
         match self {
             Self::Scalar(f) => f.start,
             Self::Group(g) => g.start,
+        }
+    }
+    fn declared(&self) -> usize {
+        match self {
+            Self::Scalar(f) => f.declared,
+            Self::Group(g) => g.declared,
         }
     }
     fn width(&self) -> usize {
@@ -146,8 +238,14 @@ impl FixedWidthEncoderConfig {
     ) -> Result<Self, FormatError> {
         let scope = resources.scope()?;
         scope.check_cancelled()?;
-        field::check_write_layout(fields)
-            .map_err(|e| output_error(e.name, 0, 0, OutputEncodingKind::FixedWidthLayout))?;
+        field::check_write_layout(fields).map_err(|e| {
+            output_error(
+                e.name,
+                declared_position(fields, e.name),
+                0,
+                OutputEncodingKind::FixedWidthLayout,
+            )
+        })?;
         if let Some(count) = count {
             return Err(output_error(
                 count,
@@ -159,12 +257,17 @@ impl FixedWidthEncoderConfig {
         let mut layouts = ReservedVec::new(scope.allocation().clone());
         layouts.reserve_exact(fields.len())?;
         let mut next_start = 0;
-        for column in fields {
+        for (declared, column) in fields.iter().enumerate() {
             scope.check_cancelled()?;
             let start = column.start.unwrap_or(next_start);
             let layout = if field::is_group(column) {
                 let dimensions = field::group_dimensions(column, start).map_err(|e| {
-                    output_error(e.name, 0, start, OutputEncodingKind::FixedWidthLayout)
+                    output_error(
+                        e.name,
+                        declared,
+                        start,
+                        OutputEncodingKind::FixedWidthLayout,
+                    )
                 })?;
                 let children = column.fields.as_deref().unwrap_or_default();
                 let mut fields = ReservedVec::new(scope.allocation().clone());
@@ -172,25 +275,35 @@ impl FixedWidthEncoderConfig {
                 let mut next_child = 0;
                 for child in children {
                     scope.check_cancelled()?;
-                    let child =
-                        PreparedField::new(child, child.start.unwrap_or(next_child), &scope)?;
+                    let child = PreparedField::new(
+                        child,
+                        child.start.unwrap_or(next_child),
+                        declared,
+                        &scope,
+                    )?;
                     next_child = child.start + child.width;
                     fields.push(child)?;
                 }
                 fields.as_mut_slice().sort_unstable_by_key(|f| f.start);
                 PreparedLayout::Group(PreparedGroup {
                     name: retained_text(&column.name, &scope)?,
+                    declared,
                     start,
                     width: dimensions.max_width,
                     occurrence_width: dimensions.occurrence_width,
                     count_width: column.count_field.as_ref().map_or(0, |c| c.width),
                     occurs: column.occurs.clone().ok_or_else(|| {
-                        output_error(&column.name, 0, start, OutputEncodingKind::FixedWidthLayout)
+                        output_error(
+                            &column.name,
+                            declared,
+                            start,
+                            OutputEncodingKind::FixedWidthLayout,
+                        )
                     })?,
                     fields,
                 })
             } else {
-                PreparedLayout::Scalar(PreparedField::new(column, start, &scope)?)
+                PreparedLayout::Scalar(PreparedField::new(column, start, declared, &scope)?)
             };
             next_start = layout.start() + layout.width();
             layouts.push(layout)?;
@@ -417,8 +530,7 @@ impl<W: Write + Send> FormatWriter for PreparedWriter<W, FixedWidthEncoder> {
 // Strings bypass this fixed scratch and retain their original record owner.
 fn physical_scalar<T>(
     value: &Value,
-    name: &str,
-    index: usize,
+    at: CellAt<'_>,
     envelope: bool,
     action: impl FnOnce(&str) -> Result<T, FormatError>,
 ) -> Result<T, FormatError> {
@@ -453,9 +565,7 @@ fn physical_scalar<T>(
         Value::Date(v) => v.format("%Y%m%d").write_to(&mut text),
         Value::DateTime(v) => v.format("%Y%m%d%H%M%S").write_to(&mut text),
         Value::Array(_) | Value::Map(_) => {
-            return Err(output_error(
-                name,
-                index,
+            return Err(at.error(
                 0,
                 if envelope {
                     OutputEncodingKind::FixedWidthEnvelope
@@ -465,9 +575,9 @@ fn physical_scalar<T>(
             ));
         }
     };
-    result.map_err(|_| output_error(name, index, 0, OutputEncodingKind::FixedWidthScalar))?;
+    result.map_err(|_| at.error(0, OutputEncodingKind::FixedWidthScalar))?;
     let text = std::str::from_utf8(&text.bytes[..text.len])
-        .map_err(|_| output_error(name, index, 0, OutputEncodingKind::FixedWidthScalar))?;
+        .map_err(|_| at.error(0, OutputEncodingKind::FixedWidthScalar))?;
     action(text)
 }
 fn padding(
@@ -560,21 +670,16 @@ fn prepared_cell(
     stage: &mut dyn Write,
     field: &PreparedField,
     value: &Value,
-    index: usize,
+    at: CellAt<'_>,
     group: Option<&str>,
     warnings: &mut ReservedVec<ReservedText>,
     scope: &WriterScope,
 ) -> Result<(), FormatError> {
-    physical_scalar(value, field.name.as_str(), index, false, |text| {
+    physical_scalar(value, at, false, |text| {
         if text.len() > field.width {
             match field.truncation {
                 TruncationPolicy::Error => {
-                    return Err(output_error(
-                        field.name.as_str(),
-                        index,
-                        field.width,
-                        OutputEncodingKind::FixedWidthTruncation,
-                    ));
+                    return Err(at.error(field.width, OutputEncodingKind::FixedWidthTruncation));
                 }
                 TruncationPolicy::Warn => append_warning(warnings, field, text, group, scope)?,
                 TruncationPolicy::Silent => {}
@@ -594,13 +699,13 @@ fn prepared_cell(
 fn blank_cell(
     field: &PreparedField,
     value: &Value,
-    index: usize,
+    at: CellAt<'_>,
     scope: &WriterScope,
 ) -> Result<bool, FormatError> {
     if !field.trim || matches!(value, Value::Array(_) | Value::Map(_)) {
         return Ok(false);
     }
-    physical_scalar(value, field.name.as_str(), index, false, |text| {
+    physical_scalar(value, at, false, |text| {
         let text = kept(text, field);
         let pads = field.width - text.len();
         let left = if matches!(field.justify, Justify::Right) {
@@ -651,11 +756,11 @@ fn prepared_group(
     stage: &mut dyn Write,
     group: &PreparedGroup,
     value: &Value,
-    index: usize,
+    cell: CellAt<'_>,
     warnings: &mut ReservedVec<ReservedText>,
     scope: &WriterScope,
 ) -> Result<usize, FormatError> {
-    let failure = |kind| output_error(group.name.as_str(), index, group.start, kind);
+    let failure = |kind| cell.error(group.start, kind);
     let supplied = match value {
         Value::Null => &[][..],
         Value::Array(values) => values.as_slice(),
@@ -681,17 +786,11 @@ fn prepared_group(
         // usize has at most 20 decimal digits; no count-width-sized scratch.
         let count = i64::try_from(selected.len())
             .map_err(|_| failure(OutputEncodingKind::FixedWidthCardinality))?;
-        physical_scalar(
-            &Value::Integer(count),
-            group.name.as_str(),
-            index,
-            false,
-            |text| {
-                padding(stage, b'0', group.count_width - text.len(), scope)?;
-                stage.write_all(text.as_bytes())?;
-                Ok(())
-            },
-        )?;
+        physical_scalar(&Value::Integer(count), cell, false, |text| {
+            padding(stage, b'0', group.count_width - text.len(), scope)?;
+            stage.write_all(text.as_bytes())?;
+            Ok(())
+        })?;
     }
     let slots = match group.occurs.fill {
         FixedWidthFill::Pad => group.occurs.max,
@@ -714,7 +813,7 @@ fn prepared_group(
                 if !blank_cell(
                     field,
                     values.get(field.name.as_str()).unwrap_or(&Value::Null),
-                    index,
+                    cell.child(field.name.as_str(), occurrence),
                     scope,
                 )? {
                     blank = false;
@@ -736,7 +835,7 @@ fn prepared_group(
                 stage,
                 field,
                 value,
-                index,
+                cell.child(field.name.as_str(), occurrence),
                 Some(group.name.as_str()),
                 warnings,
                 scope,
@@ -781,18 +880,19 @@ impl FormatEncoder for FixedWidthEncoder {
                 let mut pending = ReservedVec::new(scope.allocation().clone());
                 let mut at = 0;
                 let mut shifted = 0;
-                for (index, layout) in self.config.0.layouts.as_slice().iter().enumerate() {
+                for layout in self.config.0.layouts.as_slice() {
                     scope.check_cancelled()?;
                     let start = layout.start() - shifted;
                     padding(stage, b' ', start - at, scope)?;
                     let value = record.get(layout.name()).unwrap_or(&Value::Null);
+                    let cell = CellAt::record(record, layout.name(), layout.declared());
                     let width = match layout {
                         PreparedLayout::Scalar(field) => {
-                            prepared_cell(stage, field, value, index, None, &mut pending, scope)?;
+                            prepared_cell(stage, field, value, cell, None, &mut pending, scope)?;
                             field.width
                         }
                         PreparedLayout::Group(group) => {
-                            prepared_group(stage, group, value, index, &mut pending, scope)?
+                            prepared_group(stage, group, value, cell, &mut pending, scope)?
                         }
                     };
                     shifted += layout.width() - width;
@@ -813,7 +913,7 @@ impl FormatEncoder for FixedWidthEncoder {
                     if let Some(fields) = fields {
                         for (index, (name, value)) in fields.iter().enumerate() {
                             scope.check_cancelled()?;
-                            physical_scalar(value, name, index, true, |text| {
+                            physical_scalar(value, CellAt::fixed(name, index), true, |text| {
                                 stage.write_all(text.as_bytes())?;
                                 Ok(())
                             })?;

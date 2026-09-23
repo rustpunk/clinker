@@ -552,3 +552,106 @@ fn read_layout_reports_the_first_physical_shift_group() {
             .unwrap();
     assert_eq!(reader_error.to_string(), error.to_string());
 }
+
+fn output_field(error: FormatError) -> (usize, String, Option<usize>, OutputEncodingKind) {
+    match error {
+        FormatError::OutputEncoding {
+            format: "fixed-width",
+            field,
+            field_name,
+            element,
+            kind,
+            ..
+        } => (
+            field,
+            field_name.to_string(),
+            element.map(|e| e.get()),
+            kind,
+        ),
+        other => panic!("expected a fixed-width output encoding error, got {other:?}"),
+    }
+}
+
+fn numeric(name: &str, start: usize, width: usize) -> Column {
+    Column {
+        ty: Type::Int,
+        ..scalar(name, start, width)
+    }
+}
+
+/// `field` is the column's 1-based position among the record's user fields —
+/// the numbering every writer shares and the DLQ indexes by — never its rank
+/// in byte-offset order or in the declared schema.
+#[test]
+fn cell_errors_number_fields_by_record_position() {
+    // Declared `b` first but laid out after `a`; `b` overflows its width.
+    let layout = || vec![numeric("b", 10, 3), scalar("a", 0, 3)];
+    let overflow = Value::Integer(12_345);
+
+    let b_first = record_fields(&[("b", overflow.clone()), ("a", Value::String("x".into()))]);
+    let error = write(layout(), &b_first).expect_err("b overflows");
+    assert_eq!(
+        output_field(error),
+        (
+            1,
+            "b".into(),
+            None,
+            OutputEncodingKind::FixedWidthTruncation
+        )
+    );
+
+    let a_first = record_fields(&[("a", Value::String("x".into())), ("b", overflow)]);
+    let error = write(layout(), &a_first).expect_err("b overflows");
+    assert_eq!(
+        output_field(error),
+        (
+            2,
+            "b".into(),
+            None,
+            OutputEncodingKind::FixedWidthTruncation
+        )
+    );
+}
+
+#[test]
+fn layout_errors_number_the_declared_column() {
+    let layout = vec![scalar("a", 0, 5), scalar("b", 5, 5), scalar("c", 7, 5)];
+    let error = finite_writer(Vec::new(), layout, FixedWidthWriterConfig::default())
+        .err()
+        .expect("c overlaps b");
+    assert_eq!(
+        output_field(error),
+        (3, "c".into(), None, OutputEncodingKind::FixedWidthLayout)
+    );
+}
+
+/// A repeating-group child error carries the group's record position and the
+/// 1-based occurrence, so `field` + `element` address the offending cell.
+#[test]
+fn group_child_errors_carry_group_position_and_occurrence() {
+    let layout = vec![scalar("id", 0, 3), group("items", 3, 2, false)];
+    let bad = nested_record(&[
+        ("kind", Value::String("B".into())),
+        (
+            "code",
+            Value::Array(OwnedValues::from_vec(vec![Value::String("x".into())])),
+        ),
+    ]);
+    let record = record_fields(&[
+        ("id", Value::String("1".into())),
+        (
+            "items",
+            Value::Array(OwnedValues::from_vec(vec![occurrence("A", "12"), bad])),
+        ),
+    ]);
+    let error = write(layout, &record).expect_err("array child is not a scalar");
+    assert_eq!(
+        output_field(error),
+        (
+            2,
+            "code".into(),
+            Some(2),
+            OutputEncodingKind::FixedWidthScalar
+        )
+    );
+}
