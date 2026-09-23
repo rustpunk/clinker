@@ -68,7 +68,9 @@ When a run finishes, each output that truncated under `warn` prints one
 number of values cut, the longest original value in bytes, the column width,
 and the numbers of the first eight output records that were cut (records
 count from 1 across everything that output wrote, including every file of a
-split output). The warning does not change the exit code. The report never
+split output; an output that writes one file per source file numbers its files
+one after another in file-path order, except that a file whose writer fails is
+numbered when it fails). The warning does not change the exit code. The report never
 copies a value, so it cannot leak data into logs, and its memory is fixed by
 the schema when the output opens: recording a truncation cannot fail, so
 `warn` never turns an over-long value into a rejected record. A record

@@ -1527,14 +1527,19 @@ fn emit_fan_out(
     mut resolved_paths: HashMap<Arc<str>, String>,
     scan_timer: crate::executor::stage_metrics::StageTimer,
 ) {
-    use std::collections::HashMap as Hm;
-
     // Build one format writer per pre-opened raw writer. Failed
     // construction for one file does NOT abort the whole output —
     // siblings still get their chance.
     // A retained empty slot marks a terminal writer without confusing it with
     // an unregistered destination or retaining its failed resources.
-    let mut format_writers: Hm<Arc<str>, Option<clinker_format::FormatWriterHandle>> = Hm::new();
+    // Ordered by file so writers flush and drop in a stable order: each drop
+    // settles that file's truncations into the run's ledger, which numbers a
+    // Sink's records file by file in settle order. A hash order would make the
+    // W367 record numbers differ between runs of the same input.
+    let mut format_writers: std::collections::BTreeMap<
+        Arc<str>,
+        Option<clinker_format::FormatWriterHandle>,
+    > = std::collections::BTreeMap::new();
     for (file_arc, raw) in per_file {
         let mut resolved_config = fan_ctx.out_cfg.clone();
         if let Some(path) = resolved_paths.remove(&file_arc) {
